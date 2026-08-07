@@ -9,13 +9,16 @@ pub mod cmp;
 pub mod error;
 pub mod hlc;
 pub mod ids;
+pub mod index_meta;
 pub mod keyenc;
 pub mod oplog;
+pub mod path;
 pub mod record;
 
 pub use cmp::canonical_cmp;
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DocId, NodeId};
+pub use index_meta::{IndexField, IndexMeta};
 pub use oplog::{OpKind, OplogEntry, ResumeToken};
 pub use record::DocRecord;

@@ -12,6 +12,7 @@ pub mod codec;
 pub mod docs;
 pub mod engine;
 pub mod error;
+pub mod index;
 pub mod meta;
 pub mod tables;
 pub mod watch;

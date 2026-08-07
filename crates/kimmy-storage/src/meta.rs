@@ -6,6 +6,7 @@
 //! more than the space.
 
 use kimmy_core::{Hlc, ids::CollectionId};
+pub use kimmy_core::{IndexField, IndexMeta};
 use serde::{Deserialize, Serialize};
 
 /// A database: purely a namespace for collections.
@@ -74,48 +75,6 @@ impl CollectionMeta {
         let id = self.next_index_id();
         self.index_id_counter = id + 1;
         id
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexMeta {
-    pub id: u32,
-    pub name: String,
-    pub fields: Vec<IndexField>,
-    #[serde(default)]
-    pub unique: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexField {
-    /// Dot path into the document, e.g. `"address.city"`.
-    pub path: String,
-    #[serde(default)]
-    pub descending: bool,
-}
-
-impl IndexField {
-    pub fn ascending(path: impl Into<String>) -> Self {
-        Self { path: path.into(), descending: false }
-    }
-
-    pub fn descending(path: impl Into<String>) -> Self {
-        Self { path: path.into(), descending: true }
-    }
-}
-
-impl IndexMeta {
-    /// Conventional Mongo-style name, e.g. `age_1_name_-1`.
-    pub fn default_name(fields: &[IndexField]) -> String {
-        fields
-            .iter()
-            .map(|f| format!("{}_{}", f.path, if f.descending { -1 } else { 1 }))
-            .collect::<Vec<_>>()
-            .join("_")
-    }
-
-    pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.fields.iter().map(|f| f.path.as_str())
     }
 }
 

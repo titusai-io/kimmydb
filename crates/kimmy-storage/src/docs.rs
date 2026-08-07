@@ -16,6 +16,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use crate::codec;
 use crate::engine::{Engine, append_oplog, doc_range};
 use crate::error::{Result, StorageError};
+use crate::index;
 use crate::meta::CollectionMeta;
 use crate::tables;
 
@@ -130,6 +131,13 @@ impl Engine {
             docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
         }
 
+        // Same transaction as the document write, so the index cannot describe
+        // a state that never existed. A unique violation aborts the whole thing.
+        if let Err(e) = index::maintain(&txn, coll.id, &coll.indexes, None, Some(&doc), &key) {
+            txn.abort()?;
+            return Err(e);
+        }
+
         let entry = OplogEntry {
             stamp,
             kind: OpKind::Insert,
@@ -164,12 +172,15 @@ impl Engine {
         let stamp = self.next_stamp();
 
         let txn = self.db().begin_write()?;
-        let existed = {
+        let (existed, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
-            let existed = match docs.get((coll.id.0, key.as_slice()))? {
-                Some(raw) => codec::decode_doc_record(raw.value())?.is_live(),
-                None => false,
+            // The previous image is needed to remove the index entries it
+            // contributed — they are derived from the old value, not the new.
+            let previous = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
+                None => None,
             };
+            let existed = previous.is_some();
 
             if !existed && !upsert {
                 drop(docs);
@@ -179,8 +190,15 @@ impl Engine {
 
             let record = DocRecord::live(stamp, body.clone());
             docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
-            existed
+            (existed, previous)
         };
+
+        if let Err(e) =
+            index::maintain(&txn, coll.id, &coll.indexes, previous.as_ref(), Some(&doc), &key)
+        {
+            txn.abort()?;
+            return Err(e);
+        }
 
         let entry = OplogEntry {
             stamp,
@@ -208,13 +226,13 @@ impl Engine {
         let stamp = self.next_stamp();
 
         let txn = self.db().begin_write()?;
-        let existed = {
+        let previous = {
             let mut docs = txn.open_table(tables::DOCS)?;
-            let existed = match docs.get((coll.id.0, key.as_slice()))? {
-                Some(raw) => codec::decode_doc_record(raw.value())?.is_live(),
-                None => false,
+            let previous = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
+                None => None,
             };
-            if !existed {
+            if previous.is_none() {
                 drop(docs);
                 txn.abort()?;
                 return Ok(false);
@@ -223,8 +241,13 @@ impl Engine {
                 (coll.id.0, key.as_slice()),
                 codec::encode_doc_record(&DocRecord::tombstone(stamp)).as_slice(),
             )?;
-            existed
+            previous
         };
+
+        // A tombstoned document must leave no index entries behind, or a scan
+        // would surface a candidate whose document no longer exists.
+        index::maintain(&txn, coll.id, &coll.indexes, previous.as_ref(), None, &key)?;
+        let existed = true;
 
         let entry = OplogEntry {
             stamp,
