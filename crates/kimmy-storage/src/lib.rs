@@ -15,10 +15,11 @@ pub mod error;
 pub mod index;
 pub mod meta;
 pub mod tables;
+pub mod vectors;
 pub mod watch;
 
 pub use docs::{ID_FIELD, WriteOutcome};
 pub use engine::Engine;
 pub use error::{Result, StorageError};
-pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta};
+pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};
