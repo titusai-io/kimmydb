@@ -14,6 +14,7 @@ pub mod json;
 pub mod routes;
 pub mod state;
 pub mod users;
+pub mod vectors;
 pub mod watch;
 
 use std::sync::Arc;

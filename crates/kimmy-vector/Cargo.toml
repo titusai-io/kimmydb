@@ -29,6 +29,7 @@ thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+hnsw_rs = "0.3.4"
 
 [features]
 # In-process ONNX embedding. Off by default: it pulls native ONNX Runtime

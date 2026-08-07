@@ -42,6 +42,14 @@ pub fn router(state: SharedState) -> Router {
         )
         .route("/v1/db/{db}/coll/{coll}/indexes", get(list_indexes).post(create_index))
         .route("/v1/db/{db}/coll/{coll}/indexes/{name}", delete(drop_index))
+        .route(
+            "/v1/db/{db}/coll/{coll}/vector",
+            get(crate::vectors::get_vector_config)
+                .post(crate::vectors::configure_vectors)
+                .delete(crate::vectors::disable_vectors),
+        )
+        .route("/v1/db/{db}/coll/{coll}/vector_search", post(crate::vectors::vector_search))
+        .route("/v1/db/{db}/coll/{coll}/hybrid_search", post(crate::vectors::hybrid_search))
         .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
         .with_state(state)
 }
