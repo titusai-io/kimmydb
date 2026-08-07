@@ -8,8 +8,12 @@
 //! The `__` segment prefix is reserved for system objects, so a user cannot
 //! create a collection that shadows one.
 
-use kimmy_core::{DocId, Error as CoreError, Hlc, VectorConfig, VectorRecord, vector_meta};
+use kimmy_core::{
+    DocId, Error as CoreError, Hlc, ResumeToken, VectorConfig, VectorRecord, vector_meta,
+};
 use tracing::info;
+
+use redb::ReadableDatabase;
 
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
@@ -104,6 +108,46 @@ impl crate::Engine {
             .into_iter()
             .filter(|c| c.vector.is_some() && !vector_meta::is_shadow(&c.name))
             .collect())
+    }
+
+    /// Find a collection by its internal id.
+    ///
+    /// Oplog entries carry the id, not the name, so any consumer of the log
+    /// needs this to decide whether an entry is interesting.
+    pub fn collection_by_id(&self, id: kimmy_core::CollectionId) -> Result<Option<CollectionMeta>> {
+        for db in self.list_databases()? {
+            if let Some(found) = self.list_collections(&db.name)?.into_iter().find(|c| c.id == id) {
+                return Ok(Some(found));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Persist a background consumer's position in the oplog.
+    ///
+    /// Keyed by name so several consumers can track independently. Stored
+    /// rather than recomputed, because rebuilding it would mean re-reading the
+    /// whole log on every restart.
+    pub fn put_consumer_position(&self, consumer: &str, token: ResumeToken) -> Result<()> {
+        let txn = self.db().begin_write()?;
+        {
+            let mut meta = txn.open_table(crate::tables::META)?;
+            meta.insert(consumer_key(consumer).as_str(), token.encode().as_bytes())?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Where a background consumer left off, if it has ever recorded a position.
+    pub fn consumer_position(&self, consumer: &str) -> Result<Option<ResumeToken>> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(crate::tables::META)?;
+        let Some(raw) = meta.get(consumer_key(consumer).as_str())? else {
+            return Ok(None);
+        };
+        let text = std::str::from_utf8(raw.value())
+            .map_err(|_| StorageError::Corrupt("consumer position is not utf-8".into()))?;
+        Ok(Some(ResumeToken::decode(text)?))
     }
 
     // -----------------------------------------------------------------------
@@ -203,6 +247,11 @@ impl crate::Engine {
         })?;
         Ok(out)
     }
+}
+
+/// META key holding one consumer's oplog position.
+fn consumer_key(consumer: &str) -> String {
+    format!("consumer_position:{consumer}")
 }
 
 fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {

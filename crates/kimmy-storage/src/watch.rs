@@ -146,7 +146,7 @@ impl Engine {
     }
 
     /// Read up to `limit` oplog entries at or after `from`.
-    pub(crate) fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
+    pub fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
         let txn = self.db().begin_read()?;
         let oplog = txn.open_table(tables::OPLOG)?;
         let lower = codec::oplog_key_lower_bound(from);

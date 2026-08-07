@@ -38,4 +38,7 @@ pub enum VectorError {
 
     #[error(transparent)]
     Storage(#[from] kimmy_storage::StorageError),
+
+    #[error(transparent)]
+    Core(#[from] kimmy_core::Error),
 }
