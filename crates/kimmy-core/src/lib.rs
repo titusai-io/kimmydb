@@ -15,6 +15,7 @@ pub mod oplog;
 pub mod path;
 pub mod record;
 pub mod vector_meta;
+pub mod vector_record;
 
 pub use cmp::canonical_cmp;
 pub use error::{Error, Result};
@@ -24,3 +25,4 @@ pub use index_meta::{Enforcement, IndexField, IndexMeta};
 pub use oplog::{OpKind, OplogEntry, ResumeToken};
 pub use record::DocRecord;
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
+pub use vector_record::{VectorRecord, similarity};

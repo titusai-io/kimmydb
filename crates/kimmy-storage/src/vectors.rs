@@ -8,7 +8,7 @@
 //! The `__` segment prefix is reserved for system objects, so a user cannot
 //! create a collection that shadows one.
 
-use kimmy_core::{Error as CoreError, VectorConfig, vector_meta};
+use kimmy_core::{DocId, Error as CoreError, Hlc, VectorConfig, VectorRecord, vector_meta};
 use tracing::info;
 
 use crate::error::{Result, StorageError};
@@ -105,6 +105,109 @@ impl crate::Engine {
             .filter(|c| c.vector.is_some() && !vector_meta::is_shadow(&c.name))
             .collect())
     }
+
+    // -----------------------------------------------------------------------
+    // Vector records
+    // -----------------------------------------------------------------------
+
+    /// Replace every chunk belonging to one source document.
+    ///
+    /// Writes the new chunks and removes any left over from a longer previous
+    /// version. Without that cleanup, shortening a document would leave its
+    /// tail chunks searchable forever — matches pointing at text the document
+    /// no longer contains.
+    pub fn put_vectors(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        records: &[VectorRecord],
+    ) -> Result<()> {
+        for record in records {
+            let id = VectorRecord::id(source, record.chunk);
+            let doc = bson::serialize_to_document(record)
+                .map_err(|e| StorageError::Corrupt(format!("encoding vector record: {e}")))?;
+            self.replace(shadow, &id, doc, true)?;
+        }
+
+        // Drop the tail of a previously longer document.
+        for existing in self.vector_chunk_numbers(shadow, source)? {
+            if !records.iter().any(|r| r.chunk == existing) {
+                self.delete(shadow, &VectorRecord::id(source, existing))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every vector belonging to one source document, in chunk order.
+    pub fn get_vectors(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+    ) -> Result<Vec<VectorRecord>> {
+        let key = source.to_string();
+        let mut out = Vec::new();
+        self.for_each_doc(shadow, |id, doc| {
+            if VectorRecord::parse_id(&id).is_some_and(|(s, _)| s == key) {
+                out.push(decode_vector(doc)?);
+            }
+            Ok(true)
+        })?;
+        out.sort_by_key(|r| r.chunk);
+        Ok(out)
+    }
+
+    /// Remove every vector belonging to one source document.
+    pub fn delete_vectors(&self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
+        let chunks = self.vector_chunk_numbers(shadow, source)?;
+        for chunk in &chunks {
+            self.delete(shadow, &VectorRecord::id(source, *chunk))?;
+        }
+        Ok(chunks.len())
+    }
+
+    /// Visit every stored vector. Used by search and by index rebuilds.
+    pub fn for_each_vector<F>(&self, shadow: &CollectionMeta, mut f: F) -> Result<()>
+    where
+        F: FnMut(VectorRecord) -> Result<bool>,
+    {
+        self.for_each_doc(shadow, |_, doc| f(decode_vector(doc)?))
+    }
+
+    /// Whether a document's vectors are older than the document itself.
+    ///
+    /// Returns `true` when there are no vectors at all, since a document that
+    /// has never been embedded also needs work.
+    pub fn vectors_are_stale(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        current: Hlc,
+    ) -> Result<bool> {
+        let records = self.get_vectors(shadow, source)?;
+        if records.is_empty() {
+            return Ok(true);
+        }
+        Ok(records.iter().any(|r| r.is_stale(current)))
+    }
+
+    fn vector_chunk_numbers(&self, shadow: &CollectionMeta, source: &DocId) -> Result<Vec<u32>> {
+        let key = source.to_string();
+        let mut out = Vec::new();
+        self.for_each_doc(shadow, |id, _| {
+            if let Some((s, chunk)) = VectorRecord::parse_id(&id)
+                && s == key
+            {
+                out.push(chunk);
+            }
+            Ok(true)
+        })?;
+        Ok(out)
+    }
+}
+
+fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {
+    bson::deserialize_from_document(doc)
+        .map_err(|e| StorageError::Corrupt(format!("decoding vector record: {e}")))
 }
 
 #[cfg(test)]
@@ -213,6 +316,158 @@ mod tests {
         let (engine, _dir) = engine();
         // The reserved `__` prefix is what protects the namespace.
         assert!(engine.create_collection("app", "__vectors").is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Vector records
+    // -----------------------------------------------------------------------
+
+    fn record(chunk: u32, hlc_ms: u64, text: &str) -> VectorRecord {
+        VectorRecord {
+            source: DocId::Int64(1),
+            chunk,
+            source_hlc: Hlc::new(hlc_ms, 0),
+            vector: vec![chunk as f32, 1.0],
+            text: text.into(),
+        }
+    }
+
+    /// An engine with vectors enabled, returning the shadow collection.
+    fn with_vectors() -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let (engine, dir) = engine();
+        engine.configure_vectors("app", "docs", config(2)).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        (engine, shadow, dir)
+    }
+
+    #[test]
+    fn vectors_round_trip_in_chunk_order() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        // Written out of order to prove the read sorts them.
+        let records = vec![record(1, 10, "second"), record(0, 10, "first")];
+        engine.put_vectors(&shadow, &source, &records).unwrap();
+
+        let read = engine.get_vectors(&shadow, &source).unwrap();
+        assert_eq!(read.len(), 2);
+        assert_eq!(read[0].chunk, 0);
+        assert_eq!(read[0].text, "first");
+        assert_eq!(read[1].text, "second");
+        assert_eq!(read[0].vector, vec![0.0, 1.0]);
+    }
+
+    #[test]
+    fn re_embedding_replaces_chunks_rather_than_accumulating() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+
+        engine.put_vectors(&shadow, &source, &[record(0, 10, "old")]).unwrap();
+        engine.put_vectors(&shadow, &source, &[record(0, 20, "new")]).unwrap();
+
+        let read = engine.get_vectors(&shadow, &source).unwrap();
+        assert_eq!(read.len(), 1, "the chunk should be replaced, not duplicated");
+        assert_eq!(read[0].text, "new");
+        assert_eq!(read[0].source_hlc, Hlc::new(20, 0));
+    }
+
+    #[test]
+    fn shortening_a_document_removes_its_orphaned_tail_chunks() {
+        // Otherwise the removed text stays searchable forever, and a hit points
+        // at content the document no longer contains.
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+
+        let long = vec![record(0, 10, "a"), record(1, 10, "b"), record(2, 10, "c")];
+        engine.put_vectors(&shadow, &source, &long).unwrap();
+        assert_eq!(engine.get_vectors(&shadow, &source).unwrap().len(), 3);
+
+        engine.put_vectors(&shadow, &source, &[record(0, 20, "a")]).unwrap();
+        let read = engine.get_vectors(&shadow, &source).unwrap();
+        assert_eq!(read.len(), 1, "chunks 1 and 2 should be gone");
+        assert_eq!(read[0].chunk, 0);
+    }
+
+    #[test]
+    fn vectors_are_scoped_to_their_source_document() {
+        let (engine, shadow, _dir) = with_vectors();
+        let a = DocId::Int64(1);
+        let b = DocId::Int64(2);
+
+        engine.put_vectors(&shadow, &a, &[record(0, 10, "from a")]).unwrap();
+        let mut for_b = record(0, 10, "from b");
+        for_b.source = b.clone();
+        engine.put_vectors(&shadow, &b, &[for_b]).unwrap();
+
+        assert_eq!(engine.get_vectors(&shadow, &a).unwrap()[0].text, "from a");
+        assert_eq!(engine.get_vectors(&shadow, &b).unwrap()[0].text, "from b");
+
+        // Deleting one must not touch the other.
+        assert_eq!(engine.delete_vectors(&shadow, &a).unwrap(), 1);
+        assert!(engine.get_vectors(&shadow, &a).unwrap().is_empty());
+        assert_eq!(engine.get_vectors(&shadow, &b).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn staleness_is_derived_from_the_document_version() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+
+        // Never embedded: work is needed.
+        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(10, 0)).unwrap());
+
+        engine.put_vectors(&shadow, &source, &[record(0, 10, "text")]).unwrap();
+        assert!(!engine.vectors_are_stale(&shadow, &source, Hlc::new(10, 0)).unwrap());
+        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(11, 0)).unwrap());
+    }
+
+    #[test]
+    fn one_stale_chunk_marks_the_document_stale() {
+        // A partial re-embed that failed halfway must not look complete.
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        engine
+            .put_vectors(&shadow, &source, &[record(0, 20, "fresh"), record(1, 10, "stale")])
+            .unwrap();
+        assert!(engine.vectors_are_stale(&shadow, &source, Hlc::new(20, 0)).unwrap());
+    }
+
+    #[test]
+    fn every_vector_can_be_visited_for_a_rebuild() {
+        let (engine, shadow, _dir) = with_vectors();
+        for i in 1..=3i64 {
+            let mut r = record(0, 10, "t");
+            r.source = DocId::Int64(i);
+            engine.put_vectors(&shadow, &DocId::Int64(i), &[r]).unwrap();
+        }
+
+        let mut seen = 0;
+        engine
+            .for_each_vector(&shadow, |_| {
+                seen += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn vectors_survive_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let source = DocId::Int64(1);
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("app", "docs").unwrap();
+            engine.configure_vectors("app", "docs", config(2)).unwrap();
+            let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+            engine.put_vectors(&shadow, &source, &[record(0, 10, "durable")]).unwrap();
+        }
+
+        let engine = Engine::open(&path).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let read = engine.get_vectors(&shadow, &source).unwrap();
+        assert_eq!(read[0].text, "durable");
+        assert_eq!(read[0].vector, vec![0.0, 1.0]);
     }
 
     #[test]
