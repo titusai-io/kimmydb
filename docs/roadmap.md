@@ -223,6 +223,26 @@ see it. Options, none yet chosen:
 2. Stamp replicated entries with local arrival time, losing origin ordering.
 3. Document it: cluster-wide streams are eventually complete, not ordered.
 
+### Uniqueness violation detection — committed for M4
+
+Unique indexes carry an `enforcement` mode. The `local` default enforces on the
+accepting node only; two nodes can each accept a conflicting write during a
+partition, and last-writer-wins would otherwise discard one **silently**.
+
+M4 must therefore detect violations at merge time and surface them:
+
+- a `uniqueViolation` change-stream event naming the index and the colliding ids
+- the losing document recorded rather than lost, so it can be reconciled
+- a metric, so the condition is visible without watching a stream
+
+This does not *prevent* the violation — that is provably impossible without
+coordination (see [ADR-020](decisions.md)) — but it converts silent corruption
+into an actionable event, which is most of the value.
+
+`coordinated` enforcement (value-ownership routing, real cluster-wide guarantee,
+CP for those writes) stays reserved and is refused at index-creation time until
+it exists.
+
 Also open: whether `drop_collection` should replicate as a tombstone (a
 partitioned peer could otherwise resurrect a dropped collection), and how to
 handle a node whose tombstones were collected while it was partitioned.

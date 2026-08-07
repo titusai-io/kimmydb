@@ -14,7 +14,7 @@ use kimmy_core::{CollectionId, DocId, Error as CoreError, keyenc, path};
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::error::{Result, StorageError};
-use crate::meta::{IndexField, IndexMeta};
+use crate::meta::{Enforcement, IndexField, IndexMeta};
 use crate::tables;
 
 /// Guard against a compound index over two array fields producing a
@@ -229,9 +229,33 @@ impl crate::Engine {
         unique: bool,
         name: Option<String>,
     ) -> Result<IndexMeta> {
+        self.create_index_with(db, collection, fields, unique, Enforcement::Local, name)
+    }
+
+    /// Create an index, choosing how far a unique constraint reaches.
+    ///
+    /// See [`Enforcement`]: `Coordinated` requires cluster machinery that does
+    /// not exist yet, so it is refused rather than silently downgraded to a
+    /// weaker guarantee than the caller asked for.
+    pub fn create_index_with(
+        &self,
+        db: &str,
+        collection: &str,
+        fields: Vec<IndexField>,
+        unique: bool,
+        enforcement: Enforcement,
+        name: Option<String>,
+    ) -> Result<IndexMeta> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
+            )));
+        }
+        if enforcement == Enforcement::Coordinated {
+            return Err(StorageError::Core(CoreError::UnsupportedOperator(
+                "coordinated unique enforcement requires clustering, which lands in M4; \
+                 use \"local\" enforcement, whose cross-node limits are documented"
+                    .into(),
             )));
         }
 
@@ -253,7 +277,7 @@ impl crate::Engine {
             }));
         }
 
-        let index = IndexMeta { id: meta.allocate_index_id(), name, fields, unique };
+        let index = IndexMeta { id: meta.allocate_index_id(), name, fields, unique, enforcement };
 
         let txn = self.db().begin_write()?;
 
@@ -348,7 +372,13 @@ mod tests {
     use crate::meta::IndexField;
 
     fn index(fields: Vec<IndexField>, unique: bool) -> IndexMeta {
-        IndexMeta { id: 0, name: IndexMeta::default_name(&fields), fields, unique }
+        IndexMeta {
+            id: 0,
+            name: IndexMeta::default_name(&fields),
+            fields,
+            unique,
+            enforcement: Enforcement::Local,
+        }
     }
 
     fn keys(idx: &IndexMeta, d: Document) -> Vec<Vec<u8>> {

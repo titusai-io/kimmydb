@@ -5,8 +5,8 @@
 //! able to read it directly when diagnosing a broken data directory is worth
 //! more than the space.
 
+pub use kimmy_core::{Enforcement, IndexField, IndexMeta};
 use kimmy_core::{Hlc, ids::CollectionId};
-pub use kimmy_core::{IndexField, IndexMeta};
 use serde::{Deserialize, Serialize};
 
 /// A database: purely a namespace for collections.
@@ -94,9 +94,20 @@ mod tests {
             name: "age_1".into(),
             fields: vec![IndexField::ascending("age")],
             unique: false,
+            enforcement: Default::default(),
         });
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CollectionMeta>(&text).unwrap(), m);
+    }
+
+    #[test]
+    fn index_metadata_written_before_enforcement_existed_defaults_to_local() {
+        // The field was added once the cross-node semantics were settled; older
+        // metadata must keep loading, and must not silently claim a stronger
+        // guarantee than it was created with.
+        let json = r#"{"id":0,"name":"email_1","fields":[{"path":"email"}],"unique":true}"#;
+        let index: IndexMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(index.enforcement, Enforcement::Local);
     }
 
     fn push_index(m: &mut CollectionMeta, path: &str) -> u32 {
@@ -106,6 +117,7 @@ mod tests {
             name: format!("{path}_1"),
             fields: vec![IndexField::ascending(path)],
             unique: false,
+            enforcement: Default::default(),
         });
         id
     }

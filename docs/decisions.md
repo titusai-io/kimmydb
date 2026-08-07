@@ -308,6 +308,56 @@ indexes land.
 
 ---
 
+## ADR-020 — Uniqueness reaches only as far as coordination does
+
+**Decision.** Unique indexes carry an explicit `enforcement` mode. `local` (the
+default) enforces on the accepting node and **detects** cross-node violations
+after merge. `coordinated` — real cluster-wide enforcement — is reserved and
+refused until M4.
+
+**Why this is not an implementation gap.** Uniqueness is a *global* invariant:
+deciding whether a write is legal requires knowing what every other node is
+concurrently doing. Bailis et al. (*Coordination Avoidance in Database
+Systems*, VLDB 2014) formalize this as **I-confluence** — an invariant is
+maintainable without coordination iff merging any two valid states yields a
+valid state. Uniqueness fails: node A holding `email=a@x.com` and node B
+holding `email=a@x.com` on a *different* document are each valid alone and
+invalid merged.
+
+So no merge function fixes this. During a partition each side must either
+accept the write (breaking uniqueness) or refuse it (breaking availability).
+There is no third option, and a leaderless design has already chosen
+availability.
+
+**`_id` is exempt, and that covers most of the demand.** Two nodes inserting
+the same `_id` collide on the same key, and last-writer-wins converges them to
+a single document — primary-key uniqueness holds by construction. The residue
+is that the losing insert's *content* is discarded silently, where a client
+might have expected a `409`. That is a lost-update problem, not a uniqueness
+one, but it shares the silent-failure smell and is documented as such.
+
+**Alternatives considered.**
+
+| | Guarantee | Cost |
+|---|---|---|
+| Drop unique indexes | — | Loses a genuinely useful single-node feature |
+| Detect after merge *(chosen default)* | None enforced; violations reported | Almost nothing |
+| Coordinate per value *(reserved)* | Real | Those writes become CP; needs value-ownership routing |
+| Consensus per write | Linearizable | A Raft/Paxos subsystem, plus latency on every constrained write |
+
+**Note on "leaderless".** Coordinated enforcement would route a value to the
+node owning `hash(value)`. That is per-key coordination, **not** a cluster
+leader — no elections, no primary, every node owns some slice. It stays
+compatible with the project's leaderless goal; what it costs is availability
+for that one value while its owner is unreachable.
+
+**Consequence.** The default is honest rather than convenient: a `local` unique
+index does less in a cluster than its name suggests, and says so. Making that
+a visible, per-index, opt-in decision is preferable to either silently weakening
+the guarantee or refusing the feature outright.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

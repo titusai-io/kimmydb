@@ -13,6 +13,44 @@ pub struct IndexMeta {
     pub fields: Vec<IndexField>,
     #[serde(default)]
     pub unique: bool,
+    /// How `unique` is enforced once the node has peers. Ignored when
+    /// `unique` is false.
+    #[serde(default)]
+    pub enforcement: Enforcement,
+}
+
+/// How far a unique constraint reaches.
+///
+/// Uniqueness is a *global* invariant — deciding whether a write is legal
+/// requires knowing what every other node is concurrently doing. It is
+/// provably not maintainable without coordination (Bailis et al.,
+/// "Coordination Avoidance in Database Systems", VLDB 2014: uniqueness is not
+/// I-confluent). So a leaderless, always-available cluster cannot both accept
+/// writes on every node during a partition *and* guarantee uniqueness.
+///
+/// Rather than pretend otherwise, the reach is an explicit per-index choice.
+///
+/// Note that `_id` needs none of this: two nodes inserting the same `_id`
+/// collide on the same key and last-writer-wins converges them to a single
+/// document, so primary-key uniqueness holds by construction.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Enforcement {
+    /// Enforced on the node that accepts the write.
+    ///
+    /// Two nodes can still accept conflicting writes during a partition. Those
+    /// violations are **detected after merge and reported**, not prevented —
+    /// which is a real limitation, but a visible one rather than silent
+    /// corruption. This is the default because it preserves availability.
+    #[default]
+    Local,
+    /// Enforced cluster-wide by reserving the value at the node that owns its
+    /// hash before committing.
+    ///
+    /// Still leaderless — per-key coordination is not a cluster leader — but
+    /// writes to this index become unavailable while its owning node is
+    /// unreachable. Planned for M4; rejected at index-creation time until then.
+    Coordinated,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -19,6 +19,6 @@ pub use cmp::canonical_cmp;
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DocId, NodeId};
-pub use index_meta::{IndexField, IndexMeta};
+pub use index_meta::{Enforcement, IndexField, IndexMeta};
 pub use oplog::{OpKind, OplogEntry, ResumeToken};
 pub use record::DocRecord;
