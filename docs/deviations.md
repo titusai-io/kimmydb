@@ -203,11 +203,40 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
 | Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
-| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only | M5 |
+| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | No performance regression baseline exists — including the 2000-vector index threshold, which is a guess, not a measurement | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
+
+---
+
+## 🟢 Deliberate departures in M3
+
+**`kimmy-mcp` depends on `kimmy-api`, not the reverse.** The crate graph
+carried a placeholder arrow from M0 pointing the other way. Inverted so both
+edges share one executor with the authorization check inside it; the
+alternative was duplicating Extended JSON conversion, the query planner path,
+and vector search dispatch into a second crate. [ADR-024](decisions.md).
+
+**Tools are not filtered by grant.** A read-only token sees every write tool and
+is refused when it calls one. Hiding is not an enforcement boundary, and a
+filtered list makes refusals unexplainable. [ADR-025](decisions.md).
+
+**`rmcp`'s `Host` allow-list is off by default.** It is DNS-rebinding
+protection for unauthenticated local servers; `/mcp` verifies a bearer token
+before the transport runs. The SDK default would have rejected every client
+connecting by a real hostname. Operators can re-enable it via
+`server.mcp_allowed_hosts`. [ADR-026](decisions.md).
+
+**MCP resources exclude `__kimmy` and `.__vectors`.** A resource is material an
+agent attaches to its context, and the user store is a column of password
+hashes. Tools still reach them under the ordinary access check, so this is a
+default rather than a control. [ADR-027](decisions.md).
+
+**Sessions are disabled.** Stateless, so a token that expires mid-conversation
+stops working rather than riding an already-open session. The cost is that a
+long-running agent must re-authenticate.
 
 ---
 

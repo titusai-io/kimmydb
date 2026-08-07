@@ -430,6 +430,116 @@ in [Testing](testing.md).
 
 ---
 
+## ADR-024 — MCP shares the API's execution path, not just its process
+
+**Decision.** `kimmy-mcp` depends on `kimmy-api`. Both edges call one module,
+`kimmy_api::exec`, which performs the authorization check *inside* each
+operation rather than beside it. `kimmyd` merges the two routers onto one
+listener.
+
+**What was planned.** The crate graph had the arrow the other way — `kimmy-api`
+depending on `kimmy-mcp` — from a placeholder written at M0 before either
+existed.
+
+**Why it was inverted.** M3's stated constraint is that "there must not be a
+second, weaker enforcement point." In-process co-location does not achieve that
+on its own; it only makes it *possible*. Two crates sharing an `Engine` can
+still drift, because each writes its own `auth.require(...)` before touching it,
+and a tool added later can simply omit one. Sharing the executor makes the
+check unskippable: there is no path to the engine that does not pass through a
+function that already performed it.
+
+Inverting the dependency was the cheap way to get that. The alternative —
+`kimmy-api` depending on `kimmy-mcp` — would have required duplicating Extended
+JSON conversion, the index-planning query executor, and the vector search
+dispatch into the MCP crate, which is three opportunities for exactly the drift
+the milestone exists to prevent.
+
+**Cost.** `kimmy-mcp` now pulls in axum and `ApiError`. The layering diagram
+gains an edge between two crates that are conceptually peers. Worth it: the
+alternative was three copies of logic whose divergence would be silent.
+
+**Consequence.** The REST routes became thin adapters in the same change. That
+was not the goal, but it is the check that the extraction was real — if the
+executor were shaped around MCP, the HTTP handlers would not have collapsed into
+one-liners over it.
+
+---
+
+## ADR-025 — Tools are always advertised; the role decides what runs
+
+**Decision.** Every tool appears in `tools/list` for every authenticated
+caller. A read-only token sees `insert`, `delete`, and `create_index`, and gets
+an authorization error if it calls one.
+
+**Alternative rejected.** Filtering the tool list by the caller's grants.
+
+**Why.** Hiding is not a boundary — the enforcement is the `Principal::can`
+check, which runs either way — so filtering would buy no safety. It would cost
+two things. An agent that cannot see a tool cannot be told *why* it was refused,
+so "you lack write access to this collection" degrades into "no such tool",
+which is not actionable. And a filtered list makes the surface depend on the
+token, so two agents against the same server would disagree about what the
+server is.
+
+**Consequence.** The server's `instructions` say this outright, so a model reads
+the refusal as a permission fact about itself rather than a malfunction.
+
+---
+
+## ADR-026 — No `Host` allow-list on `/mcp` by default
+
+**Decision.** `server.mcp_allowed_hosts` defaults to empty, which disables the
+`Host` header check that `rmcp` enables by default.
+
+**Why.** The check is DNS-rebinding protection, designed for an MCP server
+running on a developer's laptop with no authentication — where a malicious web
+page can make the victim's browser issue requests the server will honour.
+Neither half applies here. KimmyDB binds to a network address by design, and
+`/mcp` requires a bearer token that is verified by axum middleware *before*
+`rmcp` sees the request. A rebinding attack cannot forge that token.
+
+Keeping `rmcp`'s default would have rejected every client that reached the
+server by its real hostname — which is the normal deployment — and the failure
+mode is an opaque refusal that looks like a bug rather than a policy.
+
+**Cost.** One layer of defence in depth is off by default. It is a layer that
+protects against an attack the bearer token already stops, and operators who
+want it can list their hostnames.
+
+**Consequence.** The bearer-token check must stay ahead of the MCP transport. If
+`/mcp` were ever mounted without its middleware, this decision would become
+wrong — which is why `principal()` fails closed and logs rather than defaulting
+to an anonymous caller.
+
+---
+
+## ADR-027 — MCP resources exclude KimmyDB's own internals
+
+**Decision.** `resources/list` omits the `__kimmy` system database and any
+`__`-prefixed or `.__vectors` collection. The `find` tool does not: a superuser
+can read them, exactly as through the REST API.
+
+**Why the two differ.** They are different acts. A tool call is a caller asking
+a specific question. A resource is *material an agent attaches to its context* —
+and the highest-value thing in `__kimmy.__users` is a column of Argon2id
+password hashes. Offering those for attachment is wrong regardless of whether
+the caller is authorized to read them, because the authorization answers "may
+this principal see it", not "should this be pasted into a language model".
+
+Shadow collections are excluded for a duller reason: they hold float arrays that
+would consume an enormous amount of context and describe nothing the source
+collection does not.
+
+**Not a security control.** It is a default. The access decision remains
+`Principal::can`, in one place, as everywhere else.
+
+**Found by driving the server.** The first `resources/list` against a real node
+returned `kimmy://__kimmy/__users`. No test would have caught it, because no
+test would have thought to look.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

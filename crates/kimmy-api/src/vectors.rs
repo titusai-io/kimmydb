@@ -78,14 +78,14 @@ pub async fn disable_vectors(
 #[serde(default)]
 pub struct SearchRequest {
     /// Query text. Embedded server-side, so it needs an embedding provider.
-    query: Option<String>,
+    pub query: Option<String>,
     /// A pre-computed query vector. Required when the provider is `byo`.
-    vector: Option<Vec<f32>>,
+    pub vector: Option<Vec<f32>>,
     /// Restrict results to documents matching this filter.
-    filter: Option<Value>,
-    k: Option<usize>,
+    pub filter: Option<Value>,
+    pub k: Option<usize>,
     /// Chunks per document allowed into the results.
-    per_document: Option<usize>,
+    pub per_document: Option<usize>,
 }
 
 const DEFAULT_K: usize = 10;
@@ -97,12 +97,27 @@ pub async fn vector_search(
     Path((db, coll)): Path<(String, String)>,
     Json(body): Json<SearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (shadow, config, options) = prepare(&state, &auth, &db, &coll, &body)?;
-    let query = resolve_query_vector(&config, &body).await?;
-    let allowed = allowed_ids(&state, &auth, &db, &coll, body.filter.as_ref())?;
+    Ok(Json(run_vector_search(&state, &auth, &db, &coll, &body).await?))
+}
 
-    let hits = knn(&state, &shadow, &config, &query, &options, allowed.as_ref())?;
-    Ok(Json(render(&hits)))
+/// Vector search, independent of the wire format that asked for it.
+///
+/// Shared with the MCP `vector_search` tool so the two cannot diverge — in
+/// particular on the `Search`-then-`Read` authorization pair that filtering
+/// requires.
+pub async fn run_vector_search(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    body: &SearchRequest,
+) -> Result<Value, ApiError> {
+    let (shadow, config, options) = prepare(state, auth, db, coll, body)?;
+    let query = resolve_query_vector(&config, body).await?;
+    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
+
+    let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
+    Ok(render(&hits))
 }
 
 /// k-NN by whichever path the index cache selects.
@@ -130,7 +145,18 @@ pub async fn hybrid_search(
     Path((db, coll)): Path<(String, String)>,
     Json(body): Json<SearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let (shadow, config, options) = prepare(&state, &auth, &db, &coll, &body)?;
+    Ok(Json(run_hybrid_search(&state, &auth, &db, &coll, &body).await?))
+}
+
+/// Hybrid search, independent of the wire format that asked for it.
+pub async fn run_hybrid_search(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    body: &SearchRequest,
+) -> Result<Value, ApiError> {
+    let (shadow, config, options) = prepare(state, auth, db, coll, body)?;
 
     // Hybrid needs the *text* for the lexical half; a bare vector cannot
     // produce one, so the ambiguity is refused rather than silently degrading
@@ -142,19 +168,19 @@ pub async fn hybrid_search(
         ));
     };
 
-    let query = resolve_query_vector(&config, &body).await?;
-    let allowed = allowed_ids(&state, &auth, &db, &coll, body.filter.as_ref())?;
+    let query = resolve_query_vector(&config, body).await?;
+    let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
     // Each half is retrieved wider than k, so fusion has enough to work with:
     // a document ranked modestly by both should be able to beat one ranked
     // first by only one.
     let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
-    let dense = knn(&state, &shadow, &config, &query, &wide, allowed.as_ref())?;
+    let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref())?;
     let lexical =
         search::keyword_search(&state.engine, &shadow, &text, &wide).map_err(vector_error)?;
 
     let fused = search::reciprocal_rank_fusion(&[dense, lexical], options.k);
-    Ok(Json(render(&fused)))
+    Ok(render(&fused))
 }
 
 /// Shared setup: authorize, resolve the shadow collection, read the options.

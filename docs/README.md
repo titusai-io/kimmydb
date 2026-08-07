@@ -19,7 +19,7 @@ around three things that are usually awkward to have together:
 the one structural idea everything else follows from.
 
 **Trying to use it?** [HTTP API](http-api.md), then [Query Language](query-language.md)
-and [Vectors](vectors.md).
+[Vectors](vectors.md), and — if you are wiring up an agent — [MCP](mcp.md).
 
 **Running it?** [Operations](operations.md), then [Security](security.md).
 
@@ -47,6 +47,7 @@ graph TD
     USE --> API["HTTP API<br/>endpoint reference"]
     USE --> QL["Query Language<br/>filters · updates · sort · projection"]
     USE --> CS["Change Streams<br/>subscribing · resuming"]
+    USE --> MCP["MCP<br/>agent tools · resources · schema inference"]
 
     INT --> STO["Storage<br/>on-disk layout · codecs"]
     INT --> KE["Key Encoding<br/>order-preserving bytes"]
@@ -74,6 +75,7 @@ graph TD
 | [Time & Conflicts](time-and-conflicts.md) | Hybrid logical clocks, last-writer-wins, the consistency model |
 | [Oplog](oplog.md) | The shared log, its three consumers, retention |
 | [Vectors](vectors.md) | Auto-embeddings, providers, chunking, the two search paths |
+| [MCP](mcp.md) | The in-process agent surface: tools, resources, and how authorization is shared with REST |
 | [Change Streams](change-streams.md) | The replay/live splice, resume tokens, lag recovery |
 | [Query Language](query-language.md) | Filter and update operators, array semantics, Mongo compatibility |
 | [HTTP API](http-api.md) | Endpoint reference, request and response shapes, status codes |
@@ -107,7 +109,7 @@ running server, not merely compiled.
 | Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
 | Vector search & auto-embeddings | ✅ Working | Shadow collections, oplog-driven worker, HNSW above 2000 vectors |
 | Hybrid search | ✅ Working | Dense + lexical, fused by reciprocal rank fusion |
-| Built-in MCP server | 📋 Planned (M3) | Streamable HTTP, RBAC-gated tools |
+| Built-in MCP server | ✅ | Streamable HTTP at `/mcp`, RBAC-gated tools, sampled schema inference |
 | Gossip clustering | 📋 Planned (M4) | SWIM membership, oplog anti-entropy |
 
 The replication *primitives* exist and are tested — `apply_remote` resolves
@@ -175,7 +177,7 @@ kimmydb/
 │   ├── kimmy-api/       axum router, WebSocket, JSON boundary
 │   ├── kimmy-cluster/   discovery (membership lands in M4)
 │   ├── kimmy-vector/    embeddings, HNSW, index cache, search
-│   ├── kimmy-mcp/       MCP server (M3)
+│   ├── kimmy-mcp/       MCP server
 │   ├── kimmyd/          the server binary
 │   └── kimmy-cli/       terminal client (M5)
 ├── docs/                this directory

@@ -70,7 +70,7 @@ just another change-stream subscriber, so "keep vectors up to date" reduces to
 graph TB
     subgraph EDGE["Edge — speaks JSON"]
         API["kimmy-api<br/>axum router, WebSocket, Extended JSON"]
-        MCP["kimmy-mcp<br/>📋 M3"]
+        MCP["kimmy-mcp<br/>rmcp tools · resources"]
     end
 
     subgraph POLICY["Policy"]
@@ -93,7 +93,7 @@ graph TB
     CORE["kimmy-core — Hlc · Stamp · DocId · DocRecord · OplogEntry · keyenc · cmp<br/>(no I/O)"]
 
     API --> AUTH
-    MCP --> AUTH
+    MCP --> API
     AUTH --> QRY
     API --> QRY
     QRY --> STO
@@ -112,10 +112,10 @@ graph TB
 | `kimmy-storage` | redb tables, document CRUD, oplog, change streams | Know about HTTP, users, or query syntax |
 | `kimmy-query` | Parse and evaluate filters, updates, sorts, projections | Touch storage |
 | `kimmy-auth` | Password hashing, tokens, the authorization decision | Know about HTTP |
-| `kimmy-api` | Routing, JSON⇄BSON, WebSocket, status codes | Contain business logic |
+| `kimmy-api` | Routing, JSON⇄BSON, WebSocket, status codes, and the shared executor both edges call | Contain business logic beyond composing storage and query |
 | `kimmy-cluster` | Peer discovery; membership and replication in M4 | — |
 | `kimmy-vector` | Embedding providers, the worker, HNSW, index selection, search | Sit on the write path |
-| `kimmy-mcp` | MCP tools and resources (M3) | Re-implement authorization |
+| `kimmy-mcp` | MCP tools and resources | Re-implement authorization — it calls `kimmy_api::exec`, where the check lives |
 | `kimmyd` | Configuration, wiring, lifecycle | — |
 | `kimmy-cli` | Terminal client (M5) | — |
 

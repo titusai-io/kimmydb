@@ -45,8 +45,20 @@ pub async fn run(config: Config) -> Result<()> {
     let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
 
-    let app = kimmy_api::build(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
-        .context("building the API router")?;
+    let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
+        .context("building the API state")?;
+
+    // MCP shares the state rather than being handed its own, so an agent tool
+    // and the REST route beside it reach the same engine through the same
+    // authorization check. See kimmy-mcp's crate documentation.
+    let mut app = kimmy_api::router(Arc::clone(&state));
+    if config.server.mcp {
+        app = app.merge(kimmy_mcp::mcp_router(
+            Arc::clone(&state),
+            config.server.mcp_allowed_hosts.clone(),
+        ));
+        info!("serving MCP at /mcp");
+    }
 
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns

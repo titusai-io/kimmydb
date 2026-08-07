@@ -10,8 +10,10 @@
 #![allow(dead_code)]
 
 pub mod error;
+pub mod exec;
 pub mod json;
 pub mod routes;
+pub mod schema;
 pub mod state;
 pub mod users;
 pub mod vectors;
@@ -27,14 +29,32 @@ use kimmy_vector::IndexCache;
 pub use error::ApiError;
 pub use state::{AppState, SharedState};
 
+/// Assemble the shared server state.
+///
+/// Separate from [`build`] because the MCP server mounts onto the same router
+/// and must share *this* state — the same engine handle and the same vector
+/// index cache. Handing it a second `AppState` would give the two edges
+/// different caches and, worse, make it possible for them to differ in what
+/// they consider authenticated.
+pub fn state(
+    engine: Arc<Engine>,
+    tokens: TokenIssuer,
+    insecure_no_auth: bool,
+) -> Result<SharedState, kimmy_auth::AuthError> {
+    let users = UserStore::open(&engine)?;
+    Ok(Arc::new(AppState { engine, users, tokens, vectors: IndexCache::new(), insecure_no_auth }))
+}
+
+/// Build the HTTP router for an existing state.
+pub fn router(state: SharedState) -> Router {
+    routes::router(state)
+}
+
 /// Build the application router.
 pub fn build(
     engine: Arc<Engine>,
     tokens: TokenIssuer,
     insecure_no_auth: bool,
 ) -> Result<Router, kimmy_auth::AuthError> {
-    let users = UserStore::open(&engine)?;
-    let state: SharedState =
-        Arc::new(AppState { engine, users, tokens, vectors: IndexCache::new(), insecure_no_auth });
-    Ok(routes::router(state))
+    Ok(routes::router(state(engine, tokens, insecure_no_auth)?))
 }

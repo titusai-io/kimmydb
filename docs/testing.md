@@ -9,17 +9,18 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-448 tests passing · 0 failures · clippy clean at -D warnings
+480 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 98 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 107 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage |
+| `kimmy-storage` | 108 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 41 | 20 unit (JSON boundary, errors) + 21 end-to-end over a real socket |
+| `kimmy-api` | 52 | 31 unit (JSON boundary, errors, schema inference) + 21 end-to-end over a real socket |
+| `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 14 | Config layering and validation |
 | `kimmy-cluster` | 5 | Discovery string parsing |
 
@@ -56,7 +57,7 @@ graph TB
 
 ## The load-bearing invariants
 
-These six carry disproportionate weight. Anything that breaks one produces
+These seven carry disproportionate weight. Anything that breaks one produces
 wrong answers rather than crashes.
 
 ### 1. Key encoding order
@@ -148,6 +149,40 @@ Score equality is asserted exactly rather than within a tolerance, and that is
 deliberate: an approximate *ranking* is the design, an approximate *score* would
 mean the graph's distances had leaked into the result.
 
+### 7. Every edge enforces the same authorization
+
+```
+mcp_tool(principal, op)  denied  ⟺  rest_route(principal, op)  denied
+```
+
+Two edges now reach the same engine — the REST router and the MCP server — and
+a caller cannot tell which one a given deployment exposes. If they disagree, an
+agent tool is a privilege escalation path around the API's grants, and nothing
+in the response would say so.
+
+The structural defence is that both call `kimmy_api::exec`, which checks
+*inside* each operation ([ADR-024](decisions.md)). The tests exist because
+structure is an argument, not a proof:
+
+- `mcp_requires_a_token` — rejection comes from the transport, before any tool
+  runs, so a new tool cannot forget
+- `a_read_only_token_can_read_but_not_write` — and asserts the collection is
+  **unchanged afterwards**, not merely that an error was returned
+- `grants_are_scoped_per_collection` — a grant on one collection does not reach
+  its neighbour
+- `search_can_be_granted_without_read` — `search` alone permits `vector_search`
+  and refuses `find`; the action split has to survive both edges or it means
+  nothing
+- `listing_hides_what_the_caller_cannot_read` — enumeration does not leak
+  existence
+- `reading_a_resource_the_caller_cannot_reach_is_refused` — a URI can be
+  guessed, so the read itself checks rather than relying on the filtered list
+- `the_user_store_is_never_offered_as_a_resource` — even to a superuser
+
+The last one is a different kind of invariant from the rest: not "may this
+principal", but "should this ever be handed to a language model as context".
+See [ADR-027](decisions.md).
+
 ---
 
 ## Mutation testing
@@ -198,6 +233,8 @@ Worth recording, because each one shows the test doing its job:
 | `$elemMatch` scalar form did not parse | `{$elemMatch: {$gt: 5}}` errored on arrays of numbers | `elem_match_works_on_arrays_of_scalars` |
 | Intersecting both ends of a range on a multikey index | **Wrong results.** `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` — different array elements satisfy each bound — but the intersected key range excluded it | the two-sided-range proptest generator |
 | `anndists::DistDot` asserts `1 - dot >= 0` | **Process abort.** Valid only for unit vectors; any real embedding would have crashed the server mid-search | exercising every metric against the index rather than assuming they all worked |
+| Schema inference counted array elements, not documents | `presence` reported 2.0 — a fraction above 1.0, which is meaningless — for any array field | driving `describe_collection` against a running server; **no test looked, because nobody thought to** |
+| MCP published `kimmy://__kimmy/__users` as a resource | The password-hash collection offered to an agent as attachable context | the first `resources/list` against a real node |
 
 In the first two cases the test encoded the *intended* invariant and the
 implementation was wrong — which is the right way round.
@@ -224,6 +261,16 @@ manually and are recorded so they can be repeated:
 | RBAC for a scoped analyst | ✅ read allowed; write, DDL, user admin all 403 |
 | Restart durability | ✅ data, users, node identity all survived |
 | `docker stop` | ✅ exit 0 in ~20 ms |
+| MCP `initialize`, `tools/list`, `tools/call` over JSON-RPC | ✅ |
+| MCP with no token | ✅ 401 from the transport |
+| MCP RBAC for a real scoped user | ✅ read allowed; write, cross-collection read, user-store read, and DDL all refused |
+| `resources/list` as superuser | ✅ user data only — no `__kimmy`, no shadow collections |
+| `--no-mcp` | ✅ `/mcp` 404s, REST unaffected |
+
+The two M3 bugs in the table above were both found here rather than by the
+suite, which is the argument for keeping this section: the failures a test
+suite misses are the ones nobody thought to look for, and looking is what
+driving a real server is.
 
 A minimal WebSocket client was written for this (`scratchpad/wsclient.py`) since
 none was installed — worth keeping for future manual verification.

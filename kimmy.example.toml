@@ -9,6 +9,21 @@
 # Address for HTTP, WebSocket change streams, and the MCP endpoint.
 bind = "0.0.0.0:7878"
 
+# Serve the MCP endpoint at /mcp, for AI agents.
+#
+# Every MCP tool call runs as the authenticated principal, through the same
+# authorization check as the REST routes — a read-only token calling a write
+# tool is denied. Turning this off removes surface area; it does not remove a
+# privilege, because MCP never had one of its own.
+mcp = true
+
+# Host header values /mcp will accept. Empty accepts any.
+#
+# DNS-rebinding protection, off by default because /mcp requires a bearer token
+# that a rebinding attack cannot forge. If you set it, list every name clients
+# actually connect by — anything else is refused.
+mcp_allowed_hosts = []
+
 [storage]
 # Holds the redb database file and the persistent node identity. Back this up,
 # and never share it between two running nodes.

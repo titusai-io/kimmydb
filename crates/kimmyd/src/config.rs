@@ -27,6 +27,21 @@ pub struct Config {
 pub struct ServerConfig {
     /// Address the HTTP/WebSocket/MCP listener binds to.
     pub bind: SocketAddr,
+    /// Serve the MCP endpoint at `/mcp`.
+    ///
+    /// On by default. It is not a privilege escalation — every tool call runs
+    /// through the same authorization as the REST routes — so the toggle exists
+    /// for operators who want the surface area gone, not because leaving it on
+    /// grants anything a token did not already have.
+    pub mcp: bool,
+    /// `Host` values the MCP endpoint will accept. Empty means accept any.
+    ///
+    /// This is DNS-rebinding protection, and it is off by default because the
+    /// attack it stops does not apply here: `/mcp` requires a bearer token,
+    /// checked before the MCP transport runs, and a rebinding attack cannot
+    /// forge one. Set it if you want defence in depth — but set it to every
+    /// name clients actually use, or they will be refused.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +109,11 @@ pub struct LogConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { bind: "0.0.0.0:7878".parse().expect("valid literal") }
+        Self {
+            bind: "0.0.0.0:7878".parse().expect("valid literal"),
+            mcp: true,
+            mcp_allowed_hosts: Vec::new(),
+        }
     }
 }
 
@@ -206,10 +225,11 @@ impl Config {
             self.cluster.seeds.iter().map(SeedSource::describe).collect::<Vec<_>>().join(", ")
         };
         format!(
-            "bind={} data_dir={} auth={} cluster={} seeds=[{}] log={}/{:?}",
+            "bind={} data_dir={} auth={} mcp={} cluster={} seeds=[{}] log={}/{:?}",
             self.server.bind,
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
+            if self.server.mcp { "enabled" } else { "off" },
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
             self.log.level,
