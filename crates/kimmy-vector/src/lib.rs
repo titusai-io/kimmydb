@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod error;
+pub mod index;
 #[cfg(feature = "local-embeddings")]
 pub mod local;
 pub mod provider;
@@ -17,6 +18,7 @@ pub mod search;
 pub mod worker;
 
 pub use error::{Result, VectorError};
+pub use index::HnswIndex;
 pub use provider::{EmbeddingProvider, build};
 pub use search::{Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search};
 pub use worker::{EmbeddingWorker, Outcome};

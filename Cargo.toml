@@ -39,7 +39,6 @@ http-body-util = "0.1"
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-tokio-util = "0.7"
 futures = "0.3"
 async-trait = "0.1"
 
@@ -60,7 +59,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4", "v7", "serde"] }
-bytes = "1"
 parking_lot = "0.12"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"

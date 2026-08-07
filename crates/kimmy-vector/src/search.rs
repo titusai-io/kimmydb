@@ -79,11 +79,11 @@ pub fn vector_search(
         Ok(true)
     })?;
 
-    Ok(rank(scored, options))
+    Ok(rank_hits(scored, options))
 }
 
 /// Keep the best hits, capped per document, then truncated to `k`.
-fn rank(mut hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
+pub(crate) fn rank_hits(mut hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
     // Descending by score. `total_cmp` rather than `partial_cmp`: a NaN would
     // otherwise make the comparator inconsistent and the sort order undefined.
     hits.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -164,7 +164,7 @@ pub fn keyword_search(
         Ok(true)
     })?;
 
-    Ok(rank(scored, options))
+    Ok(rank_hits(scored, options))
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -396,7 +396,7 @@ mod tests {
             Hit { id: DocId::Int64(1), score: f32::NAN, chunk: 0, text: String::new() },
             Hit { id: DocId::Int64(2), score: 0.5, chunk: 0, text: String::new() },
         ];
-        let out = rank(hits, &SearchOptions::default());
+        let out = rank_hits(hits, &SearchOptions::default());
         assert_eq!(out.len(), 2, "a NaN must not drop results or panic");
     }
 }

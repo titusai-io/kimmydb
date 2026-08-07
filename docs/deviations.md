@@ -17,26 +17,47 @@ Status meanings:
 
 ---
 
-## 🔴 HNSW not implemented; search is exact
+## 🟢 HNSW implemented (was an open drift)
 
-**Requested.** During planning the choice was *"HNSW from the start"*
-over *"flat first, HNSW behind a trait"*.
+**Requested.** During planning the choice was *"HNSW from the start"*. It was
+then deferred three times across sessions, each time to land something else
+end to end — no single decision, which is exactly how this kind of drift
+happens.
 
-**Built.** Exact search: every stored vector is scored, best `k` kept.
+**Now built.** `HnswIndex` over `hnsw_rs`, with recall measured against the
+exact path rather than assumed: the tests assert ≥ 90% recall at k=10 and that
+the nearest neighbour agrees with an exact scan exactly.
 
-**Why it drifted.** Deferred three times across separate sessions, each time to
-land something else end to end. No single decision — which is exactly how this
-kind of drift happens.
+**Two findings from building it:**
 
-**Consequence.** O(n) per query. Fine into the low tens of thousands of
-vectors; degrades linearly past that. No recall loss, and no index to keep
-consistent.
+- The crate the roadmap originally named, `hnswlib-rs`, **requires nightly
+  Rust** — its `corenn-kernels` dependency uses `#![feature(f16)]`. Naming it
+  without checking was my error. `hnsw_rs` builds on stable.
+- **The `Dot` metric has no approximate index.** `anndists::DistDot` computes
+  `1 - dot` and *asserts the result is non-negative*, which only holds for
+  unit-length vectors; a real embedding would abort the process. Dot-product
+  collections use the exact scan. Normalizing on the way in would make it work
+  but would silently change what a dot-product search means.
 
-**To close.** `VectorIndex` trait with an HNSW implementation, snapshot
-persistence, tombstoned deletes, and recall measured against the exact path
-(which is a genuinely useful oracle — the one real benefit of the ordering).
+**Still open:** see *HNSW is built but not yet wired into search* below.
 
-**Tracked as** task 18.
+---
+
+## 🔴 HNSW is built but not yet wired into search
+
+The index exists and is tested, but `vector_search` still runs the exact scan.
+Nothing chooses the approximate path.
+
+**Why.** Wiring it needs a cache-and-invalidate policy: the graph is built from
+a snapshot and does not track later writes, so something must decide when to
+rebuild. `needs_rebuild` reports drift, but no component owns that decision
+yet. Landing a half-considered policy would be worse than the current honest
+gap — a stale index silently returns wrong results.
+
+**To close.** A per-collection index cache with an explicit rebuild trigger,
+plus on-disk snapshot persistence so a restart does not rebuild from scratch.
+
+**Consequence today.** Search remains O(n).
 
 ---
 
