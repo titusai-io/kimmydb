@@ -1,7 +1,18 @@
 //! Embeddings and vector search for KimmyDB.
 //!
-//! Pluggable embedding providers, the oplog-driven embedding worker, and the
-//! HNSW index behind the shadow `{collection}.__vectors` collections.
-//! Landing in M2.
+//! Providers turn text into vectors; the embedding worker keeps them in sync
+//! with documents by consuming the oplog; the index makes them searchable.
+//!
+//! The provider is the only part that reaches outside the process, which is
+//! why embedding runs off the write path — a write must never block on a
+//! remote call or on model inference.
 
 #![allow(dead_code)]
+
+pub mod error;
+#[cfg(feature = "local-embeddings")]
+pub mod local;
+pub mod provider;
+
+pub use error::{Result, VectorError};
+pub use provider::{EmbeddingProvider, build};

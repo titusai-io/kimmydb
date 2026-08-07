@@ -11,11 +11,29 @@ description = "Embedding providers and vector indexing for KimmyDB"
 kimmy-core.workspace = true
 kimmy-storage.workspace = true
 bson.workspace = true
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde.workspace = true
+serde_json.workspace = true
+# Optional: only compiled with the `local-embeddings` feature.
+# Optional: only compiled with the `local-embeddings` feature.
+#
+# default-features = false is load-bearing. The defaults pull native-tls
+# (OpenSSL) on top of ONNX Runtime, so a build needs libssl-dev as well; the
+# rustls variants avoid that. `image-models` is dropped because this is a text
+# embedding pipeline.
+fastembed = { version = "5", default-features = false, features = [
+    "ort-download-binaries-rustls-tls",
+    "hf-hub-rustls-tls",
+], optional = true }
 thiserror.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+
+[features]
+# In-process ONNX embedding. Off by default: it pulls native ONNX Runtime
+# binaries, undoing the pure-Rust property behind ADR-001 and ADR-016.
+local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
 
 [dev-dependencies]
 tempfile.workspace = true
