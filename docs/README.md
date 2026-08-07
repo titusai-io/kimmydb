@@ -23,8 +23,10 @@ the one structural idea everything else follows from.
 **Running it?** [Operations](operations.md), then [Security](security.md).
 
 **Building on it or continuing development?** [Roadmap](roadmap.md) for what's
-planned and why, [Decisions](decisions.md) for what's already settled, and
-[Testing](testing.md) for the invariants that must not break.
+planned and why, [Decisions](decisions.md) for what's already settled,
+[Testing](testing.md) for the invariants that must not break, and
+**[Deviations](deviations.md)** for where the implementation differs from what
+was asked for — the debts, in one place.
 
 ---
 
@@ -56,6 +58,7 @@ graph TD
     DEV --> RM["Roadmap<br/>milestones and planned design"]
     DEV --> DEC["Decisions<br/>what was chosen and why"]
     DEV --> TST["Testing<br/>invariants and how they are checked"]
+    DEV --> DEV2["Deviations<br/>drifts and deferrals, in one place"]
 ```
 
 | Document | What it covers |
@@ -74,6 +77,7 @@ graph TD
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
+| [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
 
 ---
 
