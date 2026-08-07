@@ -32,6 +32,8 @@ Default port **7878**.
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
+| `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
+| `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
 
 ---
@@ -182,6 +184,36 @@ Grant semantics: [Security](security.md).
 
 ---
 
+## Indexes
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/indexes -H "$A" -d '{
+  "fields": [ { "path": "item" }, { "path": "qty", "descending": true } ],
+  "unique": false,
+  "name":   "item_qty"
+}'
+
+curl          localhost:7878/v1/db/shop/coll/orders/indexes -H "$A"
+curl -XDELETE localhost:7878/v1/db/shop/coll/orders/indexes/item_qty -H "$A"
+```
+
+`fields` is an **array**, not a `{field: 1}` object: field order decides which
+queries a compound index can answer, and JSON object key order is not something
+a client can rely on.
+
+A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
+`"enforcement": "coordinated"` returns **501** until clustering lands — a
+`local` unique index is a single-node guarantee. See [Indexes](indexes.md).
+
+Add `"explain": true` to `find` or `count` to see whether an index was used:
+
+```json
+{ "explain": { "strategy": "index", "index": "qty_1", "indexFieldsUsed": 1,
+               "documentsExamined": 10, "documentsMatched": 10 } }
+```
+
+---
+
 ## Change streams
 
 ```
@@ -252,6 +284,8 @@ round-trips exactly, and there is a test pinning it.
 | 404 | `not_found` | Document, collection, or user absent |
 | 409 | `conflict` | Collection exists; last user; self-deletion |
 | 409 | `duplicate_key` | `_id` already present |
+| 409 | `unique_violation` | A unique index would be violated |
+| 501 | `not_implemented` | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | Resume point collected from the oplog |
 | 500 | `internal` | Storage failure — details logged, never returned |
 
@@ -272,7 +306,6 @@ hash so the timing matches. Otherwise the endpoint is a user-enumeration oracle.
 
 | | |
 |---|---|
-| Index management endpoints | ⛔ Indexes not implemented |
 | Aggregation pipeline | 📋 Planned |
 | Vector / hybrid search | 📋 M2 |
 | MCP endpoint (`/mcp`) | 📋 M3 |

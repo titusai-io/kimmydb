@@ -4,8 +4,8 @@
 
 MongoDB-style query and update documents. Implemented in `kimmy-query`.
 
-> **Performance note.** Secondary indexes are ⛔ not implemented. Every query is
-> a full collection scan. Semantics are correct; performance is O(n).
+> **Performance note.** Secondary indexes exist — see [Indexes](indexes.md). A
+> query with no usable index is still a full collection scan.
 
 ---
 
@@ -19,7 +19,8 @@ planner will read, so parsing is the shared representation, not just a speed-up.
 graph LR
     J["JSON filter"] --> B["BSON"] --> P["parse → Filter AST"]
     P --> E["evaluate per document"]
-    P -.->|"📋 M1 remainder"| I["index planner"]
+    P --> I["index planner"]
+    I --> C["candidates"] --> E
 ```
 
 ---
@@ -228,6 +229,7 @@ bad pattern in an `$or` should not take down the whole request.
 
 | Feature | Status |
 |---|---|
+| Index-backed `$in` (union of point lookups) | 📋 Planned |
 | Aggregation pipeline (`$match`, `$group`, `$unwind`, …) | 📋 Planned |
 | `$vectorSearch` | 📋 M2 |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
@@ -245,9 +247,13 @@ query cannot accidentally pull an entire collection into memory.
 { "filter": {}, "limit": 50, "skip": 100 }
 ```
 
-> **Sharp edge.** `skip` is O(n): the scan still visits skipped documents. Deep
-> paging over a large collection is expensive, and will stay so until indexes
-> land.
+> **Sharp edge.** `skip` is O(n) even with an index: skipped documents are still
+> visited. Deep paging over a large collection is expensive.
+>
+> **Order without a sort is unspecified.** Which documents a `limit` returns can
+> differ between an index-backed query and a scan, because they visit documents
+> in different orders. Add an explicit `sort` when the subset matters — this
+> matches MongoDB.
 
 An unsorted query can stop scanning once it has `skip + limit` matches. A sorted
 one must see every match before it can page.

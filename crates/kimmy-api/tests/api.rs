@@ -382,3 +382,207 @@ async fn metrics_report_counts_without_naming_collections() {
     let res = server.client.request("GET", &format!("{}/metrics", server.base), None, None).await;
     assert_eq!(res.status, 200);
 }
+
+// ---------------------------------------------------------------------------
+// Indexes
+// ---------------------------------------------------------------------------
+
+/// Ids returned by a query, sorted so results are comparable across access
+/// paths (without an explicit sort, order is unspecified).
+async fn ids(server: &Server, token: &str, coll: &str, body: Value) -> Vec<i64> {
+    let res = server.post(&format!("/v1/db/shop/coll/{coll}/find"), Some(token), body).await;
+    let mut out: Vec<i64> = res.body["documents"]
+        .as_array()
+        .expect("documents")
+        .iter()
+        .map(|d| d["_id"].as_i64().expect("_id"))
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+/// Seed two identical collections; only `indexed` gets indexes.
+async fn seed_pair(server: &Server, token: &str) {
+    for coll in ["indexed", "control"] {
+        server.post("/v1/db/shop/collections", Some(token), json!({ "name": coll })).await;
+        for i in 1..=60i64 {
+            server
+                .post(
+                    &format!("/v1/db/shop/coll/{coll}/docs"),
+                    Some(token),
+                    json!({ "_id": i, "qty": i % 7, "item": format!("w{}", i % 4) }),
+                )
+                .await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_index_never_changes_which_documents_a_query_returns() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    for fields in [
+        json!([{ "path": "qty" }]),
+        json!([{ "path": "item" }, { "path": "qty" }]),
+        json!([{ "path": "qty", "descending": true }]),
+    ] {
+        let res = server
+            .post("/v1/db/shop/coll/indexed/indexes", Some(&token), json!({ "fields": fields }))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    for query in [
+        json!({ "filter": { "qty": 3 }, "limit": 500 }),
+        json!({ "filter": { "qty": { "$gte": 4 } }, "limit": 500 }),
+        json!({ "filter": { "qty": { "$gte": 2, "$lt": 5 } }, "limit": 500 }),
+        json!({ "filter": { "item": "w1", "qty": 3 }, "limit": 500 }),
+        json!({ "filter": { "qty": 3, "$or": [ { "item": "w1" }, { "item": "w2" } ] }, "limit": 500 }),
+        json!({ "filter": { "qty": { "$ne": 3 } }, "limit": 500 }),
+        json!({ "filter": {}, "limit": 500 }),
+    ] {
+        let indexed = ids(&server, &token, "indexed", query.clone()).await;
+        let scanned = ids(&server, &token, "control", query.clone()).await;
+        assert_eq!(indexed, scanned, "index and scan disagree for {query}");
+    }
+}
+
+#[tokio::test]
+async fn explain_reports_which_access_path_was_used() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let probe = json!({ "filter": { "qty": 3 }, "explain": true, "limit": 500 });
+
+    let before = server.post("/v1/db/shop/coll/indexed/find", Some(&token), probe.clone()).await;
+    assert_eq!(before.body["explain"]["strategy"], "collectionScan");
+    let examined_before = before.body["explain"]["documentsExamined"].as_u64().unwrap();
+
+    server
+        .post(
+            "/v1/db/shop/coll/indexed/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "qty" }] }),
+        )
+        .await;
+
+    let after = server.post("/v1/db/shop/coll/indexed/find", Some(&token), probe).await;
+    assert_eq!(after.body["explain"]["strategy"], "index");
+    assert_eq!(after.body["explain"]["index"], "qty_1");
+    // The whole point: the index must actually reduce the work done.
+    let examined_after = after.body["explain"]["documentsExamined"].as_u64().unwrap();
+    assert!(
+        examined_after < examined_before,
+        "index examined {examined_after}, scan examined {examined_before}"
+    );
+    // ...without changing the answer.
+    assert_eq!(
+        after.body["explain"]["documentsMatched"],
+        before.body["explain"]["documentsMatched"]
+    );
+}
+
+#[tokio::test]
+async fn a_unique_index_rejects_duplicates_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "users" })).await;
+    server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+
+    let first = server
+        .post("/v1/db/shop/coll/users/docs", Some(&token), json!({ "email": "a@x.com" }))
+        .await;
+    assert_eq!(first.status, 200);
+
+    let second = server
+        .post("/v1/db/shop/coll/users/docs", Some(&token), json!({ "email": "a@x.com" }))
+        .await;
+    assert_eq!(second.status, 409);
+    assert_eq!(second.body["error"], "unique_violation");
+    // The message must name the index, not be mangled into the _id wording.
+    assert!(
+        second.body["message"].as_str().unwrap().contains("email_1"),
+        "unhelpful message: {}",
+        second.body["message"]
+    );
+}
+
+#[tokio::test]
+async fn coordinated_enforcement_is_not_implemented_rather_than_a_bad_request() {
+    // 501 says "this will exist"; 400 would wrongly blame the caller.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "e" }], "unique": true, "enforcement": "coordinated" }),
+        )
+        .await;
+    assert_eq!(res.status, 501);
+    assert_eq!(res.body["error"], "not_implemented");
+}
+
+#[tokio::test]
+async fn indexes_can_be_listed_and_dropped() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "c" })).await;
+    server
+        .post(
+            "/v1/db/shop/coll/c/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "a" }], "name": "mine" }),
+        )
+        .await;
+
+    let listed = server.get("/v1/db/shop/coll/c/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["name"], "mine");
+    assert_eq!(listed.body["indexes"][0]["enforcement"], "local");
+
+    let dropped = server.delete("/v1/db/shop/coll/c/indexes/mine", Some(&token)).await;
+    assert_eq!(dropped.body["dropped"], true);
+    assert!(
+        server.get("/v1/db/shop/coll/c/indexes", Some(&token)).await.body["indexes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn managing_indexes_requires_admin() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&root), json!({ "name": "c" })).await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({
+                "user": "reader", "password": "reader-password",
+                "grants": [{ "db": "shop", "collection": "*", "actions": ["read"] }]
+            }),
+        )
+        .await;
+    let reader = server.login("reader", "reader-password").await;
+
+    // Reading the index list is a read; creating and dropping are not.
+    assert_eq!(server.get("/v1/db/shop/coll/c/indexes", Some(&reader)).await.status, 200);
+    let created = server
+        .post("/v1/db/shop/coll/c/indexes", Some(&reader), json!({ "fields": [{ "path": "a" }] }))
+        .await;
+    assert_eq!(created.status, 403);
+    assert_eq!(server.delete("/v1/db/shop/coll/c/indexes/a_1", Some(&reader)).await.status, 403);
+}

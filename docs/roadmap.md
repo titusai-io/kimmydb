@@ -13,7 +13,7 @@ so that development can be picked up later without re-deriving decisions.
 graph LR
     M0["<b>M0</b> ✅<br/>skeleton · config<br/>container · CI"]
     M1["<b>M1</b> ✅<br/>storage · query<br/>streams · auth · API"]
-    IDX["<b>indexes</b> ⛔<br/>the one gap<br/>left in M1"]
+    IDX["<b>indexes</b> ✅<br/>the last<br/>M1 item"]
     M2["<b>M2</b> 📋<br/>vectors and<br/>auto-embeddings"]
     M3["<b>M3</b> 📋<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> 📋<br/>gossip<br/>clustering"]
@@ -23,13 +23,13 @@ graph LR
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
-    style IDX fill:#6b2d2d,color:#fff
+    style IDX fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0** | Workspace, core types, HLC, config, Docker, CI | ✅ Complete |
-| **M1** | Storage, CRUD, query, oplog, change streams, auth, HTTP API | ✅ Except indexes |
+| **M1** | Storage, CRUD, query, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | 📋 Planned |
 | **M3** | Built-in MCP server | 📋 Planned |
 | **M4** | Gossip membership, discovery, anti-entropy replication | 📋 Planned |
@@ -41,73 +41,21 @@ clustering is the largest and riskiest piece.
 
 ---
 
-## Remaining in M1: secondary indexes
+## M1 complete
 
-The only unfinished M1 item. Groundwork already in place:
+Secondary indexes landed last: compound and descending keys, multikey arrays,
+unique constraints, a blocking backfill, a rule-based planner, and `explain`.
+See [Indexes](indexes.md).
 
-- `index_entries` table, keyed `(collection_id, index_id, encoded_key, encoded_id)`
-- `IndexMeta` / `IndexField` with a monotonic, non-reusing id counter
-- `keyenc::encode_compound` for multi-field keys
-- The filter AST the planner needs to read
+Two deliberate gaps carried forward:
 
-### What is left
+- **`$in` does not use an index.** It needs a union of point lookups rather than
+  a single range. Common enough to be worth doing.
+- **A range on a descending field falls back to the equality prefix.** Correct
+  but less selective; doing it properly needs its own property test, since the
+  failure mode is a range that is too narrow.
 
-**1. Descending fields in the encoder.** Invert every byte of a component's
-encoding. This works *because* the encoding is prefix-free — for a prefix-free
-code, flipping all bytes exactly reverses order. Needs its own property test.
-
-**2. Index maintenance in the write path.** The delicate part. Index entries must
-be updated in the **same transaction** as the document, or an index will
-silently disagree with the data:
-
-```rust
-// insert / replace / delete, all inside one txn
-for index in &coll.indexes {
-    if let Some(old) = previous_document {
-        index_entries.remove(key_for(index, old, doc_id))?;
-    }
-    if let Some(new) = new_document {
-        index_entries.insert(key_for(index, new, doc_id), ())?;
-    }
-}
-```
-
-Multikey handling: a field holding an array produces **one entry per element**,
-which is what makes `{tags: "b"}` index-answerable.
-
-**3. Rule-based planner.** No cost model. Extract equality and range predicates
-from the top-level `$and` chain, pick the index with the longest matching
-prefix, fall back to a collection scan.
-
-```mermaid
-graph TB
-    F["Filter AST"] --> E["extract (path, predicate) pairs<br/>from the top-level conjunction"]
-    E --> M["for each index: how many leading<br/>fields does the filter constrain?"]
-    M --> P{"best prefix > 0?"}
-    P -->|yes| S["index range scan → candidate ids"]
-    P -->|no| C["collection scan"]
-    S --> R["<b>recheck the full filter</b><br/>on every candidate"]
-    C --> R
-
-    style R fill:#2d3748,color:#fff
-```
-
-**The recheck is not optional.** An index answers "which documents *might*
-match"; only the filter decides. Skipping the recheck is how index-backed
-queries start returning documents that do not match.
-
-**4. API surface.** `POST/GET/DELETE /v1/db/{db}/coll/{coll}/indexes`, plus
-`explain` so users can tell whether an index was used.
-
-**5. Backfill.** Creating an index on a non-empty collection must populate it.
-Simplest correct approach: build inside one transaction, and document that it
-blocks writes for the duration.
-
-### Why it was deferred
-
-The failure mode is *silent wrong query results*, the same class as the key
-encoder — which is why the encoder got mutation testing. That work deserves a
-fresh start rather than the tail of a long session.
+Neither affects correctness — an unused index only costs time.
 
 ---
 

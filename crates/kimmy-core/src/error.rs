@@ -21,6 +21,12 @@ pub enum Error {
     #[error("duplicate key: document with _id {0} already exists")]
     DuplicateKey(String),
 
+    #[error("unique index {index:?} violated: {detail}")]
+    UniqueViolation { index: String, detail: String },
+
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("invalid _id type {found:?}: must be an ObjectId, string, integer, or binary")]
     InvalidDocumentId { found: String },
 

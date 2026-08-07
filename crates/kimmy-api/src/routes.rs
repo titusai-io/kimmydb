@@ -5,7 +5,7 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use kimmy_auth::Action;
 use kimmy_core::DocId;
-use kimmy_query::{filter, shape, update};
+use kimmy_query::{filter, plan, shape, update};
 use kimmy_storage::CollectionMeta;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -40,6 +40,8 @@ pub fn router(state: SharedState) -> Router {
             "/v1/db/{db}/coll/{coll}/docs/{id}",
             get(get_doc).put(replace_doc).delete(delete_doc),
         )
+        .route("/v1/db/{db}/coll/{coll}/indexes", get(list_indexes).post(create_index))
+        .route("/v1/db/{db}/coll/{coll}/indexes/{name}", delete(drop_index))
         .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
         .with_state(state)
 }
@@ -200,6 +202,8 @@ struct FindRequest {
     projection: Option<Value>,
     limit: Option<usize>,
     skip: Option<usize>,
+    /// Report how the query was answered alongside the results.
+    explain: bool,
 }
 
 #[derive(Deserialize, Default)]
@@ -254,15 +258,10 @@ async fn run_find(
     let limit = request.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let skip = request.skip.unwrap_or(0);
 
-    let mut matched = Vec::new();
-    state.engine.for_each_doc(&meta, |_, doc| {
-        if filter::matches(&filter, &doc) {
-            matched.push(doc);
-        }
-        // A sort has to see every match before it can page, so early exit is
-        // only safe for unsorted queries.
-        Ok(!(sort.is_empty() && matched.len() >= skip + limit))
-    })?;
+    // A sort has to see every match before it can page, so early exit is only
+    // safe for unsorted queries.
+    let stop_after = sort.is_empty().then_some(skip + limit);
+    let (mut matched, stats) = collect_matching(state, &meta, &filter, stop_after)?;
 
     shape::sort(&sort, &mut matched);
 
@@ -273,26 +272,102 @@ async fn run_find(
         .map(|doc| document_to_json(&shape::project(projection.as_ref(), &doc)))
         .collect();
 
-    Ok(Json(json!({ "documents": page, "count": page.len() })))
+    let mut body = json!({ "documents": page, "count": page.len() });
+    if request.explain {
+        body["explain"] = stats.to_json();
+    }
+    Ok(Json(body))
+}
+
+/// How a query was answered, for `explain`.
+struct QueryStats {
+    index: Option<String>,
+    fields_used: usize,
+    examined: usize,
+    matched: usize,
+}
+
+impl QueryStats {
+    fn to_json(&self) -> Value {
+        json!({
+            "strategy": if self.index.is_some() { "index" } else { "collectionScan" },
+            "index": self.index,
+            "indexFieldsUsed": self.fields_used,
+            "documentsExamined": self.examined,
+            "documentsMatched": self.matched,
+        })
+    }
+}
+
+/// Gather the documents matching a filter, through an index when one applies.
+///
+/// The index only narrows the candidate set — **every candidate is re-checked
+/// against the full filter**, because an index answers "might match" and only
+/// the filter decides. Skipping that recheck is how index-backed queries start
+/// returning documents that do not match.
+fn collect_matching(
+    state: &SharedState,
+    meta: &kimmy_storage::CollectionMeta,
+    filter: &filter::Filter,
+    stop_after: Option<usize>,
+) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
+    let plan = plan::choose(filter, &meta.indexes);
+    let mut matched = Vec::new();
+    let mut examined = 0usize;
+
+    match &plan {
+        Some(p) => {
+            let candidates = state.engine.index_candidates(meta, p.index_id, &p.lower, &p.upper)?;
+            for key in candidates {
+                let Some(doc) = state.engine.get_by_encoded_key(meta, &key)? else {
+                    continue;
+                };
+                examined += 1;
+                if filter::matches(filter, &doc) {
+                    matched.push(doc);
+                    if stop_after.is_some_and(|n| matched.len() >= n) {
+                        break;
+                    }
+                }
+            }
+        }
+        None => {
+            state.engine.for_each_doc(meta, |_, doc| {
+                examined += 1;
+                if filter::matches(filter, &doc) {
+                    matched.push(doc);
+                }
+                Ok(!stop_after.is_some_and(|n| matched.len() >= n))
+            })?;
+        }
+    }
+
+    let stats = QueryStats {
+        index: plan.as_ref().map(|p| p.index_name.clone()),
+        fields_used: plan.as_ref().map_or(0, |p| p.fields_used),
+        examined,
+        matched: matched.len(),
+    };
+    Ok((matched, stats))
 }
 
 async fn count_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<FindRequest>,
+    Json(request): Json<FindRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let meta = authorize(&state, &auth, Action::Read, &db, &coll)?;
-    let filter = parse_filter(body.filter.as_ref())?;
+    let filter = parse_filter(request.filter.as_ref())?;
 
-    let mut count = 0u64;
-    state.engine.for_each_doc(&meta, |_, doc| {
-        if filter::matches(&filter, &doc) {
-            count += 1;
-        }
-        Ok(true)
-    })?;
-    Ok(Json(json!({ "count": count })))
+    // No early exit: a count must see every match.
+    let (matched, stats) = collect_matching(&state, &meta, &filter, None)?;
+
+    let mut body = json!({ "count": matched.len() });
+    if request.explain {
+        body["explain"] = stats.to_json();
+    }
+    Ok(Json(body))
 }
 
 async fn get_doc(
@@ -415,6 +490,99 @@ async fn delete_docs(
         }
     }
     Ok(Json(json!({ "deleted": deleted })))
+}
+
+// ---------------------------------------------------------------------------
+// Indexes
+// ---------------------------------------------------------------------------
+
+/// One field of an index definition.
+///
+/// An *array* rather than a `{field: 1}` object, deliberately: field order
+/// decides which queries a compound index can answer, and JSON object key
+/// order is not something a client can rely on surviving serialization.
+#[derive(Deserialize)]
+struct IndexFieldSpec {
+    path: String,
+    #[serde(default)]
+    descending: bool,
+}
+
+#[derive(Deserialize)]
+struct CreateIndexRequest {
+    fields: Vec<IndexFieldSpec>,
+    #[serde(default)]
+    unique: bool,
+    #[serde(default)]
+    name: Option<String>,
+    /// `"local"` (default) or `"coordinated"`. See the storage docs — a
+    /// coordinated unique constraint needs clustering and is refused until M4.
+    #[serde(default)]
+    enforcement: Option<String>,
+}
+
+async fn create_index(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<CreateIndexRequest>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(Action::Admin, &db, Some(&coll))?;
+
+    let fields: Vec<kimmy_storage::IndexField> = body
+        .fields
+        .into_iter()
+        .map(|f| kimmy_storage::IndexField { path: f.path, descending: f.descending })
+        .collect();
+
+    let enforcement = match body.enforcement.as_deref() {
+        None | Some("local") => kimmy_storage::Enforcement::Local,
+        Some("coordinated") => kimmy_storage::Enforcement::Coordinated,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown enforcement {other:?}: expected \"local\" or \"coordinated\""
+            )));
+        }
+    };
+
+    let index =
+        state.engine.create_index_with(&db, &coll, fields, body.unique, enforcement, body.name)?;
+    Ok(Json(index_to_json(&index)))
+}
+
+async fn list_indexes(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&state, &auth, Action::Read, &db, &coll)?;
+    let indexes: Vec<Value> =
+        state.engine.list_indexes(&db, &coll)?.iter().map(index_to_json).collect();
+    Ok(Json(json!({ "indexes": indexes })))
+}
+
+async fn drop_index(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll, name)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    auth.require(Action::Admin, &db, Some(&coll))?;
+    Ok(Json(json!({ "dropped": state.engine.drop_index(&db, &coll, &name)? })))
+}
+
+fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
+    json!({
+        "name": index.name,
+        "fields": index.fields.iter().map(|f| json!({
+            "path": f.path,
+            "descending": f.descending,
+        })).collect::<Vec<_>>(),
+        "unique": index.unique,
+        "enforcement": match index.enforcement {
+            kimmy_storage::Enforcement::Local => "local",
+            kimmy_storage::Enforcement::Coordinated => "coordinated",
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------

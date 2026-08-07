@@ -127,10 +127,10 @@ pub(crate) fn maintain(
             for key in index_keys(index, new)? {
                 for holder in holders_of(&table, coll, index.id, &key)? {
                     if holder != doc_key {
-                        return Err(StorageError::Core(CoreError::DuplicateKey(format!(
-                            "unique index {:?}",
-                            index.name
-                        ))));
+                        return Err(StorageError::Core(CoreError::UniqueViolation {
+                            index: index.name.clone(),
+                            detail: "another document already holds this value".into(),
+                        }));
                     }
                 }
             }
@@ -252,9 +252,9 @@ impl crate::Engine {
             )));
         }
         if enforcement == Enforcement::Coordinated {
-            return Err(StorageError::Core(CoreError::UnsupportedOperator(
-                "coordinated unique enforcement requires clustering, which lands in M4; \
-                 use \"local\" enforcement, whose cross-node limits are documented"
+            return Err(StorageError::Core(CoreError::Unsupported(
+                "coordinated unique enforcement needs clustering, which lands in M4; use \
+                 \"local\" enforcement, whose cross-node limits are documented"
                     .into(),
             )));
         }
@@ -299,10 +299,12 @@ impl crate::Engine {
                     // not be created — it would report a constraint it does
                     // not actually hold.
                     if index.unique && !seen_unique.insert(key.clone()) {
-                        return Err(StorageError::Core(CoreError::DuplicateKey(format!(
-                            "existing documents violate unique index {:?}",
-                            index.name
-                        ))));
+                        return Err(StorageError::Core(CoreError::UniqueViolation {
+                            index: index.name.clone(),
+                            detail: "existing documents already violate it, so it cannot be \
+                                     created"
+                                .into(),
+                        }));
                     }
                     entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
                 }
@@ -558,7 +560,7 @@ mod tests {
 
         engine.insert(&coll, doc! { "_id": 1, "email": "a@x.com" }).unwrap();
         let err = engine.insert(&coll, doc! { "_id": 2, "email": "a@x.com" });
-        assert!(matches!(err, Err(StorageError::Core(CoreError::DuplicateKey(_)))));
+        assert!(matches!(err, Err(StorageError::Core(CoreError::UniqueViolation { .. }))));
 
         // The rejected write must leave nothing behind — neither document nor
         // index entry.
@@ -591,7 +593,7 @@ mod tests {
 
         let err =
             engine.create_index("app", "docs", vec![IndexField::ascending("email")], true, None);
-        assert!(matches!(err, Err(StorageError::Core(CoreError::DuplicateKey(_)))));
+        assert!(matches!(err, Err(StorageError::Core(CoreError::UniqueViolation { .. }))));
         // ...and the failed build must leave no index registered.
         assert!(engine.list_indexes("app", "docs").unwrap().is_empty());
     }
@@ -693,7 +695,7 @@ mod tests {
             Enforcement::Coordinated,
             None,
         );
-        assert!(matches!(err, Err(StorageError::Core(CoreError::UnsupportedOperator(_)))));
+        assert!(matches!(err, Err(StorageError::Core(CoreError::Unsupported(_)))));
     }
 
     // -----------------------------------------------------------------------
