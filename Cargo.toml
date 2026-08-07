@@ -1,0 +1,88 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/kimmy-core",
+    "crates/kimmy-storage",
+    "crates/kimmy-query",
+    "crates/kimmy-vector",
+    "crates/kimmy-auth",
+    "crates/kimmy-cluster",
+    "crates/kimmy-mcp",
+    "crates/kimmy-api",
+    "crates/kimmyd",
+    "crates/kimmy-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+repository = "https://github.com/titusai-io/kimmydb"
+authors = ["Chris Gruber <chris@titusai.io>"]
+
+[workspace.dependencies]
+# Internal crates
+kimmy-core = { path = "crates/kimmy-core" }
+kimmy-storage = { path = "crates/kimmy-storage" }
+kimmy-query = { path = "crates/kimmy-query" }
+kimmy-vector = { path = "crates/kimmy-vector" }
+kimmy-auth = { path = "crates/kimmy-auth" }
+kimmy-cluster = { path = "crates/kimmy-cluster" }
+kimmy-mcp = { path = "crates/kimmy-mcp" }
+kimmy-api = { path = "crates/kimmy-api" }
+
+# HTTP
+axum = { version = "0.8", features = ["ws", "macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "cors"] }
+http-body-util = "0.1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
+toml = "1"
+
+# Storage
+redb = "4.1"
+
+# Errors and logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+bytes = "1"
+parking_lot = "0.12"
+clap = { version = "4", features = ["derive", "env"] }
+base64 = "0.23"
+
+# Auth. argon2 0.6 is still a release candidate; password hashing is not the
+# place to run ahead of a stable release.
+argon2 = { version = "0.5", features = ["std"] }
+# rust_crypto keeps the build pure Rust, consistent with choosing redb over
+# RocksDB; aws_lc_rs would reintroduce a C toolchain dependency.
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+rand = "0.9"
+
+# Dev / test
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.bench]
+inherits = "release"
+debug = true

@@ -1,0 +1,63 @@
+# Three-node KimmyDB cluster for local development.
+#
+# Clustering itself lands in M4; until then the nodes run independently and this
+# file mainly exercises the image, the volumes, and DNS-based discovery config.
+#
+# Discovery note: Compose's built-in DNS resolves the service name `kimmy` to
+# every container in that service, which is the same shape as a Kubernetes
+# headless Service. That is why all three nodes can share one seed setting.
+
+x-kimmy-common: &kimmy-common
+  build:
+    context: .
+  image: kimmydb:dev
+  restart: unless-stopped
+  environment: &kimmy-env
+    KIMMY_ROOT_USER: root
+    KIMMY_ROOT_PASSWORD: ${KIMMY_ROOT_PASSWORD:-changeme}
+    # Every node must sign tokens with the same key, or a token minted by one
+    # node is rejected by the next request that lands elsewhere.
+    KIMMY_JWT_SECRET: ${KIMMY_JWT_SECRET:-dev-jwt-secret-not-for-production}
+    KIMMY_CLUSTER_SECRET: ${KIMMY_CLUSTER_SECRET:-dev-cluster-secret}
+    KIMMY_SEEDS: dns:kimmy:7900
+    KIMMY_LOG_LEVEL: ${KIMMY_LOG_LEVEL:-info}
+  stop_grace_period: 30s
+
+services:
+  kimmy1:
+    <<: *kimmy-common
+    container_name: kimmy1
+    networks:
+      default:
+        aliases: [kimmy]
+    ports:
+      - "7878:7878"
+    volumes:
+      - kimmy1-data:/var/lib/kimmy
+
+  kimmy2:
+    <<: *kimmy-common
+    container_name: kimmy2
+    networks:
+      default:
+        aliases: [kimmy]
+    ports:
+      - "7879:7878"
+    volumes:
+      - kimmy2-data:/var/lib/kimmy
+
+  kimmy3:
+    <<: *kimmy-common
+    container_name: kimmy3
+    networks:
+      default:
+        aliases: [kimmy]
+    ports:
+      - "7880:7878"
+    volumes:
+      - kimmy3-data:/var/lib/kimmy
+
+volumes:
+  kimmy1-data:
+  kimmy2-data:
+  kimmy3-data:

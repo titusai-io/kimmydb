@@ -1,0 +1,21 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# Local data directories
+/data
+/var
+*.redb
+*.redb.lock
+
+# Embedding model cache (fastembed downloads here)
+.fastembed_cache/
+
+# Environment / secrets
+.env
+.env.local
+
+# Editor
+.idea/
+.vscode/
+*.swp

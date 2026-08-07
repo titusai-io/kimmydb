@@ -1,0 +1,32 @@
+[package]
+name = "kimmy-api"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "HTTP and WebSocket API surface for KimmyDB"
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-storage.workspace = true
+kimmy-query.workspace = true
+kimmy-auth.workspace = true
+kimmy-vector.workspace = true
+kimmy-mcp.workspace = true
+axum.workspace = true
+base64.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+bson.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }

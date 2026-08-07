@@ -1,0 +1,25 @@
+[package]
+name = "kimmy-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Users, password hashing, JWT issuance, and RBAC for KimmyDB"
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-storage.workspace = true
+bson.workspace = true
+argon2.workspace = true
+jsonwebtoken.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tempfile.workspace = true
+proptest.workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "kimmy-mcp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "In-process MCP server exposing KimmyDB collections as agent tools"
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-storage.workspace = true
+kimmy-query.workspace = true
+kimmy-auth.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "macros"] }

@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc a9fd2e62fbdb9fd8ce0ddcd75a3a9e85476141b9ddd47bf640816a916c8384de # shrinks to a = Int32(-1), b = Int32(-2)
+cc 6fc4e877296b178928232f0724399677cf8fb448b51d7c2e01fae4c0c7654cbb # shrinks to a = [Document({"b": Array([Int64(-1)])})], b = [Document({"b": Array([Int32(-2)])})]

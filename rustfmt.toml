@@ -1,0 +1,7 @@
+edition = "2024"
+max_width = 100
+# Keep short struct literals, calls, and match arms on one line. Much of this
+# codebase is small value types (Hlc, Stamp, DocRecord) where the expanded form
+# is pure noise.
+use_small_heuristics = "Max"
+use_field_init_shorthand = true

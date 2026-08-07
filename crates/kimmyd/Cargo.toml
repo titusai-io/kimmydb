@@ -1,0 +1,30 @@
+[package]
+name = "kimmyd"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The KimmyDB server daemon"
+
+[[bin]]
+name = "kimmyd"
+path = "src/main.rs"
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-storage.workspace = true
+kimmy-api.workspace = true
+kimmy-auth.workspace = true
+axum.workspace = true
+kimmy-cluster.workspace = true
+clap.workspace = true
+serde.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

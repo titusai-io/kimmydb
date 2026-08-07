@@ -1,0 +1,21 @@
+//! Core types for KimmyDB.
+//!
+//! This crate is deliberately I/O-free: it defines the vocabulary every other
+//! crate speaks in. The most important type here is [`Hlc`], the hybrid logical
+//! clock that drives last-writer-wins conflict resolution, oplog ordering, and
+//! change-stream resume tokens alike.
+
+pub mod cmp;
+pub mod error;
+pub mod hlc;
+pub mod ids;
+pub mod keyenc;
+pub mod oplog;
+pub mod record;
+
+pub use cmp::canonical_cmp;
+pub use error::{Error, Result};
+pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
+pub use ids::{CollectionId, DocId, NodeId};
+pub use oplog::{OpKind, OplogEntry, ResumeToken};
+pub use record::DocRecord;

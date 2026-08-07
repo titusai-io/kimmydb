@@ -1,0 +1,12 @@
+target/
+data/
+var/
+.git/
+.github/
+*.redb
+*.redb.lock
+.fastembed_cache/
+.env
+.env.local
+README.md
+docs/

@@ -1,0 +1,22 @@
+[package]
+name = "kimmy-vector"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Embedding providers and vector indexing for KimmyDB"
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-storage.workspace = true
+bson.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+async-trait.workspace = true
+tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
