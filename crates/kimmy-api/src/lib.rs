@@ -22,6 +22,7 @@ use std::sync::Arc;
 use axum::Router;
 use kimmy_auth::{TokenIssuer, UserStore};
 use kimmy_storage::Engine;
+use kimmy_vector::IndexCache;
 
 pub use error::ApiError;
 pub use state::{AppState, SharedState};
@@ -33,6 +34,7 @@ pub fn build(
     insecure_no_auth: bool,
 ) -> Result<Router, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
-    let state: SharedState = Arc::new(AppState { engine, users, tokens, insecure_no_auth });
+    let state: SharedState =
+        Arc::new(AppState { engine, users, tokens, vectors: IndexCache::new(), insecure_no_auth });
     Ok(routes::router(state))
 }

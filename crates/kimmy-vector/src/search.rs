@@ -1,11 +1,12 @@
 //! Vector and hybrid search.
 //!
-//! The current implementation is **exact**: every stored vector is scored, and
-//! the best `k` are kept. That is O(n) per query but has no recall loss and no
-//! index to keep consistent — which makes it both a usable starting point and
-//! the oracle an approximate index (HNSW) will be measured against.
+//! What is in this module is the **exact** path: every stored vector is scored
+//! and the best `k` are kept. That is O(n) per query but has no recall loss and
+//! no index to keep consistent, which makes it both the path small collections
+//! take and the oracle the approximate one is measured against.
 //!
-//! See `docs/vectors.md` for where that stops being good enough.
+//! Choosing between the two lives in `crate::cache`, not here — this module is
+//! deliberately unaware that an index exists. See `docs/vectors.md`.
 
 use std::collections::HashMap;
 

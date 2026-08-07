@@ -33,7 +33,7 @@ graph TB
     W["Every mutation"] --> O[("Oplog<br/>(hlc ‖ node) → OplogEntry")]
 
     O --> C1["<b>Change streams</b><br/>WebSocket subscribers<br/>resumable by token<br/><i>✅ working</i>"]
-    O --> C2["<b>Embedding pipeline</b><br/>extract → chunk → embed<br/>an ordinary subscriber<br/><i>📋 M2</i>"]
+    O --> C2["<b>Embedding pipeline</b><br/>extract → chunk → embed<br/>an ordinary subscriber<br/><i>✅ working</i>"]
     O --> C3["<b>Cluster anti-entropy</b><br/>peers pull missing ranges<br/><i>📋 M4</i>"]
 
     style O fill:#4a5568,color:#fff

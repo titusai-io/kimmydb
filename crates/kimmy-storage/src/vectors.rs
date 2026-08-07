@@ -179,6 +179,7 @@ impl crate::Engine {
                 self.delete(shadow, &VectorRecord::id(source, existing))?;
             }
         }
+        self.bump_vector_generation(shadow.id);
         Ok(())
     }
 
@@ -206,15 +207,39 @@ impl crate::Engine {
         for chunk in &chunks {
             self.delete(shadow, &VectorRecord::id(source, *chunk))?;
         }
+        if !chunks.is_empty() {
+            self.bump_vector_generation(shadow.id);
+        }
         Ok(chunks.len())
     }
 
     /// Visit every stored vector. Used by search and by index rebuilds.
+    ///
+    /// A document that does not decode as a vector record is **skipped, not
+    /// fatal**. A shadow collection is an ordinary collection, so a client with
+    /// write access can put an arbitrary document in one; failing the scan
+    /// would let a single malformed insert turn every subsequent search on that
+    /// collection into a 500. Skipping costs one unusable record and keeps
+    /// search available.
+    ///
+    /// It is logged at `warn` rather than passed over silently, because the
+    /// other way to arrive here is genuine corruption.
     pub fn for_each_vector<F>(&self, shadow: &CollectionMeta, mut f: F) -> Result<()>
     where
         F: FnMut(VectorRecord) -> Result<bool>,
     {
-        self.for_each_doc(shadow, |_, doc| f(decode_vector(doc)?))
+        self.for_each_doc(shadow, |id, doc| match decode_vector(doc) {
+            Ok(record) => f(record),
+            Err(e) => {
+                tracing::warn!(
+                    collection = %shadow.name,
+                    document = %id,
+                    error = %e,
+                    "skipping a document in a vector collection that is not a vector record"
+                );
+                Ok(true)
+            }
+        })
     }
 
     /// Whether a document's vectors are older than the document itself.
@@ -497,6 +522,28 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn a_document_that_is_not_a_vector_record_is_skipped_not_fatal() {
+        // A shadow collection is an ordinary collection, so anyone with write
+        // access can insert an arbitrary document into one. If that failed the
+        // scan, a single bad insert would turn every later search on the
+        // collection into a 500 — a client could brick search with one write.
+        let (engine, shadow, _dir) = with_vectors();
+        engine.put_vectors(&shadow, &DocId::Int64(1), &[record(0, 10, "real")]).unwrap();
+
+        let junk = bson::doc! { "_id": "junk", "not": "a vector record" };
+        engine.insert(&shadow, junk).unwrap();
+
+        let mut seen = Vec::new();
+        engine
+            .for_each_vector(&shadow, |r| {
+                seen.push(r.text);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(seen, vec!["real".to_string()], "the good record must still be visible");
     }
 
     #[test]

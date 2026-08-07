@@ -29,6 +29,13 @@ pub struct Engine {
     /// must never be held across a redb commit.
     clock: Mutex<HlcClock>,
     events: broadcast::Sender<Arc<OplogEntry>>,
+    /// Bumped whenever a collection's vectors change.
+    ///
+    /// An in-memory vector index is built from a snapshot and cannot see later
+    /// writes. Counting vectors to detect that would be O(n) per query, and a
+    /// count misses the case where one document is deleted and another added.
+    /// A counter is exact and free.
+    vector_generations: Mutex<std::collections::HashMap<CollectionId, u64>>,
 }
 
 impl Engine {
@@ -64,11 +71,29 @@ impl Engine {
 
         info!(node = %node_id, path = %path.display(), "storage engine open");
 
-        Ok(Self { db, node_id, clock: Mutex::new(HlcClock::resuming_from(resumed)), events })
+        Ok(Self {
+            db,
+            node_id,
+            clock: Mutex::new(HlcClock::resuming_from(resumed)),
+            events,
+            vector_generations: Mutex::new(Default::default()),
+        })
     }
 
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    /// How many times this collection's vectors have changed.
+    ///
+    /// Resets to zero on restart, which is correct: an in-memory index does
+    /// not survive one either.
+    pub fn vector_generation(&self, collection: CollectionId) -> u64 {
+        self.vector_generations.lock().get(&collection).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn bump_vector_generation(&self, collection: CollectionId) {
+        *self.vector_generations.lock().entry(collection).or_insert(0) += 1;
     }
 
     /// Subscribe to the live change feed.

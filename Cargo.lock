@@ -1757,6 +1757,7 @@ dependencies = [
  "hnsw_rs",
  "kimmy-core",
  "kimmy-storage",
+ "parking_lot",
  "reqwest",
  "serde",
  "serde_json",

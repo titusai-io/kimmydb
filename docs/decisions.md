@@ -141,7 +141,7 @@ whether or not the node is clustered.
 
 **Why.** This is the central bet. It gives change streams on a single node — the
 motivating requirement — because the log exists whether or not a peer ever
-existed. It also makes the M2 embedding pipeline a plain change-stream
+existed. It also made the embedding pipeline a plain change-stream
 subscriber rather than a scheduler, and gives M4 replication a ready-made
 source.
 
@@ -358,6 +358,78 @@ the guarantee or refusing the feature outright.
 
 ---
 
+## ADR-021 — Local embeddings are opt-in, not the default
+
+**Decision.** The default provider is `byo` (client-supplied vectors). In-process
+ONNX inference lives behind a `local-embeddings` cargo feature, off by default,
+and is *rejected at configuration time* in a build that lacks it.
+
+**Why.** `fastembed` pulls native ONNX Runtime **and**, by default, OpenSSL. That
+would undo the pure-Rust property that motivated redb over RocksDB (ADR-001) and
+`rust_crypto` over `aws_lc_rs` (ADR-016), and roughly triples the image. A
+zero-config default that quietly costs cross-compilation, a native toolchain and
+hundreds of megabytes is not zero-cost.
+
+**Why rejection happens at configuration time.** A `local` provider in a build
+without the feature fails identically forever. Failing when the configuration is
+written surfaces it to the person who can fix it; failing on the first document
+write surfaces it to traffic.
+
+**Consequence.** Out of the box, embedding needs a remote provider or
+client-supplied vectors. `--features local-embeddings` restores the planned
+behaviour. Recorded as a deliberate departure in [Deviations](deviations.md).
+
+---
+
+## ADR-022 — The vector index is a candidate source, not a source of truth
+
+**Decision.** The HNSW graph supplies *candidates only*. Every candidate is
+re-scored from the vector currently in storage, and a candidate whose record no
+longer exists is skipped. The graph is never consulted for a score.
+
+**Why this matters more than it looks.** It is the single property that makes a
+*cached, deliberately stale* index safe. A stale secondary index returns wrong
+documents, because it is authoritative for what matched. A stale vector index
+cannot: a deleted document is skipped, and an updated one scores by its new
+vector. The only residue is that a very recently added document may not be found
+yet — bounded recall loss on new data, never incorrect data.
+
+**What it buys.** The index can be rebuilt on an interval rather than maintained
+transactionally on the write path. Maintaining an HNSW graph inside the write
+transaction would put O(log n) graph mutation — and a lock — in front of every
+insert, for a structure that is only ever an optimisation.
+
+**Consequence.** A rebuild interval (30 s) and a size threshold (2000 vectors)
+are tunable policy, not correctness parameters. Getting them wrong makes search
+slower or less fresh; it cannot make search wrong. `IndexCache` owns both, in
+one place, rather than letting the decision spread through the search path.
+
+---
+
+## ADR-023 — No approximate index for the `dot` metric
+
+**Decision.** Dot-product collections always take the exact scan.
+
+**Why.** `anndists::DistDot` — the distance implementation behind `hnsw_rs` —
+computes `1 - dot` and asserts the result is non-negative. That holds only for
+unit-length vectors. A real embedding would trip the assertion and **abort the
+process**, turning a search into a server crash.
+
+**Why not normalize on the way in.** It would work, and it would silently change
+what the collection means: a dot-product search over normalized vectors *is*
+cosine similarity. Redefining a user's chosen metric to make an optimisation
+available is the wrong trade.
+
+**Consequence.** `dot` collections are O(n) per query, with no recall loss. The
+limitation is in the type system's reach — `HnswIndex::supports(metric)` — not a
+runtime surprise.
+
+**Note.** This was found by testing the metric rather than trusting the crate. It
+is the strongest argument in the project so far for the measure-don't-assume rule
+in [Testing](testing.md).
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |
@@ -366,6 +438,9 @@ the guarantee or refusing the feature outright.
 | `keyenc` lives in `kimmy-storage` | Lives in `kimmy-core` | `kimmy-query` needs the comparison semantics; putting both in core avoids query→storage coupling |
 | Node identity in a file beside the data | Inside the database file | Copying or restoring carries identity with it; one source of truth |
 | Flat-then-HNSW vector index | HNSW from the start | User preference, taken during planning |
+| HNSW via `hnswlib-rs` | `hnsw_rs` | `hnswlib-rs` requires **nightly** Rust — its `corenn-kernels` dependency uses `#![feature(f16)]`. Named in the plan without checking |
+| Graph tombstones for deletes | Skip missing records at read time | ADR-022 — the graph is a candidate source, so a stale node costs nothing |
+| `fastembed` local ONNX as the default provider | `byo` is the default | ADR-021 |
 
 ---
 

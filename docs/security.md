@@ -107,7 +107,7 @@ A grant is a set of actions over a set of collections:
 | `read` | Get, find, count, list |
 | `write` | Insert, replace, update, delete |
 | `watch` | Open a change stream |
-| `search` | Vector and hybrid search (M2) |
+| `search` | Vector and hybrid search. Implied by `read` but grantable alone, so an agent can search without reading raw documents |
 | `admin` | Create/drop collections, manage users |
 
 ### Implication
