@@ -348,6 +348,38 @@ impl crate::Engine {
     pub fn list_indexes(&self, db: &str, collection: &str) -> Result<Vec<IndexMeta>> {
         Ok(self.get_collection(db, collection)?.indexes)
     }
+
+    /// Document keys an index range points at.
+    ///
+    /// These are **candidates**, not results. An index says which documents
+    /// *might* match; the caller must re-apply the full filter.
+    pub fn index_candidates(
+        &self,
+        coll: &crate::CollectionMeta,
+        index_id: u32,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        scan_range(self.db(), coll.id, index_id, lower, Some(upper))
+    }
+
+    /// Fetch a document by its already-encoded key.
+    ///
+    /// Index entries store the encoded `_id`, and `keyenc` is one-way — but the
+    /// documents table is keyed by that same encoding, so a candidate can be
+    /// resolved without ever decoding it.
+    pub fn get_by_encoded_key(
+        &self,
+        coll: &crate::CollectionMeta,
+        key: &[u8],
+    ) -> Result<Option<Document>> {
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        match docs.get((coll.id.0, key))? {
+            Some(raw) => Ok(crate::codec::decode_doc_record(raw.value())?.document()?),
+            None => Ok(None),
+        }
+    }
 }
 
 /// Key range covering every entry belonging to one index.
@@ -646,5 +678,259 @@ mod tests {
     fn an_empty_field_list_is_rejected() {
         let (engine, _coll, _dir) = engine();
         assert!(engine.create_index("app", "docs", vec![], false, None).is_err());
+    }
+
+    #[test]
+    fn coordinated_enforcement_is_refused_until_clustering_exists() {
+        // Silently downgrading to a weaker guarantee than the caller asked for
+        // would be worse than failing.
+        let (engine, _coll, _dir) = engine();
+        let err = engine.create_index_with(
+            "app",
+            "docs",
+            vec![IndexField::ascending("email")],
+            true,
+            Enforcement::Coordinated,
+            None,
+        );
+        assert!(matches!(err, Err(StorageError::Core(CoreError::UnsupportedOperator(_)))));
+    }
+
+    // -----------------------------------------------------------------------
+    // The invariant the whole feature rests on
+    // -----------------------------------------------------------------------
+
+    /// Documents matching a filter, found by a full collection scan.
+    fn by_scan(engine: &Engine, coll: &CollectionMeta, query: &Document) -> Vec<i64> {
+        let filter = kimmy_query::filter::parse(query).unwrap();
+        let mut ids = Vec::new();
+        engine
+            .for_each_doc(coll, |id, doc| {
+                if kimmy_query::filter::matches(&filter, &doc)
+                    && let DocId::Int64(n) = id
+                {
+                    ids.push(n);
+                }
+                Ok(true)
+            })
+            .unwrap();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The same, found through whichever index the planner chooses.
+    ///
+    /// Returns `None` when no index applies, so the caller can tell "the index
+    /// path agreed" from "the index path never ran".
+    fn by_index(engine: &Engine, coll: &CollectionMeta, query: &Document) -> Option<Vec<i64>> {
+        let filter = kimmy_query::filter::parse(query).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes)?;
+
+        let candidates =
+            engine.index_candidates(coll, plan.index_id, &plan.lower, &plan.upper).unwrap();
+
+        let mut ids = Vec::new();
+        for key in candidates {
+            // The recheck. An index narrows; only the filter decides.
+            if let Some(doc) = engine.get_by_encoded_key(coll, &key).unwrap()
+                && kimmy_query::filter::matches(&filter, &doc)
+                && let Ok(DocId::Int64(n)) = DocId::try_from_bson(doc.get("_id").unwrap())
+            {
+                ids.push(n);
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        Some(ids)
+    }
+
+    /// A dataset chosen to exercise the cases an index most easily gets wrong:
+    /// missing fields, nulls, arrays, mixed numeric types, and duplicates.
+    fn seeded() -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let (engine, coll, dir) = engine();
+        let docs = vec![
+            doc! { "_id": 1i64, "a": 1, "n": 10, "tags": ["x", "y"] },
+            doc! { "_id": 2i64, "a": 1, "n": 20, "tags": ["y"] },
+            doc! { "_id": 3i64, "a": 2, "n": 10, "tags": [] },
+            doc! { "_id": 4i64, "a": 2, "n": 30 },
+            doc! { "_id": 5i64, "a": Bson::Null, "n": 10 },
+            doc! { "_id": 6i64, "n": 40, "tags": "x" },
+            doc! { "_id": 7i64, "a": 1.0, "n": 10.0 },
+            doc! { "_id": 8i64, "a": 1, "n": 20, "tags": ["x", "x"] },
+        ];
+        for d in docs {
+            engine.insert(&coll, d).unwrap();
+        }
+        (engine, coll, dir)
+    }
+
+    #[test]
+    fn index_backed_results_are_identical_to_a_full_scan() {
+        let (engine, _coll, _dir) = seeded();
+
+        // Build several indexes over the same data so the planner has choices.
+        for fields in [
+            vec![IndexField::ascending("a")],
+            vec![IndexField::ascending("n")],
+            vec![IndexField::ascending("a"), IndexField::ascending("n")],
+            vec![IndexField::ascending("tags")],
+            vec![IndexField::descending("n")],
+        ] {
+            engine.create_index("app", "docs", fields, false, None).unwrap();
+        }
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let queries = vec![
+            doc! { "a": 1 },
+            doc! { "a": 1.0 },
+            doc! { "a": 2 },
+            doc! { "a": Bson::Null },
+            doc! { "a": 999 },
+            doc! { "n": { "$gt": 15 } },
+            doc! { "n": { "$gte": 10, "$lt": 30 } },
+            doc! { "n": { "$lte": 10 } },
+            doc! { "a": 1, "n": 20 },
+            doc! { "a": 1, "n": { "$gt": 15 } },
+            doc! { "a": 2, "n": { "$lt": 100 } },
+            doc! { "tags": "x" },
+            doc! { "tags": "y" },
+            doc! { "tags": ["x", "y"] },
+            doc! { "a": 1, "$or": [ { "n": 10 }, { "n": 20 } ] },
+            doc! { "a": 1, "n": { "$ne": 20 } },
+            doc! { "a": 1, "tags": "x" },
+        ];
+
+        let mut exercised = 0;
+        for query in &queries {
+            let scan = by_scan(&engine, &coll, query);
+            if let Some(indexed) = by_index(&engine, &coll, query) {
+                assert_eq!(
+                    indexed, scan,
+                    "index and scan disagree for {query:?} — the index path is wrong"
+                );
+                exercised += 1;
+            }
+        }
+        assert!(
+            exercised >= 12,
+            "only {exercised} queries used an index; test is not proving much"
+        );
+    }
+
+    /// A descending index must give the same answers as a scan.
+    ///
+    /// It is the *only* index here, so the planner cannot quietly sidestep it
+    /// by preferring an ascending one — which is exactly what hid a planner
+    /// bug from the broader test above until mutation testing found it.
+    #[test]
+    fn a_descending_index_agrees_with_a_scan_including_two_sided_ranges() {
+        let (engine, _coll, _dir) = seeded();
+        engine.create_index("app", "docs", vec![IndexField::descending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        for query in [
+            doc! { "n": 10 },
+            doc! { "n": { "$gt": 15 } },
+            doc! { "n": { "$lte": 10 } },
+            // Two-sided: a bound encoded in the wrong direction makes this
+            // range empty rather than merely wide.
+            doc! { "n": { "$gte": 10, "$lte": 30 } },
+            doc! { "n": { "$gt": 10, "$lt": 40 } },
+        ] {
+            let scan = by_scan(&engine, &coll, &query);
+            assert!(!scan.is_empty(), "{query:?} should match something, or it proves nothing");
+            if let Some(indexed) = by_index(&engine, &coll, &query) {
+                assert_eq!(indexed, scan, "descending index disagreed for {query:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn index_backed_results_stay_correct_as_documents_change() {
+        // Maintenance bugs surface as stale entries, which show up as an index
+        // result that no longer matches the scan.
+        let (engine, _coll, _dir) = seeded();
+        engine.create_index("app", "docs", vec![IndexField::ascending("a")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let check = |label: &str| {
+            for query in [doc! { "a": 1 }, doc! { "a": 2 }, doc! { "a": 7 }] {
+                let scan = by_scan(&engine, &coll, &query);
+                if let Some(indexed) = by_index(&engine, &coll, &query) {
+                    assert_eq!(indexed, scan, "{label}: disagreement for {query:?}");
+                }
+            }
+        };
+
+        check("initial");
+        engine.replace(&coll, &DocId::Int64(1), doc! { "a": 7 }, false).unwrap();
+        check("after replace");
+        engine.delete(&coll, &DocId::Int64(2)).unwrap();
+        check("after delete");
+        engine.insert(&coll, doc! { "_id": 99i64, "a": 1 }).unwrap();
+        check("after insert");
+        engine.delete(&coll, &DocId::Int64(3)).unwrap();
+        engine.insert(&coll, doc! { "_id": 3i64, "a": 2 }).unwrap();
+        check("after delete and reinsert");
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            // Each case builds a real engine, so the count is modest; the
+            // deterministic matrix above carries the breadth.
+            #![proptest_config(ProptestConfig::with_cases(48))]
+
+            /// For any dataset and any equality or range filter, going through
+            /// the index must return exactly what a full scan returns.
+            #[test]
+            fn an_index_never_changes_a_query_result(
+                values in prop::collection::vec(
+                    prop_oneof![
+                        Just(Bson::Null),
+                        (0i32..5).prop_map(Bson::Int32),
+                        (0i64..5).prop_map(|n| Bson::Double(n as f64)),
+                        prop::collection::vec(0i32..3, 0..3)
+                            .prop_map(|v| Bson::Array(v.into_iter().map(Bson::Int32).collect())),
+                    ],
+                    1..12,
+                ),
+                probe in 0i32..5,
+                // A two-sided range matters: with only a lower bound, a
+                // mis-encoded bound makes the range too *wide*, which the
+                // recheck silently repairs. Both ends are needed to expose a
+                // range that is too narrow.
+                span in 0i32..4,
+                shape in 0u8..3,
+                descending in any::<bool>(),
+            ) {
+                let (engine, coll, _dir) = engine();
+                for (i, v) in values.iter().enumerate() {
+                    engine.insert(&coll, doc! { "_id": i as i64, "a": v.clone() }).unwrap();
+                }
+                let field = if descending {
+                    IndexField::descending("a")
+                } else {
+                    IndexField::ascending("a")
+                };
+                engine.create_index("app", "docs", vec![field], false, None).unwrap();
+                let coll = engine.get_collection("app", "docs").unwrap();
+
+                let query = match shape {
+                    0 => doc! { "a": probe },
+                    1 => doc! { "a": { "$gte": probe } },
+                    // Two-sided: the shape that catches a too-narrow range.
+                    _ => doc! { "a": { "$gte": probe, "$lte": probe + span } },
+                };
+
+                let scan = by_scan(&engine, &coll, &query);
+                if let Some(indexed) = by_index(&engine, &coll, &query) {
+                    prop_assert_eq!(indexed, scan, "index disagreed with scan for {:?}", query);
+                }
+            }
+        }
     }
 }

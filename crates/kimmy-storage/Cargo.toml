@@ -20,6 +20,9 @@ parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 
 [dev-dependencies]
+# Dev-only: lets the index tests check that an index-backed result is
+# identical to a full scan. No production dependency in this direction.
+kimmy-query.workspace = true
 proptest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

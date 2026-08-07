@@ -994,6 +994,7 @@ version = "0.1.0"
 dependencies = [
  "bson",
  "kimmy-core",
+ "kimmy-query",
  "parking_lot",
  "proptest",
  "redb",
