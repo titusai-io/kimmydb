@@ -73,6 +73,14 @@ impl From<CoreError> for ApiError {
             CoreError::DuplicateKey(_) => {
                 ApiError::new(StatusCode::CONFLICT, "duplicate_key", e.to_string())
             }
+            CoreError::UniqueViolation { .. } => {
+                ApiError::new(StatusCode::CONFLICT, "unique_violation", e.to_string())
+            }
+            // Reserved-but-unbuilt capability. 501 says "this will exist";
+            // 400 would wrongly imply the caller made a mistake.
+            CoreError::Unsupported(_) => {
+                ApiError::new(StatusCode::NOT_IMPLEMENTED, "not_implemented", e.to_string())
+            }
             CoreError::InvalidName { .. }
             | CoreError::InvalidQuery(_)
             | CoreError::InvalidUpdate(_)

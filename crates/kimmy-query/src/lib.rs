@@ -7,10 +7,15 @@
 #![allow(dead_code)]
 
 pub mod filter;
-pub mod path;
+
+/// Dot-path resolution. Lives in `kimmy-core` because index maintenance in
+/// `kimmy-storage` needs it too; re-exported here for convenience.
+pub use kimmy_core::path;
+pub mod plan;
 pub mod shape;
 pub mod update;
 
 pub use filter::{Condition, Filter, matches};
+pub use plan::{IndexPlan, choose};
 pub use shape::{Projection, SortKey};
 pub use update::Update;

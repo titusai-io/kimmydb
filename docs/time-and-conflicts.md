@@ -261,6 +261,24 @@ updates, counters that never lose an increment, or "check then act" logic.
 If you need any of those, you need coordination, and coordination is exactly
 what a leaderless design forgoes.
 
+### Unique indexes are a per-index choice
+
+Uniqueness is the sharpest example. It is a *global* invariant — legality
+depends on what every other node is concurrently doing — and is provably not
+maintainable without coordination. So it is an explicit per-index mode:
+
+| `enforcement` | Reach | Availability |
+|---|---|---|
+| `local` (default) | The accepting node. Cross-node violations are **detected after merge**, not prevented | Full |
+| `coordinated` (📋 M4) | Cluster-wide, by reserving the value at its owning node | That value's writes fail while its owner is unreachable |
+
+**`_id` needs none of this.** Two nodes inserting the same `_id` collide on the
+same key and converge to one document, so primary-key uniqueness holds by
+construction. The residue is that the losing insert's content is discarded
+where a client might have expected a `409` — a lost-update, not a duplicate.
+
+Full reasoning in [ADR-020](decisions.md).
+
 ---
 
 ## Status

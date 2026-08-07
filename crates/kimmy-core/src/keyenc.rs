@@ -177,6 +177,33 @@ pub fn encode_compound(values: &[Bson]) -> Result<Vec<u8>> {
     Ok(out)
 }
 
+/// Encode a compound key where individual components may sort descending.
+///
+/// A descending component has every byte of its encoding inverted. That
+/// reverses its order *exactly* — but only because this encoding is
+/// **prefix-free**: no encoding is ever a proper prefix of another.
+///
+/// Prefix-freeness is what makes the trick sound. For a code with prefixes, if
+/// `A` is a prefix of `B` then `A < B`, and `flip(A)` is still a prefix of
+/// `flip(B)`, so `flip(A) < flip(B)` — the order is *preserved* rather than
+/// reversed, and a descending index would silently sort ascending. Fixed-width
+/// encodings share a length, variable-width ones are terminated, and composites
+/// end with a terminator that cannot appear where an element starts, so the
+/// property holds throughout.
+pub fn encode_compound_ordered(components: &[(Bson, bool)]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(16 * components.len());
+    for (value, descending) in components {
+        let start = out.len();
+        encode_into(value, &mut out)?;
+        if *descending {
+            for byte in &mut out[start..] {
+                *byte = !*byte;
+            }
+        }
+    }
+    Ok(out)
+}
+
 /// Encode the exact sign/exponent/mantissa form.
 ///
 /// Because every numeric type reduces to the same normalized form, `5i32`,
@@ -368,6 +395,45 @@ mod tests {
     }
 
     #[test]
+    fn descending_components_reverse_their_order() {
+        let asc = |a: i32, b: i32| {
+            encode_compound_ordered(&[(Bson::Int32(a), false), (Bson::Int32(b), false)]).unwrap()
+        };
+        let desc = |a: i32, b: i32| {
+            encode_compound_ordered(&[(Bson::Int32(a), false), (Bson::Int32(b), true)]).unwrap()
+        };
+
+        // Leading component ascending in both.
+        assert!(asc(1, 0) < asc(2, 0));
+        assert!(desc(1, 0) < desc(2, 0));
+
+        // Trailing component: ascending normally, reversed when descending.
+        assert!(asc(1, 1) < asc(1, 2));
+        assert!(desc(1, 2) < desc(1, 1), "a descending component must invert");
+    }
+
+    #[test]
+    fn descending_works_for_variable_width_components() {
+        // Strings are terminated rather than fixed-width, so this exercises the
+        // prefix-free property the inversion depends on.
+        let d = |s: &str| encode_compound_ordered(&[(Bson::String(s.into()), true)]).unwrap();
+        assert!(d("b") < d("a"));
+        assert!(d("abc") < d("ab"), "a longer string must sort first descending");
+        assert!(d("ab\u{0}c") < d("ab"));
+    }
+
+    #[test]
+    fn descending_handles_mixed_types_and_numeric_edges() {
+        let d = |v: Bson| encode_compound_ordered(&[(v, true)]).unwrap();
+        // Canonical order reversed: MaxKey first, MinKey last.
+        assert!(d(Bson::MaxKey) < d(Bson::MinKey));
+        assert!(d(Bson::Int64(i64::MAX)) < d(Bson::Int64(i64::MIN)));
+        assert!(d(Bson::Double(f64::INFINITY)) < d(Bson::Double(f64::NAN)));
+        // Equal values across types still collide, ascending or descending.
+        assert_eq!(d(Bson::Int32(5)), d(Bson::Double(5.0)));
+    }
+
+    #[test]
     fn compound_keys_order_by_leading_component() {
         let first = encode_compound(&[Bson::Int32(1), Bson::String("zzz".into())]).unwrap();
         let second = encode_compound(&[Bson::Int32(2), Bson::String("aaa".into())]).unwrap();
@@ -444,6 +510,40 @@ mod tests {
                 if canonical_cmp(&a, &b) == Ordering::Equal {
                     prop_assert_eq!(encode(&a).unwrap(), encode(&b).unwrap());
                 }
+            }
+
+            /// Inverting a component's bytes must reverse its order exactly.
+            ///
+            /// This is the property descending index fields rest on, and it
+            /// only holds because the encoding is prefix-free.
+            #[test]
+            fn descending_reverses_order_for_any_value(a in any_bson(), b in any_bson()) {
+                let asc = |v: &Bson| encode_compound_ordered(&[(v.clone(), false)]).unwrap();
+                let desc = |v: &Bson| encode_compound_ordered(&[(v.clone(), true)]).unwrap();
+                prop_assert_eq!(
+                    desc(&a).cmp(&desc(&b)),
+                    asc(&a).cmp(&asc(&b)).reverse(),
+                    "descending did not invert for {:?} vs {:?}", a, b
+                );
+            }
+
+            /// A mixed-direction compound key must order by each component's
+            /// own direction, leading component first.
+            #[test]
+            fn mixed_direction_compound_keys_order_per_component(
+                a1 in any_bson(), a2 in any_bson(),
+                b1 in any_bson(), b2 in any_bson(),
+                d1 in any::<bool>(), d2 in any::<bool>(),
+            ) {
+                let dir = |o: Ordering, desc: bool| if desc { o.reverse() } else { o };
+                let expected = match dir(canonical_cmp(&a1, &b1), d1) {
+                    Ordering::Equal => dir(canonical_cmp(&a2, &b2), d2),
+                    other => other,
+                };
+                let key = |x: &Bson, y: &Bson| {
+                    encode_compound_ordered(&[(x.clone(), d1), (y.clone(), d2)]).unwrap()
+                };
+                prop_assert_eq!(key(&a1, &a2).cmp(&key(&b1, &b2)), expected);
             }
 
             /// Concatenation must not create ambiguity between different

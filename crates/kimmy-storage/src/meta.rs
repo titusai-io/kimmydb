@@ -5,6 +5,7 @@
 //! able to read it directly when diagnosing a broken data directory is worth
 //! more than the space.
 
+pub use kimmy_core::{Enforcement, IndexField, IndexMeta};
 use kimmy_core::{Hlc, ids::CollectionId};
 use serde::{Deserialize, Serialize};
 
@@ -77,48 +78,6 @@ impl CollectionMeta {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexMeta {
-    pub id: u32,
-    pub name: String,
-    pub fields: Vec<IndexField>,
-    #[serde(default)]
-    pub unique: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexField {
-    /// Dot path into the document, e.g. `"address.city"`.
-    pub path: String,
-    #[serde(default)]
-    pub descending: bool,
-}
-
-impl IndexField {
-    pub fn ascending(path: impl Into<String>) -> Self {
-        Self { path: path.into(), descending: false }
-    }
-
-    pub fn descending(path: impl Into<String>) -> Self {
-        Self { path: path.into(), descending: true }
-    }
-}
-
-impl IndexMeta {
-    /// Conventional Mongo-style name, e.g. `age_1_name_-1`.
-    pub fn default_name(fields: &[IndexField]) -> String {
-        fields
-            .iter()
-            .map(|f| format!("{}_{}", f.path, if f.descending { -1 } else { 1 }))
-            .collect::<Vec<_>>()
-            .join("_")
-    }
-
-    pub fn paths(&self) -> impl Iterator<Item = &str> {
-        self.fields.iter().map(|f| f.path.as_str())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,9 +94,20 @@ mod tests {
             name: "age_1".into(),
             fields: vec![IndexField::ascending("age")],
             unique: false,
+            enforcement: Default::default(),
         });
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CollectionMeta>(&text).unwrap(), m);
+    }
+
+    #[test]
+    fn index_metadata_written_before_enforcement_existed_defaults_to_local() {
+        // The field was added once the cross-node semantics were settled; older
+        // metadata must keep loading, and must not silently claim a stronger
+        // guarantee than it was created with.
+        let json = r#"{"id":0,"name":"email_1","fields":[{"path":"email"}],"unique":true}"#;
+        let index: IndexMeta = serde_json::from_str(json).unwrap();
+        assert_eq!(index.enforcement, Enforcement::Local);
     }
 
     fn push_index(m: &mut CollectionMeta, path: &str) -> u32 {
@@ -147,6 +117,7 @@ mod tests {
             name: format!("{path}_1"),
             fields: vec![IndexField::ascending(path)],
             unique: false,
+            enforcement: Default::default(),
         });
         id
     }

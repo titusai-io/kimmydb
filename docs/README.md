@@ -46,6 +46,7 @@ graph TD
 
     INT --> STO["Storage<br/>on-disk layout · codecs"]
     INT --> KE["Key Encoding<br/>order-preserving bytes"]
+    INT --> IX["Indexes<br/>maintenance · planning · unique"]
     INT --> TC["Time and Conflicts<br/>HLC · last-writer-wins"]
     INT --> OPL["Oplog<br/>the shared log"]
 
@@ -62,6 +63,7 @@ graph TD
 | [Architecture](architecture.md) | Crate layout, layering, request lifecycle, the oplog spine |
 | [Storage](storage.md) | redb tables, on-disk record formats, tombstones, durability |
 | [Key Encoding](key-encoding.md) | Order-preserving byte encoding — the subtlest component |
+| [Indexes](indexes.md) | Index maintenance, the planner, multikey and unique semantics |
 | [Time & Conflicts](time-and-conflicts.md) | Hybrid logical clocks, last-writer-wins, the consistency model |
 | [Oplog](oplog.md) | The shared log, its three consumers, retention |
 | [Change Streams](change-streams.md) | The replay/live splice, resume tokens, lag recovery |
@@ -92,7 +94,7 @@ running server, not merely compiled.
 | Multiple users | ✅ Working | Argon2id, JWT, per-collection RBAC |
 | HTTP + WebSocket API | ✅ Working | Also health and Prometheus metrics |
 | Docker container | ✅ Working | ~93 MB, graceful SIGTERM shutdown |
-| **Secondary indexes** | ⛔ Not implemented | **Every query is a collection scan** |
+| Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
 | Vector search & auto-embeddings | 📋 Planned (M2) | Shadow collections, HNSW |
 | Built-in MCP server | 📋 Planned (M3) | Streamable HTTP, RBAC-gated tools |
 | Gossip clustering | 📋 Planned (M4) | SWIM membership, oplog anti-entropy |
