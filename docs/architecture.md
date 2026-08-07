@@ -44,7 +44,7 @@ graph LR
     OPL[(Oplog)]
 
     OPL --> CS["Change streams<br/><i>✅ working</i>"]
-    OPL --> EMB["Embedding pipeline<br/><i>📋 M2</i>"]
+    OPL --> EMB["Embedding pipeline<br/>extract → chunk → embed"]
     OPL --> AE["Cluster anti-entropy<br/><i>📋 M4</i>"]
 
     CS --> WS[WebSocket clients]
@@ -83,7 +83,7 @@ graph TB
 
     subgraph DATA["Data"]
         STO["kimmy-storage<br/>redb · documents · oplog · change streams"]
-        VEC["kimmy-vector<br/>📋 M2"]
+        VEC["kimmy-vector<br/>embeddings · HNSW · search"]
     end
 
     subgraph DIST["Distribution"]
@@ -114,7 +114,7 @@ graph TB
 | `kimmy-auth` | Password hashing, tokens, the authorization decision | Know about HTTP |
 | `kimmy-api` | Routing, JSON⇄BSON, WebSocket, status codes | Contain business logic |
 | `kimmy-cluster` | Peer discovery; membership and replication in M4 | — |
-| `kimmy-vector` | Embedding providers and vector index (M2) | — |
+| `kimmy-vector` | Embedding providers, the worker, HNSW, index selection, search | Sit on the write path |
 | `kimmy-mcp` | MCP tools and resources (M3) | Re-implement authorization |
 | `kimmyd` | Configuration, wiring, lifecycle | — |
 | `kimmy-cli` | Terminal client (M5) | — |

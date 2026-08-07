@@ -6,6 +6,7 @@ use axum::extract::FromRequestParts;
 use axum::http::request::Parts;
 use kimmy_auth::{Action, Principal, TokenIssuer, UserStore};
 use kimmy_storage::Engine;
+use kimmy_vector::IndexCache;
 
 use crate::error::ApiError;
 
@@ -13,6 +14,10 @@ pub struct AppState {
     pub engine: Arc<Engine>,
     pub users: UserStore,
     pub tokens: TokenIssuer,
+    /// Approximate vector indexes, built lazily and shared across requests.
+    /// Held here rather than rebuilt per query — a graph is O(n log n) to
+    /// construct, which would cost more than the exact scan it replaces.
+    pub vectors: IndexCache,
     /// When set, every request runs as a superuser. Guarded at startup so it
     /// cannot combine with a non-loopback bind.
     pub insecure_no_auth: bool,

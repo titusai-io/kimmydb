@@ -14,7 +14,7 @@ graph LR
     M0["<b>M0</b> ✅<br/>skeleton · config<br/>container · CI"]
     M1["<b>M1</b> ✅<br/>storage · query<br/>streams · auth · API"]
     IDX["<b>indexes</b> ✅<br/>the last<br/>M1 item"]
-    M2["<b>M2</b> 📋<br/>vectors and<br/>auto-embeddings"]
+    M2["<b>M2</b> ✅<br/>vectors and<br/>auto-embeddings"]
     M3["<b>M3</b> 📋<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> 📋<br/>gossip<br/>clustering"]
     M5["<b>M5</b> 📋<br/>hardening"]
@@ -24,13 +24,14 @@ graph LR
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
     style IDX fill:#2f5d3a,color:#fff
+    style M2 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0** | Workspace, core types, HLC, config, Docker, CI | ✅ Complete |
 | **M1** | Storage, CRUD, query, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
-| **M2** | Auto-embeddings, HNSW, vector and hybrid search | 📋 Planned |
+| **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server | 📋 Planned |
 | **M4** | Gossip membership, discovery, anti-entropy replication | 📋 Planned |
 | **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 📋 Planned |
@@ -59,21 +60,14 @@ Neither affects correctness — an unused index only costs time.
 
 ---
 
-## M2 — Vectors and auto-embeddings
+## M2 — Vectors and auto-embeddings ✅
 
-Per-collection configuration creates a shadow collection `{coll}.__vectors`:
+**Built.** Full detail in [Vectors](vectors.md); this section records what the
+plan said and where the build departed from it.
 
-```json
-{ "vector": {
-    "enabled": true,
-    "fields": ["title", "body"],
-    "provider": "local",
-    "model": "bge-small-en-v1.5",
-    "dim": 384,
-    "metric": "cosine",
-    "chunk": { "max_tokens": 512, "overlap": 64 }
-}}
-```
+Enabling embedding on a collection creates a shadow collection
+`{coll}.__vectors`, maintained by a worker that is an ordinary change-stream
+subscriber:
 
 ```mermaid
 graph LR
@@ -88,28 +82,35 @@ graph LR
     style S fill:#2d3748,color:#fff
 ```
 
-The worker being a plain change-stream subscriber is the payoff from the oplog
-design: "keep vectors in sync" reduces to "consume the log", which already
-works, including resume-after-restart.
+The worker being a plain change-stream subscriber was the payoff from the oplog
+design, and it held: "keep vectors in sync" reduced to "consume the log", which
+already worked, including resume-after-restart and backfill of a collection that
+predates the configuration.
 
-**Off the write path.** Writes must never block on model inference. The API
-returns as soon as the oplog entry is durable; embedding happens behind it. Each
-vector record carries its source document's HLC, so staleness is detectable and
-re-embedding is idempotent — if a document's HLC exceeds its vector's, it is
-queued.
+**Off the write path,** as planned. The API returns as soon as the oplog entry
+is durable. Each vector record carries its source document's HLC, so staleness
+is a comparison rather than a state machine, and re-embedding is idempotent.
 
-| Piece | Plan |
-|---|---|
-| Providers | `EmbeddingProvider` trait; `fastembed` (local ONNX, no network) is the zero-config default; OpenAI / Voyage / Ollama / custom HTTP |
-| Index | `VectorIndex` trait; HNSW via `hnswlib-rs` — it decouples the graph from vector storage, so redb stays the source of truth, and supports tombstoned deletes |
-| Persistence | Periodic graph snapshot plus replay of newer vector entries on startup |
-| Deletes | Tombstone in the graph; background rebuild past a tombstone-ratio threshold |
-| Search | `POST .../vector_search` (k-NN + filter) and `.../hybrid_search` (keyword + vector fused by Reciprocal Rank Fusion) |
-| Replication | Vectors ride the oplog as data — recomputing per node is wasteful and, with remote providers, not deterministic |
+| Piece | Planned | Built |
+|---|---|---|
+| Providers | `fastembed` local ONNX as the zero-config default | ✅ trait + OpenAI / Ollama / custom HTTP. **`byo` is the default; local is feature-gated** — its native ONNX + OpenSSL dependencies would undo the pure-Rust property ([Deviations](deviations.md)) |
+| Index | HNSW via `hnswlib-rs` | ✅ HNSW via **`hnsw_rs`** — `hnswlib-rs` requires nightly Rust (`#![feature(f16)]` in a dependency) |
+| Index selection | — | ✅ `IndexCache` chooses approximate above 2000 vectors, exact below, with a 30 s rebuild interval |
+| Persistence | Snapshot the graph, replay newer entries on startup | ⛔ **Not built.** In-memory only; a restart rebuilds lazily. Correctness does not depend on it |
+| Deletes | Tombstone in the graph, rebuild past a ratio threshold | ✅ Handled differently: the graph supplies candidates only, and a candidate whose record is gone is skipped. No tombstoning needed |
+| Search | `vector_search` + `hybrid_search` with RRF | ✅ Both, with filter composition against the query language |
+| Replication | Vectors ride the oplog as data | 📋 M4 — the records are stored like any document, so this needs no vector-specific work |
+| `$vectorSearch` stage | A pipeline stage | ⛔ Not built; search is its own endpoint |
 
-Open questions: pre-filter versus post-filter selection for filtered k-NN;
-whether to ship a slim image variant without the bundled ONNX model (it adds
-hundreds of MB).
+**Resolved open questions.** Filtered k-NN post-filters, widening the graph
+search 8× to compensate — a pre-filter would need the graph to know about
+document state it deliberately does not track. The slim-image question dissolved
+once local embeddings became opt-in: the default image carries no model at all.
+
+**The one thing that surprised.** `anndists::DistDot` asserts `1 - dot >= 0`,
+which only holds for unit vectors — a real embedding would have aborted the
+process. Dot-product collections take the exact path. Found by testing the
+metric rather than trusting it.
 
 ---
 

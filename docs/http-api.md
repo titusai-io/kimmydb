@@ -306,8 +306,7 @@ hash so the timing matches. Otherwise the endpoint is a user-enumeration oracle.
 
 | | |
 |---|---|
-| Aggregation pipeline | 📋 Planned |
-| Vector / hybrid search | 📋 M2 |
+| Aggregation pipeline | 📋 Planned — including the `$vectorSearch` stage |
 | MCP endpoint (`/mcp`) | 📋 M3 |
 | Database- and cluster-scoped watch routes | Implemented in storage, no route yet |
 | TLS | 📋 M5 — terminate at a proxy for now |

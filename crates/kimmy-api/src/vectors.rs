@@ -6,6 +6,7 @@ use axum::extract::{Path, State};
 use axum::{Json, http::StatusCode};
 use kimmy_auth::Action;
 use kimmy_core::VectorConfig;
+use kimmy_vector::Access;
 use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -26,6 +27,8 @@ pub async fn configure_vectors(
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Admin, &db, Some(&coll))?;
     let meta = state.engine.configure_vectors(&db, &coll, body)?;
+    // A changed dimension or metric makes any cached graph meaningless.
+    invalidate_index(&state, &db, &coll);
     Ok(Json(json!({
         "collection": meta.name,
         "vector": meta.vector,
@@ -57,7 +60,13 @@ pub async fn disable_vectors(
     axum::extract::Query(q): axum::extract::Query<DisableQuery>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Admin, &db, Some(&coll))?;
+    // Resolved *before* the call: dropping the vectors also drops the shadow
+    // collection, and afterwards there is no id left to forget the graph under.
+    let shadow = state.engine.vector_collection(&db, &coll).ok().flatten().map(|s| s.id);
     let disabled = state.engine.disable_vectors(&db, &coll, q.drop_vectors)?;
+    if let Some(id) = shadow {
+        state.vectors.invalidate(id);
+    }
     Ok(Json(json!({ "disabled": disabled, "droppedVectors": q.drop_vectors })))
 }
 
@@ -92,9 +101,27 @@ pub async fn vector_search(
     let query = resolve_query_vector(&config, &body).await?;
     let allowed = allowed_ids(&state, &auth, &db, &coll, body.filter.as_ref())?;
 
-    let hits = search::vector_search(&state.engine, &shadow, &query, &options, allowed.as_ref())
-        .map_err(vector_error)?;
+    let hits = knn(&state, &shadow, &config, &query, &options, allowed.as_ref())?;
     Ok(Json(render(&hits)))
+}
+
+/// k-NN by whichever path the index cache selects.
+///
+/// The two paths return the same shape and score the same way — the exact scan
+/// is exhaustive, the graph walk is approximate — so callers do not branch.
+fn knn(
+    state: &SharedState,
+    shadow: &kimmy_storage::CollectionMeta,
+    config: &VectorConfig,
+    query: &[f32],
+    options: &SearchOptions,
+    allowed: Option<&HashSet<String>>,
+) -> Result<Vec<Hit>, ApiError> {
+    match state.vectors.access(&state.engine, shadow, config.metric, config.dim) {
+        Access::Approximate(index) => index.search(&state.engine, shadow, query, options, allowed),
+        Access::Exact => search::vector_search(&state.engine, shadow, query, options, allowed),
+    }
+    .map_err(vector_error)
 }
 
 pub async fn hybrid_search(
@@ -122,8 +149,7 @@ pub async fn hybrid_search(
     // a document ranked modestly by both should be able to beat one ranked
     // first by only one.
     let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
-    let dense = search::vector_search(&state.engine, &shadow, &query, &wide, allowed.as_ref())
-        .map_err(vector_error)?;
+    let dense = knn(&state, &shadow, &config, &query, &wide, allowed.as_ref())?;
     let lexical =
         search::keyword_search(&state.engine, &shadow, &text, &wide).map_err(vector_error)?;
 
@@ -229,6 +255,17 @@ fn allowed_ids(
         Ok(true)
     })?;
     Ok(Some(ids))
+}
+
+/// Drop a collection's cached graph.
+///
+/// Best-effort: if the shadow collection cannot be resolved there is nothing
+/// cached under it to forget, so a lookup failure is not worth failing the
+/// request that triggered it.
+fn invalidate_index(state: &SharedState, db: &str, coll: &str) {
+    if let Ok(Some(shadow)) = state.engine.vector_collection(db, coll) {
+        state.vectors.invalidate(shadow.id);
+    }
 }
 
 fn render(hits: &[Hit]) -> Value {

@@ -18,7 +18,8 @@ around three things that are usually awkward to have together:
 **New to the project?** Read [Architecture](architecture.md) first — it explains
 the one structural idea everything else follows from.
 
-**Trying to use it?** [HTTP API](http-api.md), then [Query Language](query-language.md).
+**Trying to use it?** [HTTP API](http-api.md), then [Query Language](query-language.md)
+and [Vectors](vectors.md).
 
 **Running it?** [Operations](operations.md), then [Security](security.md).
 
@@ -26,7 +27,8 @@ the one structural idea everything else follows from.
 planned and why, [Decisions](decisions.md) for what's already settled,
 [Testing](testing.md) for the invariants that must not break, and
 **[Deviations](deviations.md)** for where the implementation differs from what
-was asked for — the debts, in one place.
+was asked for — the debts, in one place. **[Handoff](handoff.md)** is the
+shortest path back into the work: where it stands and what is next.
 
 ---
 
@@ -51,6 +53,7 @@ graph TD
     INT --> IX["Indexes<br/>maintenance · planning · unique"]
     INT --> TC["Time and Conflicts<br/>HLC · last-writer-wins"]
     INT --> OPL["Oplog<br/>the shared log"]
+    INT --> VEC["Vectors<br/>embeddings · chunking · HNSW"]
 
     OPS --> OP["Operations<br/>config · deploy · observability"]
     OPS --> SEC["Security<br/>auth · RBAC · threat model"]
@@ -59,6 +62,7 @@ graph TD
     DEV --> DEC["Decisions<br/>what was chosen and why"]
     DEV --> TST["Testing<br/>invariants and how they are checked"]
     DEV --> DEV2["Deviations<br/>drifts and deferrals, in one place"]
+    DEV --> HO["Handoff<br/>current state · what's next"]
 ```
 
 | Document | What it covers |
@@ -69,6 +73,7 @@ graph TD
 | [Indexes](indexes.md) | Index maintenance, the planner, multikey and unique semantics |
 | [Time & Conflicts](time-and-conflicts.md) | Hybrid logical clocks, last-writer-wins, the consistency model |
 | [Oplog](oplog.md) | The shared log, its three consumers, retention |
+| [Vectors](vectors.md) | Auto-embeddings, providers, chunking, the two search paths |
 | [Change Streams](change-streams.md) | The replay/live splice, resume tokens, lag recovery |
 | [Query Language](query-language.md) | Filter and update operators, array semantics, Mongo compatibility |
 | [HTTP API](http-api.md) | Endpoint reference, request and response shapes, status codes |
@@ -78,6 +83,7 @@ graph TD
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
+| [Handoff](handoff.md) | Current state, what's next, and what needs a decision |
 
 ---
 
@@ -99,7 +105,8 @@ running server, not merely compiled.
 | HTTP + WebSocket API | ✅ Working | Also health and Prometheus metrics |
 | Docker container | ✅ Working | ~93 MB, graceful SIGTERM shutdown |
 | Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
-| Vector search & auto-embeddings | 📋 Planned (M2) | Shadow collections, HNSW |
+| Vector search & auto-embeddings | ✅ Working | Shadow collections, oplog-driven worker, HNSW above 2000 vectors |
+| Hybrid search | ✅ Working | Dense + lexical, fused by reciprocal rank fusion |
 | Built-in MCP server | 📋 Planned (M3) | Streamable HTTP, RBAC-gated tools |
 | Gossip clustering | 📋 Planned (M4) | SWIM membership, oplog anti-entropy |
 
@@ -122,7 +129,7 @@ graph LR
     T --> O[(Oplog entry)]
 
     O --> CS[Change streams<br/>WebSocket subscribers]
-    O --> EM[Embedding pipeline<br/>M2]
+    O --> EM[Embedding pipeline<br/>vectors]
     O --> AE[Cluster anti-entropy<br/>M4]
 
     style O fill:#4a5568,color:#fff
@@ -133,8 +140,8 @@ streams work here at all. In MongoDB they are a byproduct of replication, so
 they require a replica set. Here the log exists whether or not the node has
 ever seen a peer — clustering is a *consumer* of the log, not its cause.
 
-It is also why auto-embeddings (M2) need no scheduler: the embedding worker is
-an ordinary change-stream subscriber.
+It is also why auto-embeddings need no scheduler: the embedding worker is an
+ordinary change-stream subscriber. See [Vectors](vectors.md).
 
 ---
 
@@ -167,7 +174,7 @@ kimmydb/
 │   ├── kimmy-auth/      Argon2id, JWT, RBAC, user store
 │   ├── kimmy-api/       axum router, WebSocket, JSON boundary
 │   ├── kimmy-cluster/   discovery (membership lands in M4)
-│   ├── kimmy-vector/    embeddings and HNSW (M2)
+│   ├── kimmy-vector/    embeddings, HNSW, index cache, search
 │   ├── kimmy-mcp/       MCP server (M3)
 │   ├── kimmyd/          the server binary
 │   └── kimmy-cli/       terminal client (M5)

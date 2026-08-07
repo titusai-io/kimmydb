@@ -39,25 +39,100 @@ the nearest neighbour agrees with an exact scan exactly.
   collections use the exact scan. Normalizing on the way in would make it work
   but would silently change what a dot-product search means.
 
-**Still open:** see *HNSW is built but not yet wired into search* below.
+---
+
+## 🟢 HNSW is wired into search (was an open drift)
+
+**Was.** The index existed and was tested, but `vector_search` always ran the
+exact scan — nothing chose the approximate path. Wiring it needed a
+cache-and-invalidate policy that no component owned.
+
+**Now.** `kimmy_vector::IndexCache` owns that decision, held in `AppState` so
+one graph is shared across requests. `access()` returns `Approximate` or
+`Exact`, and both search endpoints dispatch through it.
+
+The policy, and why each part of it is what it is:
+
+| Question | Answer | Because |
+|---|---|---|
+| When is a graph worth building? | ≥ 2000 vectors | Below that, scanning beats building *and* walking a graph |
+| How is staleness detected? | A per-collection generation counter, bumped on every vector write and delete | Counting is O(n); a count also cannot see a delete-then-add that leaves the total unchanged |
+| When does a stale graph rebuild? | After 30s | Rebuilding per write would rebuild continuously under load, and each rebuild is O(n log n) |
+| What happens if a build fails? | Fall back to the exact scan | An optimisation that cannot be built must not fail the query |
+
+**Why bounded staleness is safe here, when a stale secondary index is not.**
+The graph only supplies *candidates*. Scores are recomputed from the currently
+stored vector, and a candidate whose record no longer exists is skipped. So a
+deleted document cannot surface and an updated one scores by its new vector —
+the only effect of staleness is that a document written in the last 30 seconds
+may not be found yet. That is bounded recall loss on new data, never incorrect
+data. `the_approximate_path_agrees_with_the_exact_one` asserts the two paths
+return the same nearest neighbour with a byte-identical score.
+
+**Still open:** no on-disk snapshot persistence — see below.
 
 ---
 
-## 🔴 HNSW is built but not yet wired into search
+## 🟡 Vector indexes are rebuilt from scratch after a restart
 
-The index exists and is tested, but `vector_search` still runs the exact scan.
-Nothing chooses the approximate path.
+The plan called for snapshotting the graph to `hnsw_snapshots` and replaying
+newer vector-oplog entries on startup. Not built: the cache is in-memory only.
 
-**Why.** Wiring it needs a cache-and-invalidate policy: the graph is built from
-a snapshot and does not track later writes, so something must decide when to
-rebuild. `needs_rebuild` reports drift, but no component owns that decision
-yet. Landing a half-considered policy would be worse than the current honest
-gap — a stale index silently returns wrong results.
+**Consequence.** The first search of a large collection after a restart pays a
+full O(n log n) build, and until then queries are served by the exact scan —
+slower, never wrong. Correctness does not depend on it, which is why it was
+deferred rather than blocking the wiring.
 
-**To close.** A per-collection index cache with an explicit rebuild trigger,
-plus on-disk snapshot persistence so a restart does not rebuild from scratch.
+---
 
-**Consequence today.** Search remains O(n).
+## 🔴 `byo` is the default provider but has no ingest route
+
+**The gap.** `byo` — "the client supplies the vectors" — is the default, and it
+is what you get with no external dependency of any kind. But **there is no
+endpoint for supplying them.** Search on a `byo` collection returns nothing,
+always.
+
+The only path that works is writing raw records into the shadow collection
+through the ordinary document route, using the internal `VectorRecord` serde
+shape:
+
+```json
+POST /v1/db/shop/coll/orders.__vectors/docs
+{ "_id": "w#0",
+  "source": { "String": "w" },
+  "chunk": 0,
+  "source_hlc": { "wall_ms": 1, "counter": 0 },
+  "vector": [1.0, 0.0, 0.0, 0.0],
+  "text": "widget" }
+```
+
+That is an implementation detail serving as a public contract: the `#` chunk
+separator in `_id`, the externally-tagged `DocId`, and the internal HLC shape
+are all things a client should never have to know, and none can change without
+breaking anyone who depends on them.
+
+**Found by** driving the documented quick-start against a running server rather
+than trusting that it worked.
+
+**To close.** Needs a decision on the intended shape — most likely `PUT
+.../docs/{id}/vectors` taking `[{chunk, vector, text}]`, with the server
+supplying `source` and `source_hlc` from the document it already has. Not built
+unilaterally, because it is a public API surface.
+
+---
+
+## 🟢 A malformed shadow document no longer breaks search (was a live bug)
+
+**Was.** A shadow collection is an ordinary collection, so anyone with write
+access could insert a document into one. Any document that did not decode as a
+`VectorRecord` made `for_each_vector` fail — turning **every subsequent search
+on that collection into a 500**. One insert could brick search.
+
+**Now.** Undecodable documents are skipped and logged at `warn`. Search stays
+available; the operator still sees the problem. Same principle as the index
+skipping records that no longer exist.
+
+**Found by** the same manual verification as the entry above.
 
 ---
 
@@ -128,10 +203,11 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
 | Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
-| Aggregation pipeline | `$group`, `$unwind`, etc. absent | M5 |
+| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only | M5 |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
-| Benchmarks | No performance regression baseline exists | M5 |
+| Benchmarks | No performance regression baseline exists — including the 2000-vector index threshold, which is a guess, not a measurement | M5 |
+| Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 
 ---
 

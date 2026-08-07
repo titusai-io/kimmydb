@@ -9,6 +9,7 @@
 
 #![allow(dead_code)]
 
+pub mod cache;
 pub mod error;
 pub mod index;
 #[cfg(feature = "local-embeddings")]
@@ -17,6 +18,7 @@ pub mod provider;
 pub mod search;
 pub mod worker;
 
+pub use cache::{Access, IndexCache};
 pub use error::{Result, VectorError};
 pub use index::HnswIndex;
 pub use provider::{EmbeddingProvider, build};

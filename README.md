@@ -15,10 +15,10 @@ awkward to get together:
 📚 **[Full documentation is in `docs/`](docs/README.md)** — architecture, internals,
 API reference, operations, and the decision record.
 
-> **Status: early development.** The server runs: multi-user document CRUD,
-> Mongo-style queries, and live change streams over WebSocket all work on a
-> single node. Secondary indexes are not implemented yet, so every query is a
-> collection scan. See [Roadmap](#roadmap).
+> **Status: early development.** The server runs on a single node: multi-user
+> document CRUD, Mongo-style queries, secondary indexes, live change streams
+> over WebSocket, and automatic embeddings with vector and hybrid search all
+> work. Clustering and the MCP server are not built yet. See [Roadmap](#roadmap).
 
 ## Why it is built this way
 
@@ -67,6 +67,17 @@ curl -s -XPOST localhost:7878/v1/db/shop/coll/orders/docs -H "$A" \
 curl -s -XPOST localhost:7878/v1/db/shop/coll/orders/find -H "$A" \
   -d '{"filter":{"qty":{"$gt":4},"tags":"a"},"sort":{"qty":-1}}'
 
+# Automatic embeddings -- maintained off the write path by an oplog consumer.
+# Needs a provider that can embed; the `byo` default means you supply vectors.
+curl -s -XPOST localhost:7878/v1/db/shop/coll/orders/vector -H "$A" \
+  -d '{"fields":["item"],"dim":768,"metric":"cosine",
+       "provider":{"kind":"ollama","model":"nomic-embed-text",
+                   "endpoint":"http://localhost:11434"}}'
+
+# ...then search it semantically
+curl -s -XPOST localhost:7878/v1/db/shop/coll/orders/vector_search -H "$A" \
+  -d '{"query":"small mechanical part","k":5}'
+
 # Live change stream -- no replica set required
 websocat "ws://localhost:7878/v1/db/shop/coll/orders/watch?full_document=true" \
   -H "$A"
@@ -91,6 +102,11 @@ websocat "ws://localhost:7878/v1/db/shop/coll/orders/watch?full_document=true" \
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | Count matching |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | Update operators, `multi` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | Delete matching |
+| `GET`/`POST` | `/v1/db/{db}/coll/{coll}/indexes` | List / create a secondary index |
+| `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | Drop |
+| `GET`/`POST`/`DELETE` | `/v1/db/{db}/coll/{coll}/vector` | Inspect / enable / disable embeddings |
+| `POST` | `/v1/db/{db}/coll/{coll}/vector_search` | k-NN, with an optional filter |
+| `POST` | `/v1/db/{db}/coll/{coll}/hybrid_search` | Vector + keyword, fused by RRF |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | WebSocket change stream |
 | `GET` | `/healthz` `/readyz` `/metrics` | Unauthenticated |
 
@@ -149,11 +165,14 @@ eventually-consistent store is a user who assumed otherwise.
 | Milestone | Scope | Status |
 |---|---|---|
 | **M0** | Workspace, core types, HLC, config, Docker, CI | ✅ Complete |
-| **M1** | Storage engine, CRUD, queries, oplog, change streams, auth, HTTP API | Done except secondary indexes |
-| **M2** | Auto-embeddings, HNSW vector index, vector and hybrid search | Planned |
-| **M3** | Built-in MCP server over streamable HTTP | Planned |
-| **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | Planned |
-| **M5** | Backup/restore, TLS, rate limiting, CLI shell, benchmarks | Planned |
+| **M1** | Storage engine, CRUD, queries, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
+| **M2** | Auto-embeddings, HNSW vector index, vector and hybrid search | ✅ Complete |
+| **M3** | Built-in MCP server over streamable HTTP | 📋 Next |
+| **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | 📋 Planned |
+| **M5** | Backup/restore, TLS, rate limiting, CLI shell, benchmarks | 📋 Planned |
+
+Where the build departs from what was planned — and why — is tracked in
+[Deviations](docs/deviations.md), in one place rather than scattered.
 
 ## Architecture
 
@@ -178,7 +197,7 @@ eventually-consistent store is a user who assumed otherwise.
 | `kimmy-core` | `Hlc`, `Stamp`, `NodeId`, `DocId`, `DocRecord`, `OplogEntry`. No I/O. |
 | `kimmy-storage` | redb layout, collections, secondary indexes, oplog, tombstone GC |
 | `kimmy-query` | Filter and update operators, projection, sort, aggregation-lite |
-| `kimmy-vector` | Embedding providers, HNSW index, shadow-collection manager |
+| `kimmy-vector` | Embedding providers, oplog-driven worker, HNSW, index selection, search |
 | `kimmy-auth` | Users, Argon2id, JWT, RBAC evaluation |
 | `kimmy-cluster` | SWIM membership, discovery, version vectors, anti-entropy |
 | `kimmy-mcp` | MCP tools and resources bound to storage |

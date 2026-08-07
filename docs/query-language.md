@@ -231,10 +231,10 @@ bad pattern in an `$or` should not take down the whole request.
 |---|---|
 | Index-backed `$in` (union of point lookups) | 📋 Planned |
 | Aggregation pipeline (`$match`, `$group`, `$unwind`, …) | 📋 Planned |
-| `$vectorSearch` | 📋 M2 |
+| `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not a pipeline stage |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
 | Geospatial operators | ⛔ Not planned |
-| Text indexes / `$text` | ⛔ Superseded by vector search (M2) |
+| Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
 
 ---
 

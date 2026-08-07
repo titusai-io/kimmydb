@@ -9,16 +9,17 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-299 tests passing · 0 failures · clippy clean at -D warnings
+448 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 54 | HLC, key encoding, comparison, LWW merge, resume tokens |
-| `kimmy-storage` | 63 | Codecs, engine lifecycle, document CRUD, change streams |
+| `kimmy-core` | 98 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-storage` | 107 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
+| `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 35 | 20 unit (JSON boundary, errors) + 15 end-to-end over a real socket |
+| `kimmy-api` | 41 | 20 unit (JSON boundary, errors) + 21 end-to-end over a real socket |
 | `kimmyd` | 14 | Config layering and validation |
 | `kimmy-cluster` | 5 | Discovery string parsing |
 
@@ -55,7 +56,7 @@ graph TB
 
 ## The load-bearing invariants
 
-These five carry disproportionate weight. Anything that breaks one produces
+These six carry disproportionate weight. Anything that breaks one produces
 wrong answers rather than crashes.
 
 ### 1. Key encoding order
@@ -118,6 +119,35 @@ This is the test that justifies the subscribe-then-replay ordering. Also
 `a_lagging_consumer_recovers_from_the_oplog_without_losing_events` (2,500 events
 with nobody reading).
 
+### 6. The approximate search path agrees with the exact one
+
+```
+approximate[0] == exact[0]        // same document, same score, bit for bit
+```
+
+Two search paths exist — an exhaustive scan and an HNSW walk — and a caller
+cannot choose between them. If they disagree, an index cache has silently
+changed what a search *means*, which no user-facing error would reveal.
+
+The exact scan is the oracle. It is O(n) and has no recall loss, so it is by
+construction the right answer to measure against.
+
+- `the_approximate_path_agrees_with_the_exact_one` — same nearest neighbour,
+  byte-identical score, because both paths score from the *stored* vector rather
+  than from graph distances
+- `recall_against_exact_search_is_high` — ≥ 90% recall at k=10, **measured, not
+  assumed**
+- `the_top_result_matches_exact_search` — approximation is acceptable in the
+  tail, not at rank 1
+- `scores_match_the_exact_path_exactly` — the graph's own distances never reach
+  a result
+- `dot_is_refused_rather_than_panicking` — the metric with no index takes the
+  exact path instead of aborting the process
+
+Score equality is asserted exactly rather than within a tolerance, and that is
+deliberate: an approximate *ranking* is the design, an approximate *score* would
+mean the graph's distances had leaked into the result.
+
 ---
 
 ## Mutation testing
@@ -166,9 +196,17 @@ Worth recording, because each one shows the test doing its job:
 | Index ids derived from `max(existing) + 1` | A new index would inherit a dropped index's stale entries | `index_ids_are_never_reused` |
 | `$options` parsed as an independent operator | Regex flags silently dropped, so `$regex` + `$options: "i"` was case-sensitive | `regex_honours_sibling_options` |
 | `$elemMatch` scalar form did not parse | `{$elemMatch: {$gt: 5}}` errored on arrays of numbers | `elem_match_works_on_arrays_of_scalars` |
+| Intersecting both ends of a range on a multikey index | **Wrong results.** `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` — different array elements satisfy each bound — but the intersected key range excluded it | the two-sided-range proptest generator |
+| `anndists::DistDot` asserts `1 - dot >= 0` | **Process abort.** Valid only for unit vectors; any real embedding would have crashed the server mid-search | exercising every metric against the index rather than assuming they all worked |
 
 In the first two cases the test encoded the *intended* invariant and the
 implementation was wrong — which is the right way round.
+
+The multikey bug is the one worth studying: hundreds of property cases passed
+before the generator was taught to emit *two-sided* ranges. The invariant was
+right and the implementation was wrong, and the only thing standing between
+that and production was whether the generator happened to produce the shape
+that exposed it. Mutation testing is what found the generator gap.
 
 ---
 
