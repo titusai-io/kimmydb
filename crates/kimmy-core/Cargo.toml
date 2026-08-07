@@ -17,3 +17,9 @@ base64.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true
+
+[features]
+# In-process ONNX embedding. Off by default: it pulls native ONNX Runtime
+# binaries, which would undo the pure-Rust property that motivated choosing
+# redb over RocksDB (ADR-001) and rust_crypto over aws_lc_rs (ADR-016).
+local-embeddings = []

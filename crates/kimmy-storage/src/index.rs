@@ -847,6 +847,32 @@ mod tests {
         }
     }
 
+    /// A two-sided range over an array field.
+    ///
+    /// `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` because *different elements*
+    /// satisfy each bound. Intersecting both bounds into one key range excludes
+    /// it — the index silently loses a matching document. Found by the
+    /// equivalence proptest once it began generating two-sided ranges.
+    #[test]
+    fn a_two_sided_range_over_an_array_field_agrees_with_a_scan() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 1i64, "a": [2, 0] }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2i64, "a": [5, 5] }).unwrap();
+        engine.insert(&coll, doc! { "_id": 3i64, "a": 1 }).unwrap();
+        engine.create_index("app", "docs", vec![IndexField::ascending("a")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        for query in [
+            doc! { "a": { "$gte": 1, "$lte": 1 } },
+            doc! { "a": { "$gte": 0, "$lte": 2 } },
+            doc! { "a": { "$gt": 1, "$lt": 3 } },
+        ] {
+            let scan = by_scan(&engine, &coll, &query);
+            let indexed = by_index(&engine, &coll, &query).expect("the index should apply");
+            assert_eq!(indexed, scan, "index lost documents for {query:?}");
+        }
+    }
+
     #[test]
     fn index_backed_results_stay_correct_as_documents_change() {
         // Maintenance bugs surface as stale entries, which show up as an index

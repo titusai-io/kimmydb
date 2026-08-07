@@ -4,5 +4,5 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc fe15206f1fb992f41187a30676be45b1bb29f2bb57839acb2f88c0e9531a4a7b # shrinks to values = [Int32(2)], probe = 0, use_range = true, descending = false
 cc 169e7a7c17e814e880e84008db14d38ab967afd798cc5e5d8d9a4749aa4b8948 # shrinks to values = [Double(1.0)], probe = 0, span = 1, shape = 2, descending = true
+cc aa5fd93417d00160c588d41988d12f33f236a06d56de31756ff8735053ecd16a # shrinks to values = [Array([Int32(2), Int32(0)])], probe = 1, span = 0, shape = 2, descending = false

@@ -167,9 +167,38 @@ re-applied regardless.
 | `$in` | Needs a *union* of point lookups. 📋 Planned |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
 | A range on a **descending** field | Inverted encoding swaps which end each bound belongs to; getting it backwards yields a range that is too **narrow**. Falls back to the equality prefix |
+| The **second end** of a two-sided range | See below — an array field can satisfy each bound with a *different element* |
 
 A conjunction *containing* an `$or` still uses its other conjuncts —
 `{a: 1, $or: [...]}` narrows on `a == 1`, which must hold for every match.
+
+### Only one end of a range is used
+
+A field may hold an array — a **multikey** index — and Mongo semantics let
+*different elements* satisfy each end of a range:
+
+```javascript
+// document
+{ a: [2, 0] }
+
+// matches: element 2 satisfies $gte, element 0 satisfies $lte
+{ a: { $gte: 1, $lte: 1 } }
+```
+
+Neither element satisfies *both* bounds, so intersecting them into a single key
+range `[1, 1]` excludes the document entirely — a range that is too narrow, and
+therefore silently wrong. The planner uses **one** bound only, keeping the range
+a superset; the recheck removes the extras.
+
+> This was a real bug, found by the equivalence property test once it began
+> generating two-sided ranges. It had passed hundreds of one-sided cases first —
+> a one-sided range with a bad bound comes out too *wide*, which the recheck
+> silently repairs.
+
+**The cost is selectivity, not correctness.** `{qty: {$gte: 5, $lte: 9}}` scans
+the index from 5 upward rather than stopping at 9. Tracking multikey-ness per
+index — as MongoDB does — would let both bounds be used for fields that never
+hold arrays. 📋 Planned.
 
 ### Bounds
 

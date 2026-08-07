@@ -5,7 +5,7 @@
 //! able to read it directly when diagnosing a broken data directory is worth
 //! more than the space.
 
-pub use kimmy_core::{Enforcement, IndexField, IndexMeta};
+pub use kimmy_core::{Enforcement, IndexField, IndexMeta, VectorConfig};
 use kimmy_core::{Hlc, ids::CollectionId};
 use serde::{Deserialize, Serialize};
 
@@ -33,9 +33,9 @@ pub struct CollectionMeta {
     /// inherit them.
     #[serde(default)]
     index_id_counter: u32,
-    /// Auto-embedding configuration. Populated in M2.
+    /// Auto-embedding configuration, when enabled for this collection.
     #[serde(default)]
-    pub vector: Option<serde_json::Value>,
+    pub vector: Option<VectorConfig>,
 }
 
 impl CollectionMeta {

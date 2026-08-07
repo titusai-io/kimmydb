@@ -137,11 +137,24 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         // — the failure mode is a range that is too *narrow* — the range is
         // dropped and only the equality prefix is used. Wider, always correct.
         if !field.descending {
-            if let Some(v) = &bounds.lower {
-                lower.push((v.clone(), false));
-            }
-            if let Some(v) = &bounds.upper {
-                upper.push((v.clone(), false));
+            // Only ONE end of a range may be used.
+            //
+            // A field can hold an array — a *multikey* index — and Mongo
+            // semantics let **different elements** satisfy each end of a range.
+            // `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` because 2 satisfies
+            // the lower bound and 0 the upper, even though neither satisfies
+            // both. Intersecting the bounds into a single key range would
+            // exclude that document entirely — a range that is too narrow, and
+            // therefore silently wrong.
+            //
+            // Using one bound keeps the range a superset; the recheck removes
+            // the extras. Tracking multikey-ness per index would let both
+            // bounds be used for fields that never hold arrays — a selectivity
+            // win, not a correctness one. See docs/indexes.md.
+            match (&bounds.lower, &bounds.upper) {
+                (Some(v), _) => lower.push((v.clone(), false)),
+                (None, Some(v)) => upper.push((v.clone(), false)),
+                (None, None) => unreachable!("checked above"),
             }
             used += 1;
         }
@@ -238,6 +251,25 @@ mod tests {
         let idx = [index(0, vec![IndexField::ascending("n")])];
         let p = plan(doc! { "n": { "$gte": 5 } }, &idx).unwrap();
         assert_eq!(p.fields_used, 1);
+    }
+
+    #[test]
+    fn only_one_end_of_a_range_is_used() {
+        // A field may hold an array, and different elements may satisfy each
+        // bound — `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}`. Intersecting both
+        // bounds would exclude it, so only the lower bound narrows the range
+        // and the upper end stays open.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let two_sided = plan(doc! { "a": { "$gte": 1, "$lte": 1 } }, &idx).unwrap();
+        let lower_only = plan(doc! { "a": { "$gte": 1 } }, &idx).unwrap();
+        assert_eq!(
+            two_sided, lower_only,
+            "a two-sided range must not narrow further than its lower bound alone"
+        );
+
+        // With no lower bound, the upper one is used instead.
+        let upper_only = plan(doc! { "a": { "$lte": 1 } }, &idx).unwrap();
+        assert_ne!(upper_only.upper, lower_only.upper);
     }
 
     #[test]
