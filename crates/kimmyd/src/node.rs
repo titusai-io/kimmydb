@@ -48,6 +48,19 @@ pub async fn run(config: Config) -> Result<()> {
     let app = kimmy_api::build(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
         .context("building the API router")?;
 
+    // The embedding worker is an ordinary change-stream subscriber, so it runs
+    // alongside the server rather than inside the write path. A write returns
+    // as soon as its oplog entry is durable; embedding catches up behind it.
+    let worker_handle = tokio::spawn({
+        let engine = Arc::clone(&engine);
+        async move {
+            let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+            if let Err(e) = worker.run().await {
+                warn!(error = %e, "embedding worker stopped");
+            }
+        }
+    });
+
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
@@ -58,6 +71,10 @@ pub async fn run(config: Config) -> Result<()> {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving")?;
+
+    // The worker holds no locks and its position is durable, so aborting is
+    // safe: whatever it had not finished is re-delivered on the next start.
+    worker_handle.abort();
 
     info!("shutdown complete");
     Ok(())

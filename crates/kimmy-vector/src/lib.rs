@@ -13,8 +13,10 @@ pub mod error;
 #[cfg(feature = "local-embeddings")]
 pub mod local;
 pub mod provider;
+pub mod search;
 pub mod worker;
 
 pub use error::{Result, VectorError};
 pub use provider::{EmbeddingProvider, build};
+pub use search::{Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search};
 pub use worker::{EmbeddingWorker, Outcome};

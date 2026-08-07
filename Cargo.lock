@@ -1575,6 +1575,7 @@ dependencies = [
  "kimmy-cluster",
  "kimmy-core",
  "kimmy-storage",
+ "kimmy-vector",
  "serde",
  "tempfile",
  "tokio",
