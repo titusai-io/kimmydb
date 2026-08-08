@@ -36,7 +36,7 @@ graph LR
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
-| **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 📋 Planned |
+| **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 🚧 In progress — login rate limiting landed |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -322,7 +322,7 @@ handle a node whose tombstones were collected while it was partitioned.
 |---|---|
 | Backup / restore | Online snapshot, point-in-time restore from the oplog |
 | TLS | Native termination |
-| Rate limiting | Especially `/v1/auth/login` |
+| Rate limiting | ✅ Done for `/v1/auth/login` — token bucket per caller, checked *before* the Argon2 verify it exists to bound. [ADR-038](decisions.md). Other routes deliberately deferred to the benchmark work below |
 | Oplog & tombstone GC | ✅ Done — background pass, `storage.gc_interval_secs`. [ADR-028](decisions.md) |
 | Aggregation pipeline | `$match`, `$group`, `$unwind`, `$project`, `$sort`, `$limit` |
 | `kimmy` CLI | Interactive shell |

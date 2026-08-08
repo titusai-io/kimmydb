@@ -12,6 +12,7 @@
 pub mod error;
 pub mod exec;
 pub mod json;
+pub mod ratelimit;
 pub mod routes;
 pub mod schema;
 pub mod state;
@@ -27,6 +28,7 @@ use kimmy_storage::Engine;
 use kimmy_vector::IndexCache;
 
 pub use error::ApiError;
+pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use state::{AppState, SharedState};
 
 /// Assemble the shared server state.
@@ -40,9 +42,17 @@ pub fn state(
     engine: Arc<Engine>,
     tokens: TokenIssuer,
     insecure_no_auth: bool,
+    limits: RateLimits,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
-    Ok(Arc::new(AppState { engine, users, tokens, vectors: IndexCache::new(), insecure_no_auth }))
+    Ok(Arc::new(AppState {
+        engine,
+        users,
+        tokens,
+        vectors: IndexCache::new(),
+        insecure_no_auth,
+        limits,
+    }))
 }
 
 /// Build the HTTP router for an existing state.
@@ -55,6 +65,7 @@ pub fn build(
     engine: Arc<Engine>,
     tokens: TokenIssuer,
     insecure_no_auth: bool,
+    limits: RateLimits,
 ) -> Result<Router, kimmy_auth::AuthError> {
-    Ok(routes::router(state(engine, tokens, insecure_no_auth)?))
+    Ok(routes::router(state(engine, tokens, insecure_no_auth, limits)?))
 }

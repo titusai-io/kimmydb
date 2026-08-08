@@ -1795,6 +1795,7 @@ dependencies = [
  "kimmy-query",
  "kimmy-storage",
  "kimmy-vector",
+ "parking_lot",
  "serde",
  "serde_json",
  "tempfile",

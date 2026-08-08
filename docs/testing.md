@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-614 tests passing · 0 failures · clippy clean at -D warnings
+629 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 58 | 31 unit (JSON boundary, errors, schema inference) + 27 end-to-end over a real socket |
+| `kimmy-api` | 73 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 31 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 18 | Config layering and validation |
 | `kimmy-cluster` | 44 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
@@ -183,6 +183,39 @@ The last one is a different kind of invariant from the rest: not "may this
 principal", but "should this ever be handed to a language model as context".
 See [ADR-027](decisions.md).
 
+### 8. A rate limit cannot be cleared by anything a caller controls
+
+A limiter is only worth having if none of the things an attacker can vary — a
+header, a reconnection, the passage of time under a clock they can influence —
+returns a fresh budget. Each of these is a way that could quietly stop being
+true while the limiter still *looks* like it is working, which is the failure
+mode this document keeps arriving at.
+
+- `a_backwards_clock_does_not_clear_the_limit` — a naive `now - last` on `u64`
+  underflows to an enormous elapsed time and refills the bucket completely. NTP
+  steps backwards; the saturating subtraction is what stops a clock correction
+  from being a reset
+- `refill_never_exceeds_the_burst` — otherwise an idle key banks credit and the
+  burst stops being a cap
+- `keys_do_not_share_a_budget` — one exhausted caller must not lock out the rest
+- `an_unseen_key_is_allowed_without_being_tracked` — a bare check must not
+  allocate, or checking is itself a way to fill the map
+- `the_tracked_key_count_stays_bounded` and
+  `eviction_prefers_keys_that_have_recovered` — the key space is
+  attacker-controlled, so the defence must not become a denial of service, and
+  what it forgets first must be the buckets carrying no information
+- `a_successful_login_does_not_spend_the_budget` — over a real socket; a
+  security control that throttles correct credentials is a capacity control
+- `the_limit_does_not_leak_whether_a_user_exists` — a 429 for a real name beside
+  a 401 for an invented one would rebuild the enumeration oracle that
+  `a_wrong_password_does_not_reveal_whether_the_user_exists` removes
+- `limiting_by_username_is_off_unless_configured` — asserts the default rather
+  than trusting it, because that default is a deliberate trade
+  ([ADR-038](decisions.md))
+
+Time is a parameter throughout ([ADR-007](decisions.md)), so none of these
+sleeps.
+
 ---
 
 ## Mutation testing
@@ -198,6 +231,30 @@ counterexamples:
 
 Worth repeating whenever a new invariant is added: break it on purpose, confirm
 the suite goes red, revert.
+
+### The rate limiter, seven for seven
+
+Every rule in the limiter was broken deliberately before the branch landed, and
+each one turned a named test red:
+
+| Injected fault | Caught by |
+|---|---|
+| `saturating_sub` → `wrapping_sub` in refill (the release-mode underflow) | `a_backwards_clock_does_not_clear_the_limit` |
+| Dropped the `.min(burst)` clamp on refill | `refill_never_exceeds_the_burst` |
+| Inverted the eviction predicate, so recovered buckets are kept and drained ones dropped | `eviction_prefers_keys_that_have_recovered` |
+| `check_at` allocates a bucket for an unseen key | `an_unseen_key_is_allowed_without_being_tracked` |
+| Record the attempt before authenticating, so success also spends | `a_successful_login_does_not_spend_the_budget` |
+| Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
+| Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
+
+**Two of them appeared to escape, and the harness was the bug.** The runner was
+invoked as `run "<name>" <filter> --test api`, which shell-splits into four
+arguments where three were expected — so `cargo test --test <filter>` ran against
+a target that does not exist, produced no `test result: FAILED` line, and was
+scored as "escaped". Both mutants were caught immediately once the call was
+fixed. Worth recording because it is the same failure this document keeps
+describing from the other side: a green result that means nothing because the
+thing it claims to have run never ran.
 
 ---
 
@@ -345,6 +402,15 @@ manually and are recorded so they can be repeated:
 | Retention pass on a live node | ✅ 45 oplog entries and 15 tombstones collected; 15 live documents untouched |
 | Restart after an aggressive collection | ✅ clock resumed from the retained tail; a post-restart update took effect rather than losing to LWW |
 | File size across a collection pass | ✅ measured — 52.7 MB → 105.4 MB → 53.3 MB after refill ([Operations](operations.md)) |
+| Login limit on a live node | ✅ three 401s within a burst of 3, then `429` with `Retry-After: 18` |
+| Recovery against a **real** clock | ✅ the unit tests inject time; after ~22s of a 3-per-60s bucket, a correct login returned 200 |
+| A spoofed `X-Forwarded-For`, header untrusted | ✅ varying it across three addresses stayed `429` — the default cannot be bypassed |
+| A prepended `X-Forwarded-For`, header trusted | ✅ `9.9.9.9, 10.0.0.77` against a drained peer still `429`; the rightmost entry is what counts |
+| Per-username limiting spread across addresses | ✅ the third address trying the same name was refused; a different name from a fourth was not |
+| A correct password while the address is over budget | ✅ `429` — the check necessarily precedes authentication ([Deviations](deviations.md)) |
+| Rate-limit config errors | ✅ zero window, zero `max_tracked_keys`, empty `trusted_proxy_header`, and a typo'd key all refused at startup |
+| `kimmy.example.toml` still parses | ✅ `check-config` valid — `deny_unknown_fields` makes this a real check |
+| `--insecure-no-auth` | ✅ limiter off; no login to protect |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test
@@ -406,6 +472,7 @@ Honest list of what is not covered:
 | No crash-consistency tests | redb is trusted for durability |
 | No concurrent-writer stress test | Only the change-stream test writes concurrently |
 | Property tests use default case counts | 256 unless overridden; the critical ones raise it explicitly |
+| **The login limit is not proven to run *before* Argon2** | It is the reason the limit exists ([ADR-038](decisions.md)) and the only difference a moved check makes is latency, which no deterministic test can assert. Defended by structure and a comment, not by a test. Closing it honestly needs a counter on the authentication path |
 
 ---
 

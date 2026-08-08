@@ -4,6 +4,7 @@
 //! handlers directly, so routing, extractors, status codes, and the JSON
 //! boundary are all exercised the way a client meets them.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kimmy_auth::TokenIssuer;
@@ -26,6 +27,21 @@ struct Client;
 struct Res {
     status: u16,
     body: Value,
+    /// The raw response head, so a test can assert on a header without the
+    /// client growing a parser it would only use once.
+    head: String,
+}
+
+impl Res {
+    /// Case-insensitive header lookup over the raw head.
+    fn header(&self, name: &str) -> Option<String> {
+        let want = format!("{}:", name.to_ascii_lowercase());
+        self.head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            (format!("{}:", key.trim().to_ascii_lowercase()) == want)
+                .then(|| value.trim().to_string())
+        })
+    }
 }
 
 impl Client {
@@ -72,7 +88,7 @@ impl Client {
         // Responses are Connection: close, so the body is everything left; no
         // chunked decoding needed.
         let body = serde_json::from_str(body_text.trim()).unwrap_or(Value::Null);
-        Res { status, body }
+        Res { status, body, head: head.to_string() }
     }
 }
 
@@ -82,6 +98,36 @@ impl Server {
     }
 
     async fn start_with(insecure_no_auth: bool) -> Self {
+        // Most tests log in repeatedly and would otherwise trip the limiter for
+        // reasons unrelated to what they assert.
+        Self::build(insecure_no_auth, kimmy_api::RateLimits::disabled()).await
+    }
+
+    /// A server whose login limiter allows `burst` failures per minute.
+    async fn start_rate_limited(burst: u32) -> Self {
+        let limits = kimmy_api::RateLimits {
+            login_ip: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(burst, std::time::Duration::from_secs(60)),
+                1024,
+            ),
+            ..kimmy_api::RateLimits::disabled()
+        };
+        Self::build(false, limits).await
+    }
+
+    /// A server that limits per username rather than per address.
+    async fn start_user_rate_limited(burst: u32) -> Self {
+        let limits = kimmy_api::RateLimits {
+            login_user: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(burst, std::time::Duration::from_secs(60)),
+                1024,
+            ),
+            ..kimmy_api::RateLimits::disabled()
+        };
+        Self::build(false, limits).await
+    }
+
+    async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
 
@@ -91,13 +137,18 @@ impl Server {
         }
 
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
-        let app = kimmy_api::build(Arc::clone(&engine), tokens, insecure_no_auth).unwrap();
+        let app = kimmy_api::build(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
 
         // Port 0: let the OS pick, so parallel tests never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
+            // Served with connect info exactly as the daemon serves it, so the
+            // peer address really does reach the limiter. Without this the
+            // rate-limit tests would pass against a single shared bucket and
+            // prove nothing about keying.
+            let _ = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
+                .await;
         });
 
         Self { base: format!("http://{addr}"), client: Client, _dir: dir }
@@ -156,6 +207,83 @@ async fn a_wrong_password_does_not_reveal_whether_the_user_exists() {
     assert_eq!(wrong.status, 401);
     assert_eq!(missing.status, 401);
     assert_eq!(wrong.body, missing.body, "the responses must be indistinguishable");
+}
+
+#[tokio::test]
+async fn repeated_failed_logins_are_rate_limited() {
+    // Without this, a password is guessable at network speed, and every guess
+    // costs the server a full Argon2id verification whether or not the user
+    // exists.
+    let server = Server::start_rate_limited(3).await;
+    let bad = json!({"user":"root","password":"wrong"});
+
+    for attempt in 1..=3 {
+        let res = server.post("/v1/auth/login", None, bad.clone()).await;
+        assert_eq!(res.status, 401, "attempt {attempt} is within the burst and should reach auth");
+    }
+
+    let res = server.post("/v1/auth/login", None, bad).await;
+    assert_eq!(res.status, 429, "the fourth attempt is past a burst of 3: {:?}", res.body);
+    assert_eq!(res.body["error"], "rate_limited");
+    // A refusal that does not say when to come back leaves a client guessing.
+    let retry = res.header("retry-after").expect("a 429 must carry Retry-After");
+    assert!(retry.parse::<u64>().is_ok_and(|s| s > 0), "Retry-After should be seconds: {retry}");
+}
+
+#[tokio::test]
+async fn a_successful_login_does_not_spend_the_budget() {
+    // Only failures are recorded. A fleet re-authenticating on a short token
+    // TTL is not the thing being defended against, and throttling it would turn
+    // a security control into an outage.
+    let server = Server::start_rate_limited(2).await;
+
+    for attempt in 1..=10 {
+        let res = server
+            .post("/v1/auth/login", None, json!({"user":"root","password":ROOT_PASSWORD}))
+            .await;
+        assert_eq!(
+            res.status, 200,
+            "correct credentials must never be limited (attempt {attempt})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_limit_does_not_leak_whether_a_user_exists() {
+    // A 429 for a real name and a 401 for an invented one would turn the
+    // limiter into the user-enumeration oracle that login itself avoids being.
+    let server = Server::start_rate_limited(1).await;
+
+    server.post("/v1/auth/login", None, json!({"user":"root","password":"wrong"})).await;
+
+    let real = server.post("/v1/auth/login", None, json!({"user":"root","password":"wrong"})).await;
+    let fake =
+        server.post("/v1/auth/login", None, json!({"user":"ghost","password":"wrong"})).await;
+
+    assert_eq!(real.status, 429);
+    assert_eq!(fake.status, 429, "the address is over its budget regardless of the name tried");
+    assert_eq!(real.body, fake.body, "the responses must be indistinguishable");
+}
+
+#[tokio::test]
+async fn limiting_by_username_is_off_unless_configured() {
+    // It is a real defence against a distributed guess, and a real lockout: it
+    // lets anyone keep a named user out for a window. That trade is an
+    // operator's to make, so the default must be off — assert the default
+    // rather than trusting it.
+    let limits = kimmy_api::RateLimits::disabled();
+    assert!(limits.login_user.limit().is_disabled());
+
+    let server = Server::start_user_rate_limited(2).await;
+    let bad = json!({"user":"root","password":"wrong"});
+    for _ in 0..2 {
+        assert_eq!(server.post("/v1/auth/login", None, bad.clone()).await.status, 401);
+    }
+    assert_eq!(
+        server.post("/v1/auth/login", None, bad).await.status,
+        429,
+        "when it is switched on it must actually limit"
+    );
 }
 
 #[tokio::test]

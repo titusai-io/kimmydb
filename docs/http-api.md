@@ -63,6 +63,11 @@ Tokens are signed with a cluster-wide secret, so any node validates any node's
 token. Default lifetime one hour (`auth.token_ttl_secs`). See
 [Security](security.md).
 
+**Login is rate-limited.** Repeated *failures* from one caller earn a `429` with
+a `Retry-After` header; a successful login spends nothing, so a client that
+re-authenticates on a short TTL is never throttled for succeeding. Tunable under
+`[server.rate_limit]` — see [Security](security.md#login-rate-limiting).
+
 ---
 
 ## Documents
@@ -314,9 +319,10 @@ round-trips exactly, and there is a test pinning it.
 | 409 | `unique_violation` | A unique index would be violated |
 | 501 | `not_implemented` | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | Resume point collected from the oplog |
+| 429 | `rate_limited` | Too many failed logins from this caller. Carries `Retry-After` in seconds |
 | 500 | `internal` | Storage failure — details logged, never returned |
 
-Two deliberate properties:
+Three deliberate properties:
 
 **403 does not reveal existence.** Authorization is checked *before* the
 collection is resolved, so a denied request looks identical whether the target
@@ -326,6 +332,11 @@ access.
 **Login failures are indistinguishable.** A wrong password and a nonexistent
 user return byte-identical responses, and the missing-user path still performs a
 hash so the timing matches. Otherwise the endpoint is a user-enumeration oracle.
+
+**A 429 says nothing about the attempt.** The limit is keyed on the caller, so a
+real username and an invented one over the same budget get identical responses.
+A 429 for one and a 401 for the other would reintroduce the enumeration oracle
+the property above removes.
 
 ---
 

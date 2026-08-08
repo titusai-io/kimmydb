@@ -42,6 +42,48 @@ pub struct ServerConfig {
     /// forge one. Set it if you want defence in depth — but set it to every
     /// name clients actually use, or they will be refused.
     pub mcp_allowed_hosts: Vec<String>,
+    pub rate_limit: RateLimitConfig,
+}
+
+/// Request rate limiting.
+///
+/// Only `/v1/auth/login` is limited today, because that is the one route where
+/// a limit is a *security* control rather than a capacity control: it is
+/// unauthenticated by necessity, passwords are guessable at network speed, and
+/// every attempt runs a full Argon2id verification whether or not the user
+/// exists. Capacity limits on the authenticated routes want measurements behind
+/// them, which is what M5's benchmarks are for.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RateLimitConfig {
+    /// Failed logins allowed per client address per window. Zero disables it.
+    pub login_per_ip: u32,
+    pub login_per_ip_window_secs: u64,
+    /// Failed logins allowed per attempted username per window, across every
+    /// address. Zero disables it, **which is the default**.
+    ///
+    /// This is the only defence against a brute force spread across many source
+    /// addresses. It is off by default because it introduces a lockout: anyone
+    /// who can reach the endpoint can spend a named user's budget and keep the
+    /// legitimate holder out for the rest of the window. Turning it on trades a
+    /// remote-guessing risk for a denial-of-service one, and which of those
+    /// matters more depends on a deployment rather than on a default.
+    pub login_per_user: u32,
+    pub login_per_user_window_secs: u64,
+    /// Header naming the real client, for a server behind a proxy. Empty means
+    /// use the socket peer address.
+    ///
+    /// Opt-in because a forwarded header is client-supplied: trusting one by
+    /// default would let any caller defeat per-address limiting by varying a
+    /// header, which is worse than no limiter, because it would look like one
+    /// was working. Set it only when a proxy you control rewrites the header.
+    pub trusted_proxy_header: Option<String>,
+    /// Upper bound on distinct keys held in memory.
+    ///
+    /// The key space is attacker-controlled — an address is whatever packets
+    /// arrive from — so this is what keeps the defence from becoming a denial
+    /// of service itself. Buckets that have refilled are dropped first.
+    pub max_tracked_keys: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,6 +183,28 @@ impl Default for ServerConfig {
             bind: "0.0.0.0:7878".parse().expect("valid literal"),
             mcp: true,
             mcp_allowed_hosts: Vec::new(),
+            rate_limit: RateLimitConfig::default(),
+        }
+    }
+}
+
+impl Default for RateLimitConfig {
+    fn default() -> Self {
+        Self {
+            // Ten failures a minute is far below what guessing a password
+            // needs, and far above what any legitimate client produces —
+            // only failures count, so a correct client never spends any.
+            login_per_ip: 10,
+            login_per_ip_window_secs: 60,
+            // Off. See the field documentation: enabling it is a trade, not
+            // an improvement.
+            login_per_user: 0,
+            login_per_user_window_secs: 300,
+            trusted_proxy_header: None,
+            // ~100k keys of a two-field bucket plus a short string key is a
+            // few megabytes — cheap enough not to need tuning, small enough
+            // to bound.
+            max_tracked_keys: 100_000,
         }
     }
 }
@@ -264,6 +328,8 @@ impl Config {
             );
         }
 
+        self.server.rate_limit.validate()?;
+
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
         }
@@ -307,17 +373,96 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} data_dir={} auth={} mcp={} gc={} cluster={} seeds=[{}] log={}/{:?}",
+            "bind={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] cluster={} seeds=[{}] \
+             log={}/{:?}",
             self.server.bind,
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
             if self.server.mcp { "enabled" } else { "off" },
             gc,
+            self.server.rate_limit.describe(),
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
             self.log.level,
             self.log.format,
         )
+    }
+}
+
+impl RateLimitConfig {
+    fn validate(&self) -> Result<()> {
+        // A window of zero would divide the burst by a clamped one-millisecond
+        // window, producing a rate so high the limit is decorative. Rejecting
+        // it is better than honouring a number that cannot mean what it says;
+        // the way to turn a limiter off is to set its burst to zero.
+        if self.login_per_ip > 0 && self.login_per_ip_window_secs == 0 {
+            anyhow::bail!(
+                "server.rate_limit.login_per_ip_window_secs must be greater than zero when \
+                 login_per_ip is set; to disable the limit, set login_per_ip = 0"
+            );
+        }
+        if self.login_per_user > 0 && self.login_per_user_window_secs == 0 {
+            anyhow::bail!(
+                "server.rate_limit.login_per_user_window_secs must be greater than zero when \
+                 login_per_user is set; to disable the limit, set login_per_user = 0"
+            );
+        }
+        if self.max_tracked_keys == 0 {
+            anyhow::bail!(
+                "server.rate_limit.max_tracked_keys must be greater than zero; a limiter that \
+                 can remember nothing cannot limit anything"
+            );
+        }
+        // An empty string is almost certainly meant as "no proxy", but it would
+        // be read as a header whose name is empty and never match, so the
+        // operator would believe forwarding was configured when it was not.
+        if self.trusted_proxy_header.as_deref().is_some_and(str::is_empty) {
+            anyhow::bail!(
+                "server.rate_limit.trusted_proxy_header is empty; omit the setting to use the \
+                 socket peer address, or name the header your proxy writes"
+            );
+        }
+        Ok(())
+    }
+
+    /// Build the limiters the API layer holds.
+    pub fn build(&self) -> kimmy_api::RateLimits {
+        use std::time::Duration;
+        kimmy_api::RateLimits {
+            login_ip: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(
+                    self.login_per_ip,
+                    Duration::from_secs(self.login_per_ip_window_secs),
+                ),
+                self.max_tracked_keys,
+            ),
+            login_user: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(
+                    self.login_per_user,
+                    Duration::from_secs(self.login_per_user_window_secs),
+                ),
+                self.max_tracked_keys,
+            ),
+            // Lowercased because `http::HeaderMap` lookups are case-sensitive
+            // over its canonical lowercase form, so `X-Forwarded-For` written
+            // in a config file would otherwise silently never match.
+            trusted_proxy_header: self.trusted_proxy_header.as_deref().map(str::to_lowercase),
+        }
+    }
+
+    /// One-line form for the startup summary.
+    fn describe(&self) -> String {
+        let ip = if self.login_per_ip == 0 {
+            "off".to_string()
+        } else {
+            format!("{}/{}s", self.login_per_ip, self.login_per_ip_window_secs)
+        };
+        let user = if self.login_per_user == 0 {
+            "off".to_string()
+        } else {
+            format!("{}/{}s", self.login_per_user, self.login_per_user_window_secs)
+        };
+        format!("login_ip={ip} login_user={user}")
     }
 }
 

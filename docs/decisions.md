@@ -994,6 +994,79 @@ so a later licence audit finds the reasoning rather than a surprise.
 
 ---
 
+## ADR-038 — Login is rate-limited before the password is checked
+
+**Decision.** `/v1/auth/login` carries a token bucket per client address. The
+budget is consulted **before** `UserStore::authenticate` runs, and a token is
+spent only when authentication **fails**.
+
+**Why before, not after.** Every login attempt runs a full Argon2id
+verification, including for a user that does not exist — deliberately, since
+equalising that cost is what stops timing from revealing whether an account
+exists. At the configured work factor (`m=19456`, `t=2`) that is roughly 19 MB
+and milliseconds of CPU per request, available to anyone who can reach the port.
+A limit applied after the hash would return the same `429` while performing the
+exact work it exists to prevent. The limit is therefore not only an
+anti-guessing measure; it is the only thing bounding an amplification vector.
+
+**Why only failures are recorded.** A caller with correct credentials is not the
+threat being defended against. Charging them would turn a security control into
+a capacity control, and would throttle exactly the legitimate case — a fleet
+re-authenticating on a short `token_ttl_secs`. The consequence is that a
+correct client is never limited *for succeeding*, though it is still refused
+while its address is over budget from other callers' failures.
+
+**Why login and nothing else.** Everywhere else in the API a limit is a capacity
+control, and capacity numbers chosen without measurement are guesses — which is
+the thing M5's benchmarks exist to remove. The mechanism is deliberately
+route-agnostic so that the benchmark work can decide the rest;
+`kimmy_api::Limiter` maps an arbitrary key to a budget and knows nothing about
+login.
+
+**A token bucket, with time as a parameter.** Consistent with
+[ADR-007](#adr-007--physical-time-as-a-parameter): `check_at`/`record_at` take
+the clock as an argument and the wrappers supply it. Refill across a window, a
+bucket that recovers, a burst that cannot be banked, and a clock that steps
+backwards all become ordinary unit tests instead of tests that sleep. The
+backwards-clock case is not hypothetical — a naive `now - last` on `u64`
+underflows to an enormous elapsed time and refills the bucket completely, which
+is a limiter an attacker resets by waiting for an NTP correction.
+
+**Rejected: `tower_governor`.** Battle-tested GCRA and much less code to own,
+but it reads `Instant::now()` internally, so its behaviour cannot be driven from
+a test without real sleeps. That would have made the limiter one of the few
+components here whose timing rules are untested, in a codebase whose stated rule
+is that a test never seen to fail is of unmeasured value. Hand-rolling it is
+~200 lines and keeps the dependency count where the pure-Rust discipline of
+[ADR-001](#adr-001--redb-as-the-storage-engine) and
+[ADR-016](#adr-016--pure-rust-cryptography) put it.
+
+**The key space is attacker-controlled, so it is capped.** A source address is
+whatever packets arrive from and a username is whatever was typed, so an
+unbounded map would make the defence against one denial of service into another.
+`max_tracked_keys` bounds it; buckets that have fully refilled are evicted first
+because they carry no information, and only then the fullest remaining one,
+because it has the least evidence of abuse against it.
+
+**A forwarded header is not trusted by default.** `trusted_proxy_header` is
+opt-in. Trusting `X-Forwarded-For` where nothing rewrites it would let any
+caller mint a fresh budget per request, which is worse than having no limiter,
+because the metrics and logs would suggest one was working. When it is set, the
+**last** value is used, not the first: a proxy appends the peer it saw, so the
+rightmost entry is the only one the client did not supply. Verified against a
+running server — prepending an attacker-chosen address to a drained peer's entry
+still returned `429`.
+
+**Per-username limiting exists and defaults to off.** It is the only defence
+against a guess spread across many source addresses, and it introduces a
+lockout: anyone reachable can spend a named user's budget and keep the real
+holder out for the window. Trading a guessing risk for a denial-of-service risk
+is a deployment-specific judgement, not something a default should make on an
+operator's behalf. Both behaviours are tested; switching it on is one config
+value.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |
