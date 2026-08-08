@@ -180,6 +180,35 @@ than a structure they might be tempted to interpret.
 
 ---
 
+## Schema-change entries
+
+Five kinds carry schema changes between nodes:
+
+| Kind | Body |
+|---|---|
+| `CreateCollection` | `{ db, name }` |
+| `DropCollection` | `{ db, name }` |
+| `CreateIndex` | the full `IndexMeta`, including its derived id |
+| `DropIndex` | `{ db, collection, index }` |
+| `ConfigureVectors` | `{ db, collection, config }` — `config: null` disables |
+
+Each names its target by **name**, not only by the entry's collection id: ids
+are derived from names by a hash, and a hash cannot be inverted, so a node
+meeting a collection for the first time could not otherwise learn what to call
+it.
+
+They are *operations*, not a metadata snapshot, so two nodes adding different
+indexes during a partition both keep theirs — see [ADR-033](decisions.md).
+
+**Applying one must not log a new entry.** The originating entry is appended as
+received; minting a local one would send the change back to the peer, which
+would apply it and mint another, trading the same change forever.
+
+The older payload-free `Collection` kind is still decoded so existing oplogs
+load, but is never written and cannot be applied — it names nothing.
+
+---
+
 ## Collection-level entries
 
 DDL appends entries too, with `kind = Collection`, no `doc_id`, and no `body`.

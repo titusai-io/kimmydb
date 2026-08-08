@@ -93,9 +93,11 @@ async fn pump(
 fn render(event: &ChangeEvent, full_document: bool) -> Option<Value> {
     match event {
         ChangeEvent::Change { entry, token } => {
-            // Collection create/drop entries have no document and would appear
-            // as malformed document events.
-            if entry.kind == kimmy_core::OpKind::Collection {
+            // Schema changes carry no document and would appear as malformed
+            // document events. They are omitted rather than rendered, which is
+            // what collection create/drop already did before schema changes
+            // replicated — clients see data, not DDL.
+            if !entry.kind.is_document() && entry.kind != kimmy_core::OpKind::UniqueViolation {
                 return None;
             }
             // A violation is not a document change and has no documentKey; it
@@ -146,6 +148,11 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::Replace => "replace",
         kimmy_core::OpKind::Delete => "delete",
         kimmy_core::OpKind::Collection => "collection",
+        kimmy_core::OpKind::CreateCollection => "createCollection",
+        kimmy_core::OpKind::DropCollection => "dropCollection",
+        kimmy_core::OpKind::CreateIndex => "createIndex",
+        kimmy_core::OpKind::DropIndex => "dropIndex",
+        kimmy_core::OpKind::ConfigureVectors => "configureVectors",
         kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
     }
 }

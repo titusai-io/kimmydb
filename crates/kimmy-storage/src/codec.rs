@@ -191,6 +191,11 @@ fn op_kind_tag(kind: OpKind) -> u8 {
         OpKind::Delete => 4,
         OpKind::Collection => 5,
         OpKind::UniqueViolation => 6,
+        OpKind::CreateCollection => 7,
+        OpKind::DropCollection => 8,
+        OpKind::CreateIndex => 9,
+        OpKind::DropIndex => 10,
+        OpKind::ConfigureVectors => 11,
     }
 }
 
@@ -202,6 +207,11 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
         4 => OpKind::Delete,
         5 => OpKind::Collection,
         6 => OpKind::UniqueViolation,
+        7 => OpKind::CreateCollection,
+        8 => OpKind::DropCollection,
+        9 => OpKind::CreateIndex,
+        10 => OpKind::DropIndex,
+        11 => OpKind::ConfigureVectors,
         other => return Err(corrupt(&format!("unknown op kind {other}"))),
     })
 }

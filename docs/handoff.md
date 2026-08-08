@@ -6,83 +6,82 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M4: replication core done, DDL replication next
+## As of 2026-08-08 — M4: everything but the transport
 
-**Branches, stacked, both ready to merge:**
+**Branch:** `m4-ddl-replication` (ready to merge)
+**Gate:** 558 tests · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · DDL driven on a real server
 
-| Branch | What |
-|---|---|
-| `m4-version-vectors` | Version vectors and anti-entropy, transport-free |
-| `m4-derived-index-ids` | Index ids derived from names, schema 3 |
+### What this branch did
 
-**Gate:** 548 tests · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · migration driven on a real
-server with an index-backed query before and after.
-
-### `m4-version-vectors`
-
-`VersionVector` (`{node → max_hlc}`), the `oplog_versions` table maintained on
-append, `entries_for_peer`, and `apply_batch`. Tested between engines in one
-process: two-node convergence, three-node transitive convergence, conflicting
-writes agreeing on a winner, deletes replicating, a stable second round.
-
-A mutation check changed a *test* rather than the code — see
-[Testing](testing.md).
-
-### `m4-derived-index-ids`
-
-The prerequisite for DDL replication, and the same bug as ADR-031 one level
-down. Index ids came from a per-collection counter while index-entry keys embed
-them, so node A's index 1 and node B's index 1 would key the same storage while
-describing different indexes. A `CreateIndex` payload carrying a node-local id
-is not something you can send anywhere.
-
-Now `FNV-1a-32(name)`, with schema 3 renumbering existing entries.
-[ADR-032](decisions.md).
-
-### Next: DDL replication
-
-**the maintainer chose operation-specific entries.** New op kinds, each with its own
-payload, so two nodes adding *different* indexes during a partition both keep
-theirs:
+Schema changes replicate, which was the last correctness gap before the
+network. Five entry kinds, each with its own payload and idempotency rule:
 
 ```
-OpKind::CreateCollection   body: { db, name }
-OpKind::DropCollection     body: { db, name }
-OpKind::CreateIndex        body: IndexMeta
-OpKind::DropIndex          body: { name }
-OpKind::ConfigureVectors   body: Option<VectorConfig>   // None disables
+CreateCollection   { db, name }
+DropCollection     { db, name }
+CreateIndex        IndexMeta (with its derived id)
+DropIndex          { db, collection, index }
+ConfigureVectors   { db, collection, config }   // config: null disables
 ```
 
-What still needs building:
+Operations rather than one metadata snapshot, as chosen — whole-metadata LWW
+would lose an index whenever two nodes added different ones during a partition.
+A test pins that both survive. [ADR-033](decisions.md).
 
-1. The op kinds and their codec tags. The existing payload-free
-   `OpKind::Collection` stays decodable for old oplogs but is never written
-   again; `apply_batch` cannot act on one, since it names nothing.
-2. Logging from `create_collection`, `drop_collection`, `create_index`,
-   `drop_index`, `configure_vectors`, `disable_vectors` — **five of those six
-   currently write no oplog entry at all**.
-3. Applying them idempotently in `apply_batch`, in stamp order.
+Before this, **five of the six DDL operations wrote no oplog entry at all**, and
+the two that did carried no payload.
 
-**The open sub-question:** a `DropCollection` entry acts as a tombstone only for
-as long as the oplog retains it. Past `oplog_retention_secs`, a partitioned peer
-rejoining could resurrect a dropped collection. That is the same trade as
-document tombstones, but it is the roadmap's flagged open question and worth
-deciding explicitly rather than inheriting.
+**A real bug found on the way.** Applying a replicated DDL originally ran the
+ordinary local operation, which logged an entry under *this* node's stamp. The
+peer pulled that back, applied it, minted another — the same change traded
+forever, the oplog growing every round. Each DDL operation now has a
+non-logging path used only when applying a replicated change; the originating
+entry is appended instead. Two convergence tests failed on this before it was
+understood, and it now has one of its own that fails under a reintroduced
+double-log.
+
+### Next: the transport — the only thing left
+
+`foca` (SWIM + suspicion) membership over UDP, TCP for oversized payloads and
+oplog range transfer. Everything it needs to call already exists and is tested
+between engines in one process:
+
+```rust
+let mine = engine.version_vector()?;
+// exchange vectors with the peer
+if let Some(from) = mine.behind(&theirs) {
+    let entries = peer.entries_for_peer(from, limit)?;   // over the wire
+    engine.apply_batch(&entries)?;
+}
+```
+
+`kimmy-cluster` has discovery parsing and nothing else. Config already carries
+`cluster.enabled`, `cluster.bind`, `cluster.seeds`, `cluster.cluster_secret`,
+and validation already refuses the unsafe combinations.
 
 ### Then
 
-- **The transport** — `foca` membership over UDP, TCP for oversized payloads.
 - **Full resync** for a peer further behind than `oplog_retention_secs`.
+- **Collection tombstones**, if you want them — see below.
+
+### Open question worth deciding
+
+A `DropCollection` entry acts as a tombstone only while the oplog retains it.
+Past `oplog_retention_secs`, a rejoining partitioned peer could resurrect a
+dropped collection. Same trade as document tombstones, and the roadmap has
+flagged it since M2 — but it is inherited rather than decided.
 
 ### Worth knowing
 
+- **Anti-entropy excludes `OpKind::UniqueViolation`** — a node's own observation.
+- **Applying replicated DDL must not log** — see the amplification bug above.
 - **Anti-entropy uses `read_oplog_from`** (stamp order); change streams use
   `read_arrival_from` (arrival order).
-- **`apply_remote` is not `exec`** — it serves no principal.
-- **Retention never collects the newest oplog entry** ([ADR-028](decisions.md)).
-- **Both collection and index ids are derived**, which is what makes a
-  replicated entry address the same thing everywhere.
+- **DDL entries are not rendered on change streams**, matching what collection
+  entries always did — clients see data, not schema.
+- **Collection and index ids are both derived**, which is what lets a replicated
+  entry address the same thing everywhere.
 
 ### Open, none blocking
 

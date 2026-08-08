@@ -29,7 +29,12 @@ pub enum OpKind {
     /// A whole-document overwrite.
     Replace,
     Delete,
-    /// A collection was created, dropped, or reconfigured. Carries no document.
+    /// **Legacy.** A collection was created, dropped, or reconfigured, with no
+    /// payload saying which or naming it.
+    ///
+    /// Still decoded so that oplogs written before schema changes replicated
+    /// keep loading, but never written again — and it cannot be applied by a
+    /// peer, because it identifies nothing. Superseded by the operations below.
     Collection,
     /// Merging a replicated write broke a unique constraint.
     ///
@@ -44,6 +49,35 @@ pub enum OpKind {
     /// time, so shipping these to peers would double-report. See
     /// [`crate::UniqueViolationDetail`].
     UniqueViolation,
+    /// A collection was created. Body: [`crate::CollectionRef`].
+    CreateCollection,
+    /// A collection was dropped. Body: [`crate::CollectionRef`].
+    DropCollection,
+    /// An index was created. Body: [`crate::IndexCreate`].
+    CreateIndex,
+    /// An index was dropped. Body: [`crate::IndexDrop`].
+    DropIndex,
+    /// Auto-embedding was configured or turned off. Body: [`crate::VectorSet`].
+    ConfigureVectors,
+}
+
+impl OpKind {
+    /// Whether this entry describes a schema change rather than a document.
+    pub fn is_ddl(self) -> bool {
+        matches!(
+            self,
+            Self::CreateCollection
+                | Self::DropCollection
+                | Self::CreateIndex
+                | Self::DropIndex
+                | Self::ConfigureVectors
+        )
+    }
+
+    /// Whether this entry carries a document change to merge.
+    pub fn is_document(self) -> bool {
+        matches!(self, Self::Insert | Self::Update | Self::Replace | Self::Delete)
+    }
 }
 
 /// One durable, totally-ordered record of a mutation.

@@ -9,13 +9,13 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-548 tests passing · 0 failures · clippy clean at -D warnings
+558 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 114 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 151 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
+| `kimmy-core` | 116 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-storage` | 159 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
@@ -258,6 +258,7 @@ Worth recording, because each one shows the test doing its job:
 | MCP published `kimmy://__kimmy/__users` as a resource | The password-hash collection offered to an agent as attachable context | the first `resources/list` against a real node |
 | `apply_remote` never maintained secondary indexes | A replicated document would be invisible to every index-backed query — present in a scan, missing from an index-backed `find` | reading the merge path while designing violation detection, which needs an index write to detect anything |
 | Collection ids came from a node-local counter | **Silent cross-node corruption.** Every oplog entry names its collection by id, so two nodes that created collections in a different order would apply each other's writes to the wrong collection — and it works whenever creation order happens to match, which is what a two-node smoke test does | writing a throwaway two-engine probe while starting the transport, rather than trusting the roadmap's "missing: the transport" |
+| Applying a replicated schema change also minted a local one | **Unbounded amplification.** The peer pulls the local copy back, applies it, mints another — the same change traded forever, the oplog growing every round | two convergence tests failing on the second half of a create-then-drop sequence; the cause was only found by asking why the drop did not stick |
 | Change streams de-duplicated by comparing stamps | Dropped any entry stamped at or below the high-water mark — exactly what a replicated entry looks like — and, separately, would have reordered two concurrent writers that published out of commit order | designing the arrival index; the second half was latent and unrelated to replication |
 | Retention collecting the oplog tail | **Silent data loss.** The clock resumes from the tail, so an idle node would restart at `Hlc::ZERO` and every later write would lose to its own older version | writing the invariant into `the_clock_still_resumes_after_an_aggressive_collection` *before* the collector, then confirming a mutant that removes the guard fails three tests |
 
