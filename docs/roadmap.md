@@ -235,6 +235,14 @@ converged in both directions; a partition healed; and a cross-node unique
 violation left both documents in place while both nodes reported it.
 [ADR-035](decisions.md).
 
+### Built: snapshot resync ✅
+
+A peer below the sender's retention horizon is told so and sent current state
+instead of history. Without it, a node added to a cluster older than
+`oplog_retention_secs` received nothing it could apply and retried forever —
+which, at the default retention, is any node added to a running cluster.
+[ADR-036](decisions.md).
+
 ### Still missing
 
 - **SWIM membership** via `foca`. Without it there is no failure detection or
@@ -244,7 +252,7 @@ violation left both documents in place while both nodes reported it.
 - **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
   DNS resolver that can read record types the standard library does not expose.
   `dns:` and `k8s:` both work.
-- **Full resync** for a peer further behind than `oplog_retention_secs`.
+
 
 ### Resolved: dropped collections leave a tombstone ✅
 

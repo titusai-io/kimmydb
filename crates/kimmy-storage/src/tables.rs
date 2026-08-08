@@ -99,3 +99,11 @@ pub const META_FORMAT_VERSION: &str = "format_version";
 /// collection name now, so nothing reads this; it is kept so that a database
 /// written by an older build still round-trips rather than losing a key.
 pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
+
+/// The highest `Hlc` retention has removed from the oplog.
+///
+/// The replication horizon, recorded rather than inferred. The oldest *retained*
+/// entry cannot stand in for it: on a node that has never collected anything,
+/// that is simply the first write ever made, and a peer asking from before it
+/// would be sent a full snapshot it does not need.
+pub const META_OPLOG_COLLECTED_THROUGH: &str = "oplog_collected_through";

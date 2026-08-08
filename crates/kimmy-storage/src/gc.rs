@@ -135,9 +135,30 @@ impl Engine {
                 !expired
             })?;
 
+            let mut highest = None;
             for key in dropped_keys {
+                if let Ok(stamp) = codec::decode_oplog_key(&key) {
+                    highest = Some(highest.map_or(stamp.hlc, |h: Hlc| h.max(stamp.hlc)));
+                }
                 if let Some(seq) = by_stamp.remove(key.as_slice())? {
                     arrival.remove(seq.value())?;
+                }
+            }
+
+            // Recording the horizon is what lets a peer be told it needs a
+            // snapshot rather than being served a silent gap.
+            if let Some(highest) = highest {
+                let mut meta = txn.open_table(tables::META)?;
+                let previous = match meta.get(tables::META_OPLOG_COLLECTED_THROUGH)? {
+                    Some(raw) => codec::decode_oplog_key(raw.value()).ok().map(|s| s.hlc),
+                    None => None,
+                };
+                if previous.is_none_or(|p| highest > p) {
+                    let marker = kimmy_core::Stamp::new(highest, self.node_id());
+                    meta.insert(
+                        tables::META_OPLOG_COLLECTED_THROUGH,
+                        codec::oplog_key(&marker).as_slice(),
+                    )?;
                 }
             }
         }

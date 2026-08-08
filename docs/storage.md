@@ -76,7 +76,7 @@ erDiagram
 | `oplog` | `&[u8]` — 26 bytes (hlc \|\| node) | `OplogEntry` |
 | `oplog_arrival` | `u64` — local arrival sequence | oplog key |
 | `oplog_arrival_seq` | oplog key | `u64` |
-| `oplog_versions` | node id (16 bytes) | highest `Hlc` from that node |
+| `oplog_versions` | node id (16 bytes) | highest `Hlc` covered from that node — **not** purely oplog-derived; a snapshot grants coverage too |
 | `collections_dropped` | collection id | `Stamp` of the drop |
 
 ### Why the keys are shaped this way

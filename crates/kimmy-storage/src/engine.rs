@@ -210,13 +210,17 @@ impl Engine {
         Ok(())
     }
 
-    /// Rebuild the version vector if it does not agree with the oplog.
+    /// Raise the version vector to cover everything in the oplog.
     ///
-    /// Derived state, like the arrival index, so a database written before it
-    /// existed is repaired rather than refused. The check is a comparison
-    /// against the oplog tail per node rather than a count, because the vector
-    /// holds one row per *node* while the oplog holds one per entry — a length
-    /// comparison would say nothing.
+    /// **Only ever raises.** The vector was derived state when the oplog was
+    /// the sole way to gain coverage; a snapshot transfer grants coverage of
+    /// entries this node will never hold, so the oplog is now a *lower bound*
+    /// on what has been seen rather than the whole truth. Recomputing from it
+    /// would silently undo a completed snapshot and send the node back to
+    /// asking for history it has already been given another way.
+    ///
+    /// What it still does is repair a vector that has fallen behind: a database
+    /// written before the vector existed, or one an older build appended to.
     fn rebuild_version_vector_if_stale(db: &Database) -> Result<()> {
         let mut actual = kimmy_core::VersionVector::new();
         {
@@ -228,24 +232,23 @@ impl Engine {
             }
         }
 
-        let stored = Self::read_version_vector(db)?;
-        if stored == actual {
+        let mut stored = Self::read_version_vector(db)?;
+        let before = stored.clone();
+        stored.merge(&actual);
+        if stored == before {
             return Ok(());
         }
 
         let txn = db.begin_write()?;
         {
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-            versions.retain(|_, _| false)?;
-            for (node, hlc) in actual.iter() {
+            for (node, hlc) in stored.iter() {
                 versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
         txn.commit()?;
 
-        if !actual.is_empty() {
-            info!(nodes = actual.len(), "rebuilt the oplog version vector");
-        }
+        info!(nodes = stored.len(), "raised the version vector to cover the oplog");
         Ok(())
     }
 
@@ -290,6 +293,52 @@ impl Engine {
         }
         txn.commit()?;
         Ok(())
+    }
+
+    /// Record coverage granted by a snapshot.
+    ///
+    /// Merged rather than replaced, so writes this node made that the sender
+    /// never saw are not claimed to be forgotten.
+    pub fn absorb_version_vector(&self, granted: &kimmy_core::VersionVector) -> Result<()> {
+        let mut current = Self::read_version_vector(&self.db)?;
+        current.merge(granted);
+
+        let txn = self.db.begin_write()?;
+        {
+            let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+            for (node, hlc) in current.iter() {
+                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The highest `Hlc` retention has removed from the oplog.
+    ///
+    /// [`Hlc::ZERO`] when nothing has ever been collected, which reads
+    /// naturally: every peer is at or above it, so every peer can be served
+    /// incrementally.
+    pub fn oplog_collected_through(&self) -> Result<Hlc> {
+        let txn = self.db.begin_read()?;
+        let meta = txn.open_table(tables::META)?;
+        match meta.get(tables::META_OPLOG_COLLECTED_THROUGH)? {
+            Some(raw) => Ok(codec::decode_oplog_key(raw.value())?.hlc),
+            None => Ok(Hlc::ZERO),
+        }
+    }
+
+    /// The oldest stamp still in the oplog, if any.
+    ///
+    /// A peer asking from a point below this cannot be served incrementally:
+    /// the history it is missing has been collected.
+    pub fn oldest_retained(&self) -> Result<Option<Stamp>> {
+        let txn = self.db.begin_read()?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        match oplog.first()? {
+            Some((key, _)) => Ok(Some(codec::decode_oplog_key(key.value())?)),
+            None => Ok(None),
+        }
     }
 
     /// What this node holds, summarized per originating node.
@@ -738,7 +787,11 @@ pub(crate) fn index_range(
 /// The only place the storage layer reads the wall clock. `kimmy-core` takes
 /// physical time as a parameter precisely so that this stays isolated and the
 /// clock logic remains deterministically testable.
-pub(crate) fn physical_now_ms() -> u64 {
+/// Milliseconds since the Unix epoch.
+///
+/// Public so that tests elsewhere in the workspace can express "far in the
+/// future" against the same clock retention uses.
+pub fn physical_now_ms() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 

@@ -16,6 +16,7 @@ pub mod gc;
 pub mod index;
 pub mod meta;
 pub mod migrate;
+pub mod snapshot;
 pub mod sync;
 pub mod tables;
 pub mod vectors;
@@ -23,8 +24,10 @@ pub mod watch;
 
 pub use docs::{ID_FIELD, WriteOutcome};
 pub use engine::Engine;
+pub use engine::physical_now_ms;
 pub use error::{Result, StorageError};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
+pub use snapshot::{CollectionState, SNAPSHOT_PAGE, SnapshotCursor, SnapshotDoc, SnapshotPage};
 pub use sync::SyncOutcome;
 pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};

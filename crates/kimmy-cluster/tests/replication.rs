@@ -210,6 +210,61 @@ async fn connecting_to_a_dead_peer_is_an_error_not_a_hang() {
     assert!(result.is_err());
 }
 
+#[tokio::test]
+async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() {
+    // The failure this exists for. Without snapshot fallback, a node added to a
+    // cluster older than oplog_retention_secs receives nothing it can apply,
+    // never advances its version vector, and retries forever.
+    let a = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.create_index("shop", "orders", vec![field("item")], true, None).unwrap();
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    for i in 0..50i64 {
+        a.engine.insert(&ca, doc! { "_id": i, "item": format!("item-{i}") }).unwrap();
+    }
+
+    // A has been running long enough that its history is gone.
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+    // B joins knowing nothing.
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection must arrive");
+    assert_eq!(b.engine.count(&cb).unwrap(), 50, "every document must arrive");
+    assert!(
+        cb.indexes.iter().any(|i| i.name == "item_1" && i.unique),
+        "the index must arrive with its uniqueness"
+    );
+
+    // And it must stop asking for history that no longer exists.
+    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
+}
+
+#[tokio::test]
+async fn a_snapshot_is_only_used_when_the_oplog_cannot_serve() {
+    // Snapshots transfer everything, so they must be the fallback rather than
+    // the ordinary path.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..10i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+
+    let b = node().await;
+    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+
+    // An incremental round reports DDL separately; a snapshot reports only
+    // applied documents, so a non-zero ddl count means the oplog served it.
+    assert!(outcome.ddl > 0, "nothing was collected, so history should have served: {outcome:?}");
+}
+
 fn field(path: &str) -> kimmy_storage::IndexField {
     kimmy_storage::IndexField { path: path.into(), descending: false }
 }

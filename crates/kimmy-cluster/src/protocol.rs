@@ -32,6 +32,7 @@
 use std::io;
 
 use kimmy_core::{Hlc, NodeId, OplogEntry, VersionVector};
+use kimmy_storage::{SnapshotCursor, SnapshotPage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -70,6 +71,17 @@ pub enum Message {
     AskEntries { from: Hlc, limit: usize },
     /// The answer, in stamp order.
     Entries(Vec<OplogEntry>),
+    /// "I have collected the history you asked for; ask for a snapshot."
+    ///
+    /// Sent instead of `Entries` when the requester is below the sender's
+    /// retention horizon. Serving it entries anyway would hand it a silent gap:
+    /// it would apply what still exists, advance its version vector, and never
+    /// learn what it missed.
+    BeyondHorizon {},
+    /// "Send me current state instead of history."
+    AskSnapshot { after: Option<SnapshotCursor> },
+    /// One page of it.
+    Snapshot(Box<SnapshotPage>),
     /// Something went wrong; the sender is closing.
     Fault(String),
 }
