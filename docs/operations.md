@@ -278,12 +278,27 @@ a shorter `gc_interval_secs` keeps each pass small.
 
 ## Upgrades
 
-The on-disk format version is checked on open. A mismatch **refuses to start**
-rather than misreading records — the right failure, since a silent
-misinterpretation corrupts further.
+The on-disk **schema version** is checked on open, and the two directions are
+treated differently on purpose:
 
-There is no migration tooling yet. While the format is at version 1 and
-pre-release, treat a format bump as "start from a fresh data directory".
+| Stored version | Behaviour |
+|---|---|
+| Older than this build | **Migrated in place** on open, logged at `info` |
+| Equal | Opens normally |
+| Newer | **Refuses to start** |
+
+Refusing on a *newer* schema is the right failure: a build cannot know a layout
+that did not exist when it was written, and guessing corrupts further. Migrating
+an *older* one is equally right — a user with data has no other route forward.
+
+Current schema is **2**. The 1 → 2 migration renumbers collections to ids
+derived from their names ([ADR-031](decisions.md)), rewriting document keys,
+index entries, and the collection field of every oplog entry. It is idempotent
+and runs before the node serves anything.
+
+> **Back up the data directory before a version-crossing upgrade.** The
+> migration is transactional per step, but a rollback to the older build is not
+> possible once it has run — the older build will refuse the newer schema.
 
 ---
 
@@ -293,12 +308,12 @@ pre-release, treat a format bump as "start from a fresh data directory".
 |---|---|
 | `no root password configured` | Set `KIMMY_ROOT_PASSWORD` or pass `--insecure-no-auth` on loopback |
 | `insecure_no_auth is set but the server binds to 0.0.0.0` | Bind to `127.0.0.1` or configure auth |
-| `on-disk format version N is not supported` | Data directory written by a different build |
+| `on-disk format version N is not supported` | Data directory written by a **newer** build; older ones migrate automatically |
 | 401 on a token that worked a moment ago | Token expired (1 h default), or the node has a different `jwt_secret` |
 | 403 where you expected 404 | Deliberate — authorization does not reveal existence |
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |
 | Second `Engine::open` fails | redb allows one handle per file; share an `Arc<Engine>` |
-| Queries slow on a large collection | Expected — no indexes yet |
+| Queries slow on a large collection | Check `find` with `"explain": true`; if `strategy` is `collectionScan`, add an index |
 
 ---
 

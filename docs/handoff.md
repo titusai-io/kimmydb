@@ -6,90 +6,78 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-07 — M3 done, and all three M4 blockers resolved
+## As of 2026-08-07 — M4 started; collection identity fixed first
 
-**Branches, each ready to merge, stacked in this order:**
+**Branch:** `m4-deterministic-collection-ids` (ready to merge)
+**Gate:** 525 tests · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · migration driven against two
+real pre-existing databases
 
-| Branch | What |
-|---|---|
-| `m3-mcp-server` | The in-process MCP server |
-| `m5-retention-gc` | Oplog and tombstone retention, enforced |
-| `m4-oplog-arrival-order` | Change streams follow arrival, not origin stamp |
-| `m4-remote-index-maintenance` | Secondary indexes on the merge path |
-| `m2-byo-vector-ingest` | The `byo` ingest route, and the silent-search fix |
+### What this branch did
 
-**Gate:** 513 tests · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · each branch driven against a
-running server.
+Starting M4's transport turned up a blocker underneath it. **Collection ids came
+from a node-local counter**, and every oplog entry names its collection by id —
+so two nodes that created the same collections in a different order disagreed
+about what an entry referred to, and a replicated write would have landed in the
+wrong collection. Confirmed with a throwaway two-engine probe before designing
+around it.
 
-### The three blockers, and what was chosen
+Ids are now derived: `FNV-1a-64(db || 0x00 || name)`. Every node computes the
+same answer with no coordination, which is the leaderless property the design
+rests on. The maintainer chose this over replicating metadata or carrying `(db, name)` in
+every entry. [ADR-031](decisions.md).
 
-**1. `byo` had no ingest route.** Now `PUT
-/v1/db/{db}/coll/{coll}/docs/{id}/vectors` taking `[{chunk, vector, text}]`,
-replace-all per document, server supplying `source` and `source_hlc`. Searching
-a collection with no vectors at all is `409 no_vectors` with the remedy in the
-message, rather than an empty result that reads as "nothing matched".
+- **Schema version 2**, separate from the record `codec::FORMAT_VERSION` — a
+  record whose bytes still decode does not need rewriting because the meaning of
+  a key changed around it.
+- **Migration, not refusal.** Schema 1 databases are renumbered on open:
+  document keys, index entries, and the collection field of every oplog entry.
+  Idempotent. A *newer* schema is still refused.
+- **Collision checked** at creation and at migration, since two collections
+  sharing storage is unrecoverable.
 
-**2. Replicated writes landed behind the change-stream position.** Resolved with
-a second ordering — `oplog_arrival` — over local arrival sequence, with the
-oplog still keyed by origin stamp for conflict resolution and anti-entropy.
-Resume tokens unchanged. No format bump: the index is derived from the oplog and
-rebuilt on open when it does not cover it. [Oplog](oplog.md).
+**One consequence, unavoidable:** dropping and recreating a collection now
+reuses its id. "Same name means same id everywhere" and "recreating yields a
+fresh id" are contradictory. That makes purging on drop load-bearing rather than
+tidy; `drop_collection` already purged, and a test now pins that instead of the
+id-uniqueness property it replaced.
 
-**3. Unique violations on merge.** `OpKind::UniqueViolation` oplog entries, so
-they reach change streams durably and resumably, plus a `kimmy_unique_violations`
-metric. Both colliding documents survive and both are indexed.
-[ADR-029](decisions.md).
+### Next: the rest of M4
 
-### Bugs found and fixed along the way
+In order:
 
-- **`apply_remote` never maintained secondary indexes.** A replicated document
-  would have been invisible to every index-backed query — present in a scan,
-  missing from a `find` the planner chose an index for.
-- **Streams de-duplicated by comparing stamps**, discarding exactly the
-  replicated entries the arrival index exists to deliver.
-- **Streams trusted publication order**, which can differ from commit order
-  under concurrency — latent, intermittent, unrelated to replication. Both
-  dissolved once the broadcast became a wake-up ([ADR-030](decisions.md)).
-- **`ConsumerLagged` was never emitted**, so a stream whose range retention had
-  collected skipped it silently.
-- **Schema inference counted array elements, not documents**, reporting a
-  presence above 1.0.
-- **MCP published the password-hash collection as an attachable resource.**
+1. **Version vectors.** Nothing computes `{node → max_hlc}` yet. The roadmap's
+   "missing: the transport" understated what is left. Needs a table maintained
+   in `append_oplog`, plus "what do I need from you" comparison.
+2. **Anti-entropy** — request an oplog range from a peer, apply with
+   `apply_remote`, which now maintains indexes and reports violations.
+3. **The transport** — `foca` membership over UDP, TCP for oversized payloads.
 
-### Next: M4 — gossip clustering
+I would do 1 and 2 first, transport-free and tested between two in-process
+engines, then wire the network. That is the order that keeps the correctness
+work separable from the networking.
 
-`apply_remote`, conflict resolution, index maintenance on merge, violation
-reporting, and discovery parsing all exist and are tested. **Missing: the
-transport.** Membership via [`foca`](https://github.com/caio/foca) over UDP,
-TCP for oversized payloads.
+### Worth knowing before continuing
 
-Nothing is blocking it now.
-
-### Worth knowing before starting
-
-- **Exclude `OpKind::UniqueViolation` from anti-entropy.** These are a node's
-  own observation; every node detects the same collision when it merges, so
-  shipping them would report one violation once per node.
-- **`kimmy_api::exec` is the single authorization point**, and replication is a
-  third writer. It serves no principal, so it goes through `apply_remote`, not
-  `exec`. Keep that boundary.
-- **Anti-entropy uses `read_oplog_from`** (stamp order), streams use
-  `read_arrival_from` (arrival order). They are different questions; do not
-  merge them.
-- **`oplog_retention_secs` now bounds peer catch-up.** A peer further behind
-  than the window needs a full resync, which does not exist yet.
+- **Exclude `OpKind::UniqueViolation` from anti-entropy.** These are a node's own
+  observation; replicating them reports one violation once per node.
+- **Anti-entropy uses `read_oplog_from`** (stamp order); change streams use
+  `read_arrival_from` (arrival order). Different questions — do not merge them.
+- **`apply_remote` is not `exec`.** It serves no principal, so it does not go
+  through the authorization path. Keep that boundary.
+- **`oplog_retention_secs` bounds peer catch-up.** A peer further behind than
+  the window needs a full resync, which does not exist.
 - **Retention never collects the newest oplog entry** — the clock resumes from
   it ([ADR-028](decisions.md)).
 
-### Still open, none blocking
+### Open, none blocking
 
-Implementation only, no decisions needed: `$in` not using an index;
-descending-field ranges; one-bound index ranges; HNSW snapshot persistence; the
-aggregation pipeline that would give MCP its `aggregate` tool.
+Implementation only: `$in` not using an index; descending-field ranges;
+one-bound index ranges; HNSW snapshot persistence; the aggregation pipeline that
+would give MCP its `aggregate` tool.
 
-Two design questions M4 will raise but has not yet: whether `drop_collection`
-should replicate as a tombstone, and how to handle a node whose tombstones were
+Two questions M4 will raise but has not yet: whether `drop_collection` should
+replicate as a tombstone, and how to handle a node whose tombstones were
 collected while it was partitioned.
 
 ## Conventions for this file

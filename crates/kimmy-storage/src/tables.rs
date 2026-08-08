@@ -68,4 +68,7 @@ pub const OPLOG_ARRIVAL_SEQ: TableDefinition<&[u8], u64> =
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";
+/// Left over from counter-allocated collection ids. Ids are derived from the
+/// collection name now, so nothing reads this; it is kept so that a database
+/// written by an older build still round-trips rather than losing a key.
 pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
