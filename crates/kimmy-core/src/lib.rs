@@ -17,6 +17,7 @@ pub mod path;
 pub mod record;
 pub mod vector_meta;
 pub mod vector_record;
+pub mod version;
 
 pub use cmp::canonical_cmp;
 pub use conflict::UniqueViolationDetail;
@@ -28,3 +29,4 @@ pub use oplog::{OpKind, OplogEntry, ResumeToken};
 pub use record::DocRecord;
 pub use vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
 pub use vector_record::{VectorRecord, similarity};
+pub use version::VersionVector;

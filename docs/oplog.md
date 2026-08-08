@@ -250,6 +250,45 @@ Shorten `oplog_retention_secs` to trade resume range for disk.
 
 ---
 
+## Version vectors
+
+A third derived index summarizes coverage: the highest `Hlc` held from each
+*originating* node.
+
+```
+oplog_versions:  node id (16 bytes) -> Hlc (10 bytes)
+```
+
+Maintained on every append rather than computed, because deriving it would mean
+scanning the whole log for a max-per-node — for a value read on every gossip
+round. Like the arrival index it is derived state, and `Engine::open` rebuilds
+it if it disagrees with the oplog.
+
+Two peers exchange vectors and each works out what to ask for:
+
+```rust
+match mine.behind(&theirs) {
+    Some(from) => apply_batch(&peer.entries_for_peer(from, limit)?)?,
+    None => { /* already covered */ }
+}
+```
+
+**The request is a single threshold, not a range per node.** The oplog sorts by
+time first, so "everything from node N after H" would be a scan and filter,
+while "everything after H" is one range read. `behind` therefore returns the
+*lowest* point this node is deficient at — starting any later would silently
+skip whatever the furthest-behind peer was missing.
+
+The cost is over-fetching entries already held, and that is deliberately cheap:
+`apply_remote` requires the incoming stamp to *strictly* win, so a re-delivered
+entry is compared and discarded without touching the document or republishing an
+event.
+
+**Unique-violation entries are never sent.** They record what one node observed
+when it merged, and every node observes the same collision independently.
+
+---
+
 ## Replication (📋 M4)
 
 The intended flow, with the primitives that already exist marked:

@@ -65,6 +65,16 @@ pub const OPLOG_ARRIVAL: TableDefinition<u64, &[u8]> = TableDefinition::new("opl
 pub const OPLOG_ARRIVAL_SEQ: TableDefinition<&[u8], u64> =
     TableDefinition::new("oplog_arrival_seq");
 
+/// `node id (16 bytes) -> highest Hlc held from that node`.
+///
+/// The version vector, maintained incrementally rather than computed. Deriving
+/// it on demand would mean scanning the whole oplog for a max-per-node, which
+/// is O(n) for a value read on every gossip round.
+///
+/// **Derived state**, like the arrival index: `Engine::open` rebuilds it if it
+/// does not agree with the oplog, so it can be discarded without loss.
+pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_versions");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";
