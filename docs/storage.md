@@ -77,6 +77,7 @@ erDiagram
 | `oplog_arrival` | `u64` — local arrival sequence | oplog key |
 | `oplog_arrival_seq` | oplog key | `u64` |
 | `oplog_versions` | node id (16 bytes) | highest `Hlc` from that node |
+| `collections_dropped` | collection id | `Stamp` of the drop |
 
 ### Why the keys are shaped this way
 
@@ -202,11 +203,18 @@ tombstones are kept; a background pass collects expired ones every
 data, however old — and the index entries were already removed when the delete
 was applied, so nothing is left referring to the collected key.
 
+**Dropped collections leave a tombstone too**, in `collections_dropped`, keyed
+by collection id and collected on the same window. Without one, the
+`DropCollection` oplog entry was the only record of the drop — bounded by
+`oplog_retention_secs` rather than by tombstone retention — so a peer
+partitioned across that window rejoined and the whole collection came back,
+documents included. See [ADR-034](decisions.md).
+
 > **Sharp edge.** The retention window must exceed the longest partition you are
 > willing to tolerate. If a partitioned peer rejoins after tombstones have been
-> collected here, documents it deleted will resurrect. This is inherent to
-> tombstone-based deletion in an eventually-consistent store, not a bug to be
-> fixed later.
+> collected here, documents it deleted — and collections it dropped — will
+> resurrect. This is inherent to tombstone-based deletion in an
+> eventually-consistent store, not a bug to be fixed later.
 
 ---
 

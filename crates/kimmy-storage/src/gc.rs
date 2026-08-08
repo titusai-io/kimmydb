@@ -78,9 +78,11 @@ impl Engine {
     /// Taking the time as a parameter is what makes retention testable at all:
     /// the alternative is a test that sleeps for the retention window.
     pub fn collect_garbage_at(&self, now_ms: u64, policy: RetentionPolicy) -> Result<GcOutcome> {
+        let tombstone_cutoff = cutoff(now_ms, policy.tombstone_secs);
         let outcome = GcOutcome {
             oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
-            tombstones_removed: self.collect_tombstones(cutoff(now_ms, policy.tombstone_secs))?,
+            tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
+                + self.collect_dropped_collections(tombstone_cutoff)?,
         };
 
         if !outcome.is_empty() {
@@ -159,6 +161,32 @@ impl Engine {
                     return true;
                 };
                 let expired = record.deleted && record.stamp.hlc < cutoff;
+                if expired {
+                    removed += 1;
+                }
+                !expired
+            })?;
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
+    /// Drop collection tombstones older than `cutoff`.
+    ///
+    /// Counted alongside document tombstones because they answer the same
+    /// question over the same window: "was this deleted more recently than the
+    /// thing a peer is trying to replay?"
+    fn collect_dropped_collections(&self, cutoff: Hlc) -> Result<usize> {
+        let txn = self.db().begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            dropped.retain(|_, value| {
+                let Ok(stamp) = codec::decode_oplog_key(value) else {
+                    warn!("undecodable collection tombstone retained");
+                    return true;
+                };
+                let expired = stamp.hlc < cutoff;
                 if expired {
                     removed += 1;
                 }

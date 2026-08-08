@@ -96,6 +96,17 @@ impl Engine {
                 continue;
             }
 
+            // A drop the sender has not heard about yet must not be undone by
+            // the documents it is still replaying. Checked by id, because a
+            // node that dropped the collection can no longer resolve that id
+            // to a name.
+            if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
+                && entry.stamp < dropped_at
+            {
+                outcome.superseded += 1;
+                continue;
+            }
+
             let Some(collection) = self.collection_by_id(entry.collection)? else {
                 outcome.unknown_collection += 1;
                 continue;
@@ -145,6 +156,21 @@ impl Engine {
         match entry.kind {
             OpKind::CreateCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+
+                // A creation older than the drop that removed it is history,
+                // not an instruction. Without this a peer partitioned across
+                // the drop would recreate the collection on rejoining.
+                if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
+                    && entry.stamp < dropped_at
+                {
+                    debug!(
+                        db = %target.db,
+                        collection = %target.name,
+                        "ignored a creation older than the drop that removed it"
+                    );
+                    return Ok(());
+                }
+
                 match self.get_collection(&target.db, &target.name) {
                     Ok(_) => {}
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
@@ -158,7 +184,14 @@ impl Engine {
             }
             OpKind::DropCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
-                self.drop_collection_inner(&target.db, &target.name, false)?;
+                // The originating stamp, not a local one: the tombstone has to
+                // sort before any recreation that legitimately followed the
+                // drop, or the name becomes unusable on this node forever.
+                self.drop_collection_inner(&target.db, &target.name, Some(entry.stamp))?;
+                // Recorded even when the collection was already gone: the
+                // tombstone is what stops a *later* replay from recreating it,
+                // and a node that never had the collection still needs it.
+                self.record_collection_drop(entry.collection, entry.stamp)?;
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
@@ -229,6 +262,9 @@ mod tests {
     use kimmy_core::DocId;
 
     const BATCH: usize = 1024;
+    const DAY: u64 = 24 * 60 * 60;
+
+    use crate::gc::RetentionPolicy;
 
     fn engine() -> (Engine, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
@@ -599,6 +635,133 @@ mod tests {
             "b must record coverage of a's writes under a's node id"
         );
         assert!(b.version_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    #[test]
+    fn a_partitioned_peer_cannot_resurrect_a_dropped_collection() {
+        // The scenario collection tombstones exist for.
+        //
+        // The partitioned peer has to keep *writing* for this to arise: only
+        // then does the dropper fall behind it, and only then does it request
+        // from the beginning and receive the peer's copy of the original
+        // CreateCollection entry. Without that, the dropper is ahead of the
+        // peer on every node and asks for nothing — which is why an earlier
+        // version of this test passed even with the check removed.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1, "v": "original" }).unwrap();
+        sync(&a, &b);
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some(), "b must start out holding it");
+
+        // A drops the collection while B is unreachable...
+        a.drop_collection("shop", "orders").unwrap();
+        // ...and B, still partitioned, keeps serving writes to it.
+        b.insert(&cb, doc! { "_id": 2, "v": "written during the partition" }).unwrap();
+
+        // The drop ages out of A's oplog, leaving *only* the tombstone.
+        // Tombstone retention is deliberately unbounded here: the point is the
+        // window in which the oplog has forgotten and the tombstone has not.
+        a.collect_garbage_at(
+            crate::engine::physical_now_ms() + 1_000_000_000,
+            RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+        // B rejoins. A is now behind on B, so it asks from the beginning and
+        // receives B's copy of the creation.
+        pull(&a, &b);
+
+        assert!(
+            a.get_collection("shop", "orders").is_err(),
+            "the dropped collection must not come back"
+        );
+    }
+
+    #[test]
+    fn documents_written_before_a_drop_do_not_return_to_a_recreated_collection() {
+        // Recreating the collection is one route back; replaying its documents
+        // into a node that has since recreated it is another.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        sync(&a, &b);
+
+        // B keeps writing into the doomed collection while partitioned.
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": 2 }).unwrap();
+
+        a.drop_collection("shop", "orders").unwrap();
+        let ca = a.create_collection("shop", "orders").unwrap();
+
+        pull(&a, &b);
+
+        assert_eq!(
+            a.count(&ca).unwrap(),
+            0,
+            "documents written before the drop must not flow back into the recreated collection"
+        );
+    }
+
+    #[test]
+    fn a_drop_still_replicates_to_a_peer_that_never_had_the_collection() {
+        // The tombstone has to be recorded even when there is nothing local to
+        // remove, or a third node could later reintroduce the collection.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": 1 }).unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+
+        pull(&b, &a);
+
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        assert!(
+            b.collection_dropped_at(id).unwrap().is_some(),
+            "b must remember the drop even though it never held the collection"
+        );
+        assert!(b.get_collection("shop", "orders").is_err());
+    }
+
+    #[test]
+    fn recreating_after_a_drop_beats_the_tombstone() {
+        // A tombstone must not make a name permanently unusable: a creation
+        // stamped after the drop is a new collection, not a resurrection.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let recreated = a.create_collection("shop", "orders").unwrap();
+        a.insert(&recreated, doc! { "_id": "new" }).unwrap();
+
+        pull(&b, &a);
+
+        let cb = b.get_collection("shop", "orders").expect("the recreation must replicate");
+        assert!(b.get(&cb, &DocId::String("new".into())).unwrap().is_some());
+    }
+
+    #[test]
+    fn collection_tombstones_are_collected_on_the_tombstone_window() {
+        // They answer the same question as document tombstones over the same
+        // window, so they expire on the same setting rather than on the oplog's.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        assert!(a.collection_dropped_at(id).unwrap().is_some());
+
+        let outcome = a
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                RetentionPolicy::new(DAY, 0),
+            )
+            .unwrap();
+
+        assert!(outcome.tombstones_removed > 0);
+        assert!(a.collection_dropped_at(id).unwrap().is_none());
     }
 
     fn vector_config() -> kimmy_core::VectorConfig {
