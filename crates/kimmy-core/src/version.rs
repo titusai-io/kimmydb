@@ -198,4 +198,29 @@ mod tests {
         let text = serde_json::to_string(&v).unwrap();
         assert_eq!(serde_json::from_str::<VersionVector>(&text).unwrap(), v);
     }
+
+    #[test]
+    fn a_populated_vector_round_trips_through_bson() {
+        // BSON is what crosses the wire between nodes, and it is stricter than
+        // JSON: document keys must be strings, and it disagrees with itself
+        // about whether it is a human-readable format. An *empty* vector round
+        // trips under any encoding, which is why this one is deliberately not.
+        let mut v = VersionVector::new();
+        v.observe(Stamp::new(Hlc::new(3, 1), node()));
+        v.observe(Stamp::new(Hlc::new(90, 0), node()));
+
+        let bytes = bson::serialize_to_vec(&v).unwrap();
+        assert_eq!(bson::deserialize_from_slice::<VersionVector>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn a_node_id_round_trips_through_bson() {
+        let id = node();
+        #[derive(serde::Serialize, serde::Deserialize, PartialEq, Debug)]
+        struct Wrapper {
+            node: NodeId,
+        }
+        let bytes = bson::serialize_to_vec(&Wrapper { node: id }).unwrap();
+        assert_eq!(bson::deserialize_from_slice::<Wrapper>(&bytes).unwrap().node, id);
+    }
 }

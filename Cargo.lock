@@ -1768,10 +1768,15 @@ dependencies = [
 name = "kimmy-cluster"
 version = "0.1.0"
 dependencies = [
+ "bson",
+ "hmac",
  "kimmy-core",
  "kimmy-storage",
  "serde",
  "serde_json",
+ "sha2",
+ "subtle",
+ "tempfile",
  "thiserror 2.0.19",
  "tokio",
  "tracing",

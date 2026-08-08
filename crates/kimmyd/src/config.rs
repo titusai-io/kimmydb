@@ -95,6 +95,14 @@ pub struct ClusterConfig {
     pub seeds: Vec<SeedSource>,
     /// Shared secret authenticating node-to-node traffic.
     pub cluster_secret: Option<String>,
+    /// How often to run an anti-entropy round against each known peer.
+    pub sync_interval_secs: u64,
+    /// How often to re-resolve the seed sources.
+    ///
+    /// Slower than syncing on purpose: DNS is the expensive half, and a pod set
+    /// does not change every few seconds. But it must repeat — a node that
+    /// resolved only at startup would never see a peer that joined later.
+    pub discovery_interval_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -158,6 +166,8 @@ impl Default for ClusterConfig {
                 .expect("valid literal"),
             seeds: Vec::new(),
             cluster_secret: None,
+            sync_interval_secs: 5,
+            discovery_interval_secs: 30,
         }
     }
 }
@@ -218,6 +228,19 @@ impl Config {
                      rejected by the others. Set KIMMY_JWT_SECRET identically on all nodes."
                 );
             }
+        }
+
+        if self.cluster.enabled && self.cluster.sync_interval_secs == 0 {
+            anyhow::bail!(
+                "cluster.sync_interval_secs must be greater than zero; a node that never runs \
+                 an anti-entropy round would serve peers but never catch up itself"
+            );
+        }
+        if self.cluster.enabled && self.cluster.discovery_interval_secs == 0 {
+            anyhow::bail!(
+                "cluster.discovery_interval_secs must be greater than zero; a node that never \
+                 re-resolves its seeds would never see a peer that joined after it started"
+            );
         }
 
         if self.storage.oplog_retention_secs == 0 {
@@ -384,6 +407,25 @@ mod tests {
         cfg.storage.gc_interval_secs = 0;
         cfg.validate().unwrap();
         assert!(cfg.summary().contains("gc=off"));
+    }
+
+    #[test]
+    fn cluster_intervals_must_be_non_zero() {
+        let mut cfg = valid();
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.cluster_secret = Some("shared".into());
+        cfg.auth.jwt_secret = Some("signing-key".into());
+        cfg.validate().unwrap();
+
+        cfg.cluster.sync_interval_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sync_interval_secs"), "unhelpful error: {err}");
+
+        cfg.cluster.sync_interval_secs = 5;
+        cfg.cluster.discovery_interval_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("discovery_interval_secs"), "unhelpful error: {err}");
     }
 
     #[test]

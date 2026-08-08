@@ -38,6 +38,8 @@ fails fast on a bad volume mount.
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents *and* dropped collections |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
+| `cluster.sync_interval_secs` | — | `5` | How often to run an anti-entropy round against each peer |
+| `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Identical on every node.** ≥16 bytes |

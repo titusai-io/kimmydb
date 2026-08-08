@@ -9,20 +9,20 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-563 tests passing · 0 failures · clippy clean at -D warnings
+585 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 116 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-core` | 118 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
 | `kimmy-storage` | 164 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | 58 | 31 unit (JSON boundary, errors, schema inference) + 27 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
-| `kimmyd` | 17 | Config layering and validation |
-| `kimmy-cluster` | 5 | Discovery string parsing |
+| `kimmyd` | 18 | Config layering and validation |
+| `kimmy-cluster` | 24 | Discovery, wire protocol, handshake, and replication over real sockets |
 
 ---
 
@@ -201,6 +201,22 @@ the suite goes red, revert.
 
 ---
 
+### A third: an empty value round-trips under any encoding
+
+The wire protocol's round-trip test serialized a `VersionVector` — and used an
+**empty** one. An empty map encodes identically everywhere, so the test proved
+nothing about the thing that actually mattered: `NodeId` is a map *key*, BSON
+keys must be strings, and `uuid`'s serde picks its representation from whether
+the format calls itself human-readable — which BSON answers differently when
+writing than when reading.
+
+The first real two-node sync failed instantly with a decode error. The fix was
+to give `NodeId` one fixed representation rather than let each format choose,
+and to populate the fixture. Empty collections, zero-length strings and default
+structs all make cheerful, worthless test data.
+
+---
+
 ### Two tests that passed for the wrong reason
 
 `a_partitioned_peer_cannot_resurrect_a_dropped_collection` was written, passed,
@@ -281,6 +297,7 @@ Worth recording, because each one shows the test doing its job:
 | `apply_remote` never maintained secondary indexes | A replicated document would be invisible to every index-backed query — present in a scan, missing from an index-backed `find` | reading the merge path while designing violation detection, which needs an index write to detect anything |
 | Collection ids came from a node-local counter | **Silent cross-node corruption.** Every oplog entry names its collection by id, so two nodes that created collections in a different order would apply each other's writes to the wrong collection — and it works whenever creation order happens to match, which is what a two-node smoke test does | writing a throwaway two-engine probe while starting the transport, rather than trusting the roadmap's "missing: the transport" |
 | Applying a replicated schema change also minted a local one | **Unbounded amplification.** The peer pulls the local copy back, applies it, mints another — the same change traded forever, the oplog growing every round | two convergence tests failing on the second half of a create-then-drop sequence; the cause was only found by asking why the drop did not stick |
+| `NodeId` could be written to BSON but not read back | Replication failed on the first frame carrying a version vector. `uuid`'s serde chooses its representation from `is_human_readable()`, which BSON answers inconsistently | the first two-node sync over a real socket; the protocol round-trip test had used an *empty* vector and so never encoded a node id |
 | Change streams de-duplicated by comparing stamps | Dropped any entry stamped at or below the high-water mark — exactly what a replicated entry looks like — and, separately, would have reordered two concurrent writers that published out of commit order | designing the arrival index; the second half was latent and unrelated to replication |
 | Retention collecting the oplog tail | **Silent data loss.** The clock resumes from the tail, so an idle node would restart at `Hlc::ZERO` and every later write would lose to its own older version | writing the invariant into `the_clock_still_resumes_after_an_aggressive_collection` *before* the collector, then confirming a mutant that removes the guard fails three tests |
 
@@ -314,6 +331,10 @@ manually and are recorded so they can be repeated:
 | MCP RBAC for a real scoped user | ✅ read allowed; write, cross-collection read, user-store read, and DDL all refused |
 | `resources/list` as superuser | ✅ user data only — no `__kimmy`, no shadow collections |
 | `--no-mcp` | ✅ `/mcp` 404s, REST unaffected |
+| Two-node cluster, seeded by one address | ✅ collection, unique index and document replicated with no other configuration |
+| Writes on each node | ✅ converged in both directions |
+| Partition (`SIGSTOP`) and heal | ✅ both nodes reached the same document count |
+| Same unique value written on each side of a partition | ✅ both documents survived, availability preserved, and **both nodes reported the violation** — ADR-020 end to end |
 | Schema 1 → 2 migration on two real databases | ✅ 3 collections and 11 oplog entries repointed in one, 2 and 1 in the other; login still works (the user store moves too), documents and their exact values survived |
 | Retention pass on a live node | ✅ 45 oplog entries and 15 tombstones collected; 15 live documents untouched |
 | Restart after an aggressive collection | ✅ clock resumed from the retained tail; a post-restart update took effect rather than losing to LWW |
