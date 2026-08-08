@@ -12,8 +12,29 @@ kimmy-core.workspace = true
 kimmy-storage.workspace = true
 kimmy-query.workspace = true
 kimmy-auth.workspace = true
+kimmy-api.workspace = true
+axum.workspace = true
+http = "1"
+# `server` and `transport-streamable-http-server` only: the client half and the
+# stdio/child-process transports would be dead weight in a database server, and
+# the OAuth feature would be a second authentication system beside the one that
+# already governs every REST route.
+rmcp = { version = "3.1", default-features = false, features = [
+    "server",
+    "macros",
+    "schemars",
+    "transport-streamable-http-server",
+] }
+schemars = "1.0"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "macros"] }
+
+[dev-dependencies]
+bson.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full", "test-util"] }
+tower.workspace = true
+http-body-util.workspace = true

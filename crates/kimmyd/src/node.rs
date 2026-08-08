@@ -1,10 +1,11 @@
 //! Node lifecycle: startup, serving, and graceful shutdown.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use kimmy_auth::{TokenIssuer, UserStore};
-use kimmy_storage::Engine;
+use kimmy_storage::{Engine, RetentionPolicy};
 use tracing::{info, warn};
 
 use crate::config::Config;
@@ -45,8 +46,22 @@ pub async fn run(config: Config) -> Result<()> {
     let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
 
-    let app = kimmy_api::build(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
-        .context("building the API router")?;
+    let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
+        .context("building the API state")?;
+
+    // MCP shares the state rather than being handed its own, so an agent tool
+    // and the REST route beside it reach the same engine through the same
+    // authorization check. See kimmy-mcp's crate documentation.
+    let mut app = kimmy_api::router(Arc::clone(&state));
+    if config.server.mcp {
+        app = app.merge(kimmy_mcp::mcp_router(
+            Arc::clone(&state),
+            config.server.mcp_allowed_hosts.clone(),
+        ));
+        info!("serving MCP at /mcp");
+    }
+
+    let gc_handle = spawn_collector(Arc::clone(&engine), &config);
 
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
@@ -75,9 +90,51 @@ pub async fn run(config: Config) -> Result<()> {
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
     worker_handle.abort();
+    // Likewise the collector: a pass is a transaction, so an aborted one either
+    // committed or did not, and the next start simply finds the same garbage.
+    if let Some(handle) = gc_handle {
+        handle.abort();
+    }
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Start the retention collector, unless it is disabled.
+fn spawn_collector(engine: Arc<Engine>, config: &Config) -> Option<tokio::task::JoinHandle<()>> {
+    if config.storage.gc_interval_secs == 0 {
+        warn!("retention collection is disabled; the oplog and tombstones will grow without bound");
+        return None;
+    }
+
+    let interval = Duration::from_secs(config.storage.gc_interval_secs);
+    let policy = RetentionPolicy::new(
+        config.storage.oplog_retention_secs,
+        config.storage.tombstone_retention_secs,
+    );
+
+    Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // The first tick fires immediately, which would collect during startup
+        // while the node is still opening for business. Skip it.
+        ticker.tick().await;
+
+        loop {
+            ticker.tick().await;
+            match engine.collect_garbage(policy) {
+                // A failed pass is not fatal — the garbage is still there and
+                // the next tick will find it — so it is logged and retried
+                // rather than taking the node down.
+                Err(e) => warn!(error = %e, "retention pass failed"),
+                Ok(outcome) if outcome.is_empty() => {}
+                Ok(outcome) => info!(
+                    oplog = outcome.oplog_removed,
+                    tombstones = outcome.tombstones_removed,
+                    "collected expired records"
+                ),
+            }
+        }
+    }))
 }
 
 /// Create the bootstrap superuser on first start.

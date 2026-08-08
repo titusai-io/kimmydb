@@ -6,85 +6,91 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-07 — end of M2
+## As of 2026-08-07 — M3 done, and all three M4 blockers resolved
 
-**Branch:** `m2-index-wiring` (ready to merge)
-**Gate:** 449 tests passing · `cargo fmt --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · vector endpoints driven
-manually against a running server
+**Branches, each ready to merge, stacked in this order:**
 
-### What this branch did
+| Branch | What |
+|---|---|
+| `m3-mcp-server` | The in-process MCP server |
+| `m5-retention-gc` | Oplog and tombstone retention, enforced |
+| `m4-oplog-arrival-order` | Change streams follow arrival, not origin stamp |
+| `m4-remote-index-maintenance` | Secondary indexes on the merge path |
+| `m2-byo-vector-ingest` | The `byo` ingest route, and the silent-search fix |
 
-Closed the last 🔴 drift from M2 — HNSW existed and was tested but nothing
-chose it — and completed the M2 documentation.
+**Gate:** 513 tests · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · each branch driven against a
+running server.
 
-1. **`IndexCache`** (`crates/kimmy-vector/src/cache.rs`) owns the
-   exact-versus-approximate decision. Held in `AppState`, so one graph is
-   shared across requests rather than rebuilt per query. Both search endpoints
-   dispatch through `knn()` in `crates/kimmy-api/src/vectors.rs`.
+### The three blockers, and what was chosen
 
-2. **A per-collection vector generation counter** on `Engine`, bumped by
-   `put_vectors` and `delete_vectors`. Staleness detection that is exact and
-   free, where counting would be O(n) and would still miss a delete-then-add.
+**1. `byo` had no ingest route.** Now `PUT
+/v1/db/{db}/coll/{coll}/docs/{id}/vectors` taking `[{chunk, vector, text}]`,
+replace-all per document, server supplying `source` and `source_hlc`. Searching
+a collection with no vectors at all is `409 no_vectors` with the remedy in the
+message, rather than an empty result that reads as "nothing matched".
 
-3. **Fixed: a malformed shadow document broke search permanently.** A shadow
-   collection is an ordinary collection, so any client with write access could
-   insert into one; anything that did not decode as a `VectorRecord` made
-   `for_each_vector` fail and turned *every subsequent search on that
-   collection* into a 500. Now skipped and logged at `warn`.
+**2. Replicated writes landed behind the change-stream position.** Resolved with
+a second ordering — `oplog_arrival` — over local arrival sequence, with the
+oplog still keyed by origin stamp for conflict resolution and anti-entropy.
+Resume tokens unchanged. No format bump: the index is derived from the oplog and
+rebuilt on open when it does not cover it. [Oplog](oplog.md).
 
-4. **Docs:** new [Vectors](vectors.md); ADR-021/022/023; roadmap M2 marked
-   complete with a planned-versus-built table; testing updated with a sixth
-   load-bearing invariant; README corrected (it still claimed indexes were
-   unimplemented, and its vector example did not deserialize).
+**3. Unique violations on merge.** `OpKind::UniqueViolation` oplog entries, so
+they reach change streams durably and resumably, plus a `kimmy_unique_violations`
+metric. Both colliding documents survive and both are indexed.
+[ADR-029](decisions.md).
 
-### Next: M3 — the built-in MCP server
+### Bugs found and fixed along the way
 
-Planned shape, from [Roadmap](roadmap.md): `rmcp` with
-`transport-streamable-http-server`, mounted at `/mcp` on the same axum router,
-sharing storage handles directly — no separate process, no loopback hop.
+- **`apply_remote` never maintained secondary indexes.** A replicated document
+  would have been invisible to every index-backed query — present in a scan,
+  missing from a `find` the planner chose an index for.
+- **Streams de-duplicated by comparing stamps**, discarding exactly the
+  replicated entries the arrival index exists to deliver.
+- **Streams trusted publication order**, which can differ from commit order
+  under concurrency — latent, intermittent, unrelated to replication. Both
+  dissolved once the broadcast became a wake-up ([ADR-030](decisions.md)).
+- **`ConsumerLagged` was never emitted**, so a stream whose range retention had
+  collected skipped it silently.
+- **Schema inference counted array elements, not documents**, reporting a
+  presence above 1.0.
+- **MCP published the password-hash collection as an attachable resource.**
 
-The load-bearing constraint: **every tool call runs as the authenticated
-principal, through the same `Principal::can()` the REST routes use.** Write
-tools exist but fail authorization for a read-only token. There must not be a
-second, weaker enforcement point — that is the whole reason MCP lives in-process.
+### Next: M4 — gossip clustering
 
-Worth knowing before starting:
+`apply_remote`, conflict resolution, index maintenance on merge, violation
+reporting, and discovery parsing all exist and are tested. **Missing: the
+transport.** Membership via [`foca`](https://github.com/caio/foca) over UDP,
+TCP for oversized payloads.
 
-- `Auth` is an axum extractor (`crates/kimmy-api/src/state.rs`), deliberately
-  so a route cannot forget it. Whatever MCP does should reuse it rather than
-  re-deriving a principal.
-- `search` is already its own action, grantable without `read` — so an agent
-  can be given semantic search over a collection without raw document access.
-- `describe_collection` (sampled schema inference) is the high-value tool for
-  an agent that does not know the data. It does not exist yet.
+Nothing is blocking it now.
 
-### Open, and needing your decision
+### Worth knowing before starting
 
-**`byo` has no ingest route.** `byo` is the default embedding provider, and
-there is no endpoint for supplying vectors — so search on a `byo` collection
-returns nothing, always. The only working path is writing raw records into the
-shadow collection using internal serde shapes, which should not be a public
-contract.
+- **Exclude `OpKind::UniqueViolation` from anti-entropy.** These are a node's
+  own observation; every node detects the same collision when it merges, so
+  shipping them would report one violation once per node.
+- **`kimmy_api::exec` is the single authorization point**, and replication is a
+  third writer. It serves no principal, so it goes through `apply_remote`, not
+  `exec`. Keep that boundary.
+- **Anti-entropy uses `read_oplog_from`** (stamp order), streams use
+  `read_arrival_from` (arrival order). They are different questions; do not
+  merge them.
+- **`oplog_retention_secs` now bounds peer catch-up.** A peer further behind
+  than the window needs a full resync, which does not exist yet.
+- **Retention never collects the newest oplog entry** — the clock resumes from
+  it ([ADR-028](decisions.md)).
 
-Proposed: `PUT /v1/db/{db}/coll/{coll}/docs/{id}/vectors` taking
-`[{chunk, vector, text}]`, with the server supplying `source` and `source_hlc`
-from the document it already has. **Not built unilaterally — it is a public API
-surface.** Detail in [Deviations](deviations.md).
+### Still open, none blocking
 
-Everything else open is implementation, not decision: one-bound index ranges,
-`$in` not using an index, descending-field ranges, HNSW snapshot persistence.
-The M4 change-stream problem below will force a decision when M4 starts.
+Implementation only, no decisions needed: `$in` not using an index;
+descending-field ranges; one-bound index ranges; HNSW snapshot persistence; the
+aggregation pipeline that would give MCP its `aggregate` tool.
 
-### The trap waiting in M4
-
-**Replicated writes land behind the change-stream position.** An applied remote
-entry keeps its originating stamp, so it enters the oplog *behind* the local
-tail — and a subscriber already past that point never sees it. Single-node
-streams are unaffected, which is why it has not bitten yet. Three candidate
-resolutions are in [Roadmap](roadmap.md); none is chosen.
-
----
+Two design questions M4 will raise but has not yet: whether `drop_collection`
+should replicate as a tombstone, and how to handle a node whose tombstones were
+collected while it was partitioned.
 
 ## Conventions for this file
 

@@ -37,6 +37,7 @@ fails fast on a bad volume mount.
 | `storage.data_dir` | `KIMMY_DATA_DIR` | `/var/lib/kimmy` | Holds `kimmy.redb` |
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition** |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
+| `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Identical on every node.** ≥16 bytes |
@@ -64,6 +65,8 @@ runtime confusion:
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
 | `cluster.enabled` with no `jwt_secret` | Tokens issued by one node would be rejected by the next |
 | `oplog_retention_secs = 0` | Change streams could never resume |
+| `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
+| `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |
 
 Boolean flags are one-way: passing `--insecure-no-auth` turns it on, but
 omitting it does **not** turn off what the config file asked for.
@@ -242,15 +245,34 @@ breaks last-writer-wins tiebreaks. Restore to one node only.
 
 | Aspect | Behaviour today |
 |---|---|
-| Query cost | **O(n) — every query is a collection scan.** Indexes ⛔ not implemented |
-| `skip` | O(n); deep paging is expensive |
-| Oplog growth | Unbounded — retention is ⛔ not enforced yet |
+| Query cost | Index-backed where a secondary index applies, otherwise a collection scan. `POST …/find` with `"explain": true` reports which |
+| `skip` | O(n) even with an index; deep paging is expensive |
+| Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
+| Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly
-860 MB/day. Provision disk with that in mind until retention lands.
+860 MB/day. Retention caps that at one window's worth, so provision for the data
+plus roughly `oplog_retention_secs` of log.
+
+**A collection pass temporarily grows the file before it shrinks it.** redb is
+copy-on-write, so the transaction that removes records allocates new pages
+before the old ones are freed. Measured on 2,000 documents of 4 KB, all deleted
+and then collected:
+
+| | File size |
+|---|---|
+| Before collection | 52.7 MB |
+| Immediately after | 105.4 MB |
+| After writing 2,000 fresh documents | 53.3 MB |
+
+So the space *is* reclaimed and the file *does* shrink — but the peak comes
+during collection, not before it. **Keep free space at least equal to the
+volume a single pass will collect.** A first pass on a database that has never
+been collected is the largest one, which is exactly when headroom is tightest;
+a shorter `gc_interval_secs` keeps each pass small.
 
 ---
 

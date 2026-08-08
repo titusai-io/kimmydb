@@ -183,7 +183,10 @@ Without the tombstone there would be nothing at that key, so the late insert
 would look like a first write and the delete would silently undo itself.
 
 **Retention.** `storage.tombstone_retention_secs` (default 24 h) bounds how long
-tombstones are kept. Collection is 📋 planned, not yet implemented.
+tombstones are kept; a background pass collects expired ones every
+`storage.gc_interval_secs`. Only tombstones are collected — a live record is
+data, however old — and the index entries were already removed when the delete
+was applied, so nothing is left referring to the collected key.
 
 > **Sharp edge.** The retention window must exceed the longest partition you are
 > willing to tolerate. If a partitioned peer rejoins after tombstones have been

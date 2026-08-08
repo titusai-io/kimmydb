@@ -137,6 +137,83 @@ pub(crate) fn maintain(
         }
     }
 
+    apply_entries(&mut table, coll, indexes, old, new, doc_key)
+}
+
+/// A unique constraint that a merged write broke.
+///
+/// Produced only by [`maintain_remote`]. A local write is *rejected* on
+/// violation, so there is nothing to report; a replicated one cannot be
+/// rejected without abandoning convergence, so it is recorded instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UniqueViolation {
+    pub index: String,
+    /// Encoded index key that now has more than one holder.
+    pub key: Vec<u8>,
+    /// Encoded document keys holding it, including the one just applied.
+    pub holders: Vec<Vec<u8>>,
+}
+
+/// Maintain indexes for a *replicated* write, reporting rather than rejecting.
+///
+/// The asymmetry with [`maintain`] is deliberate and is the whole of
+/// [ADR-020](../../../docs/decisions.md). A local write can be refused because
+/// the client is still there to be told. A replicated write cannot: refusing it
+/// means the two nodes never agree, which trades away the availability this
+/// design exists to provide. Uniqueness is not I-confluent — no merge function
+/// can repair it — so the only honest options are to converge with a violated
+/// constraint or to diverge, and diverging is worse.
+///
+/// So the entry goes in regardless and the collision is returned. Adding the
+/// entry rather than skipping it matters: a missing entry would leave an
+/// index-backed query silently unable to find a document that exists, which is
+/// a wrong answer rather than a reported problem.
+pub(crate) fn maintain_remote(
+    txn: &redb::WriteTransaction,
+    coll: CollectionId,
+    indexes: &[IndexMeta],
+    old: Option<&Document>,
+    new: Option<&Document>,
+    doc_key: &[u8],
+) -> Result<Vec<UniqueViolation>> {
+    if indexes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut table = txn.open_table(tables::INDEX_ENTRIES)?;
+
+    let mut violations = Vec::new();
+    if let Some(new) = new {
+        for index in indexes.iter().filter(|i| i.unique) {
+            for key in index_keys(index, new)? {
+                let mut holders: Vec<Vec<u8>> = holders_of(&table, coll, index.id, &key)?
+                    .into_iter()
+                    .filter(|holder| holder != doc_key)
+                    .collect();
+                if !holders.is_empty() {
+                    holders.push(doc_key.to_vec());
+                    violations.push(UniqueViolation {
+                        index: index.name.clone(),
+                        key: key.clone(),
+                        holders,
+                    });
+                }
+            }
+        }
+    }
+
+    apply_entries(&mut table, coll, indexes, old, new, doc_key)?;
+    Ok(violations)
+}
+
+/// Remove the old image's entries and add the new one's.
+fn apply_entries(
+    table: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
+    coll: CollectionId,
+    indexes: &[IndexMeta],
+    old: Option<&Document>,
+    new: Option<&Document>,
+    doc_key: &[u8],
+) -> Result<()> {
     for index in indexes {
         if let Some(old) = old {
             for key in index_keys(index, old)? {

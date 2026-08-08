@@ -85,39 +85,32 @@ deferred rather than blocking the wiring.
 
 ---
 
-## 🔴 `byo` is the default provider but has no ingest route
+## 🟢 `byo` now has an ingest route (was an open drift)
 
-**The gap.** `byo` — "the client supplies the vectors" — is the default, and it
-is what you get with no external dependency of any kind. But **there is no
-endpoint for supplying them.** Search on a `byo` collection returns nothing,
-always.
+**Was.** `byo` — "the client supplies the vectors" — is the default provider,
+and there was **no endpoint for supplying them**. Search on a `byo` collection
+returned nothing, always. The only working path was writing raw records into
+the shadow collection using the internal `VectorRecord` serde shape: the `#`
+chunk separator in `_id`, the externally-tagged `DocId`, the internal HLC
+shape. An implementation detail acting as a public contract.
 
-The only path that works is writing raw records into the shadow collection
-through the ordinary document route, using the internal `VectorRecord` serde
-shape:
+**Now.** `PUT /v1/db/{db}/coll/{coll}/docs/{id}/vectors` taking
+`[{chunk, vector, text}]`, with `GET` and `DELETE` alongside it. Replace-all
+per document, matching what the embedding worker does — the only semantics that
+stops a shortened document from leaving orphan chunks. The server supplies
+`source` and `source_hlc` from the document it already holds, so no internal
+shape crosses the boundary and staleness detection keeps working.
 
-```json
-POST /v1/db/shop/coll/orders.__vectors/docs
-{ "_id": "w#0",
-  "source": { "String": "w" },
-  "chunk": 0,
-  "source_hlc": { "wall_ms": 1, "counter": 0 },
-  "vector": [1.0, 0.0, 0.0, 0.0],
-  "text": "widget" }
-```
+Requires `write` on the collection, and the document must exist: without it
+there is no HLC for staleness to compare against.
 
-That is an implementation detail serving as a public contract: the `#` chunk
-separator in `_id`, the externally-tagged `DocId`, and the internal HLC shape
-are all things a client should never have to know, and none can change without
-breaking anyone who depends on them.
+**And the failure is no longer silent.** Searching a collection with no vectors
+stored at all now returns `409 no_vectors` naming the remedy, rather than an
+empty result that reads as "nothing matched". That was the more damaging half:
+M3 exposed `vector_search` to agents, which would retry a query forever against
+a collection that could never answer it.
 
-**Found by** driving the documented quick-start against a running server rather
-than trusting that it worked.
-
-**To close.** Needs a decision on the intended shape — most likely `PUT
-.../docs/{id}/vectors` taking `[{chunk, vector, text}]`, with the server
-supplying `source` and `source_hlc` from the document it already has. Not built
-unilaterally, because it is a public API surface.
+**Shape chosen by the maintainer** rather than unilaterally, since it is public API.
 
 ---
 
@@ -199,15 +192,55 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 | Gap | Consequence | Milestone |
 |---|---|---|
-| Oplog and tombstone GC | **Unbounded disk growth.** Retention is configured but not enforced | M5 |
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
 | Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
-| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only | M5 |
+| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | No performance regression baseline exists — including the 2000-vector index threshold, which is a guess, not a measurement | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
+
+---
+
+## 🟢 Closed
+
+**Oplog and tombstone GC.** Was the most serious 🟡 in this register —
+retention was configured but not enforced, so both tables grew without bound.
+Enforced now by a background pass every `storage.gc_interval_secs`. The design
+constraint that mattered was not the collection itself but that **the newest
+oplog entry must never be collected**: the logical clock resumes from the oplog
+tail, so an aged-out tail would reset the clock on restart and make every later
+write lose to its own older version, silently. [ADR-028](decisions.md).
+
+---
+
+## 🟢 Deliberate departures in M3
+
+**`kimmy-mcp` depends on `kimmy-api`, not the reverse.** The crate graph
+carried a placeholder arrow from M0 pointing the other way. Inverted so both
+edges share one executor with the authorization check inside it; the
+alternative was duplicating Extended JSON conversion, the query planner path,
+and vector search dispatch into a second crate. [ADR-024](decisions.md).
+
+**Tools are not filtered by grant.** A read-only token sees every write tool and
+is refused when it calls one. Hiding is not an enforcement boundary, and a
+filtered list makes refusals unexplainable. [ADR-025](decisions.md).
+
+**`rmcp`'s `Host` allow-list is off by default.** It is DNS-rebinding
+protection for unauthenticated local servers; `/mcp` verifies a bearer token
+before the transport runs. The SDK default would have rejected every client
+connecting by a real hostname. Operators can re-enable it via
+`server.mcp_allowed_hosts`. [ADR-026](decisions.md).
+
+**MCP resources exclude `__kimmy` and `.__vectors`.** A resource is material an
+agent attaches to its context, and the user store is a column of password
+hashes. Tools still reach them under the ordinary access check, so this is a
+default rather than a control. [ADR-027](decisions.md).
+
+**Sessions are disabled.** Stateless, so a token that expires mid-conversation
+stops working rather than riding an already-open session. The cost is that a
+long-running agent must re-authenticate.
 
 ---
 
@@ -232,14 +265,24 @@ an index-backed query and a scan. Matches MongoDB, still a footgun.
 
 ---
 
-## 🔴 Known problem deferred to M4
+## 🟢 Replicated writes now reach change streams (was the 🔴 M4 blocker)
 
-**Replicated writes land behind the change-stream position.** An applied remote
-entry keeps its originating stamp, so it enters the oplog *behind* the local
-tail. A subscriber past that point never sees it.
+**Was.** An applied remote entry keeps its originating stamp, so it entered the
+oplog *behind* the local tail and a subscriber past that point never saw it.
+Single-node streams were unaffected, which is why it had not bitten.
 
-Single-node streams are unaffected. Three candidate resolutions are recorded in
-[Roadmap](roadmap.md); none is chosen.
+**Now.** A second ordering — `oplog_arrival` — over local arrival sequence, with
+the oplog still keyed by origin stamp for conflict resolution and anti-entropy.
+The maintainer chose this over restamping on arrival or documenting the limitation.
+Resume tokens are unchanged; they are translated to an arrival position at watch
+time, because tokens live in clients where no migration can reach them. Detail
+in [Oplog](oplog.md).
+
+**Two bugs closed on the way.** Streams de-duplicated by comparing stamps, which
+discarded exactly the replicated entries this was meant to deliver; and they
+trusted publication order, which can differ from commit order under concurrency.
+Both dissolved once the broadcast became a wake-up rather than a data path —
+[ADR-030](decisions.md).
 
 ---
 

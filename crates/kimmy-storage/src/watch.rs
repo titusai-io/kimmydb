@@ -24,7 +24,7 @@ use std::sync::Arc;
 use kimmy_core::{CollectionId, Hlc, OplogEntry, ResumeToken, Stamp};
 use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::codec;
 use crate::engine::Engine;
@@ -63,11 +63,11 @@ pub enum ChangeEvent {
     /// The stream can no longer be trusted to be gap-free; the client must
     /// resubscribe. Delivered rather than silently dropping events.
     ///
-    /// Currently unreachable, and deliberately so: falling behind the live
-    /// buffer recovers from the oplog, and a resume point that predates the log
-    /// is rejected up front by [`Engine::watch`] rather than mid-stream. This
-    /// becomes reachable when oplog collection lands and a stream can have its
-    /// replay range removed underneath it.
+    /// Reachable in exactly one way: retention collected the range this stream
+    /// was about to read. Falling behind the live channel is *not* one of them —
+    /// that channel is only a wake-up, so a slow consumer simply re-reads from
+    /// disk. A resume point that predates the log is refused up front by
+    /// [`Engine::watch`] instead, so it never becomes a mid-stream event.
     Invalidate {
         reason: InvalidateReason,
     },
@@ -75,7 +75,7 @@ pub enum ChangeEvent {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum InvalidateReason {
-    /// The consumer fell behind and the oplog no longer covers the gap.
+    /// The stream's position was collected before it could be read.
     ConsumerLagged,
     /// The resume point has been collected from the oplog.
     ResumeTokenExpired,
@@ -91,18 +91,17 @@ impl Engine {
         // lines reintroduces the gap this whole module exists to avoid.
         let rx = self.subscribe();
 
+        // Streams follow *arrival* order, not stamp order. A replicated entry
+        // keeps its origin stamp and so lands behind the local tail; following
+        // stamp order would mean a subscriber already past that point never
+        // saw it. See `tables::OPLOG_ARRIVAL`.
         let start = match (&options.resume_after, options.start_at) {
             // Resuming is exclusive of the token itself, so a client never sees
             // the last event it already acknowledged twice.
-            (Some(token), _) => {
-                self.check_resume_point(token)?;
-                token.exclusive_start()
-            }
-            (None, Some(at)) => at,
-            (None, None) => {
-                // No resume point: start live, skipping all history.
-                self.current_tail()?.map_or(Hlc::ZERO, Hlc::successor)
-            }
+            (Some(token), _) => self.arrival_after(token)?,
+            (None, Some(at)) => self.first_arrival_at_or_after(at)?,
+            // No resume point: start live, skipping all history.
+            (None, None) => self.next_arrival_seq()?,
         };
 
         Ok(ChangeStream {
@@ -115,6 +114,100 @@ impl Engine {
             db_of_collection: HashMap::new(),
             finished: false,
         })
+    }
+
+    /// The arrival position just after the entry a token names.
+    ///
+    /// The token is a stamp, which is a public contract older than the arrival
+    /// index, so it is translated here rather than changing what clients hold.
+    fn arrival_after(&self, token: &ResumeToken) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+        let key = codec::oplog_key(&token.to_stamp());
+
+        if let Some(seq) = by_stamp.get(key.as_slice())? {
+            return Ok(seq.value() + 1);
+        }
+
+        // The entry is not in the log. Either it was collected — in which case
+        // resuming would silently skip everything between — or it is newer than
+        // anything we hold, which is fine and simply means nothing has happened
+        // since. The oldest retained stamp distinguishes the two.
+        drop(by_stamp);
+        let collected = {
+            let oplog = txn.open_table(tables::OPLOG)?;
+            match oplog.first()? {
+                Some((oldest, _)) => token.to_stamp() < codec::decode_oplog_key(oldest.value())?,
+                // An empty log cannot have collected anything.
+                None => false,
+            }
+        };
+
+        if collected {
+            return Err(StorageError::Core(kimmy_core::Error::ResumeTokenExpired));
+        }
+        drop(txn);
+        self.next_arrival_seq()
+    }
+
+    /// The first arrival position whose entry is stamped at or after `at`.
+    ///
+    /// `start_at` is expressed in logical time, so it has to be resolved
+    /// against arrival order. Scanning is acceptable because this runs once per
+    /// stream and only for the explicit `start_at` form.
+    fn first_arrival_at_or_after(&self, at: Hlc) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        for row in arrival.iter()? {
+            let (seq, key) = row?;
+            if codec::decode_oplog_key(key.value())?.hlc >= at {
+                return Ok(seq.value());
+            }
+        }
+        drop(arrival);
+        self.next_arrival_seq()
+    }
+
+    /// The position the next appended entry will take.
+    fn next_arrival_seq(&self) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        Ok(arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1))
+    }
+
+    /// The oldest arrival position still retained.
+    ///
+    /// A stream whose next position is below this has had its replay range
+    /// collected underneath it.
+    fn oldest_arrival_seq(&self) -> Result<Option<u64>> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        Ok(arrival.first()?.map(|(seq, _)| seq.value()))
+    }
+
+    /// Read up to `limit` entries in arrival order, starting at `from`.
+    pub fn read_arrival_from(&self, from: u64, limit: usize) -> Result<Vec<OplogEntry>> {
+        let txn = self.db().begin_read()?;
+        let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+
+        let mut out = Vec::new();
+        for row in arrival.range(from..)? {
+            let (_, key) = row?;
+            // The two tables are written in one transaction, so a missing entry
+            // means the index outlived what it points at — a bug rather than a
+            // race. Skipping keeps the stream serving; the count mismatch is
+            // repaired on the next open.
+            let Some(raw) = oplog.get(key.value())? else {
+                warn!("arrival index points at a missing oplog entry");
+                continue;
+            };
+            out.push(codec::decode_oplog_entry(raw.value())?);
+            if out.len() >= limit {
+                break;
+            }
+        }
+        Ok(out)
     }
 
     /// Reject a resume token whose position has already been collected.
@@ -145,7 +238,12 @@ impl Engine {
         }
     }
 
-    /// Read up to `limit` oplog entries at or after `from`.
+    /// Read up to `limit` oplog entries at or after `from`, in **stamp** order.
+    ///
+    /// This is the replication view, not the stream view: anti-entropy asks
+    /// "what do you hold after this logical time", which is a question about
+    /// origin stamps. Change streams use [`Self::read_arrival_from`] instead —
+    /// see [`tables::OPLOG_ARRIVAL`] for why the two differ.
     pub fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
         let txn = self.db().begin_read()?;
         let oplog = txn.open_table(tables::OPLOG)?;
@@ -167,14 +265,14 @@ impl Engine {
 pub struct ChangeStream {
     rx: broadcast::Receiver<Arc<OplogEntry>>,
     scope: WatchScope,
-    /// Where the next replay batch starts, or `None` once replay is exhausted.
-    next_replay_from: Option<Hlc>,
-    /// The earliest point this stream may ever rewind to. Recovering from lag
-    /// must not resurrect history the client deliberately started after.
-    resume_floor: Hlc,
+    /// Arrival position the next replay batch starts at, or `None` once replay
+    /// is exhausted.
+    next_replay_from: Option<u64>,
+    /// The earliest position this stream may ever rewind to. A stream that
+    /// deliberately started late must not be rewound into history it skipped.
+    resume_floor: u64,
     replay: std::vec::IntoIter<OplogEntry>,
-    /// The highest stamp handed to the caller, used to discard live events that
-    /// replay already covered.
+    /// The last stamp handed to the caller, which is what a resume token names.
     last_delivered: Option<Stamp>,
     /// Cache for database-scoped filtering.
     db_of_collection: HashMap<CollectionId, String>,
@@ -187,13 +285,31 @@ impl ChangeStream {
     /// Cancel-safe with respect to replay: an abandoned call may drop a live
     /// event, so callers must not race this in a `select!` they intend to
     /// resume.
+    ///
+    /// # Why the broadcast channel is only a wake-up
+    ///
+    /// Every entry delivered here is read from the arrival index, never from
+    /// the channel — the channel's payload is discarded and only its *arrival*
+    /// is used, as a signal that there may be more on disk.
+    ///
+    /// That is what makes ordering exact. Publication happens after the commit
+    /// that assigned an arrival position, so two concurrent writers can publish
+    /// in the opposite order from the one they committed in. A stream that
+    /// trusted publication order would deliver those two events reversed, and a
+    /// stream that de-duplicated by comparing stamps would drop the second one
+    /// outright — which is exactly what a replicated entry looks like, since it
+    /// carries an older stamp than the local tail.
+    ///
+    /// Reading from the index instead makes falling behind the channel buffer a
+    /// non-event: the data is on disk either way, so a `Lagged` receiver is
+    /// just a wake-up that arrived late.
     pub async fn next(&mut self, engine: &Engine) -> Option<ChangeEvent> {
         if self.finished {
             return None;
         }
 
         loop {
-            // Phase 1: drain the current replay batch.
+            // Phase 1: drain the batch already read.
             if let Some(entry) = self.replay.next() {
                 if let Some(event) = self.accept(engine, Arc::new(entry)) {
                     return Some(event);
@@ -201,47 +317,48 @@ impl ChangeStream {
                 continue;
             }
 
-            // Phase 2: refill from the oplog until it runs dry.
-            if let Some(from) = self.next_replay_from {
-                match engine.read_oplog_from(from, REPLAY_BATCH) {
-                    Ok(batch) => {
-                        // A short batch means we have caught up to the tail;
-                        // everything after this arrives on the live channel.
-                        self.next_replay_from = if batch.len() < REPLAY_BATCH {
-                            None
-                        } else {
-                            batch.last().map(|e| e.stamp.hlc.successor())
-                        };
-                        self.replay = batch.into_iter();
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "oplog replay failed; ending stream");
-                        self.finished = true;
-                        return None;
-                    }
+            let from = self.next_replay_from.unwrap_or(self.resume_floor);
+
+            // Phase 2: has retention collected the range we were about to read?
+            // Detecting it here is what turns a silent gap into an event the
+            // client can act on.
+            match engine.oldest_arrival_seq() {
+                Ok(Some(oldest)) if from < oldest => {
+                    self.finished = true;
+                    return Some(ChangeEvent::Invalidate {
+                        reason: InvalidateReason::ConsumerLagged,
+                    });
+                }
+                Err(e) => {
+                    debug!(error = %e, "could not check the retained range; ending stream");
+                    self.finished = true;
+                    return None;
+                }
+                _ => {}
+            }
+
+            // Phase 3: read whatever has arrived since we last looked.
+            match engine.read_arrival_from(from, REPLAY_BATCH) {
+                Ok(batch) if !batch.is_empty() => {
+                    self.next_replay_from = Some(from + batch.len() as u64);
+                    self.replay = batch.into_iter();
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!(error = %e, "oplog replay failed; ending stream");
+                    self.finished = true;
+                    return None;
                 }
             }
 
-            // Phase 3: live.
+            // Phase 4: nothing new on disk. Wait to be told to look again.
+            self.next_replay_from = Some(from);
             match self.rx.recv().await {
-                Ok(entry) => {
-                    if let Some(event) = self.accept(engine, entry) {
-                        return Some(event);
-                    }
-                }
+                // The payload is deliberately ignored; see the note above.
+                Ok(_) => {}
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                    // Falling behind the in-memory buffer is recoverable,
-                    // because the same events are on disk. Rewind to just after
-                    // the last one delivered and replay from the oplog instead
-                    // of invalidating the client. Only oplog *collection* can
-                    // make a gap unrecoverable, and that is caught at watch
-                    // time by `check_resume_point`.
-                    debug!(skipped, "consumer lagged; recovering from the oplog");
-                    let from = self
-                        .last_delivered
-                        .map_or(self.resume_floor, |stamp| stamp.hlc.successor());
-                    self.next_replay_from = Some(from);
+                    debug!(skipped, "wake-up channel lagged; re-reading from the arrival index");
                 }
                 Err(broadcast::error::RecvError::Closed) => {
                     self.finished = true;
@@ -253,18 +370,10 @@ impl ChangeStream {
 
     /// Decide whether an entry should be delivered.
     ///
-    /// Filters by scope, and discards anything at or below the high-water mark
-    /// so that the overlap between replay and live is not delivered twice.
+    /// Only scope filtering: arrival positions are consumed strictly in order
+    /// and never revisited, so there is no overlap to de-duplicate.
     fn accept(&mut self, engine: &Engine, entry: Arc<OplogEntry>) -> Option<ChangeEvent> {
-        if let Some(last) = self.last_delivered
-            && entry.stamp <= last
-        {
-            return None;
-        }
         if !self.in_scope(engine, &entry) {
-            // Still advance the mark: a filtered-out entry is one we have
-            // decided about, and not advancing would re-examine it forever.
-            self.last_delivered = Some(entry.stamp);
             return None;
         }
 
@@ -630,5 +739,194 @@ mod tests {
 
         let events = take(&engine, &mut stream, 1).await;
         assert_eq!(doc_ids(&events), vec![100], "must not replay pre-stream history");
+    }
+    // -----------------------------------------------------------------------
+    // Arrival order
+    // -----------------------------------------------------------------------
+
+    /// A remote entry stamped *behind* the local tail, as replication produces.
+    fn remote_entry(coll: &CollectionMeta, id: &str, wall_ms: u64) -> OplogEntry {
+        OplogEntry {
+            stamp: Stamp::new(Hlc::new(wall_ms, 0), kimmy_core::NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: coll.id,
+            doc_id: Some(kimmy_core::DocId::String(id.into())),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": id }).unwrap()),
+        }
+    }
+
+    /// The bug this whole index exists for.
+    #[tokio::test]
+    async fn a_replicated_entry_reaches_a_subscriber_already_past_its_stamp() {
+        let (engine, coll, _dir) = setup();
+
+        // Local history, so the tail is well above where the remote entry will
+        // be stamped.
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+        }
+
+        // A live subscriber, caught up to the tail.
+        let mut stream = engine.watch(WatchScope::Cluster, WatchOptions::default()).unwrap();
+
+        // Now apply a remote write stamped in 1970 — far behind everything the
+        // subscriber has already read past. Under stamp ordering it would land
+        // behind the stream position and never be delivered.
+        let entry = remote_entry(&coll, "from-a-peer", 1);
+        engine.apply_remote(&coll, &entry).unwrap();
+
+        let events = take(&engine, &mut stream, 1).await;
+        match &events[0] {
+            ChangeEvent::Change { entry, .. } => {
+                assert_eq!(
+                    entry.doc_id,
+                    Some(kimmy_core::DocId::String("from-a-peer".into())),
+                    "a replicated write must reach a live subscriber"
+                );
+            }
+            other => panic!("expected a change, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_replicated_entry_is_delivered_after_a_resume() {
+        // Same property across a disconnect: the token is a stamp, and the
+        // entry sorts below it, so translating the token to an arrival position
+        // is what keeps this working.
+        let (engine, coll, _dir) = setup();
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+        }
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Cluster,
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+        let events = take(&engine, &mut stream, 5).await;
+        let token = stream.resume_token().expect("a token after delivery");
+        drop(stream);
+
+        engine.apply_remote(&coll, &remote_entry(&coll, "late", 1)).unwrap();
+
+        let mut resumed = engine
+            .watch(
+                WatchScope::Cluster,
+                WatchOptions { resume_after: Some(token), ..Default::default() },
+            )
+            .unwrap();
+        let after = take(&engine, &mut resumed, 1).await;
+
+        assert_eq!(doc_ids(&events), vec![0, 1, 2, 3, 4]);
+        match &after[0] {
+            ChangeEvent::Change { entry, .. } => {
+                assert_eq!(entry.doc_id, Some(kimmy_core::DocId::String("late".into())))
+            }
+            other => panic!("expected a change, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn re_applying_a_remote_entry_does_not_deliver_it_twice() {
+        // Peers resend overlapping ranges routinely. A second append must not
+        // take a second arrival position.
+        let (engine, coll, _dir) = setup();
+        let mut stream = engine.watch(WatchScope::Cluster, WatchOptions::default()).unwrap();
+
+        let entry = remote_entry(&coll, "dup", 1);
+        engine.apply_remote(&coll, &entry).unwrap();
+        engine.apply_remote(&coll, &entry).unwrap();
+        engine.insert(&coll, doc! { "_id": "after" }).unwrap();
+
+        let events = take(&engine, &mut stream, 2).await;
+        let ids = doc_ids_str(&events);
+        assert_eq!(ids, vec!["dup", "after"], "the resend must not be redelivered");
+    }
+
+    #[test]
+    fn the_arrival_index_is_rebuilt_when_it_does_not_cover_the_oplog() {
+        // The index is derived state, so a database written without it — or by
+        // a build that stopped maintaining it — is repaired rather than refused.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+
+        let entries = {
+            let engine = Engine::open(&path).unwrap();
+            let coll = engine.create_collection("app", "docs").unwrap();
+            for i in 0..10i64 {
+                engine.insert(&coll, doc! { "_id": i }).unwrap();
+            }
+            engine.read_arrival_from(0, 1000).unwrap().len()
+        };
+
+        // Wipe the index, simulating a database that predates it.
+        {
+            let db = redb::Database::create(&path).unwrap();
+            let txn = db.begin_write().unwrap();
+            {
+                let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL).unwrap();
+                let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ).unwrap();
+                arrival.retain(|_, _| false).unwrap();
+                by_stamp.retain(|_, _| false).unwrap();
+            }
+            txn.commit().unwrap();
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        assert_eq!(
+            reopened.read_arrival_from(0, 1000).unwrap().len(),
+            entries,
+            "reopening must rebuild the index from the oplog"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stream_whose_range_was_collected_is_invalidated() {
+        // Retention can remove the range a live stream was about to read. That
+        // used to be a silent gap; it is now an event the client can act on.
+        use crate::gc::RetentionPolicy;
+
+        let (engine, coll, _dir) = setup();
+        let mut stream = engine
+            .watch(
+                WatchScope::Cluster,
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+
+        for i in 0..10i64 {
+            engine.insert(&coll, doc! { "_id": i }).unwrap();
+        }
+        engine
+            .collect_garbage_at(
+                crate::engine::physical_now_ms() + 1_000_000_000,
+                RetentionPolicy::new(0, 0),
+            )
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+            .await
+            .expect("timed out")
+            .expect("stream ended instead of invalidating");
+
+        assert!(
+            matches!(event, ChangeEvent::Invalidate { reason: InvalidateReason::ConsumerLagged }),
+            "expected an invalidate, got {event:?}"
+        );
+    }
+
+    /// String document ids from a batch of events.
+    fn doc_ids_str(events: &[ChangeEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                ChangeEvent::Change { entry, .. } => match &entry.doc_id {
+                    Some(kimmy_core::DocId::String(s)) => Some(s.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
     }
 }

@@ -17,8 +17,9 @@ API reference, operations, and the decision record.
 
 > **Status: early development.** The server runs on a single node: multi-user
 > document CRUD, Mongo-style queries, secondary indexes, live change streams
-> over WebSocket, and automatic embeddings with vector and hybrid search all
-> work. Clustering and the MCP server are not built yet. See [Roadmap](#roadmap).
+> over WebSocket, automatic embeddings with vector and hybrid search, and an
+> in-process MCP server at `/mcp` all work. Clustering is not built yet. See
+> [Roadmap](#roadmap).
 
 ## Why it is built this way
 
@@ -102,12 +103,15 @@ websocat "ws://localhost:7878/v1/db/shop/coll/orders/watch?full_document=true" \
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | Count matching |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | Update operators, `multi` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | Delete matching |
+| `GET` | `/v1/db/{db}/coll/{coll}/describe` | Sampled schema: field paths, types, presence |
 | `GET`/`POST` | `/v1/db/{db}/coll/{coll}/indexes` | List / create a secondary index |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | Drop |
 | `GET`/`POST`/`DELETE` | `/v1/db/{db}/coll/{coll}/vector` | Inspect / enable / disable embeddings |
+| `GET`/`PUT`/`DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | Client-supplied vectors, for the `byo` provider |
 | `POST` | `/v1/db/{db}/coll/{coll}/vector_search` | k-NN, with an optional filter |
 | `POST` | `/v1/db/{db}/coll/{coll}/hybrid_search` | Vector + keyword, fused by RRF |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | WebSocket change stream |
+| `POST` | `/mcp` | MCP for agents — see [MCP](docs/mcp.md) |
 | `GET` | `/healthz` `/readyz` `/metrics` | Unauthenticated |
 
 Documents cross the boundary as JSON, using Extended JSON v2 (`{"$oid":…}`,
@@ -136,6 +140,7 @@ The settings worth knowing before you deploy:
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |
 | `storage.tombstone_retention_secs` | — | Must exceed your worst tolerable partition, or deleted documents resurrect. See below. |
+| `storage.gc_interval_secs` | — | How often retention is enforced (default 10 min). `0` disables collection and the oplog grows without bound. |
 
 `--insecure-no-auth` is refused on any non-loopback bind address, and clustering
 is refused without seeds and secrets. These are startup errors, not runtime
@@ -167,8 +172,8 @@ eventually-consistent store is a user who assumed otherwise.
 | **M0** | Workspace, core types, HLC, config, Docker, CI | ✅ Complete |
 | **M1** | Storage engine, CRUD, queries, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
 | **M2** | Auto-embeddings, HNSW vector index, vector and hybrid search | ✅ Complete |
-| **M3** | Built-in MCP server over streamable HTTP | 📋 Next |
-| **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | 📋 Planned |
+| **M3** | Built-in MCP server over streamable HTTP | ✅ Complete |
+| **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | 📋 Next |
 | **M5** | Backup/restore, TLS, rate limiting, CLI shell, benchmarks | 📋 Planned |
 
 Where the build departs from what was planned — and why — is tracked in
@@ -200,8 +205,8 @@ Where the build departs from what was planned — and why — is tracked in
 | `kimmy-vector` | Embedding providers, oplog-driven worker, HNSW, index selection, search |
 | `kimmy-auth` | Users, Argon2id, JWT, RBAC evaluation |
 | `kimmy-cluster` | SWIM membership, discovery, version vectors, anti-entropy |
-| `kimmy-mcp` | MCP tools and resources bound to storage |
-| `kimmy-api` | axum router, REST handlers, change-stream WebSocket |
+| `kimmy-mcp` | MCP tools and resources — calls the same executor the REST routes do, so authorization cannot diverge |
+| `kimmy-api` | axum router, REST handlers, change-stream WebSocket, and the executor both edges share |
 | `kimmyd` | The server binary |
 | `kimmy-cli` | Terminal client |
 
@@ -239,5 +244,6 @@ wrong answers rather than crashes. These are property-tested:
 | [Time & Conflicts](docs/time-and-conflicts.md) · [Oplog](docs/oplog.md) | HLC, last-writer-wins, the shared log |
 | [Change Streams](docs/change-streams.md) | The replay/live splice, resume, lag recovery |
 | [Query Language](docs/query-language.md) · [HTTP API](docs/http-api.md) | Using it |
+| [Vectors](docs/vectors.md) · [MCP](docs/mcp.md) | Embeddings, search, and the agent surface |
 | [Security](docs/security.md) · [Operations](docs/operations.md) | Running it |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |

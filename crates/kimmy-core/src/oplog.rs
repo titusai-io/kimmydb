@@ -31,6 +31,19 @@ pub enum OpKind {
     Delete,
     /// A collection was created, dropped, or reconfigured. Carries no document.
     Collection,
+    /// Merging a replicated write broke a unique constraint.
+    ///
+    /// Not a mutation — it describes something that *happened to* the data
+    /// rather than a change to it. It lives in the oplog anyway because that is
+    /// the only path to a change stream, and because being durable and
+    /// resumable is the whole point: a violation nobody was connected to
+    /// witness is barely better than a silent one.
+    ///
+    /// Carries no `doc_id`; the colliding ids are in the body. **Must not be
+    /// replicated** — every node detects its own violations at its own merge
+    /// time, so shipping these to peers would double-report. See
+    /// [`crate::UniqueViolationDetail`].
+    UniqueViolation,
 }
 
 /// One durable, totally-ordered record of a mutation.

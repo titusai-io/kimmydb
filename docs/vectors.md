@@ -85,7 +85,7 @@ POST /v1/db/{db}/coll/{coll}/vector
 
 | Provider | Needs | Notes |
 |---|---|---|
-| `byo` | nothing | **The default.** The client supplies vectors; the server never embeds. ⚠️ **There is currently no route for supplying them** — see [Deviations](deviations.md). Useful today only for validating configuration |
+| `byo` | nothing | **The default.** The client supplies vectors through [the ingest route](#supplying-your-own-vectors); the server never embeds |
 | `openai` | an API key | Any OpenAI-compatible `/v1/embeddings` endpoint |
 | `ollama` | a reachable Ollama | Local or remote |
 | `custom_http` | an endpoint | Accepts `{"input": [...]}`, returns `{"embeddings": [[...]]}` |
@@ -114,6 +114,46 @@ The default is 2000 characters ≈ 512 tokens. **It counts characters, not
 tokens** — a real token count depends on the model's tokenizer, which the
 storage layer has no business knowing. Dense text can therefore overshoot the
 model's window. Recorded in [Deviations](deviations.md).
+
+---
+
+## Supplying your own vectors
+
+With `byo`, nothing populates the shadow collection unless you do. Embed
+however you like, then store the result against the document it came from:
+
+```bash
+curl -XPUT localhost:7878/v1/db/shop/coll/orders/docs/42/vectors -H "$A" -d '[
+  { "chunk": 0, "vector": [0.01, -0.22, …], "text": "first chunk of the document" },
+  { "chunk": 1, "vector": [0.44,  0.10, …], "text": "second chunk" }
+]'
+```
+
+```json
+{ "stored": 2, "_id": "42" }
+```
+
+**The body is the complete set of chunks for that document.** Anything
+previously stored under it and not named here is removed — the same replace-all
+semantics the embedding worker uses, and the only ones that stop a shortened
+document from leaving orphan chunks that still match text it no longer contains.
+
+The server fills in the rest of each record: which document it belongs to, and
+the document's current HLC. That second part is why staleness detection keeps
+working for `byo` exactly as it does for a server-side provider — the version a
+chunk was derived from is the document's own, not something a client could get
+wrong.
+
+| | |
+|---|---|
+| `GET` | Read back what is stored for one document |
+| `PUT` | Replace the whole set |
+| `DELETE` | Remove every chunk for that document |
+
+Requires `write` on the collection — this is derived data about a document you
+can already write, not an administrative act. The document must exist (there is
+no HLC to attach otherwise, so a missing one is `404`), and every vector must
+match the configured `dim` or the request is `400`.
 
 ---
 
@@ -173,8 +213,10 @@ pre-computed one. A `byo` collection must send `vector` — the server has no
 provider to embed the query with, and says so rather than returning an empty
 result that looks like "no matches".
 
-Note that a `byo` collection has no vectors to search *against* either, until
-the ingest route described in [Deviations](deviations.md) exists.
+A collection with **no vectors stored at all** is refused with `409 no_vectors`
+rather than returning an empty result. Those two are indistinguishable to a
+caller, and the difference is between refining a query forever and learning that
+ingestion never happened.
 
 `filter` is an ordinary query-language document. It runs first, and its matching
 ids restrict the search — which is what lets semantic search compose with

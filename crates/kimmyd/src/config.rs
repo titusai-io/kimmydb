@@ -27,6 +27,21 @@ pub struct Config {
 pub struct ServerConfig {
     /// Address the HTTP/WebSocket/MCP listener binds to.
     pub bind: SocketAddr,
+    /// Serve the MCP endpoint at `/mcp`.
+    ///
+    /// On by default. It is not a privilege escalation — every tool call runs
+    /// through the same authorization as the REST routes — so the toggle exists
+    /// for operators who want the surface area gone, not because leaving it on
+    /// grants anything a token did not already have.
+    pub mcp: bool,
+    /// `Host` values the MCP endpoint will accept. Empty means accept any.
+    ///
+    /// This is DNS-rebinding protection, and it is off by default because the
+    /// attack it stops does not apply here: `/mcp` requires a bearer token,
+    /// checked before the MCP transport runs, and a rebinding attack cannot
+    /// forge one. Set it if you want defence in depth — but set it to every
+    /// name clients actually use, or they will be refused.
+    pub mcp_allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,6 +58,13 @@ pub struct StorageConfig {
     /// How much oplog history to keep for change-stream resumption and peer
     /// catch-up. A subscriber that lags past this gets an `invalidate`.
     pub oplog_retention_secs: u64,
+    /// How often to collect records that are past their retention.
+    ///
+    /// Separate from the retention windows themselves: retention says what is
+    /// garbage, this says how often to look. Zero disables collection, which
+    /// restores the pre-M5 behaviour of unbounded growth — available because an
+    /// operator debugging a replication problem may want the history kept.
+    pub gc_interval_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,7 +116,11 @@ pub struct LogConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { bind: "0.0.0.0:7878".parse().expect("valid literal") }
+        Self {
+            bind: "0.0.0.0:7878".parse().expect("valid literal"),
+            mcp: true,
+            mcp_allowed_hosts: Vec::new(),
+        }
     }
 }
 
@@ -104,6 +130,9 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("/var/lib/kimmy"),
             tombstone_retention_secs: 24 * 60 * 60,
             oplog_retention_secs: 24 * 60 * 60,
+            // Frequent enough that disk use tracks retention rather than
+            // sawtoothing, rare enough that the scan is not a background load.
+            gc_interval_secs: 10 * 60,
         }
     }
 }
@@ -195,6 +224,29 @@ impl Config {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
         }
 
+        if self.storage.tombstone_retention_secs == 0 {
+            anyhow::bail!(
+                "storage.tombstone_retention_secs must be greater than zero; collecting a \
+                 tombstone the instant it is written lets a peer that never saw the delete \
+                 resurrect the document"
+            );
+        }
+
+        // A collection pass rarer than the window it enforces means records
+        // outlive their retention by up to a whole interval. Not unsafe, but it
+        // makes `oplog_retention_secs` a number that does not mean what it says,
+        // which is worse than a number that is simply large.
+        if self.storage.gc_interval_secs > self.storage.oplog_retention_secs {
+            anyhow::bail!(
+                "storage.gc_interval_secs ({}) exceeds storage.oplog_retention_secs ({}), so \
+                 entries would be retained for up to {} seconds rather than the configured \
+                 window. Lower the interval, or raise the retention.",
+                self.storage.gc_interval_secs,
+                self.storage.oplog_retention_secs,
+                self.storage.gc_interval_secs + self.storage.oplog_retention_secs,
+            );
+        }
+
         Ok(())
     }
 
@@ -205,11 +257,18 @@ impl Config {
         } else {
             self.cluster.seeds.iter().map(SeedSource::describe).collect::<Vec<_>>().join(", ")
         };
+        let gc = if self.storage.gc_interval_secs == 0 {
+            "off".to_string()
+        } else {
+            format!("{}s", self.storage.gc_interval_secs)
+        };
         format!(
-            "bind={} data_dir={} auth={} cluster={} seeds=[{}] log={}/{:?}",
+            "bind={} data_dir={} auth={} mcp={} gc={} cluster={} seeds=[{}] log={}/{:?}",
             self.server.bind,
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
+            if self.server.mcp { "enabled" } else { "off" },
+            gc,
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
             self.log.level,
@@ -288,6 +347,43 @@ mod tests {
 
         cfg.auth.jwt_secret = Some("signing-key".into());
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn zero_retention_is_rejected_for_both_kinds() {
+        let mut cfg = valid();
+        cfg.storage.oplog_retention_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = valid();
+        cfg.storage.tombstone_retention_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn a_collection_interval_longer_than_retention_is_rejected() {
+        // Otherwise `oplog_retention_secs` silently means "retention plus up to
+        // one interval", which is a number that does not mean what it says.
+        let mut cfg = valid();
+        cfg.storage.oplog_retention_secs = 60;
+        cfg.storage.gc_interval_secs = 600;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("gc_interval_secs"), "unhelpful error: {err}");
+
+        cfg.storage.gc_interval_secs = 60;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn collection_can_be_disabled() {
+        // Zero is a supported choice, not an oversight: an operator debugging
+        // replication may want the history kept.
+        let mut cfg = valid();
+        cfg.storage.gc_interval_secs = 0;
+        cfg.validate().unwrap();
+        assert!(cfg.summary().contains("gc=off"));
     }
 
     #[test]

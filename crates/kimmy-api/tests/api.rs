@@ -111,6 +111,10 @@ impl Server {
         self.client.request("POST", &format!("{}{path}", self.base), token, Some(body)).await
     }
 
+    async fn put(&self, path: &str, token: Option<&str>, body: Value) -> Res {
+        self.client.request("PUT", &format!("{}{path}", self.base), token, Some(body)).await
+    }
+
     async fn delete(&self, path: &str, token: Option<&str>) -> Res {
         self.client.request("DELETE", &format!("{}{path}", self.base), token, None).await
     }
@@ -585,4 +589,177 @@ async fn managing_indexes_requires_admin() {
         .await;
     assert_eq!(created.status, 403);
     assert_eq!(server.delete("/v1/db/shop/coll/c/indexes/a_1", Some(&reader)).await.status, 403);
+}
+
+// ---------------------------------------------------------------------------
+// Client-supplied vectors
+// ---------------------------------------------------------------------------
+
+/// Enable `byo` embeddings on a fresh collection and return a root token.
+async fn byo_collection(server: &Server) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({
+                "fields": ["text"],
+                "provider": { "kind": "byo" },
+                "dim": 3,
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "configuring vectors failed: {:?}", res.body);
+    token
+}
+
+#[tokio::test]
+async fn searching_a_collection_with_no_vectors_says_so() {
+    // An empty result set is indistinguishable from "nothing matched", which is
+    // how `byo` being the default produced a collection that silently could
+    // never return anything.
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0] }),
+        )
+        .await;
+
+    assert_eq!(res.status, 409, "expected a refusal, got {:?}", res.body);
+    assert_eq!(res.body["error"], "no_vectors");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("/vectors"), "the message must say how to fix it: {message}");
+}
+
+#[tokio::test]
+async fn client_supplied_vectors_become_searchable() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server
+        .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a", "text": "alpha" }))
+        .await;
+
+    let stored = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "alpha" }]),
+        )
+        .await;
+    assert_eq!(stored.status, 200, "{:?}", stored.body);
+    assert_eq!(stored.body["stored"], 1);
+
+    let found = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0] }),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{:?}", found.body);
+    assert_eq!(found.body["count"], 1);
+    assert_eq!(found.body["matches"][0]["_id"], "a");
+    assert_eq!(found.body["matches"][0]["text"], "alpha");
+}
+
+#[tokio::test]
+async fn storing_vectors_replaces_the_whole_set() {
+    // Replace-all, so a document that shrinks to fewer chunks cannot leave
+    // orphans matching text it no longer contains.
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server.post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a" })).await;
+
+    server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([
+                { "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "one" },
+                { "chunk": 1, "vector": [0.0, 1.0, 0.0], "text": "two" },
+            ]),
+        )
+        .await;
+
+    server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "one" }]),
+        )
+        .await;
+
+    let read = server.get("/v1/db/shop/coll/docs/docs/a/vectors", Some(&token)).await;
+    assert_eq!(read.body["count"], 1, "the dropped chunk must be gone: {:?}", read.body);
+}
+
+#[tokio::test]
+async fn a_wrong_width_vector_is_refused() {
+    // A mis-sized vector would score against nothing and look like "no
+    // matches" rather than "wrong input".
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server.post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a" })).await;
+
+    let res = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0], "text": "short" }]),
+        )
+        .await;
+
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("dimensions"));
+}
+
+#[tokio::test]
+async fn vectors_cannot_be_attached_to_a_document_that_does_not_exist() {
+    // `source_hlc` comes from the document, so without one there is nothing
+    // for staleness detection to compare against.
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+
+    let res = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/ghost/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "x" }]),
+        )
+        .await;
+    assert_eq!(res.status, 404, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn storing_vectors_needs_write_access() {
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    server.post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": "a" })).await;
+
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({
+                "user": "reader",
+                "password": "reader-password-1",
+                "grants": [{ "db": "shop", "collection": "docs", "actions": ["read"] }],
+            }),
+        )
+        .await;
+    let reader = server.login("reader", "reader-password-1").await;
+
+    let res = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/a/vectors",
+            Some(&reader),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "x" }]),
+        )
+        .await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
 }

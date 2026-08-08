@@ -50,6 +50,10 @@ pub struct Overrides {
     #[arg(short, long, env = "KIMMY_DATA_DIR")]
     pub data_dir: Option<PathBuf>,
 
+    /// Do not serve the MCP endpoint at /mcp.
+    #[arg(long, env = "KIMMY_NO_MCP")]
+    pub no_mcp: bool,
+
     /// Bootstrap superuser name, created on first start.
     #[arg(long, env = "KIMMY_ROOT_USER")]
     pub root_user: Option<String>,
@@ -144,6 +148,12 @@ impl Overrides {
         // config file asked for.
         if self.insecure_no_auth {
             cfg.auth.insecure_no_auth = true;
+        }
+        // Phrased as `--no-mcp` rather than `--mcp` for the same reason: the
+        // flag can only turn the endpoint off, so omitting it cannot override a
+        // config file that already disabled it.
+        if self.no_mcp {
+            cfg.server.mcp = false;
         }
         if self.cluster {
             cfg.cluster.enabled = true;

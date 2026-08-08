@@ -15,7 +15,7 @@ graph LR
     M1["<b>M1</b> ✅<br/>storage · query<br/>streams · auth · API"]
     IDX["<b>indexes</b> ✅<br/>the last<br/>M1 item"]
     M2["<b>M2</b> ✅<br/>vectors and<br/>auto-embeddings"]
-    M3["<b>M3</b> 📋<br/>built-in<br/>MCP server"]
+    M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> 📋<br/>gossip<br/>clustering"]
     M5["<b>M5</b> 📋<br/>hardening"]
 
@@ -25,6 +25,7 @@ graph LR
     style M1 fill:#2f5d3a,color:#fff
     style IDX fill:#2f5d3a,color:#fff
     style M2 fill:#2f5d3a,color:#fff
+    style M3 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -32,7 +33,7 @@ graph LR
 | **M0** | Workspace, core types, HLC, config, Docker, CI | ✅ Complete |
 | **M1** | Storage, CRUD, query, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
-| **M3** | Built-in MCP server | 📋 Planned |
+| **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Gossip membership, discovery, anti-entropy replication | 📋 Planned |
 | **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 📋 Planned |
 
@@ -114,26 +115,49 @@ metric rather than trusting it.
 
 ---
 
-## M3 — Built-in MCP server
+## M3 — Built-in MCP server ✅
+
+**Built.** Full detail in [MCP](mcp.md); this section records what the plan said
+and where the build departed from it.
 
 `rmcp` with `transport-streamable-http-server`, mounted at `/mcp` on the same
 axum router, sharing storage handles directly — no separate process, no loopback
-hop.
+hop. That held exactly as planned.
 
 **Every tool call runs as the authenticated principal**, through the same
 `Principal::can()` the REST routes use. Write tools exist but simply fail
 authorization for a read-only token: capability is controlled by the role, not
 by build flags or a second permission system.
 
-| Tools | |
-|---|---|
-| Read | `list_databases`, `list_collections`, `describe_collection`, `find`, `count`, `aggregate` |
-| Search | `vector_search`, `hybrid_search` |
-| Write | `insert`, `update`, `delete`, `create_collection`, `create_index` |
+| Piece | Planned | Built |
+|---|---|---|
+| Transport | `rmcp` streamable HTTP at `/mcp` | ✅ **Stateless** — no MCP session, so an expired token stops working immediately rather than riding a session opened while it was valid |
+| Read tools | `list_databases`, `list_collections`, `describe_collection`, `find`, `count`, `aggregate` | ✅ all but **`aggregate`**, which has nothing to expose: the pipeline itself is M5 |
+| Search tools | `vector_search`, `hybrid_search` | ✅ Both, with filter composition |
+| Write tools | `insert`, `update`, `delete`, `create_collection`, `create_index` | ✅ All five |
+| Resources | Collections with inferred schema and samples | ✅ `kimmy://{db}/{coll}`, grant-filtered, **excluding `__kimmy` and shadow collections** ([ADR-027](decisions.md)) |
+| Enforcement | One `Principal::can()`, shared with REST | ✅ Stronger than planned — both edges share `kimmy_api::exec`, so the check is *inside* each operation rather than repeated beside it ([ADR-024](decisions.md)) |
 
-`describe_collection` does sampled schema inference — high value for an agent
-that has never seen your data. Collections are also exposed as MCP *resources*
-with inferred schema and samples.
+**The dependency arrow was inverted.** The crate graph had `kimmy-api` depending
+on `kimmy-mcp`, from a placeholder written at M0. It is now the other way. The
+milestone's stated constraint — "there must not be a second, weaker enforcement
+point" — is not achieved by co-location alone, only made possible by it; sharing
+the executor is what makes the check unskippable. The REST handlers collapsed
+into thin adapters in the same change, which is the evidence the extraction was
+real rather than shaped around MCP.
+
+**Two things were found by driving a real server, not by tests.**
+`describe_collection` reported a `presence` of 2.0 — above 1.0, and meaningless
+— because array elements were counted per element rather than per document. And
+the first `resources/list` offered `kimmy://__kimmy/__users`, the password-hash
+collection, as attachable context. Neither had a test, because neither had
+occurred to anyone.
+
+**One deliberate deviation from the SDK's default.** `rmcp` enables a `Host`
+allow-list as DNS-rebinding protection; it is off by default here, because the
+attack needs an unauthenticated server and `/mcp` verifies a bearer token before
+the transport runs. Keeping the default would have refused every client
+connecting by a real hostname. [ADR-026](decisions.md).
 
 ---
 
@@ -180,9 +204,23 @@ partition, and last-writer-wins would otherwise discard one **silently**.
 
 M4 must therefore detect violations at merge time and surface them:
 
-- a `uniqueViolation` change-stream event naming the index and the colliding ids
-- the losing document recorded rather than lost, so it can be reconciled
-- a metric, so the condition is visible without watching a stream
+- a `uniqueViolation` change-stream event naming the index and the colliding ids — ✅ **built**
+- the losing document recorded rather than lost, so it can be reconciled — ✅ **moot, see below**
+- a metric, so the condition is visible without watching a stream — ✅ **built** (`kimmy_unique_violations`)
+
+**Correction found while building it: there is no losing document.** The two
+colliding documents have different `_id`s, so last-writer-wins never runs on
+them — both are applied and both survive. Only the constraint is broken. So
+nothing needs recording to avoid being lost; what needed deciding was what to
+do when maintaining the index at merge finds the key already held. The answer
+is to add the entry anyway and report: skipping it would keep the index
+formally unique at the cost of an index-backed query being unable to find a
+document that exists, trading a reported problem for a silent wrong answer.
+
+**Still to do in M4:** `OpKind::UniqueViolation` entries are a node's own
+observation, not replicated facts — every node detects the same collision when
+it merges. Anti-entropy must **exclude them** when shipping oplog ranges to
+peers, or the same violation is reported once per node.
 
 This does not *prevent* the violation — that is provably impossible without
 coordination (see [ADR-020](decisions.md)) — but it converts silent corruption
@@ -205,7 +243,7 @@ handle a node whose tombstones were collected while it was partitioned.
 | Backup / restore | Online snapshot, point-in-time restore from the oplog |
 | TLS | Native termination |
 | Rate limiting | Especially `/v1/auth/login` |
-| Oplog & tombstone GC | Currently ⛔ unbounded growth |
+| Oplog & tombstone GC | ✅ Done — background pass, `storage.gc_interval_secs`. [ADR-028](decisions.md) |
 | Aggregation pipeline | `$match`, `$group`, `$unwind`, `$project`, `$sort`, `$limit` |
 | `kimmy` CLI | Interactive shell |
 | Benchmarks | Criterion; establish a regression baseline |

@@ -6,6 +6,7 @@
 //! change-stream resume tokens alike.
 
 pub mod cmp;
+pub mod conflict;
 pub mod error;
 pub mod hlc;
 pub mod ids;
@@ -18,6 +19,7 @@ pub mod vector_meta;
 pub mod vector_record;
 
 pub use cmp::canonical_cmp;
+pub use conflict::UniqueViolationDetail;
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};
 pub use ids::{CollectionId, DocId, NodeId};

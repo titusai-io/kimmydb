@@ -430,6 +430,217 @@ in [Testing](testing.md).
 
 ---
 
+## ADR-024 — MCP shares the API's execution path, not just its process
+
+**Decision.** `kimmy-mcp` depends on `kimmy-api`. Both edges call one module,
+`kimmy_api::exec`, which performs the authorization check *inside* each
+operation rather than beside it. `kimmyd` merges the two routers onto one
+listener.
+
+**What was planned.** The crate graph had the arrow the other way — `kimmy-api`
+depending on `kimmy-mcp` — from a placeholder written at M0 before either
+existed.
+
+**Why it was inverted.** M3's stated constraint is that "there must not be a
+second, weaker enforcement point." In-process co-location does not achieve that
+on its own; it only makes it *possible*. Two crates sharing an `Engine` can
+still drift, because each writes its own `auth.require(...)` before touching it,
+and a tool added later can simply omit one. Sharing the executor makes the
+check unskippable: there is no path to the engine that does not pass through a
+function that already performed it.
+
+Inverting the dependency was the cheap way to get that. The alternative —
+`kimmy-api` depending on `kimmy-mcp` — would have required duplicating Extended
+JSON conversion, the index-planning query executor, and the vector search
+dispatch into the MCP crate, which is three opportunities for exactly the drift
+the milestone exists to prevent.
+
+**Cost.** `kimmy-mcp` now pulls in axum and `ApiError`. The layering diagram
+gains an edge between two crates that are conceptually peers. Worth it: the
+alternative was three copies of logic whose divergence would be silent.
+
+**Consequence.** The REST routes became thin adapters in the same change. That
+was not the goal, but it is the check that the extraction was real — if the
+executor were shaped around MCP, the HTTP handlers would not have collapsed into
+one-liners over it.
+
+---
+
+## ADR-025 — Tools are always advertised; the role decides what runs
+
+**Decision.** Every tool appears in `tools/list` for every authenticated
+caller. A read-only token sees `insert`, `delete`, and `create_index`, and gets
+an authorization error if it calls one.
+
+**Alternative rejected.** Filtering the tool list by the caller's grants.
+
+**Why.** Hiding is not a boundary — the enforcement is the `Principal::can`
+check, which runs either way — so filtering would buy no safety. It would cost
+two things. An agent that cannot see a tool cannot be told *why* it was refused,
+so "you lack write access to this collection" degrades into "no such tool",
+which is not actionable. And a filtered list makes the surface depend on the
+token, so two agents against the same server would disagree about what the
+server is.
+
+**Consequence.** The server's `instructions` say this outright, so a model reads
+the refusal as a permission fact about itself rather than a malfunction.
+
+---
+
+## ADR-026 — No `Host` allow-list on `/mcp` by default
+
+**Decision.** `server.mcp_allowed_hosts` defaults to empty, which disables the
+`Host` header check that `rmcp` enables by default.
+
+**Why.** The check is DNS-rebinding protection, designed for an MCP server
+running on a developer's laptop with no authentication — where a malicious web
+page can make the victim's browser issue requests the server will honour.
+Neither half applies here. KimmyDB binds to a network address by design, and
+`/mcp` requires a bearer token that is verified by axum middleware *before*
+`rmcp` sees the request. A rebinding attack cannot forge that token.
+
+Keeping `rmcp`'s default would have rejected every client that reached the
+server by its real hostname — which is the normal deployment — and the failure
+mode is an opaque refusal that looks like a bug rather than a policy.
+
+**Cost.** One layer of defence in depth is off by default. It is a layer that
+protects against an attack the bearer token already stops, and operators who
+want it can list their hostnames.
+
+**Consequence.** The bearer-token check must stay ahead of the MCP transport. If
+`/mcp` were ever mounted without its middleware, this decision would become
+wrong — which is why `principal()` fails closed and logs rather than defaulting
+to an anonymous caller.
+
+---
+
+## ADR-027 — MCP resources exclude KimmyDB's own internals
+
+**Decision.** `resources/list` omits the `__kimmy` system database and any
+`__`-prefixed or `.__vectors` collection. The `find` tool does not: a superuser
+can read them, exactly as through the REST API.
+
+**Why the two differ.** They are different acts. A tool call is a caller asking
+a specific question. A resource is *material an agent attaches to its context* —
+and the highest-value thing in `__kimmy.__users` is a column of Argon2id
+password hashes. Offering those for attachment is wrong regardless of whether
+the caller is authorized to read them, because the authorization answers "may
+this principal see it", not "should this be pasted into a language model".
+
+Shadow collections are excluded for a duller reason: they hold float arrays that
+would consume an enormous amount of context and describe nothing the source
+collection does not.
+
+**Not a security control.** It is a default. The access decision remains
+`Principal::can`, in one place, as everywhere else.
+
+**Found by driving the server.** The first `resources/list` against a real node
+returned `kimmy://__kimmy/__users`. No test would have caught it, because no
+test would have thought to look.
+
+---
+
+## ADR-028 — The newest oplog entry is never collected
+
+**Decision.** Retention collects oplog entries older than its window, with one
+exception that overrides age entirely: the single newest entry always survives.
+
+**Why.** The logical clock is not persisted separately. `Engine::open` resumes
+it by reading the oplog tail — that is the *only* record of how far the clock
+has advanced. An empty oplog resumes at `Hlc::ZERO`.
+
+So a retention rule that collects purely by age is a data-loss bug on a delay.
+Collect the last entry, restart, and the node begins minting stamps below ones
+already on disk. Every subsequent write to an existing document loses to its own
+older version under last-writer-wins — and loses *silently*: the write returns
+200, the oplog entry is appended, and the document does not change.
+
+**Where it would have bitten.** An idle node. No writes means every entry
+eventually ages past the window, so the naive rule empties the log precisely
+when there is no activity to make the damage visible. A busy node always has a
+fresh entry and would never have shown the bug in testing.
+
+**Alternative considered.** Persist the clock high-water mark in the `meta`
+table on every write. Correct, and it would decouple the clock from retention
+entirely — but it puts an extra write in every transaction to remove a
+one-line special case. Worth revisiting if something else ever needs the clock
+independent of the log; not worth it for this.
+
+**Consequence.** An oplog can never be fully empty once anything has been
+written, so "collect everything" is not an expressible state. Three tests pin
+it, including one that restarts the engine after collecting with zero retention
+and asserts the next write stamps above the retained tail. Removing the
+exception fails all three.
+
+---
+
+## ADR-029 — A violation is an oplog entry, because that is what a change stream is
+
+**Decision.** `OpKind::UniqueViolation` — a real oplog entry, locally stamped,
+carrying the index name and every colliding id. Not a document change; it
+describes something that happened *to* the data.
+
+**Why it had to be an entry.** [Roadmap](roadmap.md) committed M4 to "a
+`uniqueViolation` change-stream event". When that was written, streams read from
+the in-memory broadcast, so an in-memory event would have worked. It no longer
+would: streams now read from the oplog and discard the broadcast payload
+([ADR-030](#adr-030--the-broadcast-channel-is-a-wake-up-not-a-data-path)). An
+event outside the log cannot be delivered at all.
+
+That turned out to be the better outcome anyway. As an entry it is durable,
+ordered, and resumable, and it reaches subscribers through machinery that
+already exists — a violation nobody happened to be connected to witness is
+barely better than a silent one, and this one survives being missed.
+
+**Alternative considered: a `{coll}.__conflicts` collection.** An ordinary
+document write, so it would also produce a stream event, and it would outlive
+`oplog_retention_secs` because it would be data. Rejected for now as more
+surface area than the commitment requires — a second shadow collection per
+collection, with its own retention story — but it remains the right answer if
+violations ever need to be reconcilable weeks later.
+
+**Locally stamped, and must not replicate.** Every node detects the same
+collision independently when it merges, so the entry is *this* node's
+observation. Shipping it to peers would report one violation once per node. M4's
+anti-entropy has to exclude the kind explicitly; this is recorded in the roadmap
+rather than left to be rediscovered.
+
+**Written in a separate transaction from the merge.** Deliberate: reporting must
+not be able to fail the write. A converged write with an unreported violation is
+bad, but a *rejected* replicated write is worse — the nodes then never agree,
+which is the availability the whole design is protecting.
+
+---
+
+## ADR-030 — The broadcast channel is a wake-up, not a data path
+
+**Decision.** Change streams read every entry from the oplog's arrival index.
+The broadcast channel's payload is discarded; only the fact that a message
+arrived is used, as a signal that there may be more on disk.
+
+**What forced it.** The old stream de-duplicated the replay/live overlap by
+dropping anything stamped at or below its high-water mark. A replicated entry
+carries an older stamp by definition, so that check discarded exactly the
+entries the arrival index exists to deliver.
+
+**What it also fixed.** Publication happens *after* the commit that assigns an
+arrival position, so two concurrent writers can publish in the opposite order
+from the one they committed in. A stream trusting publication order would have
+delivered those reversed — and the stamp comparison would then have dropped the
+second one permanently. That bug was latent, unrelated to replication, and would
+have been load-dependent and intermittent.
+
+**What it bought.** Falling behind the channel buffer stopped being an error
+condition. The data is on disk either way, so a `Lagged` receiver is a late
+wake-up and nothing more. `InvalidateReason::ConsumerLagged` now has exactly one
+cause: retention collected the range the stream was about to read.
+
+**Cost.** A read per wake-up rather than delivery straight from memory. Under
+load the reads batch, so the cost falls as throughput rises — the opposite of
+the shape that would matter.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

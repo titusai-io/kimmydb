@@ -190,6 +190,7 @@ fn op_kind_tag(kind: OpKind) -> u8 {
         OpKind::Replace => 3,
         OpKind::Delete => 4,
         OpKind::Collection => 5,
+        OpKind::UniqueViolation => 6,
     }
 }
 
@@ -200,6 +201,7 @@ fn op_kind_from_tag(tag: u8) -> Result<OpKind> {
         3 => OpKind::Replace,
         4 => OpKind::Delete,
         5 => OpKind::Collection,
+        6 => OpKind::UniqueViolation,
         other => return Err(corrupt(&format!("unknown op kind {other}"))),
     })
 }

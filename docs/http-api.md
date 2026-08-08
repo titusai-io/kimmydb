@@ -32,9 +32,12 @@ Default port **7878**.
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
+| `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
+| `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
+| `POST` | `/mcp` | authenticated; per-tool ([MCP](mcp.md)) |
 
 ---
 
@@ -135,6 +138,30 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
 > **Sharp edge.** A multi-document update or delete is **not atomic as a batch**.
 > Each write is individually atomic and logged, but a crash partway leaves a
 > partial result. See [Storage](storage.md).
+
+### Describe
+
+Sample a collection and report the field paths it actually contains, their BSON
+types, and how often each appears — useful against a schemaless store where a
+filter on a misremembered field name returns an empty result rather than an
+error.
+
+```bash
+curl "localhost:7878/v1/db/shop/coll/orders/describe?sample=200&examples=true" -H "$A"
+```
+
+| Query | |
+|---|---|
+| `sample` | Documents to inspect. Default 100, max 1000 |
+| `examples` | Include one example value per field |
+
+Array elements are reported under `path[]`, matching how a query on the field
+matches an *element*. `presence` is a fraction of the **sample**, counting
+documents — it is inference, not a schema, and a field missing from the sample
+may still exist.
+
+The same information backs the MCP `describe_collection` tool; see
+[MCP](mcp.md).
 
 ---
 
@@ -306,8 +333,7 @@ hash so the timing matches. Otherwise the endpoint is a user-enumeration oracle.
 
 | | |
 |---|---|
-| Aggregation pipeline | 📋 Planned — including the `$vectorSearch` stage |
-| MCP endpoint (`/mcp`) | 📋 M3 |
+| Aggregation pipeline | 📋 Planned — including the `$vectorSearch` stage, and the MCP `aggregate` tool that would wrap it |
 | Database- and cluster-scoped watch routes | Implemented in storage, no route yet |
 | TLS | 📋 M5 — terminate at a proxy for now |
 

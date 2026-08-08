@@ -15,6 +15,7 @@ path = "src/main.rs"
 kimmy-core.workspace = true
 kimmy-storage.workspace = true
 kimmy-api.workspace = true
+kimmy-mcp.workspace = true
 kimmy-vector.workspace = true
 kimmy-auth.workspace = true
 axum.workspace = true
