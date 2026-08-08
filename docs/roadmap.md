@@ -35,7 +35,7 @@ graph LR
 | **M1** | Storage, CRUD, query, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server | ✅ Complete |
-| **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health | ✅ Complete — **without SWIM**, see [ADR-037](decisions.md) |
+| **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
