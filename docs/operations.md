@@ -40,6 +40,7 @@ fails fast on a bad volume mount.
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
 | `cluster.sync_interval_secs` | — | `5` | How often to run an anti-entropy round against each peer |
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
+| `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Identical on every node.** ≥16 bytes |
@@ -103,7 +104,7 @@ Image is ~93 MB (Debian slim runtime). Notes:
 - `kimmyd` is PID 1 with **no shell wrapper**, so it receives `SIGTERM` directly
   from `docker stop` and Kubernetes. Verified: exits cleanly in ~20 ms.
 - `/var/lib/kimmy` is a volume. **Losing it loses node identity**, not just data.
-- Ports: `7878/tcp` (HTTP), `7900/tcp+udp` (gossip, M4).
+- Ports: `7878/tcp` (HTTP), `7900/tcp` (replication). **TCP only** — there is no UDP listener.
 
 ### Kubernetes
 
@@ -120,7 +121,7 @@ spec:
   selector: { app: kimmy }
   ports:
     - { name: http,   port: 7878 }
-    - { name: gossip, port: 7900 }
+    - { name: cluster, port: 7900 }
 ---
 apiVersion: apps/v1
 kind: StatefulSet

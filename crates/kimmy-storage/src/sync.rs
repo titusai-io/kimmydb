@@ -3,7 +3,7 @@
 //! Deliberately transport-free. Everything here works between two `Engine`
 //! values in one process, which is how it is tested — convergence is a property
 //! of the merge rules, not of the network, and mixing the two would make
-//! failures ambiguous. The gossip transport calls into this; it does not
+//! failures ambiguous. The replication transport calls into this; it does not
 //! reimplement it.
 //!
 //! ```text
@@ -285,7 +285,7 @@ mod tests {
         }
     }
 
-    /// A full round, both directions, as two gossiping peers would run it.
+    /// A full round, both directions, as two peers would run it.
     fn sync(a: &Engine, b: &Engine) {
         pull(a, b);
         pull(b, a);
@@ -360,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_second_round_transfers_nothing() {
-        // Convergence has to be stable, or gossip would ship the same entries
+        // Convergence has to be stable, or peers would ship the same entries
         // forever.
         let (a, _da) = engine();
         let (b, _db) = engine();

@@ -192,7 +192,7 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 | Gap | Consequence | Milestone |
 |---|---|---|
-| SWIM membership (`foca`) | No failure detection or suspicion. A node syncs with every address its seeds resolve to and learns a peer is gone by failing to connect — workable, noisier than it should be on a large or flapping cluster | M4 |
+| SWIM membership (`foca`) | **Deliberately not built.** Replaced by local peer health and fanout — see [ADR-037](decisions.md). No cluster-wide agreement about liveness; nothing depends on that today | — |
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
 | TLS between nodes | Replication frames are plaintext. `cluster_secret` authenticates peers but does not hide what they exchange | M5 |
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |

@@ -88,7 +88,7 @@ pub struct AuthConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
     pub enabled: bool,
-    /// Address the gossip transport binds to.
+    /// Address the cluster replication transport binds to (TCP).
     pub bind: SocketAddr,
     /// Where to look for peers. Re-resolved periodically, so a Kubernetes
     /// headless service picks up new pods without a restart.
@@ -103,6 +103,13 @@ pub struct ClusterConfig {
     /// does not change every few seconds. But it must repeat — a node that
     /// resolved only at startup would never see a peer that joined later.
     pub discovery_interval_secs: u64,
+    /// Peers contacted per round.
+    ///
+    /// A cap, not a quota: a cluster smaller than this contacts everyone.
+    /// Keeping it constant is what makes the per-round cost independent of
+    /// cluster size — anti-entropy is transitive, so a write still reaches
+    /// everyone through intermediate peers.
+    pub fanout: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -161,13 +168,14 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: format!("0.0.0.0:{}", kimmy_cluster::DEFAULT_GOSSIP_PORT)
+            bind: format!("0.0.0.0:{}", kimmy_cluster::DEFAULT_CLUSTER_PORT)
                 .parse()
                 .expect("valid literal"),
             seeds: Vec::new(),
             cluster_secret: None,
             sync_interval_secs: 5,
             discovery_interval_secs: 30,
+            fanout: kimmy_cluster::DEFAULT_FANOUT,
         }
     }
 }
@@ -234,6 +242,12 @@ impl Config {
             anyhow::bail!(
                 "cluster.sync_interval_secs must be greater than zero; a node that never runs \
                  an anti-entropy round would serve peers but never catch up itself"
+            );
+        }
+        if self.cluster.enabled && self.cluster.fanout == 0 {
+            anyhow::bail!(
+                "cluster.fanout must be greater than zero; a node that contacts no peers per \
+                 round would serve replication but never pull anything itself"
             );
         }
         if self.cluster.enabled && self.cluster.discovery_interval_secs == 0 {
@@ -426,6 +440,11 @@ mod tests {
         cfg.cluster.discovery_interval_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("discovery_interval_secs"), "unhelpful error: {err}");
+
+        cfg.cluster.discovery_interval_secs = 30;
+        cfg.cluster.fanout = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("fanout"), "unhelpful error: {err}");
     }
 
     #[test]

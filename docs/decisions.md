@@ -938,6 +938,59 @@ it and never lowers it.
 
 ---
 
+## ADR-037 — Local peer health instead of SWIM membership
+
+**Decision.** No gossip library. Each node keeps its own record of which peers
+have failed, backs off exponentially, and contacts a fixed number of peers per
+round in rotation.
+
+**What SWIM was for.** The plan named [`foca`](https://github.com/caio/foca)
+during design. By the time the transport existed, the concrete problems it would
+have solved had narrowed to two, neither of them correctness:
+
+- a peer that has gone away is retried every interval forever;
+- every node syncs with every other node, which is O(n²) connections per round.
+
+Both are solvable with local bookkeeping. Neither needs cluster-wide agreement.
+
+**What discovery already covers.** SWIM's third contribution — learning about
+nodes absent from your seed list — is nearly free on the primary target: a
+Kubernetes headless Service resolves to every ready pod, and re-resolving on an
+interval picks up new ones. Paying for a gossip layer to rediscover what DNS
+already reports is the wrong trade for this deployment shape.
+
+**Round-robin, not random sampling.** Every peer is contacted within
+`ceil(n / fanout)` rounds rather than probably-eventually, and the behaviour is
+reproducible in a test. Correlated choices across nodes would matter for gossip
+*dissemination*, where the point is to spread a message; here each node is
+pulling for itself.
+
+**Fanout is a cap, not a quota**, and backed-off peers are filtered *before* it
+applies — otherwise three unreachable peers would hide a live fourth every
+round, which a test pins.
+
+**A single failure is forgiven promptly.** Backoff starts at one interval and
+doubles from the second failure, so a blip does not cost a peer several rounds
+of isolation while a sustained outage still stops costing a connection.
+
+**The licensing question, stated plainly.** `foca` and `memberlist` are both
+MPL-2.0. Depending on either unmodified is permitted and unremarkable, so this
+was **not** decided on licence — it was decided because the remaining benefit
+did not justify a gossip subsystem. `chitchat` (MIT) was available had the
+decision gone the other way.
+
+**What this gives up, and when to revisit.** There is no shared opinion about
+which nodes are alive: each node forms its own, and two nodes can disagree about
+a third indefinitely. Nothing depends on that agreement today, because
+anti-entropy is transitive and idempotent — a write reaches the cluster through
+whichever peers happen to be reachable. It becomes worth revisiting if
+membership is ever needed for something that *must* be agreed, such as
+`coordinated` unique enforcement ([ADR-020](#adr-020--uniqueness-reaches-only-as-far-as-coordination-does)),
+which routes a value to the node owning it and therefore needs the cluster to
+agree who that is.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

@@ -16,7 +16,7 @@ graph LR
     IDX["<b>indexes</b> ✅<br/>the last<br/>M1 item"]
     M2["<b>M2</b> ✅<br/>vectors and<br/>auto-embeddings"]
     M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
-    M4["<b>M4</b> 📋<br/>gossip<br/>clustering"]
+    M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> 📋<br/>hardening"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5
@@ -26,6 +26,7 @@ graph LR
     style IDX fill:#2f5d3a,color:#fff
     style M2 fill:#2f5d3a,color:#fff
     style M3 fill:#2f5d3a,color:#fff
+    style M4 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -34,7 +35,7 @@ graph LR
 | **M1** | Storage, CRUD, query, indexes, oplog, change streams, auth, HTTP API | ✅ Complete |
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server | ✅ Complete |
-| **M4** | Gossip membership, discovery, anti-entropy replication | 📋 Planned |
+| **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health | ✅ Complete — **without SWIM**, see [ADR-037](decisions.md) |
 | **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
@@ -161,7 +162,7 @@ connecting by a real hostname. [ADR-026](decisions.md).
 
 ---
 
-## M4 — Gossip clustering
+## M4 — Clustering and replication ✅
 
 The largest remaining piece. Membership via [`foca`](https://github.com/caio/foca)
 (SWIM + suspicion) over UDP, with TCP for oversized payloads.
@@ -243,12 +244,18 @@ instead of history. Without it, a node added to a cluster older than
 which, at the default retention, is any node added to a running cluster.
 [ADR-036](decisions.md).
 
-### Still missing
+### Built: peer health and fanout ✅
 
-- **SWIM membership** via `foca`. Without it there is no failure detection or
-  suspicion: a node syncs with every address its seeds resolve to and finds out
-  a peer is gone by failing to connect. Workable, and noisier than it should be
-  on a large or flapping cluster.
+Local failure tracking with exponential backoff, and a fixed number of peers
+contacted per round in rotation. Chosen **instead of** SWIM: the remaining
+benefit of a gossip layer did not justify the subsystem, and Kubernetes headless
+DNS already reports the member set. [ADR-037](decisions.md).
+
+What that gives up: no cluster-wide agreement about which nodes are alive. Worth
+revisiting if membership is ever needed for something that must be agreed — such
+as `coordinated` unique enforcement.
+
+### Still missing
 - **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
   DNS resolver that can read record types the standard library does not expose.
   `dns:` and `k8s:` both work.

@@ -1,10 +1,10 @@
 //! Peer discovery sources.
 //!
 //! KimmyDB has no seed list to hand-maintain and no leader to bootstrap from. A
-//! node is told *where to look* for peers, re-resolves that periodically, and
-//! feeds whatever it finds to the SWIM layer. In Kubernetes this is the whole
-//! story: a headless Service resolves to every ready pod IP, which is exactly
-//! the seed set.
+//! node is told *where to look* for peers and re-resolves that periodically. In
+//! Kubernetes this is the whole story: a headless Service resolves to every
+//! ready pod IP, which is exactly the peer set — which is also why membership
+//! gossip was not worth building ([ADR-037](../../../docs/decisions.md)).
 
 use std::fmt;
 use std::net::SocketAddr;
@@ -29,8 +29,8 @@ pub enum SeedSource {
     Kubernetes { name: String, port: u16 },
 }
 
-/// Gossip port used when a discovery form does not carry one of its own.
-pub const DEFAULT_GOSSIP_PORT: u16 = 7900;
+/// Replication port used when a discovery form does not carry one of its own.
+pub const DEFAULT_CLUSTER_PORT: u16 = 7900;
 
 impl SeedSource {
     /// Resolve this source to the addresses it currently names.
@@ -162,7 +162,7 @@ fn split_host_port(s: &str) -> Result<(String, u16), ParseSeedError> {
             let port = port.parse().map_err(|_| ParseSeedError::BadPort(s.to_string()))?;
             Ok((host.to_string(), port))
         }
-        _ => Ok((s.to_string(), DEFAULT_GOSSIP_PORT)),
+        _ => Ok((s.to_string(), DEFAULT_CLUSTER_PORT)),
     }
 }
 
@@ -213,7 +213,7 @@ mod tests {
         );
         assert_eq!(
             parse("dns:seeds.kimmy.internal"),
-            SeedSource::Dns { name: "seeds.kimmy.internal".into(), port: DEFAULT_GOSSIP_PORT }
+            SeedSource::Dns { name: "seeds.kimmy.internal".into(), port: DEFAULT_CLUSTER_PORT }
         );
         assert_eq!(
             parse("dns:seeds.kimmy.internal:9999"),
@@ -227,7 +227,7 @@ mod tests {
             parse("k8s:kimmy-headless.default.svc.cluster.local"),
             SeedSource::Kubernetes {
                 name: "kimmy-headless.default.svc.cluster.local".into(),
-                port: DEFAULT_GOSSIP_PORT
+                port: DEFAULT_CLUSTER_PORT
             }
         );
     }
