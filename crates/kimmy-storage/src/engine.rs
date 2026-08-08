@@ -66,6 +66,7 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let _ = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             let _ = txn.open_table(tables::OPLOG_VERSIONS)?;
+            let _ = txn.open_table(tables::COLLECTIONS_DROPPED)?;
         }
         txn.commit()?;
 
@@ -257,6 +258,38 @@ impl Engine {
             out.insert(decode_node(node.value())?, decode_hlc(hlc.value())?);
         }
         Ok(out)
+    }
+
+    /// When this collection was dropped, if a tombstone still records it.
+    ///
+    /// `None` means either that it was never dropped or that the tombstone has
+    /// been collected — the two are indistinguishable, which is exactly why
+    /// `tombstone_retention_secs` must exceed the longest partition you intend
+    /// to survive.
+    pub fn collection_dropped_at(&self, id: CollectionId) -> Result<Option<Stamp>> {
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+        match dropped.get(id.0)? {
+            Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that a collection was dropped at `stamp`, if that is newer.
+    pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
+        let txn = self.db.begin_write()?;
+        {
+            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let newer = match dropped.get(id.0)? {
+                Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
+                None => true,
+            };
+            if newer {
+                dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
+            }
+        }
+        txn.commit()?;
+        Ok(())
     }
 
     /// What this node holds, summarized per originating node.
@@ -510,17 +543,31 @@ impl Engine {
 
     /// Drop a collection along with all its documents and index entries.
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
-        self.drop_collection_inner(db, name, true)
+        self.drop_collection_inner(db, name, None)
     }
 
-    pub(crate) fn drop_collection_inner(&self, db: &str, name: &str, log: bool) -> Result<bool> {
+    /// `replicated` carries the originating stamp when applying a peer's drop.
+    ///
+    /// It decides two things at once, and they have to agree: whether to log an
+    /// entry of our own (a replicated change must not — see
+    /// `create_index_inner`), and **which stamp the tombstone records**. Using a
+    /// fresh local stamp for a replicated drop would put the tombstone ahead of
+    /// a recreation that legitimately followed it, making the name permanently
+    /// unusable on that node.
+    pub(crate) fn drop_collection_inner(
+        &self,
+        db: &str,
+        name: &str,
+        replicated: Option<Stamp>,
+    ) -> Result<bool> {
         let meta = match self.get_collection(db, name) {
             Ok(m) => m,
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(false),
             Err(e) => return Err(e),
         };
 
-        let stamp = self.next_stamp();
+        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+        let log = replicated.is_none();
         let txn = self.db.begin_write()?;
         {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -535,6 +582,18 @@ impl Engine {
         {
             let mut indexes = txn.open_table(tables::INDEX_ENTRIES)?;
             indexes.retain_in(index_range(meta.id), |_, _| false)?;
+        }
+        {
+            // Same transaction as the removal, so there is no instant in which
+            // the collection is gone with no record that it was dropped.
+            let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let newer = match dropped.get(meta.id.0)? {
+                Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
+                None => true,
+            };
+            if newer {
+                dropped.insert(meta.id.0, codec::oplog_key(&stamp).as_slice())?;
+            }
         }
 
         let logged = if log {

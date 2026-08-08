@@ -65,6 +65,23 @@ pub const OPLOG_ARRIVAL: TableDefinition<u64, &[u8]> = TableDefinition::new("opl
 pub const OPLOG_ARRIVAL_SEQ: TableDefinition<&[u8], u64> =
     TableDefinition::new("oplog_arrival_seq");
 
+/// `collection id -> the Stamp of the drop that removed it`.
+///
+/// The collection equivalent of a document tombstone, and it exists for the
+/// same reason. Without one, a `DropCollection` entry is the only record of the
+/// drop, so once it ages out of the oplog a peer partitioned across that window
+/// rejoins still holding the collection — and anti-entropy, seeing entries the
+/// dropper lacks, recreates it along with every document in it.
+///
+/// Keyed by **id**, not by name, so that a replicated *document* entry can be
+/// checked against it directly: an entry names its collection by id, and a node
+/// that has dropped the collection can no longer resolve that id to a name.
+///
+/// Collected under `tombstone_retention_secs`, alongside document tombstones,
+/// because it answers the same question over the same window.
+pub const COLLECTIONS_DROPPED: TableDefinition<u64, &[u8]> =
+    TableDefinition::new("collections_dropped");
+
 /// `node id (16 bytes) -> highest Hlc held from that node`.
 ///
 /// The version vector, maintained incrementally rather than computed. Deriving

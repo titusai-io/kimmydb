@@ -232,14 +232,19 @@ adding *different* indexes during a partition both keep theirs.
   working cluster.
 - **Full resync** for a peer further behind than `oplog_retention_secs`.
 
-### Open question, unchanged
+### Resolved: dropped collections leave a tombstone ✅
 
-Whether `drop_collection` should replicate as a durable tombstone. Today the
-`DropCollection` entry acts as one only while the oplog retains it, so past
-`oplog_retention_secs` a rejoining partitioned peer could resurrect a dropped
-collection. Same trade as document tombstones — but worth deciding rather than
-inheriting. Also open: how to handle a node whose tombstones were collected
-while it was partitioned.
+They were protected only by the `DropCollection` oplog entry, so past
+`oplog_retention_secs` a rejoining partitioned peer resurrected the collection
+and every document in it. Now `collections_dropped` records the drop's stamp
+and is collected under `tombstone_retention_secs`, matching how document
+deletes already worked. [ADR-034](decisions.md).
+
+**Still inherent:** a peer partitioned for longer than
+`tombstone_retention_secs` can still resurrect, for collections and documents
+alike. That is the documented trade of tombstone-based deletion in an
+eventually-consistent store, not a bug — but it is why the setting must exceed
+your worst tolerable partition.
 
 ### Uniqueness violation detection — committed for M4
 

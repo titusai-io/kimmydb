@@ -775,10 +775,55 @@ that fails under a deliberately reintroduced double-log.
 shadow collection is ordinary data and reconciles through the same anti-entropy
 as everything else.
 
-**Still open.** A `DropCollection` entry acts as a tombstone only while the
-oplog retains it. Past `oplog_retention_secs`, a partitioned peer rejoining
-could resurrect a dropped collection — the same trade as document tombstones,
-and the roadmap's flagged open question.
+**Resolved separately.** Dropped collections now leave a tombstone —
+[ADR-034](#adr-034--dropping-a-collection-leaves-a-tombstone).
+
+---
+
+## ADR-034 — Dropping a collection leaves a tombstone
+
+**Decision.** `collections_dropped` records the stamp of every drop, keyed by
+collection id, collected under `tombstone_retention_secs` alongside document
+tombstones.
+
+**The asymmetry it fixes.** Deleting a document was protected twice: the oplog
+entry replicates the delete, and a tombstone stays in `docs` under
+`tombstone_retention_secs`, so a rejoining peer re-sending its old insert loses
+on stamp comparison even after the oplog entry is collected.
+
+Dropping a collection was protected once. `drop_collection` removed the
+`collections` row outright, leaving nothing, so the `DropCollection` oplog entry
+was the only record — bounded by `oplog_retention_secs`. Once it aged out, a
+peer partitioned across that window rejoined still holding the collection, and
+anti-entropy recreated it along with every document in it. Nothing compared
+stamps, because nothing was left to compare against.
+
+Two settings governed two scopes, and the one that governed *collections* was
+not the one anyone would guess.
+
+**Keyed by id, not name.** A replicated document entry names its collection by
+id, and a node that has dropped the collection can no longer resolve that id to
+a name — so a name-keyed tombstone could not be consulted on the path that
+needs it most.
+
+**Two checks, not one.** A creation older than the drop is ignored, and a
+document entry older than the drop is discarded. The second matters because
+recreating the collection is not the only way back: replaying its documents into
+a node that has since recreated it under the same name would refill it with
+data the drop removed.
+
+**Recreation still works.** The tombstone stores a stamp, not a prohibition, so
+a creation stamped *after* the drop wins and the name stays usable. That is what
+makes it a tombstone rather than a blocklist.
+
+**The bug this design produced, and the test that found it.** Applying a peer's
+drop initially recorded the tombstone under a *fresh local* stamp rather than
+the originating one. Local clocks have witnessed the peer's stamps and moved
+past them, so the tombstone landed ahead of a recreation that legitimately
+followed the drop — making the name permanently unusable on that node.
+`drop_collection_inner` now takes the originating stamp explicitly, and the
+parameter that decides whether to log is the same one that decides which stamp
+to record, because the two must agree.
 
 ---
 

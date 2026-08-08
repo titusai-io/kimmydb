@@ -35,7 +35,7 @@ fails fast on a bad volume mount.
 |---|---|---|---|
 | `server.bind` | `KIMMY_BIND` | `0.0.0.0:7878` | HTTP, WebSocket, and (M3) MCP |
 | `storage.data_dir` | `KIMMY_DATA_DIR` | `/var/lib/kimmy` | Holds `kimmy.redb` |
-| `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition** |
+| `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents *and* dropped collections |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |

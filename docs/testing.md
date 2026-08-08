@@ -9,13 +9,13 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-558 tests passing · 0 failures · clippy clean at -D warnings
+563 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 116 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 159 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
+| `kimmy-storage` | 164 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
@@ -198,6 +198,28 @@ counterexamples:
 
 Worth repeating whenever a new invariant is added: break it on purpose, confirm
 the suite goes red, revert.
+
+---
+
+### Two tests that passed for the wrong reason
+
+`a_partitioned_peer_cannot_resurrect_a_dropped_collection` was written, passed,
+and was wrong — twice.
+
+**First**, it never attempted the resurrection. The dropping node was ahead of
+the partitioned peer on every node in its version vector, so it asked for
+nothing and the dangerous path never ran. Disabling the tombstone check left it
+green. The peer has to keep *writing* while partitioned for the dropper to fall
+behind it, request from the beginning, and receive the peer's copy of the
+original `CreateCollection`.
+
+**Then**, with that fixed, it advanced the clock past *both* retention windows,
+so the tombstone it was testing had been collected along with the oplog entry.
+It failed for a reason unrelated to what it was checking.
+
+Only after both fixes does removing the check turn it red. The lesson is the one
+this document keeps arriving at: a test that has never been seen to fail is a
+test whose value is unmeasured.
 
 ---
 
