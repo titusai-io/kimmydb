@@ -304,6 +304,31 @@ like one was working.
 
 ## 🟢 Closed
 
+**Collection ids above `i64::MAX` broke replication.** A live bug, not a
+deferral, and the most serious thing found since the collection-id fix itself.
+Ids are derived by hashing, so they use the whole `u64` range; BSON has no
+unsigned 64-bit type; and `CollectionId` used a derived `Serialize`. Any id in
+the upper half — **about 48% of collection names** — could not be encoded, so
+every oplog entry naming that collection was unsendable and the collection
+never replicated. The write succeeded locally; the peer logged one
+`malformed frame` warning per round.
+
+Found by running three containers, not by the suite, which used a single
+collection name that happens to hash low. Fixed by giving `CollectionId` one
+fixed representation (bit-cast to `i64`), matching what `NodeId` already needed
+for the same class of bug. On-disk format untouched — ids are persisted by the
+hand-rolled codec, not serde. [ADR-031](decisions.md).
+
+**SWIM was silently degraded under the shipped container defaults.** Not a code
+bug: `cluster.bind` defaults to a wildcard, and the node correctly refuses to
+advertise one, falling back to loopback with a warning ([ADR-037](decisions.md)).
+But `docker-compose.yml` — the documented way to run a cluster — never set a
+per-node bind, so all three nodes advertised `127.0.0.1` and gossip never
+formed. Replication still converged via discovery, which is what made it look
+fine. Compose now pins a subnet and a per-node address; Kubernetes uses the
+downward API. Verified: both survivors now declare a killed node down within
+17 ms of each other, where before nothing was ever declared down.
+
 **TLS for clients.** Was 📋 M5 and the reason "terminate at a proxy" appeared in
 every deployment note: tokens and passwords crossed the wire in plaintext
 otherwise, including the bootstrap login that sets the first password. The

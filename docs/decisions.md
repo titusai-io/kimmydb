@@ -715,6 +715,30 @@ would have been easier, but a database that *can* be migrated should be — a us
 with data has no other route forward. A *newer* schema is still refused, because
 guessing at an unknown layout is how you corrupt it.
 
+**The bill for a hash-shaped id, paid 2026-08-08.** Deriving the id made it a
+hash, and a hash uses the whole `u64` range — while **BSON has no unsigned
+64-bit type**. `CollectionId` derived `Serialize`, so any id above `i64::MAX`
+failed to encode with `Unsigned integer N cannot fit into BSON`, and every
+oplog entry naming that collection was unsendable. The collection and its
+documents simply never replicated.
+
+Roughly **48% of collection names** are affected — it is a coin flip per name.
+The suite stayed green because the replication tests use `"shop"."orders"`,
+which derives `0x53ad…`, in the low half. Found by running three containers and
+noticing that `c.t` would not converge while `repl.items` had.
+
+Fixed by giving `CollectionId` one fixed representation — a bit-cast to `i64` —
+exactly as [`NodeId`](#adr-006--hlc-with-node-id-tiebreak-whole-document-lww)
+needed when the same class of bug broke the *first* two-node sync. Ids below
+`i64::MAX` encode identically to before, so the fix widens what works without
+changing what worked, and the on-disk form is untouched because ids are
+persisted by the hand-rolled codec as raw bytes rather than through serde.
+
+The lesson is not about BSON. It is that **a derived id is a value with a
+range**, and the moment a type crosses a format boundary its representation has
+to be chosen rather than inherited. Two bugs of this exact shape have now been
+paid for.
+
 ---
 
 ## ADR-032 — Index ids are derived too

@@ -105,7 +105,7 @@ running server, not merely compiled.
 | Change streams | ✅ Working | **Single node, no replica set.** Resumable by token |
 | Multiple users | ✅ Working | Argon2id, JWT, per-collection RBAC |
 | HTTP + WebSocket API | ✅ Working | Also health and Prometheus metrics |
-| Docker container | ✅ Working | ~93 MB, graceful SIGTERM shutdown |
+| Docker container | ✅ Working | ~106 MB, graceful SIGTERM shutdown |
 | Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
 | Vector search & auto-embeddings | ✅ Working | Shadow collections, oplog-driven worker, HNSW above 2000 vectors |
 | Hybrid search | ✅ Working | Dense + lexical, fused by reciprocal rank fusion |

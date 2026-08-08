@@ -66,6 +66,39 @@ async fn two_nodes_converge_over_the_network() {
 }
 
 #[tokio::test]
+async fn a_collection_whose_id_is_above_i64_max_replicates() {
+    // Every other test in this file uses "shop"."orders", whose derived id
+    // happens to land in the low half of the u64 range. Roughly half of all
+    // collection names do not — and BSON has no unsigned 64-bit type, so those
+    // ids could not be encoded at all. The collection and every document in it
+    // silently never replicated: the write succeeded locally, and the peer
+    // logged one "malformed frame" warning per round.
+    //
+    // Found by running three containers, not by this suite, which passed
+    // throughout because of the name it happened to pick.
+    let id = kimmy_core::ids::CollectionId::derive("c", "t");
+    assert!(
+        id.0 > i64::MAX as u64,
+        "this test is only meaningful while c.t derives a high id; it derives {}",
+        id.0
+    );
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("c", "t").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "high-id", "v": 1 }).unwrap();
+
+    sync(&a, &b).await;
+
+    let cb = b.engine.get_collection("c", "t").expect("the collection must replicate");
+    assert!(
+        b.engine.get(&cb, &DocId::String("high-id".into())).unwrap().is_some(),
+        "a document in a collection whose id exceeds i64::MAX must replicate like any other"
+    );
+}
+
+#[tokio::test]
 async fn a_collection_and_its_index_replicate_over_the_network() {
     // Schema changes carry BSON payloads, so this is the test that the wire
     // round-trips them rather than only documents.
