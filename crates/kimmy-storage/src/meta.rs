@@ -60,21 +60,13 @@ impl CollectionMeta {
         self.indexes.iter().find(|i| i.name == name)
     }
 
-    /// The id the next index will receive.
+    /// The collection already holding `id`, if any.
     ///
-    /// Takes the maximum of the stored counter and one past the highest live
-    /// index id. The second term only matters for metadata written before the
-    /// counter existed, where trusting the counter alone would reuse an id.
-    pub fn next_index_id(&self) -> u32 {
-        let derived = self.indexes.iter().map(|i| i.id + 1).max().unwrap_or(0);
-        self.index_id_counter.max(derived)
-    }
-
-    /// Allocate a fresh index id, never reusing a dropped one.
-    pub fn allocate_index_id(&mut self) -> u32 {
-        let id = self.next_index_id();
-        self.index_id_counter = id + 1;
-        id
+    /// Index ids are derived from names now, so the only way two indexes share
+    /// one is a hash collision — checked rather than assumed, because two
+    /// indexes sharing entries is unrecoverable.
+    pub fn index_by_id(&self, id: u32) -> Option<&IndexMeta> {
+        self.indexes.iter().find(|i| i.id == id)
     }
 }
 
@@ -110,57 +102,20 @@ mod tests {
         assert_eq!(index.enforcement, Enforcement::Local);
     }
 
-    fn push_index(m: &mut CollectionMeta, path: &str) -> u32 {
-        let id = m.allocate_index_id();
-        m.indexes.push(IndexMeta {
-            id,
-            name: format!("{path}_1"),
-            fields: vec![IndexField::ascending(path)],
-            unique: false,
-            enforcement: Default::default(),
-        });
-        id
+    #[test]
+    fn index_ids_are_derived_from_the_name() {
+        // Every node must compute the same id, or a replicated index definition
+        // would key entries differently on each of them.
+        assert_eq!(IndexMeta::derive_id("email_1"), IndexMeta::derive_id("email_1"));
+        assert_ne!(IndexMeta::derive_id("email_1"), IndexMeta::derive_id("status_1"));
     }
 
     #[test]
-    fn index_ids_are_never_reused() {
-        let mut m = meta();
-        assert_eq!(push_index(&mut m, "a"), 0);
-        assert_eq!(push_index(&mut m, "b"), 1);
-
-        // Dropping the newest index must not free its id: a dropped index's
-        // entries are removed lazily, so a new index reusing the id would
-        // inherit them.
-        m.indexes.retain(|i| i.id != 1);
-        assert_eq!(push_index(&mut m, "c"), 2);
-
-        // ...and dropping everything still must not restart from zero.
-        m.indexes.clear();
-        assert_eq!(push_index(&mut m, "d"), 3);
-    }
-
-    #[test]
-    fn the_id_counter_survives_a_round_trip() {
-        let mut m = meta();
-        push_index(&mut m, "a");
-        push_index(&mut m, "b");
-        m.indexes.clear();
-
-        let reloaded: CollectionMeta =
-            serde_json::from_str(&serde_json::to_string(&m).unwrap()).unwrap();
-        assert_eq!(reloaded.next_index_id(), 2, "the counter must be persisted");
-    }
-
-    #[test]
-    fn metadata_predating_the_counter_does_not_reuse_ids() {
-        // Written before `index_id_counter` existed: the counter defaults to 0,
-        // so falling back to the live indexes is what prevents a collision.
-        let json = r#"{"id":1,"db":"app","name":"orders",
-            "created":{"wall_ms":10,"counter":0},
-            "indexes":[{"id":0,"name":"a_1","fields":[{"path":"a"}],"unique":false},
-                       {"id":1,"name":"b_1","fields":[{"path":"b"}],"unique":false}]}"#;
-        let m: CollectionMeta = serde_json::from_str(json).unwrap();
-        assert_eq!(m.next_index_id(), 2);
+    fn derived_index_ids_are_pinned() {
+        // Index-entry keys embed these, so the hash is not free to change.
+        // Cross-checked against an independent FNV-1a-32 implementation.
+        assert_eq!(IndexMeta::derive_id("email_1"), 0xb788_067b);
+        assert_eq!(IndexMeta::derive_id(""), 0x811c_9dc5);
     }
 
     #[test]

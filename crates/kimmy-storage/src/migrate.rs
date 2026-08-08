@@ -31,7 +31,7 @@ use crate::meta::CollectionMeta;
 use crate::tables;
 
 /// The database layout this build writes and understands.
-pub const SCHEMA_VERSION: u8 = 2;
+pub const SCHEMA_VERSION: u8 = 3;
 
 /// Bring a database up to [`SCHEMA_VERSION`], or refuse if it cannot be.
 pub(crate) fn run(db: &Database) -> Result<()> {
@@ -41,9 +41,18 @@ pub(crate) fn run(db: &Database) -> Result<()> {
         // A fresh database: nothing to migrate, just stamp it.
         None => write_version(db, SCHEMA_VERSION),
         Some(SCHEMA_VERSION) => Ok(()),
+        // Migrations run in sequence, so a schema 1 database steps through 2
+        // rather than needing its own path to the latest.
         Some(1) => {
             info!("migrating storage schema 1 -> 2 (derived collection ids)");
             derive_collection_ids(db)?;
+            info!("migrating storage schema 2 -> 3 (derived index ids)");
+            derive_index_ids(db)?;
+            write_version(db, SCHEMA_VERSION)
+        }
+        Some(2) => {
+            info!("migrating storage schema 2 -> 3 (derived index ids)");
+            derive_index_ids(db)?;
             write_version(db, SCHEMA_VERSION)
         }
         // A newer schema means a newer build wrote this directory. Refusing is
@@ -132,6 +141,114 @@ fn derive_collection_ids(db: &Database) -> Result<()> {
 
     info!(collections = remap.len(), "renumbered collections to derived ids");
     Ok(())
+}
+
+/// One collection's indexes, with the id changes they need.
+struct IndexRenumber {
+    db: String,
+    name: String,
+    meta: CollectionMeta,
+    /// `(old id, new id)` per index that moved.
+    remap: Vec<(u32, u32)>,
+}
+
+/// Renumber every index from its counter id to its derived id.
+fn derive_index_ids(db: &Database) -> Result<()> {
+    let mut updated: Vec<IndexRenumber> = Vec::new();
+
+    {
+        let txn = db.begin_read()?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        for row in collections.iter()? {
+            let (key, value) = row?;
+            let (db_name, coll_name) = key.value();
+            let mut meta: CollectionMeta = serde_json::from_slice(value.value())?;
+
+            let mut remap = Vec::new();
+            let mut seen: HashMap<u32, String> = HashMap::new();
+            for index in &mut meta.indexes {
+                let new_id = kimmy_core::IndexMeta::derive_id(&index.name);
+                if let Some(other) = seen.insert(new_id, index.name.clone()) {
+                    return Err(StorageError::Corrupt(format!(
+                        "cannot migrate: indexes {:?} and {other:?} on {db_name}.{coll_name} \
+                         derive the same id; drop one with the previous build first",
+                        index.name
+                    )));
+                }
+                if new_id != index.id {
+                    remap.push((index.id, new_id));
+                }
+                index.id = new_id;
+            }
+
+            if !remap.is_empty() {
+                updated.push(IndexRenumber {
+                    db: db_name.to_string(),
+                    name: coll_name.to_string(),
+                    meta,
+                    remap,
+                });
+            }
+        }
+    }
+
+    if updated.is_empty() {
+        return Ok(());
+    }
+
+    let mut moved = 0usize;
+    for entry in &updated {
+        for (old, new) in &entry.remap {
+            moved += move_index_ids(db, entry.meta.id, *old, *new)?;
+        }
+
+        let txn = db.begin_write()?;
+        {
+            let mut collections = txn.open_table(tables::COLLECTIONS)?;
+            collections.insert(
+                (entry.db.as_str(), entry.name.as_str()),
+                serde_json::to_vec(&entry.meta)?.as_slice(),
+            )?;
+        }
+        txn.commit()?;
+    }
+
+    info!(entries = moved, "renumbered index entries to derived ids");
+    Ok(())
+}
+
+/// Move one index's entries from `old` to `new` within a collection.
+fn move_index_ids(db: &Database, coll: CollectionId, old: u32, new: u32) -> Result<usize> {
+    let rows: Vec<(Vec<u8>, Vec<u8>)> = {
+        let txn = db.begin_read()?;
+        let entries = txn.open_table(tables::INDEX_ENTRIES)?;
+        entries
+            .range(crate::engine::index_range(coll))?
+            .filter_map(|row| match row {
+                Ok((key, _)) => {
+                    let (_, index_id, value, doc_key) = key.value();
+                    (index_id == old).then(|| Ok((value.to_vec(), doc_key.to_vec())))
+                }
+                Err(e) => Some(Err(e.into())),
+            })
+            .collect::<Result<_>>()?
+    };
+
+    let count = rows.len();
+    if count == 0 {
+        return Ok(0);
+    }
+
+    let txn = db.begin_write()?;
+    {
+        let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+        for (value, doc_key) in &rows {
+            entries.insert((coll.0, new, value.as_slice(), doc_key.as_slice()), ())?;
+            entries.remove((coll.0, old, value.as_slice(), doc_key.as_slice()))?;
+        }
+    }
+    txn.commit()?;
+    Ok(count)
 }
 
 fn move_documents(db: &Database, old: u64, new: u64) -> Result<()> {
@@ -383,6 +500,72 @@ mod tests {
             matches!(err, StorageError::UnsupportedFormat { .. }),
             "expected an unsupported-format refusal, got {err:?}"
         );
+    }
+
+    #[test]
+    fn index_entries_follow_their_index_to_a_derived_id() {
+        // Index-entry keys embed the index id, so an unmigrated entry is an
+        // index that silently finds nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+
+        {
+            let engine = Engine::open(&path).unwrap();
+            engine.create_collection("shop", "orders").unwrap();
+            engine.create_index("shop", "orders", vec![field("item")], false, None).unwrap();
+            let orders = engine.get_collection("shop", "orders").unwrap();
+            engine.insert(&orders, doc! { "_id": 1, "item": "widget" }).unwrap();
+        }
+
+        rewind_index_ids_to_counters(&path);
+
+        let engine = Engine::open(&path).unwrap();
+        let orders = engine.get_collection("shop", "orders").unwrap();
+        let index = &orders.indexes[0];
+
+        assert_eq!(index.id, kimmy_core::IndexMeta::derive_id(&index.name));
+        let key = kimmy_core::keyenc::encode(&bson::Bson::String("widget".into())).unwrap();
+        let found = engine.index_candidates(&orders, index.id, &key, &key).unwrap();
+        assert_eq!(found.len(), 1, "entries must follow the index to its new id");
+    }
+
+    /// Rewind index ids to counter-allocated values, as schema 2 had them.
+    fn rewind_index_ids_to_counters(path: &std::path::Path) {
+        let db = Database::create(path).unwrap();
+        let mut work = Vec::new();
+        {
+            let txn = db.begin_read().unwrap();
+            let collections = txn.open_table(tables::COLLECTIONS).unwrap();
+            for row in collections.iter().unwrap() {
+                let (key, value) = row.unwrap();
+                let (db_name, coll_name) = key.value();
+                let mut meta: CollectionMeta = serde_json::from_slice(value.value()).unwrap();
+                let mut remap = Vec::new();
+                for (counter, index) in meta.indexes.iter_mut().enumerate() {
+                    remap.push((index.id, counter as u32));
+                    index.id = counter as u32;
+                }
+                work.push(((db_name.to_string(), coll_name.to_string()), meta, remap));
+            }
+        }
+
+        for ((db_name, coll_name), meta, remap) in work {
+            for (old, new) in remap {
+                move_index_ids(&db, meta.id, old, new).unwrap();
+            }
+            let txn = db.begin_write().unwrap();
+            {
+                let mut collections = txn.open_table(tables::COLLECTIONS).unwrap();
+                collections
+                    .insert(
+                        (db_name.as_str(), coll_name.as_str()),
+                        serde_json::to_vec(&meta).unwrap().as_slice(),
+                    )
+                    .unwrap();
+            }
+            txn.commit().unwrap();
+        }
+        write_version(&db, 2).unwrap();
     }
 
     fn field(path: &str) -> crate::meta::IndexField {
