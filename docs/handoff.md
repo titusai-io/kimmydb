@@ -6,78 +6,83 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-07 — end of M3
+## As of 2026-08-07 — M3 done, retention landed
 
-**Branch:** `m3-mcp-server` (ready to merge)
-**Gate:** 480 tests passing · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · `/mcp` driven manually against
-a running server, including a real scoped user
+**Branches:** `m3-mcp-server` (ready to merge) → `m5-retention-gc` (stacked on
+it, ready to merge)
+**Gate:** 493 tests passing · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · both branches driven manually
+against a running server
 
-### What this branch did
+### `m3-mcp-server` — the in-process MCP server
 
-Built M3: the in-process MCP server. Full detail in [MCP](mcp.md).
+Full detail in [MCP](mcp.md). The short version:
 
 1. **`kimmy_api::exec`** — one module both edges call, with the authorization
-   check *inside* each operation rather than beside it. The REST handlers
-   collapsed into thin adapters over it, which is the evidence the extraction
-   was real rather than shaped around MCP.
+   check *inside* each operation. `kimmy-mcp` depends on `kimmy-api`, not the
+   reverse; the M0 placeholder had it backwards ([ADR-024](decisions.md)).
+2. **`kimmy-mcp`** — `rmcp` 3.1 streamable HTTP at `/mcp`, stateless, twelve
+   tools, collections as resources.
+3. **Sampled schema inference** behind `describe_collection` and a new
+   `GET …/describe` REST route.
+4. Two bugs found by driving a real server: presence counted array elements
+   rather than documents, and `resources/list` offered the password-hash
+   collection as agent context.
 
-2. **`kimmy-mcp`** — `rmcp` 3.1 streamable HTTP at `/mcp`, merged onto the same
-   router in `kimmyd`. Twelve tools, collections as resources. **Stateless**: no
-   MCP session, so an expired token stops working immediately.
+### `m5-retention-gc` — the largest remaining operational gap
 
-3. **The dependency arrow was inverted.** `kimmy-mcp` now depends on
-   `kimmy-api`, not the reverse — the M0 placeholder said otherwise. Rationale
-   in [ADR-024](decisions.md); the short version is that co-location makes one
-   enforcement point *possible* and a shared executor makes it *unavoidable*.
+Retention was configurable since M0 and enforced by nothing, so the oplog and
+tombstones grew without bound. That was the most serious entry in
+[Deviations](deviations.md); it is now closed.
 
-4. **Sampled schema inference** (`kimmy-api/src/schema.rs`), behind both the
-   MCP `describe_collection` tool and a new `GET …/describe` REST route. Dotted
-   paths, `path[]` for array elements, per-document presence, bounded recursion.
+- `kimmy_storage::gc` — `Engine::collect_garbage(policy)`, plus a
+  `collect_garbage_at(now_ms, …)` that takes the time as a parameter so
+  retention is testable without sleeping for a day.
+- A background pass in `kimmyd` every `storage.gc_interval_secs` (default
+  10 min, `0` disables). Validation refuses an interval longer than the oplog
+  window, and refuses zero for either retention.
 
-5. **Two bugs found by driving a real server, not by tests.** Schema inference
-   counted array *elements* rather than documents, reporting a `presence` of
-   2.0. And the first `resources/list` offered `kimmy://__kimmy/__users` — the
-   password-hash collection — as attachable agent context. Both fixed, both now
-   have tests, both recorded in [Testing](testing.md).
+**The part worth remembering: the newest oplog entry is never collected.** The
+logical clock is not persisted separately — `Engine::open` resumes it from the
+oplog tail. Collect that entry and a restart resumes at `Hlc::ZERO`, minting
+stamps below what is already stored, and every later write to an existing
+document loses to its own older version *silently*. An idle node is where it
+would have bitten, since a busy one always has a fresh tail.
+[ADR-028](decisions.md). A mutant removing the guard fails three tests.
 
-6. **Docs:** new [MCP](mcp.md); ADR-024 through ADR-027; roadmap M3 marked
-   complete with a planned-versus-built table; a seventh load-bearing invariant
-   in testing; http-api gained `/describe` and `/mcp`.
+**Measured, because the guess was wrong.** A collection pass grows the file
+before it shrinks it — redb is copy-on-write. 2,000 documents of 4 KB: 52.7 MB
+before, 105.4 MB immediately after, 53.3 MB once later writes reused the space.
+Operators need free space equal to what one pass will collect, and the first
+pass on an uncollected database is the biggest. Recorded in
+[Operations](operations.md).
 
 ### Next: M4 — gossip clustering
 
-The largest remaining piece, and the first one where the design has a known
-unsolved problem rather than just unwritten code. Membership via
-[`foca`](https://github.com/caio/foca) over UDP; `apply_remote`, conflict
-resolution, and discovery parsing already exist and are tested. **Missing: the
-transport.**
+The largest remaining piece, and the first where the design has a known unsolved
+problem rather than just unwritten code. `apply_remote`, conflict resolution,
+and discovery parsing exist and are tested. **Missing: the transport.**
 
-Before writing any of it, two decisions have to be made — see below.
+Two decisions have to be made before writing it — see below.
 
 ### Open, and needing your decision
 
-**Two carried forward, one new.**
-
-1. **`byo` has no ingest route.** Unchanged from M2 and still the most
-   user-visible gap: `byo` is the default embedding provider and there is no
-   endpoint for supplying vectors, so search on a `byo` collection returns
-   nothing, always. **This now also affects MCP** — an agent given
-   `vector_search` on a `byo` collection gets empty results with no indication
-   why. Proposed shape unchanged: `PUT /v1/db/{db}/coll/{coll}/docs/{id}/vectors`
-   taking `[{chunk, vector, text}]`. Not built unilaterally; it is a public API
-   surface. Detail in [Deviations](deviations.md).
+1. **`byo` has no ingest route.** Carried since M2 and the most user-visible
+   gap: `byo` is the default embedding provider with no endpoint for supplying
+   vectors, so search returns nothing, always. **M3 made it worse** — an agent
+   given `vector_search` on such a collection gets empty results with no
+   indication why. Proposed: `PUT /v1/db/{db}/coll/{coll}/docs/{id}/vectors`
+   taking `[{chunk, vector, text}]`. Not built unilaterally; public API surface.
 
 2. **Replicated writes land behind the change-stream position (M4).** An applied
    remote entry keeps its originating stamp, so it enters the oplog *behind* the
-   local tail and a subscriber past that point never sees it. Three candidate
-   resolutions are in [Roadmap](roadmap.md); none is chosen. **This will block
-   M4 on day one.**
+   local tail and a subscriber past that point never sees it. Three candidates
+   in [Roadmap](roadmap.md); none chosen. **Blocks M4 on day one.**
 
-3. **New: unique-violation surfacing is committed but unspecified.** M4 must
-   convert a silent last-writer-wins discard into a `uniqueViolation` change
-   event ([ADR-020](decisions.md)). What the event carries, and where the losing
-   document is recorded so it can be reconciled, is not decided.
+3. **Unique-violation surfacing is committed but unspecified (M4).**
+   [ADR-020](decisions.md) commits to a `uniqueViolation` change event. What it
+   carries, and where the losing document is recorded for reconciliation, is
+   undecided.
 
 Everything else open is implementation, not decision: `$in` not using an index,
 descending-field ranges, one-bound index ranges, HNSW snapshot persistence, and
@@ -85,15 +90,17 @@ the aggregation pipeline that would give MCP its `aggregate` tool.
 
 ### Worth knowing before starting M4
 
-- **`kimmy_api::exec` is now the single authorization point**, and M4 adds a
-  third writer to the engine — the replication transport. It applies remote
-  entries rather than serving a principal, so it goes through `apply_remote`,
-  *not* through `exec`. Keep that boundary clear: `exec` is for things a
-  principal asked for.
-- **MCP is stateless by choice**, partly so that clustering does not later have
-  to make sessions follow a node.
-- The `uniqueViolation` work touches change streams, which the embedding worker
-  and MCP both sit downstream of.
+- **`kimmy_api::exec` is the single authorization point**, and M4 adds a third
+  writer — the replication transport. It applies remote entries rather than
+  serving a principal, so it goes through `apply_remote`, *not* `exec`. Keep
+  that boundary: `exec` is for things a principal asked for.
+- **Retention now interacts with replication.** `oplog_retention_secs` bounds
+  how far a peer can fall behind and still catch up incrementally; a peer
+  further behind than the window needs a full resync, which does not exist yet.
+  Collection also cannot empty the log, so there is always a tail to compare
+  version vectors against.
+- **MCP is stateless by choice**, partly so clustering need not make sessions
+  follow a node.
 
 ## Conventions for this file
 

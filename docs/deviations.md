@@ -199,7 +199,6 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 | Gap | Consequence | Milestone |
 |---|---|---|
-| Oplog and tombstone GC | **Unbounded disk growth.** Retention is configured but not enforced | M5 |
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
 | Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
@@ -208,6 +207,18 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | No performance regression baseline exists — including the 2000-vector index threshold, which is a guess, not a measurement | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
+
+---
+
+## 🟢 Closed
+
+**Oplog and tombstone GC.** Was the most serious 🟡 in this register —
+retention was configured but not enforced, so both tables grew without bound.
+Enforced now by a background pass every `storage.gc_interval_secs`. The design
+constraint that mattered was not the collection itself but that **the newest
+oplog entry must never be collected**: the logical clock resumes from the oplog
+tail, so an aged-out tail would reset the clock on restart and make every later
+write lose to its own older version, silently. [ADR-028](decisions.md).
 
 ---
 

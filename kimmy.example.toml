@@ -41,6 +41,17 @@ tombstone_retention_secs = 86400
 # behind a peer can fall and still catch up incrementally.
 oplog_retention_secs = 86400
 
+# How often to collect records past the two windows above.
+#
+# Retention says what is garbage; this says how often to look. It must not
+# exceed oplog_retention_secs, or records outlive their window by up to a whole
+# interval and the retention number stops meaning what it says.
+#
+# Set to 0 to disable collection entirely — the oplog and tombstones then grow
+# without bound, which is occasionally what you want while debugging a
+# replication problem, and never what you want in production.
+gc_interval_secs = 600
+
 [auth]
 # Run with no authentication at all. Only permitted when `server.bind` is a
 # loopback address; the server refuses to start otherwise.

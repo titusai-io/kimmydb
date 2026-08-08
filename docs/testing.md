@@ -9,19 +9,19 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-480 tests passing · 0 failures · clippy clean at -D warnings
+493 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 98 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 108 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage |
+| `kimmy-storage` | 118 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | 52 | 31 unit (JSON boundary, errors, schema inference) + 21 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
-| `kimmyd` | 14 | Config layering and validation |
+| `kimmyd` | 17 | Config layering and validation |
 | `kimmy-cluster` | 5 | Discovery string parsing |
 
 ---
@@ -235,6 +235,7 @@ Worth recording, because each one shows the test doing its job:
 | `anndists::DistDot` asserts `1 - dot >= 0` | **Process abort.** Valid only for unit vectors; any real embedding would have crashed the server mid-search | exercising every metric against the index rather than assuming they all worked |
 | Schema inference counted array elements, not documents | `presence` reported 2.0 — a fraction above 1.0, which is meaningless — for any array field | driving `describe_collection` against a running server; **no test looked, because nobody thought to** |
 | MCP published `kimmy://__kimmy/__users` as a resource | The password-hash collection offered to an agent as attachable context | the first `resources/list` against a real node |
+| Retention collecting the oplog tail | **Silent data loss.** The clock resumes from the tail, so an idle node would restart at `Hlc::ZERO` and every later write would lose to its own older version | writing the invariant into `the_clock_still_resumes_after_an_aggressive_collection` *before* the collector, then confirming a mutant that removes the guard fails three tests |
 
 In the first two cases the test encoded the *intended* invariant and the
 implementation was wrong — which is the right way round.
@@ -266,6 +267,9 @@ manually and are recorded so they can be repeated:
 | MCP RBAC for a real scoped user | ✅ read allowed; write, cross-collection read, user-store read, and DDL all refused |
 | `resources/list` as superuser | ✅ user data only — no `__kimmy`, no shadow collections |
 | `--no-mcp` | ✅ `/mcp` 404s, REST unaffected |
+| Retention pass on a live node | ✅ 45 oplog entries and 15 tombstones collected; 15 live documents untouched |
+| Restart after an aggressive collection | ✅ clock resumed from the retained tail; a post-restart update took effect rather than losing to LWW |
+| File size across a collection pass | ✅ measured — 52.7 MB → 105.4 MB → 53.3 MB after refill ([Operations](operations.md)) |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test

@@ -540,6 +540,40 @@ test would have thought to look.
 
 ---
 
+## ADR-028 — The newest oplog entry is never collected
+
+**Decision.** Retention collects oplog entries older than its window, with one
+exception that overrides age entirely: the single newest entry always survives.
+
+**Why.** The logical clock is not persisted separately. `Engine::open` resumes
+it by reading the oplog tail — that is the *only* record of how far the clock
+has advanced. An empty oplog resumes at `Hlc::ZERO`.
+
+So a retention rule that collects purely by age is a data-loss bug on a delay.
+Collect the last entry, restart, and the node begins minting stamps below ones
+already on disk. Every subsequent write to an existing document loses to its own
+older version under last-writer-wins — and loses *silently*: the write returns
+200, the oplog entry is appended, and the document does not change.
+
+**Where it would have bitten.** An idle node. No writes means every entry
+eventually ages past the window, so the naive rule empties the log precisely
+when there is no activity to make the damage visible. A busy node always has a
+fresh entry and would never have shown the bug in testing.
+
+**Alternative considered.** Persist the clock high-water mark in the `meta`
+table on every write. Correct, and it would decouple the clock from retention
+entirely — but it puts an extra write in every transaction to remove a
+one-line special case. Worth revisiting if something else ever needs the clock
+independent of the log; not worth it for this.
+
+**Consequence.** An oplog can never be fully empty once anything has been
+written, so "collect everything" is not an expressible state. Three tests pin
+it, including one that restarts the engine after collecting with zero retention
+and asserts the next write stamps above the retained tail. Removing the
+exception fails all three.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

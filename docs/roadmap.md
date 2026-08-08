@@ -229,7 +229,7 @@ handle a node whose tombstones were collected while it was partitioned.
 | Backup / restore | Online snapshot, point-in-time restore from the oplog |
 | TLS | Native termination |
 | Rate limiting | Especially `/v1/auth/login` |
-| Oplog & tombstone GC | Currently ⛔ unbounded growth |
+| Oplog & tombstone GC | ✅ Done — background pass, `storage.gc_interval_secs`. [ADR-028](decisions.md) |
 | Aggregation pipeline | `$match`, `$group`, `$unwind`, `$project`, `$sort`, `$limit` |
 | `kimmy` CLI | Interactive shell |
 | Benchmarks | Criterion; establish a regression baseline |

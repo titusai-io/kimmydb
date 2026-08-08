@@ -161,10 +161,13 @@ channel as documents.
 
 ## Retention
 
-Configured by `storage.oplog_retention_secs` (default 24 h). Collection is
-📋 **planned, not implemented** — the log currently grows without bound.
+Configured by `storage.oplog_retention_secs` (default 24 h) and enforced by a
+background pass every `storage.gc_interval_secs` (default 10 min). Set the
+interval to `0` to disable collection; validation refuses an interval *longer*
+than the retention window, since that would make the retention number mean
+"the window, plus up to one interval".
 
-Retention will bound two things:
+Retention bounds two things:
 
 | Bounded thing | Consequence when exceeded |
 |---|---|
@@ -182,6 +185,18 @@ if token.to_stamp() < oldest { return Err(ResumeTokenExpired) }
 Returning `410 Gone` rather than silently restarting from the beginning is
 deliberate: a silent restart would hide the fact that events were missed.
 
+### The newest entry is never collected
+
+Whatever its age. The logical clock is not stored separately — it is resumed on
+startup from the oplog tail. Collect the last entry and a restart reads an empty
+log, resumes at `Hlc::ZERO`, and begins minting stamps *below* ones already on
+disk; every later write to an existing document would then lose to its own older
+version under last-writer-wins, silently.
+
+An idle node is where this would bite, because no writes means every entry
+eventually ages out — so the naive rule empties the log exactly when nothing is
+happening to reveal the damage. See [ADR-028](decisions.md).
+
 ---
 
 ## Growth characteristics
@@ -194,8 +209,10 @@ Because entries carry full post-images:
 | Update-heavy, large documents | ≈ document size × update count |
 | Delete-heavy | Small (deletes carry no body) |
 
-Until retention lands, plan disk accordingly. A collection of 10 KB documents
-updated once a second produces roughly 860 MB of log per day.
+Retention bounds this, but only up to the window: a collection of 10 KB
+documents updated once a second produces roughly 860 MB of log per day, so a
+24-hour window means provisioning for about that much log on top of the data.
+Shorten `oplog_retention_secs` to trade resume range for disk.
 
 ---
 

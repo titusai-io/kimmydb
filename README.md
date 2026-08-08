@@ -139,6 +139,7 @@ The settings worth knowing before you deploy:
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |
 | `storage.tombstone_retention_secs` | — | Must exceed your worst tolerable partition, or deleted documents resurrect. See below. |
+| `storage.gc_interval_secs` | — | How often retention is enforced (default 10 min). `0` disables collection and the oplog grows without bound. |
 
 `--insecure-no-auth` is refused on any non-loopback bind address, and clustering
 is refused without seeds and secrets. These are startup errors, not runtime
