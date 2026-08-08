@@ -3,12 +3,13 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kimmy_storage::Engine;
 use tracing::{debug, info, warn};
 
 use crate::discovery::SeedSource;
+use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::transport::sync_once;
 
 /// How often to run a round against every known peer.
@@ -29,11 +30,31 @@ pub struct ReplicationConfig {
     pub local: SocketAddr,
     pub sync_interval: Duration,
     pub discovery_interval: Duration,
+    /// Peers contacted per round.
+    ///
+    /// A cap rather than a quota: a cluster smaller than this contacts
+    /// everyone. Keeping it constant is what makes the per-round cost
+    /// independent of cluster size.
+    pub fanout: usize,
+}
+
+impl ReplicationConfig {
+    pub fn new(seeds: Vec<SeedSource>, secret: String, local: SocketAddr) -> Self {
+        Self {
+            seeds,
+            secret,
+            local,
+            sync_interval: DEFAULT_SYNC_INTERVAL,
+            discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
+            fanout: DEFAULT_FANOUT,
+        }
+    }
 }
 
 /// Run anti-entropy against discovered peers, forever.
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut peers: BTreeSet<SocketAddr> = BTreeSet::new();
+    let mut health = PeerHealth::new(config.fanout, config.sync_interval);
     let mut discovery = tokio::time::interval(config.discovery_interval);
     let mut sync = tokio::time::interval(config.sync_interval);
 
@@ -44,21 +65,41 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 debug!(count = peers.len(), "resolved peers");
             }
             _ = sync.tick() => {
-                for peer in &peers {
+                // A subset, not everyone: anti-entropy is transitive, so a
+                // write reaches the cluster through intermediate peers without
+                // every node contacting every other one every interval.
+                for peer in health.select(&peers, Instant::now()) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once(&engine, *peer, &config.secret).await {
-                        Ok(outcome) if outcome.total() > 0 => info!(
-                            %peer,
-                            applied = outcome.applied,
-                            ddl = outcome.ddl,
-                            "merged from peer"
-                        ),
-                        Ok(_) => {}
+                    match sync_once(&engine, peer, &config.secret).await {
+                        Ok(outcome) => {
+                            health.succeeded(peer);
+                            if outcome.total() > 0 {
+                                info!(
+                                    %peer,
+                                    applied = outcome.applied,
+                                    ddl = outcome.ddl,
+                                    "merged from peer"
+                                );
+                            }
+                        }
                         // A peer being unreachable is the normal state of a
-                        // cluster, not an error worth stopping for.
-                        Err(e) => debug!(%peer, error = %e, "sync round failed"),
+                        // cluster, not an error worth stopping for — but it is
+                        // worth backing off, so a node that is not coming back
+                        // stops costing a connection every interval.
+                        Err(e) => {
+                            let now = Instant::now();
+                            health.failed(peer, now);
+                            let failures = health.failures(peer);
+                            // Noisy once, then quiet: repeating the same failure
+                            // every interval is how a log stops being read.
+                            if failures == 1 {
+                                warn!(%peer, error = %e, "sync round failed; backing off");
+                            } else {
+                                debug!(%peer, error = %e, failures, "sync round failed");
+                            }
+                        }
                     }
                 }
             }

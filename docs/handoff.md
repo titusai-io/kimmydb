@@ -6,75 +6,73 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — a node can join a running cluster
+## As of 2026-08-08 — M4 is functionally complete
 
-**Branch:** `m4-snapshot-resync` (ready to merge)
-**Gate:** 596 tests · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · **an empty node joined a live
-cluster whose history had been collected**
+**Branches, stacked, both ready to merge:**
 
-### What this branch did
+| Branch | What |
+|---|---|
+| `m4-snapshot-resync` | A peer past the retention horizon catches up from state |
+| `m4-peer-health` | Backoff for failing peers, fanout instead of all-to-all |
 
-I probed the retention horizon before starting SWIM, and found that "full
-resync" was not a deferred optimisation but a hard limit:
+**Gate:** 606 tests · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · both driven on real daemons
 
-```
-A documents:                      20
-entries A could still offer:       1   (the retained tail)
-outcome:  unknown_collection: 1        (the CreateCollection entry is gone)
-B documents:  collection missing entirely
-B still considers itself behind:  Some(Hlc(0.0))
-```
+### `m4-snapshot-resync`
 
-**A node could not join a cluster older than `oplog_retention_secs`** — at the
-default, any node added to a cluster more than a day old. It received nothing it
-could apply and retried forever. Honest (it never falsely believed it was caught
-up) but hard-stuck.
+A node could not join a cluster older than `oplog_retention_secs` — it received
+nothing it could apply and retried forever. Probed rather than assumed. It now
+detects the horizon and pulls current state instead. [ADR-036](decisions.md).
 
-Now a peer below the horizon is told `BeyondHorizon` and asks for a **snapshot**:
-collection definitions, documents in pages, then the sender's coverage.
-[ADR-036](decisions.md).
+The subtle part: **the version vector stopped being derived from the oplog.** It
+was rebuilt on every open, which would have recomputed a completed snapshot's
+coverage away. Opening now only ever *raises* it.
 
-Three things worth remembering:
+### `m4-peer-health`
 
-- **The horizon is recorded** (`oplog_collected_through`), not inferred from the
-  oldest retained entry — which on a node that has collected nothing is just the
-  first write ever made.
-- **Snapshot documents are applied through `apply_remote`**, so LWW still
-  decides, indexes are maintained, and unique violations are still detected.
-- **The version vector stopped being derived state.** It was rebuilt from the
-  oplog on open, which would have recomputed a completed snapshot's coverage
-  away. Opening now only ever *raises* it.
+Local failure tracking with exponential backoff, and a fixed number of peers
+contacted per round in rotation — **instead of** SWIM, not before it.
+[ADR-037](decisions.md).
 
-### Verified on real daemons
+By the time the transport existed, what a gossip layer would have added had
+narrowed to two things, neither of them correctness: retrying dead peers
+forever, and O(n²) connections per round. Both are local problems with local
+fixes. The third thing SWIM gives — learning about nodes absent from your seeds
+— is nearly free on Kubernetes, where a headless Service already resolves to
+every ready pod.
 
-An empty node joined a cluster whose oplog had been collected: it detected the
-horizon, snapshotted, and received all 30 documents and the unique index. Then
-**exactly one** snapshot across many subsequent rounds, followed by ordinary
-incremental replication in both directions.
+**This was not decided on licence.** `foca` and `memberlist` are MPL-2.0;
+depending on either unmodified is permitted and unremarkable, and `chitchat`
+(MIT) was available. It was decided because the remaining benefit did not
+justify the subsystem.
 
-### Next: SWIM membership — and a licensing question first
+**What it gives up:** no shared opinion about which nodes are alive. Nothing
+depends on that today, because anti-entropy is transitive and idempotent. It
+becomes worth revisiting if membership is ever needed for something that *must*
+be agreed — `coordinated` unique enforcement ([ADR-020](decisions.md)) being the
+obvious candidate, since it routes a value to the node that owns it.
 
-`foca` is the crate the roadmap names, and it is **MPL-2.0**. Depending on it
-without modification is permitted and common, but it is a licensing
-consideration rather than a purely technical call — and dependency choices here
-have been deliberate (redb over RocksDB for pure Rust, `jsonwebtoken` with
-`rust_crypto` to avoid a C toolchain).
+### M4 status
 
-What SWIM would buy, now that resync works:
+Everything the milestone set out to do is built, with one substitution
+(peer health for SWIM) and one addition nobody planned (snapshot resync,
+which turned out to be load-bearing).
 
-- **Failure detection.** Today a node learns a peer is gone by failing to
-  connect, every round.
-- **Membership beyond seeds.** Lower value on the primary target: a Kubernetes
-  headless Service already resolves to the full member set.
-- **Scale.** Every node currently syncs with every other node each interval,
-  which is O(n²) connections.
+Verified on real daemons across the last few branches: two nodes forming a
+cluster from one seed address; convergence in both directions; a partition
+healing; a cross-node unique violation leaving both documents in place while
+both nodes reported it; an empty node joining a cluster whose history had been
+collected; and a dead seed producing one warning rather than one per round.
 
-### Then
+### Remaining, none blocking
 
-- **SRV discovery**, which needs a DNS resolver crate.
-- **TLS between nodes** (M5) — `cluster_secret` authenticates peers but frames
+- **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
+  DNS resolver crate. `dns:` and `k8s:` both work.
+- **TLS between nodes** (M5) — `cluster_secret` authenticates peers, but frames
   are plaintext.
+- `$in` not using an index; descending-field ranges; one-bound index ranges;
+  HNSW snapshot persistence; the aggregation pipeline that would give MCP its
+  `aggregate` tool.
 
 ### Worth knowing
 
@@ -84,12 +82,8 @@ What SWIM would buy, now that resync works:
   rebuild that lowers it.
 - **Applying replicated DDL must not log**, and must carry the originating stamp
   into any tombstone it records.
+- **Anti-entropy excludes `OpKind::UniqueViolation`** — a node's own observation.
 - **`tombstone_retention_secs` governs dropped collections too.**
-
-### Open, none blocking
-
-`$in` not using an index; descending-field ranges; one-bound index ranges; HNSW
-snapshot persistence; the aggregation pipeline that would give MCP `aggregate`.
 
 ## Conventions for this file
 

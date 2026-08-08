@@ -71,12 +71,12 @@ root_user = "root"
 token_ttl_secs = 3600
 
 [cluster]
-# KimmyDB is leaderless: there is no primary, no election, and no quorum. Nodes
-# gossip membership and pull oplog entries they are missing. Writes are
-# accepted anywhere and converge by last-writer-wins.
+# KimmyDB is leaderless: there is no primary, no election, and no quorum. Each
+# node pulls the oplog entries it is missing from a few peers each round. Writes
+# are accepted anywhere and converge by last-writer-wins.
 enabled = false
 
-# Gossip transport bind address (UDP for SWIM, TCP for oplog transfer).
+# Replication bind address (TCP; peers authenticate with cluster_secret).
 bind = "0.0.0.0:7900"
 
 # Where to look for peers, re-resolved periodically so new pods are picked up
@@ -84,7 +84,7 @@ bind = "0.0.0.0:7900"
 #
 #   "k8s:kimmy-headless.default.svc.cluster.local"  headless Service, one A record per pod
 #   "dns:seeds.kimmy.internal"                      A/AAAA records
-#   "dns-srv:_kimmy._udp.example.com"               SRV records, ports included
+#   "dns-srv:_kimmy._tcp.example.com"               SRV records -- parsed, NOT yet resolved
 #   "static:10.0.0.1:7900,10.0.0.2:7900"            explicit list
 #   "10.0.0.1:7900"                                 shorthand for a single static peer
 seeds = []
@@ -102,6 +102,15 @@ sync_interval_secs = 5
 # not change every few seconds. But it must repeat -- a node that resolved only
 # at startup would never see a peer that joined after it.
 discovery_interval_secs = 30
+
+# Peers contacted per anti-entropy round.
+#
+# A cap, not a quota: a cluster smaller than this contacts everyone. Keeping it
+# constant is what makes the per-round cost independent of cluster size --
+# replication is transitive, so a write still reaches every node through
+# intermediate peers. Peers that are failing are backed off and skipped, and do
+# not count against this.
+fanout = 3
 
 [log]
 # A tracing-subscriber filter directive. RUST_LOG overrides this when set.

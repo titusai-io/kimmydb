@@ -12,10 +12,12 @@
 #![allow(dead_code)]
 
 pub mod discovery;
+pub mod health;
 pub mod peers;
 pub mod protocol;
 pub mod transport;
 
 pub use discovery::{DEFAULT_GOSSIP_PORT, ResolveError, SeedSource};
+pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth};
 pub use peers::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ReplicationConfig, replicate};
 pub use transport::{serve, sync_once};

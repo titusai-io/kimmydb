@@ -243,12 +243,18 @@ instead of history. Without it, a node added to a cluster older than
 which, at the default retention, is any node added to a running cluster.
 [ADR-036](decisions.md).
 
-### Still missing
+### Built: peer health and fanout ✅
 
-- **SWIM membership** via `foca`. Without it there is no failure detection or
-  suspicion: a node syncs with every address its seeds resolve to and finds out
-  a peer is gone by failing to connect. Workable, and noisier than it should be
-  on a large or flapping cluster.
+Local failure tracking with exponential backoff, and a fixed number of peers
+contacted per round in rotation. Chosen **instead of** SWIM: the remaining
+benefit of a gossip layer did not justify the subsystem, and Kubernetes headless
+DNS already reports the member set. [ADR-037](decisions.md).
+
+What that gives up: no cluster-wide agreement about which nodes are alive. Worth
+revisiting if membership is ever needed for something that must be agreed — such
+as `coordinated` unique enforcement.
+
+### Still missing
 - **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
   DNS resolver that can read record types the standard library does not expose.
   `dns:` and `k8s:` both work.

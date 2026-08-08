@@ -138,6 +138,7 @@ async fn spawn_cluster(
             local,
             sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
             discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
+            fanout: config.cluster.fanout,
         },
     ));
 

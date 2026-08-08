@@ -265,6 +265,45 @@ async fn a_snapshot_is_only_used_when_the_oplog_cannot_serve() {
     assert!(outcome.ddl > 0, "nothing was collected, so history should have served: {outcome:?}");
 }
 
+#[tokio::test]
+async fn a_dead_peer_is_backed_off_rather_than_retried_every_round() {
+    // Nothing breaks without this — anti-entropy is idempotent and a failed
+    // round costs a refused connection — but every round pays for a node that
+    // is not coming back, and the log fills with the same failure.
+    use kimmy_cluster::PeerHealth;
+    use std::collections::BTreeSet;
+    use std::time::Instant;
+
+    // A port nothing is listening on.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead = listener.local_addr().unwrap();
+    drop(listener);
+
+    let node = node().await;
+    let mut health = PeerHealth::new(3, Duration::from_secs(5));
+    let peers: BTreeSet<_> = BTreeSet::from([dead]);
+
+    // First round: contacted, and it really does fail.
+    let now = Instant::now();
+    assert_eq!(health.select(&peers, now), vec![dead]);
+    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    health.failed(dead, now);
+
+    // A single failure is forgiven promptly — a blip should not cost a peer
+    // several intervals of isolation.
+    let next = now + Duration::from_secs(5);
+    assert_eq!(health.select(&peers, next), vec![dead], "one failure should retry soon");
+    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    health.failed(dead, next);
+
+    // Repeated failure is what earns the backoff.
+    assert!(
+        health.select(&peers, next + Duration::from_secs(5)).is_empty(),
+        "a peer failing repeatedly must stop costing a connection every round"
+    );
+    assert_eq!(health.failures(dead), 2);
+}
+
 fn field(path: &str) -> kimmy_storage::IndexField {
     kimmy_storage::IndexField { path: path.into(), descending: false }
 }
