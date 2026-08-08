@@ -10,6 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
+use crate::membership::Members;
 use crate::transport::sync_once;
 
 /// How often to run a round against every known peer.
@@ -36,6 +37,19 @@ pub struct ReplicationConfig {
     /// everyone. Keeping it constant is what makes the per-round cost
     /// independent of cluster size.
     pub fanout: usize,
+    /// Where to send discovered addresses so membership can announce to them.
+    ///
+    /// Membership finds the rest of the cluster by gossip once it has *one*
+    /// contact, but a node that starts alone has none — so discovery keeps
+    /// feeding it, not only at startup.
+    pub announce: Option<tokio::sync::mpsc::Sender<SocketAddr>>,
+    /// Live members according to SWIM, when membership is running.
+    ///
+    /// Preferred over discovery once it knows anyone: discovery reports who was
+    /// *configured*, membership reports who is *up*, and only the second can
+    /// tell a node that was removed from a Service from one that never
+    /// answered. Discovery remains the bootstrap and the fallback.
+    pub members: Option<Members>,
 }
 
 impl ReplicationConfig {
@@ -47,13 +61,15 @@ impl ReplicationConfig {
             sync_interval: DEFAULT_SYNC_INTERVAL,
             discovery_interval: DEFAULT_DISCOVERY_INTERVAL,
             fanout: DEFAULT_FANOUT,
+            announce: None,
+            members: None,
         }
     }
 }
 
-/// Run anti-entropy against discovered peers, forever.
+/// Run anti-entropy against known peers, forever.
 pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
-    let mut peers: BTreeSet<SocketAddr> = BTreeSet::new();
+    let mut discovered: BTreeSet<SocketAddr> = BTreeSet::new();
     let mut health = PeerHealth::new(config.fanout, config.sync_interval);
     let mut discovery = tokio::time::interval(config.discovery_interval);
     let mut sync = tokio::time::interval(config.sync_interval);
@@ -61,13 +77,35 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     loop {
         tokio::select! {
             _ = discovery.tick() => {
-                peers = resolve(&config.seeds, config.local).await;
-                debug!(count = peers.len(), "resolved peers");
+                discovered = resolve(&config.seeds, config.local).await;
+                debug!(count = discovered.len(), "resolved peers");
+
+                // Offer every resolved address to membership. Announcing to one
+                // we already know is harmless — foca ignores it — and doing it
+                // every interval is what lets a node that started alone join
+                // the cluster whenever it appears.
+                if let Some(announce) = &config.announce {
+                    for peer in &discovered {
+                        let _ = announce.try_send(*peer);
+                    }
+                }
             }
             _ = sync.tick() => {
                 // A subset, not everyone: anti-entropy is transitive, so a
                 // write reaches the cluster through intermediate peers without
                 // every node contacting every other one every interval.
+                // Membership when it knows anyone, discovery otherwise. A node
+                // that has just started has resolved seeds but not yet gossiped
+                // with them, so discovery is what gets the first round out.
+                let peers = match &config.members {
+                    Some(members) if !members.is_empty() => {
+                        let mut live = members.snapshot();
+                        live.remove(&config.local);
+                        live
+                    }
+                    _ => discovered.clone(),
+                };
+
                 for peer in health.select(&peers, Instant::now()) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make

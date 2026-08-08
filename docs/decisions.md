@@ -938,56 +938,59 @@ it and never lowers it.
 
 ---
 
-## ADR-037 — Local peer health instead of SWIM membership
+## ADR-037 — Local peer health, and SWIM membership above it
 
-**Decision.** No gossip library. Each node keeps its own record of which peers
-have failed, backs off exponentially, and contacts a fixed number of peers per
-round in rotation.
+**Decision.** Two layers, built in that order. Each node keeps private
+bookkeeping — exponential backoff for peers that fail it, and a fixed fanout
+contacted per round in rotation. Above that, SWIM via [`foca`](https://github.com/caio/foca)
+over UDP gives the cluster a *shared* opinion about who is alive.
 
-**What SWIM was for.** The plan named [`foca`](https://github.com/caio/foca)
-during design. By the time the transport existed, the concrete problems it would
-have solved had narrowed to two, neither of them correctness:
+**Why both.** They answer different questions and neither subsumes the other.
 
-- a peer that has gone away is retried every interval forever;
-- every node syncs with every other node, which is O(n²) connections per round.
+Backoff and fanout are about *this node's* costs: not retrying a peer that is
+not coming back, and not opening O(n²) connections per interval across the
+cluster. Those are local problems with local fixes, and they still apply with
+membership running — SWIM tells you a peer is up, not that your last three
+attempts to reach it timed out.
 
-Both are solvable with local bookkeeping. Neither needs cluster-wide agreement.
+SWIM is about *agreement*: a node that cannot reach a peer asks others to probe
+it indirectly before anything is declared, so one bad link does not evict a
+healthy node, and a genuine failure is agreed rather than rediscovered
+independently by everyone. It also learns members that were never configured —
+verified with three daemons where the third was told only about the first and
+learned the second by gossip.
 
-**What discovery already covers.** SWIM's third contribution — learning about
-nodes absent from your seed list — is nearly free on the primary target: a
-Kubernetes headless Service resolves to every ready pod, and re-resolving on an
-interval picks up new ones. Paying for a gossip layer to rediscover what DNS
-already reports is the wrong trade for this deployment shape.
+**The order was wrong at first, and worth recording.** I built the local layer
+and wrote this ADR as *instead of* SWIM, having judged that discovery on
+Kubernetes covered enough. That reasoning held for the deployment shape and
+missed the point: gossiping state between peers with no leader is a stated goal
+of the project, not an implementation detail to be optimised away. The local
+layer was the right thing to build; presenting it as a replacement was not.
 
-**Round-robin, not random sampling.** Every peer is contacted within
-`ceil(n / fanout)` rounds rather than probably-eventually, and the behaviour is
-reproducible in a test. Correlated choices across nodes would matter for gossip
-*dissemination*, where the point is to spread a message; here each node is
-pulling for itself.
+**Membership is on by default and can be turned off.** With `membership = false`
+peers come from discovery alone and each node forms its own private opinion —
+which is exactly the earlier behaviour, kept because it is a reasonable
+single-datacentre configuration and because it is what runs if the UDP port is
+blocked.
 
-**Fanout is a cap, not a quota**, and backed-off peers are filtered *before* it
-applies — otherwise three unreachable peers would hide a live fourth every
-round, which a test pins.
+**Two protocols share one port.** UDP carries probes and membership, TCP carries
+version vectors, oplog entries and snapshots. One address to configure, one
+firewall rule to get wrong instead of two.
 
-**A single failure is forgiven promptly.** Backoff starts at one interval and
-doubles from the second failure, so a blip does not cost a peer several rounds
-of isolation while a sustained outage still stops costing a connection.
+**A wildcard bind is not an identity.** `0.0.0.0` is a listening instruction;
+announcing it would tell the cluster to probe an address that routes nowhere.
+The advertised address falls back to loopback with a warning, which keeps a
+single-host cluster working and makes the misconfiguration visible.
 
-**The licensing question, stated plainly.** `foca` and `memberlist` are both
-MPL-2.0. Depending on either unmodified is permitted and unremarkable, so this
-was **not** decided on licence — it was decided because the remaining benefit
-did not justify a gossip subsystem. `chitchat` (MIT) was available had the
-decision gone the other way.
+**Identities carry an incarnation.** Without one, `Identity::renew` has nothing
+to change and a node evicted by a transient fault could never rejoin — it would
+keep offering an identity the cluster had already buried.
 
-**What this gives up, and when to revisit.** There is no shared opinion about
-which nodes are alive: each node forms its own, and two nodes can disagree about
-a third indefinitely. Nothing depends on that agreement today, because
-anti-entropy is transitive and idempotent — a write reaches the cluster through
-whichever peers happen to be reachable. It becomes worth revisiting if
-membership is ever needed for something that *must* be agreed, such as
-`coordinated` unique enforcement ([ADR-020](#adr-020--uniqueness-reaches-only-as-far-as-coordination-does)),
-which routes a value to the node owning it and therefore needs the cluster to
-agree who that is.
+**On the licence.** `foca` is MPL-2.0. For an unmodified dependency the
+obligation amounts to keeping the notice; MPL § 3.3 explicitly contemplates use
+within a larger work under other terms. Raised before adding it rather than
+after, because dependency choices here have been deliberate — and recorded here
+so a later licence audit finds the reasoning rather than a surprise.
 
 ---
 

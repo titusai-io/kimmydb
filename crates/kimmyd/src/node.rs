@@ -130,6 +130,32 @@ async fn spawn_cluster(
 
     let serving = tokio::spawn(kimmy_cluster::serve(Arc::clone(&engine), listener, secret.clone()));
 
+    // SWIM shares the port with replication: UDP for probes and membership,
+    // TCP for oplog transfer. Bound here for the same reason as the listener —
+    // a port already in use should fail at startup, not in a log line.
+    let mut cluster_tasks = vec![serving];
+    let mut members = None;
+    let mut announce = None;
+
+    if config.cluster.membership {
+        let socket = tokio::net::UdpSocket::bind(config.cluster.bind)
+            .await
+            .with_context(|| format!("binding the membership socket on {}", config.cluster.bind))?;
+
+        let live = kimmy_cluster::Members::default();
+        let (tx, feed) = kimmy_cluster::SeedFeed::channel();
+        cluster_tasks.push(tokio::spawn(kimmy_cluster::membership::run(
+            socket,
+            advertised(local),
+            live.clone(),
+            feed,
+        )));
+        members = Some(live);
+        announce = Some(tx);
+    } else {
+        warn!("SWIM membership is disabled; peers come from discovery alone");
+    }
+
     let replicating = tokio::spawn(kimmy_cluster::replicate(
         engine,
         kimmy_cluster::ReplicationConfig {
@@ -139,15 +165,36 @@ async fn spawn_cluster(
             sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
             discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
             fanout: config.cluster.fanout,
+            announce,
+            members,
         },
     ));
+    cluster_tasks.push(replicating);
 
     info!(
         bind = %local,
         seeds = config.cluster.seeds.len(),
+        membership = config.cluster.membership,
         "clustering enabled"
     );
-    Ok(vec![serving, replicating])
+    Ok(cluster_tasks)
+}
+
+/// The address peers should use to reach this node.
+///
+/// A wildcard bind is a listening instruction, not an identity: announcing
+/// `0.0.0.0` would tell the cluster to probe an address that routes nowhere.
+/// Falling back to loopback keeps a single-host cluster working, and a real
+/// deployment binds an address it can be reached on.
+fn advertised(bind: std::net::SocketAddr) -> std::net::SocketAddr {
+    if bind.ip().is_unspecified() {
+        let mut resolved = bind;
+        resolved.set_ip(std::net::Ipv4Addr::LOCALHOST.into());
+        warn!(%bind, advertised = %resolved, "cluster bind is a wildcard; advertising loopback");
+        resolved
+    } else {
+        bind
+    }
 }
 
 /// Start the retention collector, unless it is disabled.
