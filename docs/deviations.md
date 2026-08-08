@@ -164,16 +164,54 @@ too **narrow** — silently wrong. Deliberately slow rather than possibly wrong.
 
 ---
 
-## 🟢 Local embeddings are feature-gated, not the default
+## 🔴 The "no C toolchain" property has not held since M2
+
+**Claimed.** ADR-001 chose redb over RocksDB and ADR-016 chose `rust_crypto`
+over `aws_lc_rs` to keep the build free of a native toolchain. This register
+repeated that as a live property, and the `local-embeddings` gating below cites
+it as a reason.
+
+**Actually.** `kimmy-vector` depends on `reqwest` with `rustls-tls`,
+**non-optionally**, for the remote embedding providers — so
+`reqwest → hyper-rustls → rustls → ring` has been in every default build since
+M2. `ring` ships C and assembly and builds with `cc`.
+
+**How it was found.** Planning TLS, by running `cargo tree -i ring` instead of
+trusting this document. Two milestones of a stated property being false is
+exactly the drift this register exists to catch, and it did not catch it — a
+claim was recorded once and never re-checked against the build.
+
+**Decided.** Accept the cost and correct the record, rather than gating
+`reqwest` behind a feature. The individual choices in ADR-001 and ADR-016 were
+still right; only the claim about the whole build was wrong. Recorded 🔴 rather
+than 🟢 because what closes it is not code — it is *checking*, and there is no
+mechanism that would catch the next such drift.
+
+**The rule that replaces it.** Do not add a *second* native crypto stack.
+`ring` is already paid for; `aws-lc-rs` would add CMake for the same primitives.
+That is what selected the TLS provider in [ADR-039](decisions.md).
+
+**To close.** A CI check that fails when the dependency graph gains a crate with
+a `build.rs` invoking a C compiler. Then the property is enforced instead of
+asserted.
+
+---
+
+## 🟡 Local embeddings are feature-gated, not the default
 
 **Planned.** `fastembed` local ONNX as the zero-config default provider.
 
 **Built.** Behind a `local-embeddings` cargo feature, off by default.
 
-**Why.** Its dependencies pull native ONNX Runtime *and* OpenSSL, which would
-undo the pure-Rust property that motivated choosing redb over RocksDB
-(ADR-001) and `rust_crypto` over `aws_lc_rs` (ADR-016), and roughly triple the
-image. Raised and agreed before building.
+**Why.** Its dependencies pull native ONNX Runtime *and* OpenSSL, and roughly
+triple the image. Raised and agreed before building.
+
+**One of the original reasons no longer holds.** This was justified partly by
+preserving a pure-Rust build, which the entry above shows was already untrue
+when it was written. The decision still stands on the other reason: ONNX Runtime
+is hundreds of megabytes of native binaries and a separate runtime, which is a
+different order of cost from a crate that builds some C with `cc`. Downgraded
+from 🟢 to 🟡 because the stated rationale was partly wrong, not the outcome.
 
 **Consequence.** Out of the box, embedding needs a remote provider or
 client-supplied vectors. `--features local-embeddings` restores it.
@@ -194,7 +232,8 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 |---|---|---|
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
 | TLS between nodes | Replication frames are plaintext. `cluster_secret` authenticates peers but does not hide what they exchange | M5 |
-| TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
+| Client certificates (mTLS) | Server TLS authenticates the *server* to clients; clients still authenticate with a bearer token only | not planned |
+| Certificate reload | A renewed certificate needs a restart to take effect | M5 |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
 | Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
@@ -264,6 +303,16 @@ like one was working.
 ---
 
 ## 🟢 Closed
+
+**TLS for clients.** Was 📋 M5 and the reason "terminate at a proxy" appeared in
+every deployment note: tokens and passwords crossed the wire in plaintext
+otherwise, including the bootstrap login that sets the first password. The
+listener now terminates TLS itself — `axum-server` over `rustls`, on the `ring`
+provider already in the build. Set `server.tls.cert_file` and
+`server.tls.key_file`. [ADR-039](decisions.md). A proxy is still a fine
+deployment; it is no longer the only one. **Node-to-node replication is still
+plaintext** — that is a separate piece with its own trust question, and it stays
+📋 in the table above.
 
 **Login rate limiting.** Was a 🔴 in [Security](security.md) and a 📋 in this
 register: `/v1/auth/login` had no limit, so a password was guessable as fast as

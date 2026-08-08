@@ -63,6 +63,12 @@ Tokens are signed with a cluster-wide secret, so any node validates any node's
 token. Default lifetime one hour (`auth.token_ttl_secs`). See
 [Security](security.md).
 
+**Use `https://` when the node is configured with a certificate.** TLS
+terminates on the same listener and the same port — there is no plaintext half
+and no redirect, so a plaintext request to a TLS port simply fails. Change
+streams become `wss://` on that node. See
+[Security](security.md#tls).
+
 **Login is rate-limited.** Repeated *failures* from one caller earn a `429` with
 a `Retry-After` header; a successful login spends nothing, so a client that
 re-authenticates on a short TTL is never throttled for succeeding. Tunable under
@@ -346,7 +352,7 @@ the property above removes.
 |---|---|
 | Aggregation pipeline | 📋 Planned — including the `$vectorSearch` stage, and the MCP `aggregate` tool that would wrap it |
 | Database- and cluster-scoped watch routes | Implemented in storage, no route yet |
-| TLS | 📋 M5 — terminate at a proxy for now |
+| Client certificates (mTLS) | Not planned — the server proves itself, clients authenticate with a bearer token |
 
 ---
 

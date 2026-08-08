@@ -25,6 +25,32 @@ mcp = true
 mcp_allowed_hosts = []
 
 # ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+#
+# Native termination for HTTP, WebSocket and MCP — one listener, one port. There
+# is no on/off switch: TLS is on when both of these are set, and setting exactly
+# one is refused at startup, because starting anyway would serve plaintext on a
+# port you believe is encrypted.
+#
+# Both files are read before the socket is bound, so a missing or unusable
+# certificate stops the node instead of failing for whoever connects first.
+#
+# Commented out below, which means plaintext. A non-loopback bind without TLS
+# warns once at startup — terminating at a proxy is a fine deployment, but
+# nothing about a working request would tell you the token crossed the wire in
+# the clear.
+[server.tls]
+
+# PEM certificate chain, leaf first, then any intermediates. A client that
+# cannot build a path to a root it trusts refuses the connection even when the
+# leaf itself is valid.
+# cert_file = "/etc/kimmy/tls/server.crt"
+
+# PEM private key: PKCS#8, PKCS#1 or SEC1.
+# key_file = "/etc/kimmy/tls/server.key"
+
+# ---------------------------------------------------------------------------
 # Rate limiting
 # ---------------------------------------------------------------------------
 #
