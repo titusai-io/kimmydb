@@ -78,10 +78,16 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
          # HELP kimmy_collections Number of collections across all databases.\n\
          # TYPE kimmy_collections gauge\n\
          kimmy_collections {collections}\n\
+         # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
+         # TYPE kimmy_unique_violations counter\n\
+         kimmy_unique_violations {violations}\n\
          # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
          # TYPE kimmy_up gauge\n\
          kimmy_up 1\n",
         databases_count = databases.len(),
+        // Surfaced here, not only on a change stream, so the condition is
+        // visible without anyone having been subscribed when it happened.
+        violations = state.engine.unique_violations(),
     ))
 }
 

@@ -36,6 +36,12 @@ pub struct Engine {
     /// count misses the case where one document is deleted and another added.
     /// A counter is exact and free.
     vector_generations: Mutex<std::collections::HashMap<CollectionId, u64>>,
+    /// Unique constraints broken by merging replicated writes, since start.
+    ///
+    /// A counter rather than only a log line so the condition is visible on the
+    /// metrics endpoint without anyone having to be watching a stream when it
+    /// happens — see [ADR-020](../../../docs/decisions.md).
+    unique_violations: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -86,6 +92,7 @@ impl Engine {
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
             vector_generations: Mutex::new(Default::default()),
+            unique_violations: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -99,6 +106,15 @@ impl Engine {
     /// not survive one either.
     pub fn vector_generation(&self, collection: CollectionId) -> u64 {
         self.vector_generations.lock().get(&collection).copied().unwrap_or(0)
+    }
+
+    /// How many merged writes have broken a unique constraint since start.
+    pub fn unique_violations(&self) -> u64 {
+        self.unique_violations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub(crate) fn count_unique_violation(&self) {
+        self.unique_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn bump_vector_generation(&self, collection: CollectionId) {
