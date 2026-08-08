@@ -46,7 +46,16 @@ pub async fn run(config: Config) -> Result<()> {
     let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
 
-    let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth)
+    // With auth off there is no login to brute-force and every request is a
+    // superuser anyway, so a limiter would only be an obstacle to the local
+    // development the flag exists for.
+    let limits = if config.auth.insecure_no_auth {
+        kimmy_api::RateLimits::disabled()
+    } else {
+        config.server.rate_limit.build()
+    };
+
+    let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth, limits)
         .context("building the API state")?;
 
     // MCP shares the state rather than being handed its own, so an agent tool
@@ -83,7 +92,10 @@ pub async fn run(config: Config) -> Result<()> {
     let local = listener.local_addr().unwrap_or(config.server.bind);
     info!(bind = %local, "serving HTTP and WebSocket");
 
-    axum::serve(listener, app)
+    // `into_make_service_with_connect_info` rather than the plain service: it is
+    // what puts the peer address in the request extensions, and without it every
+    // caller shares one rate-limit bucket.
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(shutdown_signal())
         .await
         .context("serving")?;

@@ -17,11 +17,33 @@ pub struct ApiError {
     pub status: StatusCode,
     pub code: &'static str,
     pub message: String,
+    /// Seconds to wait before retrying, emitted as a `Retry-After` header.
+    ///
+    /// Carried on the error rather than assembled at the call site so that a
+    /// 429 cannot be returned without one: a refusal that does not say when to
+    /// come back leaves a client to guess, and clients guess badly.
+    pub retry_after_secs: Option<u64>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: &'static str, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into() }
+        Self { status, code, message: message.into(), retry_after_secs: None }
+    }
+
+    /// Over a rate limit.
+    ///
+    /// The message names no user and no limit: it is returned before
+    /// authentication, so anything specific to the attempt would be readable by
+    /// whoever triggered it.
+    pub fn too_many_requests(retry_after_secs: u64) -> Self {
+        Self {
+            retry_after_secs: Some(retry_after_secs),
+            ..Self::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many requests; retry later",
+            )
+        }
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -59,7 +81,19 @@ impl IntoResponse for ApiError {
             error!(code = self.code, message = %self.message, "request failed");
         }
         let body = json!({ "error": self.code, "message": self.message });
-        (self.status, Json(body)).into_response()
+        let mut response = (self.status, Json(body)).into_response();
+        if let Some(secs) = self.retry_after_secs {
+            match axum::http::HeaderValue::from_str(&secs.to_string()) {
+                Ok(value) => {
+                    response.headers_mut().insert(axum::http::header::RETRY_AFTER, value);
+                }
+                // A digit string is always a valid header value, so this cannot
+                // happen — but dropping the header is better than panicking on
+                // the error path.
+                Err(e) => error!(error = %e, "could not encode Retry-After"),
+            }
+        }
+        response
     }
 }
 

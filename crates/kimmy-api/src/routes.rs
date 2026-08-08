@@ -5,9 +5,11 @@ use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::error::ApiError;
 use crate::exec;
+use crate::ratelimit::{self, Decision};
 use crate::state::{Auth, SharedState};
 use crate::watch;
 
@@ -114,11 +116,44 @@ struct LoginRequest {
     password: String,
 }
 
+/// Exchange credentials for a token.
+///
+/// Rate-limited, and the limit is checked *before* `authenticate` rather than
+/// after: every attempt runs a full Argon2id verification — including for a user
+/// that does not exist, which is what stops timing from revealing whether one
+/// does — so an unthrottled endpoint hands an anonymous caller ~19 MB and
+/// milliseconds of CPU per request. Checking afterwards would return 429 while
+/// still doing all the work it was meant to prevent.
+///
+/// Only *failed* attempts are recorded. A caller with correct credentials is not
+/// the thing being defended against, and a fleet re-authenticating on a short
+/// `token_ttl_secs` must not be throttled for succeeding.
 async fn login(
     State(state): State<SharedState>,
+    client: crate::state::ClientAddr,
     Json(body): Json<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let principal = state.users.authenticate(&state.engine, &body.user, &body.password)?;
+    let limits = &state.limits;
+    if let Decision::Limited { retry_after } = limits.login_ip.check(client.as_str()) {
+        warn!(client = client.as_str(), "rate-limited a login attempt by source address");
+        return Err(ratelimit::too_many_requests(retry_after));
+    }
+    // Keyed on the name as typed. Normalizing would let `Root` and `root` be
+    // told apart by the limiter while the user store treats them as one.
+    if let Decision::Limited { retry_after } = limits.login_user.check(&body.user) {
+        warn!(user = %body.user, "rate-limited a login attempt by username");
+        return Err(ratelimit::too_many_requests(retry_after));
+    }
+
+    let principal = match state.users.authenticate(&state.engine, &body.user, &body.password) {
+        Ok(principal) => principal,
+        Err(e) => {
+            limits.login_ip.record(client.as_str());
+            limits.login_user.record(&body.user);
+            return Err(e.into());
+        }
+    };
+
     let token = state.tokens.issue(&principal)?;
     Ok(Json(json!({ "token": token, "user": principal.user })))
 }

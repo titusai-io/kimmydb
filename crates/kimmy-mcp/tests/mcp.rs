@@ -31,7 +31,15 @@ impl Server {
         UserStore::open(&engine).unwrap();
 
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
-        let state = kimmy_api::state(Arc::clone(&engine), tokens.clone(), false).unwrap();
+        // No limits: these tests mint tokens directly and never log in, so a
+        // limiter would add state without exercising anything.
+        let state = kimmy_api::state(
+            Arc::clone(&engine),
+            tokens.clone(),
+            false,
+            kimmy_api::RateLimits::disabled(),
+        )
+        .unwrap();
 
         // Merged exactly as the daemon merges it, so the test exercises the
         // real mounting rather than a convenient stand-in.

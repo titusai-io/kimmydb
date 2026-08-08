@@ -24,6 +24,57 @@ mcp = true
 # actually connect by — anything else is refused.
 mcp_allowed_hosts = []
 
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+#
+# Only /v1/auth/login is limited. That is the one route where a limit is a
+# security control rather than a capacity control: it is unauthenticated by
+# necessity, and every attempt runs a full Argon2id verification — including for
+# a user that does not exist, which is what stops timing from revealing whether
+# one does. Unthrottled, it lets an anonymous caller spend ~19 MB and
+# milliseconds of CPU per request.
+#
+# The limit is checked before the password is verified, and only *failed*
+# attempts are recorded — a client with correct credentials is never throttled
+# for succeeding.
+[server.rate_limit]
+
+# Failed logins allowed per client address, per window. Set to 0 to disable.
+#
+# Callers behind one NAT share a bucket, and an address over its budget is
+# refused even with the right password. Raise this on a shared egress, or set
+# trusted_proxy_header below.
+login_per_ip = 10
+login_per_ip_window_secs = 60
+
+# Failed logins allowed per attempted username, across every address. 0 disables
+# it, and 0 is the default.
+#
+# It is the only defence against a guess spread over many source addresses,
+# which per-address limiting cannot see. It also lets anyone who can reach the
+# endpoint spend a named user's budget and keep the real holder locked out for
+# the window. That trade depends on your deployment, so it is opt-in.
+login_per_user = 0
+login_per_user_window_secs = 300
+
+# Header naming the real client, when this server sits behind a proxy.
+# Commented out, meaning the socket peer address is used.
+#
+# Only set this if a proxy you control rewrites the header. It is client-
+# supplied data otherwise, and trusting it would let any caller get a fresh
+# budget per request by varying a header — worse than no limiter, because it
+# would look like one was working. The *last* value is used, since a proxy
+# appends the peer it saw.
+# trusted_proxy_header = "X-Forwarded-For"
+
+# Upper bound on distinct keys held in memory.
+#
+# The key space is attacker-controlled — an address is whatever packets arrive
+# from — so this is what stops the defence becoming a denial of service itself.
+# Buckets that have refilled are forgotten first.
+max_tracked_keys = 100000
+
 [storage]
 # Holds the redb database file and the persistent node identity. Back this up,
 # and never share it between two running nodes.

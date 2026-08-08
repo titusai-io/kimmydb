@@ -195,7 +195,7 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
 | TLS between nodes | Replication frames are plaintext. `cluster_secret` authenticates peers but does not hide what they exchange | M5 |
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
-| Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |
+| Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
 | Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
 | Backup / restore | Cold file copy only | M5 |
@@ -205,7 +205,73 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 ---
 
+## 🟡 Rate limiting covers login only
+
+**Built.** A token bucket per key, on `/v1/auth/login`, keyed on the client
+address. Closes the 🔴 that made a password guessable at network speed.
+
+**Deliberately not more than that.** On login a limit is a *security* control:
+the route is unauthenticated by necessity, and every attempt runs a full
+Argon2id verification — including for a user that does not exist, since
+equalising that is what stops timing from revealing whether one does. At the
+configured work factor an unthrottled endpoint hands an anonymous caller ~19 MB
+and milliseconds of CPU per request.
+
+Everywhere else a limit would be a *capacity* control, and a capacity number
+picked without a measurement is a guess of exactly the kind M5's benchmarks
+exist to remove. Agreed with the maintainer: build the mechanism route-agnostic, apply it
+where it is a security property, and let the benchmark work decide the rest.
+
+**To close.** `kimmy_api::Limiter` takes an arbitrary key and knows nothing
+about login, so another route is a field on `RateLimits`, a config knob, and a
+`check_at` call — in the handler when the key depends on the body, or in a
+`tower` layer when it is just the caller.
+
+---
+
+## 🟡 Per-username login limiting is off by default
+
+`login_per_user` is implemented and defaults to `0`, which disables it.
+
+**Why it exists.** It is the only defence against a brute force spread across
+many source addresses, which per-address limiting cannot see.
+
+**Why it is off.** It introduces a lockout: anyone who can reach the endpoint
+can spend a *named* user's budget and keep the legitimate holder out for the
+rest of the window. Enabling it trades a remote-guessing risk for a
+denial-of-service one, and which of those matters more is a property of a
+deployment, not something a default should assume. Turning it on is one config
+value, and the behaviour is tested either way.
+
+---
+
+## 🟡 A shared egress address shares a login budget
+
+Per-address limiting keys on the peer address, so callers behind one NAT or one
+egress gateway draw on one budget. An address that is over its budget is refused
+**even with correct credentials** — the check has to precede authentication or
+it would not prevent the Argon2 work it exists to prevent.
+
+**Consequence.** On a shared egress, one client guessing passwords can lock out
+its neighbours for the rest of the window. Raise `login_per_ip`, or set
+`trusted_proxy_header` so the limiter sees the real client.
+
+**Not closed by** trusting a forwarded header by default — that is client-
+supplied data, so trusting it unasked would let anyone defeat the limit by
+varying a header, which is worse than having no limiter, because it would look
+like one was working.
+
+---
+
 ## 🟢 Closed
+
+**Login rate limiting.** Was a 🔴 in [Security](security.md) and a 📋 in this
+register: `/v1/auth/login` had no limit, so a password was guessable as fast as
+the network allowed, and each guess cost a full Argon2id hash. Now a token
+bucket per client address, refusing with `429` and a `Retry-After` **before**
+authentication runs. Only failed attempts are recorded, so a client with correct
+credentials is never throttled for succeeding. What remains is scope, not the
+mechanism — see the three 🟡 entries above.
 
 **Oplog and tombstone GC.** Was the most serious 🟡 in this register —
 retention was configured but not enforced, so both tables grew without bound.

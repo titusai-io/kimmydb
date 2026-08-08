@@ -23,6 +23,7 @@ serde_json.workspace = true
 bson.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+parking_lot.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
 
 [dev-dependencies]

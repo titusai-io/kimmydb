@@ -214,7 +214,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 |---|---|---|
 | **No TLS** | 📋 M5 | Terminate at a reverse proxy or service mesh. Tokens and passwords cross the wire in plaintext otherwise. |
 | **No token revocation** | Not planned | Short TTLs; rotate the secret to revoke everything |
-| **No rate limiting** | 📋 M5 | Login is brute-forceable at network speed. Rate-limit at the proxy. |
+| **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **No audit log** | 📋 Planned | `tracing` output only |
 | **No field-level security** | Not planned | Collection is the finest granularity |
 | **No encryption at rest** | Not planned | Use an encrypted volume |
@@ -224,9 +224,73 @@ Stated plainly, because a security model you have to infer is worse than none.
 ### Denial of service
 
 Partially addressed. Regex is linear-time by construction (the `regex` crate),
-so patterns cannot be pathological. `find` caps at 10,000 documents. But there
-is no rate limiting, no request size limit beyond axum's default, and no query
-timeout — a collection scan over a large collection will run to completion.
+so patterns cannot be pathological. `find` caps at 10,000 documents. Login is
+rate-limited, which also closes an amplification vector — see below. But there
+is no limit on the authenticated routes, no request size limit beyond axum's
+default, and no query timeout — a collection scan over a large collection will
+run to completion.
+
+---
+
+## Login rate limiting
+
+`/v1/auth/login` is limited by a token bucket per client address. Over the
+limit, it answers `429` with a `Retry-After` in seconds.
+
+**Why this route and not the others.** Everywhere else a limit would be a
+capacity control, and a capacity number picked without measurement is a guess.
+Here it is a security control, for two reasons:
+
+- the route is unauthenticated by necessity, so nothing else stands between a
+  guesser and the password;
+- every attempt runs a full Argon2id verification **including for a user that
+  does not exist** — that is deliberate, and is what stops timing from revealing
+  whether an account exists (`UserStore::authenticate`). At the configured work
+  factor it is ~19 MB and milliseconds of CPU that an anonymous caller can spend
+  at will.
+
+The second is why the limit is checked *before* authentication rather than
+after. Checking afterwards would return the same `429` while still doing all the
+work the limit exists to prevent.
+
+**Only failures count.** A caller presenting correct credentials is not the
+threat, and a fleet re-authenticating on a short `token_ttl_secs` must not be
+throttled for succeeding. A successful login spends nothing.
+
+### Settings
+
+```toml
+[server.rate_limit]
+login_per_ip = 10              # failed logins per address per window; 0 disables
+login_per_ip_window_secs = 60
+login_per_user = 0             # per username, across all addresses; 0 disables
+login_per_user_window_secs = 300
+trusted_proxy_header = "X-Forwarded-For"   # omit to use the socket peer address
+max_tracked_keys = 100000
+```
+
+### Three things worth knowing before you tune it
+
+**A shared egress shares a budget.** Keying on the peer address means callers
+behind one NAT draw on one bucket, and an address over its budget is refused
+even with correct credentials. On a shared egress, raise `login_per_ip` or set
+`trusted_proxy_header`.
+
+**`trusted_proxy_header` is off by default, and must stay off unless a proxy you
+control rewrites it.** A forwarded header is client-supplied data. Trusting one
+that nothing rewrites lets any caller mint a fresh budget per request by varying
+a header — worse than no limiter, because it would look like one was working.
+When it is set, the **last** value is used: a proxy appends the peer it saw, so
+the rightmost entry is the only one the client did not choose.
+
+**`login_per_user` defaults to off, and enabling it is a trade.** It is the only
+defence against a guess spread across many addresses, which per-address limiting
+cannot see. It also lets anyone who can reach the endpoint spend a *named* user's
+budget and keep the legitimate holder out for the window. Which risk matters more
+depends on your deployment, so it is not something a default should assume.
+
+With `--insecure-no-auth` the limiter is off entirely: there is no login to
+protect and every request is already a superuser.
 
 ---
 
@@ -237,7 +301,7 @@ graph TB
     A["Generate a strong KIMMY_JWT_SECRET<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
     B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file"]
     C --> D["Terminate TLS at a proxy"]
-    D --> E["Rate-limit /v1/auth/login at the proxy"]
+    D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]
     F --> G["Never expose --insecure-no-auth beyond loopback"]
 ```

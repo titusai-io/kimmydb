@@ -42,6 +42,12 @@ fails fast on a bad volume mount.
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
 | `cluster.membership` | — | `true` | Gossip liveness over UDP. Off falls back to discovery-only peers |
+| `server.rate_limit.login_per_ip` | — | `10` | Failed logins per client address per window. `0` disables |
+| `server.rate_limit.login_per_ip_window_secs` | — | `60` | |
+| `server.rate_limit.login_per_user` | — | `0` | Failed logins per username across all addresses. Off by default — it is a real defence and a real lockout, see [Security](security.md#login-rate-limiting) |
+| `server.rate_limit.login_per_user_window_secs` | — | `300` | |
+| `server.rate_limit.trusted_proxy_header` | — | — | Unset means use the socket peer. **Only set it if a proxy you control rewrites the header** |
+| `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiter's own memory; the key space is attacker-controlled |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Identical on every node.** ≥16 bytes |
@@ -71,6 +77,9 @@ runtime confusion:
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
 | `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |
+| A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |
+| `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
+| An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
 
 Boolean flags are one-way: passing `--insecure-no-auth` turns it on, but
 omitting it does **not** turn off what the config file asked for.
