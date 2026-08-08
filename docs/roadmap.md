@@ -186,15 +186,32 @@ Already implemented and tested: `apply_remote`, conflict resolution, convergence
 of concurrent writes applied in opposite orders on two engines, and discovery
 string parsing. **Missing: the transport.**
 
-### Known problem to solve
+### Solved: replicated writes reaching change streams ✅
 
 An applied remote entry keeps its *originating* stamp, so it lands in the oplog
-**behind** the local tail. A change-stream subscriber past that point will not
-see it. Options, none yet chosen:
+**behind** the local tail, and a subscriber past that point would never see it.
+Resolved with option 1 — a second index over local arrival order, which streams
+follow while replication keeps origin order. See [Oplog](oplog.md).
 
-1. A second index over "local arrival order" for streams to follow.
-2. Stamp replicated entries with local arrival time, losing origin ordering.
-3. Document it: cluster-wide streams are eventually complete, not ordered.
+### Solved: collection identity across nodes ✅
+
+Not in the original plan, and found while starting the transport. Collection
+ids came from a **node-local counter**, and every oplog entry names its
+collection by id — so two nodes that created the same collection in a different
+order disagreed about which collection an entry referred to, and a replicated
+write would land in the wrong one. Silently, and only for peers whose creation
+order differed.
+
+Ids are now derived from `(database, name)`, so every node computes the same
+answer with no coordination. [ADR-031](decisions.md).
+
+### Still missing
+
+- **Version vectors.** Nothing computes `{node → max_hlc}` yet; the roadmap's
+  "missing: the transport" understated this.
+- **The transport itself** — `foca` membership over UDP, TCP for oversized
+  payloads and for oplog range transfer.
+- **Anti-entropy must exclude `OpKind::UniqueViolation`** — see below.
 
 ### Uniqueness violation detection — committed for M4
 

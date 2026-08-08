@@ -641,6 +641,66 @@ the shape that would matter.
 
 ---
 
+## ADR-031 — Collection ids are derived from the name, not allocated
+
+**Decision.** `CollectionId = FNV-1a-64(db || 0x00 || name)`. Every node computes
+the same id for the same collection, with no coordination.
+
+**The bug this fixes.** Ids came from a node-local counter, and every oplog
+entry names its collection by id. Two nodes creating the same collections in a
+different order therefore disagreed about what an entry referred to:
+
+```
+Node A: orders, then customers   →  shop.orders = 1
+Node B: customers, then orders   →  shop.orders = 2
+```
+
+A replicated write for `shop.orders` from A would have been applied to whatever
+collection held id 1 on B. Verified empirically before designing around it, not
+inferred from reading.
+
+The failure mode is what makes it serious: it *works* whenever both nodes happen
+to create collections in the same order, which is exactly what a two-node smoke
+test does. It would have passed early testing and corrupted data later.
+
+**Why derivation rather than agreement.** The alternatives both required
+coordination or rewriting. Replicating metadata and letting a first writer win
+means the loser must renumber — rewriting every document, index entry and vector
+for that collection, racily. Carrying `(db, name)` in every oplog entry avoids
+ids entirely but pays two strings per entry forever. Derivation costs one
+migration and then nothing, and it works on a node that has never met a peer,
+which is the leaderless property the whole design rests on.
+
+**Why FNV-1a specifically.** The hash is baked into on-disk keys, so it must be
+stable *forever*. `DefaultHasher` is explicitly not guaranteed stable across
+Rust releases — using it would mean a compiler upgrade could silently repoint
+every collection. FNV-1a is fully specified, dependency-free, and a few lines.
+The pinned values are cross-checked in tests against an independent
+implementation, so the test would also catch this implementation being wrong in
+a self-consistent way.
+
+**Collisions are checked, not assumed.** 64 bits over a realistic number of
+collections makes one vanishingly unlikely, but the consequence — two unrelated
+collections sharing storage — is unrecoverable, so creation refuses on collision
+and the migration refuses to merge.
+
+**The consequence worth knowing.** Dropping and recreating a collection now
+reuses its id. That is not a choice; "same name means same id everywhere" and
+"recreating yields a fresh id" are contradictory. It makes purging on drop
+load-bearing rather than tidy — a surviving document or index entry would be
+inherited by the new collection. `drop_collection` already purges both, and a
+test now pins that rather than pinning the old id-uniqueness property it
+replaced.
+
+**Migration, not refusal.** Schema 1 databases are renumbered on open:
+documents, index entries, and the `collection` field of every oplog entry. The
+arrival index needs no migration because it maps sequence to stamp. Refusing
+would have been easier, but a database that *can* be migrated should be — a user
+with data has no other route forward. A *newer* schema is still refused, because
+guessing at an unknown layout is how you corrupt it.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

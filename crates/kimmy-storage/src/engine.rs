@@ -68,6 +68,10 @@ impl Engine {
         }
         txn.commit()?;
 
+        // Before anything reads a collection id: schema 1 allocated them from a
+        // counter, schema 2 derives them from the name.
+        crate::migrate::run(&db)?;
+
         // The arrival index is derived from the oplog, so a database written
         // before it existed — or by a build that did not maintain it — is
         // repaired rather than refused. That is why adding it needed no format
@@ -137,27 +141,8 @@ impl Engine {
 
             // Read guards borrow the table, so copy out what we need before
             // any insert.
-            let stored_version =
-                meta.get(tables::META_FORMAT_VERSION)?.map(|v| v.value().first().copied());
             let stored_node =
                 meta.get(tables::META_NODE_ID)?.map(|v| <[u8; 16]>::try_from(v.value()));
-
-            // Refuse to open a data directory written by an incompatible build
-            // rather than misinterpreting its records.
-            match stored_version {
-                Some(found) => {
-                    let found = found.unwrap_or(0);
-                    if found != codec::FORMAT_VERSION {
-                        return Err(StorageError::UnsupportedFormat {
-                            found,
-                            expected: codec::FORMAT_VERSION,
-                        });
-                    }
-                }
-                None => {
-                    meta.insert(tables::META_FORMAT_VERSION, [codec::FORMAT_VERSION].as_slice())?;
-                }
-            }
 
             match stored_node {
                 Some(bytes) => NodeId::from_bytes(
@@ -364,22 +349,32 @@ impl Engine {
                 .into());
             }
 
-            // Allocate the id inside the same transaction as the insert, so a
-            // crash between the two cannot hand the same id to two collections.
-            let id = {
-                let mut meta_table = txn.open_table(tables::META)?;
-                let next = match meta_table.get(tables::META_NEXT_COLLECTION_ID)? {
-                    Some(v) => u64::from_be_bytes(
-                        v.value()
-                            .try_into()
-                            .map_err(|_| StorageError::Corrupt("collection counter".into()))?,
-                    ),
-                    None => 1,
-                };
-                meta_table
-                    .insert(tables::META_NEXT_COLLECTION_ID, (next + 1).to_be_bytes().as_slice())?;
-                CollectionId(next)
-            };
+            // Derived, not allocated: every node computes the same id for the
+            // same collection, so a replicated oplog entry addresses the same
+            // collection everywhere. See `CollectionId::derive`.
+            let id = CollectionId::derive(db, name);
+
+            // The derivation is a 64-bit hash, so a collision is possible in
+            // principle. Checked rather than trusted, because the failure would
+            // be two unrelated collections quietly sharing storage — refusing
+            // to create the second one is recoverable, merging them is not.
+            let mut collision = None;
+            for existing in collections.iter()? {
+                let (key, value) = existing?;
+                let other: CollectionMeta = serde_json::from_slice(value.value())?;
+                if other.id == id {
+                    let (other_db, other_name) = key.value();
+                    collision = Some(format!("{other_db}.{other_name}"));
+                    break;
+                }
+            }
+            if let Some(other) = collision {
+                drop(collections);
+                txn.abort()?;
+                return Err(StorageError::Corrupt(format!(
+                    "collection id for {db}.{name} collides with {other}; rename one of them"
+                )));
+            }
 
             let meta = CollectionMeta::new(id, db, name, stamp.hlc);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
@@ -621,18 +616,52 @@ mod tests {
     }
 
     #[test]
-    fn collection_ids_are_unique_and_never_reused() {
+    fn distinct_collections_get_distinct_ids() {
         let (engine, _dir) = engine();
         let a = engine.create_collection("app", "a").unwrap().id;
         let b = engine.create_collection("app", "b").unwrap().id;
         assert_ne!(a, b);
+    }
 
-        // Dropping and recreating must not hand back the old id, or stale
-        // index entries would be attributed to the new collection.
+    #[test]
+    fn recreating_a_collection_reuses_its_id_but_not_its_data() {
+        // Ids are derived from the name, so a recreated collection necessarily
+        // gets the same id — "same name means same id on every node" and
+        // "recreating yields a fresh id" cannot both hold.
+        //
+        // That makes purging on drop load-bearing rather than merely tidy: a
+        // surviving document or index entry would be inherited by the new
+        // collection.
+        let (engine, _dir) = engine();
+        let coll = engine.create_collection("app", "a").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 1, "v": "old" }).unwrap();
+
         engine.drop_collection("app", "a").unwrap();
-        let c = engine.create_collection("app", "a").unwrap().id;
-        assert_ne!(c, a);
-        assert_ne!(c, b);
+        let recreated = engine.create_collection("app", "a").unwrap();
+
+        assert_eq!(recreated.id, coll.id, "a derived id is stable across drop and recreate");
+        assert_eq!(engine.count(&recreated).unwrap(), 0, "the dropped data must not be inherited");
+        assert!(engine.get(&recreated, &kimmy_core::DocId::Int64(1)).unwrap().is_none());
+    }
+
+    #[test]
+    fn two_nodes_agree_on_a_collection_id_whatever_the_creation_order() {
+        // The reason ids are derived at all. A counter makes this depend on
+        // creation order, so a replicated write would land in whichever
+        // collection happened to hold that number locally.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+
+        let a_orders = a.create_collection("shop", "orders").unwrap().id;
+        a.create_collection("shop", "customers").unwrap();
+
+        // Deliberately the opposite order on the second node.
+        b.create_collection("shop", "customers").unwrap();
+        let b_orders = b.create_collection("shop", "orders").unwrap().id;
+
+        assert_eq!(a_orders, b_orders);
     }
 
     #[test]

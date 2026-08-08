@@ -68,12 +68,14 @@ erDiagram
 
 | Table | Key | Value |
 |---|---|---|
-| `meta` | `&str` | Node id, format version, collection-id counter |
+| `meta` | `&str` | Node id, schema version |
 | `databases` | `&str` | `DatabaseMeta` as JSON |
 | `collections` | `(&str, &str)` — (db, name) | `CollectionMeta` as JSON |
 | `docs` | `(u64, &[u8])` — (collection id, encoded `_id`) | `DocRecord` |
-| `index_entries` | `(u64, u32, &[u8], &[u8])` | `()` — ⛔ not yet populated |
-| `oplog` | `&[u8]` — 26 bytes | `OplogEntry` |
+| `index_entries` | `(u64, u32, &[u8], &[u8])` | `()` |
+| `oplog` | `&[u8]` — 26 bytes (hlc \|\| node) | `OplogEntry` |
+| `oplog_arrival` | `u64` — local arrival sequence | oplog key |
+| `oplog_arrival_seq` | oplog key | `u64` |
 
 ### Why the keys are shaped this way
 
@@ -83,8 +85,19 @@ single `retain_in` — no key set has to be materialized in memory to delete a
 large collection.
 
 **Collections are keyed by integer id on disk, not by name.** Names appear once,
-in the `collections` table. Index keys stay short, and a future rename becomes
-metadata-only.
+in the `collections` table, and index keys stay short.
+
+**That id is *derived* from `(database, name)`, not allocated.** A counter is
+node-local, so two nodes creating the same collection in a different order would
+disagree about which collection an oplog entry refers to — and a replicated
+write would land in the wrong one. Deriving it means every node computes the
+same answer with no coordination at all. See [ADR-031](decisions.md).
+
+One consequence follows from that and cannot be avoided: **dropping and
+recreating a collection reuses its id**. "Same name means same id everywhere"
+and "recreating yields a fresh id" are contradictory. So purging on drop is
+load-bearing — a surviving document or index entry would be inherited by the new
+collection — and `drop_collection` removes both in the same transaction.
 
 **Index entries put the document id in the *key*, with an empty value.** A
 non-unique index can then hold many documents under one value without needing a

@@ -15,6 +15,7 @@ pub mod error;
 pub mod gc;
 pub mod index;
 pub mod meta;
+pub mod migrate;
 pub mod tables;
 pub mod vectors;
 pub mod watch;

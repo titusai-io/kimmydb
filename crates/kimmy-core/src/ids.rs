@@ -61,6 +61,45 @@ impl std::str::FromStr for NodeId {
 pub struct CollectionId(pub u64);
 
 impl CollectionId {
+    /// The id of `db.name`, on every node, without coordination.
+    ///
+    /// Derived rather than allocated. A counter is node-local, so two nodes
+    /// that create the same collection in a different order end up with
+    /// different ids for it — and since every oplog entry names its collection
+    /// by id, a replicated write would then be applied to whichever collection
+    /// happened to hold that number locally. Silently, and only for peers whose
+    /// creation order differed, which is the worst way for it to fail.
+    ///
+    /// Deriving the id from the name removes the problem rather than
+    /// coordinating it away: no agreement round, no leader, and a node that has
+    /// never met a peer computes the same answer.
+    ///
+    /// # Why FNV-1a
+    ///
+    /// The hash has to be **stable forever** — it is baked into every on-disk
+    /// key. `DefaultHasher` is explicitly not guaranteed stable across Rust
+    /// releases, so an upgrade could silently repoint every collection. FNV-1a
+    /// is a handful of lines, has no dependency, and is fully specified.
+    ///
+    /// Collisions are checked at creation time rather than trusted; see
+    /// `Engine::create_collection`.
+    pub fn derive(db: &str, name: &str) -> Self {
+        const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+        const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+        let mut hash = OFFSET;
+        // The NUL separator keeps `("a", "bc")` and `("ab", "c")` distinct.
+        // Without it they hash identically, which would merge two collections.
+        for byte in db.as_bytes().iter().chain(b"\0").chain(name.as_bytes()) {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+
+        // Zero is reserved so that an uninitialised or defaulted id cannot
+        // silently address a real collection.
+        Self(if hash == 0 { 1 } else { hash })
+    }
+
     pub const fn to_bytes(self) -> [u8; 8] {
         self.0.to_be_bytes()
     }
@@ -160,5 +199,54 @@ mod tests {
     fn node_id_round_trips_through_bytes() {
         let id = NodeId::generate();
         assert_eq!(NodeId::from_bytes(id.to_bytes()), id);
+    }
+    #[test]
+    fn a_collection_id_is_the_same_on_every_node() {
+        // The whole point: no coordination, no creation-order dependence.
+        assert_eq!(CollectionId::derive("shop", "orders"), CollectionId::derive("shop", "orders"));
+    }
+
+    #[test]
+    fn different_collections_get_different_ids() {
+        let ids = [
+            CollectionId::derive("shop", "orders"),
+            CollectionId::derive("shop", "customers"),
+            CollectionId::derive("hr", "orders"),
+            CollectionId::derive("", "orders"),
+        ];
+        for (i, a) in ids.iter().enumerate() {
+            for b in &ids[i + 1..] {
+                assert_ne!(a, b, "distinct collections must not share an id");
+            }
+        }
+    }
+
+    #[test]
+    fn the_separator_keeps_split_points_distinct() {
+        // Without a separator, ("a","bc") and ("ab","c") hash the same input
+        // and two unrelated collections would silently become one.
+        assert_ne!(CollectionId::derive("a", "bc"), CollectionId::derive("ab", "c"));
+        assert_ne!(CollectionId::derive("ab", ""), CollectionId::derive("a", "b"));
+    }
+
+    #[test]
+    fn zero_is_never_produced() {
+        // Reserved, so a defaulted id cannot address a real collection.
+        assert_ne!(CollectionId::derive("", "").0, 0);
+    }
+
+    #[test]
+    fn ids_are_pinned_to_exact_values() {
+        // These are on-disk keys. If this test fails, every existing database
+        // has just been repointed — the hash is not free to change, and a
+        // "harmless refactor" of `derive` is not harmless.
+        //
+        // Cross-checked against an independent FNV-1a implementation rather
+        // than recorded from this one, so the test would also catch this
+        // implementation being wrong in a self-consistent way.
+        assert_eq!(CollectionId::derive("shop", "orders").0, 0x53ad_8d42_0376_3a3a);
+        assert_eq!(CollectionId::derive("__kimmy", "__users").0, 0x1f65_9d82_1893_00f2);
+        assert_eq!(CollectionId::derive("a", "bc").0, 0xab40_f682_0d40_b523);
+        assert_eq!(CollectionId::derive("ab", "c").0, 0xfd61_c083_ef20_0867);
     }
 }
