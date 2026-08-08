@@ -98,6 +98,25 @@ fn render(event: &ChangeEvent, full_document: bool) -> Option<Value> {
             if entry.kind == kimmy_core::OpKind::Collection {
                 return None;
             }
+            // A violation is not a document change and has no documentKey; it
+            // reports a constraint that a merge broke. See ADR-020.
+            if entry.kind == kimmy_core::OpKind::UniqueViolation {
+                let detail: Option<kimmy_core::UniqueViolationDetail> =
+                    entry.body.as_ref().and_then(|b| bson::deserialize_from_slice(b).ok());
+                let detail = detail?;
+                return Some(json!({
+                    "operationType": "uniqueViolation",
+                    "resumeToken": token.encode(),
+                    "clusterTime": entry.stamp.hlc.to_string(),
+                    "index": detail.index,
+                    "merged": crate::json::bson_to_json(&detail.merged.to_bson()),
+                    "documentKeys": detail
+                        .ids
+                        .iter()
+                        .map(|id| json!({ "_id": crate::json::bson_to_json(&id.to_bson()) }))
+                        .collect::<Vec<_>>(),
+                }));
+            }
             let mut payload = json!({
                 "operationType": operation_name(entry.kind),
                 "resumeToken": token.encode(),
@@ -127,5 +146,6 @@ fn operation_name(kind: kimmy_core::OpKind) -> &'static str {
         kimmy_core::OpKind::Replace => "replace",
         kimmy_core::OpKind::Delete => "delete",
         kimmy_core::OpKind::Collection => "collection",
+        kimmy_core::OpKind::UniqueViolation => "uniqueViolation",
     }
 }

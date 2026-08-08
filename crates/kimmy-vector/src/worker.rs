@@ -114,6 +114,13 @@ impl EmbeddingWorker {
 
     /// Handle one oplog entry.
     pub async fn process(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
+        // Not every oplog entry describes a mutation. A unique-violation entry
+        // reports something that happened *to* the data and has nothing to
+        // embed. It would be filtered by the `doc_id` check below anyway, but
+        // relying on that would make the safety incidental.
+        if entry.kind == OpKind::UniqueViolation {
+            return Ok(Outcome::Skipped);
+        }
         let Some(source) = entry.doc_id.clone() else {
             return Ok(Outcome::Skipped);
         };

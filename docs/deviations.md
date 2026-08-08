@@ -265,14 +265,24 @@ an index-backed query and a scan. Matches MongoDB, still a footgun.
 
 ---
 
-## 🔴 Known problem deferred to M4
+## 🟢 Replicated writes now reach change streams (was the 🔴 M4 blocker)
 
-**Replicated writes land behind the change-stream position.** An applied remote
-entry keeps its originating stamp, so it enters the oplog *behind* the local
-tail. A subscriber past that point never sees it.
+**Was.** An applied remote entry keeps its originating stamp, so it entered the
+oplog *behind* the local tail and a subscriber past that point never saw it.
+Single-node streams were unaffected, which is why it had not bitten.
 
-Single-node streams are unaffected. Three candidate resolutions are recorded in
-[Roadmap](roadmap.md); none is chosen.
+**Now.** A second ordering — `oplog_arrival` — over local arrival sequence, with
+the oplog still keyed by origin stamp for conflict resolution and anti-entropy.
+The maintainer chose this over restamping on arrival or documenting the limitation.
+Resume tokens are unchanged; they are translated to an arrival position at watch
+time, because tokens live in clients where no migration can reach them. Detail
+in [Oplog](oplog.md).
+
+**Two bugs closed on the way.** Streams de-duplicated by comparing stamps, which
+discarded exactly the replicated entries this was meant to deliver; and they
+trusted publication order, which can differ from commit order under concurrency.
+Both dissolved once the broadcast became a wake-up rather than a data path —
+[ADR-030](decisions.md).
 
 ---
 

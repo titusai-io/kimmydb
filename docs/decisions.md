@@ -574,6 +574,73 @@ exception fails all three.
 
 ---
 
+## ADR-029 — A violation is an oplog entry, because that is what a change stream is
+
+**Decision.** `OpKind::UniqueViolation` — a real oplog entry, locally stamped,
+carrying the index name and every colliding id. Not a document change; it
+describes something that happened *to* the data.
+
+**Why it had to be an entry.** [Roadmap](roadmap.md) committed M4 to "a
+`uniqueViolation` change-stream event". When that was written, streams read from
+the in-memory broadcast, so an in-memory event would have worked. It no longer
+would: streams now read from the oplog and discard the broadcast payload
+([ADR-030](#adr-030--the-broadcast-channel-is-a-wake-up-not-a-data-path)). An
+event outside the log cannot be delivered at all.
+
+That turned out to be the better outcome anyway. As an entry it is durable,
+ordered, and resumable, and it reaches subscribers through machinery that
+already exists — a violation nobody happened to be connected to witness is
+barely better than a silent one, and this one survives being missed.
+
+**Alternative considered: a `{coll}.__conflicts` collection.** An ordinary
+document write, so it would also produce a stream event, and it would outlive
+`oplog_retention_secs` because it would be data. Rejected for now as more
+surface area than the commitment requires — a second shadow collection per
+collection, with its own retention story — but it remains the right answer if
+violations ever need to be reconcilable weeks later.
+
+**Locally stamped, and must not replicate.** Every node detects the same
+collision independently when it merges, so the entry is *this* node's
+observation. Shipping it to peers would report one violation once per node. M4's
+anti-entropy has to exclude the kind explicitly; this is recorded in the roadmap
+rather than left to be rediscovered.
+
+**Written in a separate transaction from the merge.** Deliberate: reporting must
+not be able to fail the write. A converged write with an unreported violation is
+bad, but a *rejected* replicated write is worse — the nodes then never agree,
+which is the availability the whole design is protecting.
+
+---
+
+## ADR-030 — The broadcast channel is a wake-up, not a data path
+
+**Decision.** Change streams read every entry from the oplog's arrival index.
+The broadcast channel's payload is discarded; only the fact that a message
+arrived is used, as a signal that there may be more on disk.
+
+**What forced it.** The old stream de-duplicated the replay/live overlap by
+dropping anything stamped at or below its high-water mark. A replicated entry
+carries an older stamp by definition, so that check discarded exactly the
+entries the arrival index exists to deliver.
+
+**What it also fixed.** Publication happens *after* the commit that assigns an
+arrival position, so two concurrent writers can publish in the opposite order
+from the one they committed in. A stream trusting publication order would have
+delivered those reversed — and the stamp comparison would then have dropped the
+second one permanently. That bug was latent, unrelated to replication, and would
+have been load-dependent and intermittent.
+
+**What it bought.** Falling behind the channel buffer stopped being an error
+condition. The data is on disk either way, so a `Lagged` receiver is a late
+wake-up and nothing more. `InvalidateReason::ConsumerLagged` now has exactly one
+cause: retention collected the range the stream was about to read.
+
+**Cost.** A read per wake-up rather than delivery straight from memory. Under
+load the reads batch, so the cost falls as throughput rises — the opposite of
+the shape that would matter.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

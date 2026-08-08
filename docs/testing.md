@@ -9,17 +9,17 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-493 tests passing · 0 failures · clippy clean at -D warnings
+513 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 98 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 118 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention |
+| `kimmy-core` | 100 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-storage` | 130 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 52 | 31 unit (JSON boundary, errors, schema inference) + 21 end-to-end over a real socket |
+| `kimmy-api` | 58 | 31 unit (JSON boundary, errors, schema inference) + 27 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 17 | Config layering and validation |
 | `kimmy-cluster` | 5 | Discovery string parsing |
@@ -235,6 +235,8 @@ Worth recording, because each one shows the test doing its job:
 | `anndists::DistDot` asserts `1 - dot >= 0` | **Process abort.** Valid only for unit vectors; any real embedding would have crashed the server mid-search | exercising every metric against the index rather than assuming they all worked |
 | Schema inference counted array elements, not documents | `presence` reported 2.0 — a fraction above 1.0, which is meaningless — for any array field | driving `describe_collection` against a running server; **no test looked, because nobody thought to** |
 | MCP published `kimmy://__kimmy/__users` as a resource | The password-hash collection offered to an agent as attachable context | the first `resources/list` against a real node |
+| `apply_remote` never maintained secondary indexes | A replicated document would be invisible to every index-backed query — present in a scan, missing from an index-backed `find` | reading the merge path while designing violation detection, which needs an index write to detect anything |
+| Change streams de-duplicated by comparing stamps | Dropped any entry stamped at or below the high-water mark — exactly what a replicated entry looks like — and, separately, would have reordered two concurrent writers that published out of commit order | designing the arrival index; the second half was latent and unrelated to replication |
 | Retention collecting the oplog tail | **Silent data loss.** The clock resumes from the tail, so an idle node would restart at `Hlc::ZERO` and every later write would lose to its own older version | writing the invariant into `the_clock_still_resumes_after_an_aggressive_collection` *before* the collector, then confirming a mutant that removes the guard fails three tests |
 
 In the first two cases the test encoded the *intended* invariant and the

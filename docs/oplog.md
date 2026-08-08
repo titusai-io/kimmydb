@@ -113,11 +113,45 @@ key yields exactly the total write order `(wall_ms, counter, node_id)`. So:
 
 - **Scanning the log forward** is a plain redb range scan.
 - **"Everything since time T"** is a range from an encoded lower bound.
-- **A resume token** is just a position in this key space.
+- **A resume token** names a position in this key space.
 
 ```rust
 pub fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>>
 ```
+
+### The second ordering, for change streams
+
+That key is the **origin** stamp, which is what conflict resolution and
+anti-entropy compare. But it is the wrong order for a change stream: an applied
+remote entry keeps its originating stamp, so it lands *behind* the local tail,
+and a subscriber already past that point would never see it.
+
+So a second index maps a monotonic local counter — assigned when an entry is
+appended *here* — to its stamp:
+
+```
+oplog_arrival:      arrival_seq -> (hlc || node)
+oplog_arrival_seq:  (hlc || node) -> arrival_seq
+```
+
+```rust
+pub fn read_arrival_from(&self, from: u64, limit: usize) -> Result<Vec<OplogEntry>>
+```
+
+| Consumer | Order it needs | Why |
+|---|---|---|
+| Conflict resolution | Origin stamp | The stamp *is* the input to last-writer-wins |
+| Anti-entropy (M4) | Origin stamp, per node | Version vectors ask "what do you hold after this logical time" |
+| Change streams | Arrival | Must be append-only *locally*, whatever the entry's origin |
+
+On a single node the two orderings are identical, which is why single-node
+semantics did not change. Both index tables are **derived** from the oplog:
+`Engine::open` compares their size against it and rebuilds when they disagree,
+so a database written before they existed is repaired rather than refused.
+
+Resume tokens are unchanged — they still name an entry by stamp, and are
+translated to an arrival position by point lookup when a stream opens. Tokens
+live in *clients*, where no migration can reach them.
 
 ---
 

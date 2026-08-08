@@ -204,9 +204,23 @@ partition, and last-writer-wins would otherwise discard one **silently**.
 
 M4 must therefore detect violations at merge time and surface them:
 
-- a `uniqueViolation` change-stream event naming the index and the colliding ids
-- the losing document recorded rather than lost, so it can be reconciled
-- a metric, so the condition is visible without watching a stream
+- a `uniqueViolation` change-stream event naming the index and the colliding ids — ✅ **built**
+- the losing document recorded rather than lost, so it can be reconciled — ✅ **moot, see below**
+- a metric, so the condition is visible without watching a stream — ✅ **built** (`kimmy_unique_violations`)
+
+**Correction found while building it: there is no losing document.** The two
+colliding documents have different `_id`s, so last-writer-wins never runs on
+them — both are applied and both survive. Only the constraint is broken. So
+nothing needs recording to avoid being lost; what needed deciding was what to
+do when maintaining the index at merge finds the key already held. The answer
+is to add the entry anyway and report: skipping it would keep the index
+formally unique at the cost of an index-backed query being unable to find a
+document that exists, trading a reported problem for a silent wrong answer.
+
+**Still to do in M4:** `OpKind::UniqueViolation` entries are a node's own
+observation, not replicated facts — every node detects the same collision when
+it merges. Anti-entropy must **exclude them** when shipping oplog ranges to
+peers, or the same violation is reported once per node.
 
 This does not *prevent* the violation — that is provably impossible without
 coordination (see [ADR-020](decisions.md)) — but it converts silent corruption

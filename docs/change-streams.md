@@ -33,9 +33,28 @@ Each event is one JSON text frame:
 | `from_start=true` | Replay the whole retained oplog |
 | `full_document=true` | Include the post-image on every event |
 
-`operationType` is `insert`, `update`, `replace`, `delete`, or `invalidate`.
-Requires the `watch` action on the collection — which is **not** implied by
-`read`. See [Security](security.md).
+`operationType` is `insert`, `update`, `replace`, `delete`, `uniqueViolation`,
+or `invalidate`. Requires the `watch` action on the collection — which is
+**not** implied by `read`. See [Security](security.md).
+
+A `uniqueViolation` event reports that merging a replicated write broke a unique
+constraint. It carries no `documentKey` — nothing was lost, and no single
+document is *the* problem — but names the index and every colliding id:
+
+```json
+{
+  "operationType": "uniqueViolation",
+  "index": "email_1",
+  "merged": "remote-doc",
+  "documentKeys": [{ "_id": "local-doc" }, { "_id": "remote-doc" }],
+  "resumeToken": "…",
+  "clusterTime": "…"
+}
+```
+
+Both documents still exist. Uniqueness cannot be enforced across nodes without
+coordination, so this converts a silent constraint break into something an
+application can reconcile. See [ADR-020](decisions.md).
 
 ---
 
@@ -123,33 +142,31 @@ otherwise they would be re-examined forever.
 
 ## Lag recovery
 
-`tokio::sync::broadcast` buffers 1024 events per subscriber. A consumer slower
-than the write rate falls off the back of that buffer.
-
-The obvious response is to invalidate the stream and make the client
-resubscribe. **KimmyDB does something better**: the same events are on disk, so
-lag rewinds to just after the last delivered event and replays from the oplog.
+`tokio::sync::broadcast` buffers 1024 events per subscriber, and a consumer
+slower than the write rate falls off the back of it. That is a non-event here,
+because **the broadcast channel is only a wake-up**: its payload is discarded,
+and every delivered entry is read from the oplog.
 
 ```mermaid
 graph TB
-    L["broadcast::recv() → Lagged(n)"] --> R["rewind to<br/>last_delivered.successor()"]
-    R --> P["replay from oplog"]
-    P --> C["catch up, return to live"]
-    C -.->|"only if the oplog no longer<br/>covers the gap — needs GC,<br/>📋 not yet implemented"| I["Invalidate"]
+    L["broadcast::recv()"] --> R["read from the arrival index<br/>at the stream's position"]
+    R --> C["deliver, advance, repeat"]
+    C -.->|"position already collected<br/>by retention"| I["Invalidate"]
 
     style R fill:#2d3748,color:#fff
 ```
 
-Tested by writing 2,500 events with nobody reading, then draining and asserting
-all 2,500 arrive in order.
+So a `Lagged` receiver is just a wake-up that arrived late — the data is on disk
+either way. Tested by writing 2,500 events with nobody reading, then draining
+and asserting all 2,500 arrive in order.
 
 Recovery is bounded by a **resume floor** — the position the stream started at —
 so a stream that deliberately skipped history cannot resurrect it by lagging.
 
-> **Consequence:** `ChangeEvent::Invalidate` is currently **unreachable**, and is
-> documented as such in the code rather than left looking live. It becomes
-> reachable when oplog collection lands and a stream can have its replay range
-> removed underneath it.
+> **`Invalidate` is reachable in exactly one way:** retention collected the
+> range the stream was about to read. A stream checks the oldest retained
+> position before each read and emits `ConsumerLagged` rather than skipping the
+> gap silently. Before retention landed there was no way to reach it at all.
 
 ---
 

@@ -374,11 +374,8 @@ impl Engine {
         // Advance the local clock past what we just accepted, so a subsequent
         // local write is ordered after it.
         self.witness(&entry.stamp);
-        self.publish(vec![entry.clone()]);
 
-        // A violation that only a running listener would notice is barely
-        // better than a silent one, so it is also logged and counted. How it
-        // reaches a *client* is still being decided — see docs/deviations.md.
+        let mut published = vec![entry.clone()];
         for violation in &violations {
             self.count_unique_violation();
             warn!(
@@ -387,9 +384,72 @@ impl Engine {
                 collection = %coll.name,
                 "a merged write broke a unique constraint"
             );
+            published.push(self.log_unique_violation(coll, &id, violation)?);
         }
 
+        self.publish(published);
+
         Ok(applied)
+    }
+}
+
+impl Engine {
+    /// Append the oplog entry that carries a violation to change streams.
+    ///
+    /// Locally stamped, because this is *this node's* observation rather than a
+    /// replicated fact — every node detects the same collision independently
+    /// when it merges, so a shared stamp would be wrong and shipping the entry
+    /// to peers would double-report.
+    ///
+    /// A separate transaction from the merge itself, deliberately. The merge
+    /// must not fail because reporting failed: a converged write with an
+    /// unreported violation is bad, but a *rejected* replicated write is worse,
+    /// because the nodes then never agree.
+    fn log_unique_violation(
+        &self,
+        coll: &CollectionMeta,
+        merged: &DocId,
+        violation: &index::UniqueViolation,
+    ) -> Result<OplogEntry> {
+        let mut ids = Vec::with_capacity(violation.holders.len());
+        for holder in &violation.holders {
+            // The holder list is encoded document keys, which do not decode
+            // back to ids; read each document to recover its `_id`.
+            match self.document_at_key(coll, holder)? {
+                Some(id) => ids.push(id),
+                None => continue,
+            }
+        }
+
+        let detail =
+            kimmy_core::UniqueViolationDetail::new(violation.index.clone(), merged.clone(), ids);
+
+        let entry = OplogEntry {
+            stamp: self.next_stamp(),
+            kind: OpKind::UniqueViolation,
+            collection: coll.id,
+            doc_id: None,
+            body: Some(bson::serialize_to_vec(&detail)?),
+        };
+
+        let txn = self.db().begin_write()?;
+        append_oplog(&txn, &entry)?;
+        txn.commit()?;
+        Ok(entry)
+    }
+
+    /// The `_id` of the document stored under an encoded key.
+    fn document_at_key(&self, coll: &CollectionMeta, key: &[u8]) -> Result<Option<DocId>> {
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let Some(raw) = docs.get((coll.id.0, key))? else {
+            return Ok(None);
+        };
+        let record = codec::decode_doc_record(raw.value())?;
+        match record.document()? {
+            Some(doc) => Ok(Some(extract_id(&doc)?)),
+            None => Ok(None),
+        }
     }
 }
 
@@ -888,5 +948,74 @@ mod tests {
         engine.apply_remote(&coll, &entry).unwrap();
 
         assert_eq!(engine.unique_violations(), 1, "a resend must not be counted again");
+    }
+    #[tokio::test]
+    async fn a_merged_violation_reaches_a_change_stream() {
+        // ADR-020's commitment: the violation is an event a client can act on,
+        // not just a log line. It has to be an oplog entry to be one, because
+        // streams read from the oplog.
+        use crate::watch::{ChangeEvent, WatchOptions, WatchScope};
+
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+
+        let mut stream =
+            engine.watch(WatchScope::Collection(coll.id), WatchOptions::default()).unwrap();
+
+        let entry =
+            remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
+        engine.apply_remote(&coll, &entry).unwrap();
+
+        // The merged insert first, then the violation it revealed.
+        let mut kinds = Vec::new();
+        let mut detail = None;
+        for _ in 0..2 {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+                    .await
+                    .expect("timed out")
+                    .expect("stream ended early");
+            if let ChangeEvent::Change { entry, .. } = event {
+                kinds.push(entry.kind);
+                if entry.kind == OpKind::UniqueViolation {
+                    detail = Some(
+                        bson::deserialize_from_slice::<kimmy_core::UniqueViolationDetail>(
+                            entry.body.as_ref().unwrap(),
+                        )
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+
+        assert!(kinds.contains(&OpKind::UniqueViolation), "expected a violation event: {kinds:?}");
+        let detail = detail.expect("the violation must carry its detail");
+        assert_eq!(detail.index, "email_1", "the event must name the index that broke");
+        assert_eq!(detail.merged, DocId::String("remote".into()));
+        assert_eq!(detail.ids.len(), 2, "both holders must be named: {:?}", detail.ids);
+        assert!(detail.ids.contains(&DocId::String("local".into())));
+        assert!(detail.ids.contains(&DocId::String("remote".into())));
+    }
+
+    #[test]
+    fn a_clean_merge_logs_no_violation_entry() {
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+
+        engine
+            .apply_remote(
+                &coll,
+                &remote_insert(&coll, "a", doc! { "_id": "a", "email": "x@y" }, 1_000),
+            )
+            .unwrap();
+
+        let entries = engine.read_arrival_from(0, 100).unwrap();
+        assert!(
+            !entries.iter().any(|e| e.kind == OpKind::UniqueViolation),
+            "a merge that broke nothing must not report a violation"
+        );
     }
 }
