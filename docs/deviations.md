@@ -194,7 +194,6 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 |---|---|---|
 | SWIM membership (`foca`) | No failure detection or suspicion. A node syncs with every address its seeds resolve to and learns a peer is gone by failing to connect — workable, noisier than it should be on a large or flapping cluster | M4 |
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
-| Full resync | A peer further behind than `oplog_retention_secs` cannot catch up incrementally, and there is no fallback | M4 |
 | TLS between nodes | Replication frames are plaintext. `cluster_secret` authenticates peers but does not hide what they exchange | M5 |
 | TLS | Tokens and passwords cross the wire in plaintext without a proxy | M5 |
 | Rate limiting | `/v1/auth/login` is brute-forceable at network speed | M5 |

@@ -77,6 +77,21 @@ impl VersionVector {
             .min()
     }
 
+    /// Raise every entry to the maximum of the two vectors.
+    ///
+    /// Used when a snapshot hands over coverage wholesale. Merging rather than
+    /// replacing matters: the receiver may hold writes of its own that the
+    /// sender has never seen, and adopting the sender's vector outright would
+    /// claim to have forgotten them.
+    pub fn merge(&mut self, other: &VersionVector) {
+        for (node, hlc) in other.iter() {
+            let slot = self.0.entry(node).or_insert(Hlc::ZERO);
+            if hlc > *slot {
+                *slot = hlc;
+            }
+        }
+    }
+
     /// Whether this vector covers everything `theirs` reports.
     pub fn covers(&self, theirs: &VersionVector) -> bool {
         self.behind(theirs).is_none()
@@ -189,6 +204,40 @@ mod tests {
 
         assert!(x.behind(&y).is_some());
         assert!(y.behind(&x).is_some());
+    }
+
+    #[test]
+    fn merging_takes_the_higher_of_each_entry() {
+        let (a, b) = (node(), node());
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(Hlc::new(10, 0), a));
+        mine.observe(Stamp::new(Hlc::new(99, 0), b));
+
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(Hlc::new(50, 0), a));
+        theirs.observe(Stamp::new(Hlc::new(7, 0), b));
+
+        mine.merge(&theirs);
+
+        assert_eq!(mine.get(a), Hlc::new(50, 0), "the higher of the two must win");
+        assert_eq!(mine.get(b), Hlc::new(99, 0), "and merging must never lower one");
+    }
+
+    #[test]
+    fn merging_keeps_writes_the_other_side_never_saw() {
+        // A snapshot hands over the sender's coverage. Adopting it outright
+        // would claim the receiver had forgotten its own writes.
+        let (mine_node, theirs_node) = (node(), node());
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(Hlc::new(5, 0), mine_node));
+
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(Hlc::new(80, 0), theirs_node));
+
+        mine.merge(&theirs);
+
+        assert_eq!(mine.get(mine_node), Hlc::new(5, 0), "own writes must survive the merge");
+        assert_eq!(mine.get(theirs_node), Hlc::new(80, 0));
     }
 
     #[test]

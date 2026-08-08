@@ -883,6 +883,61 @@ malformed frame becomes an out-of-memory kill.
 
 ---
 
+## ADR-036 — A peer past the retention horizon gets state, not history
+
+**Decision.** When a peer asks for oplog entries from a point retention has
+already collected, it is told so and sent **current state** instead: collection
+definitions, then documents in pages, then the sender's version vector.
+
+**The failure this fixes was not an optimisation.** Anti-entropy replays oplog
+entries, which reach back only as far as `oplog_retention_secs`. A node joining
+an older cluster asks for history nobody holds. Probed rather than assumed:
+
+```
+A documents:                      20
+entries A could still offer:       1   (the retained tail)
+outcome:  unknown_collection: 1        (the CreateCollection entry is gone)
+B documents:  collection missing entirely
+B still considers itself behind:  Some(Hlc(0.0))
+```
+
+With the default retention this is *any* node added to a cluster more than a day
+old — which is to say, adding a node to a running cluster.
+
+**It was at least honest.** B never falsely believed it was caught up, so there
+was no silent divergence, only an infinite retry. That is why the fix is a
+fallback rather than a correction: nothing was wrong, something was missing.
+
+**The horizon is recorded, not inferred.** `oplog_collected_through` holds what
+retention has actually removed. The oldest *retained* entry cannot stand in for
+it: on a node that has never collected anything, that is simply the first write
+ever made, and a peer asking from before it would be sent a full snapshot it did
+not need.
+
+**Documents arrive as oplog entries.** Each is applied through the same
+`apply_remote` replication uses, carrying the stamp the document actually holds.
+Not to save code — it is what keeps the result correct: last-writer-wins still
+decides, so a receiver holding a newer version keeps it; indexes are maintained,
+so the new node can answer index-backed queries; and unique violations are
+detected rather than smuggled past the check through a side door.
+
+**Collection definitions are not logged.** Unlike a document's stamp, a snapshot
+carries no honest record of when or where a collection was created — only that
+it exists. Inventing history would be worse than omitting it, and a node that
+joined by snapshot can pass the collection on by snapshotting in turn.
+
+**Coverage is merged, not adopted.** The receiver may hold writes the sender has
+never seen; taking the sender's vector outright would claim it had forgotten
+them.
+
+**The version vector stopped being derived state.** It was rebuilt from the
+oplog on every open, which would have recomputed a completed snapshot's coverage
+away and sent the node straight back to asking for history it cannot be given.
+The oplog is now a *lower bound* on coverage: opening raises the vector to cover
+it and never lowers it.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

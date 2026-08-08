@@ -316,6 +316,20 @@ event.
 **Unique-violation entries are never sent.** They record what one node observed
 when it merged, and every node observes the same collision independently.
 
+### Past the horizon
+
+A peer can ask for entries the oplog no longer holds. `oplog_collected_through`
+records what retention has actually removed, so the sender can tell — and
+answers `BeyondHorizon` rather than serving what is left, which would hand the
+peer a silent gap: it would apply the remainder, advance its version vector, and
+never learn what it missed.
+
+The peer then asks for a **snapshot** — current state rather than history — and
+adopts the sender's coverage once it is complete. That is why the version vector
+is no longer derived from the oplog: coverage can be granted by a snapshot for
+entries this node will never hold, so opening only ever *raises* the vector to
+cover the log. See [ADR-036](decisions.md).
+
 ---
 
 ## Replication (📋 M4)

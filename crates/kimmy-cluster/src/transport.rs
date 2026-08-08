@@ -90,6 +90,17 @@ async fn serve_peer(
                 write_frame(&mut stream, &Message::Versions(versions)).await?;
             }
             Message::AskEntries { from, limit } => {
+                // Tell a peer below the horizon rather than serving it what is
+                // left: it would apply that, advance its version vector, and
+                // never learn what had been collected.
+                let servable = engine
+                    .can_serve_from_oplog(from)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                if !servable {
+                    write_frame(&mut stream, &Message::BeyondHorizon {}).await?;
+                    continue;
+                }
+
                 // The peer's limit is a request, not an instruction: honouring
                 // an arbitrary one would let it ask for the whole oplog in a
                 // single frame.
@@ -98,6 +109,12 @@ async fn serve_peer(
                     .entries_for_peer(from, limit)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Entries(entries)).await?;
+            }
+            Message::AskSnapshot { after } => {
+                let page = engine
+                    .snapshot_page(after)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             // Anything else is a peer talking out of turn.
@@ -168,16 +185,58 @@ pub async fn sync_once(
         };
 
         write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
-        let Message::Entries(entries) = read_frame(&mut stream).await? else {
-            return Err(ProtocolError::Malformed("expected Entries".into()));
-        };
-
-        engine.apply_batch(&entries).map_err(|e| ProtocolError::Malformed(e.to_string()))
+        match read_frame(&mut stream).await? {
+            Message::Entries(entries) => {
+                engine.apply_batch(&entries).map_err(|e| ProtocolError::Malformed(e.to_string()))
+            }
+            // The peer has collected what we need. Fall back to current state.
+            Message::BeyondHorizon {} => {
+                warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
+                pull_snapshot(engine, &mut stream).await
+            }
+            other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
+        }
     };
 
     tokio::time::timeout(REQUEST_TIMEOUT, round)
         .await
         .map_err(|_| ProtocolError::Malformed("sync round timed out".into()))?
+}
+
+/// Pull a full snapshot, page by page, until the peer says it is complete.
+///
+/// Returns what applying it changed, so a caller sees a snapshot the same way
+/// it sees an incremental round.
+async fn pull_snapshot(
+    engine: &Engine,
+    stream: &mut TcpStream,
+) -> Result<SyncOutcome, ProtocolError> {
+    let mut cursor = None;
+    let mut outcome = SyncOutcome::default();
+
+    loop {
+        write_frame(stream, &Message::AskSnapshot { after: cursor.clone() }).await?;
+        let page = match read_frame(stream).await? {
+            Message::Snapshot(page) => page,
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!("expected Snapshot, got {other:?}")));
+            }
+        };
+
+        let applied = engine
+            .apply_snapshot_page(&page)
+            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        outcome.applied += applied;
+
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+
+    info!(documents = outcome.applied, "caught up from a snapshot");
+    Ok(outcome)
 }
 
 /// Open a handshake: challenge them, check the answer, then answer theirs.
