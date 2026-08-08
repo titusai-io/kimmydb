@@ -827,6 +827,62 @@ to record, because the two must agree.
 
 ---
 
+## ADR-035 — Replication pulls over TCP; peers authenticate mutually
+
+**Decision.** A TCP listener answers two questions — "what do you hold?" and
+"send me everything after this point" — and every node periodically asks them of
+every peer discovery resolves. Length-prefixed BSON frames. No push half.
+
+**Pull, not push.** A round is one-directional, and both peers running the same
+loop against each other is what converges them. A push half would need its own
+retry, ordering and back-pressure story to say nothing a pull does not already
+say, and a node that is behind is the one with the information about *how* far
+behind it is.
+
+**BSON, not JSON.** The payload is oplog entries, which are already BSON-shaped.
+A JSON hop would have to re-derive `Hlc`, `DocId` and binary bodies from a
+representation that cannot hold them — the same reason storage is BSON and only
+the HTTP edge is JSON.
+
+**The transport decides nothing.** It moves bytes; `kimmy-storage` decides what
+wins, what is missing, and how a merge resolves. That half was built and tested
+without a network deliberately, so a convergence failure and a dropped packet
+cannot be confused for one another.
+
+### Mutual authentication, in three messages
+
+```text
+Hello   { node, nonce_a }              ───▶
+        ◀───  Welcome { node, nonce_b, HMAC(secret, nonce_a) }
+Confirm { HMAC(secret, nonce_b) }      ───▶
+```
+
+**Three, not two.** A challenge has to be *received* before it can be answered;
+an initiator cannot prove a nonce the responder has not chosen yet. The first
+version of this got that wrong — it had the initiator signing a nonce it
+generated itself, which the responder then checked against a different one, so
+no valid handshake existed.
+
+**Mutual, not one-sided.** A server-only check would let anything that can open
+a socket read the entire oplog by simply never demanding proof in return. The
+initiator therefore verifies the responder *before* answering its challenge —
+answering first would hand an unauthenticated peer a valid proof for a nonce it
+chose.
+
+**Constant-time comparison.** A byte-by-byte check leaks how much of a forged
+proof was correct, which recovers the rest one byte at a time.
+
+**This is authentication, not confidentiality.** Frames are plaintext; anyone on
+the path reads replicated documents. TLS is M5. The secret's job today is to
+stop an unrelated process — a node pointed at the wrong cluster, most likely —
+from joining and merging its data in.
+
+**The frame limit is checked before allocating.** A length prefix read from the
+network is attacker-controlled, and trusting it enough to allocate is how one
+malformed frame becomes an out-of-memory kill.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

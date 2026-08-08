@@ -87,7 +87,7 @@ graph TB
     end
 
     subgraph DIST["Distribution"]
-        CLU["kimmy-cluster<br/>discovery ✅ · membership 📋 M4"]
+        CLU["kimmy-cluster<br/>discovery · replication ✅<br/>membership 📋"]
     end
 
     CORE["kimmy-core — Hlc · Stamp · DocId · DocRecord · OplogEntry · keyenc · cmp<br/>(no I/O)"]
@@ -113,7 +113,7 @@ graph TB
 | `kimmy-query` | Parse and evaluate filters, updates, sorts, projections | Touch storage |
 | `kimmy-auth` | Password hashing, tokens, the authorization decision | Know about HTTP |
 | `kimmy-api` | Routing, JSON⇄BSON, WebSocket, status codes, and the shared executor both edges call | Contain business logic beyond composing storage and query |
-| `kimmy-cluster` | Peer discovery; membership and replication in M4 | — |
+| `kimmy-cluster` | Peer discovery, the wire protocol, and anti-entropy replication. SWIM membership still to come | Decide what wins — that is `kimmy-storage` |
 | `kimmy-vector` | Embedding providers, the worker, HNSW, index selection, search | Sit on the write path |
 | `kimmy-mcp` | MCP tools and resources | Re-implement authorization — it calls `kimmy_api::exec`, where the check lives |
 | `kimmyd` | Configuration, wiring, lifecycle | — |

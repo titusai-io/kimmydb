@@ -62,6 +62,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config);
+    let cluster_handles = spawn_cluster(Arc::clone(&engine), &config).await?;
 
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
@@ -95,9 +96,57 @@ pub async fn run(config: Config) -> Result<()> {
     if let Some(handle) = gc_handle {
         handle.abort();
     }
+    // And replication: anti-entropy is idempotent and resumes from version
+    // vectors, so an interrupted round costs nothing but a repeat.
+    for handle in cluster_handles {
+        handle.abort();
+    }
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Start the replication listener and peer loop, unless clustering is off.
+///
+/// Binding happens here rather than inside the task so that a port already in
+/// use is a startup failure with a clear message, not a warning in a log nobody
+/// reads while the node silently never replicates.
+async fn spawn_cluster(
+    engine: Arc<Engine>,
+    config: &Config,
+) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+    if !config.cluster.enabled {
+        return Ok(Vec::new());
+    }
+
+    let secret = config.cluster.cluster_secret.clone().context(
+        "cluster.enabled is set with no cluster_secret (validation should have caught this)",
+    )?;
+
+    let listener = tokio::net::TcpListener::bind(config.cluster.bind)
+        .await
+        .with_context(|| format!("binding the cluster listener on {}", config.cluster.bind))?;
+    let local = listener.local_addr().unwrap_or(config.cluster.bind);
+
+    let serving = tokio::spawn(kimmy_cluster::serve(Arc::clone(&engine), listener, secret.clone()));
+
+    let replicating = tokio::spawn(kimmy_cluster::replicate(
+        engine,
+        kimmy_cluster::ReplicationConfig {
+            seeds: config.cluster.seeds.clone(),
+            secret,
+            local,
+            sync_interval: Duration::from_secs(config.cluster.sync_interval_secs),
+            discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
+        },
+    ));
+
+    info!(
+        bind = %local,
+        seeds = config.cluster.seeds.len(),
+        "clustering enabled"
+    );
+    Ok(vec![serving, replicating])
 }
 
 /// Start the retention collector, unless it is disabled.

@@ -225,11 +225,25 @@ idempotency rule. Operations rather than a metadata snapshot, so two nodes
 adding *different* indexes during a partition both keep theirs.
 [ADR-033](decisions.md).
 
+### Built: the replication transport ✅
+
+TCP, length-prefixed BSON, mutually authenticated with `cluster_secret`. Every
+node periodically asks every discovered peer what it holds and pulls what it
+lacks. Verified between two real daemons: a collection, a unique index and a
+document replicated with no configuration beyond a seed address; writes
+converged in both directions; a partition healed; and a cross-node unique
+violation left both documents in place while both nodes reported it.
+[ADR-035](decisions.md).
+
 ### Still missing
 
-- **The transport** — `foca` membership over UDP, TCP for oversized payloads
-  and oplog range transfer. This is now the only thing between here and a
-  working cluster.
+- **SWIM membership** via `foca`. Without it there is no failure detection or
+  suspicion: a node syncs with every address its seeds resolve to and finds out
+  a peer is gone by failing to connect. Workable, and noisier than it should be
+  on a large or flapping cluster.
+- **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
+  DNS resolver that can read record types the standard library does not expose.
+  `dns:` and `k8s:` both work.
 - **Full resync** for a peer further behind than `oplog_retention_secs`.
 
 ### Resolved: dropped collections leave a tombstone ✅

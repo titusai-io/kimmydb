@@ -93,6 +93,16 @@ seeds = []
 # without it any host that can reach the gossip port could inject writes.
 # cluster_secret = "generate-me-with-openssl-rand-base64-32"
 
+# How often to run an anti-entropy round against each known peer.
+sync_interval_secs = 5
+
+# How often to re-resolve the seed sources.
+#
+# Slower than syncing on purpose: DNS is the expensive half and a pod set does
+# not change every few seconds. But it must repeat -- a node that resolved only
+# at startup would never see a peer that joined after it.
+discovery_interval_secs = 30
+
 [log]
 # A tracing-subscriber filter directive. RUST_LOG overrides this when set.
 level = "info"

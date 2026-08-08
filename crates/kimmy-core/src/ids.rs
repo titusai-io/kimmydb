@@ -10,8 +10,32 @@ use uuid::Uuid;
 /// Generated once on first start and persisted, so a restarting node keeps its
 /// identity — losing it would make the node a stranger to its own prior writes
 /// and break last-writer-wins tiebreaks.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(Uuid);
+
+/// Serialized as its hyphenated string form, always.
+///
+/// `Uuid`'s own serde picks between a string and raw bytes based on whether the
+/// format calls itself human-readable, and BSON answers that question
+/// differently when writing than when reading — so a `NodeId` written into a
+/// BSON frame could not be read back out of one.
+///
+/// A string is also what makes a `NodeId` usable as a **map key**: BSON
+/// document keys must be strings, and [`crate::VersionVector`] is keyed by node.
+/// Fixing the representation here rather than at each use site means there is
+/// one answer rather than one per format.
+impl Serialize for NodeId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(&self.0.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for NodeId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
 
 impl NodeId {
     pub fn generate() -> Self {

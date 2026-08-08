@@ -33,6 +33,33 @@ pub enum SeedSource {
 pub const DEFAULT_GOSSIP_PORT: u16 = 7900;
 
 impl SeedSource {
+    /// Resolve this source to the addresses it currently names.
+    ///
+    /// Called periodically rather than once: a Kubernetes headless Service
+    /// gains and loses records as pods come and go, and a node that resolved
+    /// only at startup would never see a peer that joined after it.
+    ///
+    /// Failure to resolve is *not* an error worth propagating — a DNS name that
+    /// is temporarily unresolvable is the normal state of a cluster starting
+    /// up, and treating it as fatal would make the first node to boot refuse to
+    /// run. Callers get an empty list and try again next tick.
+    pub async fn resolve(&self) -> Result<Vec<SocketAddr>, ResolveError> {
+        match self {
+            Self::Static(addrs) => Ok(addrs.clone()),
+            Self::Dns { name, port } | Self::Kubernetes { name, port } => {
+                let host = format!("{name}:{port}");
+                match tokio::net::lookup_host(host.clone()).await {
+                    Ok(addrs) => Ok(addrs.collect()),
+                    Err(source) => Err(ResolveError::Lookup { target: host, source }),
+                }
+            }
+            // SRV records carry their own ports, which the standard library
+            // cannot read — it resolves names, not arbitrary record types. A
+            // resolver crate would be needed; see docs/deviations.md.
+            Self::DnsSrv { name } => Err(ResolveError::SrvUnsupported(name.clone())),
+        }
+    }
+
     /// A human-readable description for startup logs.
     pub fn describe(&self) -> String {
         match self {
@@ -44,6 +71,17 @@ impl SeedSource {
             }
         }
     }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("could not resolve {target}: {source}")]
+    Lookup { target: String, source: std::io::Error },
+    #[error(
+        "SRV discovery ({0}) needs a DNS resolver that can read SRV records, which is not \
+         built yet; use dns: or k8s: with an explicit port"
+    )]
+    SrvUnsupported(String),
 }
 
 #[derive(Debug, thiserror::Error)]
