@@ -393,6 +393,17 @@ impl Engine {
     }
 
     fn create_collection_unchecked(&self, db: &str, name: &str) -> Result<CollectionMeta> {
+        self.create_collection_inner(db, name, true)
+    }
+
+    /// `log = false` when applying a replicated creation. See
+    /// `create_index_inner` for why a replicated change must not mint an entry.
+    pub(crate) fn create_collection_inner(
+        &self,
+        db: &str,
+        name: &str,
+        log: bool,
+    ) -> Result<CollectionMeta> {
         let stamp = self.next_stamp();
         let txn = self.db.begin_write()?;
 
@@ -449,17 +460,23 @@ impl Engine {
             }
         }
 
-        let entry = OplogEntry {
-            stamp,
-            kind: OpKind::Collection,
-            collection: meta.id,
-            doc_id: None,
-            body: None,
+        let logged = if log {
+            let entry = ddl_entry(
+                stamp,
+                OpKind::CreateCollection,
+                meta.id,
+                &kimmy_core::CollectionRef::new(db, name),
+            )?;
+            append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
         };
-        append_oplog(&txn, &entry)?;
 
         txn.commit()?;
-        self.publish(vec![entry]);
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
 
         info!(db, collection = name, id = %meta.id, "created collection");
         Ok(meta)
@@ -493,6 +510,10 @@ impl Engine {
 
     /// Drop a collection along with all its documents and index entries.
     pub fn drop_collection(&self, db: &str, name: &str) -> Result<bool> {
+        self.drop_collection_inner(db, name, true)
+    }
+
+    pub(crate) fn drop_collection_inner(&self, db: &str, name: &str, log: bool) -> Result<bool> {
         let meta = match self.get_collection(db, name) {
             Ok(m) => m,
             Err(StorageError::Core(CoreError::CollectionNotFound { .. })) => return Ok(false),
@@ -516,17 +537,23 @@ impl Engine {
             indexes.retain_in(index_range(meta.id), |_, _| false)?;
         }
 
-        let entry = OplogEntry {
-            stamp,
-            kind: OpKind::Collection,
-            collection: meta.id,
-            doc_id: None,
-            body: None,
+        let logged = if log {
+            let entry = ddl_entry(
+                stamp,
+                OpKind::DropCollection,
+                meta.id,
+                &kimmy_core::CollectionRef::new(db, name),
+            )?;
+            append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
         };
-        append_oplog(&txn, &entry)?;
 
         txn.commit()?;
-        self.publish(vec![entry]);
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
 
         info!(db, collection = name, "dropped collection");
         Ok(true)
@@ -542,6 +569,27 @@ impl Engine {
             .insert((meta.db.as_str(), meta.name.as_str()), serde_json::to_vec(meta)?.as_slice())?;
         Ok(())
     }
+}
+
+/// Build a DDL oplog entry with a BSON-encoded payload.
+///
+/// Every schema change names its target by db and collection *name*, not only
+/// by the entry's collection id: ids are derived from names by a hash, and a
+/// hash cannot be inverted, so a peer meeting a collection for the first time
+/// could not otherwise learn what to call it.
+pub(crate) fn ddl_entry<T: serde::Serialize>(
+    stamp: Stamp,
+    kind: OpKind,
+    collection: CollectionId,
+    payload: &T,
+) -> Result<OplogEntry> {
+    Ok(OplogEntry {
+        stamp,
+        kind,
+        collection,
+        doc_id: None,
+        body: Some(bson::serialize_to_vec(payload)?),
+    })
 }
 
 fn decode_hlc(bytes: &[u8]) -> Result<Hlc> {
@@ -820,7 +868,7 @@ mod tests {
         let meta = engine.create_collection("app", "orders").unwrap();
 
         let event = rx.try_recv().expect("a create should publish an event");
-        assert_eq!(event.kind, OpKind::Collection);
+        assert_eq!(event.kind, OpKind::CreateCollection);
         assert_eq!(event.collection, meta.id);
     }
 

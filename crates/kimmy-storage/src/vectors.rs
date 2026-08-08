@@ -30,6 +30,18 @@ impl crate::Engine {
         collection: &str,
         config: VectorConfig,
     ) -> Result<CollectionMeta> {
+        self.configure_vectors_inner(db, collection, config, true)
+    }
+
+    /// `log = false` when applying a replicated configuration. See
+    /// `create_index_inner` for why a replicated change must not mint an entry.
+    pub(crate) fn configure_vectors_inner(
+        &self,
+        db: &str,
+        collection: &str,
+        config: VectorConfig,
+        log: bool,
+    ) -> Result<CollectionMeta> {
         config.validate().map_err(|e| StorageError::Core(CoreError::InvalidQuery(e)))?;
 
         // A shadow collection holds vectors, not documents; configuring
@@ -58,10 +70,30 @@ impl crate::Engine {
         let shadow = vector_meta::shadow_name(collection);
         self.create_system_collection(db, &shadow)?;
 
-        meta.vector = Some(config);
+        meta.vector = Some(config.clone());
         let txn = self.db().begin_write()?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
+
+        let logged = if log {
+            let entry = crate::engine::ddl_entry(
+                self.next_stamp(),
+                kimmy_core::OpKind::ConfigureVectors,
+                meta.id,
+                &kimmy_core::VectorSet {
+                    db: db.to_string(),
+                    collection: collection.to_string(),
+                    config: Some(config),
+                },
+            )?;
+            crate::engine::append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
+        };
         txn.commit()?;
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
 
         info!(db, collection, shadow = %shadow, "configured auto-embedding");
         Ok(meta)
@@ -72,6 +104,16 @@ impl crate::Engine {
     /// Keeping them by default means re-enabling with the same settings does
     /// not force a full re-embed, which for a remote provider is a real cost.
     pub fn disable_vectors(&self, db: &str, collection: &str, drop_vectors: bool) -> Result<bool> {
+        self.disable_vectors_inner(db, collection, drop_vectors, true)
+    }
+
+    pub(crate) fn disable_vectors_inner(
+        &self,
+        db: &str,
+        collection: &str,
+        drop_vectors: bool,
+        log: bool,
+    ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
         if meta.vector.is_none() {
             return Ok(false);
@@ -80,8 +122,31 @@ impl crate::Engine {
         meta.vector = None;
         let txn = self.db().begin_write()?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
-        txn.commit()?;
 
+        let logged = if log {
+            let entry = crate::engine::ddl_entry(
+                self.next_stamp(),
+                kimmy_core::OpKind::ConfigureVectors,
+                meta.id,
+                &kimmy_core::VectorSet {
+                    db: db.to_string(),
+                    collection: collection.to_string(),
+                    config: None,
+                },
+            )?;
+            crate::engine::append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
+        };
+        txn.commit()?;
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
+
+        // Deliberately after the config change and not replicated: discarding
+        // the stored vectors is a local reclamation choice, and the shadow
+        // collection is ordinary data that reconciles like any other.
         if drop_vectors {
             self.drop_collection(db, &vector_meta::shadow_name(collection))?;
         }

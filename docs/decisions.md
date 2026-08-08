@@ -731,6 +731,57 @@ describing a hazard that the code did not actually have.
 
 ---
 
+## ADR-033 — Schema changes replicate as operations, not as a snapshot
+
+**Decision.** Five oplog entry kinds — `CreateCollection`, `DropCollection`,
+`CreateIndex`, `DropIndex`, `ConfigureVectors` — each carrying its own payload,
+each applied independently and idempotently.
+
+**What was broken.** Five of the six DDL operations wrote **no oplog entry at
+all**, and the two that did (`create_collection`, `drop_collection`) carried no
+payload — byte-identical to each other, naming nothing. A peer receiving one
+learned only that *something* happened to a collection id it might not
+recognise. So no schema change could replicate, and documents could only flow
+between collections that already existed on both sides.
+
+**Alternative rejected: one metadata snapshot, merged last-writer-wins.**
+Simpler, and it loses index additions. Two nodes each adding a *different* index
+during a partition produce two whole-`CollectionMeta` values; one wins entirely
+and the other's index silently vanishes. Separate operations merge
+independently, so both survive — which a test pins.
+
+**Every payload names its target by db and collection *name*.** Ids are derived
+from names by a hash ([ADR-031](#adr-031--collection-ids-are-derived-from-the-name-not-allocated)),
+and a hash cannot be inverted, so a node meeting a collection for the first time
+could not otherwise learn what to call it.
+
+**Idempotency is "is the world already like this?", not "have I seen this
+entry?"** Peers resend overlapping ranges by design. Asking about the world
+needs no per-entry bookkeeping and stays correct after an index rebuild.
+
+**The bug this surfaced.** Applying a replicated DDL originally ran the ordinary
+local operation, which logged an entry of its own under *this* node's stamp. The
+peer then pulled that back, applied it, and minted another — the same change
+traded forever, the oplog growing on every round. Fixed by giving each DDL
+operation a non-logging path used only when applying a replicated change; the
+*originating* entry is appended instead, so the change propagates onward with
+its identity intact and the version vector advances for the right node.
+
+Two tests failed on this before it was understood, and it now has one of its own
+that fails under a deliberately reintroduced double-log.
+
+**Not replicated: discarding stored vectors.** `disable_vectors` takes a
+`drop_vectors` flag; the flag is a local reclamation choice and stays local. The
+shadow collection is ordinary data and reconciles through the same anti-entropy
+as everything else.
+
+**Still open.** A `DropCollection` entry acts as a tombstone only while the
+oplog retains it. Past `oplog_retention_secs`, a partitioned peer rejoining
+could resurrect a dropped collection — the same trade as document tombstones,
+and the roadmap's flagged open question.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

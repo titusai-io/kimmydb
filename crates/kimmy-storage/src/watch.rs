@@ -445,8 +445,8 @@ mod tests {
 
     /// Collect the next `n` *document* changes, failing rather than hanging.
     ///
-    /// Collection-level entries (create/drop) share the collection id and would
-    /// otherwise be counted alongside document changes.
+    /// Schema-change entries share the collection id and would otherwise be
+    /// counted alongside document changes.
     async fn take(engine: &Engine, stream: &mut ChangeStream, n: usize) -> Vec<ChangeEvent> {
         let mut out = Vec::new();
         while out.len() < n {
@@ -456,7 +456,7 @@ mod tests {
                     .unwrap_or_else(|_| panic!("timed out after {} of {n} events", out.len()))
                     .expect("stream ended early");
             if let ChangeEvent::Change { entry, .. } = &event
-                && entry.kind == OpKind::Collection
+                && !entry.kind.is_document()
             {
                 continue;
             }

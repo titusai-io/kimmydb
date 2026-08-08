@@ -323,6 +323,26 @@ impl crate::Engine {
         enforcement: Enforcement,
         name: Option<String>,
     ) -> Result<IndexMeta> {
+        self.create_index_inner(db, collection, fields, unique, enforcement, name, true)
+    }
+
+    /// `log = false` when applying a replicated definition.
+    ///
+    /// A replicated change must not mint an entry of its own: the originating
+    /// entry is appended by the caller, and minting a second one under this
+    /// node's stamp would send the same change back to the peer, which would
+    /// apply it and mint another. That amplifies without bound.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_index_inner(
+        &self,
+        db: &str,
+        collection: &str,
+        fields: Vec<IndexField>,
+        unique: bool,
+        enforcement: Enforcement,
+        name: Option<String>,
+        log: bool,
+    ) -> Result<IndexMeta> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
@@ -407,7 +427,27 @@ impl crate::Engine {
 
         meta.indexes.push(index.clone());
         crate::Engine::put_collection_meta(&txn, &meta)?;
+
+        let logged = if log {
+            let entry = crate::engine::ddl_entry(
+                self.next_stamp(),
+                kimmy_core::OpKind::CreateIndex,
+                meta.id,
+                &kimmy_core::IndexCreate {
+                    db: db.to_string(),
+                    collection: collection.to_string(),
+                    index: index.clone(),
+                },
+            )?;
+            crate::engine::append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
+        };
         txn.commit()?;
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
 
         tracing::info!(db, collection, index = %index.name, unique, "created index");
         Ok(index)
@@ -415,6 +455,16 @@ impl crate::Engine {
 
     /// Drop an index and every entry it holds.
     pub fn drop_index(&self, db: &str, collection: &str, name: &str) -> Result<bool> {
+        self.drop_index_inner(db, collection, name, true)
+    }
+
+    pub(crate) fn drop_index_inner(
+        &self,
+        db: &str,
+        collection: &str,
+        name: &str,
+        log: bool,
+    ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
         let Some(index) = meta.index(name).cloned() else {
             return Ok(false);
@@ -430,7 +480,27 @@ impl crate::Engine {
         // receive the same derived id — it cannot inherit anything.
         meta.indexes.retain(|i| i.name != name);
         crate::Engine::put_collection_meta(&txn, &meta)?;
+
+        let logged = if log {
+            let entry = crate::engine::ddl_entry(
+                self.next_stamp(),
+                kimmy_core::OpKind::DropIndex,
+                meta.id,
+                &kimmy_core::IndexDrop {
+                    db: db.to_string(),
+                    collection: collection.to_string(),
+                    index: name.to_string(),
+                },
+            )?;
+            crate::engine::append_oplog(&txn, &entry)?;
+            Some(entry)
+        } else {
+            None
+        };
         txn.commit()?;
+        if let Some(entry) = logged {
+            self.publish(vec![entry]);
+        }
 
         tracing::info!(db, collection, index = name, "dropped index");
         Ok(true)

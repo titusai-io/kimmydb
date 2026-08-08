@@ -217,17 +217,29 @@ two-node convergence, three-node transitive convergence through a middle peer,
 conflicting writes agreeing on a winner, deletes replicating, and a stable
 second round that transfers nothing.
 
+### Built: DDL replication ✅
+
+Five entry kinds — `CreateCollection`, `DropCollection`, `CreateIndex`,
+`DropIndex`, `ConfigureVectors` — each with its own payload and its own
+idempotency rule. Operations rather than a metadata snapshot, so two nodes
+adding *different* indexes during a partition both keep theirs.
+[ADR-033](decisions.md).
+
 ### Still missing
 
-- **DDL replication.** A `Collection` oplog entry carries **no payload** — no
-  name, and no indication of create versus drop — so a peer cannot create the
-  collection an entry refers to. Index creation and vector configuration are
-  **not logged at all**. Until this is fixed, replication moves documents
-  between collections that already exist on both sides; `SyncOutcome`
-  counts what it had to skip rather than letting it look like convergence.
 - **The transport** — `foca` membership over UDP, TCP for oversized payloads
-  and oplog range transfer.
+  and oplog range transfer. This is now the only thing between here and a
+  working cluster.
 - **Full resync** for a peer further behind than `oplog_retention_secs`.
+
+### Open question, unchanged
+
+Whether `drop_collection` should replicate as a durable tombstone. Today the
+`DropCollection` entry acts as one only while the oplog retains it, so past
+`oplog_retention_secs` a rejoining partitioned peer could resurrect a dropped
+collection. Same trade as document tombstones — but worth deciding rather than
+inheriting. Also open: how to handle a node whose tombstones were collected
+while it was partitioned.
 
 ### Uniqueness violation detection — committed for M4
 

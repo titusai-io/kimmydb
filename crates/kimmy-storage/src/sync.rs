@@ -31,18 +31,20 @@ pub struct SyncOutcome {
     /// Entries already covered by an equal or newer local version. Expected,
     /// not an error: peers resend overlapping ranges by design.
     pub superseded: usize,
+    /// Schema changes applied: collections, indexes, vector configuration.
+    pub ddl: usize,
     /// Entries for a collection this node does not have.
     ///
-    /// **Currently unavoidable**, and the reason M4 is not finished: collection
-    /// creation is logged with no payload naming it, so a peer cannot create
-    /// the collection an entry refers to. Counted rather than silently dropped
-    /// so the gap is visible instead of looking like convergence.
+    /// Should be zero in a healthy cluster now that collection creation
+    /// replicates. It stays non-zero when the `CreateCollection` entry has aged
+    /// out of the peer's oplog — counted rather than silently dropped, because
+    /// that case is a gap in coverage rather than convergence.
     pub unknown_collection: usize,
 }
 
 impl SyncOutcome {
     pub fn total(&self) -> usize {
-        self.applied + self.superseded + self.unknown_collection
+        self.applied + self.superseded + self.ddl + self.unknown_collection
     }
 }
 
@@ -81,6 +83,19 @@ impl Engine {
                 continue;
             }
 
+            // Schema changes come first in stamp order, so a collection exists
+            // by the time documents for it arrive.
+            if entry.kind.is_ddl() {
+                self.apply_ddl(entry)?;
+                outcome.ddl += 1;
+                continue;
+            }
+
+            // A legacy `Collection` entry names nothing and cannot be acted on.
+            if !entry.kind.is_document() {
+                continue;
+            }
+
             let Some(collection) = self.collection_by_id(entry.collection)? else {
                 outcome.unknown_collection += 1;
                 continue;
@@ -97,7 +112,7 @@ impl Engine {
             warn!(
                 entries = outcome.unknown_collection,
                 "skipped replicated entries for collections this node does not have; \
-                 collection replication is not implemented yet"
+                 their creation has probably aged out of the peer's oplog"
             );
         }
         debug!(
@@ -106,6 +121,104 @@ impl Engine {
             "merged a batch from a peer"
         );
         Ok(outcome)
+    }
+}
+
+impl Engine {
+    /// Apply a replicated schema change.
+    ///
+    /// Every arm is idempotent, because a peer resending an overlapping range
+    /// is the normal case rather than an error. Idempotency is expressed as
+    /// "is the world already like this?" rather than "have I seen this entry?"
+    /// — the second would need per-entry bookkeeping that the oplog already
+    /// provides, and would be wrong after a rebuild.
+    ///
+    /// The originating entry is appended either way, so this node's version
+    /// vector advances and further peers learn of the change from it. That is
+    /// the same rule `apply_remote` follows for documents.
+    fn apply_ddl(&self, entry: &OplogEntry) -> Result<()> {
+        let Some(body) = &entry.body else {
+            // A legacy `Collection` entry, which names nothing.
+            return Ok(());
+        };
+
+        match entry.kind {
+            OpKind::CreateCollection => {
+                let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+                match self.get_collection(&target.db, &target.name) {
+                    Ok(_) => {}
+                    Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                        ..
+                    })) => {
+                        self.create_collection_inner(&target.db, &target.name, false)?;
+                        debug!(db = %target.db, collection = %target.name, "created a replicated collection");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+            OpKind::DropCollection => {
+                let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+                self.drop_collection_inner(&target.db, &target.name, false)?;
+            }
+            OpKind::CreateIndex => {
+                let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
+                self.apply_remote_index(&target)?;
+            }
+            OpKind::DropIndex => {
+                let target: kimmy_core::IndexDrop = bson::deserialize_from_slice(body)?;
+                self.drop_index_inner(&target.db, &target.collection, &target.index, false)?;
+            }
+            OpKind::ConfigureVectors => {
+                let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
+                match target.config {
+                    Some(config) => {
+                        self.configure_vectors_inner(
+                            &target.db,
+                            &target.collection,
+                            config,
+                            false,
+                        )?;
+                    }
+                    None => {
+                        // Never `drop_vectors`: discarding a peer's stored
+                        // vectors is not something a configuration change from
+                        // elsewhere should decide.
+                        self.disable_vectors_inner(&target.db, &target.collection, false, false)?;
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        // The operations above deliberately logged nothing. Recording the
+        // *originating* entry is what lets the change propagate onward with its
+        // identity intact, and is what advances the version vector for its
+        // origin node — while minting a local entry instead would send the
+        // change back to the peer, which would apply it and mint another.
+        let txn = self.db().begin_write()?;
+        crate::engine::append_oplog(&txn, entry)?;
+        txn.commit()?;
+        self.witness(&entry.stamp);
+        Ok(())
+    }
+
+    /// Create a replicated index, tolerating one that is already there.
+    fn apply_remote_index(&self, target: &kimmy_core::IndexCreate) -> Result<()> {
+        let meta = self.get_collection(&target.db, &target.collection)?;
+        if meta.index(&target.index.name).is_some() {
+            return Ok(());
+        }
+
+        self.create_index_inner(
+            &target.db,
+            &target.collection,
+            target.index.fields.clone(),
+            target.index.unique,
+            target.index.enforcement,
+            Some(target.index.name.clone()),
+            false,
+        )?;
+        Ok(())
     }
 }
 
@@ -296,20 +409,206 @@ mod tests {
     }
 
     #[test]
-    fn entries_for_an_unknown_collection_are_counted_not_dropped() {
-        // Collection creation carries no payload naming it, so a peer cannot
-        // create the collection an entry refers to. Until that is fixed this
-        // must be visible rather than looking like successful convergence.
+    fn a_collection_created_on_one_node_appears_on_the_other() {
+        // Schema changes replicate, so a peer no longer has to be told about a
+        // collection out of band before documents for it can arrive.
         let (a, _da) = engine();
         let (b, _db) = engine();
         let ca = a.create_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": 1 }).unwrap();
 
-        // `b` never created the collection.
         let outcome = pull(&b, &a);
 
-        assert!(outcome.unknown_collection > 0, "the gap must be counted: {outcome:?}");
+        assert!(outcome.ddl > 0, "the creation must have been applied: {outcome:?}");
+        assert_eq!(outcome.unknown_collection, 0, "nothing should be skipped: {outcome:?}");
+        let cb = b.get_collection("shop", "orders").expect("the collection must exist on b");
+        assert_eq!(cb.id, ca.id, "and address the same storage");
+        assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_document_whose_collection_creation_aged_out_is_counted() {
+        // The remaining gap, and the reason the counter stays: if the peer's
+        // CreateCollection entry has been collected by retention, a document
+        // entry arrives for a collection this node cannot learn the name of.
+        let (b, _db) = engine();
+
+        let orphan = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(1_000, 0), kimmy_core::NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: kimmy_core::CollectionId::derive("shop", "never-heard-of"),
+            doc_id: Some(DocId::Int64(1)),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": 1 }).unwrap()),
+        };
+
+        let outcome = b.apply_batch(&[orphan]).unwrap();
+
+        assert_eq!(outcome.unknown_collection, 1, "the gap must be counted: {outcome:?}");
         assert_eq!(outcome.applied, 0);
+    }
+
+    #[test]
+    fn an_index_replicates_with_its_definition() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+
+        pull(&b, &a);
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.indexes.iter().find(|i| i.name == "email_1").expect("the index must exist");
+        assert!(index.unique, "a unique constraint must replicate as unique");
+        assert_eq!(index.id, kimmy_core::IndexMeta::derive_id("email_1"));
+    }
+
+    #[test]
+    fn concurrent_index_additions_both_survive() {
+        // The reason schema changes are separate operations rather than one
+        // metadata snapshot: whole-metadata last-writer-wins would keep only
+        // the later of these two and silently lose the other.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        for engine in [&a, &b] {
+            engine.create_collection("shop", "orders").unwrap();
+        }
+
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        b.create_index("shop", "orders", vec![field("status")], false, None).unwrap();
+
+        sync(&a, &b);
+        sync(&a, &b);
+
+        for engine in [&a, &b] {
+            let names: Vec<String> = engine
+                .get_collection("shop", "orders")
+                .unwrap()
+                .indexes
+                .iter()
+                .map(|i| i.name.clone())
+                .collect();
+            assert!(names.contains(&"email_1".to_string()), "lost email_1: {names:?}");
+            assert!(names.contains(&"status_1".to_string()), "lost status_1: {names:?}");
+        }
+    }
+
+    #[test]
+    fn dropping_an_index_replicates() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        sync(&a, &b);
+        assert!(!b.get_collection("shop", "orders").unwrap().indexes.is_empty());
+
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        sync(&a, &b);
+
+        assert!(
+            b.get_collection("shop", "orders").unwrap().indexes.is_empty(),
+            "the drop must replicate too"
+        );
+    }
+
+    #[test]
+    fn vector_configuration_replicates_and_can_be_turned_off() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+
+        sync(&a, &b);
+        assert!(
+            b.get_collection("shop", "orders").unwrap().vector.is_some(),
+            "embedding settings must replicate, or nodes would disagree about what to embed"
+        );
+
+        a.disable_vectors("shop", "orders", false).unwrap();
+        sync(&a, &b);
+
+        assert!(
+            b.get_collection("shop", "orders").unwrap().vector.is_none(),
+            "turning it off must replicate as well"
+        );
+    }
+
+    #[test]
+    fn replicated_schema_changes_are_idempotent() {
+        // Peers resend overlapping ranges, so applying the same creation twice
+        // must not error or duplicate anything.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        b.apply_batch(&entries).unwrap();
+        b.apply_batch(&entries).unwrap();
+
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(cb.indexes.len(), 1, "a resend must not duplicate the index");
+    }
+
+    #[test]
+    fn replicating_a_schema_change_does_not_amplify_it() {
+        // Applying a replicated DDL entry must not mint a local one. If it did,
+        // the peer would pull that back, apply it, mint another, and the two
+        // nodes would trade the same change forever — the oplog growing on
+        // every round while nothing changed.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+
+        sync(&a, &b);
+        let after_first = (
+            a.read_arrival_from(0, 10_000).unwrap().len(),
+            b.read_arrival_from(0, 10_000).unwrap().len(),
+        );
+
+        for _ in 0..5 {
+            sync(&a, &b);
+        }
+        let after_five_more = (
+            a.read_arrival_from(0, 10_000).unwrap().len(),
+            b.read_arrival_from(0, 10_000).unwrap().len(),
+        );
+
+        assert_eq!(
+            after_first, after_five_more,
+            "repeated rounds must transfer nothing new; the oplog grew from {after_first:?} \
+             to {after_five_more:?}"
+        );
+    }
+
+    #[test]
+    fn a_replicated_change_keeps_its_originating_stamp() {
+        // The entry a peer stores has to be the one that was sent, not a
+        // re-stamped copy: version vectors are keyed by originating node, so a
+        // local stamp would make the peer look like the author and leave the
+        // real origin permanently outstanding.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+
+        sync(&a, &b);
+
+        let vector = b.version_vector().unwrap();
+        assert!(
+            vector.get(a.node_id()) > Hlc::ZERO,
+            "b must record coverage of a's writes under a's node id"
+        );
+        assert!(b.version_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    fn vector_config() -> kimmy_core::VectorConfig {
+        kimmy_core::VectorConfig {
+            fields: vec!["text".into()],
+            provider: kimmy_core::ProviderConfig::Byo,
+            dim: 4,
+            metric: Default::default(),
+            chunk: Default::default(),
+        }
     }
 
     #[test]
