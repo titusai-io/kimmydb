@@ -33,6 +33,7 @@ Default port **7878**.
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
+| `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |

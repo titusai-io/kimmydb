@@ -78,6 +78,26 @@ impl Engine {
         Ok(())
     }
 
+    /// The stamp of a live document, or `None` if it is absent or tombstoned.
+    ///
+    /// Exposed so that derived data can be tagged with the version of the
+    /// document it was derived *from* — client-supplied vectors carry the
+    /// source document's HLC, which is what makes staleness a comparison
+    /// rather than a state machine. A tombstone reads as absent here for the
+    /// same reason it does to any other reader.
+    pub fn document_stamp(&self, coll: &CollectionMeta, id: &DocId) -> Result<Option<Stamp>> {
+        let key = doc_key(id)?;
+        let txn = self.db().begin_read()?;
+        let docs = txn.open_table(tables::DOCS)?;
+        match docs.get((coll.id.0, key.as_slice()))? {
+            Some(raw) => {
+                let record = codec::decode_doc_record(raw.value())?;
+                Ok(record.is_live().then_some(record.stamp))
+            }
+            None => Ok(None),
+        }
+    }
+
     pub fn count(&self, coll: &CollectionMeta) -> Result<u64> {
         let mut n = 0;
         self.for_each_doc(coll, |_, _| {

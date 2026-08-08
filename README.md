@@ -107,6 +107,7 @@ websocat "ws://localhost:7878/v1/db/shop/coll/orders/watch?full_document=true" \
 | `GET`/`POST` | `/v1/db/{db}/coll/{coll}/indexes` | List / create a secondary index |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | Drop |
 | `GET`/`POST`/`DELETE` | `/v1/db/{db}/coll/{coll}/vector` | Inspect / enable / disable embeddings |
+| `GET`/`PUT`/`DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | Client-supplied vectors, for the `byo` provider |
 | `POST` | `/v1/db/{db}/coll/{coll}/vector_search` | k-NN, with an optional filter |
 | `POST` | `/v1/db/{db}/coll/{coll}/hybrid_search` | Vector + keyword, fused by RRF |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | WebSocket change stream |

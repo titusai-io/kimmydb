@@ -85,39 +85,32 @@ deferred rather than blocking the wiring.
 
 ---
 
-## 🔴 `byo` is the default provider but has no ingest route
+## 🟢 `byo` now has an ingest route (was an open drift)
 
-**The gap.** `byo` — "the client supplies the vectors" — is the default, and it
-is what you get with no external dependency of any kind. But **there is no
-endpoint for supplying them.** Search on a `byo` collection returns nothing,
-always.
+**Was.** `byo` — "the client supplies the vectors" — is the default provider,
+and there was **no endpoint for supplying them**. Search on a `byo` collection
+returned nothing, always. The only working path was writing raw records into
+the shadow collection using the internal `VectorRecord` serde shape: the `#`
+chunk separator in `_id`, the externally-tagged `DocId`, the internal HLC
+shape. An implementation detail acting as a public contract.
 
-The only path that works is writing raw records into the shadow collection
-through the ordinary document route, using the internal `VectorRecord` serde
-shape:
+**Now.** `PUT /v1/db/{db}/coll/{coll}/docs/{id}/vectors` taking
+`[{chunk, vector, text}]`, with `GET` and `DELETE` alongside it. Replace-all
+per document, matching what the embedding worker does — the only semantics that
+stops a shortened document from leaving orphan chunks. The server supplies
+`source` and `source_hlc` from the document it already holds, so no internal
+shape crosses the boundary and staleness detection keeps working.
 
-```json
-POST /v1/db/shop/coll/orders.__vectors/docs
-{ "_id": "w#0",
-  "source": { "String": "w" },
-  "chunk": 0,
-  "source_hlc": { "wall_ms": 1, "counter": 0 },
-  "vector": [1.0, 0.0, 0.0, 0.0],
-  "text": "widget" }
-```
+Requires `write` on the collection, and the document must exist: without it
+there is no HLC for staleness to compare against.
 
-That is an implementation detail serving as a public contract: the `#` chunk
-separator in `_id`, the externally-tagged `DocId`, and the internal HLC shape
-are all things a client should never have to know, and none can change without
-breaking anyone who depends on them.
+**And the failure is no longer silent.** Searching a collection with no vectors
+stored at all now returns `409 no_vectors` naming the remedy, rather than an
+empty result that reads as "nothing matched". That was the more damaging half:
+M3 exposed `vector_search` to agents, which would retry a query forever against
+a collection that could never answer it.
 
-**Found by** driving the documented quick-start against a running server rather
-than trusting that it worked.
-
-**To close.** Needs a decision on the intended shape — most likely `PUT
-.../docs/{id}/vectors` taking `[{chunk, vector, text}]`, with the server
-supplying `source` and `source_hlc` from the document it already has. Not built
-unilaterally, because it is a public API surface.
+**Shape chosen by the maintainer** rather than unilaterally, since it is public API.
 
 ---
 
