@@ -6,84 +6,78 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M4 is functionally complete
+## As of 2026-08-08 — M4 complete, M5 next
 
-**Branches, stacked, both ready to merge:**
+**Branch:** `main`, everything merged (PRs #13–#15 landed SWIM, peer health and
+snapshot resync).
+**Gate on merged main:** 614 tests · `cargo fmt --all -- --check` clean ·
+`cargo clippy --workspace --all-targets -- -D warnings` clean.
 
-| Branch | What |
+### Where the project is
+
+M0–M4 are complete. Clustering works end to end and has been driven on real
+daemons, not only in tests:
+
+- two nodes forming a cluster from one seed address, converging both ways;
+- a partition healing;
+- a cross-node unique violation leaving both documents in place while both nodes
+  reported it (ADR-020, on real hardware);
+- an empty node joining a cluster whose oplog history had been collected;
+- a third node learning a peer **by gossip** that it was never configured with,
+  and both survivors agreeing within milliseconds when a node was killed.
+
+### M4 turned up four things the plan did not anticipate
+
+All fixed, all with tests, all in [Decisions](decisions.md):
+
+| Found | ADR |
 |---|---|
-| `m4-snapshot-resync` | A peer past the retention horizon catches up from state |
-| `m4-peer-health` | Backoff for failing peers, fanout instead of all-to-all |
+| Collection ids were node-local counters — replicated writes would land in the wrong collection | 031 |
+| Index ids were the same bug one level down | 032 |
+| DDL did not replicate at all; five of six operations logged nothing | 033 |
+| A node could not join a cluster older than `oplog_retention_secs` | 036 |
 
-**Gate:** 606 tests · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · both driven on real daemons
+### Next: M5 — hardening
 
-### `m4-snapshot-resync`
+Nothing in it is blocked. Full list in [Roadmap](roadmap.md); the shape of it:
 
-A node could not join a cluster older than `oplog_retention_secs` — it received
-nothing it could apply and retried forever. Probed rather than assumed. It now
-detects the horizon and pulls current state instead. [ADR-036](decisions.md).
+| Item | Note |
+|---|---|
+| Rate limiting | `/v1/auth/login` is brute-forceable at network speed |
+| TLS | Two fronts: client↔server, and node↔node (`cluster_secret` authenticates but does not encrypt) |
+| Benchmarks | Several tuning constants are guesses — the 2000-vector index threshold especially |
+| Aggregation pipeline | Biggest single feature; also unblocks the MCP `aggregate` tool and `$vectorSearch` |
+| Backup / restore | Cold file copy only today |
+| `kimmy` CLI, audit log, richer metrics | |
 
-The subtle part: **the version vector stopped being derived from the oplog.** It
-was rebuilt on every open, which would have recomputed a completed snapshot's
-coverage away. Opening now only ever *raises* it.
+Suggested order: rate limiting and TLS first (they separate "runs" from "can be
+exposed"), then benchmarks (M5 is where guessed constants stop being
+acceptable). Aggregation is self-contained and can slot anywhere.
 
-### `m4-peer-health`
+### Carried debt, none blocking
 
-Local failure tracking with exponential backoff, and a fixed number of peers
-contacted per round in rotation — **instead of** SWIM, not before it.
-[ADR-037](decisions.md).
+One 🔴 in [Deviations](deviations.md): index ranges use only one bound —
+correct but less selective; closing it means tracking multikey-ness per index on
+the write path. Then `$in` not using an index, descending-field ranges, HNSW
+snapshot persistence, SRV discovery (needs a DNS resolver crate), and a vector
+reindex operation.
 
-By the time the transport existed, what a gossip layer would have added had
-narrowed to two things, neither of them correctness: retrying dead peers
-forever, and O(n²) connections per round. Both are local problems with local
-fixes. The third thing SWIM gives — learning about nodes absent from your seeds
-— is nearly free on Kubernetes, where a headless Service already resolves to
-every ready pod.
-
-**This was not decided on licence.** `foca` and `memberlist` are MPL-2.0;
-depending on either unmodified is permitted and unremarkable, and `chitchat`
-(MIT) was available. It was decided because the remaining benefit did not
-justify the subsystem.
-
-**What it gives up:** no shared opinion about which nodes are alive. Nothing
-depends on that today, because anti-entropy is transitive and idempotent. It
-becomes worth revisiting if membership is ever needed for something that *must*
-be agreed — `coordinated` unique enforcement ([ADR-020](decisions.md)) being the
-obvious candidate, since it routes a value to the node that owns it.
-
-### M4 status
-
-Everything the milestone set out to do is built, with one substitution
-(peer health for SWIM) and one addition nobody planned (snapshot resync,
-which turned out to be load-bearing).
-
-Verified on real daemons across the last few branches: two nodes forming a
-cluster from one seed address; convergence in both directions; a partition
-healing; a cross-node unique violation leaving both documents in place while
-both nodes reported it; an empty node joining a cluster whose history had been
-collected; and a dead seed producing one warning rather than one per round.
-
-### Remaining, none blocking
-
-- **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
-  DNS resolver crate. `dns:` and `k8s:` both work.
-- **TLS between nodes** (M5) — `cluster_secret` authenticates peers, but frames
-  are plaintext.
-- `$in` not using an index; descending-field ranges; one-bound index ranges;
-  HNSW snapshot persistence; the aggregation pipeline that would give MCP its
-  `aggregate` tool.
-
-### Worth knowing
+### Invariants a change must not break
 
 - **The transport moves bytes and nothing else.** Convergence is tested without
-  a network in `kimmy-storage`; keep it that way.
-- **The version vector is authoritative, not derived.** Do not reintroduce a
-  rebuild that lowers it.
+  a network in `kimmy-storage/src/sync.rs`; keep it that way, or a merge bug and
+  a dropped packet become indistinguishable.
+- **The version vector is authoritative, not derived.** Never reintroduce a
+  rebuild that lowers it — a snapshot grants coverage the oplog never held.
 - **Applying replicated DDL must not log**, and must carry the originating stamp
-  into any tombstone it records.
+  into any tombstone it records. Both were bugs; both have tests.
+- **Retention never collects the newest oplog entry** — the clock resumes from
+  it (ADR-028).
 - **Anti-entropy excludes `OpKind::UniqueViolation`** — a node's own observation.
-- **`tombstone_retention_secs` governs dropped collections too.**
+- **Collection and index ids are derived from names**, which is what lets a
+  replicated entry address the same thing on every node.
+- **`kimmy_api::exec` is the single authorization point** for anything a
+  principal asked for. Replication goes through `apply_remote`, not `exec`.
 
 ## Conventions for this file
 
