@@ -70,6 +70,14 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
 
+    /// PEM certificate chain, leaf first. Enables TLS together with --tls-key.
+    #[arg(long, env = "KIMMY_TLS_CERT")]
+    pub tls_cert: Option<PathBuf>,
+
+    /// PEM private key (PKCS#8, PKCS#1 or SEC1).
+    #[arg(long, env = "KIMMY_TLS_KEY")]
+    pub tls_key: Option<PathBuf>,
+
     /// Join a cluster.
     #[arg(long, env = "KIMMY_CLUSTER_ENABLED")]
     pub cluster: bool,
@@ -142,6 +150,12 @@ impl Overrides {
         }
         if let Some(secret) = &self.jwt_secret {
             cfg.auth.jwt_secret = Some(secret.clone());
+        }
+        if let Some(cert) = &self.tls_cert {
+            cfg.server.tls.cert_file = Some(cert.clone());
+        }
+        if let Some(key) = &self.tls_key {
+            cfg.server.tls.key_file = Some(key.clone());
         }
         // Boolean flags are one-way: passing `--insecure-no-auth` turns the
         // setting on, but omitting it must not silently turn off what the

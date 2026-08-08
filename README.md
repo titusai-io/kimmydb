@@ -175,7 +175,7 @@ eventually-consistent store is a user who assumed otherwise.
 | **M2** | Auto-embeddings, HNSW vector index, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server over streamable HTTP | ✅ Complete |
 | **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | ✅ Complete |
-| **M5** | Backup/restore, TLS, rate limiting, CLI shell, benchmarks | 🚧 In progress — login rate limiting landed |
+| **M5** | Backup/restore, TLS, rate limiting, CLI shell, benchmarks | 🚧 In progress — login rate limiting and client TLS landed |
 
 Where the build departs from what was planned — and why — is tracked in
 [Deviations](docs/deviations.md), in one place rather than scattered.

@@ -43,6 +43,69 @@ pub struct ServerConfig {
     /// name clients actually use, or they will be refused.
     pub mcp_allowed_hosts: Vec<String>,
     pub rate_limit: RateLimitConfig,
+    pub tls: TlsConfig,
+}
+
+/// Native TLS termination for the HTTP, WebSocket and MCP listener.
+///
+/// There is no `enabled` flag. TLS is on when both a certificate and a key are
+/// configured and off when neither is — a separate toggle would add a state
+/// where `enabled = true` with no certificate, which can only ever be a startup
+/// failure. Naming exactly one of the two is refused for the same reason: it is
+/// unambiguously a mistake, and the useful moment to say so is at startup.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TlsConfig {
+    /// PEM certificate chain. Leaf first, then any intermediates — a client
+    /// that cannot build a path to a root it trusts will refuse the connection
+    /// even though the leaf itself is valid.
+    pub cert_file: Option<PathBuf>,
+    /// PEM private key: PKCS#8, PKCS#1 or SEC1.
+    pub key_file: Option<PathBuf>,
+}
+
+impl TlsConfig {
+    /// Both halves, or neither.
+    pub fn pair(&self) -> Option<(&Path, &Path)> {
+        match (&self.cert_file, &self.key_file) {
+            (Some(cert), Some(key)) => Some((cert.as_path(), key.as_path())),
+            _ => None,
+        }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.pair().is_some()
+    }
+
+    fn validate(&self) -> Result<()> {
+        match (&self.cert_file, &self.key_file) {
+            (Some(_), None) => anyhow::bail!(
+                "server.tls.cert_file is set but server.tls.key_file is not; TLS needs both, \
+                 and starting without it would serve plaintext on a port an operator believes \
+                 is encrypted"
+            ),
+            (None, Some(_)) => anyhow::bail!(
+                "server.tls.key_file is set but server.tls.cert_file is not; TLS needs both, \
+                 and starting without it would serve plaintext on a port an operator believes \
+                 is encrypted"
+            ),
+            // Existence is checked here rather than at first connection: a
+            // missing file should stop the node, not become a handshake failure
+            // for whoever connects first.
+            (Some(cert), Some(key)) => {
+                for (label, path) in [("cert_file", cert), ("key_file", key)] {
+                    if !path.is_file() {
+                        anyhow::bail!(
+                            "server.tls.{label} points at {}, which is not a readable file",
+                            path.display()
+                        );
+                    }
+                }
+                Ok(())
+            }
+            (None, None) => Ok(()),
+        }
+    }
 }
 
 /// Request rate limiting.
@@ -184,6 +247,7 @@ impl Default for ServerConfig {
             mcp: true,
             mcp_allowed_hosts: Vec::new(),
             rate_limit: RateLimitConfig::default(),
+            tls: TlsConfig::default(),
         }
     }
 }
@@ -329,6 +393,7 @@ impl Config {
         }
 
         self.server.rate_limit.validate()?;
+        self.server.tls.validate()?;
 
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
@@ -373,9 +438,10 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] cluster={} seeds=[{}] \
-             log={}/{:?}",
+            "bind={} scheme={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] cluster={} \
+             seeds=[{}] log={}/{:?}",
             self.server.bind,
+            if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
             if self.server.mcp { "enabled" } else { "off" },
@@ -597,6 +663,55 @@ mod tests {
         cfg.cluster.fanout = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("fanout"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn tls_needs_both_halves_or_neither() {
+        // Half-configured TLS would otherwise start and serve plaintext on a
+        // port the operator believes is encrypted — the failure is silent from
+        // the server's side, and only a client would notice.
+        let mut cfg = valid();
+        cfg.server.tls.cert_file = Some(PathBuf::from("/tmp/does-not-matter.crt"));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("key_file"), "unhelpful error: {err}");
+
+        let mut cfg = valid();
+        cfg.server.tls.key_file = Some(PathBuf::from("/tmp/does-not-matter.key"));
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cert_file"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_missing_certificate_is_refused_at_startup() {
+        // Not at the first connection: the operator who can fix it is watching
+        // the boot, not the traffic.
+        let mut cfg = valid();
+        cfg.server.tls.cert_file = Some(PathBuf::from("/nonexistent/server.crt"));
+        cfg.server.tls.key_file = Some(PathBuf::from("/nonexistent/server.key"));
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not a readable file"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn tls_is_enabled_by_naming_both_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("server.crt");
+        let key = dir.path().join("server.key");
+        std::fs::write(&cert, "x").unwrap();
+        std::fs::write(&key, "x").unwrap();
+
+        let mut cfg = valid();
+        assert!(!cfg.server.tls.is_enabled(), "off by default");
+        assert!(cfg.summary().contains("scheme=http "), "summary: {}", cfg.summary());
+
+        cfg.server.tls.cert_file = Some(cert);
+        cfg.server.tls.key_file = Some(key);
+        cfg.validate().unwrap();
+
+        assert!(cfg.server.tls.is_enabled());
+        // The startup line is how an operator confirms which one is running.
+        assert!(cfg.summary().contains("scheme=https"), "summary: {}", cfg.summary());
     }
 
     #[test]

@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use axum_server::tls_rustls::RustlsConfig;
 use kimmy_auth::{TokenIssuer, UserStore};
 use kimmy_storage::{Engine, RetentionPolicy};
 use tracing::{info, warn};
@@ -86,19 +87,35 @@ pub async fn run(config: Config) -> Result<()> {
         }
     });
 
+    // Loaded before binding, so a bad certificate is a startup failure rather
+    // than a handshake error for whoever connects first.
+    let tls = load_tls(&config).await?;
+
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
     let local = listener.local_addr().unwrap_or(config.server.bind);
-    info!(bind = %local, "serving HTTP and WebSocket");
 
-    // `into_make_service_with_connect_info` rather than the plain service: it is
-    // what puts the peer address in the request extensions, and without it every
-    // caller shares one rate-limit bucket.
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("serving")?;
+    if tls.is_some() {
+        info!(bind = %local, "serving HTTPS, WebSocket over TLS, and MCP");
+    } else {
+        info!(bind = %local, "serving HTTP and WebSocket");
+        if !is_loopback(&local) && !config.auth.insecure_no_auth {
+            // Not fatal — terminating TLS at a proxy or a service mesh is a
+            // legitimate deployment, and refusing to start would break every
+            // one of them. But it is worth saying out loud, because the failure
+            // it warns about is silent: nothing about a working request reveals
+            // that the token authorising it crossed the wire in the clear.
+            warn!(
+                bind = %local,
+                "serving plaintext HTTP on a non-loopback address; tokens and passwords cross \
+                 the wire unencrypted. Set server.tls.cert_file and server.tls.key_file, or \
+                 terminate TLS at a proxy in front of this node"
+            );
+        }
+    }
+
+    serve(listener, app, tls).await.context("serving")?;
 
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
@@ -116,6 +133,88 @@ pub async fn run(config: Config) -> Result<()> {
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// How long in-flight requests get to finish once shutdown begins.
+///
+/// Only reached when a request is still running; an idle server stops
+/// immediately, which is what keeps `docker stop` returning in milliseconds.
+const DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Read the certificate and key, if TLS is configured.
+///
+/// Returns `None` when neither is set. The configuration layer has already
+/// refused the half-configured case, so "one of the two" cannot reach here.
+async fn load_tls(config: &Config) -> Result<Option<RustlsConfig>> {
+    let Some((cert, key)) = config.server.tls.pair() else {
+        return Ok(None);
+    };
+
+    // rustls needs a process-wide crypto provider. Installed explicitly rather
+    // than left to the crate-features fallback so the choice is visible in the
+    // code: `ring` is already in the build via `reqwest`, whereas the
+    // `aws-lc-rs` default would add CMake and a full C build for a second
+    // implementation of the same primitives. See ADR-039.
+    //
+    // An error means one is already installed, which is the desired end state,
+    // so it is not a failure.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
+    let tls = RustlsConfig::from_pem_file(cert, key).await.with_context(|| {
+        format!("loading the TLS certificate {} and key {}", cert.display(), key.display())
+    })?;
+    info!(cert = %cert.display(), "TLS enabled");
+    Ok(Some(tls))
+}
+
+/// Serve the router, with or without TLS.
+///
+/// Both paths use `into_make_service_with_connect_info`, which is not optional:
+/// it is what puts the peer address in the request extensions, and without it
+/// every caller shares one rate-limit bucket — silently, since requests still
+/// succeed. Both paths also shut down gracefully, because a node that drops
+/// in-flight requests on SIGTERM makes every rolling restart a source of
+/// client-visible errors.
+async fn serve(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    tls: Option<RustlsConfig>,
+) -> Result<()> {
+    let service = app.into_make_service_with_connect_info::<std::net::SocketAddr>();
+
+    let Some(tls) = tls else {
+        axum::serve(listener, service).with_graceful_shutdown(shutdown_signal()).await?;
+        return Ok(());
+    };
+
+    // `axum::serve` has no TLS, so the TLS path runs on axum-server. It takes a
+    // std listener, which lets the bind stay where it was — a port already in
+    // use is still a startup error rather than a warning in a log nobody reads.
+    let std_listener = listener.into_std().context("converting the listener")?;
+    // Must stay non-blocking. `into_std` preserves the flag tokio set, and
+    // axum-server re-registers the socket with the runtime — handing it a
+    // blocking one panics at the first connection, not at startup.
+    std_listener.set_nonblocking(true).context("configuring the listener")?;
+
+    let handle = axum_server::Handle::new();
+    tokio::spawn({
+        let handle = handle.clone();
+        async move {
+            shutdown_signal().await;
+            handle.graceful_shutdown(Some(DRAIN_TIMEOUT));
+        }
+    });
+
+    axum_server::from_tcp_rustls(std_listener, tls)
+        .context("preparing the TLS listener")?
+        .handle(handle)
+        .serve(service)
+        .await?;
+    Ok(())
+}
+
+fn is_loopback(addr: &std::net::SocketAddr) -> bool {
+    addr.ip().is_loopback()
 }
 
 /// Start the replication listener and peer loop, unless clustering is off.
@@ -293,6 +392,11 @@ async fn shutdown_signal() {
 
 #[cfg(test)]
 mod tests {
+    use std::net::SocketAddr;
+
+    use axum::extract::ConnectInfo;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
     use super::*;
 
     #[test]
@@ -303,5 +407,129 @@ mod tests {
         let first = Engine::open(&path).unwrap().node_id();
         let second = Engine::open(&path).unwrap().node_id();
         assert_eq!(first, second, "identity must survive a restart");
+    }
+
+    /// A self-signed certificate for `localhost`, written to a temp directory.
+    ///
+    /// Generated per run rather than checked in: a private key in the
+    /// repository trips secret scanners and eventually expires, and neither
+    /// problem is worth inheriting for a fixture this cheap to build.
+    fn self_signed() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cert_path = dir.path().join("server.crt");
+        let key_path = dir.path().join("server.key");
+        std::fs::write(&cert_path, issued.cert.pem()).unwrap();
+        std::fs::write(&key_path, issued.signing_key.serialize_pem()).unwrap();
+        let der = issued.cert.der().to_vec();
+        (dir, cert_path, key_path, der)
+    }
+
+    /// Serve a router that reports the caller's address, and return where it is.
+    async fn serve_echoing_peer(tls: Option<RustlsConfig>) -> SocketAddr {
+        async fn peer(ConnectInfo(addr): ConnectInfo<SocketAddr>) -> String {
+            addr.to_string()
+        }
+
+        let app = axum::Router::new().route("/peer", axum::routing::get(peer));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = serve(listener, app, tls).await;
+        });
+        addr
+    }
+
+    /// A TLS client that trusts exactly the certificate it is given.
+    fn client_config(trusted: Vec<u8>) -> tokio_rustls::TlsConnector {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.add(trusted.into()).unwrap();
+        let config = tokio_rustls::rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(std::sync::Arc::new(config))
+    }
+
+    #[tokio::test]
+    async fn tls_serves_requests_and_still_reports_the_caller() {
+        // Two properties in one request, because the second fails silently.
+        // Encryption announces itself when it breaks — a handshake error is
+        // loud. Losing `ConnectInfo` does not: requests keep succeeding, and
+        // the only symptom is that every caller shares one rate-limit bucket,
+        // which nothing in a response would reveal.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_dir, cert, key, der) = self_signed();
+
+        let tls = RustlsConfig::from_pem_file(&cert, &key).await.expect("load the test cert");
+        let addr = serve_echoing_peer(Some(tls)).await;
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+        let mut tls_stream = client_config(der)
+            .connect(server_name, stream)
+            .await
+            .expect("the handshake must succeed against the certificate the server was given");
+
+        tls_stream
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        tls_stream.read_to_end(&mut raw).await.unwrap();
+        let response = String::from_utf8_lossy(&raw);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+        let body = response.rsplit("\r\n\r\n").next().unwrap_or_default();
+        assert!(
+            body.starts_with("127.0.0.1:"),
+            "the peer address must survive the TLS serving stack, or every caller shares one \
+             rate-limit bucket; handler saw {body:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plaintext_client_is_refused_by_a_tls_listener() {
+        // Otherwise a misconfigured client could silently fall back to sending
+        // credentials in the clear against a port believed to be encrypted.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_dir, cert, key, _der) = self_signed();
+
+        let tls = RustlsConfig::from_pem_file(&cert, &key).await.unwrap();
+        let addr = serve_echoing_peer(Some(tls)).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw).await;
+
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("200"),
+            "a plaintext request must not be answered by a TLS listener, got {} bytes",
+            raw.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plaintext_path_still_reports_the_caller() {
+        // The same invariant on the other branch: adding TLS must not quietly
+        // change how an unencrypted node sees its callers.
+        let addr = serve_echoing_peer(None).await;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /peer HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let response = String::from_utf8_lossy(&raw);
+
+        assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
+        let body = response.rsplit("\r\n\r\n").next().unwrap_or_default();
+        assert!(body.starts_with("127.0.0.1:"), "handler saw {body:?}");
     }
 }

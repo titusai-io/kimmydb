@@ -37,6 +37,20 @@ tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 http-body-util = "0.1"
 
+# TLS termination. `axum::serve` has no TLS, and the serving stack is
+# load-bearing here for two reasons beyond encryption: connection info must
+# survive (the login limiter keys on the peer address) and graceful shutdown
+# must keep working (`docker stop` returns in ~20 ms).
+#
+# `tls-rustls-no-provider` rather than `tls-rustls`, deliberately. The default
+# feature selects **aws-lc-rs**, which needs CMake and a full C build; `ring` is
+# already in the tree via `reqwest`, so taking the provider we already pay for
+# adds no new toolchain requirement. See ADR-016 and ADR-039.
+axum-server = { version = "0.8", default-features = false, features = ["tls-rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["pem", "ring"] }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"

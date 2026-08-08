@@ -267,6 +267,22 @@ stable 0.5 rather than the 0.6 release candidate.
 reason redb was chosen over RocksDB. And password hashing is not the place to
 run ahead of a stable release.
 
+> **Corrected 2026-08-08.** The stated goal — a build needing no C toolchain —
+> **has not held since M2**, and this ADR claimed otherwise for two milestones.
+> `kimmy-vector` depends on `reqwest` with `rustls-tls`, non-optionally, for the
+> remote embedding providers, which pulls `rustls → ring`. `ring` ships C and
+> assembly and builds with `cc`. Found while planning TLS, by checking
+> `cargo tree -i ring` rather than trusting the register.
+>
+> The choices above are still the right ones and still stand — picking a pure
+> option where one exists costs nothing. What is no longer true is the *claim*
+> that the whole build is free of a native toolchain. The maintainer chose to accept the
+> cost and correct the record rather than gate `reqwest` behind a feature.
+>
+> The practical rule going forward: **do not add a second native crypto stack.**
+> `ring` is paid for; `aws-lc-rs` would add CMake on top of it for the same
+> primitives. That is what decides the provider in [ADR-039](#adr-039--tls-terminates-natively-on-the-provider-already-in-the-build).
+
 ---
 
 ## ADR-017 — Reserved `__` prefix, with an internal escape hatch
@@ -1064,6 +1080,80 @@ holder out for the window. Trading a guessing risk for a denial-of-service risk
 is a deployment-specific judgement, not something a default should make on an
 operator's behalf. Both behaviours are tested; switching it on is one config
 value.
+
+---
+
+## ADR-039 — TLS terminates natively, on the provider already in the build
+
+**Decision.** The HTTP, WebSocket and MCP listener terminates TLS itself, via
+`axum-server` over `rustls`, with **`ring`** as the crypto provider. Enabled by
+naming a certificate and a key; there is no separate toggle.
+
+**Why native at all, when a proxy could do it.** A proxy remains a perfectly
+good deployment and nothing here forces the change. But "terminate at a proxy"
+was the *only* answer, which made a single node with no proxy in front of it
+unable to protect a password in transit — including the bootstrap login that
+sets one. A database that cannot be run safely on its own is a database with a
+prerequisite it never declared.
+
+**Why `ring`, not the default.** `axum-server`'s `tls-rustls` feature selects
+`aws-lc-rs`, which needs CMake and a full C build. `ring` is already compiled
+into every build via `reqwest` (see the correction on
+[ADR-016](#adr-016--pure-rust-cryptography)), so choosing it adds **no new
+toolchain requirement**, while the default would add a second native crypto
+stack for the same primitives. Hence `tls-rustls-no-provider` plus an explicit
+`ring` provider installed at startup — explicit so the choice is visible in the
+code rather than resolved by feature unification, which is exactly how a build
+acquires a dependency nobody chose.
+
+**Why no `enabled` flag.** TLS is on when both `cert_file` and `key_file` are
+set. A separate toggle would create a state — enabled with no certificate —
+whose only possible meaning is a startup failure. Naming exactly one of the two
+is refused for the same reason: it is unambiguously a mistake, and the useful
+moment to say so is at startup rather than at the first handshake.
+
+**Certificates are read before the socket is bound.** A missing or unreadable
+file stops the node with a message naming it. The alternative is a node that
+starts, reports healthy, and fails only for whoever connects first — the failure
+lands on traffic instead of on the person who can fix it. Same principle as
+refusing a bad configuration at startup.
+
+**Plaintext on a public bind warns, and does not refuse.** Terminating at a
+proxy or a service mesh is legitimate, so refusing to start would break real
+deployments. But the risk is invisible from the server's side — nothing about a
+successful request reveals that the token authorising it crossed the wire in the
+clear — so it is said out loud once at startup.
+
+**What the serving stack had to preserve.** `axum::serve` has no TLS, so the TLS
+path runs on `axum-server`, and two existing properties depend on the serving
+stack rather than on the router:
+
+- **Connection info.** The login limiter keys on the peer address, and losing it
+  fails *silently* — requests still succeed, and the only symptom is every
+  caller sharing one bucket. Both paths use
+  `into_make_service_with_connect_info`, and a test asserts a real handler sees a
+  real address through each.
+- **Graceful shutdown.** Measured at 52 ms on a TLS node against ~20 ms
+  plaintext; both are drain-then-exit rather than a hard kill.
+
+**A bug this found before it shipped.** The first version called
+`set_nonblocking(false)` on the listener handed to `axum-server`, reasoning that
+a `std` listener wants blocking mode. Tokio panics when a blocking socket is
+registered with the runtime — and it would have panicked at the *first TLS
+connection*, not at startup, so a smoke test that only checked the process was
+up would have passed. Caught by the end-to-end test on the first run.
+
+**WebSocket survives ALPN negotiating h2**, which was not obvious and was checked
+rather than assumed: axum's upgrade is HTTP/1.1-only (no RFC 8441), so a
+connection that had genuinely switched to HTTP/2 could not carry a change
+stream. Hyper's auto builder sniffs the connection preface and serves HTTP/1.1
+when it does not see the h2 one, so a client offering `h2,http/1.1` still opens a
+stream. Verified against a running node with a real write flowing through it.
+
+**Out of scope, deliberately:** client certificates (mTLS), certificate reload
+without a restart, and any HTTP→HTTPS redirect — one listener, one port, no
+plaintext half. Node-to-node TLS is a separate piece with its own trust
+question; `cluster_secret` still authenticates peers without encrypting them.
 
 ---
 

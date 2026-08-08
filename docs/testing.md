@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-629 tests passing · 0 failures · clippy clean at -D warnings
+635 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -21,7 +21,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | 73 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 31 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
-| `kimmyd` | 18 | Config layering and validation |
+| `kimmyd` | 24 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cluster` | 44 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
@@ -57,8 +57,8 @@ graph TB
 
 ## The load-bearing invariants
 
-These seven carry disproportionate weight. Anything that breaks one produces
-wrong answers rather than crashes.
+These nine carry disproportionate weight. Anything that breaks one produces
+wrong answers, or a silently weakened defence, rather than a crash.
 
 ### 1. Key encoding order
 
@@ -216,6 +216,29 @@ mode this document keeps arriving at.
 Time is a parameter throughout ([ADR-007](decisions.md)), so none of these
 sleeps.
 
+### 9. The serving stack does not lose the caller
+
+```
+handler sees a real peer address   —  with TLS and without it
+```
+
+Adding TLS meant a second serving stack (`axum-server` for TLS, `axum::serve`
+without), and one property they must agree on fails *silently*: if
+`into_make_service_with_connect_info` is dropped, requests keep succeeding and
+the only symptom is that every caller shares one rate-limit bucket. Nothing in a
+response would say so.
+
+- `tls_serves_requests_and_still_reports_the_caller` — a real TLS handshake
+  against a generated certificate, then a handler that echoes what it saw
+- `the_plaintext_path_still_reports_the_caller` — the same assertion on the
+  other branch, so adding TLS cannot quietly change the unencrypted path
+- `a_plaintext_client_is_refused_by_a_tls_listener` — a misconfigured client
+  must fail rather than send credentials in the clear to a port believed
+  encrypted
+
+Certificates are generated per run with `rcgen` rather than checked in: a
+private key in the repository trips secret scanners and eventually expires.
+
 ---
 
 ## Mutation testing
@@ -246,6 +269,27 @@ each one turned a named test red:
 | Record the attempt before authenticating, so success also spends | `a_successful_login_does_not_spend_the_budget` |
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
+
+### TLS and the serving stack, four for four
+
+| Injected fault | Caught by |
+|---|---|
+| Dropped connect info from the plaintext path | `the_plaintext_path_still_reports_the_caller` |
+| TLS-configured listener serves plaintext instead | `a_plaintext_client_is_refused_by_a_tls_listener` |
+| Half-configured TLS passes validation | `tls_needs_both_halves_or_neither` |
+| Certificate file existence not checked | `a_missing_certificate_is_refused_at_startup` |
+
+Run with a deliberate **no-op mutation first**, as a control — it reported
+"escaped", confirming the harness still detects the case where nothing changed.
+That is the check whose absence caused the false result recorded below.
+
+**A fifth was caught without being injected.** The first version of the TLS path
+called `set_nonblocking(false)` on the listener handed to `axum-server`. Tokio
+panics when a blocking socket is registered with the runtime — at the *first TLS
+connection*, not at startup, so the process would have come up healthy and died
+on first contact. `tls_serves_requests_and_still_reports_the_caller` failed on
+its first run with the panic message. A smoke test that only checked the process
+was listening would have passed.
 
 **Two of them appeared to escape, and the harness was the bug.** The runner was
 invoked as `run "<name>" <filter> --test api`, which shell-splits into four
@@ -411,6 +455,15 @@ manually and are recorded so they can be repeated:
 | Rate-limit config errors | ✅ zero window, zero `max_tracked_keys`, empty `trusted_proxy_header`, and a typo'd key all refused at startup |
 | `kimmy.example.toml` still parses | ✅ `check-config` valid — `deny_unknown_fields` makes this a real check |
 | `--insecure-no-auth` | ✅ limiter off; no login to protect |
+| HTTPS with a verified certificate | ✅ TLS 1.3, `ssl_verify_result=0`, ALPN `h2` |
+| A client that does not trust the certificate | ✅ refused (curl exit 60) |
+| Login and an authenticated request over TLS | ✅ token issued, `/v1/databases` 200 |
+| **Change stream over `wss://`** | ✅ 101, then a live insert event — with ALPN unset, `http/1.1`, **and `h2`** |
+| MCP over TLS without a token | ✅ 401 from the transport, unchanged |
+| Rate limiting over TLS | ✅ 429 after the burst; no "no connection info" warning, so the peer address is reaching the limiter |
+| SIGTERM on a TLS node | ✅ drained and exited in **52 ms** (plaintext measured ~20 ms) |
+| Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
+| Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test
@@ -418,7 +471,10 @@ suite misses are the ones nobody thought to look for, and looking is what
 driving a real server is.
 
 A minimal WebSocket client was written for this (`scratchpad/wsclient.py`) since
-none was installed — worth keeping for future manual verification.
+none was installed — worth keeping for future manual verification. It grew a
+TLS variant for the change-stream checks above, with a settable ALPN list,
+which is what made the `h2` question answerable by evidence rather than by
+reading hyper's source.
 
 ---
 

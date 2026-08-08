@@ -212,7 +212,9 @@ Stated plainly, because a security model you have to infer is worse than none.
 
 | Gap | Status | Mitigation today |
 |---|---|---|
-| **No TLS** | 📋 M5 | Terminate at a reverse proxy or service mesh. Tokens and passwords cross the wire in plaintext otherwise. |
+| **Client TLS** | ✅ Built | Native termination — see [TLS](#tls). A reverse proxy still works if you prefer it |
+| **No TLS between nodes** | 📋 M5 | Replication frames are plaintext; `cluster_secret` authenticates peers but does not encrypt them |
+| **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **No token revocation** | Not planned | Short TTLs; rotate the secret to revoke everything |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **No audit log** | 📋 Planned | `tracing` output only |
@@ -229,6 +231,63 @@ rate-limited, which also closes an amplification vector — see below. But there
 is no limit on the authenticated routes, no request size limit beyond axum's
 default, and no query timeout — a collection scan over a large collection will
 run to completion.
+
+---
+
+## TLS
+
+The HTTP, WebSocket and MCP listener terminates TLS itself. Point it at a
+certificate and a key:
+
+```toml
+[server.tls]
+cert_file = "/etc/kimmy/tls/server.crt"   # PEM chain, leaf first
+key_file  = "/etc/kimmy/tls/server.key"   # PKCS#8, PKCS#1 or SEC1
+```
+
+or `--tls-cert` / `--tls-key`, or `KIMMY_TLS_CERT` / `KIMMY_TLS_KEY`.
+
+**There is no on/off switch.** TLS is on when both are set. Setting exactly one
+is refused at startup, because the alternative is serving plaintext on a port an
+operator believes is encrypted. So is a path that does not exist, or a file that
+is not a usable certificate — all three stop the node with a message naming the
+file, rather than becoming a handshake failure for whoever connects first.
+
+One listener, one port. There is no plaintext half and no HTTP→HTTPS redirect:
+a port is either encrypted or it is not.
+
+**Plaintext on a public bind warns but still starts.** Terminating at a proxy or
+a service mesh is a legitimate deployment and refusing to start would break it.
+But nothing about a successful request reveals that the token authorising it
+crossed the wire in the clear, so the node says so once at startup:
+
+```
+WARN serving plaintext HTTP on a non-loopback address; tokens and passwords
+     cross the wire unencrypted
+```
+
+Loopback binds do not warn.
+
+### What this does and does not cover
+
+| | |
+|---|---|
+| Clients → this node | ✅ Encrypted, and the node proves its identity |
+| Change streams (WebSocket) | ✅ `wss://`, verified against a running node |
+| MCP at `/mcp` | ✅ Same listener, same certificate |
+| **Node → node replication** | ❌ Still plaintext. `cluster_secret` authenticates peers; it does not hide what they exchange |
+| **Client certificates (mTLS)** | ❌ Not planned. Clients authenticate with a bearer token |
+| **Certificate reload** | ❌ A renewed certificate needs a restart |
+
+### Notes
+
+TLS 1.3 and HTTP/2 are negotiated where the client supports them. WebSocket
+still works when a client offers `h2` in ALPN — axum's upgrade is HTTP/1.1-only,
+but hyper serves HTTP/1.1 on any connection that does not open with the HTTP/2
+preface. Checked against a real node rather than assumed.
+
+`rustls` on the `ring` provider, which was already in the build. See
+[ADR-039](decisions.md) for why not the `aws-lc-rs` default.
 
 ---
 
@@ -300,7 +359,7 @@ protect and every request is already a superuser.
 graph TB
     A["Generate a strong KIMMY_JWT_SECRET<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
     B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file"]
-    C --> D["Terminate TLS at a proxy"]
+    C --> D["Set server.tls.cert_file and key_file<br/>(or terminate at a proxy)"]
     D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]
     F --> G["Never expose --insecure-no-auth beyond loopback"]
