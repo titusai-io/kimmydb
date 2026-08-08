@@ -65,6 +65,7 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG)?;
             let _ = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let _ = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            let _ = txn.open_table(tables::OPLOG_VERSIONS)?;
         }
         txn.commit()?;
 
@@ -78,6 +79,7 @@ impl Engine {
         // version bump: there is no state here that the oplog does not already
         // determine.
         Self::rebuild_arrival_index_if_stale(&db)?;
+        Self::rebuild_version_vector_if_stale(&db)?;
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;
@@ -205,6 +207,63 @@ impl Engine {
             info!(entries = rebuilt, "rebuilt the oplog arrival index");
         }
         Ok(())
+    }
+
+    /// Rebuild the version vector if it does not agree with the oplog.
+    ///
+    /// Derived state, like the arrival index, so a database written before it
+    /// existed is repaired rather than refused. The check is a comparison
+    /// against the oplog tail per node rather than a count, because the vector
+    /// holds one row per *node* while the oplog holds one per entry — a length
+    /// comparison would say nothing.
+    fn rebuild_version_vector_if_stale(db: &Database) -> Result<()> {
+        let mut actual = kimmy_core::VersionVector::new();
+        {
+            let txn = db.begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            for row in oplog.iter()? {
+                let (key, _) = row?;
+                actual.observe(codec::decode_oplog_key(key.value())?);
+            }
+        }
+
+        let stored = Self::read_version_vector(db)?;
+        if stored == actual {
+            return Ok(());
+        }
+
+        let txn = db.begin_write()?;
+        {
+            let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+            versions.retain(|_, _| false)?;
+            for (node, hlc) in actual.iter() {
+                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
+        }
+        txn.commit()?;
+
+        if !actual.is_empty() {
+            info!(nodes = actual.len(), "rebuilt the oplog version vector");
+        }
+        Ok(())
+    }
+
+    fn read_version_vector(db: &Database) -> Result<kimmy_core::VersionVector> {
+        let txn = db.begin_read()?;
+        let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+        let mut out = kimmy_core::VersionVector::new();
+        for row in versions.iter()? {
+            let (node, hlc) = row?;
+            out.insert(decode_node(node.value())?, decode_hlc(hlc.value())?);
+        }
+        Ok(out)
+    }
+
+    /// What this node holds, summarized per originating node.
+    ///
+    /// The half of anti-entropy a peer needs in order to work out what to send.
+    pub fn version_vector(&self) -> Result<kimmy_core::VersionVector> {
+        Self::read_version_vector(&self.db)
     }
 
     /// The highest stamp in the oplog, used to resume the logical clock.
@@ -485,6 +544,20 @@ impl Engine {
     }
 }
 
+fn decode_hlc(bytes: &[u8]) -> Result<Hlc> {
+    let fixed: [u8; kimmy_core::HLC_ENCODED_LEN] = bytes
+        .try_into()
+        .map_err(|_| StorageError::Corrupt("version vector entry is not an Hlc".into()))?;
+    Ok(Hlc::from_bytes(fixed))
+}
+
+fn decode_node(bytes: &[u8]) -> Result<NodeId> {
+    let fixed: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| StorageError::Corrupt("version vector key is not a node id".into()))?;
+    Ok(NodeId::from_bytes(fixed))
+}
+
 /// Append one oplog entry inside an existing transaction.
 ///
 /// Always called in the same transaction as the change it describes, so the log
@@ -501,6 +574,20 @@ pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> 
     // arrival entry would deliver the same change twice to every stream.
     if existed {
         return Ok(());
+    }
+
+    // Same transaction as the entry, so the vector can never claim coverage of
+    // something that was rolled back — a peer would then never be sent it.
+    {
+        let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+        let node = entry.stamp.node.to_bytes();
+        let higher = match versions.get(node.as_slice())? {
+            Some(current) => entry.stamp.hlc > decode_hlc(current.value())?,
+            None => true,
+        };
+        if higher {
+            versions.insert(node.as_slice(), entry.stamp.hlc.to_bytes().as_slice())?;
+        }
     }
 
     let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;

@@ -701,6 +701,36 @@ guessing at an unknown layout is how you corrupt it.
 
 ---
 
+## ADR-032 — Index ids are derived too
+
+**Decision.** `IndexMeta.id = FNV-1a-32(name)`, the same treatment
+[ADR-031](#adr-031--collection-ids-are-derived-from-the-name-not-allocated)
+gave collections, one level down.
+
+**Why it follows.** An index definition has to replicate — a unique index is a
+*constraint*, and a constraint that exists on one node and not another is not a
+constraint. But index-entry keys embed the index id, and that id came from a
+per-collection counter. Node A's index 1 and node B's index 1 would key the same
+storage while describing different indexes, so replicating the definition would
+have corrupted the entries.
+
+Found while designing DDL replication rather than by a failure: the
+`CreateIndex` payload carries an `IndexMeta`, and an `IndexMeta` whose id is
+node-local is not a thing you can send anywhere.
+
+**32 bits, not 64.** That is the width index-entry keys already use, and the
+population is far smaller — collisions are between indexes *on one collection*,
+where a handful is typical rather than thousands. Checked at creation and at
+migration regardless, since two indexes sharing entries is unrecoverable.
+
+**Same consequence as collections.** Recreating an index under the same name
+reuses its id, so purging on drop is load-bearing. `drop_index` already removed
+its entries in the same transaction as the metadata change; the comment claiming
+ids were "not returned to the pool" because entries were "removed lazily" was
+describing a hazard that the code did not actually have.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

@@ -6,79 +6,88 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-07 — M4 started; collection identity fixed first
+## As of 2026-08-08 — M4: replication core done, DDL replication next
 
-**Branch:** `m4-deterministic-collection-ids` (ready to merge)
-**Gate:** 525 tests · `cargo fmt --all -- --check` clean · `cargo clippy
---workspace --all-targets -- -D warnings` clean · migration driven against two
-real pre-existing databases
+**Branches, stacked, both ready to merge:**
 
-### What this branch did
+| Branch | What |
+|---|---|
+| `m4-version-vectors` | Version vectors and anti-entropy, transport-free |
+| `m4-derived-index-ids` | Index ids derived from names, schema 3 |
 
-Starting M4's transport turned up a blocker underneath it. **Collection ids came
-from a node-local counter**, and every oplog entry names its collection by id —
-so two nodes that created the same collections in a different order disagreed
-about what an entry referred to, and a replicated write would have landed in the
-wrong collection. Confirmed with a throwaway two-engine probe before designing
-around it.
+**Gate:** 548 tests · `cargo fmt --all -- --check` clean · `cargo clippy
+--workspace --all-targets -- -D warnings` clean · migration driven on a real
+server with an index-backed query before and after.
 
-Ids are now derived: `FNV-1a-64(db || 0x00 || name)`. Every node computes the
-same answer with no coordination, which is the leaderless property the design
-rests on. The maintainer chose this over replicating metadata or carrying `(db, name)` in
-every entry. [ADR-031](decisions.md).
+### `m4-version-vectors`
 
-- **Schema version 2**, separate from the record `codec::FORMAT_VERSION` — a
-  record whose bytes still decode does not need rewriting because the meaning of
-  a key changed around it.
-- **Migration, not refusal.** Schema 1 databases are renumbered on open:
-  document keys, index entries, and the collection field of every oplog entry.
-  Idempotent. A *newer* schema is still refused.
-- **Collision checked** at creation and at migration, since two collections
-  sharing storage is unrecoverable.
+`VersionVector` (`{node → max_hlc}`), the `oplog_versions` table maintained on
+append, `entries_for_peer`, and `apply_batch`. Tested between engines in one
+process: two-node convergence, three-node transitive convergence, conflicting
+writes agreeing on a winner, deletes replicating, a stable second round.
 
-**One consequence, unavoidable:** dropping and recreating a collection now
-reuses its id. "Same name means same id everywhere" and "recreating yields a
-fresh id" are contradictory. That makes purging on drop load-bearing rather than
-tidy; `drop_collection` already purged, and a test now pins that instead of the
-id-uniqueness property it replaced.
+A mutation check changed a *test* rather than the code — see
+[Testing](testing.md).
 
-### Next: the rest of M4
+### `m4-derived-index-ids`
 
-In order:
+The prerequisite for DDL replication, and the same bug as ADR-031 one level
+down. Index ids came from a per-collection counter while index-entry keys embed
+them, so node A's index 1 and node B's index 1 would key the same storage while
+describing different indexes. A `CreateIndex` payload carrying a node-local id
+is not something you can send anywhere.
 
-1. **Version vectors.** Nothing computes `{node → max_hlc}` yet. The roadmap's
-   "missing: the transport" understated what is left. Needs a table maintained
-   in `append_oplog`, plus "what do I need from you" comparison.
-2. **Anti-entropy** — request an oplog range from a peer, apply with
-   `apply_remote`, which now maintains indexes and reports violations.
-3. **The transport** — `foca` membership over UDP, TCP for oversized payloads.
+Now `FNV-1a-32(name)`, with schema 3 renumbering existing entries.
+[ADR-032](decisions.md).
 
-I would do 1 and 2 first, transport-free and tested between two in-process
-engines, then wire the network. That is the order that keeps the correctness
-work separable from the networking.
+### Next: DDL replication
 
-### Worth knowing before continuing
+**the maintainer chose operation-specific entries.** New op kinds, each with its own
+payload, so two nodes adding *different* indexes during a partition both keep
+theirs:
 
-- **Exclude `OpKind::UniqueViolation` from anti-entropy.** These are a node's own
-  observation; replicating them reports one violation once per node.
+```
+OpKind::CreateCollection   body: { db, name }
+OpKind::DropCollection     body: { db, name }
+OpKind::CreateIndex        body: IndexMeta
+OpKind::DropIndex          body: { name }
+OpKind::ConfigureVectors   body: Option<VectorConfig>   // None disables
+```
+
+What still needs building:
+
+1. The op kinds and their codec tags. The existing payload-free
+   `OpKind::Collection` stays decodable for old oplogs but is never written
+   again; `apply_batch` cannot act on one, since it names nothing.
+2. Logging from `create_collection`, `drop_collection`, `create_index`,
+   `drop_index`, `configure_vectors`, `disable_vectors` — **five of those six
+   currently write no oplog entry at all**.
+3. Applying them idempotently in `apply_batch`, in stamp order.
+
+**The open sub-question:** a `DropCollection` entry acts as a tombstone only for
+as long as the oplog retains it. Past `oplog_retention_secs`, a partitioned peer
+rejoining could resurrect a dropped collection. That is the same trade as
+document tombstones, but it is the roadmap's flagged open question and worth
+deciding explicitly rather than inheriting.
+
+### Then
+
+- **The transport** — `foca` membership over UDP, TCP for oversized payloads.
+- **Full resync** for a peer further behind than `oplog_retention_secs`.
+
+### Worth knowing
+
 - **Anti-entropy uses `read_oplog_from`** (stamp order); change streams use
-  `read_arrival_from` (arrival order). Different questions — do not merge them.
-- **`apply_remote` is not `exec`.** It serves no principal, so it does not go
-  through the authorization path. Keep that boundary.
-- **`oplog_retention_secs` bounds peer catch-up.** A peer further behind than
-  the window needs a full resync, which does not exist.
-- **Retention never collects the newest oplog entry** — the clock resumes from
-  it ([ADR-028](decisions.md)).
+  `read_arrival_from` (arrival order).
+- **`apply_remote` is not `exec`** — it serves no principal.
+- **Retention never collects the newest oplog entry** ([ADR-028](decisions.md)).
+- **Both collection and index ids are derived**, which is what makes a
+  replicated entry address the same thing everywhere.
 
 ### Open, none blocking
 
-Implementation only: `$in` not using an index; descending-field ranges;
-one-bound index ranges; HNSW snapshot persistence; the aggregation pipeline that
-would give MCP its `aggregate` tool.
-
-Two questions M4 will raise but has not yet: whether `drop_collection` should
-replicate as a tombstone, and how to handle a node whose tombstones were
-collected while it was partitioned.
+`$in` not using an index; descending-field ranges; one-bound index ranges; HNSW
+snapshot persistence; the aggregation pipeline that would give MCP `aggregate`.
 
 ## Conventions for this file
 

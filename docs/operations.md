@@ -291,10 +291,15 @@ Refusing on a *newer* schema is the right failure: a build cannot know a layout
 that did not exist when it was written, and guessing corrupts further. Migrating
 an *older* one is equally right — a user with data has no other route forward.
 
-Current schema is **2**. The 1 → 2 migration renumbers collections to ids
-derived from their names ([ADR-031](decisions.md)), rewriting document keys,
-index entries, and the collection field of every oplog entry. It is idempotent
-and runs before the node serves anything.
+Current schema is **3**. Migrations run in sequence, so an older database steps
+through each one rather than needing its own path to the latest.
+
+| Step | What it does |
+|---|---|
+| 1 → 2 | Collections renumbered to ids derived from their names ([ADR-031](decisions.md)) — rewrites document keys, index entries, and the collection field of every oplog entry |
+| 2 → 3 | Indexes renumbered to ids derived from their names ([ADR-032](decisions.md)) — rewrites index-entry keys |
+
+Both are idempotent and run before the node serves anything.
 
 > **Back up the data directory before a version-crossing upgrade.** The
 > migration is transactional per step, but a rollback to the older build is not

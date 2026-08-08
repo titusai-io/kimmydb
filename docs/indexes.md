@@ -264,9 +264,17 @@ scan visit documents in different orders, so which documents a `limit` returns
 can differ between them. Add a `sort` when the subset matters. This matches
 MongoDB.
 
-**Index ids are never reused.** A dropped index's entries are removed eagerly,
-but the id is retired anyway — a reused id would inherit anything a failed drop
-left behind.
+**Index ids are derived from the index name**, not allocated from a counter, so
+every node in a cluster computes the same id for the same index. That is what
+lets an index definition replicate at all: entry keys embed the id, so a
+node-local counter would mean two nodes keying the same storage while describing
+different indexes. See [ADR-032](decisions.md).
+
+The consequence is that **recreating an index under the same name reuses its
+id** — unavoidable, since "same name means same id everywhere" and "recreating
+yields a fresh id" cannot both hold. Purging on drop is therefore load-bearing
+rather than tidy, and `drop_index` removes the entries in the same transaction
+as the metadata change.
 
 **No index statistics.** The planner counts covered fields; it has no idea which
 index is more *selective*. Two indexes covering the same number of fields are

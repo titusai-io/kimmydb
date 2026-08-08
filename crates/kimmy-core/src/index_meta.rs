@@ -8,6 +8,13 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMeta {
+    /// Derived from [`Self::name`], so every node agrees.
+    ///
+    /// Index entries are keyed by this, and an index definition replicates
+    /// between nodes — so a node-local counter would mean node A's index 1 and
+    /// node B's index 1 keying the same storage while describing different
+    /// indexes. The same failure as node-local collection ids
+    /// ([ADR-031](../../../docs/decisions.md)), one level down.
     pub id: u32,
     pub name: String,
     pub fields: Vec<IndexField>,
@@ -72,6 +79,29 @@ impl IndexField {
 }
 
 impl IndexMeta {
+    /// The id of an index called `name`, on every node, without coordination.
+    ///
+    /// Same reasoning as [`crate::CollectionId::derive`] and the same hash
+    /// family, narrowed to 32 bits because that is the width index-entry keys
+    /// use. Index names are unique within a collection, so the input is already
+    /// the right identity — the id is only a shorter way to write it.
+    ///
+    /// 32 bits is a much smaller space than the collection id's 64, but the
+    /// population is far smaller too: collisions are between indexes *on one
+    /// collection*, where a handful is typical. Checked at creation rather than
+    /// assumed, since two indexes sharing entries would be unrecoverable.
+    pub fn derive_id(name: &str) -> u32 {
+        const OFFSET: u32 = 0x811c_9dc5;
+        const PRIME: u32 = 0x0100_0193;
+
+        let mut hash = OFFSET;
+        for byte in name.as_bytes() {
+            hash ^= u32::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+        hash
+    }
+
     /// Conventional Mongo-style name, e.g. `age_1_name_-1`.
     pub fn default_name(fields: &[IndexField]) -> String {
         fields

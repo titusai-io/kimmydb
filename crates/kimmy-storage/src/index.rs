@@ -354,7 +354,18 @@ impl crate::Engine {
             }));
         }
 
-        let index = IndexMeta { id: meta.allocate_index_id(), name, fields, unique, enforcement };
+        // Derived from the name so every node agrees, which is what lets an
+        // index definition replicate at all.
+        let id = IndexMeta::derive_id(&name);
+        if let Some(existing) = meta.index_by_id(id) {
+            return Err(StorageError::Corrupt(format!(
+                "index id for {name:?} collides with existing index {:?} on {db}.{collection}; \
+                 rename one of them",
+                existing.name
+            )));
+        }
+
+        let index = IndexMeta { id, name, fields, unique, enforcement };
 
         let txn = self.db().begin_write()?;
 
@@ -414,8 +425,9 @@ impl crate::Engine {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             entries.retain_in(index_id_range(meta.id, index.id), |_, _| false)?;
         }
-        // The id is not returned to the pool: a future index reusing it would
-        // inherit any entry this drop failed to remove.
+        // Entries are removed above, in this same transaction, which is what
+        // makes it safe for an index later recreated under the same name to
+        // receive the same derived id — it cannot inherit anything.
         meta.indexes.retain(|i| i.name != name);
         crate::Engine::put_collection_meta(&txn, &meta)?;
         txn.commit()?;
@@ -1037,5 +1049,72 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn recreating_an_index_reuses_its_id_but_not_its_entries() {
+        // Ids are derived from the name, so a recreated index necessarily gets
+        // the same id. That makes purging on drop load-bearing: a surviving
+        // entry would be inherited and would point at a document that no longer
+        // satisfies the index.
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("item")], false, None)
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.insert(&coll, doc! { "_id": 1, "item": "widget" }).unwrap();
+
+        let first = coll.indexes[0].clone();
+        engine.drop_index("app", "docs", &first.name).unwrap();
+
+        // Recreate under the same name with the collection now empty.
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.delete(&coll, &kimmy_core::DocId::Int64(1)).unwrap();
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("item")], false, None)
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let second = &coll.indexes[0];
+
+        assert_eq!(second.id, first.id, "a derived id is stable across drop and recreate");
+        let key = kimmy_core::keyenc::encode(&bson::Bson::String("widget".into())).unwrap();
+        let found = engine.index_candidates(&coll, second.id, &key, &key).unwrap();
+        assert!(found.is_empty(), "the dropped index's entries must not be inherited");
+    }
+
+    #[test]
+    fn two_nodes_agree_on_an_index_id_whatever_the_creation_order() {
+        // The reason ids are derived: an index definition replicates, and its
+        // entries are keyed by id, so the two nodes must mean the same thing.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+
+        for engine in [&a, &b] {
+            engine.create_collection("shop", "orders").unwrap();
+        }
+        a.create_index("shop", "orders", vec![IndexField::ascending("email")], false, None)
+            .unwrap();
+        a.create_index("shop", "orders", vec![IndexField::ascending("status")], false, None)
+            .unwrap();
+
+        // Opposite order on the second node.
+        b.create_index("shop", "orders", vec![IndexField::ascending("status")], false, None)
+            .unwrap();
+        b.create_index("shop", "orders", vec![IndexField::ascending("email")], false, None)
+            .unwrap();
+
+        let id_of = |engine: &Engine, name: &str| {
+            engine
+                .get_collection("shop", "orders")
+                .unwrap()
+                .indexes
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .id
+        };
+        assert_eq!(id_of(&a, "email_1"), id_of(&b, "email_1"));
+        assert_eq!(id_of(&a, "status_1"), id_of(&b, "status_1"));
     }
 }

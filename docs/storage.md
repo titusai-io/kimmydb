@@ -76,6 +76,7 @@ erDiagram
 | `oplog` | `&[u8]` — 26 bytes (hlc \|\| node) | `OplogEntry` |
 | `oplog_arrival` | `u64` — local arrival sequence | oplog key |
 | `oplog_arrival_seq` | oplog key | `u64` |
+| `oplog_versions` | node id (16 bytes) | highest `Hlc` from that node |
 
 ### Why the keys are shaped this way
 

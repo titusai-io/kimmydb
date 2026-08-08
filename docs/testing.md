@@ -9,13 +9,13 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-525 tests passing · 0 failures · clippy clean at -D warnings
+548 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 105 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 137 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration |
+| `kimmy-core` | 114 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-storage` | 151 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
@@ -198,6 +198,27 @@ counterexamples:
 
 Worth repeating whenever a new invariant is added: break it on purpose, confirm
 the suite goes red, revert.
+
+---
+
+### A mutation check that found a real testing gap
+
+Worth recording because it changed a test rather than the code.
+
+`VersionVector::behind` returns the **lowest** point this node is behind at, so
+one request covers every peer it is behind on. Replacing `min` with `max` was
+caught immediately by the unit tests in `kimmy-core` — and **not at all** by the
+convergence tests in `kimmy-storage`, which passed unchanged.
+
+The reason is that those tests never built the situation that distinguishes the
+two: a node behind on two peers where what it is missing from one is stamped
+*earlier* than what it already holds from the other. Every scenario they set up
+happened to have the missing entries at the end.
+
+`a_node_behind_on_two_peers_at_different_points_receives_both` constructs that
+case deliberately, and now fails under the mutant with the exact message it was
+written for. The first version of it did not — it was written and commented as
+if verified before being checked, and the check is what caught that.
 
 ---
 

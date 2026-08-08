@@ -205,13 +205,29 @@ order differed.
 Ids are now derived from `(database, name)`, so every node computes the same
 answer with no coordination. [ADR-031](decisions.md).
 
+### Built: version vectors and anti-entropy ✅
+
+`oplog_versions` tracks `{node → max_hlc}`, maintained on every oplog append and
+rebuilt on open if it disagrees with the log. `VersionVector::behind` answers
+"where must a peer start sending", `entries_for_peer` produces the range, and
+`apply_batch` merges it. Unique-violation entries are excluded, as they must be.
+
+All of it is **transport-free** and tested between engines in one process:
+two-node convergence, three-node transitive convergence through a middle peer,
+conflicting writes agreeing on a winner, deletes replicating, and a stable
+second round that transfers nothing.
+
 ### Still missing
 
-- **Version vectors.** Nothing computes `{node → max_hlc}` yet; the roadmap's
-  "missing: the transport" understated this.
-- **The transport itself** — `foca` membership over UDP, TCP for oversized
-  payloads and for oplog range transfer.
-- **Anti-entropy must exclude `OpKind::UniqueViolation`** — see below.
+- **DDL replication.** A `Collection` oplog entry carries **no payload** — no
+  name, and no indication of create versus drop — so a peer cannot create the
+  collection an entry refers to. Index creation and vector configuration are
+  **not logged at all**. Until this is fixed, replication moves documents
+  between collections that already exist on both sides; `SyncOutcome`
+  counts what it had to skip rather than letting it look like convergence.
+- **The transport** — `foca` membership over UDP, TCP for oversized payloads
+  and oplog range transfer.
+- **Full resync** for a peer further behind than `oplog_retention_secs`.
 
 ### Uniqueness violation detection — committed for M4
 
