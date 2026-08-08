@@ -74,7 +74,7 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_CLUSTER_ENABLED")]
     pub cluster: bool,
 
-    /// Address for the gossip transport.
+    /// Address for the cluster replication transport.
     #[arg(long, env = "KIMMY_CLUSTER_BIND")]
     pub cluster_bind: Option<SocketAddr>,
 

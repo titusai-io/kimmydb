@@ -88,7 +88,7 @@ pub struct AuthConfig {
 #[serde(deny_unknown_fields, default)]
 pub struct ClusterConfig {
     pub enabled: bool,
-    /// Address the gossip transport binds to.
+    /// Address the cluster replication transport binds to (TCP).
     pub bind: SocketAddr,
     /// Where to look for peers. Re-resolved periodically, so a Kubernetes
     /// headless service picks up new pods without a restart.
@@ -168,7 +168,7 @@ impl Default for ClusterConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            bind: format!("0.0.0.0:{}", kimmy_cluster::DEFAULT_GOSSIP_PORT)
+            bind: format!("0.0.0.0:{}", kimmy_cluster::DEFAULT_CLUSTER_PORT)
                 .parse()
                 .expect("valid literal"),
             seeds: Vec::new(),

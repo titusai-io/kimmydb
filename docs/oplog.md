@@ -289,7 +289,7 @@ oplog_versions:  node id (16 bytes) -> Hlc (10 bytes)
 ```
 
 Maintained on every append rather than computed, because deriving it would mean
-scanning the whole log for a max-per-node — for a value read on every gossip
+scanning the whole log for a max-per-node — for a value read on every sync
 round. Like the arrival index it is derived state, and `Engine::open` rebuilds
 it if it disagrees with the oplog.
 
@@ -341,7 +341,7 @@ sequenceDiagram
     participant A as Node A
     participant B as Node B
 
-    Note over A,B: gossip carries version vectors<br/>{node_id → max_hlc_applied}
+    Note over A,B: each round carries version vectors<br/>{node_id → max_hlc_applied}
     A->>B: SWIM message + version vector
     Note over B: B sees A has entries B lacks
     B->>A: open TCP, request range (from_hlc, limit)

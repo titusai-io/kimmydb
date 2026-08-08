@@ -104,7 +104,7 @@ Image is ~93 MB (Debian slim runtime). Notes:
 - `kimmyd` is PID 1 with **no shell wrapper**, so it receives `SIGTERM` directly
   from `docker stop` and Kubernetes. Verified: exits cleanly in ~20 ms.
 - `/var/lib/kimmy` is a volume. **Losing it loses node identity**, not just data.
-- Ports: `7878/tcp` (HTTP), `7900/tcp+udp` (gossip, M4).
+- Ports: `7878/tcp` (HTTP), `7900/tcp` (replication). **TCP only** — there is no UDP listener.
 
 ### Kubernetes
 
@@ -121,7 +121,7 @@ spec:
   selector: { app: kimmy }
   ports:
     - { name: http,   port: 7878 }
-    - { name: gossip, port: 7900 }
+    - { name: cluster, port: 7900 }
 ---
 apiVersion: apps/v1
 kind: StatefulSet
