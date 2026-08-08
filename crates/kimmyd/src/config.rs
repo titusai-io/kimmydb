@@ -103,6 +103,12 @@ pub struct ClusterConfig {
     /// does not change every few seconds. But it must repeat — a node that
     /// resolved only at startup would never see a peer that joined later.
     pub discovery_interval_secs: u64,
+    /// Gossip membership over UDP, so the cluster agrees who is alive.
+    ///
+    /// On by default. With it off, peers come from discovery alone and each
+    /// node forms its own private opinion of liveness from failed connections —
+    /// workable, but two nodes can then disagree about a third indefinitely.
+    pub membership: bool,
     /// Peers contacted per round.
     ///
     /// A cap, not a quota: a cluster smaller than this contacts everyone.
@@ -175,6 +181,7 @@ impl Default for ClusterConfig {
             cluster_secret: None,
             sync_interval_secs: 5,
             discovery_interval_secs: 30,
+            membership: true,
             fanout: kimmy_cluster::DEFAULT_FANOUT,
         }
     }

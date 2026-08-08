@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-606 tests passing · 0 failures · clippy clean at -D warnings
+614 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -22,7 +22,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-api` | 58 | 31 unit (JSON boundary, errors, schema inference) + 27 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 18 | Config layering and validation |
-| `kimmy-cluster` | 36 | Discovery, wire protocol, handshake, and replication over real sockets |
+| `kimmy-cluster` | 44 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
 
@@ -338,6 +338,8 @@ manually and are recorded so they can be repeated:
 | Same unique value written on each side of a partition | ✅ both documents survived, availability preserved, and **both nodes reported the violation** — ADR-020 end to end |
 | Empty node joining a cluster whose history was collected | ✅ detected the horizon, fell back to a snapshot, received all 30 documents and the unique index |
 | A cluster with a dead seed alongside a live peer | ✅ replication converged, and the dead peer produced **one** warning rather than one per round |
+| Three daemons, the third told only about the first | ✅ it learned the second **by gossip** — the capability discovery cannot provide |
+| Killing a node in that cluster | ✅ both survivors independently declared it down, within milliseconds of each other |
 | That node afterwards | ✅ **exactly one** snapshot across many rounds, then ordinary incremental replication in both directions |
 | Schema 1 → 2 migration on two real databases | ✅ 3 collections and 11 oplog entries repointed in one, 2 and 1 in the other; login still works (the user store moves too), documents and their exact values survived |
 | Retention pass on a live node | ✅ 45 oplog entries and 15 tombstones collected; 15 live documents untouched |

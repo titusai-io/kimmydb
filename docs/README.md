@@ -7,7 +7,7 @@ around three things that are usually awkward to have together:
 1. **Change streams that work on one node.** No replica set, no cluster, no
    ceremony.
 2. **Leaderless clustering.** No primary, no elections, no quorum — peers gossip
-   state with one another and converge eventually.
+   membership and state with one another and converge eventually.
 3. **AI-native storage.** Embeddings maintained automatically per collection,
    and an MCP server running *inside* the database.
 

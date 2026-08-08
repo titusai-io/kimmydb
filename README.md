@@ -6,9 +6,9 @@ awkward to get together:
 - **Change streams on a single instance.** No replica set, no cluster, no
   ceremony. Start one container and subscribe to changes.
 - **Leaderless clustering.** No primary, no elections, no quorum. Nodes gossip
-  state directly with one another — each contacts a few peers per round, pulls
-  the oplog entries it is missing, and data reaches the whole cluster
-  transitively. Discovery is DNS or a Kubernetes headless Service.
+  membership over SWIM and gossip state by anti-entropy — each contacts a few
+  peers per round, pulls the oplog entries it is missing, and data reaches the
+  whole cluster transitively. Discovery is DNS or a Kubernetes headless Service.
 - **AI-native storage.** Embeddings are generated and maintained automatically
   per collection, and an MCP server runs *inside* the database so agents can
   query it directly.
@@ -195,7 +195,7 @@ Where the build departs from what was planned — and why — is tracked in
                     └──────┬───────┴─────────┬─────────────────┘
                            │   OPLOG (the spine)
                            ▼                 ▼
-                    change streams    kimmy-cluster (anti-entropy)
+                    change streams    kimmy-cluster (SWIM + anti-entropy)
 ```
 
 | Crate | Responsibility |
@@ -205,7 +205,7 @@ Where the build departs from what was planned — and why — is tracked in
 | `kimmy-query` | Filter and update operators, projection, sort, aggregation-lite |
 | `kimmy-vector` | Embedding providers, oplog-driven worker, HNSW, index selection, search |
 | `kimmy-auth` | Users, Argon2id, JWT, RBAC evaluation |
-| `kimmy-cluster` | Discovery, the replication protocol, anti-entropy, peer health |
+| `kimmy-cluster` | SWIM membership, discovery, the replication protocol, anti-entropy |
 | `kimmy-mcp` | MCP tools and resources — calls the same executor the REST routes do, so authorization cannot diverge |
 | `kimmy-api` | axum router, REST handlers, change-stream WebSocket, and the executor both edges share |
 | `kimmyd` | The server binary |

@@ -76,7 +76,11 @@ token_ttl_secs = 3600
 # are accepted anywhere and converge by last-writer-wins.
 enabled = false
 
-# Replication bind address (TCP; peers authenticate with cluster_secret).
+# Cluster bind address. Both protocols share it:
+#   UDP -- SWIM membership probes, so the cluster agrees who is alive
+#   TCP -- version vectors, oplog entries and snapshots
+#
+# Peers authenticate on the TCP side with cluster_secret.
 bind = "0.0.0.0:7900"
 
 # Where to look for peers, re-resolved periodically so new pods are picked up
@@ -102,6 +106,15 @@ sync_interval_secs = 5
 # not change every few seconds. But it must repeat -- a node that resolved only
 # at startup would never see a peer that joined after it.
 discovery_interval_secs = 30
+
+# Gossip membership over UDP, so the cluster forms a shared opinion about which
+# nodes are alive.
+#
+# With this off, peers come from discovery alone and each node forms its own
+# private opinion from failed connections -- workable, but two nodes can then
+# disagree about a third indefinitely, and a node absent from your seed list is
+# never learned about.
+membership = true
 
 # Peers contacted per anti-entropy round.
 #

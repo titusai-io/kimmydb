@@ -1,0 +1,99 @@
+//! SWIM membership over real UDP sockets.
+//!
+//! The unit tests cover identity and the live set. These cover the thing that
+//! cannot be checked without a network: that two nodes given nothing but each
+//! other's address actually converge on a shared view of who is alive, and
+//! notice when one stops answering.
+
+use std::net::SocketAddr;
+use std::time::Duration;
+
+use kimmy_cluster::{Members, SeedFeed};
+use tokio::net::UdpSocket;
+
+struct Node {
+    addr: SocketAddr,
+    members: Members,
+    announce: tokio::sync::mpsc::Sender<SocketAddr>,
+    handle: tokio::task::JoinHandle<()>,
+}
+
+async fn node() -> Node {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    let members = Members::default();
+    let (announce, feed) = SeedFeed::channel();
+
+    let handle = tokio::spawn(kimmy_cluster::membership::run(socket, addr, members.clone(), feed));
+    Node { addr, members, announce, handle }
+}
+
+/// Wait for a condition, failing rather than hanging.
+async fn eventually(label: &str, mut check: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if check() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for: {label}");
+}
+
+#[tokio::test]
+async fn two_nodes_discover_each_other() {
+    // One address each, no shared configuration beyond that.
+    let a = node().await;
+    let b = node().await;
+
+    a.announce.send(b.addr).await.unwrap();
+
+    eventually("a to see b", || a.members.snapshot().contains(&b.addr)).await;
+    // And membership is mutual: b learns about a without being told.
+    eventually("b to see a", || b.members.snapshot().contains(&a.addr)).await;
+}
+
+#[tokio::test]
+async fn a_third_node_is_learned_by_gossip_not_by_configuration() {
+    // The capability discovery cannot provide: C is told only about A, and A
+    // never announces B to it — yet C ends up knowing B.
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+
+    a.announce.send(b.addr).await.unwrap();
+    eventually("a and b to meet", || a.members.snapshot().contains(&b.addr)).await;
+
+    c.announce.send(a.addr).await.unwrap();
+
+    eventually("c to learn about b through a", || c.members.snapshot().contains(&b.addr)).await;
+    assert!(c.members.snapshot().contains(&a.addr));
+}
+
+#[tokio::test]
+async fn a_node_that_stops_answering_is_declared_down() {
+    // The other capability: a shared opinion that a peer is gone, rather than
+    // each node privately failing to connect forever.
+    let a = node().await;
+    let b = node().await;
+
+    a.announce.send(b.addr).await.unwrap();
+    eventually("a to see b", || a.members.snapshot().contains(&b.addr)).await;
+
+    // Kill b's membership task; its socket closes with it.
+    b.handle.abort();
+
+    eventually("a to declare b down", || !a.members.snapshot().contains(&b.addr)).await;
+}
+
+#[tokio::test]
+async fn a_node_does_not_list_itself() {
+    // Replication filters this too, but a member set that includes the local
+    // node would have it probing and syncing with itself.
+    let a = node().await;
+    let b = node().await;
+    a.announce.send(b.addr).await.unwrap();
+    eventually("a to see b", || a.members.snapshot().contains(&b.addr)).await;
+
+    assert!(!a.members.snapshot().contains(&a.addr));
+}
