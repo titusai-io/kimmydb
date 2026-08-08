@@ -57,8 +57,17 @@ impl Engine {
             let _ = txn.open_table(tables::DOCS)?;
             let _ = txn.open_table(tables::INDEX_ENTRIES)?;
             let _ = txn.open_table(tables::OPLOG)?;
+            let _ = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let _ = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
         }
         txn.commit()?;
+
+        // The arrival index is derived from the oplog, so a database written
+        // before it existed — or by a build that did not maintain it — is
+        // repaired rather than refused. That is why adding it needed no format
+        // version bump: there is no state here that the oplog does not already
+        // determine.
+        Self::rebuild_arrival_index_if_stale(&db)?;
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;
@@ -148,6 +157,53 @@ impl Engine {
         };
         txn.commit()?;
         Ok(id)
+    }
+
+    /// Rebuild the arrival index if it does not cover the oplog exactly.
+    ///
+    /// Cheap to check — two counts — and only pays the rebuild when something
+    /// is actually wrong: a database written before the index existed, or one
+    /// an older build appended to after this one had created it. Comparing
+    /// counts rather than contents is enough because the index is only ever
+    /// written alongside an oplog append and collected alongside an oplog
+    /// removal, so a length mismatch is the only way it can diverge.
+    ///
+    /// Existing history is ordered by stamp, which is correct: everything
+    /// written before this index existed was locally originated, and for local
+    /// writes arrival order *is* stamp order.
+    fn rebuild_arrival_index_if_stale(db: &Database) -> Result<()> {
+        {
+            let txn = db.begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            if oplog.iter()?.count() == arrival.iter()?.count() {
+                return Ok(());
+            }
+        }
+
+        let txn = db.begin_write()?;
+        let rebuilt = {
+            let oplog = txn.open_table(tables::OPLOG)?;
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+            arrival.retain(|_, _| false)?;
+            by_stamp.retain(|_, _| false)?;
+
+            let mut seq = 0u64;
+            for row in oplog.iter()? {
+                let (key, _) = row?;
+                arrival.insert(seq, key.value())?;
+                by_stamp.insert(key.value(), seq)?;
+                seq += 1;
+            }
+            seq
+        };
+        txn.commit()?;
+
+        if rebuilt > 0 {
+            info!(entries = rebuilt, "rebuilt the oplog arrival index");
+        }
+        Ok(())
     }
 
     /// The highest stamp in the oplog, used to resume the logical clock.
@@ -424,11 +480,27 @@ impl Engine {
 /// and the data can never disagree — there is no window in which a document is
 /// updated but unlogged, or logged but not applied.
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
+    let key = codec::oplog_key(&entry.stamp);
     let mut oplog = txn.open_table(tables::OPLOG)?;
-    oplog.insert(
-        codec::oplog_key(&entry.stamp).as_slice(),
-        codec::encode_oplog_entry(entry).as_slice(),
-    )?;
+    let existed =
+        oplog.insert(key.as_slice(), codec::encode_oplog_entry(entry).as_slice())?.is_some();
+
+    // Re-appending an entry we already hold must not give it a second arrival
+    // position. Peers resend overlapping ranges routinely, and a duplicate
+    // arrival entry would deliver the same change twice to every stream.
+    if existed {
+        return Ok(());
+    }
+
+    let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+    let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+
+    // The counter lives in the index rather than in `meta` so that it cannot
+    // drift from the thing it counts: rebuilding the index also rebuilds the
+    // counter, and there is no third place for them to disagree.
+    let next = arrival.last()?.map_or(0, |(seq, _)| seq.value() + 1);
+    arrival.insert(next, key.as_slice())?;
+    by_stamp.insert(key.as_slice(), next)?;
     Ok(())
 }
 

@@ -39,6 +39,32 @@ pub const INDEX_ENTRIES: TableDefinition<IndexKey<'static>, ()> =
 /// already sorts in exactly the total write order.
 pub const OPLOG: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog");
 
+/// `arrival sequence -> (hlc || node)`.
+///
+/// The oplog is keyed by *origin* stamp, because that is what last-writer-wins
+/// and anti-entropy compare. A replicated entry therefore lands at its original
+/// position, which may be **behind** the local tail — and a change-stream
+/// subscriber already past that point would never see it.
+///
+/// So streams follow this second ordering instead: a monotonic counter assigned
+/// when an entry is appended *here*, which is by construction append-only no
+/// matter where the entry came from. On a single node the two orderings agree
+/// exactly, which is why single-node semantics are unchanged.
+///
+/// Both this and [`OPLOG_ARRIVAL_SEQ`] are **derived** from [`OPLOG`] — see
+/// `Engine::rebuild_arrival_index`. Nothing is lost if they are discarded.
+pub const OPLOG_ARRIVAL: TableDefinition<u64, &[u8]> = TableDefinition::new("oplog_arrival");
+
+/// `(hlc || node) -> arrival sequence`. The reverse of [`OPLOG_ARRIVAL`].
+///
+/// Exists so that resuming a stream stays a point lookup. A resume token names
+/// an entry by stamp — it is a public, opaque contract that predates this index
+/// and clients hold them across upgrades — and finding where that entry sits in
+/// arrival order would otherwise be a scan, since stamp order and arrival order
+/// differ precisely when it matters.
+pub const OPLOG_ARRIVAL_SEQ: TableDefinition<&[u8], u64> =
+    TableDefinition::new("oplog_arrival_seq");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";

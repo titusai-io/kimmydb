@@ -105,6 +105,13 @@ impl Engine {
         let mut removed = 0usize;
         {
             let mut oplog = txn.open_table(tables::OPLOG)?;
+            let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
+            let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
+
+            // Collected in one transaction with the entries themselves, so the
+            // arrival index can never point at something that is gone. A stream
+            // reading it mid-collection sees either state, never a mixture.
+            let mut dropped_keys: Vec<Vec<u8>> = Vec::new();
             oplog.retain(|key, _| {
                 let Ok(stamp) = codec::decode_oplog_key(key) else {
                     // An entry whose key will not decode cannot be aged, so it
@@ -121,9 +128,16 @@ impl Engine {
                 let expired = stamp.hlc < cutoff;
                 if expired {
                     removed += 1;
+                    dropped_keys.push(key.to_vec());
                 }
                 !expired
             })?;
+
+            for key in dropped_keys {
+                if let Some(seq) = by_stamp.remove(key.as_slice())? {
+                    arrival.remove(seq.value())?;
+                }
+            }
         }
         txn.commit()?;
         Ok(removed)
