@@ -66,15 +66,34 @@ there. With index maintenance already free on writes, an index is close to free
 in both directions. `MAX_LIMIT = 10_000` is now checked, not guessed: a full
 10,000-document scan is ~8 ms.
 
+### The native-dependency check
+
+`scripts/check-native-deps.sh`, wired into CI. It fails when the **default**
+build gains a package matching a native-toolchain indicator (`cc`, `cmake`,
+`bindgen`, `pkg-config`, `*-sys`, `*-src`) that is not on
+`scripts/allowed-native-deps.txt` — currently one entry, `cc`, with its reason.
+
+This is the ADR-016 rule made enforceable. The property "no C toolchain" was
+false for two milestones because it lived in prose; what is checkable is the
+narrower rule that replaced it — do not add a *second* native stack. Adding one
+stays allowed, it just has to be a line in a diff.
+
+Its first version exited 1 for the wrong reason: under `set -e`, an allowlist
+of only comments made `grep` return non-zero and killed the script before it
+printed anything. A passing failure — found by running the failure path, not
+the happy one. Both failure paths are now driven and recorded in
+[Testing](testing.md).
+
 ### What is left in M5
+
+the maintainer asked for **one branch and PR per remaining item**. Each is independent:
 
 | Item | Note |
 |---|---|
-| TLS between nodes | The last security gap. Needs a trust decision before code: `cluster_secret` already authenticates with a mutual HMAC challenge, so TLS would add confidentiality — the question is operator certificates versus binding the channel to the existing secret |
+| TLS between nodes | **Decided:** bind the channel to `cluster_secret`. Self-signed certs per node, no cert verification, but the existing HMAC handshake also signs the TLS exporter (RFC 5705) — a man-in-the-middle running two sessions gets different exporters and the proof fails. Real MITM resistance, no certificate distribution |
 | Backup / restore | Cold file copy only |
 | `kimmy` CLI | Still a stub that points at the HTTP API |
 | Audit log, richer metrics | |
-| A CI check for native build dependencies | What would have caught the ADR-016 drift, and the audit above |
 
 ### Carried debt, none blocking
 

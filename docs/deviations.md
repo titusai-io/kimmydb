@@ -164,7 +164,7 @@ too **narrow** — silently wrong. Deliberately slow rather than possibly wrong.
 
 ---
 
-## 🔴 The "no C toolchain" property has not held since M2
+## 🟡 The "no C toolchain" property has not held since M2 — now enforced
 
 **Claimed.** ADR-001 chose redb over RocksDB and ADR-016 chose `rust_crypto`
 over `aws_lc_rs` to keep the build free of a native toolchain. This register
@@ -191,9 +191,22 @@ mechanism that would catch the next such drift.
 `ring` is already paid for; `aws-lc-rs` would add CMake for the same primitives.
 That is what selected the TLS provider in [ADR-039](decisions.md).
 
-**To close.** A CI check that fails when the dependency graph gains a crate with
-a `build.rs` invoking a C compiler. Then the property is enforced instead of
-asserted.
+**Closed as far as it can be.** `scripts/check-native-deps.sh` runs in CI and
+fails when the default build gains a package matching a native-toolchain
+indicator — `cc`, `cmake`, `bindgen`, `pkg-config`, `*-sys`, `*-src` — that is
+not on `scripts/allowed-native-deps.txt`. The allowlist currently holds one
+entry, `cc`, with the reason beside it.
+
+Downgraded from 🔴 to 🟡 rather than 🟢 because the *claim* was wrong for two
+milestones and nothing brought it back to true; what changed is that the next
+such drift now fails a build instead of sitting in prose. Adding native code is
+still allowed — it just has to be a deliberate line in a diff.
+
+**Worth noting about the check itself:** its first version exited 1 for the
+wrong reason. With `set -e`, an allowlist holding only comments made `grep`
+return non-zero and killed the script *before it printed anything* — a passing
+failure, which is precisely the class of bug this register exists to catch. It
+was found by running the failure path rather than only the happy one.
 
 ---
 
