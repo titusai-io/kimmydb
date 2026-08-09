@@ -10,6 +10,7 @@
 #![allow(dead_code)]
 
 pub mod audit;
+pub mod egress;
 pub mod error;
 pub mod exec;
 pub mod json;
@@ -21,6 +22,7 @@ pub mod state;
 pub mod users;
 pub mod vectors;
 pub mod watch;
+pub mod webhooks;
 
 use std::sync::Arc;
 
@@ -48,6 +50,17 @@ pub fn state(
     insecure_no_auth: bool,
     limits: RateLimits,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
+    state_with_egress(engine, tokens, insecure_no_auth, limits, egress::EgressPolicy::default())
+}
+
+/// As [`state`], with an egress policy for webhooks.
+pub fn state_with_egress(
+    engine: Arc<Engine>,
+    tokens: TokenIssuer,
+    insecure_no_auth: bool,
+    limits: RateLimits,
+    egress: egress::EgressPolicy,
+) -> Result<SharedState, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
     Ok(Arc::new(AppState {
         engine,
@@ -57,6 +70,7 @@ pub fn state(
         insecure_no_auth,
         limits,
         metrics: Metrics::default(),
+        egress,
     }))
 }
 

@@ -19,6 +19,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub auth: AuthConfig,
     pub cluster: ClusterConfig,
+    pub webhooks: WebhookConfig,
     pub audit: AuditConfig,
     pub log: LogConfig,
 }
@@ -231,6 +232,21 @@ pub enum LogFormat {
     Pretty,
     /// One JSON object per line, for log shippers.
     Json,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct WebhookConfig {
+    /// Hosts a webhook may target beyond the public internet.
+    ///
+    /// Empty by default, which means public addresses only. Loopback,
+    /// link-local (169.254.0.0/16 — cloud metadata) and RFC1918 ranges are
+    /// refused unless the host is named here, because otherwise anyone who can
+    /// register a webhook can make this node probe its own network.
+    ///
+    /// Naming a host exempts it from the address checks entirely, so add only
+    /// the ones you mean.
+    pub allowed_hosts: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

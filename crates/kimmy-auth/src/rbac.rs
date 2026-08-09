@@ -17,6 +17,15 @@ pub enum Action {
     Watch,
     /// Vector and hybrid search.
     Search,
+    /// Register a webhook: an endpoint the node pushes change events to.
+    ///
+    /// Independent of `watch`, deliberately, even though the two carry the same
+    /// events. A change stream ends when the client disconnects and dies with
+    /// the token that opened it; a webhook keeps sending to an address the
+    /// grant never named, long after that token expires. Handing out an egress
+    /// path is a different act from being allowed to read, so it is granted
+    /// separately rather than arriving bundled with reading.
+    Webhook,
     /// Create/drop collections, manage indexes and users.
     Admin,
 }
@@ -33,6 +42,9 @@ impl Action {
             Action::Write => &[Action::Write, Action::Admin],
             Action::Watch => &[Action::Watch, Action::Admin],
             Action::Search => &[Action::Search, Action::Read, Action::Write, Action::Admin],
+            // Only `Admin` implies it. `Watch` deliberately does not: see the
+            // variant's documentation.
+            Action::Webhook => &[Action::Webhook, Action::Admin],
             Action::Admin => &[Action::Admin],
         }
     }

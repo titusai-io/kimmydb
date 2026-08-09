@@ -437,15 +437,15 @@ high-water mark per batch rather than a record per event.
 
 | # | Task | Notes |
 |---|---|---|
-| 1 | **`webhook` RBAC action** | Add to `Action`, decide implication: `admin` implies it; `read`/`write`/`watch` do **not**. Independent, like `watch` ([ADR-014](decisions.md)) |
-| 2 | **Subscription registry** | `__kimmy.__webhooks`: url, collection, operation filter, secret, state, created-by. A collection, so it replicates, backs up and restores unchanged |
+| 1 | ✅ **`webhook` RBAC action** | Add to `Action`, decide implication: `admin` implies it; `read`/`write`/`watch` do **not**. Independent, like `watch` ([ADR-014](decisions.md)) |
+| 2 | ✅ **Subscription registry** | `__kimmy.__webhooks`: url, collection, operation filter, secret, state, created-by. A collection, so it replicates, backs up and restores unchanged |
 | 3 | **Progress records** | `__kimmy.__webhook_progress`, `_id = {subscription}:{node}`, holding a `VersionVector`. Written only by its own node, so conflict-free by construction |
-| 4 | **Registration API** | `POST/GET/DELETE /v1/db/{db}/coll/{coll}/webhooks`, gated on `webhook`. Deliberately **no MCP tool** at first: registering an egress path is not a reading act |
+| 4 | ✅ **Registration API** | `POST/GET/DELETE /v1/db/{db}/coll/{coll}/webhooks`, gated on `webhook`. Deliberately **no MCP tool** at first: registering an egress path is not a reading act |
 | 5 | **Ownership** | Rendezvous hash over `Members::snapshot()`. Must degrade correctly with clustering off — a single node owns everything — and when membership is momentarily empty |
 | 6 | **Dispatcher worker** | One per node. Computes owned subscriptions, reads union progress, uses `VersionVector::behind` to find undelivered entries, batches by size and max delay so a bulk load is not one request per document |
 | 7 | **Delivery** | HTTP POST, change-stream event shape, timeout, `X-Kimmy-Event-Id` and `X-Kimmy-Signature` headers |
 | 8 | **Signing** | HMAC-SHA256 over the body with a per-subscription secret, plus a timestamp against replay. `hmac`/`sha2` are already in the build for the cluster handshake |
-| 9 | **Egress policy** | Resolve the host and check the **resolved** address, refuse redirects, block loopback/link-local/RFC1918 unless allowlisted. A name that is public at registration must not be able to point inward at delivery |
+| 9 | ✅ **Egress policy** — registration-time checking done; the re-check before each delivery lands with the dispatcher | Resolve the host and check the **resolved** address, refuse redirects, block loopback/link-local/RFC1918 unless allowlisted. A name that is public at registration must not be able to point inward at delivery |
 | 10 | **Failure handling** | Exponential backoff; invalidate the subscription when its progress falls past `oplog_retention_secs`, exactly as a lagging change-stream consumer gets `410` |
 | 11 | **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_subscriptions`, backlog age; an audit record on register and remove, since registering one grants ongoing egress |
 | 12 | **Tests** | A local receiver over a real socket: delivery, batching, signature verification, retry after failure, invalidation past retention, a deleted subscription stopping, ownership failover with a node removed from the member set, and that a private-range URL is refused |

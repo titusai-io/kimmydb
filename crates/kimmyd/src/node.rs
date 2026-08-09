@@ -63,8 +63,15 @@ pub async fn run(config: Config) -> Result<()> {
     kimmy_api::audit::set_mode(audit);
     info!(mode = audit.name(), "audit logging");
 
-    let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth, limits)
-        .context("building the API state")?;
+    let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
+    let state = kimmy_api::state_with_egress(
+        Arc::clone(&engine),
+        tokens,
+        config.auth.insecure_no_auth,
+        limits,
+        egress,
+    )
+    .context("building the API state")?;
 
     // MCP shares the state rather than being handed its own, so an agent tool
     // and the REST route beside it reach the same engine through the same

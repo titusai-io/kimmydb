@@ -35,6 +35,8 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/find", post(find_docs_post))
         .route("/v1/db/{db}/coll/{coll}/count", post(count_docs))
         .route("/v1/db/{db}/coll/{coll}/aggregate", post(aggregate_docs))
+        .route("/v1/db/{db}/coll/{coll}/webhooks", get(list_webhooks).post(register_webhook))
+        .route("/v1/db/{db}/coll/{coll}/webhooks/{id}", delete(remove_webhook))
         .route("/v1/db/{db}/coll/{coll}/update", post(update_docs))
         .route("/v1/db/{db}/coll/{coll}/delete", post(delete_docs))
         .route(
@@ -356,6 +358,35 @@ async fn aggregate_docs(
     Json(body): Json<AggregateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline)?))
+}
+
+// ---------------------------------------------------------------------------
+// Webhooks
+// ---------------------------------------------------------------------------
+
+async fn register_webhook(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<crate::webhooks::RegisterRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::webhooks::register(&state, &auth, &db, &coll, &body, &state.egress)?))
+}
+
+async fn list_webhooks(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::webhooks::list(&state, &auth, &db, &coll)?))
+}
+
+async fn remove_webhook(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll, id)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(crate::webhooks::remove(&state, &auth, &db, &coll, &id)?))
 }
 
 async fn get_doc(
