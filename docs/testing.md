@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-639 tests passing · 0 failures · clippy clean at -D warnings
+640 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -554,7 +554,7 @@ Honest list of what is not covered:
 
 | Gap | Notes |
 |---|---|
-| Benchmarks are partial | The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline |
+| Benchmarks are partial | The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline |
 | No fuzzing | The codecs are the obvious target |
 | No multi-node tests | Nothing to test until M4 |
 | No crash-consistency tests | redb is trusted for durability |

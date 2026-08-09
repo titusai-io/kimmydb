@@ -33,7 +33,7 @@ fails fast on a bad volume mount.
 
 | TOML | Env | Default | Notes |
 |---|---|---|---|
-| `server.bind` | `KIMMY_BIND` | `0.0.0.0:7878` | HTTP, WebSocket, and (M3) MCP |
+| `server.bind` | `KIMMY_BIND` | `0.0.0.0:7878` | HTTP, WebSocket, and MCP |
 | `storage.data_dir` | `KIMMY_DATA_DIR` | `/var/lib/kimmy` | Holds `kimmy.redb` |
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents *and* dropped collections |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
@@ -55,7 +55,7 @@ fails fast on a bad volume mount.
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Identical on every node.** ≥16 bytes |
 | `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
 | `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only |
-| `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | 📋 M4 |
+| `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
 | `cluster.seeds` | `KIMMY_SEEDS` | `[]` | Naming seeds implies `enabled` |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | — | Required when clustering |
@@ -213,9 +213,10 @@ spec:
         resources: { requests: { storage: 10Gi } }
 ```
 
-> Clustering lands in M4. Until then each pod is an **independent database** —
-> the seeds setting is accepted and validated but nothing replicates. Run
-> `replicas: 1` for now unless you genuinely want independent instances.
+> **`KIMMY_CLUSTER_BIND` is not optional here.** Without it the node advertises
+> loopback and SWIM never forms — replication still converges through discovery,
+> which is what makes the misconfiguration look healthy. The downward-API
+> snippet above is the fix.
 
 A headless Service resolving to every ready pod IP is exactly the seed set a
 SWIM member needs, which is why `k8s:` discovery is a one-liner.
@@ -230,7 +231,7 @@ SWIM member needs, which is why `k8s:` discovery is a one-liner.
 | `static:10.0.0.1:7900,10.0.0.2:7900` | Explicit list |
 | `10.0.0.1:7900` | Shorthand for one static peer |
 
-Parsing is implemented and tested; resolution lands in M4.
+Parsing is implemented and tested; **resolution is still not implemented** — `dns-srv:` returns an error. It needs a resolver that can read SRV records, which the standard library does not expose. `dns:` and `k8s:` both work.
 
 ---
 

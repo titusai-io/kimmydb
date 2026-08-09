@@ -19,7 +19,8 @@ base64.workspace = true
 proptest.workspace = true
 
 [features]
-# In-process ONNX embedding. Off by default: it pulls native ONNX Runtime
-# binaries, which would undo the pure-Rust property that motivated choosing
-# redb over RocksDB (ADR-001) and rust_crypto over aws_lc_rs (ADR-016).
+# In-process ONNX embedding. Off by default: it pulls ONNX Runtime as native
+# binaries plus OpenSSL — hundreds of megabytes and a separate runtime. The
+# build is not toolchain-free anyway (ADR-016), but this is a different order
+# of cost from a crate that builds some C with `cc`.
 local-embeddings = []

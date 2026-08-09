@@ -6,63 +6,70 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5: the write path measured, and a wrong number corrected
+## As of 2026-08-08 — M5: docs audited for accuracy, planner measured
 
-**Branch:** `m5-write-benchmarks`, off `main` (PRs #16-#19 all merged).
+**Branch:** `m5-doc-accuracy-and-planner`, off `main` (PRs #16–#20 merged).
 Not merged.
 **Gate:** 640 tests · fmt clean · clippy clean at `-D warnings`.
 
-### First: a correction
+### The documentation was audited, and it was wrong in several places
 
-The previous handoff recorded that `put_vectors` costs ~50-65 ms, implying
-vector ingest of **15-20 documents per second**. **That was wrong by roughly six
-times.** It is 5.67 ms for a single chunk — about 176 documents per second.
+the maintainer asked for stale and incorrect documentation to be fixed rather than left.
+A sweep found more than the one number that prompted it:
 
-The figure was never measured. It was inferred from how long a *test* took
-divided by the writes inside it — and that test ran in a **debug** binary while
-every benchmark runs in release, with a graph build and ten searches also inside
-the same stopwatch. A timing taken as a by-product of measuring something else
-inherits the other thing's build profile and everything else sharing the clock.
-It is an anecdote, not a measurement. Kept in
-[Benchmarks](benchmarks.md#a-number-published-here-was-wrong) rather than quietly
-deleted, because the wrong number was acted on.
-
-### What the write path actually costs
-
-| Operation | Cost |
-|---|---:|
-| `insert`, no secondary index | 3.52 ms |
-| `insert`, one secondary index | 3.37 ms |
-| `insert`, two secondary indexes | 3.53 ms |
-| `replace` | 3.38 ms |
-| `put_vectors`, 1 chunk | 5.67 ms |
-| `put_vectors`, 4 chunks | 18.51 ms |
-
-**Two findings worth carrying forward:**
-
-1. **Secondary indexes are free on the write path.** Zero, one and two cost the
-   same within noise, which contradicts the usual intuition that indexes make
-   writes slower — and that intuition shapes how people design schemas.
-2. **Everything costs exactly one durable commit** (~3.4 ms). The mutation and
-   its oplog entry share one transaction ([ADR-008](decisions.md)), and that
-   commit swamps index maintenance, document size and record shape. `delete` +
-   `insert` is 6.8 ms because it is two commits.
-
-So the lever for ingest throughput is **batching mutations into one
-transaction**, and nothing in the API offers that — every route commits per
-operation. That is the obvious next thing if ingest rate ever matters, and it is
-the ceiling the embedding worker runs against.
-
-### Next in M5
-
-| Item | Note |
+| Was | Reality |
 |---|---|
-| Index-backed vs scanned `find` | The planner's premise is still unmeasured, and now the more interesting gap given indexes cost nothing to maintain |
-| `MAX_LIMIT = 10_000` | Still a guess |
-| TLS between nodes | Needs a trust decision before code — `cluster_secret` authenticates but does not encrypt |
-| Aggregation pipeline | Biggest single feature; unblocks the MCP `aggregate` tool and `$vectorSearch` |
-| Backup / restore, `kimmy` CLI, audit log | |
-| A CI check for native build dependencies | What would have caught the ADR-016 drift |
+| `docs/README.md`: "Gossip clustering — 📋 Planned (M4)" | M4 shipped three PRs ago |
+| `docs/README.md`: "nothing transports [replication] between nodes yet" | It has been driven on real daemons and in containers |
+| `docs/change-streams.md`: "replicated writes may land behind the stream position" | **Solved** by the arrival index (ADR-030) — this documented a fixed bug as a live limitation |
+| `docs/oplog.md`: "full resync needed (M4)" | Snapshot resync is built (ADR-036) |
+| Five places still citing the 2,000-vector threshold | It is 500 since the benchmark branch |
+| ADR-021 and six code comments citing the "pure-Rust property" | Corrected in ADR-016 — the build has carried `ring` since M2 |
+| `index.rs` error text: "coordinated … lands in M4" | User-facing, and wrong: M4 landed, coordinated did not |
+| `docs/operations.md`: "clustering lands in M4, run replicas: 1" | Replaced with the `KIMMY_CLUSTER_BIND` requirement that actually matters |
+
+The retracted `put_vectors` figure is now a short note that does not repeat the
+wrong numbers, since a reader skimming it could otherwise carry them away.
+
+**The pattern worth noting:** every one of these was true when written. Nothing
+in the process catches a doc that quietly becomes false because the code moved
+under it — which is the same failure mode as the ADR-016 drift, and it argues
+for the same fix: checks that fail, not claims that are asserted.
+
+### The planner's premise, measured
+
+10,000 documents, one equality filter, selectivity as the dial:
+
+| Matching | Indexed | Scan |
+|---:|---:|---:|
+| 1 | 0.003 ms | 8.085 ms |
+| 100 | 0.171 ms | 8.133 ms |
+| 1,000 | 1.670 ms | 7.905 ms |
+| 5,000 | 8.288 ms | 7.911 ms |
+
+A scan is flat at ~0.8 µs per document; the indexed path is ~1.66 µs per
+candidate. **A random read costs about twice a sequential one, so an index wins
+exactly when it eliminates more than half the collection** — and the measured
+crossover sits there.
+
+Together with "indexes are free on the write path", an index is close to free in
+both directions. The planner has no statistics and will use one whenever it
+applies, including where a scan would be marginally faster; the worst case
+measured is 8.3 ms against 7.9 ms, which is why statistics are not worth
+building.
+
+**`MAX_LIMIT = 10_000` is now checked rather than guessed** — a full scan of
+exactly 10,000 documents is ~8 ms, so the cap bounds an unindexed query at
+single-digit milliseconds. Unchanged.
+
+### Next: aggregation, the last big M5 feature
+
+Nothing is blocked. `$match`, `$group`, `$unwind`, `$project`, `$sort`,
+`$limit` — it also unblocks the MCP `aggregate` tool, which has been advertised
+as planned since M3, and the `$vectorSearch` stage.
+
+Then: node↔node TLS (needs a trust decision first), backup/restore, the `kimmy`
+CLI, audit log, and a CI check for native build dependencies.
 
 ### Carried debt, none blocking
 

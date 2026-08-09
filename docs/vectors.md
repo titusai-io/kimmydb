@@ -99,8 +99,10 @@ credential.
 failing later on the first write — a misconfiguration should surface when you
 make it, not when traffic arrives. The reason it is not the default at all is
 recorded in [Deviations](deviations.md): its dependencies pull native ONNX
-Runtime *and* OpenSSL, which would undo the pure-Rust property that motivated
-choosing redb ([ADR-001](decisions.md)) and `rust_crypto` ([ADR-016](decisions.md)).
+Runtime *and* OpenSSL — hundreds of megabytes and a separate runtime. Note the
+default build is **not** free of a native toolchain and has not been since M2;
+that claim was corrected in [ADR-016](decisions.md). ONNX is still gated because
+it is a different order of cost, not because the build is otherwise pristine.
 
 ### Chunking
 
@@ -262,7 +264,7 @@ choose, and cannot tell which ran except by speed.
 graph TD
     Q["vector_search"] --> A{"IndexCache::access"}
     A -->|"metric is dot"| E["Exact scan<br/>score every vector"]
-    A -->|"< 2000 vectors"| E
+    A -->|"< 500 vectors"| E
     A -->|"build failed"| E
     A -->|"otherwise"| H["HNSW walk<br/>candidates only"]
     H --> S["Rescore from storage"]
@@ -289,7 +291,7 @@ every request rather than being rebuilt per query.
 
 | Rule | Threshold | Why |
 |---|---|---|
-| Minimum size | 2000 vectors | Below that, scanning beats building *and* walking a graph. Deliberately conservative, not a measured optimum |
+| Minimum size | 500 vectors | **Measured** — see [Benchmarks](benchmarks.md). The graph is faster at every size tested, so this is not a crossover; it is the point where one build repays itself in about a dozen queries |
 | Staleness detection | a per-collection generation counter | Counting vectors would be O(n) per query, and a count cannot see a delete-then-add that leaves the total unchanged. A counter is exact and free |
 | Rebuild interval | 30 s | Rebuilding per write would rebuild continuously under load, and each rebuild is O(n log n) |
 | Build failure | fall back to exact | An optimisation that cannot be built must not fail a query |

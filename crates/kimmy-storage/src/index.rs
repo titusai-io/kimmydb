@@ -350,7 +350,8 @@ impl crate::Engine {
         }
         if enforcement == Enforcement::Coordinated {
             return Err(StorageError::Core(CoreError::Unsupported(
-                "coordinated unique enforcement needs clustering, which lands in M4; use \
+                "coordinated unique enforcement is reserved and not implemented; it needs \
+                 value-ownership routing, which trades availability for the guarantee. Use \
                  \"local\" enforcement, whose cross-node limits are documented"
                     .into(),
             )));

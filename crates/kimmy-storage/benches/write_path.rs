@@ -1,15 +1,16 @@
 //! The write path, and what a secondary index costs it.
 //!
-//! Written after a wrong number was published. The vector benchmark's fixture
-//! setup looked like ~50-65 ms per stored vector, and that got recorded as an
-//! observation implying vector ingest around 15-20 documents per second. It was
-//! wrong by roughly six times: the figure came from a **debug** test binary,
-//! while the benchmarks that produced the search numbers run in release.
+//! Written after a figure was published that had never been measured: a
+//! `put_vectors` cost inferred from how long a *test* took divided by the writes
+//! inside it. That test was a debug binary while benchmarks run in release, and
+//! its timing also contained a graph build and ten searches. The estimate was
+//! about six times too slow. See the retraction in
+//! [Benchmarks](../../../docs/benchmarks.md).
 //!
-//! The lesson is worth more than the number. A timing taken as a by-product of
-//! measuring something else inherits whatever the other thing was compiled and
-//! configured as — so it is not a measurement, it is an anecdote. Anything
-//! quoted as a rate belongs in a harness that states its own conditions.
+//! The lesson outlives the number. A timing taken as a by-product of measuring
+//! something else inherits whatever the other thing was compiled and configured
+//! as — it is an anecdote, not a measurement. Anything quoted as a rate belongs
+//! in a harness that states its own conditions, which is what this is.
 //!
 //! What is measured here:
 //!

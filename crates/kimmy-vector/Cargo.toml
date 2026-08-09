@@ -33,8 +33,9 @@ tokio = { workspace = true, features = ["sync", "rt", "time", "macros"] }
 hnsw_rs = "0.3.4"
 
 [features]
-# In-process ONNX embedding. Off by default: it pulls native ONNX Runtime
-# binaries, undoing the pure-Rust property behind ADR-001 and ADR-016.
+# In-process ONNX embedding. Off by default: it pulls ONNX Runtime as native
+# binaries plus OpenSSL — hundreds of megabytes and a separate runtime, a
+# different order of cost from the `ring` the build already carries (ADR-016).
 local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
 
 [dev-dependencies]

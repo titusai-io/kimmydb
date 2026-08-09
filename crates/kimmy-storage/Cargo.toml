@@ -31,3 +31,7 @@ tokio = { workspace = true, features = ["full", "test-util"] }
 [[bench]]
 name = "write_path"
 harness = false
+
+[[bench]]
+name = "query_path"
+harness = false

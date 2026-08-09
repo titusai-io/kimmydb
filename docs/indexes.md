@@ -169,6 +169,27 @@ re-applied regardless.
 | A range on a **descending** field | Inverted encoding swaps which end each bound belongs to; getting it backwards yields a range that is too **narrow**. Falls back to the equality prefix |
 | The **second end** of a two-sided range | See below — an array field can satisfy each bound with a *different element* |
 
+### When an index is worth it — measured
+
+| Matching documents (of 10,000) | Indexed | Scan |
+|---:|---:|---:|
+| 1 | 0.003 ms | 8.1 ms |
+| 100 | 0.171 ms | 8.1 ms |
+| 1,000 | 1.67 ms | 7.9 ms |
+| 5,000 | 8.29 ms | 7.9 ms |
+
+A scan is flat — it reads everything either way, at ~0.8 µs per document. The
+indexed path costs ~1.66 µs per candidate and reads only candidates. A random
+read is about twice a sequential one, so **an index wins whenever it eliminates
+more than half the collection**, and the measured crossover sits exactly there.
+
+The planner has no statistics, so it uses an index whenever one applies —
+including on the unselective filters where a scan would be marginally faster.
+That costs 8.3 ms against 7.9 ms in the worst case measured, which is why
+statistics have not been worth building. Full numbers in
+[Benchmarks](benchmarks.md).
+
+
 A conjunction *containing* an `$or` still uses its other conjuncts —
 `{a: 1, $or: [...]}` narrows on `a == 1`, which must hold for every match.
 
@@ -234,7 +255,7 @@ everywhere during a partition cannot also guarantee it. Full reasoning in
 | `enforcement` | Reach | Availability | Status |
 |---|---|---|---|
 | `local` (default) | The accepting node. Cross-node violations are **detected after merge**, not prevented | Full | ✅ |
-| `coordinated` | Cluster-wide, by reserving the value at its owning node | That value's writes fail while its owner is unreachable | 📋 M4 — refused with `501` until then |
+| `coordinated` | Cluster-wide, by reserving the value at its owning node | That value's writes fail while its owner is unreachable | **Reserved, not implemented** — refused with `501`. Clustering shipped in M4; this did not, because it trades availability for the guarantee |
 
 **`_id` needs none of this.** Two nodes inserting the same `_id` collide on one
 key and last-writer-wins converges them to a single document, so primary-key

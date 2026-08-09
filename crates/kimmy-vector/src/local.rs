@@ -1,9 +1,9 @@
 //! In-process ONNX embedding.
 //!
 //! Compiled only with the `local-embeddings` feature. It pulls ONNX Runtime as
-//! a **native** dependency, which undoes the pure-Rust property that motivated
-//! choosing redb over RocksDB (ADR-001) and `rust_crypto` over `aws_lc_rs`
-//! (ADR-016) — so the default build does without it, and this is opt-in.
+//! a **native** dependency — hundreds of megabytes of binaries and a separate
+//! runtime, which is a different order of cost from the `ring` the default
+//! build already carries (see the correction on ADR-016). So it stays opt-in.
 //!
 //! What the feature costs:
 //!

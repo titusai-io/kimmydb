@@ -380,11 +380,17 @@ the guarantee or refusing the feature outright.
 ONNX inference lives behind a `local-embeddings` cargo feature, off by default,
 and is *rejected at configuration time* in a build that lacks it.
 
-**Why.** `fastembed` pulls native ONNX Runtime **and**, by default, OpenSSL. That
-would undo the pure-Rust property that motivated redb over RocksDB (ADR-001) and
-`rust_crypto` over `aws_lc_rs` (ADR-016), and roughly triples the image. A
-zero-config default that quietly costs cross-compilation, a native toolchain and
-hundreds of megabytes is not zero-cost.
+**Why.** `fastembed` pulls native ONNX Runtime **and**, by default, OpenSSL, and
+roughly triples the image. A zero-config default that quietly costs
+cross-compilation and hundreds of megabytes is not zero-cost.
+
+> **Corrected 2026-08-08.** This originally argued the feature would "undo the
+> pure-Rust property" behind ADR-001 and ADR-016. That property was already
+> gone — `reqwest` has pulled `ring` into every build since M2, as recorded in
+> the correction on [ADR-016](#adr-016--pure-rust-cryptography). The decision
+> stands on the remaining reason, which is the stronger one anyway: ONNX Runtime
+> is hundreds of megabytes of binaries and a separate runtime, a different order
+> of cost from a crate that builds some C with `cc`.
 
 **Why rejection happens at configuration time.** A `local` provider in a build
 without the feature fails identically forever. Failing when the configuration is

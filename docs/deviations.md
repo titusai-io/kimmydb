@@ -55,7 +55,7 @@ The policy, and why each part of it is what it is:
 
 | Question | Answer | Because |
 |---|---|---|
-| When is a graph worth building? | ≥ 2000 vectors | Below that, scanning beats building *and* walking a graph |
+| When is a graph worth building? | ≥ 500 vectors | **Measured.** Originally 2000 on the assumption that a scan wins below some size; it never does. 500 is where one build repays itself in ~12 queries ([Benchmarks](benchmarks.md)) |
 | How is staleness detected? | A per-collection generation counter, bumped on every vector write and delete | Counting is O(n); a count also cannot see a delete-then-add that leaves the total unchanged |
 | When does a stale graph rebuild? | After 30s | Rebuilding per write would rebuild continuously under load, and each rebuild is O(n log n) |
 | What happens if a build fails? | Fall back to the exact scan | An optimisation that cannot be built must not fail the query |
@@ -239,7 +239,7 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
-| Benchmarks | Partial. The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline | M5 |
+| Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 
 ---

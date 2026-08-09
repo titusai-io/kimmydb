@@ -15,8 +15,9 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "net", "time", "macros", "io-util"] }
 bson.workspace = true
-# RustCrypto, so peer authentication adds no C toolchain — the same reason
-# `jsonwebtoken` uses rust_crypto and storage uses redb.
+# RustCrypto, so peer authentication adds no *additional* native dependency.
+# The build already carries `ring` via `reqwest` (ADR-016), so the rule is not
+# to add a second crypto stack rather than to have none.
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"
