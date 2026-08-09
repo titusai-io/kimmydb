@@ -234,7 +234,7 @@ pub enum LogFormat {
     Json,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct WebhookConfig {
     /// Hosts a webhook may target beyond the public internet.
@@ -247,6 +247,34 @@ pub struct WebhookConfig {
     /// Naming a host exempts it from the address checks entirely, so add only
     /// the ones you mean.
     pub allowed_hosts: Vec<String>,
+
+    /// How many deliveries this node may have in flight at once.
+    ///
+    /// A cap rather than "as many as there are subscriptions": a webhook on a
+    /// hot collection would otherwise be free to consume every outbound
+    /// connection the node has. Bounded concurrency is also what stops one
+    /// endpoint that has stopped answering from delaying every subscription
+    /// behind it, which is what a serial dispatcher does.
+    pub max_concurrent_deliveries: usize,
+
+    /// The largest request body a delivery may carry.
+    ///
+    /// Batches are trimmed to fit. A *single* event whose document already
+    /// exceeds this is delivered with `fullDocument` omitted rather than
+    /// dropped — the receiver still learns the change happened and can fetch
+    /// the document itself. Skipping it would leave a gap the receiver could
+    /// never detect.
+    pub max_payload_bytes: usize,
+}
+
+impl Default for WebhookConfig {
+    fn default() -> Self {
+        Self {
+            allowed_hosts: Vec::new(),
+            max_concurrent_deliveries: 8,
+            max_payload_bytes: 1024 * 1024,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -428,6 +456,19 @@ impl Config {
             anyhow::bail!(
                 "cluster.discovery_interval_secs must be greater than zero; a node that never \
                  re-resolves its seeds would never see a peer that joined after it started"
+            );
+        }
+
+        if self.webhooks.max_concurrent_deliveries == 0 {
+            anyhow::bail!(
+                "webhooks.max_concurrent_deliveries must be greater than zero; a node that may \
+                 have no delivery in flight would never deliver a webhook at all"
+            );
+        }
+        if self.webhooks.max_payload_bytes == 0 {
+            anyhow::bail!(
+                "webhooks.max_payload_bytes must be greater than zero; a body that may hold no \
+                 bytes leaves every delivery with nothing to carry"
             );
         }
 
@@ -682,6 +723,22 @@ mod tests {
         cfg.storage.gc_interval_secs = 0;
         cfg.validate().unwrap();
         assert!(cfg.summary().contains("gc=off"));
+    }
+
+    #[test]
+    fn webhook_delivery_limits_must_be_non_zero() {
+        // Both are bounds on work, and zero of either does not mean "no bound"
+        // — it means a dispatcher that can never send anything. Caught at
+        // startup rather than as a webhook that silently never fires.
+        let mut cfg = valid();
+        cfg.webhooks.max_concurrent_deliveries = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_concurrent_deliveries"), "unhelpful error: {err}");
+
+        let mut cfg = valid();
+        cfg.webhooks.max_payload_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_payload_bytes"), "unhelpful error: {err}");
     }
 
     #[test]

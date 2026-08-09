@@ -18,7 +18,7 @@ graph LR
     M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> ✅<br/>hardening"]
-    M6["<b>M6</b> 🚧<br/>webhooks"]
+    M6["<b>M6</b> ✅<br/>webhooks"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6
 
@@ -29,6 +29,7 @@ graph LR
     style M3 fill:#2f5d3a,color:#fff
     style M4 fill:#2f5d3a,color:#fff
     style M5 fill:#2f5d3a,color:#fff
+    style M6 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -39,7 +40,7 @@ graph LR
 | **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
-| **M6** | Webhooks — registration and push delivery of change events | 🚧 Working end to end; two observability and test gaps remain |
+| **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -335,7 +336,7 @@ handle a node whose tombstones were collected while it was partitioned.
 
 ---
 
-## M6 — Webhooks: registration and push 🚧
+## M6 — Webhooks: registration and push ✅
 
 A developer registers a URL and the cluster **pushes** change events to it.
 Change streams already carry these events, but the client must open and hold a
@@ -447,21 +448,19 @@ high-water mark per batch rather than a record per event.
 | 8 | ✅ **Signing** | HMAC-SHA256 over the body with a per-subscription secret, plus a timestamp against replay. `hmac`/`sha2` are already in the build for the cluster handshake |
 | 9 | ✅ **Egress policy** | Resolved address checked, not the name; every address, not the first; redirects refused; loopback, link-local, RFC1918, carrier NAT and reserved ranges blocked unless allowlisted. Enforced at registration **and** before each delivery |
 | 10 | ✅ **Failure handling** — per-subscription backoff, and invalidation when progress falls past retention | Exponential backoff; invalidate the subscription when its progress falls past `oplog_retention_secs`, exactly as a lagging change-stream consumer gets `410` |
-| 11 | 🚧 **Observability** | Built: `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_events_total`, and audit records on register, remove and invalidate. **Not built:** a gauge of live subscriptions, and backlog age — the second is the one an operator would actually alert on |
-| 12 | 🚧 **Tests** | Against a local receiver over a real socket: delivery, signature verification and tampering, retry after failure, per-subscription backoff, invalidation past retention, no history replay, ownership standing down, and egress refused at delivery. **Not covered:** batching behaviour under load, and that deleting a subscription stops it mid-flight |
+| 11 | ✅ **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_events_total`, `kimmy_webhook_subscriptions{state}` and `kimmy_webhook_backlog_seconds` — the last is the one an operator alerts on. Plus audit records on register, remove and invalidate |
+| 12 | ✅ **Tests** | Against a local receiver over a real socket: delivery, signature verification and tampering, retry after failure, per-subscription backoff, invalidation past retention, no history replay, ownership standing down, egress refused at delivery, batching under load, removal stopping delivery, the concurrency bound, and the payload cap |
 | 13 | ✅ **Docs and ADRs** — [Webhooks](webhooks.md), ADR-045 | One ADR for derived ownership plus replicated progress — including why it is not leader election — and one for the egress policy |
+| 14 | ✅ **Delivery limits** | `webhooks.max_concurrent_deliveries` and `webhooks.max_payload_bytes`. Bounded concurrency rather than a serial pass, and an oversized document delivered without `fullDocument` rather than dropped |
 
-### Open questions to settle during
+### Open questions, settled
 
-- **Rendezvous input.** `Members` holds `SocketAddr`; hashing node ids would be
-  stabler across a re-address. May need a member → node-id mapping.
-- **Payload cap.** `fullDocument` on large documents, batched, can produce a
-  very large POST. Needs a cap and a decision on what happens to a single event
-  that exceeds it.
-- **Per-node delivery cap**, so a webhook on a hot collection cannot saturate a
-  node's outbound connections.
-- **Does the registry replicate?** It will, being a collection — which is what
-  lets any node take ownership. Worth confirming that is wanted.
+| Question | Answer |
+|---|---|
+| **Payload cap** — what happens to a single event that exceeds it | Delivered with `fullDocument` omitted and `fullDocumentOmitted` set. The receiver still learns the change happened; dropping it would leave a gap it could never detect |
+| **Per-node delivery cap** | `max_concurrent_deliveries`, default 8. The serial dispatcher it replaced could not saturate anything — it had the opposite fault, letting one stalled endpoint hold every other subscription for the delivery timeout |
+| **Does the registry replicate?** | Yes, being a collection — which is what lets any node take ownership. Confirmed as wanted |
+| **Rendezvous input** | Still `SocketAddr`. Hashing node ids would be stabler across a re-address; it needs a member → node-id mapping and has not been worth it. Carried in [Deviations](deviations.md) |
 
 ---
 

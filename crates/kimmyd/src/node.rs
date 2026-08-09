@@ -96,11 +96,18 @@ pub async fn run(config: Config) -> Result<()> {
         let state = Arc::clone(&state);
         let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
         let members = cluster.members.clone();
+        let limits = kimmy_api::dispatch::Limits {
+            max_concurrent_deliveries: config.webhooks.max_concurrent_deliveries,
+            max_payload_bytes: config.webhooks.max_payload_bytes,
+            // A cadence rather than a policy, so it stays out of the config
+            // file — see `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
+            ..Default::default()
+        };
         // With clustering off there is no advertised address and no member set;
         // a single node owns everything, which is what an empty set means.
         let me = cluster.advertised.unwrap_or_else(|| "127.0.0.1:7900".parse().expect("literal"));
         tokio::spawn(async move {
-            kimmy_api::dispatch::run(state, egress, me, members).await;
+            kimmy_api::dispatch::run(state, egress, me, members, limits).await;
         })
     };
 

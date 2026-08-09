@@ -60,6 +60,8 @@ fails fast on a bad volume mount.
 | `cluster.seeds` | `KIMMY_SEEDS` | `[]` | Naming seeds implies `enabled` |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | — | Required when clustering |
 | `webhooks.allowed_hosts` | — | `[]` | Hosts a webhook may target beyond the public internet. Empty means public addresses only |
+| `webhooks.max_concurrent_deliveries` | — | `8` | Deliveries in flight at once. A bound, and what stops one dead endpoint delaying the others |
+| `webhooks.max_payload_bytes` | — | `1048576` | Largest request body. Batches are trimmed; a single oversized document is sent without `fullDocument` |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |

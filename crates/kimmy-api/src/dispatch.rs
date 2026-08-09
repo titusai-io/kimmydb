@@ -28,13 +28,38 @@
 //! resolves publicly when a webhook is registered can resolve to
 //! `169.254.169.254` an hour later. Checking once would validate a promise DNS
 //! can withdraw.
+//!
+//! # A pass plans serially, delivers concurrently, and applies serially
+//!
+//! Only the network call runs concurrently, under a semaphore of
+//! [`Limits::max_concurrent_deliveries`]. Everything that touches the engine —
+//! reading progress, choosing a batch, recording what landed — stays on one
+//! thread, so there is no interleaving to reason about and no way for two
+//! subscriptions' progress writes to race.
+//!
+//! Concurrency is not an optimisation here. A serial pass lets one endpoint
+//! that has stopped answering hold the whole node for the delivery timeout,
+//! delaying every subscription behind it — which is the cross-subscription
+//! interference the per-subscription [`Backoff`] exists to prevent, one layer
+//! up. The bound is what keeps a webhook on a hot collection from consuming
+//! every outbound connection the node has.
+//!
+//! # An event is never dropped for being large
+//!
+//! A batch is trimmed to fit [`Limits::max_payload_bytes`]; the remainder goes
+//! next pass. A single event whose document alone exceeds the cap is delivered
+//! with `fullDocument` omitted and `fullDocumentOmitted` set, so the receiver
+//! still learns the change happened and can fetch the document itself. Skipping
+//! it would leave a gap the receiver could never detect — the thing
+//! [`invalidate`] exists to avoid.
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use bson::{Document, doc};
-use kimmy_core::{Hlc, OpKind, OplogEntry, VersionVector};
+use kimmy_core::{Hlc, OpKind, OplogEntry, Stamp, VersionVector};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -61,6 +86,52 @@ const TICK: Duration = Duration::from_secs(2);
 /// Backoff bounds for an endpoint that is failing.
 const BACKOFF_MIN: Duration = Duration::from_secs(2);
 const BACKOFF_MAX: Duration = Duration::from_secs(300);
+
+/// What one node will spend on delivery.
+///
+/// Held together rather than passed as loose numbers so the dispatcher's
+/// signature does not grow a parameter every time a bound is added.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Limits {
+    /// Deliveries in flight at once, across every subscription this node owns.
+    pub max_concurrent_deliveries: usize,
+    /// The largest request body a delivery may carry.
+    pub max_payload_bytes: usize,
+    /// How old a subscription's resume point may get before it is written
+    /// forward even though nothing was delivered.
+    ///
+    /// Not a knob an operator sets — a cadence. See
+    /// [`Limits::DEFAULT_PROGRESS_HEARTBEAT`] for why it exists at all.
+    pub progress_heartbeat: Duration,
+}
+
+impl Limits {
+    /// Why the resume point has to move even when nothing is delivered.
+    ///
+    /// Retention collects by age. A subscription's resume point only advanced
+    /// when something was delivered, so a webhook on a quiet collection — or on
+    /// a busy one that goes quiet for a night — sat still while the horizon
+    /// walked toward it, and was invalidated for "falling behind" events it had
+    /// never been going to be sent. Every healthy webhook died one retention
+    /// window after its last delivery.
+    ///
+    /// A minute, against a retention window measured in hours: frequent enough
+    /// that the horizon never catches up, rare enough that an idle node writes
+    /// once a minute per subscription rather than once per two-second tick.
+    pub const DEFAULT_PROGRESS_HEARTBEAT: Duration = Duration::from_secs(60);
+}
+
+impl Default for Limits {
+    /// The same numbers as `webhooks` in the config file, so a test and a
+    /// default-configured node behave alike.
+    fn default() -> Self {
+        Self {
+            max_concurrent_deliveries: 8,
+            max_payload_bytes: 1024 * 1024,
+            progress_heartbeat: Self::DEFAULT_PROGRESS_HEARTBEAT,
+        }
+    }
+}
 
 /// What one dispatch pass did, for tests and for metrics.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -150,6 +221,35 @@ pub fn union_progress(state: &SharedState, subscription: &str) -> VersionVector 
         Ok(true)
     });
     union
+}
+
+/// Drop every node's progress record for a subscription that is gone.
+///
+/// Called when a subscription is removed. Without it `__webhook_progress`
+/// accumulates one orphaned record per node that ever delivered the
+/// subscription, and nothing ever reads or collects them again.
+///
+/// Best-effort: the subscription is already deleted by the time this runs, and
+/// failing the removal over leftover bookkeeping would be the worse outcome.
+pub fn forget_progress(state: &SharedState, subscription: &str) {
+    let Ok(meta) = state.engine.get_collection(WEBHOOKS_DB, PROGRESS_COLLECTION) else {
+        return;
+    };
+    let prefix = format!("{subscription}:");
+    let mut stale = Vec::new();
+    let _ = state.engine.for_each_doc(&meta, |_id, document| {
+        if let Ok(id) = document.get_str("_id")
+            && id.starts_with(&prefix)
+        {
+            stale.push(id.to_string());
+        }
+        Ok(true)
+    });
+    for id in stale {
+        if let Err(e) = state.engine.delete(&meta, &kimmy_core::DocId::String(id.clone())) {
+            warn!(subscription, record = %id, error = %e, "could not remove webhook progress");
+        }
+    }
 }
 
 /// Mark a subscription as already caught up to `now`.
@@ -253,6 +353,20 @@ fn wanted(entry: &OplogEntry, collection_id: u64, operations: &[String]) -> bool
 /// The same field names a WebSocket subscriber sees, so a consumer can move
 /// between the two without relearning anything.
 pub fn render(entry: &OplogEntry) -> Value {
+    let mut payload = render_without_document(entry);
+    if let Ok(Some(document)) = entry.document() {
+        payload["fullDocument"] = crate::json::document_to_json(&document);
+    }
+    payload
+}
+
+/// The same event with the document left out.
+///
+/// What a receiver gets when one document alone exceeds the payload cap. It
+/// still carries the event id, the operation and the document key, so the
+/// change is not lost — only the copy of the document is, and the receiver can
+/// read that itself.
+fn render_without_document(entry: &OplogEntry) -> Value {
     let operation = match entry.kind {
         OpKind::Insert => "insert",
         OpKind::Update => "update",
@@ -270,10 +384,83 @@ pub fn render(entry: &OplogEntry) -> Value {
     if let Some(id) = &entry.doc_id {
         payload["documentKey"] = json!({ "_id": crate::json::bson_to_json(&id.to_bson()) });
     }
-    if let Ok(Some(document)) = entry.document() {
-        payload["fullDocument"] = crate::json::document_to_json(&document);
-    }
     payload
+}
+
+/// The body envelope, so the cap covers what actually goes on the wire rather
+/// than the events alone.
+fn envelope(subscription: &str, events: &[Value]) -> String {
+    json!({ "subscription": subscription, "events": events }).to_string()
+}
+
+/// How many bytes the envelope costs before any event is in it.
+///
+/// Measured rather than assumed: the subscription id is inside it, and a
+/// hand-counted constant would drift the moment the envelope gains a field.
+fn envelope_overhead(subscription: &str) -> usize {
+    envelope(subscription, &[]).len()
+}
+
+/// Choose the events that fit within `max_payload_bytes`, and render them.
+///
+/// Returns the body and the stamps it covers — the stamps rather than the
+/// entries because that is all advancing progress needs.
+///
+/// Three rules, in order:
+///
+/// 1. Events are taken in oplog order and stop at the first one that would not
+///    fit. The rest go next pass; ordering per subscription is preserved.
+/// 2. If the *first* event does not fit on its own, it is re-rendered without
+///    `fullDocument` and sent alone. An event is never dropped for being large.
+/// 3. That lone event goes out even if it still does not fit, which can only
+///    happen with an enormous `_id`. A subscription that refused to send it
+///    would never advance past it.
+fn assemble(subscription: &str, entries: &[OplogEntry], max_payload_bytes: usize) -> Delivery {
+    let mut events: Vec<Value> = Vec::new();
+    let mut stamps: Vec<Stamp> = Vec::new();
+    // Accumulated rather than re-serialising the whole batch per candidate,
+    // which would be quadratic in the batch size. Compact JSON adds exactly the
+    // event's own text plus a comma once there is something to separate it
+    // from.
+    let mut used = envelope_overhead(subscription);
+
+    for entry in entries.iter().take(BATCH) {
+        let candidate = render(entry);
+        let cost = candidate.to_string().len() + usize::from(!events.is_empty());
+        if used + cost <= max_payload_bytes {
+            used += cost;
+            events.push(candidate);
+            stamps.push(entry.stamp);
+            continue;
+        }
+
+        if events.is_empty() {
+            // Rule 2: too large on its own, so the document comes off rather
+            // than the event being skipped.
+            let mut stripped = render_without_document(entry);
+            stripped["fullDocumentOmitted"] = json!(true);
+            stripped["omittedReason"] =
+                json!("document exceeds webhooks.max_payload_bytes; fetch it from the collection");
+            events.push(stripped);
+            stamps.push(entry.stamp);
+            warn!(
+                subscription,
+                event = %event_id(entry),
+                "webhook event exceeds the payload cap; delivering it without fullDocument"
+            );
+        }
+        // Rule 1: whether this event was stripped or left for later, the batch
+        // ends here.
+        break;
+    }
+
+    Delivery { body: envelope(subscription, &events), stamps }
+}
+
+/// One batch, rendered and ready to send.
+struct Delivery {
+    body: String,
+    stamps: Vec<Stamp>,
 }
 
 /// A globally unique id for one change.
@@ -347,10 +534,26 @@ fn load_jobs(state: &SharedState) -> Vec<Job> {
     jobs
 }
 
+/// A subscription with a batch ready to go out.
+struct Planned {
+    job: Job,
+    /// The union progress as it stood, to be advanced once the batch lands.
+    progress: VersionVector,
+    delivery: Delivery,
+    /// Events in the batch — the count `DispatchOutcome` and the metrics report.
+    events: usize,
+}
+
 /// Run one dispatch pass over every subscription this node owns.
 ///
 /// Exposed rather than buried in the loop so a test can drive a single pass
 /// deterministically instead of sleeping and hoping.
+///
+/// Three phases, and the split is deliberate: **plan** serially, **deliver**
+/// concurrently under a bound, **apply** serially. Every engine read and write
+/// is in a serial phase, so two subscriptions can never race each other's
+/// progress records, and only the network call — the slow part, and the part a
+/// dead endpoint stalls — overlaps.
 pub async fn dispatch_once(
     state: &SharedState,
     client: &reqwest::Client,
@@ -358,10 +561,24 @@ pub async fn dispatch_once(
     me: SocketAddr,
     members: &BTreeSet<SocketAddr>,
     backoff: &mut Backoff,
+    limits: Limits,
 ) -> DispatchOutcome {
     let mut outcome = DispatchOutcome::default();
+    let mut planned: Vec<Planned> = Vec::new();
 
+    // Gauges, gathered as the pass already walks the registry rather than
+    // recomputed on every `/metrics` scrape.
+    let (mut active, mut invalidated_count) = (0u64, 0u64);
+    let mut backlog_ms = 0u64;
+    let now_ms = kimmy_storage::physical_now_ms();
+
+    // --- Phase 1: plan, serially -------------------------------------------
     for job in load_jobs(state) {
+        if job.invalidated {
+            invalidated_count += 1;
+        } else {
+            active += 1;
+        }
         if !crate::ownership::owns(&job.id, me, members) {
             outcome.skipped_not_owner += 1;
             continue;
@@ -369,22 +586,31 @@ pub async fn dispatch_once(
         if job.invalidated {
             continue;
         }
-        // Checked before any work: a subscription in backoff costs nothing,
-        // and that is what keeps one dead endpoint from slowing the others.
-        if !backoff.ready(&job.id) {
-            outcome.skipped_backoff += 1;
-            continue;
-        }
 
         let mut progress = union_progress(state, &job.id);
         // `behind` answers "from where must I read", which is the same question
-        // anti-entropy asks of a peer.
-        let from = state
-            .engine
-            .version_vector()
-            .ok()
-            .and_then(|current| progress.behind(&current))
-            .unwrap_or(Hlc::ZERO);
+        // anti-entropy asks of a peer. `None` means the subscription's progress
+        // already covers everything this node holds — it is caught up, and
+        // there is nothing to read, invalidate or deliver.
+        let Some(from) =
+            state.engine.version_vector().ok().and_then(|current| progress.behind(&current))
+        else {
+            continue;
+        };
+
+        // Backoff is checked after the progress read but before the oplog scan
+        // and the delivery. Reading a small system collection is not what one
+        // dead endpoint must not cost the others; dialling it is.
+        if !backoff.ready(&job.id) {
+            // Counted as backlog even though the scan is skipped: a
+            // subscription is only in backoff because a delivery carrying
+            // events just failed, so it is precisely the one falling behind.
+            // The resume point's age is the honest approximation available
+            // without reading the oplog.
+            backlog_ms = backlog_ms.max(now_ms.saturating_sub(from.wall_ms));
+            outcome.skipped_backoff += 1;
+            continue;
+        }
 
         // The events this subscription still needs may have been collected.
         // `from` is where it must resume; if that is behind the retention
@@ -403,43 +629,108 @@ pub async fn dispatch_once(
             continue;
         }
 
-        let Ok(entries) = state.engine.entries_for_peer(from, BATCH * 4) else {
+        let Ok(scanned) = state.engine.entries_for_peer(from, BATCH * 4) else {
             continue;
         };
-        let batch: Vec<OplogEntry> = entries
-            .into_iter()
+        let batch: Vec<OplogEntry> = scanned
+            .iter()
             .filter(|e| wanted(e, job.collection_id, &job.operations))
             .filter(|e| progress.get(e.stamp.node) < e.stamp.hlc)
             .take(BATCH)
+            .cloned()
             .collect();
-        if batch.is_empty() {
-            continue;
-        }
 
-        match deliver(client, policy, &job, &batch).await {
-            Ok(()) => {
-                for entry in &batch {
+        if batch.is_empty() {
+            // Nothing here was this subscription's — every entry belonged to
+            // another collection or another operation. Progress still advances
+            // over them, because deciding an entry is not yours *is* the work,
+            // and a position that never moves is one the retention horizon
+            // eventually overtakes. A webhook on a quiet collection in a busy
+            // database would otherwise be invalidated for falling behind events
+            // it was never going to be sent.
+            //
+            // Safe by construction: `scanned` is contiguous from `from`, and
+            // nothing in it matched `wanted`, so nothing deliverable is being
+            // stepped over.
+            //
+            // Written forward on a heartbeat rather than every pass. Recording
+            // progress is itself a write, so it appends the very entry the next
+            // pass reads; doing it every tick would have an idle node writing
+            // to the oplog — and replicating it — every two seconds forever.
+            // Once a minute is far more often than retention needs and rare
+            // enough to cost nothing. See `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
+            let stale =
+                now_ms.saturating_sub(from.wall_ms) >= limits.progress_heartbeat.as_millis() as u64;
+            if stale {
+                for entry in &scanned {
                     progress.observe(entry.stamp);
                 }
-                // Recorded only after the endpoint accepted it. Recording first
-                // would turn a failed delivery into a silently skipped event.
                 if let Err(e) = record_progress(state, &job.id, &progress) {
                     warn!(subscription = %job.id, error = %e, "could not record webhook progress");
                 }
-                backoff.succeeded(&job.id);
-                state.metrics.record_webhook_delivery(true, batch.len());
-                outcome.delivered += batch.len();
-                debug!(subscription = %job.id, events = batch.len(), "delivered");
+            }
+            continue;
+        }
+
+        // Backlog is the age of the oldest event this subscription has **not
+        // delivered**, and it is only measured here — where there demonstrably
+        // is one. Deriving it from the resume point instead would have an idle,
+        // fully caught-up subscription report a backlog that grows with the
+        // clock, which is an alert firing for a webhook that is working.
+        if let Some(oldest) = batch.first() {
+            backlog_ms = backlog_ms.max(now_ms.saturating_sub(oldest.stamp.hlc.wall_ms));
+        }
+
+        let delivery = assemble(&job.id, &batch, limits.max_payload_bytes);
+        let events = delivery.stamps.len();
+        planned.push(Planned { job, progress, delivery, events });
+    }
+
+    state.metrics.set_webhook_gauges(active, invalidated_count, backlog_ms / 1_000);
+
+    // --- Phase 2: deliver, concurrently under a bound ----------------------
+    //
+    // `max(1)` because a semaphore of zero permits never wakes. The config
+    // refuses zero at startup; this makes a hand-built `Limits` in a test
+    // deliver slowly rather than hang forever.
+    let permits = Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_deliveries.max(1)));
+    let results = futures::future::join_all(planned.iter().map(|plan| {
+        let permits = Arc::clone(&permits);
+        async move {
+            // Held for the request only. A subscription waiting for a permit is
+            // not holding one.
+            let _permit = permits.acquire().await;
+            deliver(client, policy, &plan.job, &plan.delivery).await
+        }
+    }))
+    .await;
+
+    // --- Phase 3: apply, serially ------------------------------------------
+    for (mut plan, result) in planned.into_iter().zip(results) {
+        match result {
+            Ok(()) => {
+                for stamp in &plan.delivery.stamps {
+                    plan.progress.observe(*stamp);
+                }
+                // Recorded only after the endpoint accepted it. Recording first
+                // would turn a failed delivery into a silently skipped event.
+                if let Err(e) = record_progress(state, &plan.job.id, &plan.progress) {
+                    warn!(subscription = %plan.job.id, error = %e, "could not record webhook progress");
+                }
+                backoff.succeeded(&plan.job.id);
+                state.metrics.record_webhook_delivery(true, plan.events);
+                outcome.delivered += plan.events;
+                debug!(subscription = %plan.job.id, events = plan.events, "delivered");
             }
             Err(e) => {
-                backoff.failed(&job.id);
-                state.metrics.record_webhook_delivery(false, batch.len());
+                backoff.failed(&plan.job.id);
+                state.metrics.record_webhook_delivery(false, plan.events);
                 outcome.failed += 1;
                 warn!(
-                    subscription = %job.id,
-                    url = %job.url,
+                    subscription = %plan.job.id,
+                    url = %plan.job.url,
                     error = %e,
-                    attempts = backoff.failure_count(&job.id),
+                    attempts = backoff.failure_count(&plan.job.id),
                     "webhook delivery failed"
                 );
             }
@@ -452,17 +743,18 @@ async fn deliver(
     client: &reqwest::Client,
     policy: &EgressPolicy,
     job: &Job,
-    batch: &[OplogEntry],
+    delivery: &Delivery,
 ) -> Result<(), String> {
     // Re-checked here, not just at registration: a name that resolved publicly
     // then can resolve inward now.
     policy.check(&job.url).map_err(|e| e.to_string())?;
 
-    let events: Vec<Value> = batch.iter().map(render).collect();
-    let body = json!({ "subscription": job.id, "events": events }).to_string();
+    // Signed at the moment of sending rather than when the batch was planned,
+    // so the timestamp a receiver checks against replay is the send time.
     let timestamp = kimmy_storage::physical_now_ms();
-    let signature = sign(&job.secret, timestamp, &body);
-    let first = batch.first().map(event_id).unwrap_or_default();
+    let signature = sign(&job.secret, timestamp, &delivery.body);
+    let first =
+        delivery.stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default();
 
     let response = client
         .post(&job.url)
@@ -471,7 +763,7 @@ async fn deliver(
         .header("x-kimmy-timestamp", timestamp.to_string())
         .header("x-kimmy-signature", signature)
         .timeout(DELIVERY_TIMEOUT)
-        .body(body)
+        .body(delivery.body.clone())
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -489,6 +781,7 @@ pub async fn run(
     policy: EgressPolicy,
     me: SocketAddr,
     members: Option<kimmy_cluster::Members>,
+    limits: Limits,
 ) {
     // Redirects are refused: a permitted host answering `302` to
     // `169.254.169.254` would otherwise walk the request through the policy.
@@ -506,7 +799,7 @@ pub async fn run(
         // The pass itself always runs on the tick. Backoff is held per
         // subscription inside it, so a failing endpoint delays only its own
         // deliveries and every other subscription keeps its cadence.
-        dispatch_once(&state, &client, &policy, me, &live, &mut backoff).await;
+        dispatch_once(&state, &client, &policy, me, &live, &mut backoff, limits).await;
         tokio::time::sleep(TICK).await;
     }
 }
