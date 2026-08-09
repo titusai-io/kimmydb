@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 86 | 48 unit (JSON boundary, errors, schema inference, rate limiting) + 36 end-to-end over a real socket |
+| `kimmy-api` | 87 | 50 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 37 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -600,15 +600,20 @@ with `check-config`.
 
 ## Gaps
 
-Honest list of what is not covered:
+Honest list of what is not covered. Worth reading next to
+[the list of things verified by hand](#verified-by-hand): several properties
+this project relies on have been *observed* on a running node without being
+*pinned* by a test, and the difference matters — an observation is true once,
+a test stays true.
 
 | Gap | Notes |
 |---|---|
 | Benchmarks are partial | The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline |
 | No fuzzing | The codecs are the obvious target |
-| No multi-node tests | Nothing to test until M4 |
-| No crash-consistency tests | redb is trusted for durability |
-| No concurrent-writer stress test | Only the change-stream test writes concurrently |
+| **Nothing runs for long, or at scale** | Every test finishes in seconds against thousands of documents. Nothing has run for hours, and nothing has been tested near the sizes a real deployment reaches. Bugs that need time or volume to appear — leaks, unbounded growth, degradation as a collection grows — would not be caught by anything here |
+| No crash-consistency tests | Nothing kills a node mid-write and checks what survived. redb is *trusted* for durability rather than verified |
+| Multi-node tests are pairwise and short-lived | 19 integration tests over real sockets and real UDP cover convergence, the handshake, snapshot resync and SWIM. What they do not cover: topologies larger than a pair, partitions healing, or a cluster under sustained write load. Those were driven **by hand** on three daemons and in containers ([verified by hand](#verified-by-hand)), which is not the same as being in the suite |
+| No concurrent-writer stress test | Two tests write concurrently — `resuming_under_continuous_writes_has_no_gaps_and_no_duplicates` and `a_backup_is_consistent_while_writes_continue` — but neither is a stress test, and redb allows one writer, so contention behaviour is unmeasured |
 | Property tests use default case counts | 256 unless overridden; the critical ones raise it explicitly |
 | **The login limit is not proven to run *before* Argon2** | It is the reason the limit exists ([ADR-038](decisions.md)) and the only difference a moved check makes is latency, which no deterministic test can assert. Defended by structure and a comment, not by a test. Closing it honestly needs a counter on the authentication path |
 
