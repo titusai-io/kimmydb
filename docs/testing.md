@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-723 tests passing · 0 failures · clippy clean at -D warnings
+745 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 108 | 63 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket |
+| `kimmy-api` | 130 | 78 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket + 7 webhook delivery against a real receiver |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -270,6 +270,24 @@ each one turned a named test red:
 | Record the attempt before authenticating, so success also spends | `a_successful_login_does_not_spend_the_budget` |
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
+
+### Webhook delivery, six for six
+
+| Injected fault | Caught by |
+|---|---|
+| Progress recorded before the endpoint accepts | `a_failed_delivery_does_not_advance_progress` |
+| Progress never recorded | `nothing_is_delivered_twice` |
+| Ownership ignored, so every node delivers | `a_node_that_does_not_own_a_subscription_delivers_nothing` |
+| Egress not re-checked at delivery | `the_egress_policy_is_enforced_at_delivery_not_only_at_registration` |
+| The signature omits the timestamp | `a_signature_covers_the_timestamp_as_well_as_the_body` |
+| Ownership by iteration order rather than hash | the `ownership` suite |
+
+Delivery is tested against a **receiver on a real socket** rather than by
+calling the delivery function: a webhook *is* an outbound HTTP request, and the
+signature a consumer must verify, the headers it reads, and whether the egress
+policy lets it out at all only exist on the wire. The test recomputes the HMAC
+exactly as a real consumer would, and a sibling test confirms a tampered body
+fails it — without that, the signature is decoration.
 
 ### Webhook registration, six for six after one escape
 
@@ -554,6 +572,7 @@ manually and are recorded so they can be repeated:
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
 | The `kimmy` CLI against a live node | ✅ every command driven: login, ping, insert from an argument and from stdin, find with sort, count, aggregate from stdin, update, delete, describe, backup-then-restore, and RBAC refusing a scoped user. Exit codes checked directly rather than through a pipeline, which had masked them |
+| Webhook delivery on a live node | ✅ four events (three inserts and a delete) reached a Python receiver with correct types and document keys; a second subscription's deliveries verified its HMAC as **VALID** while the first subscription's delivery to the same port read **INVALID**, which is per-subscription secrets working; an insert-only filter sent no deletes |
 | Webhook registration on a live node | ✅ a public endpoint registered and the secret returned once; the metadata endpoint, loopback and RFC1918 refused with an explanatory message; listing showed no secret; a `webhook`-granted user could register but not write, and a `watch`-granted user could not register at all; both registrations produced audit records |
 | Point-in-time restore, end to end | ✅ five documents wrecked by a bulk update, a backup taken after the incident, restored with `--until` a mark before it: all five back to their previous value, and the restored node served them |
 | The audit log at `mode=writes` | ✅ on a live node: the two admin actions and the write recorded, the denial recorded, and the `find` correctly absent |

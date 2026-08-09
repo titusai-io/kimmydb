@@ -13,6 +13,7 @@ kimmy-storage.workspace = true
 kimmy-query.workspace = true
 kimmy-auth.workspace = true
 kimmy-vector.workspace = true
+kimmy-cluster.workspace = true
 axum.workspace = true
 base64.workspace = true
 tower.workspace = true
@@ -25,9 +26,19 @@ thiserror.workspace = true
 tracing.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
+reqwest.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
 tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
 
 [dev-dependencies]
+parking_lot.workspace = true
+kimmy-core.workspace = true
+uuid.workspace = true
+reqwest.workspace = true
+bson.workspace = true
+kimmy-auth.workspace = true
+kimmy-storage.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -1467,6 +1467,77 @@ it.
 
 ---
 
+## ADR-045 — Webhook delivery is owned by a derived node, over replicated progress
+
+**Decision.** Each subscription is delivered by exactly one node, chosen by
+rendezvous hashing over the live SWIM member set. Every node records what it has
+delivered as a `VersionVector` in its **own** progress document, and any node
+reads the union. At-least-once, ordered per subscription.
+
+**The two obvious designs both fail.** If the *originating* node delivers, there
+is exactly one request — until that node dies before dispatching, and then
+nobody delivers at all, because its peers hold the data but consider it not
+theirs. A client silently never receives an event. If *every* node delivers,
+nothing is lost and a five-node cluster fires five identical requests per write.
+
+Both fix *which node delivers* in advance, and that framing is what forces the
+choice. The way out is to make delivery progress replicated state.
+
+**Progress is written per (subscription, node).** A node only ever writes its
+own record, so there are no write conflicts and nothing for last-writer-wins to
+discard — the union is the cluster's answer. This is the same shape as
+`oplog_versions`, and it uses the same type, so "what have I not delivered?" is
+answered by `VersionVector::behind`, exactly as anti-entropy asks it of a peer.
+
+**Ownership is derived, not elected.** `owner = rendezvous_hash(subscription,
+live_members)` is a pure function computed identically and independently by
+every node. There is no vote, no term, no consensus and no cluster-wide
+coordinator — this is not leader election, and the project's leaderless premise
+is intact. A transient membership disagreement produces a *duplicate delivery*,
+not a split brain.
+
+**Rendezvous, not modulo.** `hash(subscription) % members.len()` remaps almost
+every subscription whenever the member count changes, so one node leaving would
+shuffle the whole cluster. Rendezvous moves only what the departed node owned,
+which is what makes failover cheap — and there is a test asserting nothing else
+moves.
+
+**FNV-1a, not `DefaultHasher`.** The standard hasher is explicitly not stable
+between Rust versions, and an ownership function that changed under a compiler
+upgrade would reshuffle every subscription on a rolling restart. The mapping is
+pinned by a test, cross-checked against an independent implementation.
+
+**So a dying node does not cost an event.** It leaves the live set, every
+survivor recomputes, one becomes the owner, and it resumes from the union of
+progress. The only way an event is never delivered is if the write never
+replicated off the node that accepted it — in which case the data is gone from
+the database too, and webhooks are not what failed.
+
+**At-least-once, stated rather than implied.** Progress advances only after an
+endpoint accepts, so a crash mid-flight redelivers. Exactly-once is not
+achievable over a network, so every delivery carries the originating `Stamp` as
+`X-Kimmy-Event-Id` — globally unique, identical on every node, stable across
+redeliveries — and deduplicating is a set-membership test.
+
+**Addresses, not node ids, feed the hash.** `Members` publishes `SocketAddr`,
+and hashing that keeps ownership a pure function of what SWIM already provides.
+Re-addressing a node reshuffles its subscriptions, which is the same disruption
+as that node leaving and another joining. Chosen over building an
+address-to-node-id mapping purely to hash it.
+
+**Deliveries are signed** with `HMAC-SHA256(secret, timestamp || "." || body)`.
+The timestamp is *inside* the signature: signing the body alone would leave it
+free to change, so a captured delivery could be replayed later with a fresh one
+and still verify.
+
+**Redirects are refused and the egress policy is re-checked before every
+delivery**, not only at registration. A hostname is not a destination — a name
+that resolves publicly today can resolve to `169.254.169.254` tomorrow, and a
+permitted host answering `302` would otherwise walk the request straight through
+the policy.
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

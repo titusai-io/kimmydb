@@ -86,7 +86,23 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config);
-    let cluster_handles = spawn_cluster(Arc::clone(&engine), &config).await?;
+    let cluster = spawn_cluster(Arc::clone(&engine), &config).await?;
+
+    // The webhook dispatcher is an ordinary oplog consumer, like the embedding
+    // worker below. It derives which subscriptions it owns from the same live
+    // member set SWIM maintains, so a node dying hands its subscriptions to a
+    // survivor without anything being elected. See ADR-045.
+    let webhook_handle = {
+        let state = Arc::clone(&state);
+        let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
+        let members = cluster.members.clone();
+        // With clustering off there is no advertised address and no member set;
+        // a single node owns everything, which is what an empty set means.
+        let me = cluster.advertised.unwrap_or_else(|| "127.0.0.1:7900".parse().expect("literal"));
+        tokio::spawn(async move {
+            kimmy_api::dispatch::run(state, egress, me, members).await;
+        })
+    };
 
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
@@ -141,9 +157,12 @@ pub async fn run(config: Config) -> Result<()> {
     }
     // And replication: anti-entropy is idempotent and resumes from version
     // vectors, so an interrupted round costs nothing but a repeat.
-    for handle in cluster_handles {
+    for handle in cluster.tasks {
         handle.abort();
     }
+    // The dispatcher records its progress only after an endpoint accepts, so
+    // an aborted delivery is redelivered rather than lost.
+    webhook_handle.abort();
 
     info!("shutdown complete");
     Ok(())
@@ -236,12 +255,17 @@ fn is_loopback(addr: &std::net::SocketAddr) -> bool {
 /// Binding happens here rather than inside the task so that a port already in
 /// use is a startup failure with a clear message, not a warning in a log nobody
 /// reads while the node silently never replicates.
-async fn spawn_cluster(
-    engine: Arc<Engine>,
-    config: &Config,
-) -> Result<Vec<tokio::task::JoinHandle<()>>> {
+/// The cluster tasks, plus what the webhook dispatcher needs to derive
+/// ownership: the live member set and this node's advertised address.
+struct Cluster {
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+    members: Option<kimmy_cluster::Members>,
+    advertised: Option<std::net::SocketAddr>,
+}
+
+async fn spawn_cluster(engine: Arc<Engine>, config: &Config) -> Result<Cluster> {
     if !config.cluster.enabled {
-        return Ok(Vec::new());
+        return Ok(Cluster { tasks: Vec::new(), members: None, advertised: None });
     }
 
     let secret = config.cluster.cluster_secret.clone().context(
@@ -291,7 +315,9 @@ async fn spawn_cluster(
             discovery_interval: Duration::from_secs(config.cluster.discovery_interval_secs),
             fanout: config.cluster.fanout,
             announce,
-            members,
+            // Cloned: the replication loop and the webhook dispatcher both
+            // read the same live set, and `Members` is a shared handle.
+            members: members.clone(),
         },
     ));
     cluster_tasks.push(replicating);
@@ -302,7 +328,7 @@ async fn spawn_cluster(
         membership = config.cluster.membership,
         "clustering enabled"
     );
-    Ok(cluster_tasks)
+    Ok(Cluster { tasks: cluster_tasks, members, advertised: Some(local) })
 }
 
 /// The address peers should use to reach this node.
