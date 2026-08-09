@@ -33,6 +33,9 @@ pub struct Metrics {
     auth_failures: AtomicU64,
     rate_limited: AtomicU64,
     backups: AtomicU64,
+    webhook_delivered: AtomicU64,
+    webhook_failed: AtomicU64,
+    webhook_events: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -47,6 +50,9 @@ impl Default for Metrics {
             auth_failures: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
             backups: AtomicU64::new(0),
+            webhook_delivered: AtomicU64::new(0),
+            webhook_failed: AtomicU64::new(0),
+            webhook_events: AtomicU64::new(0),
         }
     }
 }
@@ -80,6 +86,20 @@ impl Metrics {
             429 => self.rate_limited.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+    }
+
+    /// One delivery attempt, and how many events it carried.
+    ///
+    /// Batches, not events, are counted as the outcome: a retried batch is one
+    /// failure, and counting per event would make one dead endpoint look like
+    /// thousands of separate problems.
+    pub fn record_webhook_delivery(&self, succeeded: bool, events: usize) {
+        if succeeded {
+            self.webhook_delivered.fetch_add(1, Ordering::Relaxed);
+            self.webhook_events.fetch_add(events as u64, Ordering::Relaxed);
+        } else {
+            self.webhook_failed.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn record_backup(&self) {
@@ -123,7 +143,14 @@ impl Metrics {
              kimmy_rate_limited_total {limited}\n\
              # HELP kimmy_backups_total Backups served.\n\
              # TYPE kimmy_backups_total counter\n\
-             kimmy_backups_total {backups}\n",
+             kimmy_backups_total {backups}\n\
+             # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
+             # TYPE kimmy_webhook_deliveries_total counter\n\
+             kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
+             kimmy_webhook_deliveries_total{{outcome=\"failed\"}} {wh_fail}\n\
+             # HELP kimmy_webhook_events_total Change events pushed to endpoints.\n\
+             # TYPE kimmy_webhook_events_total counter\n\
+             kimmy_webhook_events_total {wh_events}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -133,6 +160,9 @@ impl Metrics {
             auth = self.get(&self.auth_failures),
             limited = self.get(&self.rate_limited),
             backups = self.get(&self.backups),
+            wh_ok = self.get(&self.webhook_delivered),
+            wh_fail = self.get(&self.webhook_failed),
+            wh_events = self.get(&self.webhook_events),
         )
     }
 }
@@ -182,7 +212,7 @@ mod tests {
             assert!(value.parse::<u64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        assert_eq!(samples, 9, "expected one sample per series: {out}");
+        assert_eq!(samples, 12, "expected one sample per series: {out}");
     }
 
     #[test]

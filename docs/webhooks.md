@@ -1,0 +1,150 @@
+# Webhooks
+
+[← Documentation index](README.md)
+
+Register a URL and the cluster pushes change events to it. The same events a
+[change stream](change-streams.md) carries, for consumers that cannot hold a
+WebSocket open.
+
+```bash
+curl -X POST https://node:7878/v1/db/shop/coll/orders/webhooks \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"url":"https://example.com/hook","operations":["insert","delete"]}'
+
+{"id":"wh_…","url":"https://example.com/hook","secret":"…",
+ "note":"the secret is shown once and cannot be retrieved later"}
+```
+
+Registering requires the **`webhook`** action on the collection. It is separate
+from `watch` on purpose: a change stream ends when the client disconnects and
+dies with its token, while a webhook keeps sending to an address the grant never
+named. Only `admin` implies it.
+
+---
+
+## Verifying a delivery
+
+Every request carries three headers:
+
+| Header | |
+|---|---|
+| `X-Kimmy-Event-Id` | Stable, globally unique id of the first event in the batch |
+| `X-Kimmy-Timestamp` | Milliseconds since the epoch |
+| `X-Kimmy-Signature` | `HMAC-SHA256(secret, timestamp + "." + body)`, hex |
+
+```python
+expected = hmac.new(secret, f"{timestamp}.".encode() + body, hashlib.sha256).hexdigest()
+if not hmac.compare_digest(signature, expected):
+    return 401
+```
+
+The timestamp is **inside** the signature. Signing the body alone would leave it
+free to change, so a captured delivery could be replayed later with a fresh
+timestamp and still verify.
+
+The body is a batch:
+
+```json
+{ "subscription": "wh_…",
+  "events": [ { "eventId": "1786…-ec4c…", "operationType": "insert",
+                "clusterTime": "1786…", "documentKey": {"_id": 1},
+                "fullDocument": {"_id": 1, "item": "widget"} } ] }
+```
+
+---
+
+## Delivery is at-least-once
+
+**Deduplicate on `eventId`.** Exactly-once is not achievable over a network by
+any design, so the id is stable across redeliveries and identical on every node
+— a set-membership test is all a receiver needs.
+
+Duplicates should be rare rather than routine: a crash mid-delivery, or a brief
+disagreement about cluster membership. Answer `2xx` and the batch is marked
+delivered; answer anything else, or time out, and it is retried.
+
+**Ordering holds per subscription per origin node.** There is no total order
+across nodes, which is what the leaderless design says everywhere else.
+
+**A new subscription starts from now.** Registering does not replay history —
+otherwise a webhook on a busy collection would be answered with up to a whole
+`oplog_retention_secs` of events nobody asked for.
+
+---
+
+## In a cluster
+
+One node delivers each subscription. It is chosen by hashing the subscription id
+over the live SWIM member set — a pure function every node computes
+independently, so there is no leader, no election, and no coordination.
+
+**When that node dies, another takes over** and resumes from replicated
+progress, so nothing is lost and nothing is sent five times.
+[ADR-045](decisions.md) has the reasoning.
+
+The only way an event is never delivered is if the write never replicated off
+the node that accepted it — in which case the data is gone from the database
+too, and webhooks are not what failed.
+
+---
+
+## When an endpoint stops answering
+
+**Backoff is per subscription**, doubling to a five-minute ceiling. One dead
+endpoint delays only its own deliveries; every other subscription on the node
+keeps its cadence.
+
+**A subscription that falls too far behind is invalidated.** If the events it
+still owes have been collected under `storage.oplog_retention_secs`, they no
+longer exist anywhere, so it stops rather than resuming from whatever is left —
+which would silently skip everything collected, a gap the receiver could never
+detect. The same contract a lagging change stream gets as `410`.
+
+An invalidated subscription records why, and a listing shows it:
+
+```json
+{ "id": "wh_…", "state": "invalidated",
+  "invalidReason": "delivery fell behind storage.oplog_retention_secs…" }
+```
+
+Recovery is to register a new one. It will start from now, so the gap is not
+silently papered over.
+
+---
+
+## Where a webhook may point
+
+Loopback, link-local (`169.254.0.0/16` — cloud metadata), RFC1918, carrier NAT
+and reserved ranges are **refused**. Without that, anyone who can register a
+webhook could make the database probe its own network and read the instance's
+cloud credentials.
+
+```toml
+[webhooks]
+allowed_hosts = ["internal.corp"]   # exempt specific hosts
+```
+
+The host is resolved and **every** address checked, at registration *and* before
+each delivery — a name that resolves publicly today can resolve inward tomorrow.
+Redirects are refused for the same reason.
+
+---
+
+## Observability
+
+| Series | |
+|---|---|
+| `kimmy_webhook_deliveries_total{outcome}` | `delivered` / `failed` batches |
+| `kimmy_webhook_events_total` | Events pushed |
+
+Registering and removing a subscription, and any invalidation, are recorded on
+the `kimmy::audit` target — registering one grants ongoing egress, so it belongs
+in the same stream as authorization decisions.
+
+---
+
+## Next
+
+- [Change streams](change-streams.md) — the same events, client-held
+- [Decisions](decisions.md) — ADR-045 on ownership and progress
+- [Security](security.md) — the `webhook` action among the others

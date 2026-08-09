@@ -5,8 +5,8 @@
 Subscribe to changes as they happen — on a single node, with no replica set.
 
 > **Looking for webhooks?** A change stream needs the client to open and hold a
-> WebSocket. Registering a URL and having the node **push** to it is 📋 M6 — see
-> [Roadmap](roadmap.md). The events are the same; the direction is not.
+> WebSocket. Registering a URL and having the node **push** to it is
+> [Webhooks](webhooks.md). The events are the same; the direction is not.
 
 Implemented in `kimmy-storage/src/watch.rs` and `kimmy-api/src/watch.rs`.
 
