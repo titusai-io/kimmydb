@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-697 tests passing · 0 failures · clippy clean at -D warnings
+702 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -22,6 +22,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-api` | 86 | 48 unit (JSON boundary, errors, schema inference, rate limiting) + 36 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
+| `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
 | `kimmy-cluster` | 51 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
@@ -531,6 +532,7 @@ manually and are recorded so they can be repeated:
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
+| The `kimmy` CLI against a live node | ✅ every command driven: login, ping, insert from an argument and from stdin, find with sort, count, aggregate from stdin, update, delete, describe, backup-then-restore, and RBAC refusing a scoped user. Exit codes checked directly rather than through a pipeline, which had masked them |
 | Point-in-time restore, end to end | ✅ five documents wrecked by a bulk update, a backup taken after the incident, restored with `--until` a mark before it: all five back to their previous value, and the restored node served them |
 | The audit log at `mode=writes` | ✅ on a live node: the two admin actions and the write recorded, the denial recorded, and the `find` correctly absent |
 | The audit log at `mode=denials` | ✅ the same traffic produced exactly one record — the refusal |

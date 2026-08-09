@@ -17,7 +17,7 @@ graph LR
     M2["<b>M2</b> ✅<br/>vectors and<br/>auto-embeddings"]
     M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
-    M5["<b>M5</b> 📋<br/>hardening"]
+    M5["<b>M5</b> ✅<br/>hardening"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5
 
@@ -27,6 +27,7 @@ graph LR
     style M2 fill:#2f5d3a,color:#fff
     style M3 fill:#2f5d3a,color:#fff
     style M4 fill:#2f5d3a,color:#fff
+    style M5 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -36,7 +37,7 @@ graph LR
 | **M2** | Auto-embeddings, HNSW, vector and hybrid search | ✅ Complete |
 | **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
-| **M5** | Backup, TLS, rate limiting, CLI, benchmarks | 🚧 In progress — login rate limiting and client TLS landed |
+| **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -133,7 +134,7 @@ by build flags or a second permission system.
 | Piece | Planned | Built |
 |---|---|---|
 | Transport | `rmcp` streamable HTTP at `/mcp` | ✅ **Stateless** — no MCP session, so an expired token stops working immediately rather than riding a session opened while it was valid |
-| Read tools | `list_databases`, `list_collections`, `describe_collection`, `find`, `count`, `aggregate` | ✅ all but **`aggregate`**, which has nothing to expose: the pipeline itself is M5 |
+| Read tools | `list_databases`, `list_collections`, `describe_collection`, `find`, `count`, `aggregate` | ✅ all six — `aggregate` landed with the pipeline in M5 |
 | Search tools | `vector_search`, `hybrid_search` | ✅ Both, with filter composition |
 | Write tools | `insert`, `update`, `delete`, `create_collection`, `create_index` | ✅ All five |
 | Resources | Collections with inferred schema and samples | ✅ `kimmy://{db}/{coll}`, grant-filtered, **excluding `__kimmy` and shadow collections** ([ADR-027](decisions.md)) |
@@ -316,7 +317,7 @@ handle a node whose tombstones were collected while it was partitioned.
 
 ---
 
-## M5 — Hardening
+## M5 — Hardening ✅
 
 | | |
 |---|---|
@@ -325,7 +326,7 @@ handle a node whose tombstones were collected while it was partitioned.
 | Rate limiting | ✅ Done for `/v1/auth/login` — token bucket per caller, checked *before* the Argon2 verify it exists to bound. [ADR-038](decisions.md). Other routes deliberately deferred to the benchmark work below |
 | Oplog & tombstone GC | ✅ Done — background pass, `storage.gc_interval_secs`. [ADR-028](decisions.md) |
 | Aggregation pipeline | ✅ Done — those six plus `$skip`, `$count` and `$lookup`, with a hard document ceiling on blocking stages. Also lands the MCP `aggregate` tool. [Aggregation](aggregation.md) |
-| `kimmy` CLI | Interactive shell |
+| `kimmy` CLI | ✅ Done — one-shot subcommands over the HTTP API, JSON on stdout. An interactive shell was considered and deferred: it is the same command surface plus a terminal UI. [CLI](cli.md) |
 | Benchmarks | 🚧 Vector index, write path and query planner measured. No crossover existed, so `MIN_VECTORS_FOR_INDEX` dropped 2,000 → 500; and every write costs one durable commit, which makes secondary indexes free on the write path. [Benchmarks](benchmarks.md) |
 | Audit log | ✅ Done — emitted from the single authorization point, four modes, `kimmy::audit` target. [ADR-042](decisions.md) |
 | Richer metrics | ✅ Mostly — request rates, response classes, storage size, denial and rate-limit counters. **Latency histograms and oplog lag are not built**, and are documented as such rather than guessed. [ADR-043](decisions.md) |

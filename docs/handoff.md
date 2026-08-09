@@ -6,64 +6,73 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-09 — M5: point-in-time restore
+## As of 2026-08-09 — M5 complete
 
-**Branch:** `m5-point-in-time-restore`, off `main` (PRs #16–#24 merged). Not
-merged.
-**Gate:** 697 tests (687 + 10) · fmt clean · clippy clean · native-dep check
-clean · driven end to end through a simulated incident.
+**Branch:** `m5-kimmy-cli`, off `main` (PRs #16–#25 merged). Not merged.
+**Gate:** 702 tests · fmt clean · clippy clean · native-dep check clean ·
+every command driven against a live node.
+
+**This finishes M5.** M0–M5 are all complete.
 
 ### What this branch did
 
-`kimmyd restore --from <backup> --until <ms>` restores a backup and rewinds
-document state to that instant using the oplog the backup carries.
-[ADR-044](decisions.md).
+`kimmy` is a real client: one-shot subcommands over the ordinary HTTP API,
+JSON on stdout, diagnostics on stderr, non-zero exit on failure.
 
-**The shape of the feature is set by what the oplog stores.** Post-images only
-([ADR-008](decisions.md)) — what a document *became*, never what it was — and a
-delete stores nothing at all, since `DocRecord::tombstone` discards the body. So
-a rewind can put a document back only to a value the retained oplog still holds,
-and `oplog_retention_secs` is the real point-in-time window.
+Both shape decisions were deliberate. **One-shot rather than a shell**, because
+a REPL is this same command surface plus a terminal UI, so the commands come
+first and a shell could sit on top later. **Over HTTP rather than opening the
+file**, because redb allows one process to hold a database — a file-opening
+client could not run while a node was running, and would bypass authentication
+and RBAC.
 
-Each document changed after the target is either restored from its latest entry
-at or before it, removed if its earliest later entry is an `Insert`, or
-**refused** — it existed then, with a value that has been collected. Refusing is
-the point: leaving such a document at its later value produces a database that
-looks restored and is not.
+**There is no `--password` flag,** deliberately: it would land in shell history
+and in `ps` for every user on the machine. The password comes from stdin or
+`KIMMY_PASSWORD`, and `login` prints the token rather than writing it to disk, so
+there is no file whose permissions, lifetime and cleanup have to be defended.
 
-Nothing is written until every check passes, so a refusal leaves the file
-exactly as the restore wrote it.
+### Two tests that were wrong before they were right
 
-**The undone future leaves the oplog and the version vector comes down with
-it** — otherwise a peer ships the undone writes straight back, or the node
-claims history it no longer holds and is permanently missing writes while
-looking caught up. That lowering is the one legitimate exception to "the version
-vector is never rebuilt downwards", and it has its own function rather than
-relaxing the existing one.
+`there_is_no_password_flag` first searched the rendered help text — which
+*explains* why the flag does not exist, so the search found the explanation and
+passed for the wrong reason. Rewritten to walk clap's arguments, it still passed
+under mutation, because clap does not propagate subcommand arguments until
+`build()` is called. Only after both fixes does adding a flag turn it red.
 
-### The mutation check that earned its keep
+Worth remembering: the mutation that *seemed* to escape twice was also failing to
+compile the first time, so the "passed" line being read came from the restored
+run further down the same command. **Check that a mutation compiled before
+concluding a test missed it.**
 
-Five faults injected; **the most important one escaped on the first run** —
-silently skipping unrecoverable documents. Nothing covered that path, because
-every existing test used documents whose history was still in the window.
+### M5 in one place
 
-Writing the missing test then hit the classic trap: the first version collected
-the oplog and expected a refusal, but retention never collects the newest entry
-(ADR-028), so the document's insert was still the tail and the rewind removed
-the document instead. The fixture had not built the condition it was named for.
-Both are recorded in [Testing](testing.md).
-
-### One usability bug found by running it
-
-`restore` demanded `KIMMY_ROOT_PASSWORD`. It writes a file and exits and never
-authenticates anybody, so an operator recovering from an incident was being
-asked to invent a password first. It now skips the serving configuration.
-
-### What is left in M5
-
-| Item | Note |
+| | |
 |---|---|
-| `kimmy` CLI | The last item. Still a stub printing a pointer to the HTTP API — the largest remaining piece and the least load-bearing, since everything it would do is already reachable over HTTP. Worth deciding the shape first: interactive shell, one-shot command wrapper, or both |
+| Login rate limiting | ADR-038 |
+| TLS, clients | ADR-039 |
+| Benchmarks | Vector index, write path, planner. Two guessed constants measured, one changed |
+| Aggregation pipeline | ADR-044's neighbour: nine stages, `$lookup` authorized separately |
+| Container fixes | A replication bug affecting ~48% of collection names |
+| Native-dependency CI check | The enforceable half of ADR-016 |
+| TLS, node↔node | ADR-040 — channel binding rather than PKI |
+| Backup and restore | ADR-041 |
+| Audit log, metrics | ADR-042, ADR-043 |
+| Point-in-time restore | ADR-044 |
+| `kimmy` CLI | This branch |
+
+### Where to go next
+
+Nothing is blocked, and there is no M6 defined. The register's remaining debt is
+below. Candidates, in rough order of how often they would be felt:
+
+| | |
+|---|---|
+| `$in` does not use an index | Common query shape falling back to a scan |
+| Index ranges use one bound | Correct but less selective; needs multikey tracking on the write path |
+| HNSW snapshot persistence | A restart pays a full rebuild on first search |
+| Interactive shell | Now cheap: the command surface exists |
+| SRV discovery | Needs a DNS resolver crate |
+| Latency histograms, oplog lag | Both deliberately skipped in ADR-043 rather than guessed |
 
 ### Carried debt, none blocking
 
