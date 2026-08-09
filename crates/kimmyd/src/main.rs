@@ -25,7 +25,7 @@ fn main() -> Result<()> {
             eprintln!("configuration is valid");
             Ok(())
         }
-        Command::Restore { from } => {
+        Command::Restore { from, until } => {
             // Into the configured data directory, at the same filename a node
             // opens, so that starting the node afterwards needs no extra flag.
             let target = config.storage.data_dir.join("kimmy.redb");
@@ -45,6 +45,26 @@ fn main() -> Result<()> {
                 info.node.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into()),
                 info.created_ms,
             );
+            if let Some(until_ms) = until {
+                // Opened only after the restore has written the file, because
+                // the rewind reads the oplog the restore just put there.
+                let engine = kimmy_storage::Engine::open(&target)
+                    .with_context(|| format!("opening {} to rewind it", target.display()))?;
+                let outcome = engine
+                    .rewind_to(kimmy_core::Hlc::new(until_ms, 0))
+                    .context("rewinding to the requested point in time")?;
+                eprintln!(
+                    "rewound to {until_ms}: {} document(s) reverted, {} removed, {} oplog \
+                     entries discarded",
+                    outcome.reverted, outcome.removed, outcome.oplog_discarded,
+                );
+                eprintln!(
+                    "note: a rewound database has had history removed. Do not let it rejoin a \
+                     cluster that still holds the undone writes -- anti-entropy would put them \
+                     back."
+                );
+            }
+
             eprintln!(
                 "note: this database carries the original node's identity. Do not start it \
                  alongside the node it was taken from."

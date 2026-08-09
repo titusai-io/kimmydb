@@ -1398,6 +1398,75 @@ neither is worth guessing.
 
 ---
 
+## ADR-044 — Point-in-time restore rewinds from post-images, and refuses what it cannot reconstruct
+
+**Decision.** `kimmyd restore --from <backup> --until <ms>` restores a backup and
+then rewinds document state to that instant using the oplog the backup carries.
+It refuses — having written nothing — when the target predates the oplog
+horizon, when a schema change happened after it, or when any document's value at
+that instant is no longer recoverable.
+
+**What the oplog can and cannot answer.** It stores **post-images**
+([ADR-008]): what a document *became*, never what it was. A delete stores
+nothing at all — `DocRecord::tombstone` discards the body and the `Delete` entry
+has no payload. So the only history that exists is the sequence of values
+documents took, and a rewind can put a document back only to a value the
+retained oplog still holds.
+
+That gives an exact rule for each document changed after the target `T`:
+
+| Condition | State at `T` |
+|---|---|
+| It has an entry at or before `T` | That entry's post-image (or a tombstone, if it was a delete) |
+| Its earliest entry after `T` is an `Insert` | It did not exist yet — remove it |
+| Otherwise | **Unrecoverable**: it existed, and its value has been collected |
+
+**The third case is refused, not guessed.** Leaving such a document at its
+*later* value would produce a database that looks restored and is not — a wrong
+answer no caller could detect, which is the worst outcome available here. The
+affected documents are named.
+
+**`oplog_retention_secs` is therefore the point-in-time window**, and that is
+worth knowing when choosing it. A mistaken update to a document written within
+the window is recoverable; one to a document untouched since before the horizon
+is not, because its previous value exists nowhere.
+
+**Dropped collections cannot be undone**, and any schema change after the target
+is refused for the same reason: `drop_collection` purges the documents, purged
+documents are not in the oplog either, and a rewind that recreated an empty
+collection would be answering a question it was not asked.
+
+**Nothing is written until everything is known.** The whole plan is computed and
+every refusal raised before a single document is touched, so a refused rewind
+leaves the database exactly as it was — asserted by a test.
+
+**The undone future leaves the oplog, and the version vector comes down with
+it.** An entry describing a change that no longer exists would be shipped to a
+peer, which would ship it straight back and undo the rewind. And a version
+vector left high would have the node claim history it no longer holds, so no
+peer would ever send that range again — it would be permanently missing writes
+while looking caught up.
+
+That lowering is the **one** legitimate exception to the rule that the version
+vector is authoritative and never rebuilt downwards. The rule exists for
+snapshot resync, where a snapshot grants coverage the oplog never held. Here the
+history is gone because this operation deliberately removed it, offline. It has
+its own function, `reset_version_vector_to_oplog`, rather than relaxing the
+existing one.
+
+**A rewound database must not rejoin a cluster that still holds the undone
+writes.** Anti-entropy would put them back. Rewind produces a database to run
+standalone or to seed a new cluster; the CLI says so.
+
+**`restore` skips the serving configuration.** It writes a file and exits — it
+never authenticates anybody — so requiring a root password would mean an
+operator recovering from an incident has to invent one first. Found by running
+it.
+
+[ADR-008]: #adr-008--the-oplog-is-written-unconditionally
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

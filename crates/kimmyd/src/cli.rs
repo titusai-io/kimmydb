@@ -46,6 +46,15 @@ pub enum Command {
         /// The backup file, as written by `GET /v1/admin/backup`.
         #[arg(long)]
         from: PathBuf,
+        /// Restore to an earlier instant, as milliseconds since the epoch.
+        ///
+        /// Point-in-time restore. The backup is written out, then documents
+        /// changed after this instant are put back to the value the oplog says
+        /// they held at it. Refuses, without writing, if the target predates
+        /// the oplog horizon, if a schema change happened after it, or if any
+        /// document's earlier value has already been collected.
+        #[arg(long)]
+        until: Option<u64>,
     },
 }
 
@@ -140,7 +149,15 @@ impl Cli {
             None => Config::default(),
         };
         self.overrides.apply(&mut cfg);
-        cfg.validate()?;
+
+        // `restore` moves a file into a data directory and exits. It never
+        // serves, never authenticates anybody, and never joins a cluster, so
+        // holding it to the serving configuration would mean an operator
+        // recovering from an incident has to supply a root password to a
+        // command that will not use one. Found by running it.
+        if !matches!(self.command, Some(Command::Restore { .. })) {
+            cfg.validate()?;
+        }
         Ok(cfg)
     }
 }
@@ -218,6 +235,18 @@ mod tests {
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("kimmyd").chain(args.iter().copied()))
             .unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"))
+    }
+
+    #[test]
+    fn restore_does_not_require_serving_configuration() {
+        // It writes a file and exits. Requiring a root password would mean an
+        // operator recovering from an incident has to invent one first.
+        let cli = Cli::try_parse_from(["kimmyd", "restore", "--from", "/tmp/x.backup"]).unwrap();
+        cli.resolve().expect("restore must resolve without auth configured");
+
+        // Running still demands it.
+        let cli = Cli::try_parse_from(["kimmyd", "run"]).unwrap();
+        assert!(cli.resolve().is_err(), "serving without a root password must still be refused");
     }
 
     #[test]
