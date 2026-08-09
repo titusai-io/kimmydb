@@ -198,6 +198,21 @@ pub fn register(
     let meta = registry(state)?;
     state.engine.insert(&meta, subscription.to_document())?;
 
+    // Start from *now*, not from the beginning of the retained oplog.
+    //
+    // Without this a webhook registered on a busy collection is answered with
+    // up to `oplog_retention_secs` of history the moment it is created — a
+    // surprise flood of events the caller did not ask for and, on a large
+    // collection, a stampede at whatever endpoint they just wired up. Change
+    // streams behave the same way: you subscribe to hear what happens next.
+    //
+    // Seeded by recording the current version vector as already-delivered,
+    // which needs no special case in the dispatcher: it is simply a
+    // subscription that is already caught up.
+    if let Ok(now) = state.engine.version_vector() {
+        crate::dispatch::seed_progress(state, &subscription.id, &now);
+    }
+
     tracing::warn!(
         target: "kimmy::audit",
         user = %subscription.created_by,

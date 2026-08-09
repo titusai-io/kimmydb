@@ -18,7 +18,7 @@ graph LR
     M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> ✅<br/>hardening"]
-    M6["<b>M6</b> 📋<br/>webhooks"]
+    M6["<b>M6</b> 🚧<br/>webhooks"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6
 
@@ -39,7 +39,7 @@ graph LR
 | **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
-| **M6** | Webhooks — registration and push delivery of change events | 📋 Planned |
+| **M6** | Webhooks — registration and push delivery of change events | 🚧 Working end to end; two observability and test gaps remain |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -335,7 +335,7 @@ handle a node whose tombstones were collected while it was partitioned.
 
 ---
 
-## M6 — Webhooks: registration and push 📋
+## M6 — Webhooks: registration and push 🚧
 
 A developer registers a URL and the cluster **pushes** change events to it.
 Change streams already carry these events, but the client must open and hold a
@@ -445,11 +445,11 @@ high-water mark per batch rather than a record per event.
 | 6 | ✅ **Dispatcher worker** | One per node. Computes owned subscriptions, reads union progress, uses `VersionVector::behind` to find undelivered entries, batches by size and max delay so a bulk load is not one request per document |
 | 7 | ✅ **Delivery** | HTTP POST, change-stream event shape, timeout, `X-Kimmy-Event-Id` and `X-Kimmy-Signature` headers |
 | 8 | ✅ **Signing** | HMAC-SHA256 over the body with a per-subscription secret, plus a timestamp against replay. `hmac`/`sha2` are already in the build for the cluster handshake |
-| 9 | ✅ **Egress policy** — registration-time checking done; the re-check before each delivery lands with the dispatcher | Resolve the host and check the **resolved** address, refuse redirects, block loopback/link-local/RFC1918 unless allowlisted. A name that is public at registration must not be able to point inward at delivery |
-| 10 | 🚧 **Failure handling** — backoff is per pass, not per subscription; invalidation past retention is not built | Exponential backoff; invalidate the subscription when its progress falls past `oplog_retention_secs`, exactly as a lagging change-stream consumer gets `410` |
-| 11 | **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_subscriptions`, backlog age; an audit record on register and remove, since registering one grants ongoing egress |
-| 12 | **Tests** | A local receiver over a real socket: delivery, batching, signature verification, retry after failure, invalidation past retention, a deleted subscription stopping, ownership failover with a node removed from the member set, and that a private-range URL is refused |
-| 13 | **Docs and ADRs** | One ADR for derived ownership plus replicated progress — including why it is not leader election — and one for the egress policy |
+| 9 | ✅ **Egress policy** | Resolved address checked, not the name; every address, not the first; redirects refused; loopback, link-local, RFC1918, carrier NAT and reserved ranges blocked unless allowlisted. Enforced at registration **and** before each delivery |
+| 10 | ✅ **Failure handling** — per-subscription backoff, and invalidation when progress falls past retention | Exponential backoff; invalidate the subscription when its progress falls past `oplog_retention_secs`, exactly as a lagging change-stream consumer gets `410` |
+| 11 | 🚧 **Observability** | Built: `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_events_total`, and audit records on register, remove and invalidate. **Not built:** a gauge of live subscriptions, and backlog age — the second is the one an operator would actually alert on |
+| 12 | 🚧 **Tests** | Against a local receiver over a real socket: delivery, signature verification and tampering, retry after failure, per-subscription backoff, invalidation past retention, no history replay, ownership standing down, and egress refused at delivery. **Not covered:** batching behaviour under load, and that deleting a subscription stops it mid-flight |
+| 13 | ✅ **Docs and ADRs** — [Webhooks](webhooks.md), ADR-045 | One ADR for derived ownership plus replicated progress — including why it is not leader election — and one for the egress policy |
 
 ### Open questions to settle during
 

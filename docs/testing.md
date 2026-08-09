@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-745 tests passing · 0 failures · clippy clean at -D warnings
+748 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 130 | 78 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket + 7 webhook delivery against a real receiver |
+| `kimmy-api` | 133 | 78 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket + 10 webhook delivery against a real receiver |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -270,6 +270,16 @@ each one turned a named test red:
 | Record the attempt before authenticating, so success also spends | `a_successful_login_does_not_spend_the_budget` |
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
+
+### Webhook failure handling, five for five
+
+| Injected fault | Caught by |
+|---|---|
+| Backoff ignored, so a failing endpoint is retried every tick | `a_failing_endpoint_backs_off_without_stalling_another` |
+| Backoff shared, so a healthy endpoint waits behind a failing one | same test |
+| No invalidation past retention | `a_subscription_that_falls_past_retention_is_invalidated_not_silently_gapped` |
+| An invalidated subscription keeps dialling | same test |
+| Progress not seeded, so a new subscription replays history | `a_new_subscription_does_not_replay_history` |
 
 ### Webhook delivery, six for six
 

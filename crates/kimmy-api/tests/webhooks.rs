@@ -147,10 +147,19 @@ fn me() -> std::net::SocketAddr {
 }
 
 async fn pass(state: &kimmy_api::SharedState) -> dispatch::DispatchOutcome {
+    let mut backoff = dispatch::Backoff::default();
+    pass_with(state, &mut backoff).await
+}
+
+/// A pass that carries backoff state across calls, for the tests that need it.
+async fn pass_with(
+    state: &kimmy_api::SharedState,
+    backoff: &mut dispatch::Backoff,
+) -> dispatch::DispatchOutcome {
     let client =
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
     let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
-    dispatch::dispatch_once(state, &client, &policy, me(), &BTreeSet::new()).await
+    dispatch::dispatch_once(state, &client, &policy, me(), &BTreeSet::new(), backoff).await
 }
 
 #[tokio::test]
@@ -243,7 +252,9 @@ async fn a_failed_delivery_does_not_advance_progress() {
         "a refused delivery must leave progress untouched"
     );
 
-    // ...and it is retried on the next pass rather than lost.
+    // ...and it is retried rather than lost. A fresh `Backoff` stands in for
+    // the delay having elapsed; that the delay exists at all is the subject of
+    // its own test.
     pass(&state).await;
     assert_eq!(hits.load(Ordering::Relaxed), 2, "the event must be retried");
 }
@@ -279,7 +290,9 @@ async fn a_node_that_does_not_own_a_subscription_delivers_nothing() {
         ["10.0.0.1:7900", "10.0.0.2:7900"].iter().map(|a| a.parse().unwrap()).collect();
     let client = reqwest::Client::new();
     let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
-    let outcome = dispatch::dispatch_once(&state, &client, &policy, me(), &others).await;
+    let mut backoff = dispatch::Backoff::default();
+    let outcome =
+        dispatch::dispatch_once(&state, &client, &policy, me(), &others, &mut backoff).await;
 
     assert_eq!(outcome.skipped_not_owner, 1, "{outcome:?}");
     assert_eq!(outcome.delivered, 0);
@@ -300,8 +313,126 @@ async fn the_egress_policy_is_enforced_at_delivery_not_only_at_registration() {
 
     let client = reqwest::Client::new();
     let closed = EgressPolicy::default(); // 127.0.0.1 no longer permitted
-    let outcome = dispatch::dispatch_once(&state, &client, &closed, me(), &BTreeSet::new()).await;
+    let mut backoff = dispatch::Backoff::default();
+    let outcome =
+        dispatch::dispatch_once(&state, &client, &closed, me(), &BTreeSet::new(), &mut backoff)
+            .await;
 
     assert_eq!(outcome.failed, 1, "{outcome:?}");
     assert_eq!(hits.load(Ordering::Relaxed), 0, "nothing may reach a now-forbidden address");
+}
+
+#[tokio::test]
+async fn a_failing_endpoint_backs_off_without_stalling_another() {
+    // The reason backoff is per subscription. A shared one lets a single dead
+    // endpoint slow every delivery on the node, which is the failure mode most
+    // likely to be blamed on the database rather than on the endpoint.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (dead, _dead_seen, dead_hits) = receiver(500).await;
+    let (live, _live_seen, live_hits) = receiver(200).await;
+    register(&state, &format!("http://{dead}/hook"), vec![]);
+    register(&state, &format!("http://{live}/hook"), vec![]);
+
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+
+    let mut backoff = dispatch::Backoff::default();
+    let first = pass_with(&state, &mut backoff).await;
+    assert_eq!(first.failed, 1, "the dead endpoint fails: {first:?}");
+    assert_eq!(first.delivered, 1, "the live one is delivered anyway: {first:?}");
+
+    // A second pass immediately after: the failing subscription is in backoff
+    // and is skipped, while the healthy one is simply up to date.
+    state.engine.insert(&coll, doc! { "_id": 2 }).unwrap();
+    let second = pass_with(&state, &mut backoff).await;
+    assert_eq!(second.skipped_backoff, 1, "the failing one must wait: {second:?}");
+    assert_eq!(second.delivered, 1, "the healthy one must not have to: {second:?}");
+
+    assert_eq!(dead_hits.load(Ordering::Relaxed), 1, "the dead endpoint was tried once");
+    assert_eq!(live_hits.load(Ordering::Relaxed), 2, "the live endpoint kept its cadence");
+}
+
+#[tokio::test]
+async fn a_subscription_that_falls_past_retention_is_invalidated_not_silently_gapped() {
+    // Resuming from whatever is left would skip every collected event, and the
+    // receiver could never tell. Mirrors the `410` a lagging change stream gets.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, hits) = receiver(500).await; // never succeeds, so it falls behind
+    let id = register(&state, &format!("http://{addr}/hook"), vec![]);
+
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..12i64 {
+        state.engine.insert(&coll, doc! { "_id": i }).unwrap();
+    }
+    pass(&state).await; // fails; progress stays empty
+
+    // Collect the oplog out from under it.
+    let much_later = kimmy_storage::physical_now_ms() + 365 * 24 * 60 * 60 * 1000;
+    state
+        .engine
+        .collect_garbage_at(much_later, kimmy_storage::RetentionPolicy::new(0, 24 * 60 * 60))
+        .unwrap();
+
+    let before = hits.load(Ordering::Relaxed);
+    let outcome = pass(&state).await;
+    assert_eq!(outcome.invalidated, 1, "{outcome:?}");
+
+    // It is recorded on the subscription, so an operator sees it in a listing
+    // rather than only in a log.
+    let meta = state.engine.get_collection("__kimmy", "__webhooks").unwrap();
+    let stored = state
+        .engine
+        .get(&meta, &kimmy_core::DocId::String(id.clone()))
+        .unwrap()
+        .expect("the subscription");
+    assert_eq!(stored.get_str("state").unwrap(), "invalidated");
+    assert!(stored.get_str("invalidReason").unwrap().contains("retention"));
+
+    // ...and it stops trying.
+    let after = pass(&state).await;
+    assert_eq!(after.delivered, 0);
+    assert_eq!(after.invalidated, 0, "invalidating is not repeated every pass");
+    assert_eq!(hits.load(Ordering::Relaxed), before, "an invalidated hook must stop dialling");
+}
+
+#[tokio::test]
+async fn a_new_subscription_does_not_replay_history() {
+    // Registering a webhook on a busy collection used to answer with up to a
+    // whole retention window of events the caller never asked for. A new
+    // subscription hears about what happens next.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, seen, _) = receiver(200).await;
+
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..5i64 {
+        state.engine.insert(&coll, doc! { "_id": i, "when": "before" }).unwrap();
+    }
+
+    // Registered through the real path, so the seeding runs.
+    let auth = kimmy_api::state::Auth(kimmy_auth::Principal::new(
+        "root",
+        vec![kimmy_auth::Grant::superuser()],
+    ));
+    let request = kimmy_api::webhooks::RegisterRequest {
+        url: format!("http://{addr}/hook"),
+        operations: None,
+    };
+    kimmy_api::webhooks::register(
+        &state,
+        &auth,
+        "shop",
+        "orders",
+        &request,
+        &EgressPolicy::new(vec!["127.0.0.1".into()]),
+    )
+    .expect("registration");
+
+    assert_eq!(pass(&state).await.delivered, 0, "history must not be replayed");
+
+    state.engine.insert(&coll, doc! { "_id": 99, "when": "after" }).unwrap();
+    assert_eq!(pass(&state).await.delivered, 1, "but new writes must arrive");
+    assert!(seen.lock()[0].body.contains("after"), "{}", seen.lock()[0].body);
 }

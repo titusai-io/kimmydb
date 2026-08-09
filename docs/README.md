@@ -84,6 +84,7 @@ graph TD
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
 | [Aggregation](aggregation.md) | The pipeline: stages, accumulators, `$lookup`, and the memory ceiling |
+| [Webhooks](webhooks.md) | Registering endpoints, verifying deliveries, and what happens when one stops answering |
 | [CLI](cli.md) | The `kimmy` terminal client |
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
@@ -117,6 +118,7 @@ running server, not merely compiled.
 | Audit log | ✅ Working | Authorization decisions, four modes, on their own tracing target |
 | Login rate limiting | ✅ Working | Token bucket per caller, checked before the password hash |
 | TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
+| Webhooks | ✅ Working | Register a URL; the cluster pushes change events, signed, with failover |
 | Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
 | Backup / restore | ✅ Working | Online snapshot endpoint, offline restore, and point-in-time rewind |
 | `kimmy` CLI | ✅ Working | One-shot commands over the HTTP API. [CLI](cli.md) |

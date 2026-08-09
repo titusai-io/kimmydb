@@ -68,6 +68,50 @@ pub struct DispatchOutcome {
     pub delivered: usize,
     pub failed: usize,
     pub skipped_not_owner: usize,
+    /// Subscriptions passed over because they are still backing off.
+    pub skipped_backoff: usize,
+    /// Subscriptions stopped because the history they needed was collected.
+    pub invalidated: usize,
+}
+
+/// Per-subscription failure state, held across passes.
+///
+/// **Per subscription, not per pass.** One endpoint that has stopped answering
+/// must not slow deliveries to every other endpoint on the node — which is
+/// exactly what a single shared backoff does, and what this replaces.
+#[derive(Default)]
+pub struct Backoff {
+    failures: std::collections::HashMap<String, (u32, std::time::Instant)>,
+}
+
+impl Backoff {
+    /// Whether this subscription may be attempted now.
+    fn ready(&self, subscription: &str) -> bool {
+        match self.failures.get(subscription) {
+            Some((_, next)) => std::time::Instant::now() >= *next,
+            None => true,
+        }
+    }
+
+    fn failed(&mut self, subscription: &str) {
+        let entry =
+            self.failures.entry(subscription.to_string()).or_insert((0, std::time::Instant::now()));
+        entry.0 = entry.0.saturating_add(1);
+        // Doubling, capped. Capped because an endpoint that comes back after an
+        // hour should be noticed in minutes, not left waiting for a delay that
+        // grew while it was down.
+        let delay = BACKOFF_MIN.saturating_mul(1u32 << entry.0.min(8));
+        entry.1 = std::time::Instant::now() + delay.min(BACKOFF_MAX);
+    }
+
+    fn succeeded(&mut self, subscription: &str) {
+        self.failures.remove(subscription);
+    }
+
+    /// Consecutive failures recorded for a subscription.
+    pub fn failure_count(&self, subscription: &str) -> u32 {
+        self.failures.get(subscription).map(|(n, _)| *n).unwrap_or(0)
+    }
 }
 
 /// Read the union of every node's progress for a subscription.
@@ -108,6 +152,19 @@ pub fn union_progress(state: &SharedState, subscription: &str) -> VersionVector 
     union
 }
 
+/// Mark a subscription as already caught up to `now`.
+///
+/// Used at registration so a new webhook hears about what happens next rather
+/// than being answered with the whole retained oplog. Failure is logged rather
+/// than propagated: the subscription is already stored, and refusing to
+/// register because a progress record could not be written would be a worse
+/// outcome than the replay it prevents.
+pub fn seed_progress(state: &SharedState, subscription: &str, now: &VersionVector) {
+    if let Err(e) = record_progress(state, subscription, now) {
+        warn!(subscription, error = %e, "could not seed webhook progress; it will replay history");
+    }
+}
+
 /// Record what this node has delivered.
 fn record_progress(
     state: &SharedState,
@@ -142,6 +199,36 @@ fn record_progress(
         .replace(&meta, &kimmy_core::DocId::String(id), document, true)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Stop a subscription whose history has been collected.
+///
+/// Mirrors what a lagging change-stream consumer gets: the oplog no longer
+/// describes the range it needs, so there is no honest way to continue. The
+/// alternative — resuming from whatever is left — would silently skip every
+/// event that was collected, which is a gap the receiver could never detect.
+///
+/// Recorded on the subscription so it is visible in a listing rather than only
+/// in a log nobody is reading.
+fn invalidate(state: &SharedState, subscription: &str, reason: &str) {
+    let Ok(meta) = state.engine.get_collection(WEBHOOKS_DB, WEBHOOKS_COLLECTION) else {
+        return;
+    };
+    let key = kimmy_core::DocId::String(subscription.to_string());
+    let Ok(Some(mut document)) = state.engine.get(&meta, &key) else {
+        return;
+    };
+    document.insert("state", "invalidated");
+    document.insert("invalidReason", reason.to_string());
+    let _ = state.engine.replace(&meta, &key, document, false);
+
+    warn!(
+        target: "kimmy::audit",
+        subscription,
+        reason,
+        decision = "invalidated",
+        "webhook stopped: the oplog no longer holds the events it needed"
+    );
 }
 
 /// Whether an entry belongs to a subscription.
@@ -222,6 +309,7 @@ struct Job {
     secret: String,
     collection_id: u64,
     operations: Vec<String>,
+    invalidated: bool,
 }
 
 fn load_jobs(state: &SharedState) -> Vec<Job> {
@@ -252,6 +340,7 @@ fn load_jobs(state: &SharedState) -> Vec<Job> {
             secret: secret.to_string(),
             collection_id,
             operations,
+            invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
         });
         Ok(true)
     });
@@ -268,12 +357,22 @@ pub async fn dispatch_once(
     policy: &EgressPolicy,
     me: SocketAddr,
     members: &BTreeSet<SocketAddr>,
+    backoff: &mut Backoff,
 ) -> DispatchOutcome {
     let mut outcome = DispatchOutcome::default();
 
     for job in load_jobs(state) {
         if !crate::ownership::owns(&job.id, me, members) {
             outcome.skipped_not_owner += 1;
+            continue;
+        }
+        if job.invalidated {
+            continue;
+        }
+        // Checked before any work: a subscription in backoff costs nothing,
+        // and that is what keeps one dead endpoint from slowing the others.
+        if !backoff.ready(&job.id) {
+            outcome.skipped_backoff += 1;
             continue;
         }
 
@@ -286,6 +385,23 @@ pub async fn dispatch_once(
             .ok()
             .and_then(|current| progress.behind(&current))
             .unwrap_or(Hlc::ZERO);
+
+        // The events this subscription still needs may have been collected.
+        // `from` is where it must resume; if that is behind the retention
+        // horizon, the range no longer exists anywhere.
+        if let Ok(horizon) = state.engine.oplog_collected_through()
+            && horizon > Hlc::ZERO
+            && from < horizon
+        {
+            invalidate(
+                state,
+                &job.id,
+                "delivery fell behind storage.oplog_retention_secs; the events it had not \
+                 delivered have been collected",
+            );
+            outcome.invalidated += 1;
+            continue;
+        }
 
         let Ok(entries) = state.engine.entries_for_peer(from, BATCH * 4) else {
             continue;
@@ -310,12 +426,22 @@ pub async fn dispatch_once(
                 if let Err(e) = record_progress(state, &job.id, &progress) {
                     warn!(subscription = %job.id, error = %e, "could not record webhook progress");
                 }
+                backoff.succeeded(&job.id);
+                state.metrics.record_webhook_delivery(true, batch.len());
                 outcome.delivered += batch.len();
                 debug!(subscription = %job.id, events = batch.len(), "delivered");
             }
             Err(e) => {
+                backoff.failed(&job.id);
+                state.metrics.record_webhook_delivery(false, batch.len());
                 outcome.failed += 1;
-                warn!(subscription = %job.id, url = %job.url, error = %e, "webhook delivery failed");
+                warn!(
+                    subscription = %job.id,
+                    url = %job.url,
+                    error = %e,
+                    attempts = backoff.failure_count(&job.id),
+                    "webhook delivery failed"
+                );
             }
         }
     }
@@ -372,22 +498,16 @@ pub async fn run(
         .unwrap_or_default();
 
     info!("webhook dispatcher started");
-    let mut backoff = BACKOFF_MIN;
+    let mut backoff = Backoff::default();
     loop {
         // Re-read every tick rather than once: the whole point is that
         // ownership follows the live set as it changes.
         let live = members.as_ref().map(|m| m.snapshot()).unwrap_or_default();
-        let outcome = dispatch_once(&state, &client, &policy, me, &live).await;
-        if outcome.failed > 0 {
-            // Backing off the whole pass rather than one subscription is
-            // deliberately crude for now; per-subscription backoff arrives with
-            // the failure-handling task.
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(BACKOFF_MAX);
-        } else {
-            backoff = BACKOFF_MIN;
-            tokio::time::sleep(TICK).await;
-        }
+        // The pass itself always runs on the tick. Backoff is held per
+        // subscription inside it, so a failing endpoint delays only its own
+        // deliveries and every other subscription keeps its cadence.
+        dispatch_once(&state, &client, &policy, me, &live, &mut backoff).await;
+        tokio::time::sleep(TICK).await;
     }
 }
 
