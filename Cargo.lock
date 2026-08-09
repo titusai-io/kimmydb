@@ -2133,6 +2133,7 @@ name = "kimmy-storage"
 version = "0.1.0"
 dependencies = [
  "bson",
+ "criterion",
  "kimmy-core",
  "kimmy-query",
  "parking_lot",

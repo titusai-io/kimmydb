@@ -554,7 +554,7 @@ Honest list of what is not covered:
 
 | Gap | Notes |
 |---|---|
-| Benchmarks are partial | The vector-index constants are measured ([Benchmarks](benchmarks.md)); the write path, the planner and `MAX_LIMIT` are not, and there is no regression baseline |
+| Benchmarks are partial | The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline |
 | No fuzzing | The codecs are the obvious target |
 | No multi-node tests | Nothing to test until M4 |
 | No crash-consistency tests | redb is trusted for durability |
