@@ -124,6 +124,13 @@ Image is ~106 MB (Debian slim runtime). Notes:
 - `/var/lib/kimmy` is a volume. **Losing it loses node identity**, not just data.
 - Ports: `7878/tcp` (HTTP), `7900/tcp` (replication) **and** `7900/udp` (SWIM membership). Both are needed when clustering.
 
+> **Upgrading a cluster to a version with replication TLS.** Replication is now
+> encrypted always ([ADR-040](decisions.md)), and a node speaking TLS cannot
+> talk to one speaking plaintext. A cluster therefore cannot be upgraded one
+> node at a time across that boundary: stop the cluster, upgrade every node,
+> start it again. Nodes will not lose data — each holds a full copy and
+> anti-entropy reconciles on restart — but replication stops for the duration.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback

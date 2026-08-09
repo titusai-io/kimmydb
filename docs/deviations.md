@@ -244,7 +244,6 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Gap | Consequence | Milestone |
 |---|---|---|
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
-| TLS between nodes | Replication frames are plaintext. `cluster_secret` authenticates peers but does not hide what they exchange | M5 |
 | Client certificates (mTLS) | Server TLS authenticates the *server* to clients; clients still authenticate with a bearer token only | not planned |
 | Certificate reload | A renewed certificate needs a restart to take effect | M5 |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
@@ -317,6 +316,13 @@ like one was working.
 ---
 
 ## 🟢 Closed
+
+**TLS between nodes.** Replication frames were plaintext; `cluster_secret`
+authenticated peers without hiding what they exchanged. Now TLS, always on,
+with the handshake bound to the secret through the TLS exporter rather than to
+a certificate — so there is no PKI to run and a man-in-the-middle cannot relay
+the handshake. [ADR-040](decisions.md). The residual limit is unchanged and
+inherent: a node's identity is still only "holds the cluster secret".
 
 **Collection ids above `i64::MAX` broke replication.** A live bug, not a
 deferral, and the most serious thing found since the collection-id fix itself.

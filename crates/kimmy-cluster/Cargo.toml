@@ -18,6 +18,9 @@ bson.workspace = true
 # RustCrypto, so peer authentication adds no *additional* native dependency.
 # The build already carries `ring` via `reqwest` (ADR-016), so the rule is not
 # to add a second crypto stack rather than to have none.
+tokio-rustls.workspace = true
+rustls.workspace = true
+rcgen.workspace = true
 hmac = "0.12"
 sha2 = "0.10"
 subtle = "2"

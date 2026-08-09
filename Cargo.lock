@@ -2068,6 +2068,8 @@ dependencies = [
  "parking_lot",
  "postcard",
  "rand 0.10.2",
+ "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -2075,6 +2077,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

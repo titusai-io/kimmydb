@@ -23,6 +23,7 @@ pub mod health;
 pub mod membership;
 pub mod peers;
 pub mod protocol;
+pub mod tls;
 pub mod transport;
 
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};

@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-662 tests passing · 0 failures · clippy clean at -D warnings
+668 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -22,7 +22,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-api` | 76 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 34 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 24 | Config layering and validation, TLS termination and the serving stack |
-| `kimmy-cluster` | 45 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
+| `kimmy-cluster` | 51 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
 
@@ -270,6 +270,22 @@ each one turned a named test red:
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
 
+### The cluster's channel binding
+
+| Injected fault | Caught by |
+|---|---|
+| Drop the TLS exporter from the handshake proof (pre-TLS behaviour) | `a_man_in_the_middle_cannot_relay_the_handshake` |
+
+The mutation is the interesting part. Removing the binding makes the relay
+succeed — the attacker terminates TLS on both sides, forwards the handshake, and
+replication runs straight through it. The control,
+`the_same_two_nodes_converge_when_nobody_is_in_the_middle`, keeps passing, so
+the failure is specifically the relay rather than replication being broken.
+
+A control matters here more than usual: a bug that broke *all* replication would
+make the man-in-the-middle test pass for entirely the wrong reason, which is the
+trap this suite has fallen into before.
+
 ### TLS and the serving stack, four for four
 
 | Injected fault | Caught by |
@@ -492,6 +508,7 @@ manually and are recorded so they can be repeated:
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
+| Two daemons replicating over TLS | ✅ TLS 1.3 on the replication port (confirmed with `openssl s_client`), a document replicated, and the cluster converged |
 | Aggregation on a live server | ✅ `$match`/`$group`/`$sort`, `$unwind`+`$count`, `$avg`/`$min`/`$max`/`$addToSet`, and `$lookup` joining one document while another got an empty array |
 | `$lookup` as a caller without read on the joined collection | ✅ uniform 403, and the joined data did not appear in the response |
 | **The full image, built and driven** | ✅ 106 MB; CRUD, query, indexes with `explain`, change streams, vector and hybrid search, RBAC, MCP, metrics, rate limiting and TLS all exercised in a container |
