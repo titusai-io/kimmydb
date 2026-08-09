@@ -9,12 +9,12 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-636 tests passing · 0 failures · clippy clean at -D warnings
+639 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 120 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
+| `kimmy-core` | 123 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
 | `kimmy-storage` | 171 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
@@ -22,7 +22,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-api` | 73 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 31 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 24 | Config layering and validation, TLS termination and the serving stack |
-| `kimmy-cluster` | 44 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
+| `kimmy-cluster` | 45 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
 
@@ -302,6 +302,32 @@ thing it claims to have run never ran.
 
 ---
 
+### A fourth: one fixture is not a sample when the value is a hash
+
+`CollectionId` is derived by hashing `(database, name)`, so it uses the whole
+`u64` range. BSON has no unsigned 64-bit type. Roughly **half** of all
+collection names therefore produced an id that could not be encoded at all —
+and the entire replication suite used a single name, `"shop"."orders"`, which
+lands in the low half.
+
+Thirteen tests exercised replication over real sockets, including DDL payloads,
+and every one of them passed while half the input space was broken. The suite
+was not weak; it was *narrow* in a dimension nobody had noticed was a dimension.
+
+The regression tests are written accordingly:
+`every_derived_id_encodes_regardless_of_which_half_it_lands_in` walks 2,000
+generated names and asserts both halves are actually exercised, so a future
+change that quietly restricts the range fails rather than passes on a lucky
+fixture. `a_collection_whose_id_is_above_i64_max_replicates` pins the
+end-to-end case over a real socket, and asserts its own fixture is still in the
+high half — a test whose premise has silently stopped holding is the thing this
+document keeps rediscovering.
+
+**Ask, when a fixture is a constant: what property of this particular value am
+I relying on, and does the test know?**
+
+---
+
 ### A third: an empty value round-trips under any encoding
 
 The wire protocol's round-trip test serialized a `VersionVector` — and used an
@@ -400,6 +426,7 @@ Worth recording, because each one shows the test doing its job:
 | Applying a replicated schema change also minted a local one | **Unbounded amplification.** The peer pulls the local copy back, applies it, mints another — the same change traded forever, the oplog growing every round | two convergence tests failing on the second half of a create-then-drop sequence; the cause was only found by asking why the drop did not stick |
 | A node could not join a cluster older than its oplog retention | It received nothing it could apply, never advanced its version vector, and retried forever. At the default retention, that is any node added to a running cluster | writing a throwaway probe against the retention horizon before starting SWIM, rather than trusting that "full resync" was an optimisation |
 | `NodeId` could be written to BSON but not read back | Replication failed on the first frame carrying a version vector. `uuid`'s serde chooses its representation from `is_human_readable()`, which BSON answers inconsistently | the first two-node sync over a real socket; the protocol round-trip test had used an *empty* vector and so never encoded a node id |
+| A collection id above `i64::MAX` could not be encoded | **Silent replication loss.** BSON has no unsigned 64-bit type, so ~48% of collection names — it is a coin flip per name — produced an id that no oplog entry could carry. The collection and every document in it never replicated; the write succeeded locally and the peer logged one warning per round. The suite passed throughout because the replication tests use `"shop"."orders"`, which happens to hash into the low half | running three containers and noticing `c.t` would not converge while `repl.items` had; **no test looked, because every test used one name** |
 | Change streams de-duplicated by comparing stamps | Dropped any entry stamped at or below the high-water mark — exactly what a replicated entry looks like — and, separately, would have reordered two concurrent writers that published out of commit order | designing the arrival index; the second half was latent and unrelated to replication |
 | Retention collecting the oplog tail | **Silent data loss.** The clock resumes from the tail, so an idle node would restart at `Hlc::ZERO` and every later write would lose to its own older version | writing the invariant into `the_clock_still_resumes_after_an_aggressive_collection` *before* the collector, then confirming a mutant that removes the guard fails three tests |
 
@@ -464,6 +491,11 @@ manually and are recorded so they can be repeated:
 | SIGTERM on a TLS node | ✅ drained and exited in **52 ms** (plaintext measured ~20 ms) |
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
+| **The full image, built and driven** | ✅ 106 MB; CRUD, query, indexes with `explain`, change streams, vector and hybrid search, RBAC, MCP, metrics, rate limiting and TLS all exercised in a container |
+| Restart of a container | ✅ data, users, indexes, vectors and node identity survived; `docker stop` exit 0 in 290 ms |
+| Three-node cluster in containers | ✅ collection, unique index and documents replicated to all three, bidirectionally; one JWT valid on every node; writes accepted and converged with a node down |
+| **`c.t` — the collection that would not replicate** | ✅ after the id fix, converged to both peers in 8 s with zero malformed-frame warnings |
+| SWIM under the compose defaults | ✅ **after** pinning each node's cluster bind: both survivors logged `member down` within 17 ms of each other. Before it, every node advertised `127.0.0.1` and no node was ever declared down |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test

@@ -81,8 +81,65 @@ impl std::str::FromStr for NodeId {
 /// Collections are addressed by `(database, name)` at the API edge, but keyed
 /// by this dense integer on disk so that renames stay cheap and index keys stay
 /// short.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CollectionId(pub u64);
+
+/// Serialized as a signed 64-bit integer, reinterpreting the bits.
+///
+/// **BSON has no unsigned 64-bit type.** The id is a hash, so it uses the whole
+/// `u64` range, and roughly half of all collection names derive one above
+/// `i64::MAX` — which the derived `Serialize` refuses to encode, with
+/// `Unsigned integer N cannot fit into BSON`.
+///
+/// That made every oplog entry naming such a collection unsendable, so the
+/// collection and its documents simply never replicated. The write succeeded
+/// locally and the peer's log carried one warning per round, which is about as
+/// quiet as a distributed-systems bug gets. Whether a given collection worked
+/// depended on its name hashing below the halfway point.
+///
+/// Reinterpreting the bits is lossless and round-trips exactly. Ids that
+/// already encoded — the ones below `i64::MAX` — keep the identical
+/// representation, so this widens what works without changing what worked.
+///
+/// The **on-disk** form is untouched: [`crate::ids`] values are persisted by
+/// the hand-rolled codec as raw big-endian bytes, not through serde, so no
+/// migration is involved.
+///
+/// Same lesson as [`NodeId`] above: a type that crosses a format boundary needs
+/// one fixed representation chosen here, not one inferred per format.
+impl Serialize for CollectionId {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_i64(self.0 as i64)
+    }
+}
+
+impl<'de> Deserialize<'de> for CollectionId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = CollectionId;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a 64-bit collection id")
+            }
+
+            // The representation this type writes.
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(CollectionId(v as u64))
+            }
+
+            // Accepted so that a self-describing format which can hold the
+            // value unsigned — JSON, or a debug dump — reads back correctly
+            // rather than failing on a number it represented faithfully.
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(CollectionId(v))
+            }
+        }
+
+        deserializer.deserialize_i64(Visitor)
+    }
+}
 
 impl CollectionId {
     /// The id of `db.name`, on every node, without coordination.
@@ -272,5 +329,73 @@ mod tests {
         assert_eq!(CollectionId::derive("__kimmy", "__users").0, 0x1f65_9d82_1893_00f2);
         assert_eq!(CollectionId::derive("a", "bc").0, 0xab40_f682_0d40_b523);
         assert_eq!(CollectionId::derive("ab", "c").0, 0xfd61_c083_ef20_0867);
+    }
+
+    /// A collection id above `i64::MAX`, which BSON cannot hold unsigned.
+    ///
+    /// `("c", "t")` derives `17808914187510290470`. Picked from a real failure
+    /// rather than constructed: it is the collection that would not replicate
+    /// between three containers.
+    const HIGH: (&str, &str) = ("c", "t");
+
+    #[test]
+    fn a_high_collection_id_survives_bson() {
+        // The bug this was written for: the derived `Serialize` refused any id
+        // above `i64::MAX` with "Unsigned integer N cannot fit into BSON", so
+        // every oplog entry naming such a collection was unsendable and the
+        // collection silently never replicated.
+        let id = CollectionId::derive(HIGH.0, HIGH.1);
+        assert!(id.0 > i64::MAX as u64, "the fixture must actually exercise the high half");
+
+        let bytes = bson::serialize_to_vec(&Wrapper { collection: id })
+            .expect("a collection id must encode into BSON");
+        let back: Wrapper = bson::deserialize_from_slice(&bytes).expect("and must decode back");
+
+        assert_eq!(back.collection, id, "the id must survive the round trip exactly");
+    }
+
+    /// A struct rather than `bson::doc!`, because the macro wants
+    /// `Into<Bson>` while the replication path goes through serde — and serde
+    /// is where the bug lived.
+    #[derive(Serialize, Deserialize)]
+    struct Wrapper {
+        collection: CollectionId,
+    }
+
+    #[test]
+    fn every_derived_id_encodes_regardless_of_which_half_it_lands_in() {
+        // The failure was a coin flip per collection name — roughly half of all
+        // names derive an id above `i64::MAX`. A test using one hard-coded name
+        // therefore proves nothing about the other half, which is exactly how
+        // this reached main: the replication tests use "shop"."orders", and it
+        // happens to hash low.
+        let mut high = 0;
+        for i in 0..2_000 {
+            let name = format!("collection-{i}");
+            let id = CollectionId::derive("db", &name);
+            if id.0 > i64::MAX as u64 {
+                high += 1;
+            }
+            let bytes = bson::serialize_to_vec(&Wrapper { collection: id })
+                .unwrap_or_else(|e| panic!("db.{name} (id {}) failed to encode: {e}", id.0));
+            let back: Wrapper = bson::deserialize_from_slice(&bytes).expect("decode");
+            assert_eq!(back.collection, id, "db.{name} did not round-trip");
+        }
+        assert!(high > 100, "expected both halves to be exercised; only {high} were high");
+    }
+
+    #[test]
+    fn the_wire_form_of_a_low_id_is_unchanged() {
+        // The fix must widen what works without altering what already worked,
+        // or every node would have to upgrade in lockstep.
+        let id = CollectionId::derive("shop", "orders");
+        assert!(id.0 < i64::MAX as u64, "fixture must be in the low half");
+
+        let doc = bson::serialize_to_document(&Wrapper { collection: id }).expect("encode");
+        assert_eq!(
+            doc.get_i64("collection").expect("encoded as a signed 64-bit integer"),
+            id.0 as i64,
+            "a low id must keep the representation it had before the fix"
+        );
     }
 }

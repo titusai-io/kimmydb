@@ -1,11 +1,25 @@
 # Three-node KimmyDB cluster for local development.
 #
-# Clustering itself lands in M4; until then the nodes run independently and this
-# file mainly exercises the image, the volumes, and DNS-based discovery config.
+# Discovery note: Compose's built-in DNS resolves the service alias `kimmy` to
+# every container carrying it, which is the same shape as a Kubernetes headless
+# Service. That is why all three nodes share one seed setting.
 #
-# Discovery note: Compose's built-in DNS resolves the service name `kimmy` to
-# every container in that service, which is the same shape as a Kubernetes
-# headless Service. That is why all three nodes can share one seed setting.
+# Why each node pins an IP
+# ------------------------
+# `cluster.bind` defaults to the wildcard `0.0.0.0:7900`. A wildcard is a
+# listening instruction, not an identity, so the node refuses to announce it and
+# falls back to advertising loopback with a warning (ADR-037). Inside containers
+# that quietly degrades gossip: every node tells its peers to reach it at
+# 127.0.0.1, which is each peer's own container.
+#
+# Replication still converges, because anti-entropy dials the addresses that
+# discovery resolved. What is lost is SWIM — learning peers nobody configured,
+# and a *shared* opinion about which nodes are alive. So each service pins an
+# address on a fixed subnet and binds the cluster listener to it.
+#
+# `cluster.bind` is a SocketAddr and takes an IP literal, not a hostname, which
+# is why this is a static address rather than `kimmy1:7900`. On Kubernetes use
+# the downward API instead — see docs/operations.md.
 
 x-kimmy-common: &kimmy-common
   build:
@@ -27,9 +41,13 @@ services:
   kimmy1:
     <<: *kimmy-common
     container_name: kimmy1
+    environment:
+      <<: *kimmy-env
+      KIMMY_CLUSTER_BIND: 172.28.0.11:7900
     networks:
       default:
         aliases: [kimmy]
+        ipv4_address: 172.28.0.11
     ports:
       - "7878:7878"
     volumes:
@@ -38,9 +56,13 @@ services:
   kimmy2:
     <<: *kimmy-common
     container_name: kimmy2
+    environment:
+      <<: *kimmy-env
+      KIMMY_CLUSTER_BIND: 172.28.0.12:7900
     networks:
       default:
         aliases: [kimmy]
+        ipv4_address: 172.28.0.12
     ports:
       - "7879:7878"
     volumes:
@@ -49,13 +71,23 @@ services:
   kimmy3:
     <<: *kimmy-common
     container_name: kimmy3
+    environment:
+      <<: *kimmy-env
+      KIMMY_CLUSTER_BIND: 172.28.0.13:7900
     networks:
       default:
         aliases: [kimmy]
+        ipv4_address: 172.28.0.13
     ports:
       - "7880:7878"
     volumes:
       - kimmy3-data:/var/lib/kimmy
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
 
 volumes:
   kimmy1-data:
