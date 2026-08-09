@@ -83,6 +83,7 @@ graph TD
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
+| [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
 | [Handoff](handoff.md) | Current state, what's next, and what needs a decision |

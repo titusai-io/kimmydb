@@ -32,18 +32,48 @@ use tracing::debug;
 use crate::error::Result;
 use crate::index::HnswIndex;
 
-/// Below this many vectors, an exact scan beats building and walking a graph.
+/// Below this many vectors, an exact scan is not worth displacing.
 ///
-/// Scoring a few thousand short vectors is microseconds; constructing an HNSW
-/// over them is not. The crossover is workload-dependent — this is a
-/// deliberately conservative default, not a measured optimum.
-const MIN_VECTORS_FOR_INDEX: usize = 2_000;
+/// **Measured, as of 2026-08-08** — see [Benchmarks](../../../docs/benchmarks.md).
+/// The previous value, 2,000, was a guess, and the guess was wrong in an
+/// interesting way: there is no crossover. At 384 dimensions the graph answers
+/// faster at *every* size measured, from 250 vectors (1.4 ms vs 7.6 ms) to
+/// 4,000 (3.1 ms vs 126 ms).
+///
+/// The reason is that neither path is dominated by arithmetic. An exact scan
+/// costs ~31 µs **per vector**, which is far too slow for 384 floats — it is
+/// the storage read and record decode. The graph's ~1.4 ms floor is the same
+/// cost paid for the ~40 candidates it actually loads. So the exact path is
+/// linear in collection size and the graph path is very nearly flat.
+///
+/// What remains is the build, which is not free and grows faster than linearly
+/// (50 ms at 250, 5.4 s at 4,000). Dividing it by the per-query saving gives
+/// the number of queries a build repays itself in: **8 at 250 vectors, 12 at
+/// 500, 44 at 4,000.**
+///
+/// 500 is chosen from that: a collection that serves a dozen searches between
+/// rebuilds comes out ahead, and one that serves fewer is scanning ≤ 15 ms,
+/// which is not a latency worth spending 161 ms of build to improve. Lower
+/// would start paying build costs for collections that are barely queried.
+const MIN_VECTORS_FOR_INDEX: usize = 500;
 
 /// How long a stale index may keep serving before it is rebuilt.
 ///
-/// Rebuilding on every write would make a write-heavy collection rebuild
-/// continuously, and each rebuild is O(n log n). This bounds how long a newly
-/// written document can be missing from results.
+/// **Kept at 30s after measurement**, which is a different statement from
+/// having guessed it. A rebuild costs 1.7 s at 2,000 vectors and 5.4 s at
+/// 4,000 ([Benchmarks](../../../docs/benchmarks.md)), so on a continuously
+/// written collection this window is what stands between the node and spending
+/// most of a core on rebuilds: at 4,000 vectors a 30 s window caps that at
+/// roughly 18% of one core, while a 5 s window would exceed 100% and never
+/// finish.
+///
+/// The freshness cost is unchanged and bounded — a document written in the last
+/// 30 s may not be found yet, and never returns a *wrong* answer, because the
+/// graph supplies candidates only and scores are recomputed from stored vectors
+/// ([ADR-022](../../../docs/decisions.md)).
+///
+/// Raising it is the lever for a large write-heavy collection; the measurements
+/// say what it buys.
 const MAX_STALENESS: Duration = Duration::from_secs(30);
 
 /// What the last decision for a collection was.

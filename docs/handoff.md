@@ -6,74 +6,62 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5 in progress, client TLS done
+## As of 2026-08-08 — M5: benchmarks started, a guessed constant was wrong
 
-**Branch:** `m5-tls`, off `main` (which has login rate limiting merged, PR #16).
-Not merged.
-**Gate:** 635 tests (629 + 6) · `cargo fmt --all -- --check` clean ·
-`cargo clippy --workspace --all-targets -- -D warnings` clean · driven against a
-running daemon over real TLS.
+**Branch:** `m5-benchmarks`, off `main`. Not merged. **`m5-container-fixes` is
+also open and unmerged** — it carries a severe replication fix and should go
+first; the two touch different files and do not conflict.
+**Gate:** 636 tests · fmt clean · clippy clean at `-D warnings`.
 
-### What this branch did
+### What was measured, and what it said
 
-Native TLS termination for the HTTP, WebSocket and MCP listener —
-`axum-server` over `rustls`. [ADR-039](decisions.md) has the reasoning. Enabled
-by naming `server.tls.cert_file` and `server.tls.key_file`; there is no separate
-toggle, because "enabled with no certificate" can only ever be a startup
-failure.
+the maintainer chose to measure the guessed constants before building a broad baseline.
+Full numbers and method in [Benchmarks](benchmarks.md).
 
-**Node↔node replication is still plaintext.** That is the remaining TLS work and
-it needs its own trust decision — `cluster_secret` already authenticates peers
-with a mutual HMAC challenge that never sends the secret, so what TLS would add
-there is confidentiality, and the interesting question is whether to require
-operator-supplied certificates or bind the channel to the secret that already
-exists.
+**`MIN_VECTORS_FOR_INDEX = 2_000` was wrong, and wrong in its premise.** It
+assumed a crossover below which an exact scan beats building and walking a
+graph. There is no crossover: at 384 dimensions the graph is faster at every
+size measured, from 250 vectors (1.4 ms vs 7.6 ms) to 4,000 (3.1 ms vs 126 ms).
+Lowered to **500**, which is where a build repays itself in about a dozen
+queries.
 
-### The finding that shaped it
+**The reason matters more than the number.** An exact scan costs ~31 µs *per
+vector* — far too slow for 384 floats. It is the storage read and record
+decode. So the two paths are not "arithmetic vs graph walk", they are "load
+everything vs load forty things". The optimisation this points at is making a
+vector scannable without decoding the whole record, which would move every line
+in the table.
 
-**The "no C toolchain" property has not held since M2**, and ADR-016 plus
-[Deviations](deviations.md) claimed it did. `kimmy-vector` depends on `reqwest`
-with `rustls-tls`, non-optionally, which pulls `rustls → ring`; `ring` ships C
-and assembly. Found by running `cargo tree -i ring` while planning TLS rather
-than trusting the register.
+**`MAX_STALENESS = 30s` kept, now for a reason.** A rebuild is 1.7 s at 2,000
+vectors and 5.4 s at 4,000, so the window is what caps rebuild cost at ~18% of a
+core on a continuously written collection instead of exceeding 100%.
 
-The maintainer chose to accept the cost and correct the record. The operative rule now is
-**do not add a second native crypto stack** — which is why TLS uses
-`tls-rustls-no-provider` with `ring` installed explicitly, rather than
-`axum-server`'s default, which would have added `aws-lc-rs` and CMake for the
-same primitives. It is logged 🔴 rather than 🟢 in the register because what
-closes it is a CI check, not code: nothing today would catch the next such drift.
+### A gap the change opened, and closed
 
-### Invariants this branch put under test
+Lowering the threshold routes more collections through the graph, so the ≥ 90%
+recall claim now covers more traffic. The existing recall test used **16
+dimensions** — the flattering case, since approximate search gets harder as
+width grows. `recall_holds_at_a_realistic_embedding_width` pins it at 384
+dimensions and exactly 500 vectors, the boundary case. It passes.
 
-There are now two serving stacks, and the property they must agree on fails
-silently: if `into_make_service_with_connect_info` is dropped, requests still
-succeed and the only symptom is every caller sharing one rate-limit bucket.
-Asserted on both paths.
+### An observation worth following up
 
-Four injected mutations, four caught — this time with a deliberate no-op
-mutation first as a control, since the previous branch's harness had silently
-been running a nonexistent cargo target. A fifth bug was caught without being
-injected: `set_nonblocking(false)` on the listener handed to `axum-server`
-panics tokio at the *first TLS connection*, not at startup, so the process would
-have come up healthy and died on first contact.
+One `put_vectors` call costs ~50–65 ms — a durable commit per call — implying
+vector ingest around 15–20 documents/second when written one at a time, which is
+how the embedding worker writes them. Seen while building fixtures, not properly
+benchmarked. Recorded in [Benchmarks](benchmarks.md) because it is large enough
+to matter and nobody had looked.
 
 ### Next in M5
 
-Nothing is blocked. Full list in [Roadmap](roadmap.md):
-
 | Item | Note |
 |---|---|
-| TLS between nodes | The remaining half. Needs a trust decision before code — see above |
-| Benchmarks | Several tuning constants are guesses — the 2000-vector index threshold especially. Also what should decide any further rate limits |
-| Aggregation pipeline | Biggest single feature; also unblocks the MCP `aggregate` tool and `$vectorSearch` |
-| Backup / restore | Cold file copy only today |
-| `kimmy` CLI, audit log, richer metrics | |
+| Merge `m5-container-fixes` first | It fixes replication for ~48% of collection names |
+| Finish the baseline | `MAX_LIMIT`, the write path, index-backed vs scanned `find` |
+| TLS between nodes | Needs a trust decision before code |
+| Aggregation pipeline | Biggest single feature; unblocks the MCP `aggregate` tool |
+| Backup / restore, `kimmy` CLI, audit log | |
 | A CI check for native build dependencies | What would have caught the ADR-016 drift |
-
-Suggested next: benchmarks, since they are what several deferred decisions are
-waiting on. Node↔node TLS is the natural pair with this branch if you would
-rather finish TLS first.
 
 ### Carried debt, none blocking
 

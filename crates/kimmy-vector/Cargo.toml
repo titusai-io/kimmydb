@@ -38,5 +38,10 @@ hnsw_rs = "0.3.4"
 local-embeddings = ["dep:fastembed", "kimmy-core/local-embeddings"]
 
 [dev-dependencies]
+criterion.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
+
+[[bench]]
+name = "vector_index"
+harness = false

@@ -326,7 +326,7 @@ handle a node whose tombstones were collected while it was partitioned.
 | Oplog & tombstone GC | ✅ Done — background pass, `storage.gc_interval_secs`. [ADR-028](decisions.md) |
 | Aggregation pipeline | `$match`, `$group`, `$unwind`, `$project`, `$sort`, `$limit` |
 | `kimmy` CLI | Interactive shell |
-| Benchmarks | Criterion; establish a regression baseline |
+| Benchmarks | 🚧 Started — Criterion over the vector index. Found no crossover at all and lowered `MIN_VECTORS_FOR_INDEX` 2,000 → 500. [Benchmarks](benchmarks.md) |
 | Audit log | Structured, of authorization decisions |
 | Richer metrics | Request rates, latency, oplog lag, storage size |
 

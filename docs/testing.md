@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-635 tests passing · 0 failures · clippy clean at -D warnings
+636 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -17,7 +17,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-core` | 120 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
 | `kimmy-storage` | 171 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 85 | Filter, update, sort, projection semantics |
-| `kimmy-vector` | 55 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
+| `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | 73 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 31 end-to-end over a real socket |
 | `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
@@ -522,7 +522,7 @@ Honest list of what is not covered:
 
 | Gap | Notes |
 |---|---|
-| No benchmarks | 📋 M5. No regression baseline exists |
+| Benchmarks are partial | The vector-index constants are measured ([Benchmarks](benchmarks.md)); the write path, the planner and `MAX_LIMIT` are not, and there is no regression baseline |
 | No fuzzing | The codecs are the obvious target |
 | No multi-node tests | Nothing to test until M4 |
 | No crash-consistency tests | redb is trusted for durability |
