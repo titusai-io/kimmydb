@@ -88,6 +88,9 @@ rand = "0.9"
 # Dev / test
 proptest = "1"
 tempfile = "3"
+# Benchmarks. `html_reports` off: the numbers get recorded in docs/benchmarks.md
+# by hand, and an untracked report directory is noise in a repo.
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [profile.release]
 opt-level = 3

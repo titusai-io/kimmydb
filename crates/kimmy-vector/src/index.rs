@@ -361,6 +361,56 @@ mod tests {
     }
 
     #[test]
+    fn recall_holds_at_a_realistic_embedding_width() {
+        // The test above measures recall at 16 dimensions. Approximate search
+        // gets *harder* as width grows — distances concentrate, and a greedy
+        // graph walk has less signal to follow — so 16 is the flattering case
+        // and no evidence about the widths anyone actually deploys.
+        //
+        // This matters more since `MIN_VECTORS_FOR_INDEX` dropped to 500: the
+        // graph now serves collections that previously took the exact path, so
+        // the recall claim covers more traffic than it used to.
+        //
+        // 384 is `all-MiniLM-L6-v2`, the narrowest width in common use.
+        // Exactly at `MIN_VECTORS_FOR_INDEX`, so this is the boundary case:
+        // the smallest collection the graph is now trusted to serve.
+        const COUNT: usize = 500;
+        const DIM: usize = 384;
+        const K: usize = 10;
+
+        let (engine, shadow, _dir) = setup(COUNT, DIM);
+        let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+        let options = SearchOptions { k: K, metric: Metric::Cosine, per_document: 1 };
+
+        let mut total_recall = 0.0;
+        const QUERIES: usize = 10;
+        for q in 0..QUERIES {
+            let query = pseudo_random(20_000 + q as u64, DIM);
+
+            let exact = crate::search::vector_search(&engine, &shadow, &query, &options, None)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id.to_string())
+                .collect::<HashSet<_>>();
+            let approx = index
+                .search(&engine, &shadow, &query, &options, None)
+                .unwrap()
+                .into_iter()
+                .map(|h| h.id.to_string())
+                .collect::<HashSet<_>>();
+
+            total_recall += exact.intersection(&approx).count() as f64 / exact.len() as f64;
+        }
+
+        let recall = total_recall / QUERIES as f64;
+        assert!(
+            recall >= 0.90,
+            "recall {recall:.3} at {DIM} dimensions is too low; the threshold that routes \
+             collections to this index assumes the graph finds what a scan would"
+        );
+    }
+
+    #[test]
     fn the_top_result_matches_exact_search() {
         // Recall can be high while the *ranking* is wrong; this checks the
         // nearest neighbour specifically.
