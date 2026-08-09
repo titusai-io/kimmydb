@@ -84,6 +84,7 @@ graph TD
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
 | [Aggregation](aggregation.md) | The pipeline: stages, accumulators, `$lookup`, and the memory ceiling |
+| [CLI](cli.md) | The `kimmy` terminal client |
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
@@ -118,7 +119,7 @@ running server, not merely compiled.
 | TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
 | Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
 | Backup / restore | ✅ Working | Online snapshot endpoint, offline restore, and point-in-time rewind |
-| `kimmy` CLI | 📋 Planned (M5) | The binary today prints a pointer to the HTTP API |
+| `kimmy` CLI | ✅ Working | One-shot commands over the HTTP API. [CLI](cli.md) |
 
 Replication has been driven on real daemons and in containers, not only in
 tests: a collection, a unique index and documents converging in both directions

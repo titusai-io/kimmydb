@@ -65,6 +65,11 @@ toml = "1"
 # Storage
 redb = "4.1"
 
+# HTTP client. Shared by the remote embedding providers and the `kimmy` CLI, so
+# the two cannot drift apart on features -- `rustls-tls` matters, because the
+# default would pull OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
 # Errors and logging
 thiserror = "2"
 anyhow = "1"
