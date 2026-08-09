@@ -337,16 +337,12 @@ handle a node whose tombstones were collected while it was partitioned.
 
 ## M6 — Webhooks: registration and push 📋
 
-A developer registers a URL with KimmyDB and the node **pushes** change events
-to it. Change streams already deliver the same events, but the client has to
-open and hold a WebSocket; this is the other direction, for consumers that
-cannot hold a connection — serverless functions, queues, other services.
+A developer registers a URL and the cluster **pushes** change events to it.
+Change streams already carry these events, but the client must open and hold a
+WebSocket; this is for consumers that cannot — serverless functions, queues,
+other services.
 
-### It is another oplog consumer
-
-The design falls out of the spine rather than being bolted beside it. A
-dispatcher is an ordinary consumer of the oplog, exactly like the embedding
-worker:
+### The dispatcher is another oplog consumer
 
 ```mermaid
 graph LR
@@ -354,87 +350,118 @@ graph LR
     O --> C1["Change streams<br/><i>client holds a socket</i>"]
     O --> C2["Embedding worker"]
     O --> C3["Anti-entropy"]
-    O --> C4["<b>Webhook dispatcher</b><br/><i>node holds the connection</i>"]
+    O --> C4["<b>Webhook dispatcher</b><br/><i>the node dials out</i>"]
     C4 --> H1["POST https://…"]
 
     style C4 fill:#2d3748,color:#fff
 ```
 
-Everything it needs already exists:
-
-| Need | Already there |
+| Need | Already exists |
 |---|---|
-| Durable per-consumer position | `Engine::consumer_position` — what the embedding worker uses |
-| Resume after restart | Same; position is recorded **after** the work, so a crash redelivers |
-| Which node accepted a write | `Stamp { hlc, node }` on every entry |
-| A durable, replicated, backed-up registry | A collection in `__kimmy`, like `__users` |
-| Backpressure and lag recovery | The oplog itself; a consumer that falls behind replays from disk |
+| Durable resume point | `Engine::consumer_position`, as the embedding worker uses |
+| Crash redelivers rather than skips | Position recorded **after** the work |
+| A globally unique event id | `Stamp { hlc, node }` on every entry |
+| A registry that replicates, backs up, restores | A collection in `__kimmy`, like `__users` |
+| Who is alive right now | SWIM — `Members::snapshot()` ([ADR-037](decisions.md)) |
+| "What has not been delivered yet?" | `VersionVector::behind` — the same question anti-entropy asks |
+
+### The problem, and the way out
+
+Two obvious designs both fail, in opposite directions:
+
+- **The originating node delivers.** Exactly one delivery — until that node dies
+  before dispatching, and then *nobody* delivers, because its peers hold the
+  data but consider it not theirs. A client silently never gets an event.
+- **Every node delivers.** Nothing is lost, and a five-node cluster fires five
+  identical requests for every write.
+
+Both treat *which node delivers* as fixed in advance. The way out is to stop
+fixing it and make **delivery progress replicated state**:
+
+> Each node records, per subscription, a `VersionVector` of what it has
+> delivered — "for origin node X, delivered through HLC H". A node writes only
+> **its own** record, so there are no write conflicts and nothing to merge by
+> last-writer-wins. Any node reads the union to know what the cluster as a whole
+> has already sent.
+
+Once progress converges like any other data, *any* node can deliver and every
+node knows what is already gone. The question shrinks to "who goes first", which
+has a cheap answer that survives a death.
+
+### Who goes first: a derived owner
+
+`owner(subscription) = rendezvous_hash(subscription_id, live_members)`.
+
+A pure function of the SWIM member set. **This is not leader election** — there
+is no vote, no term, no consensus, and no cluster-wide coordinator. Each node
+computes the same answer independently, different subscriptions land on
+different nodes, and a disagreement produces a duplicate rather than a split
+brain.
+
+When the owner dies, SWIM removes it, every node recomputes, and the new owner
+**resumes from the union of progress** rather than from the beginning. Failover
+costs roughly what SWIM detection costs — measured in milliseconds during M4.
+
+**So: does a client miss an event when a node dies?** No. The only way an event
+is never delivered is if the write never replicated off the node that accepted
+it — in which case the data itself is gone from the database too, and webhooks
+are not the thing that failed.
+
+### The guarantee, stated plainly
+
+**At-least-once, ordered per subscription.** Exactly-once is not achievable over
+a network by any design, and pretending otherwise would set an expectation the
+system cannot keep.
+
+What makes duplicates harmless is that every delivery carries a stable,
+globally unique id — the originating `Stamp` — in the body and in a header, so
+deduplicating is a set-membership test. Duplicates should be rare (a membership
+disagreement, or a redelivery after a crash) rather than routine.
+
+Ordering holds per subscription per origin node. There is no total order across
+nodes, which is what the leaderless design says everywhere else.
 
 ### Decisions taken
 
-Recorded here because they shape everything below, and two of them were chosen
-against the recommendation — deliberately, and the reasoning belongs with the
-plan rather than in a commit message.
-
-| Decision | Chosen | Consequence accepted |
+| Decision | Chosen | Why |
 |---|---|---|
-| Which node delivers | **Every node**, receiver deduplicates | An N-node cluster sends N deliveries per event. Every endpoint must deduplicate on the event id or do its work N times. In exchange, losing a node loses no deliveries and there is no leader |
-| Egress restrictions | **None by default** | A registered URL is dialled as given. See the security note below |
-| Registering requires | **`watch` on the collection** | The same grant that opens a change stream. A webhook outlives the token that created it and sends data somewhere the grant does not name |
+| Who delivers | Derived owner via rendezvous hash over SWIM members, with replicated progress | Leaderless, loses nothing on node death, one delivery in the normal case |
+| Egress | Private ranges blocked by default; `webhooks.allowed_hosts` to permit | Closes the SSRF hole while letting public endpoints work with no configuration |
+| Registering requires | A new **`webhook`** action | Handing out an egress path should be explicit, not bundled into reading |
 
-> ⚠️ **Security note, stated plainly.** `watch`-gated registration with
-> unrestricted egress means any principal with `watch` on any collection can
-> make the node issue outbound HTTP to an address of their choosing — including
-> loopback, RFC1918 ranges, and the cloud metadata endpoint at
-> `169.254.169.254`. That is a server-side request forgery primitive available
-> to the lowest-privilege read role. It is a deliberate choice for
-> operability; `webhooks.allowed_hosts` exists, empty by default, so an
-> operator can close it without a code change.
-
-### Delivery semantics
-
-**At-least-once.** The position is recorded after a delivery succeeds, so a
-crash mid-flight redelivers. Combined with every-node delivery, a receiver will
-see duplicates in normal operation, not just after a fault.
-
-**Every event carries a stable id** — the originating `Stamp`, which is
-`(hlc, node)` and globally unique — in the payload and in a header, so
-deduplicating is a set membership test rather than a heuristic.
-
-**Ordering is per subscription, and only within one node's stream.** Each node
-delivers in oplog order; across nodes there is no global order, which is the
-same thing the leaderless design says everywhere else.
-
-**A failing endpoint backs off and eventually invalidates.** Retries with
-exponential backoff; if the subscription's position falls behind
-`oplog_retention_secs` it is marked invalidated and stops, exactly as a lagging
-change-stream consumer gets `410 resume_token_expired`. A dead endpoint must
-not stall the node or grow a queue without bound.
+The cost, stated: one small progress write per delivered batch, which
+replicates. That is the price of not losing events, and it is why progress is a
+high-water mark per batch rather than a record per event.
 
 ### Tasks
 
 | # | Task | Notes |
 |---|---|---|
-| 1 | **Subscription registry** | `__kimmy.__webhooks`: url, collection, operation filter, secret, state, created-by. A collection, so it replicates, backs up and restores for free |
-| 2 | **Registration API** | `POST/GET/DELETE /v1/db/{db}/coll/{coll}/webhooks`, gated on `watch`. Plus the MCP surface question — probably not a tool, since an agent registering an egress path is a different thing from an agent reading |
-| 3 | **Dispatcher worker** | An oplog consumer per node, resuming from `consumer_position`. Batches events per subscription with a size and a max delay, so a bulk load does not become one request per document |
-| 4 | **Delivery** | HTTP POST, JSON body in the change-stream event shape, timeout, `X-Kimmy-Event-Id` and `X-Kimmy-Signature` headers |
-| 5 | **Signing** | HMAC-SHA256 over the body with a per-subscription secret, so a receiver can tell a genuine delivery from anything else that can reach it. `hmac`/`sha2` are already in the build for the cluster handshake |
-| 6 | **Failure handling** | Exponential backoff, attempt counter, invalidation when the position falls past retention. Failures visible on `/metrics`, not only in a log |
-| 7 | **Egress policy** | `webhooks.allowed_hosts`, empty by default meaning unrestricted, per the decision above |
-| 8 | **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_subscriptions`, and an audit record when a subscription is registered or removed — registering one is an access-granting act |
-| 9 | **Tests** | A local receiver over a real socket: delivery, batching, signature verification, retry after a failure, invalidation past retention, and that a deleted subscription stops firing |
-| 10 | **Docs and ADRs** | An ADR for the every-node delivery model and one for the egress decision, since both are choices a future reader will otherwise want to reverse |
+| 1 | **`webhook` RBAC action** | Add to `Action`, decide implication: `admin` implies it; `read`/`write`/`watch` do **not**. Independent, like `watch` ([ADR-014](decisions.md)) |
+| 2 | **Subscription registry** | `__kimmy.__webhooks`: url, collection, operation filter, secret, state, created-by. A collection, so it replicates, backs up and restores unchanged |
+| 3 | **Progress records** | `__kimmy.__webhook_progress`, `_id = {subscription}:{node}`, holding a `VersionVector`. Written only by its own node, so conflict-free by construction |
+| 4 | **Registration API** | `POST/GET/DELETE /v1/db/{db}/coll/{coll}/webhooks`, gated on `webhook`. Deliberately **no MCP tool** at first: registering an egress path is not a reading act |
+| 5 | **Ownership** | Rendezvous hash over `Members::snapshot()`. Must degrade correctly with clustering off — a single node owns everything — and when membership is momentarily empty |
+| 6 | **Dispatcher worker** | One per node. Computes owned subscriptions, reads union progress, uses `VersionVector::behind` to find undelivered entries, batches by size and max delay so a bulk load is not one request per document |
+| 7 | **Delivery** | HTTP POST, change-stream event shape, timeout, `X-Kimmy-Event-Id` and `X-Kimmy-Signature` headers |
+| 8 | **Signing** | HMAC-SHA256 over the body with a per-subscription secret, plus a timestamp against replay. `hmac`/`sha2` are already in the build for the cluster handshake |
+| 9 | **Egress policy** | Resolve the host and check the **resolved** address, refuse redirects, block loopback/link-local/RFC1918 unless allowlisted. A name that is public at registration must not be able to point inward at delivery |
+| 10 | **Failure handling** | Exponential backoff; invalidate the subscription when its progress falls past `oplog_retention_secs`, exactly as a lagging change-stream consumer gets `410` |
+| 11 | **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_subscriptions`, backlog age; an audit record on register and remove, since registering one grants ongoing egress |
+| 12 | **Tests** | A local receiver over a real socket: delivery, batching, signature verification, retry after failure, invalidation past retention, a deleted subscription stopping, ownership failover with a node removed from the member set, and that a private-range URL is refused |
+| 13 | **Docs and ADRs** | One ADR for derived ownership plus replicated progress — including why it is not leader election — and one for the egress policy |
 
-### Open questions, to settle before or during
+### Open questions to settle during
 
-- **Should `__kimmy.__webhooks` replicate?** It is a collection, so it will by
-  default — which is what makes every node deliver. Worth confirming that is
-  wanted, since it also means a URL registered on one node is dialled by all.
-- **Payload size.** `fullDocument` on a large document, batched, could produce
-  a very large POST. A cap, and what to do when a single event exceeds it.
-- **Should there be a cluster-wide delivery cap** so a webhook registered
-  against a hot collection cannot saturate a node's outbound connections.
+- **Rendezvous input.** `Members` holds `SocketAddr`; hashing node ids would be
+  stabler across a re-address. May need a member → node-id mapping.
+- **Payload cap.** `fullDocument` on large documents, batched, can produce a
+  very large POST. Needs a cap and a decision on what happens to a single event
+  that exceeds it.
+- **Per-node delivery cap**, so a webhook on a hot collection cannot saturate a
+  node's outbound connections.
+- **Does the registry replicate?** It will, being a collection — which is what
+  lets any node take ownership. Worth confirming that is wanted.
 
 ---
 
