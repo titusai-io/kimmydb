@@ -1066,3 +1066,41 @@ async fn a_backup_downloads_and_looks_like_a_backup() {
         "a downloaded backup should arrive with a filename"
     );
 }
+
+#[tokio::test]
+async fn the_metrics_endpoint_exposes_the_process_counters() {
+    // Fetched as raw text: the client parses JSON, and /metrics is Prometheus
+    // text, so this reads the socket directly.
+    let server = Server::start().await;
+    server.get("/v1/databases", None).await; // one 401
+
+    let raw = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = server.base.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        let req = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+
+    for series in [
+        "kimmy_up",
+        "kimmy_storage_bytes",
+        "kimmy_uptime_seconds",
+        "kimmy_requests_total",
+        "kimmy_responses_total",
+        "kimmy_authz_denied_total",
+        "kimmy_auth_failures_total",
+        "kimmy_rate_limited_total",
+        "kimmy_backups_total",
+    ] {
+        assert!(raw.contains(series), "missing series {series} in:\n{raw}");
+    }
+    assert!(raw.contains("kimmy_auth_failures_total 1"), "the 401 should be counted:\n{raw}");
+    assert!(
+        !raw.contains("orders"),
+        "metrics is unauthenticated and must not name collections:\n{raw}"
+    );
+}

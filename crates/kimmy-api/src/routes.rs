@@ -59,7 +59,23 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/vector_search", post(crate::vectors::vector_search))
         .route("/v1/db/{db}/coll/{coll}/hybrid_search", post(crate::vectors::hybrid_search))
         .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
+        // Counting happens in one layer rather than in each handler: a counter
+        // beside a handler is a counter the next route forgets. It wraps
+        // everything including `/metrics` itself, so a scrape is visible as
+        // traffic rather than being invisible to the thing it scrapes.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), count_request))
         .with_state(state)
+}
+
+/// Count every response by status.
+async fn count_request(
+    State(state): State<SharedState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let response = next.run(request).await;
+    state.metrics.record_request(response.status().as_u16());
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -92,13 +108,19 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
          # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
          # TYPE kimmy_unique_violations counter\n\
          kimmy_unique_violations {violations}\n\
+         # HELP kimmy_storage_bytes Size of the database file on disk.\n\
+         # TYPE kimmy_storage_bytes gauge\n\
+         kimmy_storage_bytes {storage}\n\
          # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
          # TYPE kimmy_up gauge\n\
-         kimmy_up 1\n",
+         kimmy_up 1\n\
+         {process}",
         databases_count = databases.len(),
         // Surfaced here, not only on a change stream, so the condition is
         // visible without anyone having been subscribed when it happened.
         violations = state.engine.unique_violations(),
+        storage = state.engine.storage_bytes(),
+        process = state.metrics.render(),
     ))
 }
 
@@ -186,6 +208,7 @@ async fn backup(
 
     let mut buf = Vec::new();
     let info = state.engine.backup_to(&mut buf)?;
+    state.metrics.record_backup();
     warn!(
         records = info.records,
         bytes = info.bytes,

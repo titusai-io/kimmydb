@@ -27,6 +27,8 @@ pub struct AppState {
     /// Per-caller budgets. Held in shared state rather than per-connection
     /// because a limit that resets when a client reconnects is not a limit.
     pub limits: RateLimits,
+    /// Process counters behind `/metrics`.
+    pub metrics: crate::metrics::Metrics,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -139,13 +141,20 @@ fn warn_missing_connect_info() {
 
 impl Auth {
     /// Require an action, or fail with a uniform 403.
+    ///
+    /// This is where the audit record is written, rather than at each caller.
+    /// Every authorization in the server — REST, MCP, the change-stream
+    /// upgrade, the vector endpoints — funnels through here, and a log each
+    /// route has to remember to write is a log with invisible holes in it.
     pub fn require(
         &self,
         action: Action,
         db: &str,
         collection: Option<&str>,
     ) -> Result<(), ApiError> {
-        if self.0.can(action, db, collection) {
+        let allowed = self.0.can(action, db, collection);
+        crate::audit::record(&self.0, action, db, collection, allowed);
+        if allowed {
             return Ok(());
         }
         Err(ApiError::forbidden())

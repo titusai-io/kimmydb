@@ -1327,6 +1327,77 @@ database silently missing whatever it held.
 
 ---
 
+## ADR-042 — The audit log hangs off the authorization point, not the routes
+
+**Decision.** Authorization decisions are recorded inside
+`Auth::require` — the one function every check funnels through — at the
+`kimmy::audit` tracing target. `audit.mode` selects `off`, `denials` (default),
+`writes` or `all`.
+
+**Why there and not at each route.** A log each handler has to remember to write
+is a log with holes in it, and the holes are invisible: nothing about a missing
+audit line says it is missing. The check already lives in one place
+([ADR-013]); the record belongs beside it, so a new route inherits auditing
+by inheriting the check rather than by anyone remembering.
+
+**Why the mode is process-global.** It is a property of a deployment, not of a
+request. Threading it through would put a configuration parameter into the
+signature of code that has no other reason to know configuration exists. It is
+set once, before anything can be authorized, and read atomically.
+
+**Why `denials` is the default.** `all` writes one line per authorized
+operation, which on a read-heavy node is one line per request — a real cost, and
+one an operator should opt into. `off` would mean nobody gets the event they
+actually want. A denial is rare and is what someone is watching for.
+
+**`search` and `watch` count as reads at `writes`.** One ranks documents, the
+other observes them; neither changes anything, and an auditor asking "what
+changed" does not want them.
+
+**Authentication is not audited here.** A failed login is not an authorization
+decision — there is no principal yet — and it is already logged and counted.
+Mixing them would make "denied" mean two things in one stream.
+
+**A bad mode fails at startup.** A typo would otherwise produce a server that
+records nothing, which looks exactly like a server nobody has attacked.
+
+---
+
+## ADR-043 — Metrics count statuses, not call sites
+
+**Decision.** `/metrics` gains uptime, request and response counters, storage
+size, and counters for authorization denials, authentication failures and rate
+limiting. The three specific counters are derived in one middleware from the
+response status rather than incremented where the refusal happens.
+
+**Why derived.** Each of those statuses has exactly one source: 401 from token
+or credential rejection, 403 from `ApiError::forbidden` (RBAC and nothing else),
+429 from the rate limiter. Counting them in one layer means a new route is
+counted by existing, and a counter that lives beside a check is a counter
+someone forgets to bump.
+
+**Plain atomics rather than a metrics framework.** Nine numbers and a fixed set
+of series; a registry would add a dependency and an abstraction for no gain.
+
+**Counters render at zero rather than appearing on first use.** A series that
+materialises only after its first event makes a dashboard show "no data" where
+it should show "nothing has gone wrong yet".
+
+**Still no per-collection series.** `/metrics` is unauthenticated, and a series
+per collection puts the schema on it — the same reason the endpoint has always
+reported counts rather than names.
+
+**Deliberately absent.** Latency histograms need buckets chosen from
+measurements that exist for the storage layer but not for end-to-end requests,
+and a histogram with guessed buckets reports confidently about the wrong ranges.
+Oplog lag needs a peer's version vector, which the API layer does not hold and
+which the replication loop would have to push here. Both are worth doing and
+neither is worth guessing.
+
+[ADR-013]: #adr-013--one-authorization-decision-point
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

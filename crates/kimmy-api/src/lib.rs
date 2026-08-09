@@ -9,9 +9,11 @@
 
 #![allow(dead_code)]
 
+pub mod audit;
 pub mod error;
 pub mod exec;
 pub mod json;
+pub mod metrics;
 pub mod ratelimit;
 pub mod routes;
 pub mod schema;
@@ -27,7 +29,9 @@ use kimmy_auth::{TokenIssuer, UserStore};
 use kimmy_storage::Engine;
 use kimmy_vector::IndexCache;
 
+pub use audit::AuditMode;
 pub use error::ApiError;
+pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use state::{AppState, SharedState};
 
@@ -52,6 +56,7 @@ pub fn state(
         vectors: IndexCache::new(),
         insecure_no_auth,
         limits,
+        metrics: Metrics::default(),
     }))
 }
 
