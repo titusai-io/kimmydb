@@ -239,7 +239,7 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
-| Benchmarks | Partial. The vector-index constants are now measured ([Benchmarks](benchmarks.md)); the write path, the planner and `MAX_LIMIT` are still unmeasured, and there is no regression baseline | M5 |
+| Benchmarks | Partial. The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 
 ---

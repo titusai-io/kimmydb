@@ -13,7 +13,8 @@ repetition — these are the checks.
 ## How to run
 
 ```bash
-cargo bench -p kimmy-vector                  # everything
+cargo bench -p kimmy-vector                  # vector search and index build
+cargo bench -p kimmy-storage                 # the write path
 cargo bench -p kimmy-vector -- hnsw_build    # one group
 ```
 
@@ -100,10 +101,10 @@ re-read if that judgement needs revisiting.
 | | Why it matters |
 |---|---|
 | `MAX_LIMIT = 10_000` in `kimmy_api::exec` | The cap on `find`. Still a guess |
-| Write path — insert, update, oplog append | No regression baseline |
-| Index-backed vs scanned `find` | The planner's whole premise is unmeasured |
+| Index-backed vs scanned `find` | The planner's whole premise is unmeasured — and now the more interesting gap, since the write-path cost of an index turns out to be nil |
 | Dimensions other than 384 | 768 and 1536 are both common, and the crossover depends on width |
-| Write throughput | See the observation below — it deserves a real benchmark |
+| Batched writes | Nothing commits more than one mutation per transaction, and the commit is the entire cost — see [The write path](#the-write-path) |
+| Concurrent writers | Every number here is single-threaded; redb allows one writer, so the ceiling under contention is unknown |
 
 **Recall was the gap, and it is now closed.** Lowering the threshold routes more
 collections through the graph, so the ≥ 90% recall claim covers more traffic
@@ -116,21 +117,65 @@ trusted to serve. It passes.
 
 ---
 
-## An observation worth a real benchmark
+## The write path
 
-Building the fixtures exposed something the search numbers do not: **one
-`put_vectors` call costs roughly 50–65 ms.** That is a full durable storage
-commit per call, and it is why a 4,000-vector fixture takes minutes to construct
-and why the sweep stops there.
+| Operation | Cost | Rate |
+|---|---:|---:|
+| `insert`, no secondary index | 3.52 ms | 284/s |
+| `insert`, one secondary index | 3.37 ms | 297/s |
+| `insert`, two secondary indexes | 3.53 ms | 283/s |
+| `replace` | 3.38 ms | 296/s |
+| `delete` + `insert` | 6.81 ms | 147/s |
+| `put_vectors`, 1 chunk | 5.67 ms | 176/s |
+| `put_vectors`, 4 chunks | 18.51 ms | 54/s |
 
-It implies vector ingest is bounded around 15–20 documents per second when
-written one document at a time, which is how the embedding worker writes them.
-Nothing here confirms that end to end — this is setup cost observed while
-measuring something else, not a benchmark — but the number is large enough that
-it should be measured properly before anyone concludes ingest is fast.
+### Secondary indexes are free on the write path
 
-Recorded because an unmeasured number that has been *seen* is more likely to be
-checked than one nobody has looked at.
+Zero, one and two indexes all cost the same within noise. That is worth stating
+plainly because the usual intuition — and the usual advice — is that indexes
+make writes slower, which shapes how people design schemas.
+
+Here they do not, and the reason is the row below.
+
+### Everything costs one durable commit
+
+Every mutation lands in a single transaction that also appends its oplog entry
+([ADR-008](decisions.md)), and that transaction is committed durably. At ~3.4 ms
+apiece, the commit *is* the write: index maintenance, document size and record
+shape all disappear underneath it. `delete` + `insert` is 6.8 ms because it is
+two commits, not because deleting is expensive.
+
+So the lever for ingest throughput is **batching mutations into one
+transaction**, not tuning anything inside a write. Nothing in the API offers
+that today — every route commits per operation — which makes it the obvious
+next thing to look at if ingest rate ever matters. It also sets the ceiling
+the embedding worker runs against, since it stores vectors one document at a
+time.
+
+---
+
+## A number published here was wrong
+
+The first version of this document recorded, under "an observation worth a real
+benchmark", that `put_vectors` cost ~50–65 ms and implied vector ingest of
+**15–20 documents per second**. That was wrong by roughly six times. It is
+**5.67 ms** for a single chunk, or ~176 documents per second.
+
+The error is instructive. The figure was not measured; it was *inferred* from
+how long a test took, divided by the number of writes in it. That test ran in a
+**debug** binary, while every benchmark here runs in release — and the timing
+also contained a graph build and ten searches that were quietly attributed to
+the writes.
+
+**A timing taken as a by-product of measuring something else is an anecdote, not
+a measurement.** It inherits the other thing's build profile, its warm-up, and
+whatever else shared the stopwatch. The rule this file now follows: anything
+quoted as a rate lives in a harness that states its own conditions, or it does
+not get quoted.
+
+Left in rather than quietly deleted, because the wrong number was acted on — it
+went into a handoff and a summary — and the record of why it was wrong is worth
+more than a clean page.
 
 ---
 

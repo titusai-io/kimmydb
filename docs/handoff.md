@@ -6,120 +6,61 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5 in progress; a replication bug found by running the image
+## As of 2026-08-08 — M5: the write path measured, and a wrong number corrected
 
-**Branch:** `m5-container-fixes`, off `main` (PRs #16 rate limiting, #17 TLS
-both merged). Not merged.
-**Gate:** 639 tests (635 + 4) · `cargo fmt --all -- --check` clean ·
-`cargo clippy --workspace --all-targets -- -D warnings` clean · driven as a
-built Docker image, single node and a three-node cluster.
+**Branch:** `m5-write-benchmarks`, off `main` (PRs #16-#19 all merged).
+Not merged.
+**Gate:** 640 tests · fmt clean · clippy clean at `-D warnings`.
 
-### The thing to know
+### First: a correction
 
-**Collection ids above `i64::MAX` could not be encoded, so those collections
-never replicated.** Ids are hashes over the full `u64` range, BSON has no
-unsigned 64-bit type, and `CollectionId` used a derived `Serialize`. About
-**48% of collection names** were affected — a coin flip per name. The write
-succeeded locally and the peer logged one `malformed frame` warning per round,
-so nothing surfaced to a client.
+The previous handoff recorded that `put_vectors` costs ~50-65 ms, implying
+vector ingest of **15-20 documents per second**. **That was wrong by roughly six
+times.** It is 5.67 ms for a single chunk — about 176 documents per second.
 
-The suite passed throughout, because all thirteen replication tests use
-`"shop"."orders"`, which hashes into the low half. Fixed with one fixed
-representation for `CollectionId`, matching the `NodeId` precedent; on-disk form
-untouched, since ids persist through the hand-rolled codec rather than serde.
-[ADR-031](decisions.md) carries the full account.
+The figure was never measured. It was inferred from how long a *test* took
+divided by the writes inside it — and that test ran in a **debug** binary while
+every benchmark runs in release, with a graph build and ten searches also inside
+the same stopwatch. A timing taken as a by-product of measuring something else
+inherits the other thing's build profile and everything else sharing the clock.
+It is an anecdote, not a measurement. Kept in
+[Benchmarks](benchmarks.md#a-number-published-here-was-wrong) rather than quietly
+deleted, because the wrong number was acted on.
 
-Also fixed: `docker-compose.yml` never set a per-node `cluster.bind`, so every
-containerized node advertised `127.0.0.1` and **SWIM never formed** — replication
-still converged via discovery, which is exactly what made it look healthy.
+### What the write path actually costs
 
-### Why this was found now and not earlier
+| Operation | Cost |
+|---|---:|
+| `insert`, no secondary index | 3.52 ms |
+| `insert`, one secondary index | 3.37 ms |
+| `insert`, two secondary indexes | 3.53 ms |
+| `replace` | 3.38 ms |
+| `put_vectors`, 1 chunk | 5.67 ms |
+| `put_vectors`, 4 chunks | 18.51 ms |
 
-Nothing in this project's process was skipped; the gap was that "drive a real
-server" had always meant a `cargo run` binary on loopback, never the artefact
-users actually deploy. Building the image and running three of them found two
-issues in an hour, one of them severe. **Worth repeating before any release.**
+**Two findings worth carrying forward:**
 
-### Previously, on this milestone
+1. **Secondary indexes are free on the write path.** Zero, one and two cost the
+   same within noise, which contradicts the usual intuition that indexes make
+   writes slower — and that intuition shapes how people design schemas.
+2. **Everything costs exactly one durable commit** (~3.4 ms). The mutation and
+   its oplog entry share one transaction ([ADR-008](decisions.md)), and that
+   commit swamps index maintenance, document size and record shape. `delete` +
+   `insert` is 6.8 ms because it is two commits.
 
-Login rate limiting (PR #16, [ADR-038](decisions.md)) and native client TLS
-(PR #17, [ADR-039](decisions.md)). Node↔node replication is still plaintext and
-needs its own trust decision before code.
-
-### What this branch did
-
-1. **Fixed the id-serialization bug above.** Regression tests at both levels: a
-   2,000-name sweep asserting *both* halves of the range are exercised, and an
-   end-to-end replication test over a real socket that asserts its own fixture
-   still lands in the high half.
-2. **`docker-compose.yml`** pins a subnet and a per-node `KIMMY_CLUSTER_BIND`,
-   so the shipped cluster demo actually gossips. Its header comment also still
-   claimed clustering lands in M4.
-3. **Documented two container gotchas** that cost real time: the cluster-bind
-   requirement (with a Kubernetes downward-API snippet), and that the image runs
-   as uid 10001, so a TLS key at `0600` owned by the operator stops the node.
-
-### Verification
-
-Both fixes were proven where they failed rather than only in tests: `c.t` — the
-collection that would not converge — now replicates to both peers in 8 s with
-zero malformed-frame warnings; and both survivors declare a killed node down
-within 17 ms of each other, where previously nothing was ever declared down.
-
-Reverting the id fix turns both new tests red, checked in each direction.
-
-**Branch:** `m5-benchmarks`, off `main`. Not merged. **`m5-container-fixes` is
-also open and unmerged** — it carries a severe replication fix and should go
-first; the two touch different files and do not conflict.
-**Gate:** 636 tests · fmt clean · clippy clean at `-D warnings`.
-
-### What was measured, and what it said
-
-the maintainer chose to measure the guessed constants before building a broad baseline.
-Full numbers and method in [Benchmarks](benchmarks.md).
-
-**`MIN_VECTORS_FOR_INDEX = 2_000` was wrong, and wrong in its premise.** It
-assumed a crossover below which an exact scan beats building and walking a
-graph. There is no crossover: at 384 dimensions the graph is faster at every
-size measured, from 250 vectors (1.4 ms vs 7.6 ms) to 4,000 (3.1 ms vs 126 ms).
-Lowered to **500**, which is where a build repays itself in about a dozen
-queries.
-
-**The reason matters more than the number.** An exact scan costs ~31 µs *per
-vector* — far too slow for 384 floats. It is the storage read and record
-decode. So the two paths are not "arithmetic vs graph walk", they are "load
-everything vs load forty things". The optimisation this points at is making a
-vector scannable without decoding the whole record, which would move every line
-in the table.
-
-**`MAX_STALENESS = 30s` kept, now for a reason.** A rebuild is 1.7 s at 2,000
-vectors and 5.4 s at 4,000, so the window is what caps rebuild cost at ~18% of a
-core on a continuously written collection instead of exceeding 100%.
-
-### A gap the change opened, and closed
-
-Lowering the threshold routes more collections through the graph, so the ≥ 90%
-recall claim now covers more traffic. The existing recall test used **16
-dimensions** — the flattering case, since approximate search gets harder as
-width grows. `recall_holds_at_a_realistic_embedding_width` pins it at 384
-dimensions and exactly 500 vectors, the boundary case. It passes.
-
-### An observation worth following up
-
-One `put_vectors` call costs ~50–65 ms — a durable commit per call — implying
-vector ingest around 15–20 documents/second when written one at a time, which is
-how the embedding worker writes them. Seen while building fixtures, not properly
-benchmarked. Recorded in [Benchmarks](benchmarks.md) because it is large enough
-to matter and nobody had looked.
+So the lever for ingest throughput is **batching mutations into one
+transaction**, and nothing in the API offers that — every route commits per
+operation. That is the obvious next thing if ingest rate ever matters, and it is
+the ceiling the embedding worker runs against.
 
 ### Next in M5
 
 | Item | Note |
 |---|---|
-| Merge `m5-container-fixes` first | It fixes replication for ~48% of collection names |
-| Finish the baseline | `MAX_LIMIT`, the write path, index-backed vs scanned `find` |
-| TLS between nodes | Needs a trust decision before code |
-| Aggregation pipeline | Biggest single feature; unblocks the MCP `aggregate` tool |
+| Index-backed vs scanned `find` | The planner's premise is still unmeasured, and now the more interesting gap given indexes cost nothing to maintain |
+| `MAX_LIMIT = 10_000` | Still a guess |
+| TLS between nodes | Needs a trust decision before code — `cluster_secret` authenticates but does not encrypt |
+| Aggregation pipeline | Biggest single feature; unblocks the MCP `aggregate` tool and `$vectorSearch` |
 | Backup / restore, `kimmy` CLI, audit log | |
 | A CI check for native build dependencies | What would have caught the ADR-016 drift |
 
