@@ -283,22 +283,67 @@ the port.
 
 ## Backup and restore
 
-⛔ No built-in backup yet (📋 M5). Today:
+### Taking a backup
+
+The node takes it, while it is serving:
 
 ```bash
-# Cold: stop the server, copy the file
-docker stop kimmy
-cp /var/lib/docker/volumes/kimmy-data/_data/kimmy.redb backup.redb
-docker start kimmy
+curl -H "Authorization: Bearer $TOKEN" \
+     -o kimmy.backup \
+     https://your-node:7878/v1/admin/backup
 ```
 
-> **Do not copy `kimmy.redb` while the server is running.** redb is ACID but a
-> naive file copy can capture a torn state. Use a filesystem or volume snapshot
-> if you need a hot backup.
+Requires **`admin` over `*`** — a backup is every document on the node, so a
+lesser grant would read past its own scope. There is no grant-filtered backup: a
+partial backup that looks whole is a restore that silently loses data.
 
-**Restoring carries node identity with it.** That is usually what you want. But
-restoring the *same* backup onto two nodes gives them the same identity, which
-breaks last-writer-wins tiebreaks. Restore to one node only.
+It runs inside a read transaction, so it is a consistent snapshot of one instant
+and writers are neither blocked nor affected. The response is buffered before
+sending rather than streamed as it is produced, so a slow client cannot pin
+redb's pages by reading slowly.
+
+> **Still do not copy `kimmy.redb` from a running node.** redb is rewriting
+> pages underneath the copy, and the result is not a state the database was ever
+> in. The endpoint above exists so you do not have to.
+
+### Restoring
+
+Offline, because redb allows one process to hold a database:
+
+```bash
+# The node must not be running, and the data directory must not already
+# contain kimmy.redb.
+kimmyd --data-dir /var/lib/kimmy restore --from kimmy.backup
+```
+
+Restore **refuses to overwrite an existing database**. An in-place restore turns
+a mistyped path into data loss; remove the file yourself if that is what you
+mean.
+
+### The identity comes back with it
+
+A backup carries the node's id, and a restore keeps it. That is what you want
+when replacing a node: the id is the tiebreak half of every write's stamp, so a
+node that restored under a new identity would become a stranger to its own
+history.
+
+> ⚠️ **Restoring one backup onto two nodes gives them the same identity**, and
+> the cluster cannot tell them apart — which breaks the tiebreak that makes
+> convergence deterministic. Restore is for **replacing** a node, not cloning
+> one. To add a node, start an empty one and let anti-entropy fill it.
+
+There is deliberately no flag to mint a fresh identity on restore: it would be
+one keystroke between recovering and corrupting a cluster's identity space.
+
+### What a backup contains
+
+Everything the node holds: documents, collection and index metadata, secondary
+index entries, the oplog and its arrival index, tombstones for deleted documents
+and dropped collections, version vectors, the user store, and the node id.
+
+Restoring an older backup onto a newer build is supported while the format
+version matches; a backup from a *newer* build is refused by name rather than
+partially read.
 
 ---
 

@@ -250,7 +250,6 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
-| Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
@@ -316,6 +315,14 @@ like one was working.
 ---
 
 ## 🟢 Closed
+
+**Backup and restore.** The only answer was a cold file copy, which meant
+stopping the node — and copying `kimmy.redb` from a running one captures a torn
+file. Now `GET /v1/admin/backup` takes a consistent snapshot inside a read
+transaction while the node serves, and `kimmyd restore --from` writes it into a
+fresh data directory. [ADR-041](decisions.md). The residual sharp edge is
+inherent: a backup carries the node's identity, so restoring one onto two nodes
+gives them the same id.
 
 **TLS between nodes.** Replication frames were plaintext; `cluster_secret`
 authenticated peers without hiding what they exchanged. Now TLS, always on,

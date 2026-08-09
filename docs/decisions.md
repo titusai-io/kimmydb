@@ -1262,6 +1262,71 @@ secret already meant.
 
 ---
 
+## ADR-041 — Backup is online and served; restore is offline and refuses to overwrite
+
+**Decision.** `GET /v1/admin/backup` streams a consistent backup from a running
+node. `kimmyd restore --from <file>` writes one into a data directory that does
+not yet contain a database. The backup carries the node's identity.
+
+**Why the backup is an endpoint rather than a command.** redb allows one process
+to hold a database, so a separate `kimmyd backup` process could not open a live
+one. The only way to take a backup *without stopping the node* is for the node
+to take it. Copying `kimmy.redb` from underneath a running node copies a torn
+file — pages are being rewritten during the copy, and the result is not a state
+the database was ever in.
+
+**Consistency comes from a read transaction.** The whole walk happens inside
+one, so redb's MVCC gives every table the same instant, writers are neither
+blocked nor affected, and a backup taken under load is a snapshot rather than a
+mixture. A test writes concurrently while a backup runs and asserts everything
+committed beforehand is present.
+
+**The response is buffered, not streamed as it is produced.** Streaming would
+hold the read transaction open for as long as the client took to read, pinning
+MVCC pages to a slow socket. Memory is the cheaper cost and is bounded by the
+database rather than by the caller.
+
+**Backups include index entries**, though they are derivable from documents.
+Recomputing them on restore would make a restore's correctness depend on
+replaying index maintenance exactly — the part most likely to differ between
+versions. Copying them makes a restore a transcription rather than a
+re-derivation.
+
+**`admin` over `*` is required.** A backup is every document on the node, so a
+lesser grant would let a database-scoped administrator read past their own.
+There is deliberately **no grant-filtered backup**: a partial backup that looks
+whole is a restore that silently loses data.
+
+**Restore refuses an existing file.** An in-place restore turns a mistyped path
+into data loss. An operator who wants to overwrite can remove the file, having
+thought about it.
+
+**The identity travels with the backup, and there is no flag to change it.** The
+node id is the tiebreak half of every write's stamp ([ADR-006]), so restoring
+under a fresh identity makes the node a stranger to its own history — every
+last-writer-wins comparison against its old writes changes meaning. So restore
+keeps it.
+
+The sharp edge is that restoring one backup onto two nodes puts one identity on
+both, and the cluster then cannot tell them apart, which breaks the tiebreak
+convergence depends on. **Restore is for replacing a node, not cloning one.** A
+`--new-identity` flag would be one keystroke between recovering and corrupting a
+cluster's identity space, so cloning is not offered here; the supported way to
+add a node is to start an empty one and let anti-entropy fill it ([ADR-036]).
+The CLI says so on every restore.
+
+**Explicit format, with a version byte**, for the reason [ADR-003] gives for the
+on-disk records. A backup a future version cannot read is a backup that does not
+exist, and a format defined by a serde derive changes when a dependency does. An
+unknown table tag is refused rather than skipped: skipping would restore a
+database silently missing whatever it held.
+
+[ADR-006]: #adr-006--hlc-with-node-id-tiebreak-whole-document-lww
+[ADR-036]: #adr-036--a-peer-past-the-retention-horizon-gets-state-not-history
+[ADR-003]: #adr-003--hand-rolled-binary-codec-for-hot-records
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

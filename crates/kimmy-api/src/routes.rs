@@ -1,6 +1,7 @@
 //! HTTP routes.
 
 use axum::extract::{Path, Query, State};
+use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -21,6 +22,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/auth/login", post(login))
+        .route("/v1/admin/backup", get(backup))
         .route("/v1/auth/whoami", get(crate::users::whoami))
         .route("/v1/users", get(crate::users::list_users).post(crate::users::create_user))
         .route("/v1/users/{name}", get(crate::users::get_user).delete(crate::users::delete_user))
@@ -157,6 +159,52 @@ async fn login(
 
     let token = state.tokens.issue(&principal)?;
     Ok(Json(json!({ "token": token, "user": principal.user })))
+}
+
+// ---------------------------------------------------------------------------
+// Backup
+// ---------------------------------------------------------------------------
+
+/// Stream a consistent backup of this node.
+///
+/// Requires `admin` over `*` — the same bar as managing users, and for the same
+/// reason: a backup is *every* document on the node, so anything less would let
+/// a database-scoped administrator read past their own grants. RBAC is not
+/// consulted per collection here; there is no filtered backup, because a partial
+/// backup that looks like a whole one is a restore that silently loses data.
+///
+/// Buffered rather than streamed as it is produced: the backup runs inside a
+/// read transaction, and holding that open across a slow client's socket would
+/// pin redb's MVCC pages for as long as the client cared to dawdle. Memory is
+/// the cheaper cost, and it is bounded by the database rather than by the
+/// caller.
+async fn backup(
+    State(state): State<SharedState>,
+    auth: Auth,
+) -> Result<axum::response::Response, ApiError> {
+    auth.require(kimmy_auth::Action::Admin, "*", None)?;
+
+    let mut buf = Vec::new();
+    let info = state.engine.backup_to(&mut buf)?;
+    warn!(
+        records = info.records,
+        bytes = info.bytes,
+        user = %auth.principal().user,
+        "served a backup"
+    );
+
+    let filename = format!("kimmy-{}-{}.backup", state.engine.node_id(), info.created_ms);
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{filename}\""),
+            ),
+        ],
+        buf,
+    )
+        .into_response())
 }
 
 // ---------------------------------------------------------------------------
