@@ -270,7 +270,7 @@ maintainable without coordination. So it is an explicit per-index mode:
 | `enforcement` | Reach | Availability |
 |---|---|---|
 | `local` (default) | The accepting node. Cross-node violations are **detected after merge**, not prevented | Full |
-| `coordinated` (📋 M4) | Cluster-wide, by reserving the value at its owning node | That value's writes fail while its owner is unreachable |
+| `coordinated` (reserved, not implemented) | Cluster-wide, by reserving the value at its owning node | That value's writes fail while its owner is unreachable |
 
 **`_id` needs none of this.** Two nodes inserting the same `_id` collide on the
 same key and converge to one document, so primary-key uniqueness holds by

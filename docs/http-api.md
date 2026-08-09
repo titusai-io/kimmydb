@@ -350,7 +350,7 @@ the property above removes.
 
 | | |
 |---|---|
-| Aggregation pipeline | 📋 Planned — including the `$vectorSearch` stage, and the MCP `aggregate` tool that would wrap it |
+| `$vectorSearch` as a pipeline stage | The pipeline itself is built ([Aggregation](aggregation.md)); vector search remains its own endpoint |
 | Database- and cluster-scoped watch routes | Implemented in storage, no route yet |
 | Client certificates (mTLS) | Not planned — the server proves itself, clients authenticate with a bearer token |
 

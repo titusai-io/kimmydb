@@ -83,6 +83,7 @@ graph TD
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
+| [Aggregation](aggregation.md) | The pipeline: stages, accumulators, `$lookup`, and the memory ceiling |
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
@@ -108,14 +109,21 @@ running server, not merely compiled.
 | HTTP + WebSocket API | ✅ Working | Also health and Prometheus metrics |
 | Docker container | ✅ Working | ~106 MB, graceful SIGTERM shutdown |
 | Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
-| Vector search & auto-embeddings | ✅ Working | Shadow collections, oplog-driven worker, HNSW above 2000 vectors |
+| Vector search & auto-embeddings | ✅ Working | Shadow collections, oplog-driven worker, HNSW above 500 vectors |
 | Hybrid search | ✅ Working | Dense + lexical, fused by reciprocal rank fusion |
 | Built-in MCP server | ✅ | Streamable HTTP at `/mcp`, RBAC-gated tools, sampled schema inference |
-| Gossip clustering | 📋 Planned (M4) | SWIM membership, oplog anti-entropy |
+| Gossip clustering | ✅ Working | SWIM membership over UDP, oplog anti-entropy over TCP, snapshot resync. **Containers must set `cluster.bind` to a routable address** — see [Operations](operations.md) |
+| Login rate limiting | ✅ Working | Token bucket per caller, checked before the password hash |
+| TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
+| Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
+| Backup / restore | 📋 Planned (M5) | Cold file copy only today |
+| `kimmy` CLI | 📋 Planned (M5) | The binary today prints a pointer to the HTTP API |
 
-The replication *primitives* exist and are tested — `apply_remote` resolves
-conflicts, and convergence is verified for concurrent writes — but nothing
-transports them between nodes yet. See [Roadmap](roadmap.md).
+Replication has been driven on real daemons and in containers, not only in
+tests: a collection, a unique index and documents converging in both directions
+from one seed address, a partition healing, a node joining a cluster whose oplog
+history had been collected, and both survivors agreeing a killed node was down
+within milliseconds. See [Roadmap](roadmap.md).
 
 ---
 
@@ -176,7 +184,7 @@ kimmydb/
 │   ├── kimmy-query/     filter / update / sort / projection evaluation
 │   ├── kimmy-auth/      Argon2id, JWT, RBAC, user store
 │   ├── kimmy-api/       axum router, WebSocket, JSON boundary
-│   ├── kimmy-cluster/   discovery (membership lands in M4)
+│   ├── kimmy-cluster/   discovery, SWIM membership, replication transport
 │   ├── kimmy-vector/    embeddings, HNSW, index cache, search
 │   ├── kimmy-mcp/       MCP server
 │   ├── kimmyd/          the server binary

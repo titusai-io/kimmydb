@@ -45,7 +45,7 @@ graph LR
 
     OPL --> CS["Change streams<br/><i>✅ working</i>"]
     OPL --> EMB["Embedding pipeline<br/>extract → chunk → embed"]
-    OPL --> AE["Cluster anti-entropy<br/><i>📋 M4</i>"]
+    OPL --> AE["Cluster anti-entropy<br/><i>✅ built</i>"]
 
     CS --> WS[WebSocket clients]
     EMB --> VEC[(Vector collections)]

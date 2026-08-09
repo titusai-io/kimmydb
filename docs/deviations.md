@@ -55,7 +55,7 @@ The policy, and why each part of it is what it is:
 
 | Question | Answer | Because |
 |---|---|---|
-| When is a graph worth building? | ≥ 2000 vectors | Below that, scanning beats building *and* walking a graph |
+| When is a graph worth building? | ≥ 500 vectors | **Measured.** Originally 2000 on the assumption that a scan wins below some size; it never does. 500 is where one build repays itself in ~12 queries ([Benchmarks](benchmarks.md)) |
 | How is staleness detected? | A per-collection generation counter, bumped on every vector write and delete | Counting is O(n); a count also cannot see a delete-then-add that leaves the total unchanged |
 | When does a stale graph rebuild? | After 30s | Rebuilding per write would rebuild continuously under load, and each rebuild is O(n log n) |
 | What happens if a build fails? | Fall back to the exact scan | An optimisation that cannot be built must not fail the query |
@@ -164,7 +164,7 @@ too **narrow** — silently wrong. Deliberately slow rather than possibly wrong.
 
 ---
 
-## 🔴 The "no C toolchain" property has not held since M2
+## 🟡 The "no C toolchain" property has not held since M2 — now enforced
 
 **Claimed.** ADR-001 chose redb over RocksDB and ADR-016 chose `rust_crypto`
 over `aws_lc_rs` to keep the build free of a native toolchain. This register
@@ -191,9 +191,22 @@ mechanism that would catch the next such drift.
 `ring` is already paid for; `aws-lc-rs` would add CMake for the same primitives.
 That is what selected the TLS provider in [ADR-039](decisions.md).
 
-**To close.** A CI check that fails when the dependency graph gains a crate with
-a `build.rs` invoking a C compiler. Then the property is enforced instead of
-asserted.
+**Closed as far as it can be.** `scripts/check-native-deps.sh` runs in CI and
+fails when the default build gains a package matching a native-toolchain
+indicator — `cc`, `cmake`, `bindgen`, `pkg-config`, `*-sys`, `*-src` — that is
+not on `scripts/allowed-native-deps.txt`. The allowlist currently holds one
+entry, `cc`, with the reason beside it.
+
+Downgraded from 🔴 to 🟡 rather than 🟢 because the *claim* was wrong for two
+milestones and nothing brought it back to true; what changed is that the next
+such drift now fails a build instead of sitting in prose. Adding native code is
+still allowed — it just has to be a deliberate line in a diff.
+
+**Worth noting about the check itself:** its first version exited 1 for the
+wrong reason. With `set -e`, an allowlist holding only comments made `grep`
+return non-zero and killed the script *before it printed anything* — a passing
+failure, which is precisely the class of bug this register exists to catch. It
+was found by running the failure path rather than only the happy one.
 
 ---
 
@@ -236,10 +249,11 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Certificate reload | A renewed certificate needs a restart to take effect | M5 |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
-| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
+| `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
+| Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
-| Benchmarks | Partial. The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline | M5 |
+| Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 
 ---

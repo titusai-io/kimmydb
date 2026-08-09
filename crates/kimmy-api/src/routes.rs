@@ -32,6 +32,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/docs", post(insert_doc).get(find_docs))
         .route("/v1/db/{db}/coll/{coll}/find", post(find_docs_post))
         .route("/v1/db/{db}/coll/{coll}/count", post(count_docs))
+        .route("/v1/db/{db}/coll/{coll}/aggregate", post(aggregate_docs))
         .route("/v1/db/{db}/coll/{coll}/update", post(update_docs))
         .route("/v1/db/{db}/coll/{coll}/delete", post(delete_docs))
         .route(
@@ -270,6 +271,20 @@ async fn count_docs(
     Json(body): Json<FindRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::count(&state, &auth, &db, &coll, body.into())?))
+}
+
+#[derive(Deserialize)]
+struct AggregateRequest {
+    pipeline: Value,
+}
+
+async fn aggregate_docs(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<AggregateRequest>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline)?))
 }
 
 async fn get_doc(

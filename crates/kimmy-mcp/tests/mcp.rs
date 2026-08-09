@@ -205,6 +205,7 @@ async fn the_tool_list_is_the_documented_surface() {
         "delete",
         "create_collection",
         "create_index",
+        "aggregate",
     ] {
         assert!(names.contains(&expected), "missing tool {expected}; have {names:?}");
     }
@@ -472,5 +473,75 @@ async fn tool_results_carry_both_text_and_structured_content() {
     assert!(
         result["content"][0]["text"].as_str().unwrap_or_default().contains("sales"),
         "expected a text block as well: {result}"
+    );
+}
+
+#[tokio::test]
+async fn the_aggregate_tool_runs_a_pipeline_as_the_calling_principal() {
+    // The tool that has been advertised as planned since M3. It matters that it
+    // runs through the same executor as the REST route: a second path to the
+    // engine is how an agent tool ends up more permissive than the API.
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.token(
+        "analyst",
+        vec![Grant {
+            db: "sales".into(),
+            collection: "orders".into(),
+            actions: vec![Action::Read],
+        }],
+    );
+
+    let result = server
+        .call_ok(
+            &token,
+            "aggregate",
+            json!({
+                "database": "sales",
+                "collection": "orders",
+                "pipeline": [{"$group": {"_id": "$status", "n": {"$sum": 1}}},
+                             {"$sort": {"_id": 1}}]
+            }),
+        )
+        .await;
+
+    let docs = result["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "open and closed: {docs:?}");
+    assert_eq!(docs[0]["_id"], "closed");
+    assert_eq!(docs[1]["n"], 2);
+}
+
+#[tokio::test]
+async fn the_aggregate_tool_refuses_a_lookup_the_caller_cannot_read() {
+    // Same boundary as the REST route, asserted at the MCP edge too, because
+    // "both edges enforce the same authorization" is only true while tested.
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.token(
+        "analyst",
+        vec![Grant {
+            db: "sales".into(),
+            collection: "orders".into(),
+            actions: vec![Action::Read],
+        }],
+    );
+
+    let body = server
+        .call(
+            &token,
+            "aggregate",
+            json!({
+                "database": "sales",
+                "collection": "orders",
+                "pipeline": [{"$lookup": {"from": "secrets", "localField": "status",
+                                          "foreignField": "_id", "as": "joined"}}]
+            }),
+        )
+        .await;
+
+    let rendered = format!("{body:?}");
+    assert!(
+        rendered.contains("not authorized") || rendered.contains("forbidden"),
+        "a $lookup into an ungranted collection must be refused: {rendered}"
     );
 }

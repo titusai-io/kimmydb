@@ -34,7 +34,7 @@ graph TB
 
     O --> C1["<b>Change streams</b><br/>WebSocket subscribers<br/>resumable by token<br/><i>✅ working</i>"]
     O --> C2["<b>Embedding pipeline</b><br/>extract → chunk → embed<br/>an ordinary subscriber<br/><i>✅ working</i>"]
-    O --> C3["<b>Cluster anti-entropy</b><br/>peers pull missing ranges<br/><i>📋 M4</i>"]
+    O --> C3["<b>Cluster anti-entropy</b><br/>peers pull missing ranges<br/><i>✅ built</i>"]
 
     style O fill:#4a5568,color:#fff
 ```
@@ -235,7 +235,7 @@ Retention bounds two things:
 | Bounded thing | Consequence when exceeded |
 |---|---|
 | How long a disconnected subscriber can be away and still resume | `410 Gone`, must resubscribe |
-| How far a peer can fall behind and still catch up incrementally | Full resync needed (M4) |
+| How far a peer can fall behind and still catch up incrementally | The sender says so and ships a snapshot instead ([ADR-036](decisions.md)) |
 
 The expiry check exists already:
 
@@ -332,7 +332,7 @@ cover the log. See [ADR-036](decisions.md).
 
 ---
 
-## Replication (📋 M4)
+## Replication
 
 The intended flow, with the primitives that already exist marked:
 

@@ -6,63 +6,94 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5: the write path measured, and a wrong number corrected
+## As of 2026-08-08 — M5: aggregation shipped; docs audited
 
-**Branch:** `m5-write-benchmarks`, off `main` (PRs #16-#19 all merged).
-Not merged.
-**Gate:** 640 tests · fmt clean · clippy clean at `-D warnings`.
+**Branch:** `m5-doc-accuracy-and-planner`, off `main` (PRs #16–#20 merged).
+Not merged. Carries three things: the documentation audit, the planner
+measurement, and the aggregation pipeline.
+**Gate:** 662 tests (640 + 22) · fmt clean · clippy clean · driven on a live
+server.
 
-### First: a correction
+### Aggregation
 
-The previous handoff recorded that `put_vectors` costs ~50-65 ms, implying
-vector ingest of **15-20 documents per second**. **That was wrong by roughly six
-times.** It is 5.67 ms for a single chunk — about 176 documents per second.
+Nine stages: `$match`, `$project`, `$sort`, `$skip`, `$limit`, `$unwind`,
+`$group`, `$count`, `$lookup`. Eight accumulators. `POST …/aggregate`, plus the
+MCP `aggregate` tool that had been advertised as planned since M3.
+[Aggregation](aggregation.md) is the reference.
 
-The figure was never measured. It was inferred from how long a *test* took
-divided by the writes inside it — and that test ran in a **debug** binary while
-every benchmark runs in release, with a graph build and ten searches also inside
-the same stopwatch. A timing taken as a by-product of measuring something else
-inherits the other thing's build profile and everything else sharing the clock.
-It is an anecdote, not a measurement. Kept in
-[Benchmarks](benchmarks.md#a-number-published-here-was-wrong) rather than quietly
-deleted, because the wrong number was acted on.
+**Three decisions worth carrying:**
 
-### What the write path actually costs
+1. **Blocking stages refuse rather than truncate.** A hard 100,000-document
+   ceiling, checked on every stage's output, erroring with the stage's name. A
+   `$group` over 90% of the input looks identical to one over all of it, so a
+   partial answer is worse than none. The maintainer chose this over spill-to-disk.
+2. **`$lookup` is authorized against the collection it joins.** Without that a
+   caller with `read` on one collection could pull any other through a join —
+   a privilege escalation shaped like a query, routing around the single
+   authorization point. Tested at both edges, and a mutation removing the check
+   turns the test red.
+3. **The pure pipeline refuses `$lookup` rather than passing input through.**
+   `kimmy-query` has no storage dependency, so the executor runs joins. A join
+   that silently does nothing is a wrong answer shaped like a right one.
 
-| Operation | Cost |
-|---|---:|
-| `insert`, no secondary index | 3.52 ms |
-| `insert`, one secondary index | 3.37 ms |
-| `insert`, two secondary indexes | 3.53 ms |
-| `replace` | 3.38 ms |
-| `put_vectors`, 1 chunk | 5.67 ms |
-| `put_vectors`, 4 chunks | 18.51 ms |
+`$lookup` scans the foreign collection **once**, keyed in memory — a
+per-document join is O(n·m). It sees the foreign collection as of when the stage
+runs; there is no cross-collection snapshot in a store without multi-document
+transactions.
 
-**Two findings worth carrying forward:**
+Five mutations injected, five caught, with a no-op control first.
 
-1. **Secondary indexes are free on the write path.** Zero, one and two cost the
-   same within noise, which contradicts the usual intuition that indexes make
-   writes slower — and that intuition shapes how people design schemas.
-2. **Everything costs exactly one durable commit** (~3.4 ms). The mutation and
-   its oplog entry share one transaction ([ADR-008](decisions.md)), and that
-   commit swamps index maintenance, document size and record shape. `delete` +
-   `insert` is 6.8 ms because it is two commits.
+### The documentation audit
 
-So the lever for ingest throughput is **batching mutations into one
-transaction**, and nothing in the API offers that — every route commits per
-operation. That is the obvious next thing if ingest rate ever matters, and it is
-the ceiling the embedding worker runs against.
+the maintainer asked for stale and incorrect documentation to be fixed rather than left.
+More was wrong than the number that prompted it: `docs/README.md` still listed
+clustering as planned and said nothing transported replication;
+`docs/change-streams.md` documented a bug fixed by ADR-030 as a live
+limitation; five places still cited the 2,000-vector threshold; ADR-021 and six
+code comments still claimed a pure-Rust build; and the `coordinated` enforcement
+error told users it "lands in M4" — user-facing, and wrong.
 
-### Next in M5
+**The pattern:** every one was true when written. Nothing catches a document
+that goes false as code moves under it, which is the ADR-016 drift again and
+argues for the same fix — checks that fail, not claims that are asserted.
+
+### The planner, measured
+
+A scan is flat (~0.8 µs/document); the indexed path is ~1.66 µs/candidate. **A
+random read costs about twice a sequential one, so an index wins exactly when it
+eliminates more than half the collection**, and the measured crossover sits
+there. With index maintenance already free on writes, an index is close to free
+in both directions. `MAX_LIMIT = 10_000` is now checked, not guessed: a full
+10,000-document scan is ~8 ms.
+
+### The native-dependency check
+
+`scripts/check-native-deps.sh`, wired into CI. It fails when the **default**
+build gains a package matching a native-toolchain indicator (`cc`, `cmake`,
+`bindgen`, `pkg-config`, `*-sys`, `*-src`) that is not on
+`scripts/allowed-native-deps.txt` — currently one entry, `cc`, with its reason.
+
+This is the ADR-016 rule made enforceable. The property "no C toolchain" was
+false for two milestones because it lived in prose; what is checkable is the
+narrower rule that replaced it — do not add a *second* native stack. Adding one
+stays allowed, it just has to be a line in a diff.
+
+Its first version exited 1 for the wrong reason: under `set -e`, an allowlist
+of only comments made `grep` return non-zero and killed the script before it
+printed anything. A passing failure — found by running the failure path, not
+the happy one. Both failure paths are now driven and recorded in
+[Testing](testing.md).
+
+### What is left in M5
+
+the maintainer asked for **one branch and PR per remaining item**. Each is independent:
 
 | Item | Note |
 |---|---|
-| Index-backed vs scanned `find` | The planner's premise is still unmeasured, and now the more interesting gap given indexes cost nothing to maintain |
-| `MAX_LIMIT = 10_000` | Still a guess |
-| TLS between nodes | Needs a trust decision before code — `cluster_secret` authenticates but does not encrypt |
-| Aggregation pipeline | Biggest single feature; unblocks the MCP `aggregate` tool and `$vectorSearch` |
-| Backup / restore, `kimmy` CLI, audit log | |
-| A CI check for native build dependencies | What would have caught the ADR-016 drift |
+| TLS between nodes | **Decided:** bind the channel to `cluster_secret`. Self-signed certs per node, no cert verification, but the existing HMAC handshake also signs the TLS exporter (RFC 5705) — a man-in-the-middle running two sessions gets different exporters and the proof fails. Real MITM resistance, no certificate distribution |
+| Backup / restore | Cold file copy only |
+| `kimmy` CLI | Still a stub that points at the HTTP API |
+| Audit log, richer metrics | |
 
 ### Carried debt, none blocking
 

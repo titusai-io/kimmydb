@@ -235,10 +235,13 @@ the live channel: abandoning a call inside a `select!` you intend to resume may
 drop an event. The WebSocket pump only races it against socket-close, which is
 terminal, so this is safe there.
 
-**Replicated writes may land behind the stream position (M4).** An applied
-remote entry keeps its originating stamp, so it can be inserted into the oplog
-*behind* the local tail. A subscriber past that point will not see it.
-Single-node streams are unaffected. See [Oplog](oplog.md).
+**Replicated writes reach subscribers.** This was once a real gap: an applied
+remote entry keeps its *originating* stamp, so it lands in the oplog behind the
+local tail, and a subscriber past that point would never have seen it. Streams
+now follow a second ordering over local arrival sequence (`oplog_arrival`) while
+the oplog stays keyed by origin stamp for conflict resolution and anti-entropy.
+Resume tokens are unchanged — they are translated to an arrival position at
+watch time. [ADR-030](decisions.md), and [Oplog](oplog.md) for the mechanism.
 
 **Collection DDL is filtered out.** Create and drop append `kind = Collection`
 entries with no document. The WebSocket layer drops them rather than emitting

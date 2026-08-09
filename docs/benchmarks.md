@@ -14,7 +14,7 @@ repetition — these are the checks.
 
 ```bash
 cargo bench -p kimmy-vector                  # vector search and index build
-cargo bench -p kimmy-storage                 # the write path
+cargo bench -p kimmy-storage                 # write path and query path
 cargo bench -p kimmy-vector -- hnsw_build    # one group
 ```
 
@@ -86,6 +86,7 @@ the measurement is what makes it visible.
 
 | Constant | Was | Now | Why |
 |---|---|---|---|
+| `MAX_LIMIT` | 10,000 | **10,000** | Unchanged, now checked: a full scan of exactly 10,000 documents is ~8 ms, so the cap bounds an unindexed query at single-digit milliseconds |
 | `MIN_VECTORS_FOR_INDEX` | 2,000 | **500** | No crossover exists; the graph wins from 250 up. 500 keeps a build from being paid by a collection that is barely queried — below it a scan is ≤ 15 ms, which is not worth 161 ms of build to improve |
 | `MAX_STALENESS` | 30 s | **30 s** | Unchanged, but now for a reason. A rebuild is 1.7 s at 2,000 vectors and 5.4 s at 4,000, so on a continuously written collection this window is what caps rebuild cost at ~18% of a core rather than exceeding 100% |
 
@@ -100,8 +101,6 @@ re-read if that judgement needs revisiting.
 
 | | Why it matters |
 |---|---|
-| `MAX_LIMIT = 10_000` in `kimmy_api::exec` | The cap on `find`. Still a guess |
-| Index-backed vs scanned `find` | The planner's whole premise is unmeasured — and now the more interesting gap, since the write-path cost of an index turns out to be nil |
 | Dimensions other than 384 | 768 and 1536 are both common, and the crossover depends on width |
 | Batched writes | Nothing commits more than one mutation per transaction, and the commit is the entire cost — see [The write path](#the-write-path) |
 | Concurrent writers | Every number here is single-threaded; redb allows one writer, so the ceiling under contention is unknown |
@@ -154,28 +153,68 @@ time.
 
 ---
 
-## A number published here was wrong
+## Index-backed lookup vs a collection scan
 
-The first version of this document recorded, under "an observation worth a real
-benchmark", that `put_vectors` cost ~50–65 ms and implied vector ingest of
-**15–20 documents per second**. That was wrong by roughly six times. It is
-**5.67 ms** for a single chunk, or ~176 documents per second.
+10,000 documents, one equality filter, selectivity as the dial.
 
-The error is instructive. The figure was not measured; it was *inferred* from
-how long a test took, divided by the number of writes in it. That test ran in a
-**debug** binary, while every benchmark here runs in release — and the timing
-also contained a graph build and ten searches that were quietly attributed to
-the writes.
+| Matching documents | Indexed | Scan | |
+|---:|---:|---:|---|
+| 1 | **0.003 ms** | 8.085 ms | index ~2,700× faster |
+| 100 | **0.171 ms** | 8.133 ms | index 48× faster |
+| 1,000 | **1.670 ms** | 7.905 ms | index 4.7× faster |
+| 5,000 | 8.288 ms | **7.911 ms** | scan wins |
 
-**A timing taken as a by-product of measuring something else is an anecdote, not
-a measurement.** It inherits the other thing's build profile, its warm-up, and
-whatever else shared the stopwatch. The rule this file now follows: anything
-quoted as a rate lives in a harness that states its own conditions, or it does
-not get quoted.
+### The scan is flat; the index is not
 
-Left in rather than quietly deleted, because the wrong number was acted on — it
-went into a handoff and a summary — and the record of why it was wrong is worth
-more than a clean page.
+A scan costs the same regardless of how many documents match — it reads all
+10,000 either way, at **~0.8 µs per document**. The indexed path costs
+**~1.66 µs per candidate** and reads only the candidates.
+
+A random read is therefore about **twice** a sequential one, which is the whole
+story: an index wins exactly when it eliminates more than half the collection.
+The measured crossover sits right at 50% selectivity, which is what that ratio
+predicts.
+
+### What this means alongside the write-path numbers
+
+Maintaining a secondary index costs nothing on a write, and reading through one
+is enormously faster on any selective query. So an index is close to free in
+both directions, and the remaining costs are disk and the
+[one-bound range limitation](deviations.md).
+
+The exception is real but narrow: a filter that matches most of a collection is
+better off scanning, and the planner does not know selectivity — it has no
+statistics, so it will use an index whenever one applies. On a filter matching
+most documents that is a modest loss (5,000 of 10,000 cost 8.3 ms instead of
+7.9 ms), which is why statistics have not been worth building.
+
+### `MAX_LIMIT = 10_000` is defensible
+
+The cap on `find` was a guess. A full scan of exactly 10,000 documents is
+**~8 ms**, so the cap bounds an unindexed query at single-digit milliseconds of
+storage work. That is a reasonable ceiling — big enough not to surprise, small
+enough that a pathological query cannot occupy a core. Not changed; now checked.
+
+---
+
+## A retracted figure
+
+An earlier revision of this file carried a `put_vectors` cost and an ingest rate
+that were **not measured** — they were inferred from how long a test took,
+divided by the writes inside it. That test was a debug binary while every
+benchmark here runs in release, and its timing also contained a graph build and
+ten searches. The inferred figures were about six times too slow.
+
+**The measured values are the ones in [The write path](#the-write-path) above.
+Nothing else on this page is derived from that estimate.**
+
+The retraction is noted rather than silently dropped because the figure had
+already been quoted elsewhere, and because of the rule it produced:
+
+> A timing taken as a by-product of measuring something else inherits the other
+> thing's build profile and whatever else shared the clock. It is an anecdote,
+> not a measurement. Anything quoted as a rate lives in a harness that states
+> its own conditions.
 
 ---
 

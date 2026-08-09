@@ -80,8 +80,11 @@ base64 = "0.23"
 # Auth. argon2 0.6 is still a release candidate; password hashing is not the
 # place to run ahead of a stable release.
 argon2 = { version = "0.5", features = ["std"] }
-# rust_crypto keeps the build pure Rust, consistent with choosing redb over
-# RocksDB; aws_lc_rs would reintroduce a C toolchain dependency.
+# rust_crypto rather than aws_lc_rs. Note the build is NOT free of a C
+# toolchain and has not been since M2 — `reqwest` pulls `ring`, which ships C
+# and assembly (ADR-016 records the correction). The rule that survives is to
+# not add a *second* native crypto stack: `ring` is already paid for, and
+# aws_lc_rs would add CMake for the same primitives.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 rand = "0.9"
 

@@ -35,6 +35,15 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # ADR-001 and ADR-016 both cite keeping the build free of a C toolchain.
+      # That stopped being true in M2 and nobody noticed for two milestones,
+      # because the claim lived in prose that nothing checked. This is the
+      # narrower rule that replaced it, enforced: do not add a second native
+      # stack. Adding one is still allowed — it just has to be a deliberate
+      # line in scripts/allowed-native-deps.txt rather than a surprise.
+      - name: Native build dependencies
+        run: ./scripts/check-native-deps.sh
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

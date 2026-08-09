@@ -1,0 +1,16 @@
+# Native build dependencies permitted in the default build.
+#
+# Checked by scripts/check-native-deps.sh. Adding a line here is allowed and
+# sometimes right — it just has to be a deliberate line in a diff, with a
+# reason, rather than something that arrives unnoticed with a version bump.
+#
+# The rule this enforces (see the correction on ADR-016 in docs/decisions.md):
+# the build already pays for one native crypto stack, so do not add a second.
+
+# Build-time C compiler driver. Reaches the graph through:
+#   reqwest -> hyper-rustls -> rustls -> ring   (remote embedding providers)
+#   axum-server -> rustls -> ring               (TLS termination, ADR-039)
+# `ring` ships C and assembly. Accepted 2026-08-08 rather than removed: the
+# alternative provider, aws-lc-rs, additionally needs CMake for the same
+# primitives.
+cc

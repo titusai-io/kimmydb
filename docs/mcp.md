@@ -130,6 +130,7 @@ will need to re-authenticate rather than assuming a connection stays good.
 | `describe_collection` | **Sampled schema.** See below |
 | `find` | Query with the full filter language, with `sort`, `projection`, paging, and `explain` |
 | `count` | Match count without returning documents |
+| `aggregate` | Group, reshape, join. See [Aggregation](aggregation.md) |
 
 ### Search
 
@@ -151,8 +152,14 @@ Both require the collection to have embeddings configured — see
 | `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it |
 | `create_index` | Secondary index |
 
-`aggregate` is listed in the [Roadmap](roadmap.md) but **does not exist**: the
-aggregation pipeline itself is M5 work. There is nothing to expose yet.
+`aggregate` is the one an agent should reach for when it wants a *number*
+rather than rows. Left to `find`, a model pulls documents into its context and
+reduces them there — slower, lossy past a page, and expensive. A `$group` does
+the work in the database and returns the answer.
+
+Its `$lookup` stage is authorized against the collection it joins, at this edge
+as well as the REST one, so a tool call cannot reach a collection the caller's
+grants exclude.
 
 ---
 

@@ -9,18 +9,18 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-639 tests passing · 0 failures · clippy clean at -D warnings
+662 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 123 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
 | `kimmy-storage` | 171 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
-| `kimmy-query` | 85 | Filter, update, sort, projection semantics |
+| `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 73 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 31 end-to-end over a real socket |
-| `kimmy-mcp` | 20 | 5 unit (resource URIs, internal-object filter) + 15 end-to-end JSON-RPC over a real socket |
+| `kimmy-api` | 76 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 34 end-to-end over a real socket |
+| `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 24 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cluster` | 45 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
@@ -491,6 +491,9 @@ manually and are recorded so they can be repeated:
 | SIGTERM on a TLS node | ✅ drained and exited in **52 ms** (plaintext measured ~20 ms) |
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
+| The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
+| Aggregation on a live server | ✅ `$match`/`$group`/`$sort`, `$unwind`+`$count`, `$avg`/`$min`/`$max`/`$addToSet`, and `$lookup` joining one document while another got an empty array |
+| `$lookup` as a caller without read on the joined collection | ✅ uniform 403, and the joined data did not appear in the response |
 | **The full image, built and driven** | ✅ 106 MB; CRUD, query, indexes with `explain`, change streams, vector and hybrid search, RBAC, MCP, metrics, rate limiting and TLS all exercised in a container |
 | Restart of a container | ✅ data, users, indexes, vectors and node identity survived; `docker stop` exit 0 in 290 ms |
 | Three-node cluster in containers | ✅ collection, unique index and documents replicated to all three, bidirectionally; one JWT valid on every node; writes accepted and converged with a node down |
@@ -554,7 +557,7 @@ Honest list of what is not covered:
 
 | Gap | Notes |
 |---|---|
-| Benchmarks are partial | The vector-index constants and the write path are measured ([Benchmarks](benchmarks.md)); the planner, `MAX_LIMIT` and concurrent writers are not, and there is no regression baseline |
+| Benchmarks are partial | The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline |
 | No fuzzing | The codecs are the obvious target |
 | No multi-node tests | Nothing to test until M4 |
 | No crash-consistency tests | redb is trusted for durability |

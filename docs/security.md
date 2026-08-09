@@ -25,7 +25,7 @@ graph LR
 ```
 
 **One authorization decision point.** `Principal::can()` in
-`kimmy-auth/src/rbac.rs`. Both the HTTP API and (in M3) the MCP server call it.
+`kimmy-auth/src/rbac.rs`. Both the HTTP API and the MCP server call it.
 A second enforcement path is exactly how an MCP tool ends up quietly more
 permissive than the REST route beside it.
 
