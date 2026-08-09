@@ -18,8 +18,9 @@ graph LR
     M3["<b>M3</b> ✅<br/>built-in<br/>MCP server"]
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> ✅<br/>hardening"]
+    M6["<b>M6</b> 📋<br/>webhooks"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -38,6 +39,7 @@ graph LR
 | **M3** | Built-in MCP server | ✅ Complete |
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
+| **M6** | Webhooks — registration and push delivery of change events | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -330,6 +332,109 @@ handle a node whose tombstones were collected while it was partitioned.
 | Benchmarks | 🚧 Vector index, write path and query planner measured. No crossover existed, so `MIN_VECTORS_FOR_INDEX` dropped 2,000 → 500; and every write costs one durable commit, which makes secondary indexes free on the write path. [Benchmarks](benchmarks.md) |
 | Audit log | ✅ Done — emitted from the single authorization point, four modes, `kimmy::audit` target. [ADR-042](decisions.md) |
 | Richer metrics | ✅ Mostly — request rates, response classes, storage size, denial and rate-limit counters. **Latency histograms and oplog lag are not built**, and are documented as such rather than guessed. [ADR-043](decisions.md) |
+
+---
+
+## M6 — Webhooks: registration and push 📋
+
+A developer registers a URL with KimmyDB and the node **pushes** change events
+to it. Change streams already deliver the same events, but the client has to
+open and hold a WebSocket; this is the other direction, for consumers that
+cannot hold a connection — serverless functions, queues, other services.
+
+### It is another oplog consumer
+
+The design falls out of the spine rather than being bolted beside it. A
+dispatcher is an ordinary consumer of the oplog, exactly like the embedding
+worker:
+
+```mermaid
+graph LR
+    W["Document write"] --> O[("Oplog")]
+    O --> C1["Change streams<br/><i>client holds a socket</i>"]
+    O --> C2["Embedding worker"]
+    O --> C3["Anti-entropy"]
+    O --> C4["<b>Webhook dispatcher</b><br/><i>node holds the connection</i>"]
+    C4 --> H1["POST https://…"]
+
+    style C4 fill:#2d3748,color:#fff
+```
+
+Everything it needs already exists:
+
+| Need | Already there |
+|---|---|
+| Durable per-consumer position | `Engine::consumer_position` — what the embedding worker uses |
+| Resume after restart | Same; position is recorded **after** the work, so a crash redelivers |
+| Which node accepted a write | `Stamp { hlc, node }` on every entry |
+| A durable, replicated, backed-up registry | A collection in `__kimmy`, like `__users` |
+| Backpressure and lag recovery | The oplog itself; a consumer that falls behind replays from disk |
+
+### Decisions taken
+
+Recorded here because they shape everything below, and two of them were chosen
+against the recommendation — deliberately, and the reasoning belongs with the
+plan rather than in a commit message.
+
+| Decision | Chosen | Consequence accepted |
+|---|---|---|
+| Which node delivers | **Every node**, receiver deduplicates | An N-node cluster sends N deliveries per event. Every endpoint must deduplicate on the event id or do its work N times. In exchange, losing a node loses no deliveries and there is no leader |
+| Egress restrictions | **None by default** | A registered URL is dialled as given. See the security note below |
+| Registering requires | **`watch` on the collection** | The same grant that opens a change stream. A webhook outlives the token that created it and sends data somewhere the grant does not name |
+
+> ⚠️ **Security note, stated plainly.** `watch`-gated registration with
+> unrestricted egress means any principal with `watch` on any collection can
+> make the node issue outbound HTTP to an address of their choosing — including
+> loopback, RFC1918 ranges, and the cloud metadata endpoint at
+> `169.254.169.254`. That is a server-side request forgery primitive available
+> to the lowest-privilege read role. It is a deliberate choice for
+> operability; `webhooks.allowed_hosts` exists, empty by default, so an
+> operator can close it without a code change.
+
+### Delivery semantics
+
+**At-least-once.** The position is recorded after a delivery succeeds, so a
+crash mid-flight redelivers. Combined with every-node delivery, a receiver will
+see duplicates in normal operation, not just after a fault.
+
+**Every event carries a stable id** — the originating `Stamp`, which is
+`(hlc, node)` and globally unique — in the payload and in a header, so
+deduplicating is a set membership test rather than a heuristic.
+
+**Ordering is per subscription, and only within one node's stream.** Each node
+delivers in oplog order; across nodes there is no global order, which is the
+same thing the leaderless design says everywhere else.
+
+**A failing endpoint backs off and eventually invalidates.** Retries with
+exponential backoff; if the subscription's position falls behind
+`oplog_retention_secs` it is marked invalidated and stops, exactly as a lagging
+change-stream consumer gets `410 resume_token_expired`. A dead endpoint must
+not stall the node or grow a queue without bound.
+
+### Tasks
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | **Subscription registry** | `__kimmy.__webhooks`: url, collection, operation filter, secret, state, created-by. A collection, so it replicates, backs up and restores for free |
+| 2 | **Registration API** | `POST/GET/DELETE /v1/db/{db}/coll/{coll}/webhooks`, gated on `watch`. Plus the MCP surface question — probably not a tool, since an agent registering an egress path is a different thing from an agent reading |
+| 3 | **Dispatcher worker** | An oplog consumer per node, resuming from `consumer_position`. Batches events per subscription with a size and a max delay, so a bulk load does not become one request per document |
+| 4 | **Delivery** | HTTP POST, JSON body in the change-stream event shape, timeout, `X-Kimmy-Event-Id` and `X-Kimmy-Signature` headers |
+| 5 | **Signing** | HMAC-SHA256 over the body with a per-subscription secret, so a receiver can tell a genuine delivery from anything else that can reach it. `hmac`/`sha2` are already in the build for the cluster handshake |
+| 6 | **Failure handling** | Exponential backoff, attempt counter, invalidation when the position falls past retention. Failures visible on `/metrics`, not only in a log |
+| 7 | **Egress policy** | `webhooks.allowed_hosts`, empty by default meaning unrestricted, per the decision above |
+| 8 | **Observability** | `kimmy_webhook_deliveries_total{outcome}`, `kimmy_webhook_subscriptions`, and an audit record when a subscription is registered or removed — registering one is an access-granting act |
+| 9 | **Tests** | A local receiver over a real socket: delivery, batching, signature verification, retry after a failure, invalidation past retention, and that a deleted subscription stops firing |
+| 10 | **Docs and ADRs** | An ADR for the every-node delivery model and one for the egress decision, since both are choices a future reader will otherwise want to reverse |
+
+### Open questions, to settle before or during
+
+- **Should `__kimmy.__webhooks` replicate?** It is a collection, so it will by
+  default — which is what makes every node deliver. Worth confirming that is
+  wanted, since it also means a URL registered on one node is dialled by all.
+- **Payload size.** `fullDocument` on a large document, batched, could produce
+  a very large POST. A cap, and what to do when a single event exceeds it.
+- **Should there be a cluster-wide delivery cap** so a webhook registered
+  against a hot collection cannot saturate a node's outbound connections.
 
 ---
 

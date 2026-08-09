@@ -176,6 +176,7 @@ eventually-consistent store is a user who assumed otherwise.
 | **M3** | Built-in MCP server over streamable HTTP | ✅ Complete |
 | **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | ✅ Complete |
 | **M5** | Rate limiting, TLS, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
+| **M6** | Webhooks — register a URL, the node pushes change events to it | 📋 Planned |
 
 Where the build departs from what was planned — and why — is tracked in
 [Deviations](docs/deviations.md), in one place rather than scattered.
