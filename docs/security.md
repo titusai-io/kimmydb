@@ -256,6 +256,11 @@ file, rather than becoming a handshake failure for whoever connects first.
 One listener, one port. There is no plaintext half and no HTTP→HTTPS redirect:
 a port is either encrypted or it is not.
 
+**In a container, the key must be readable by uid 10001.** The image runs as a
+non-root user, so a key at mode `0600` owned by you stops the node at startup
+with `Permission denied` naming the file. That is the right failure — but it is
+the first thing to check when a TLS container will not start.
+
 **Plaintext on a public bind warns but still starts.** Terminating at a proxy or
 a service mesh is a legitimate deployment and refusing to start would break it.
 But nothing about a successful request reveals that the token authorising it

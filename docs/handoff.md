@@ -6,57 +6,67 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5 in progress, client TLS done
+## As of 2026-08-08 — M5 in progress; a replication bug found by running the image
 
-**Branch:** `m5-tls`, off `main` (which has login rate limiting merged, PR #16).
-Not merged.
-**Gate:** 635 tests (629 + 6) · `cargo fmt --all -- --check` clean ·
-`cargo clippy --workspace --all-targets -- -D warnings` clean · driven against a
-running daemon over real TLS.
+**Branch:** `m5-container-fixes`, off `main` (PRs #16 rate limiting, #17 TLS
+both merged). Not merged.
+**Gate:** 639 tests (635 + 4) · `cargo fmt --all -- --check` clean ·
+`cargo clippy --workspace --all-targets -- -D warnings` clean · driven as a
+built Docker image, single node and a three-node cluster.
+
+### The thing to know
+
+**Collection ids above `i64::MAX` could not be encoded, so those collections
+never replicated.** Ids are hashes over the full `u64` range, BSON has no
+unsigned 64-bit type, and `CollectionId` used a derived `Serialize`. About
+**48% of collection names** were affected — a coin flip per name. The write
+succeeded locally and the peer logged one `malformed frame` warning per round,
+so nothing surfaced to a client.
+
+The suite passed throughout, because all thirteen replication tests use
+`"shop"."orders"`, which hashes into the low half. Fixed with one fixed
+representation for `CollectionId`, matching the `NodeId` precedent; on-disk form
+untouched, since ids persist through the hand-rolled codec rather than serde.
+[ADR-031](decisions.md) carries the full account.
+
+Also fixed: `docker-compose.yml` never set a per-node `cluster.bind`, so every
+containerized node advertised `127.0.0.1` and **SWIM never formed** — replication
+still converged via discovery, which is exactly what made it look healthy.
+
+### Why this was found now and not earlier
+
+Nothing in this project's process was skipped; the gap was that "drive a real
+server" had always meant a `cargo run` binary on loopback, never the artefact
+users actually deploy. Building the image and running three of them found two
+issues in an hour, one of them severe. **Worth repeating before any release.**
+
+### Previously, on this milestone
+
+Login rate limiting (PR #16, [ADR-038](decisions.md)) and native client TLS
+(PR #17, [ADR-039](decisions.md)). Node↔node replication is still plaintext and
+needs its own trust decision before code.
 
 ### What this branch did
 
-Native TLS termination for the HTTP, WebSocket and MCP listener —
-`axum-server` over `rustls`. [ADR-039](decisions.md) has the reasoning. Enabled
-by naming `server.tls.cert_file` and `server.tls.key_file`; there is no separate
-toggle, because "enabled with no certificate" can only ever be a startup
-failure.
+1. **Fixed the id-serialization bug above.** Regression tests at both levels: a
+   2,000-name sweep asserting *both* halves of the range are exercised, and an
+   end-to-end replication test over a real socket that asserts its own fixture
+   still lands in the high half.
+2. **`docker-compose.yml`** pins a subnet and a per-node `KIMMY_CLUSTER_BIND`,
+   so the shipped cluster demo actually gossips. Its header comment also still
+   claimed clustering lands in M4.
+3. **Documented two container gotchas** that cost real time: the cluster-bind
+   requirement (with a Kubernetes downward-API snippet), and that the image runs
+   as uid 10001, so a TLS key at `0600` owned by the operator stops the node.
 
-**Node↔node replication is still plaintext.** That is the remaining TLS work and
-it needs its own trust decision — `cluster_secret` already authenticates peers
-with a mutual HMAC challenge that never sends the secret, so what TLS would add
-there is confidentiality, and the interesting question is whether to require
-operator-supplied certificates or bind the channel to the secret that already
-exists.
+### Verification
 
-### The finding that shaped it
+Both fixes were proven where they failed rather than only in tests: `c.t` — the
+collection that would not converge — now replicates to both peers in 8 s with
+zero malformed-frame warnings; and both survivors declare a killed node down
+within 17 ms of each other, where previously nothing was ever declared down.
 
-**The "no C toolchain" property has not held since M2**, and ADR-016 plus
-[Deviations](deviations.md) claimed it did. `kimmy-vector` depends on `reqwest`
-with `rustls-tls`, non-optionally, which pulls `rustls → ring`; `ring` ships C
-and assembly. Found by running `cargo tree -i ring` while planning TLS rather
-than trusting the register.
-
-The maintainer chose to accept the cost and correct the record. The operative rule now is
-**do not add a second native crypto stack** — which is why TLS uses
-`tls-rustls-no-provider` with `ring` installed explicitly, rather than
-`axum-server`'s default, which would have added `aws-lc-rs` and CMake for the
-same primitives. It is logged 🔴 rather than 🟢 in the register because what
-closes it is a CI check, not code: nothing today would catch the next such drift.
-
-### Invariants this branch put under test
-
-There are now two serving stacks, and the property they must agree on fails
-silently: if `into_make_service_with_connect_info` is dropped, requests still
-succeed and the only symptom is every caller sharing one rate-limit bucket.
-Asserted on both paths.
-
-Four injected mutations, four caught — this time with a deliberate no-op
-mutation first as a control, since the previous branch's harness had silently
-been running a nonexistent cargo target. A fifth bug was caught without being
-injected: `set_nonblocking(false)` on the listener handed to `axum-server`
-panics tokio at the *first TLS connection*, not at startup, so the process would
-have come up healthy and died on first contact.
+Reverting the id fix turns both new tests red, checked in each direction.
 
 ### Next in M5
 
@@ -109,6 +119,13 @@ reindex operation.
   node rather than failing for whoever connects first (ADR-039).
 - **Do not add a second native crypto stack.** `ring` is already in the build;
   anything selecting `aws-lc-rs` adds CMake for the same primitives.
+- **A type that crosses a format boundary needs a chosen representation, not an
+  inherited one.** `NodeId` and `CollectionId` have both cost a replication
+  outage by deriving serde and letting BSON decide. Anything new on the wire
+  gets the same scrutiny — particularly a `u64`, which BSON cannot hold above
+  `i64::MAX`.
+- **A fixture that is a hash is a sample, not a constant.** Test both halves of
+  the range, and assert the fixture still has the property the test needs.
 
 ## Conventions for this file
 

@@ -112,13 +112,37 @@ docker run -d --name kimmy -p 7878:7878 \
   kimmydb
 ```
 
-Image is ~93 MB (Debian slim runtime). Notes:
+Image is ~106 MB (Debian slim runtime). Notes:
 
-- Runs as **uid 10001**, not root.
+- Runs as **uid 10001**, not root. **Anything you mount must be readable by that
+  uid** — a TLS key at mode `0600` owned by you makes the node refuse to start
+  with `Permission denied`, naming the file. Either `chown 10001` the key or
+  give it a group the container can read.
 - `kimmyd` is PID 1 with **no shell wrapper**, so it receives `SIGTERM` directly
-  from `docker stop` and Kubernetes. Verified: exits cleanly in ~20 ms.
+  from `docker stop` and Kubernetes. Measured: `docker stop` returns in ~290 ms
+  with exit code 0.
 - `/var/lib/kimmy` is a volume. **Losing it loses node identity**, not just data.
 - Ports: `7878/tcp` (HTTP), `7900/tcp` (replication) **and** `7900/udp` (SWIM membership). Both are needed when clustering.
+
+**Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
+to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
+than an identity, so the node refuses to announce it and advertises loopback
+with a warning ([ADR-037](decisions.md)). Inside a container that tells every
+peer to reach this node at `127.0.0.1`, which is their own container.
+
+The symptom is specific and easy to misread as working: **replication still
+converges**, because anti-entropy dials the addresses discovery resolved. What
+is lost is SWIM — learning peers nobody configured, and a shared opinion about
+which nodes are alive. Nothing is ever declared down; only each node's private
+backoff notices. Set it to the container's routable address:
+
+```bash
+docker run ... -e KIMMY_CLUSTER_BIND=172.28.0.11:7900 ...
+```
+
+`cluster.bind` is a socket address and takes an IP literal, not a hostname,
+which is why [`docker-compose.yml`](../docker-compose.yml) pins a subnet and
+gives each node a fixed address. On Kubernetes use the downward API — see below.
 
 ### Kubernetes
 
@@ -157,6 +181,17 @@ spec:
             - { containerPort: 7878 }
             - { containerPort: 7900 }
           env:
+            # Required for gossip. `cluster.bind` defaults to the wildcard
+            # 0.0.0.0:7900, and a wildcard is a listening instruction rather
+            # than an identity, so the node refuses to announce it and falls
+            # back to advertising loopback with a warning (ADR-037). In a pod
+            # that means every peer is told to reach this node at 127.0.0.1 —
+            # which is their own container. Replication still converges via
+            # discovery; SWIM does not.
+            - name: POD_IP
+              valueFrom: { fieldRef: { fieldPath: status.podIP } }
+            - name: KIMMY_CLUSTER_BIND
+              value: "$(POD_IP):7900"
             - name: KIMMY_SEEDS
               value: "k8s:kimmy-headless.default.svc.cluster.local"
             - name: KIMMY_JWT_SECRET
