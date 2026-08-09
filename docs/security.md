@@ -108,6 +108,7 @@ A grant is a set of actions over a set of collections:
 | `write` | Insert, replace, update, delete |
 | `watch` | Open a change stream |
 | `search` | Vector and hybrid search. Implied by `read` but grantable alone, so an agent can search without reading raw documents |
+| `webhook` | Register an endpoint the node pushes change events to |
 | `admin` | Create/drop collections, manage users |
 
 ### Implication
@@ -131,6 +132,12 @@ graph BT
 - **`watch` is independent.** A subscriber sees every change to a collection
   continuously, which is a materially different exposure from point reads, so it
   must be granted explicitly. `read` does **not** imply `watch`.
+- **`webhook` is independent too, and `watch` does not imply it.** They carry
+  the same events, but a change stream ends when the client disconnects and dies
+  with the token that opened it, while a webhook keeps sending to an address the
+  grant never named long after that token expires. Handing out an egress path is
+  a different act from being allowed to read, so it is granted separately. Only
+  `admin` implies it.
 
 ### Patterns
 

@@ -59,6 +59,7 @@ fails fast on a bad volume mount.
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
 | `cluster.seeds` | `KIMMY_SEEDS` | `[]` | Naming seeds implies `enabled` |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | — | Required when clustering |
+| `webhooks.allowed_hosts` | — | `[]` | Hosts a webhook may target beyond the public internet. Empty means public addresses only |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |

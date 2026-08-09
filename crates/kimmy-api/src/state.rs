@@ -29,6 +29,9 @@ pub struct AppState {
     pub limits: RateLimits,
     /// Process counters behind `/metrics`.
     pub metrics: crate::metrics::Metrics,
+    /// Where a webhook may be pointed. Held in state rather than read per
+    /// request so the policy cannot differ between two calls.
+    pub egress: crate::egress::EgressPolicy,
 }
 
 pub type SharedState = Arc<AppState>;

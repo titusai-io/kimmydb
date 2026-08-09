@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-702 tests passing · 0 failures · clippy clean at -D warnings
+723 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 87 | 50 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 37 end-to-end over a real socket |
+| `kimmy-api` | 108 | 63 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -270,6 +270,27 @@ each one turned a named test red:
 | Record the attempt before authenticating, so success also spends | `a_successful_login_does_not_spend_the_budget` |
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
+
+### Webhook registration, six for six after one escape
+
+| Injected fault | Caught by |
+|---|---|
+| The listing serialises the stored document whole | `registering_a_webhook_returns_the_secret_exactly_once` |
+| `watch` implies `webhook` | `registering_needs_the_webhook_action_and_watch_is_not_enough` |
+| The egress policy is not consulted at registration | `a_webhook_pointed_at_the_metadata_endpoint_is_refused` |
+| An IPv4-mapped IPv6 address bypasses the IPv4 rules | `an_ipv4_mapped_ipv6_address_cannot_smuggle_a_private_target` |
+| A subscription can be deleted through any collection | `a_webhook_can_only_be_removed_through_the_collection_it_belongs_to` |
+| **Only the first resolved address is checked** | `one_private_address_among_public_ones_refuses_the_whole_host` — **added after this escaped** |
+
+The escape is the interesting one, and it was in the security check. A host can
+answer with several addresses, and an attacker controls what theirs answers
+with; checking only the first lets `[93.184.216.34, 169.254.169.254]` through on
+the strength of the address that was never going to be dialled. Nothing tested
+it, because a unit test cannot make DNS return a chosen pair.
+
+The fix was to make the rule testable rather than to test around it:
+`permits_addrs` takes the resolved list, so the loop can be exercised without a
+resolver. Something untestable in place tends to stay untested.
 
 ### Point-in-time restore, and the mutation that found a real gap
 
@@ -533,6 +554,7 @@ manually and are recorded so they can be repeated:
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
 | The `kimmy` CLI against a live node | ✅ every command driven: login, ping, insert from an argument and from stdin, find with sort, count, aggregate from stdin, update, delete, describe, backup-then-restore, and RBAC refusing a scoped user. Exit codes checked directly rather than through a pipeline, which had masked them |
+| Webhook registration on a live node | ✅ a public endpoint registered and the secret returned once; the metadata endpoint, loopback and RFC1918 refused with an explanatory message; listing showed no secret; a `webhook`-granted user could register but not write, and a `watch`-granted user could not register at all; both registrations produced audit records |
 | Point-in-time restore, end to end | ✅ five documents wrecked by a bulk update, a backup taken after the incident, restored with `--until` a mark before it: all five back to their previous value, and the restored node served them |
 | The audit log at `mode=writes` | ✅ on a live node: the two admin actions and the write recorded, the denial recorded, and the `find` correctly absent |
 | The audit log at `mode=denials` | ✅ the same traffic produced exactly one record — the refusal |

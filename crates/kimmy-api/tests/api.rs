@@ -1104,3 +1104,164 @@ async fn the_metrics_endpoint_exposes_the_process_counters() {
         "metrics is unauthenticated and must not name collections:\n{raw}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Webhook registration (M6)
+// ---------------------------------------------------------------------------
+
+/// Register a collection and a user holding exactly `actions` on it.
+async fn with_scoped_user(server: &Server, actions: Value) -> (String, String) {
+    let root = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&root), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"scoped","password":"scoped-password",
+                   "grants":[{"db":"shop","collection":"orders","actions":actions}]}),
+        )
+        .await;
+    let scoped = server.login("scoped", "scoped-password").await;
+    (root, scoped)
+}
+
+#[tokio::test]
+async fn registering_a_webhook_returns_the_secret_exactly_once() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&token),
+            json!({"url":"https://example.com/hook"}),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    let secret = created.body["secret"].as_str().expect("a secret at registration").to_string();
+    assert!(secret.len() >= 64, "secret looks too short: {secret}");
+    let id = created.body["id"].as_str().expect("an id").to_string();
+
+    // ...and never again. Listing is the only other way to see a subscription,
+    // so if the secret is anywhere it is here.
+    let listed = server.get("/v1/db/shop/coll/orders/webhooks", Some(&token)).await;
+    let rendered = listed.body.to_string();
+    assert!(rendered.contains(&id), "the subscription should be listed: {rendered}");
+    assert!(!rendered.contains(&secret), "the secret must never be retrievable: {rendered}");
+    assert!(!rendered.contains("secret"), "not even the field: {rendered}");
+}
+
+#[tokio::test]
+async fn registering_needs_the_webhook_action_and_watch_is_not_enough() {
+    // The whole point of a separate action. A change stream ends with the
+    // client and dies with its token; a webhook keeps sending to an address
+    // the grant never named, long after that token expires.
+    let server = Server::start().await;
+    let (_root, watcher) = with_scoped_user(&server, json!(["read", "watch"])).await;
+
+    let refused = server
+        .post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&watcher),
+            json!({"url":"https://example.com/hook"}),
+        )
+        .await;
+    assert_eq!(refused.status, 403, "watch must not imply webhook: {:?}", refused.body);
+
+    assert_eq!(
+        server.get("/v1/db/shop/coll/orders/webhooks", Some(&watcher)).await.status,
+        403,
+        "nor should it allow listing them"
+    );
+}
+
+#[tokio::test]
+async fn the_webhook_action_grants_registration_without_granting_writes() {
+    // And the converse: the action is independent, not a bundle.
+    let server = Server::start().await;
+    let (_root, hooker) = with_scoped_user(&server, json!(["read", "webhook"])).await;
+
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&hooker),
+            json!({"url":"https://example.com/hook"}),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+
+    assert_eq!(
+        server.post("/v1/db/shop/coll/orders/docs", Some(&hooker), json!({"_id": 1})).await.status,
+        403,
+        "registering a webhook must not have granted writing"
+    );
+}
+
+#[tokio::test]
+async fn a_webhook_pointed_at_the_metadata_endpoint_is_refused() {
+    // Server-side request forgery, refused while the person who typed it is
+    // watching rather than at the first delivery.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    for url in [
+        "http://169.254.169.254/latest/meta-data/",
+        "http://127.0.0.1:7878/v1/databases",
+        "http://10.0.0.5/hook",
+        "file:///etc/passwd",
+    ] {
+        let refused = server
+            .post("/v1/db/shop/coll/orders/webhooks", Some(&token), json!({"url": url}))
+            .await;
+        assert_eq!(refused.status, 400, "{url} should be refused: {:?}", refused.body);
+    }
+
+    let listed = server.get("/v1/db/shop/coll/orders/webhooks", Some(&token)).await;
+    assert_eq!(listed.body["count"], 0, "nothing refused may have been stored");
+}
+
+#[tokio::test]
+async fn a_webhook_can_only_be_removed_through_the_collection_it_belongs_to() {
+    // Ids are guessable from a listing. Without this check, a caller with the
+    // grant on one collection could delete another collection's subscription
+    // by naming its id under their own.
+    let server = Server::start().await;
+    let token = server.root().await;
+    for name in ["orders", "other"] {
+        server.post("/v1/db/shop/collections", Some(&token), json!({"name": name})).await;
+    }
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&token),
+            json!({"url":"https://example.com/hook"}),
+        )
+        .await;
+    let id = created.body["id"].as_str().expect("an id").to_string();
+
+    let wrong = server.delete(&format!("/v1/db/shop/coll/other/webhooks/{id}"), Some(&token)).await;
+    assert_eq!(wrong.status, 404, "must not delete through the wrong collection");
+
+    let right =
+        server.delete(&format!("/v1/db/shop/coll/orders/webhooks/{id}"), Some(&token)).await;
+    assert_eq!(right.status, 200, "{:?}", right.body);
+    assert_eq!(server.get("/v1/db/shop/coll/orders/webhooks", Some(&token)).await.body["count"], 0);
+}
+
+#[tokio::test]
+async fn registering_against_a_missing_collection_fails_now_rather_than_silently() {
+    // Otherwise the subscription sits there delivering nothing, and the first
+    // sign of trouble is someone asking why no events arrived.
+    let server = Server::start().await;
+    let token = server.root().await;
+    let refused = server
+        .post(
+            "/v1/db/shop/coll/nosuch/webhooks",
+            Some(&token),
+            json!({"url":"https://example.com/hook"}),
+        )
+        .await;
+    assert_eq!(refused.status, 404, "{:?}", refused.body);
+}
