@@ -1187,6 +1187,81 @@ question; `cluster_secret` still authenticates peers without encrypting them.
 
 ---
 
+## ADR-040 — Replication TLS is bound to `cluster_secret`, not to certificates
+
+**Decision.** Node-to-node replication runs over TLS. Each node generates a
+self-signed certificate at startup and **neither side verifies the other's**.
+Instead the existing mutual HMAC handshake additionally signs the TLS session's
+exported keying material ([RFC 5705]):
+
+```text
+proof = HMAC(cluster_secret, len(nonce) || nonce || len(exporter) || exporter)
+```
+
+Always on. There is no switch.
+
+**The problem.** `cluster_secret` already authenticated peers — a three-message
+challenge-response where neither side transmits the secret ([ADR-035]). What was
+missing was confidentiality: frames carrying oplog entries were plaintext, so
+anyone on the path could read replicated documents.
+
+**Why not operator certificates.** The conventional answer is a CA and per-node
+certificates with mutual verification. It composes with existing PKI, and it
+makes certificate distribution and rotation a standing burden on every cluster
+— including a two-node one on a private network — while adding a new way to
+lock a cluster out of itself. For a database whose clustering story is "set one
+shared secret and name a seed", requiring a PKI to encrypt is a large step
+backwards in operability.
+
+**Why unverified TLS alone is not enough.** It stops a passive eavesdropper and
+nothing else. An active attacker terminates two TLS sessions and relays between
+them, reading everything. The HMAC handshake does not help on its own, because a
+relay can forward the challenge and its answer untouched.
+
+**What channel binding adds.** The exporter is derived from secrets specific to
+one TLS session. A man-in-the-middle holds two, so the value it sees on one side
+never equals the value on the other; the proof it relays is computed over the
+wrong bytes, and recomputing it requires `cluster_secret`, which it does not
+have. The result is confidentiality *and* man-in-the-middle resistance, with the
+secret remaining the only thing an operator manages.
+
+**This is asserted, not argued.** `a_man_in_the_middle_cannot_relay_the_handshake`
+stands up a relay that really does terminate TLS on both sides and really can
+read the frames, and requires the handshake to fail. Removing the binding from
+the proof makes that test fail while its control — two nodes converging with
+nobody in the middle — still passes, so the failure is specifically the relay
+rather than replication being broken.
+
+**Signature verification is still performed.** Only "is this certificate one I
+trust" is waived. The TLS handshake signature proves the peer holds the key for
+the certificate it presented, which is what makes the session, and therefore the
+exporter, belong to a single endpoint rather than being splice-able.
+
+**Length-prefixed inputs.** `nonce || binding` alone would let a nonce of `AB`
+with binding `C` hash identically to `A` with `BC`. The same reasoning as the
+separator in `CollectionId::derive` ([ADR-031]).
+
+**No switch, and the upgrade cost that implies.** `cluster_secret` must already
+match cluster-wide; a second setting that must also match is another way to
+misconfigure a cluster, and one whose failure mode is silent plaintext. The cost
+is that a cluster cannot be upgraded to this version node by node — a node
+speaking TLS and one speaking plaintext cannot talk. Pre-1.0, with no
+compatibility promise, that is the right trade; it is called out in
+[Operations](operations.md) because it is a real operational consequence.
+
+**Certificates are ephemeral and per process.** They prove nothing, so
+persisting one would create a key to manage and leak for no benefit.
+
+**What this does not do.** It does not authenticate a node's identity beyond
+"holds the cluster secret". Every holder is equally trusted, which is what the
+secret already meant.
+
+[RFC 5705]: https://www.rfc-editor.org/rfc/rfc5705
+[ADR-035]: #adr-035--replication-pulls-over-tcp-peers-authenticate-mutually
+[ADR-031]: #adr-031--collection-ids-are-derived-from-the-name-not-allocated
+
+---
+
 ## Superseded / reconsidered
 
 | Original plan | Now | Why |

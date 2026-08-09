@@ -6,6 +6,7 @@
 //! actually gates access, and that a listener survives a peer misbehaving.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bson::doc;
@@ -175,6 +176,13 @@ async fn a_peer_with_the_wrong_secret_is_refused() {
 async fn a_peer_that_never_proves_itself_learns_nothing() {
     // The authentication has to gate *reads*, not just writes: an intruder that
     // simply asks for the oplog must not receive it.
+    //
+    // Since replication moved onto TLS this is refused one layer earlier — the
+    // plaintext frame below is not a valid ClientHello, so the connection dies
+    // before the protocol sees it. The property is unchanged and the test still
+    // holds it; what proves the *handshake* gates reads is now
+    // `a_peer_with_the_wrong_secret_is_refused`, which completes TLS and fails
+    // on the HMAC.
     let a = node().await;
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": "secret" }).unwrap();
@@ -200,7 +208,10 @@ async fn one_bad_connection_does_not_stop_the_listener() {
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
 
-    // Garbage: a valid length prefix followed by bytes that are not BSON.
+    // Garbage: a valid length prefix followed by bytes that are not BSON. With
+    // TLS in front it is now rejected as a malformed ClientHello rather than as
+    // a malformed frame; either way the listener must survive it, which is what
+    // this test is for.
     let mut rude = TcpStream::connect(a.addr).await.unwrap();
     use tokio::io::AsyncWriteExt;
     rude.write_all(&8u32.to_be_bytes()).await.unwrap();
@@ -339,4 +350,121 @@ async fn a_dead_peer_is_backed_off_rather_than_retried_every_round() {
 
 fn field(path: &str) -> kimmy_storage::IndexField {
     kimmy_storage::IndexField { path: path.into(), descending: false }
+}
+
+// ---------------------------------------------------------------------------
+// Channel binding
+// ---------------------------------------------------------------------------
+
+/// A man-in-the-middle that terminates TLS on both sides.
+///
+/// Nodes do not verify each other's certificates, so both handshakes succeed
+/// and this relay can read every frame — which is the point. It is what makes
+/// unverified TLS on its own insufficient, and therefore what the channel
+/// binding exists to defeat.
+///
+/// Returns the address to dial and a handle that reports how many bytes it
+/// managed to relay before the connection died.
+async fn man_in_the_middle(
+    target: std::net::SocketAddr,
+) -> (std::net::SocketAddr, Arc<AtomicUsize>) {
+    let relayed = Arc::new(AtomicUsize::new(0));
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let counted = Arc::clone(&relayed);
+    tokio::spawn(async move {
+        // Its own certificate, exactly as a real attacker would present.
+        let attacker = kimmy_cluster::tls::ClusterTls::new().expect("attacker TLS");
+        while let Ok((victim_tcp, _)) = listener.accept().await {
+            let acceptor = attacker.acceptor();
+            let connector = attacker.connector();
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let Ok(mut victim) = acceptor.accept(victim_tcp).await else {
+                    return;
+                };
+                let Ok(upstream_tcp) = TcpStream::connect(target).await else {
+                    return;
+                };
+                let Ok(mut upstream) = connector
+                    .connect(kimmy_cluster::tls::ClusterTls::server_name(), upstream_tcp)
+                    .await
+                else {
+                    return;
+                };
+                // Plain byte relay between two decrypted sessions.
+                let (mut vr, mut vw) = tokio::io::split(&mut victim);
+                let (mut ur, mut uw) = tokio::io::split(&mut upstream);
+                let up = async {
+                    let n = tokio::io::copy(&mut vr, &mut uw).await.unwrap_or(0);
+                    counted.fetch_add(n as usize, Ordering::Relaxed);
+                };
+                let down = async {
+                    let n = tokio::io::copy(&mut ur, &mut vw).await.unwrap_or(0);
+                    counted.fetch_add(n as usize, Ordering::Relaxed);
+                };
+                tokio::join!(up, down);
+            });
+        }
+    });
+
+    (addr, relayed)
+}
+
+#[tokio::test]
+async fn a_man_in_the_middle_cannot_relay_the_handshake() {
+    // The single property the cluster's TLS rests on.
+    //
+    // Certificates are not verified, so an attacker who can intercept the
+    // connection completes TLS with both sides and reads everything. What stops
+    // it is that the handshake proof is computed over the TLS session's
+    // exporter: the attacker holds two sessions with different exporters, so
+    // the proof it forwards is over the wrong value and cannot be recomputed
+    // without `cluster_secret`.
+    //
+    // If this test ever passes without the binding, replication is confidential
+    // against a passive listener and nothing more — and it would still look
+    // like it was working, which is why this is asserted rather than argued.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "confidential" }).unwrap();
+
+    let (mitm_addr, _relayed) = man_in_the_middle(a.addr).await;
+
+    let b = node().await;
+    let err = sync_once(&b.engine, mitm_addr, SECRET)
+        .await
+        .expect_err("a relayed handshake must be refused");
+
+    assert!(
+        matches!(
+            err,
+            ProtocolError::Unauthenticated
+                | ProtocolError::Malformed(_)
+                | ProtocolError::Io(_)
+                | ProtocolError::Closed
+        ),
+        "expected the handshake to fail, got {err:?}"
+    );
+    assert!(
+        b.engine.get_collection("shop", "orders").is_err(),
+        "nothing may reach a peer whose handshake was relayed"
+    );
+}
+
+#[tokio::test]
+async fn the_same_two_nodes_converge_when_nobody_is_in_the_middle() {
+    // The control for the test above. Without it, a bug that broke *all*
+    // replication would make the man-in-the-middle test pass for the wrong
+    // reason — which is the trap this suite has fallen into before.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "confidential" }).unwrap();
+
+    let b = node().await;
+    sync_once(&b.engine, a.addr, SECRET).await.expect("a direct round must succeed");
+
+    let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
+    assert!(b.engine.get(&cb, &DocId::String("confidential".into())).unwrap().is_some());
 }

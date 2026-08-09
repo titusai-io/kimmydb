@@ -6,94 +6,67 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5: aggregation shipped; docs audited
+## As of 2026-08-08 — M5: replication is encrypted; TLS complete on both fronts
 
-**Branch:** `m5-doc-accuracy-and-planner`, off `main` (PRs #16–#20 merged).
-Not merged. Carries three things: the documentation audit, the planner
-measurement, and the aggregation pipeline.
-**Gate:** 662 tests (640 + 22) · fmt clean · clippy clean · driven on a live
-server.
+**Branch:** `m5-cluster-tls`, off `main` (PRs #16–#21 merged). Not merged.
+**Gate:** 668 tests (662 + 6) · fmt clean · clippy clean · native-dep check
+clean · driven on two real daemons.
 
-### Aggregation
+### What this branch did
 
-Nine stages: `$match`, `$project`, `$sort`, `$skip`, `$limit`, `$unwind`,
-`$group`, `$count`, `$lookup`. Eight accumulators. `POST …/aggregate`, plus the
-MCP `aggregate` tool that had been advertised as planned since M3.
-[Aggregation](aggregation.md) is the reference.
+Node-to-node replication runs over TLS, always. Each node generates a
+self-signed certificate at startup and **neither side verifies the other's** —
+what secures the channel is that the existing mutual HMAC handshake also signs
+the TLS session's exported keying material ([RFC 5705]):
 
-**Three decisions worth carrying:**
+```
+proof = HMAC(cluster_secret, len(nonce) || nonce || len(exporter) || exporter)
+```
 
-1. **Blocking stages refuse rather than truncate.** A hard 100,000-document
-   ceiling, checked on every stage's output, erroring with the stage's name. A
-   `$group` over 90% of the input looks identical to one over all of it, so a
-   partial answer is worse than none. The maintainer chose this over spill-to-disk.
-2. **`$lookup` is authorized against the collection it joins.** Without that a
-   caller with `read` on one collection could pull any other through a join —
-   a privilege escalation shaped like a query, routing around the single
-   authorization point. Tested at both edges, and a mutation removing the check
-   turns the test red.
-3. **The pure pipeline refuses `$lookup` rather than passing input through.**
-   `kimmy-query` has no storage dependency, so the executor runs joins. A join
-   that silently does nothing is a wrong answer shaped like a right one.
+A man-in-the-middle holds two TLS sessions with different exporters, so the
+proof it relays is over the wrong bytes and it cannot recompute one without the
+secret. Confidentiality and MITM resistance, with no PKI to run.
+[ADR-040](decisions.md).
 
-`$lookup` scans the foreign collection **once**, keyed in memory — a
-per-document join is O(n·m). It sees the foreign collection as of when the stage
-runs; there is no cross-collection snapshot in a store without multi-document
-transactions.
+### The test that carries this
 
-Five mutations injected, five caught, with a no-op control first.
+`a_man_in_the_middle_cannot_relay_the_handshake` stands up a relay that
+genuinely terminates TLS on both sides and genuinely can read the frames — that
+is the point, since it demonstrates why unverified TLS alone would be
+insufficient — and requires the handshake to fail.
 
-### The documentation audit
+**Removing the binding from the proof makes that test fail while its control
+still passes.** The control matters more than usual here: a bug breaking *all*
+replication would make the MITM test pass for entirely the wrong reason, which
+is a trap this suite has fallen into before.
 
-the maintainer asked for stale and incorrect documentation to be fixed rather than left.
-More was wrong than the number that prompted it: `docs/README.md` still listed
-clustering as planned and said nothing transported replication;
-`docs/change-streams.md` documented a bug fixed by ADR-030 as a live
-limitation; five places still cited the 2,000-vector threshold; ADR-021 and six
-code comments still claimed a pure-Rust build; and the `coordinated` enforcement
-error told users it "lands in M4" — user-facing, and wrong.
+All 13 pre-existing replication tests now run over TLS unchanged. Two of them
+speak raw TCP and are refused one layer earlier than before; their comments were
+corrected rather than left describing what they used to prove.
 
-**The pattern:** every one was true when written. Nothing catches a document
-that goes false as code moves under it, which is the ADR-016 drift again and
-argues for the same fix — checks that fail, not claims that are asserted.
+### Consequences worth knowing
 
-### The planner, measured
-
-A scan is flat (~0.8 µs/document); the indexed path is ~1.66 µs/candidate. **A
-random read costs about twice a sequential one, so an index wins exactly when it
-eliminates more than half the collection**, and the measured crossover sits
-there. With index maintenance already free on writes, an index is close to free
-in both directions. `MAX_LIMIT = 10_000` is now checked, not guessed: a full
-10,000-document scan is ~8 ms.
-
-### The native-dependency check
-
-`scripts/check-native-deps.sh`, wired into CI. It fails when the **default**
-build gains a package matching a native-toolchain indicator (`cc`, `cmake`,
-`bindgen`, `pkg-config`, `*-sys`, `*-src`) that is not on
-`scripts/allowed-native-deps.txt` — currently one entry, `cc`, with its reason.
-
-This is the ADR-016 rule made enforceable. The property "no C toolchain" was
-false for two milestones because it lived in prose; what is checkable is the
-narrower rule that replaced it — do not add a *second* native stack. Adding one
-stays allowed, it just has to be a line in a diff.
-
-Its first version exited 1 for the wrong reason: under `set -e`, an allowlist
-of only comments made `grep` return non-zero and killed the script before it
-printed anything. A passing failure — found by running the failure path, not
-the happy one. Both failure paths are now driven and recorded in
-[Testing](testing.md).
+- **No switch.** `cluster_secret` must already match cluster-wide; a second
+  setting that must also match is another way to misconfigure a cluster, and its
+  failure mode would be silent plaintext.
+- **A cluster cannot be upgraded node by node across this version.** TLS and
+  plaintext nodes cannot talk. Stop the cluster, upgrade all nodes, restart —
+  no data is lost, each node holds a full copy and anti-entropy reconciles.
+  Recorded in [Operations](operations.md).
+- **Node identity is still only "holds the cluster secret."** Unchanged, and
+  what the secret always meant.
 
 ### What is left in M5
 
-the maintainer asked for **one branch and PR per remaining item**. Each is independent:
+One branch and PR each, as agreed:
 
 | Item | Note |
 |---|---|
-| TLS between nodes | **Decided:** bind the channel to `cluster_secret`. Self-signed certs per node, no cert verification, but the existing HMAC handshake also signs the TLS exporter (RFC 5705) — a man-in-the-middle running two sessions gets different exporters and the proof fails. Real MITM resistance, no certificate distribution |
-| Backup / restore | Cold file copy only |
+| Backup / restore | Cold file copy only today. The most operationally significant gap left |
+| Audit log, richer metrics | Both small and mostly mechanical |
 | `kimmy` CLI | Still a stub that points at the HTTP API |
-| Audit log, richer metrics | |
+
+[RFC 5705]: https://www.rfc-editor.org/rfc/rfc5705
 
 ### Carried debt, none blocking
 

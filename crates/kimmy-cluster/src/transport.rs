@@ -26,6 +26,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kimmy_storage::{Engine, SyncOutcome};
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
@@ -45,7 +46,22 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Serve peer requests until the listener fails.
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
     let local = listener.local_addr().ok();
-    info!(bind = ?local, "serving cluster replication");
+
+    // Generated once per process, not per connection: the certificate proves
+    // nothing on its own (see `crate::tls`), so the only cost of reusing it is
+    // none, and generating a keypair per peer would be a denial-of-service
+    // lever anyone who can open a socket could pull.
+    let tls = match crate::tls::ClusterTls::new() {
+        Ok(tls) => Arc::new(tls),
+        Err(e) => {
+            // Fatal rather than a fall back to plaintext. Falling back would
+            // mean an operator who configured a cluster expecting encrypted
+            // replication silently got none.
+            warn!(error = %e, "cannot start cluster TLS; replication will not serve");
+            return;
+        }
+    };
+    info!(bind = ?local, "serving cluster replication over TLS");
 
     loop {
         let (stream, peer) = match listener.accept().await {
@@ -58,10 +74,30 @@ pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
 
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
+        let acceptor = tls.acceptor();
         // One task per peer: a slow or hostile peer must not stall the others,
-        // and a panic in one connection must not take the listener down.
+        // and a panic in one connection must not take the listener down. The
+        // TLS handshake happens inside the task for the same reason — it is
+        // the first thing an attacker can make slow.
         tokio::spawn(async move {
-            if let Err(e) = serve_peer(&engine, stream, &secret).await {
+            let tls_stream = match acceptor.accept(stream).await {
+                Ok(s) => s,
+                Err(e) => {
+                    debug!(%peer, error = %e, "TLS handshake failed");
+                    return;
+                }
+            };
+            let binding = {
+                let (_, conn) = tls_stream.get_ref();
+                match crate::tls::binding(conn) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        warn!(%peer, error = %e, "no channel binding; refusing the peer");
+                        return;
+                    }
+                }
+            };
+            if let Err(e) = serve_peer(&engine, tls_stream, &secret, &binding).await {
                 match e {
                     ProtocolError::Closed => debug!(%peer, "peer disconnected"),
                     other => warn!(%peer, error = %other, "peer connection failed"),
@@ -71,15 +107,21 @@ pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
     }
 }
 
-async fn serve_peer(
+async fn serve_peer<S>(
     engine: &Engine,
-    mut stream: TcpStream,
+    mut stream: S,
     secret: &str,
-) -> Result<(), ProtocolError> {
-    let peer =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, accept_handshake(engine, &mut stream, secret))
-            .await
-            .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
+    binding: &[u8],
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let peer = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        accept_handshake(engine, &mut stream, secret, binding),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
     debug!(?peer, "peer authenticated");
 
     loop {
@@ -128,11 +170,15 @@ async fn serve_peer(
 }
 
 /// Answer an inbound handshake: prove ourselves, then demand proof.
-async fn accept_handshake(
+async fn accept_handshake<S>(
     engine: &Engine,
-    stream: &mut TcpStream,
+    stream: &mut S,
     secret: &str,
-) -> Result<kimmy_core::NodeId, ProtocolError> {
+    binding: &[u8],
+) -> Result<kimmy_core::NodeId, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let Message::Hello { node, nonce: their_nonce } = read_frame(stream).await? else {
         return Err(ProtocolError::Malformed("expected Hello".into()));
     };
@@ -144,7 +190,7 @@ async fn accept_handshake(
         &Message::Welcome {
             node: engine.node_id(),
             nonce: ours.clone(),
-            proof: prove(secret, &their_nonce),
+            proof: prove(secret, &their_nonce, binding),
         },
     )
     .await?;
@@ -152,7 +198,7 @@ async fn accept_handshake(
     let Message::Confirm { proof } = read_frame(stream).await? else {
         return Err(ProtocolError::Malformed("expected Confirm".into()));
     };
-    if !proof_is_valid(secret, &ours, &proof) {
+    if !proof_is_valid(secret, &ours, binding, &proof) {
         // Deliberately terse: telling a caller *why* their proof failed helps
         // them iterate towards a valid one.
         let _ = write_frame(stream, &Message::Fault("authentication failed".into())).await;
@@ -167,9 +213,24 @@ pub async fn sync_once(
     peer: SocketAddr,
     secret: &str,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let mut stream = TcpStream::connect(peer).await?;
+    let tcp = TcpStream::connect(peer).await?;
 
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, open_handshake(engine, &mut stream, secret))
+    // Built per round rather than held: a sync round is seconds apart, and a
+    // dialling node has no accept loop to amortise it against.
+    let tls = crate::tls::ClusterTls::new()
+        .map_err(|e| ProtocolError::Malformed(format!("cluster TLS: {e}")))?;
+    let mut stream = tls
+        .connector()
+        .connect(crate::tls::ClusterTls::server_name(), tcp)
+        .await
+        .map_err(|e| ProtocolError::Malformed(format!("TLS handshake with {peer}: {e}")))?;
+
+    let binding = {
+        let (_, conn) = stream.get_ref();
+        crate::tls::binding(conn).map_err(ProtocolError::Malformed)?
+    };
+
+    tokio::time::timeout(HANDSHAKE_TIMEOUT, open_handshake(engine, &mut stream, secret, &binding))
         .await
         .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
 
@@ -207,10 +268,10 @@ pub async fn sync_once(
 ///
 /// Returns what applying it changed, so a caller sees a snapshot the same way
 /// it sees an incremental round.
-async fn pull_snapshot(
-    engine: &Engine,
-    stream: &mut TcpStream,
-) -> Result<SyncOutcome, ProtocolError> {
+async fn pull_snapshot<S>(engine: &Engine, stream: &mut S) -> Result<SyncOutcome, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut cursor = None;
     let mut outcome = SyncOutcome::default();
 
@@ -240,11 +301,15 @@ async fn pull_snapshot(
 }
 
 /// Open a handshake: challenge them, check the answer, then answer theirs.
-async fn open_handshake(
+async fn open_handshake<S>(
     engine: &Engine,
-    stream: &mut TcpStream,
+    stream: &mut S,
     secret: &str,
-) -> Result<(), ProtocolError> {
+    binding: &[u8],
+) -> Result<(), ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let ours = nonce(engine.node_id());
     write_frame(stream, &Message::Hello { node: engine.node_id(), nonce: ours.clone() }).await?;
 
@@ -259,10 +324,10 @@ async fn open_handshake(
     // Checked *before* answering their challenge: proving ourselves to an
     // unauthenticated peer would tell it whether its guess at the secret was
     // close, and hands it a valid proof for a nonce it chose.
-    if !proof_is_valid(secret, &ours, &proof) {
+    if !proof_is_valid(secret, &ours, binding, &proof) {
         return Err(ProtocolError::Unauthenticated);
     }
 
-    write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce) }).await?;
+    write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
     Ok(())
 }

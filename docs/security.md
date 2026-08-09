@@ -213,7 +213,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | Gap | Status | Mitigation today |
 |---|---|---|
 | **Client TLS** | ✅ Built | Native termination — see [TLS](#tls). A reverse proxy still works if you prefer it |
-| **No TLS between nodes** | 📋 M5 | Replication frames are plaintext; `cluster_secret` authenticates peers but does not encrypt them |
+| **Node↔node TLS** | ✅ Built | Bound to `cluster_secret` via channel binding — see below |
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **No token revocation** | Not planned | Short TTLs; rotate the secret to revoke everything |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
@@ -293,6 +293,46 @@ preface. Checked against a real node rather than assumed.
 
 `rustls` on the `ring` provider, which was already in the build. See
 [ADR-039](decisions.md) for why not the `aws-lc-rs` default.
+
+---
+
+## TLS between nodes
+
+Replication runs over TLS, always. There is no setting: `cluster_secret` must
+already match cluster-wide, and a second setting that must also match is another
+way to misconfigure a cluster — one whose failure mode is silent plaintext.
+
+**Certificates are generated per node at startup and are not verified.** That
+sounds alarming and would be, on its own: unverified TLS stops a passive
+eavesdropper, but an active attacker terminates two sessions and relays between
+them, reading everything.
+
+What stops that is **channel binding**. The mutual HMAC handshake, which already
+proved both sides hold `cluster_secret` without transmitting it, now also signs
+the TLS session's exported keying material:
+
+```
+proof = HMAC(cluster_secret, len(nonce) || nonce || len(exporter) || exporter)
+```
+
+A man-in-the-middle holds two TLS sessions whose exporters differ, so the proof
+it relays is computed over the wrong value — and it cannot recompute one without
+the secret. The connection dies.
+
+This is tested with a relay that genuinely terminates TLS on both sides and can
+read the frames: removing the binding makes that test fail while a control with
+nobody in the middle still passes.
+
+| | |
+|---|---|
+| Confidentiality | ✅ TLS 1.3 |
+| Man-in-the-middle | ✅ via channel binding |
+| Node identity | ❌ beyond "holds `cluster_secret`" — which is what the secret always meant |
+| PKI required | ❌ none |
+
+**Upgrade note.** A node speaking TLS cannot talk to one speaking plaintext, so
+a cluster cannot be upgraded to this version one node at a time. See
+[Operations](operations.md).
 
 ---
 

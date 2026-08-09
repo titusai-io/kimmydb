@@ -140,14 +140,27 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
         .map_err(|e| ProtocolError::Malformed(format!("decoding: {e}")))
 }
 
-/// `HMAC-SHA256(secret, nonce)`.
-pub fn prove(secret: &str, nonce: &[u8]) -> Vec<u8> {
+/// `HMAC-SHA256(secret, nonce || binding)`.
+///
+/// `binding` is the TLS session's exported keying material ([`crate::tls`]).
+/// Including it is what makes a relayed proof useless: a man-in-the-middle runs
+/// two TLS sessions, their exporters differ, so a proof captured from one does
+/// not validate on the other — and recomputing it needs the secret.
+///
+/// The two inputs are length-prefixed rather than concatenated. Without that,
+/// a nonce of `A` with binding `BC` and a nonce of `AB` with binding `C` hash
+/// the same bytes, and an attacker who can influence one could shift the
+/// boundary. The same reasoning as the separator in `CollectionId::derive`.
+pub fn prove(secret: &str, nonce: &[u8], binding: &[u8]) -> Vec<u8> {
     use hmac::{Hmac, Mac};
     use sha2::Sha256;
 
     let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
+    mac.update(&(nonce.len() as u64).to_be_bytes());
     mac.update(nonce);
+    mac.update(&(binding.len() as u64).to_be_bytes());
+    mac.update(binding);
     mac.finalize().into_bytes().to_vec()
 }
 
@@ -155,9 +168,9 @@ pub fn prove(secret: &str, nonce: &[u8]) -> Vec<u8> {
 ///
 /// A byte-by-byte comparison leaks how much of a forged proof was correct,
 /// which is enough to recover the rest one byte at a time.
-pub fn proof_is_valid(secret: &str, nonce: &[u8], proof: &[u8]) -> bool {
+pub fn proof_is_valid(secret: &str, nonce: &[u8], binding: &[u8], proof: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
-    let expected = prove(secret, nonce);
+    let expected = prove(secret, nonce, binding);
     expected.ct_eq(proof).into()
 }
 
@@ -248,21 +261,58 @@ mod tests {
         assert!(matches!(err, ProtocolError::TooLarge { .. }), "got {err:?}");
     }
 
+    const BINDING: &[u8] = b"a-tls-exporter-value-32-bytes-ok";
+
     #[test]
     fn a_proof_verifies_only_against_its_own_secret_and_nonce() {
         let n = nonce(NodeId::generate());
-        let proof = prove("shared-secret", &n);
+        let proof = prove("shared-secret", &n, BINDING);
 
-        assert!(proof_is_valid("shared-secret", &n, &proof));
-        assert!(!proof_is_valid("different-secret", &n, &proof), "a wrong key must not verify");
-        assert!(!proof_is_valid("shared-secret", b"another nonce", &proof), "replay must not work");
-        assert!(!proof_is_valid("shared-secret", &n, b"forged"), "a forged proof must not verify");
+        assert!(proof_is_valid("shared-secret", &n, BINDING, &proof));
+        assert!(
+            !proof_is_valid("different-secret", &n, BINDING, &proof),
+            "a wrong key must not verify"
+        );
+        assert!(
+            !proof_is_valid("shared-secret", b"another nonce", BINDING, &proof),
+            "replay must not work"
+        );
+        assert!(
+            !proof_is_valid("shared-secret", &n, BINDING, b"forged"),
+            "a forged proof must not verify"
+        );
+    }
+
+    #[test]
+    fn a_proof_does_not_verify_against_a_different_channel() {
+        // This is the whole of the man-in-the-middle defence. A relay holds two
+        // TLS sessions with different exporters, so a proof captured on one
+        // must not validate on the other. If this ever passes, the TLS between
+        // nodes is confidentiality against a passive listener and nothing more
+        // — and it would still *look* like it was working.
+        let n = nonce(NodeId::generate());
+        let proof = prove("shared-secret", &n, BINDING);
+
+        assert!(
+            !proof_is_valid("shared-secret", &n, b"a-different-tls-session-exporter!", &proof),
+            "a proof relayed onto another TLS session must be rejected"
+        );
+    }
+
+    #[test]
+    fn the_nonce_and_binding_boundary_cannot_be_shifted() {
+        // Without length prefixes, nonce=`AB` binding=`C` and nonce=`A`
+        // binding=`BC` hash identical bytes, so an attacker able to influence
+        // one field could move the boundary and reuse a proof.
+        let a = prove("s", b"AB", b"C");
+        let b = prove("s", b"A", b"BC");
+        assert_ne!(a, b, "the two fields must not be able to trade bytes");
     }
 
     #[test]
     fn the_secret_never_appears_in_a_proof() {
         let secret = "a-very-recognizable-cluster-secret";
-        let proof = prove(secret, &nonce(NodeId::generate()));
+        let proof = prove(secret, &nonce(NodeId::generate()), BINDING);
         assert!(
             !proof.windows(secret.len()).any(|w| w == secret.as_bytes()),
             "the proof must not carry the key it was made with"
