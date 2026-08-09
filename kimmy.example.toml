@@ -101,6 +101,30 @@ login_per_user_window_secs = 300
 # Buckets that have refilled are forgotten first.
 max_tracked_keys = 100000
 
+# ---------------------------------------------------------------------------
+# Audit log
+# ---------------------------------------------------------------------------
+#
+# A structured record of authorization decisions -- who was allowed or refused
+# what. Emitted from the single point every check funnels through, so a new
+# route is audited by virtue of being authorized at all.
+#
+# Records go to the `kimmy::audit` tracing target, so they can be routed
+# separately, e.g. KIMMY_LOG_LEVEL='warn,kimmy::audit=info'.
+[audit]
+
+# off      -- nothing
+# denials  -- refusals only (the default)
+# writes   -- refusals, plus anything that wrote or administered
+# all      -- every decision, including reads
+#
+# `all` writes one line per authorized operation, which on a read-heavy node is
+# one per request. A denial is rare and is the event worth watching for, which
+# is why `denials` is the default. An unknown value is refused at startup: a
+# typo would otherwise produce a server that records nothing, and that looks
+# exactly like a server nobody has attacked.
+mode = "denials"
+
 [storage]
 # Holds the redb database file and the persistent node identity. Back this up,
 # and never share it between two running nodes.

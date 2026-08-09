@@ -6,68 +6,58 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-09 — M5: online backup and restore
+## As of 2026-08-09 — M5: audit log and richer metrics
 
-**Branch:** `m5-backup-restore`, off `main` (PRs #16–#22 merged). Not merged.
-**Gate:** 677 tests (668 + 9) · fmt clean · clippy clean · native-dep check
-clean · driven end to end against a serving node.
+**Branch:** `m5-audit-and-metrics`, off `main` (PRs #16–#23 merged). Not merged.
+**Gate:** 687 tests (677 + 10) · fmt clean · clippy clean · native-dep check
+clean · driven on a live node in two audit modes.
 
-### What this branch did
+### The audit log
 
-`GET /v1/admin/backup` streams a consistent backup **while the node serves**;
-`kimmyd restore --from <file>` writes one into a data directory that does not
-already hold a database. [ADR-041](decisions.md).
+Authorization decisions are recorded inside `Auth::require` — the one function
+every check funnels through — at the `kimmy::audit` tracing target.
+`audit.mode` selects `off`, `denials` (default), `writes` or `all`.
+[ADR-042](decisions.md).
 
-Before this, the only answer was stopping the node and copying `kimmy.redb` —
-and copying it from a *running* node captures a torn file, because redb is
-rewriting pages underneath the copy.
+**Emitted from the check, not from the routes.** A log each handler has to
+remember to write is a log with holes, and nothing about a missing audit line
+says it is missing. A new route is audited by virtue of being authorized at all.
 
-**Why it is an endpoint, not a command.** redb allows one process to hold a
-database, so a separate backup process cannot open a live one. The node has to
-take its own backup. The whole walk happens in one read transaction, so every
-table is read as of the same instant and writers are neither blocked nor
-affected — asserted by a test that writes concurrently while a backup runs.
+`denials` is the default because `all` writes one line per authorized operation
+— on a read-heavy node, one per request. A denial is rare and is the event
+someone is watching for. An unknown mode is refused at startup: a typo would
+produce a server recording nothing, which looks exactly like a server nobody has
+attacked.
 
-**Buffered, not streamed as produced.** Streaming would hold the read
-transaction open for as long as a client took to read, pinning MVCC pages to a
-slow socket. Memory is bounded by the database rather than by the caller.
+Verified live at `mode=writes`: two admin actions and a write recorded, a
+refusal recorded, and a `find` correctly absent. At `mode=denials` the same
+traffic produced exactly one record.
 
-**`admin` over `*` is required** — a backup is every document, so a
-database-scoped admin must not be able to take one. There is no grant-filtered
-backup, because a partial backup that looks whole is a restore that silently
-loses data.
+### Richer metrics
 
-### The identity question, and why there is no flag
+Uptime, `kimmy_requests_total`, `kimmy_responses_total{class}`,
+`kimmy_storage_bytes`, and counters for authorization denials, authentication
+failures, rate limiting and backups. [ADR-043](decisions.md).
 
-A backup carries the node id and a restore keeps it: the id is the tiebreak half
-of every write's stamp, so restoring under a fresh identity makes a node a
-stranger to its own history.
+**The three specific counters are derived from the response status in one
+middleware**, not incremented at the refusal. Each status has exactly one source
+— 401 credentials, 403 `ApiError::forbidden`, 429 the limiter — so counting in
+one layer means a new route is counted by existing. Verified live:
+`kimmy_authz_denied_total 1` matched the single 403.
 
-The edge is that restoring one backup onto **two** nodes gives them one
-identity, and the cluster then cannot tell them apart. Restore is for replacing
-a node, not cloning one; to add a node, start an empty one and let anti-entropy
-fill it. A `--new-identity` flag is deliberately absent — one keystroke between
-recovering and corrupting a cluster's identity space. The CLI prints the warning
-on every restore.
-
-### A test that improved an error rather than being weakened
-
-`a_file_that_is_not_a_backup_is_refused_by_name` failed at first because a short
-file hit `failed to fill whole buffer` before the magic was ever checked —
-accurate and useless, when the likeliest mistake is pointing at the wrong file.
-The magic is now read and checked on its own, first.
+**Two things are deliberately missing and documented as such:** latency
+histograms need buckets from measurements that do not exist for end-to-end
+requests, and oplog lag needs a peer's version vector the API layer does not
+hold. Both are worth doing; neither is worth guessing.
 
 ### What is left in M5
 
-One branch and PR each:
-
 | Item | Note |
 |---|---|
-| Audit log, richer metrics | Both small and mostly mechanical. The audit log wants to hang off the single authorization point rather than each route |
-| `kimmy` CLI | Still a stub that points at the HTTP API. The largest remaining piece and the least load-bearing |
+| `kimmy` CLI | The last item. Still a stub printing a pointer to the HTTP API — the largest remaining piece and the least load-bearing, since everything it would do is already reachable over HTTP |
 
-Point-in-time restore from the oplog is **not** built and is not currently
-planned — a backup is a whole-node snapshot. Worth a decision if you want it.
+Point-in-time restore from the oplog remains unbuilt and unplanned; a backup is
+a whole-node snapshot. Worth a decision if you want it.
 
 ### Carried debt, none blocking
 

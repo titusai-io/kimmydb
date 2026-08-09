@@ -56,6 +56,13 @@ pub async fn run(config: Config) -> Result<()> {
         config.server.rate_limit.build()
     };
 
+    // Set before anything can be authorized, so no decision escapes the mode
+    // an operator configured.
+    let audit = kimmy_api::AuditMode::parse(&config.audit.mode)
+        .map_err(|e| anyhow::anyhow!("audit.{e}"))?;
+    kimmy_api::audit::set_mode(audit);
+    info!(mode = audit.name(), "audit logging");
+
     let state = kimmy_api::state(Arc::clone(&engine), tokens, config.auth.insecure_no_auth, limits)
         .context("building the API state")?;
 

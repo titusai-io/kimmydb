@@ -113,6 +113,7 @@ running server, not merely compiled.
 | Hybrid search | ✅ Working | Dense + lexical, fused by reciprocal rank fusion |
 | Built-in MCP server | ✅ | Streamable HTTP at `/mcp`, RBAC-gated tools, sampled schema inference |
 | Gossip clustering | ✅ Working | SWIM membership over UDP, oplog anti-entropy over TCP, snapshot resync. **Containers must set `cluster.bind` to a routable address** — see [Operations](operations.md) |
+| Audit log | ✅ Working | Authorization decisions, four modes, on their own tracing target |
 | Login rate limiting | ✅ Working | Token bucket per caller, checked before the password hash |
 | TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
 | Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |

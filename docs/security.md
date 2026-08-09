@@ -218,7 +218,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **No token revocation** | Not planned | Short TTLs; rotate the secret to revoke everything |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
-| **No audit log** | 📋 Planned | `tracing` output only |
+| **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No field-level security** | Not planned | Collection is the finest granularity |
 | **No encryption at rest** | Not planned | Use an encrypted volume |
 | **No inter-node auth yet** | 📋 M4 | `cluster_secret` is validated at config time but nothing transports data yet |

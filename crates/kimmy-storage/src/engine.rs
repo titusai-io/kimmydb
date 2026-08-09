@@ -36,6 +36,9 @@ pub struct Engine {
     /// count misses the case where one document is deleted and another added.
     /// A counter is exact and free.
     vector_generations: Mutex<std::collections::HashMap<CollectionId, u64>>,
+    /// Where the database file lives, kept so that size can be reported
+    /// without the caller having to remember what it opened.
+    path: std::path::PathBuf,
     /// Unique constraints broken by merging replicated writes, since start.
     ///
     /// A counter rather than only a log line so the condition is visible on the
@@ -99,12 +102,26 @@ impl Engine {
             clock: Mutex::new(HlcClock::resuming_from(resumed)),
             events,
             vector_generations: Mutex::new(Default::default()),
+            path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     pub fn node_id(&self) -> NodeId {
         self.node_id
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Size of the database file on disk, or zero if it cannot be read.
+    ///
+    /// Zero rather than an error: this exists for a metrics endpoint, and a
+    /// gauge that fails the whole scrape because one `stat` did is worse than a
+    /// gauge that reads zero.
+    pub fn storage_bytes(&self) -> u64 {
+        std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
     /// How many times this collection's vectors have changed.

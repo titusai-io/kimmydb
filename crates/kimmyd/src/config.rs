@@ -19,6 +19,7 @@ pub struct Config {
     pub storage: StorageConfig,
     pub auth: AuthConfig,
     pub cluster: ClusterConfig,
+    pub audit: AuditConfig,
     pub log: LogConfig,
 }
 
@@ -234,6 +235,28 @@ pub enum LogFormat {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
+pub struct AuditConfig {
+    /// What authorization decisions to record: `off`, `denials`, `writes`,
+    /// or `all`.
+    ///
+    /// `denials` by default. `all` writes one line per authorized operation,
+    /// which on a read-heavy node is one per request — a real cost, and the
+    /// reason it is not the default. A denial is rare and is the event someone
+    /// is actually watching for.
+    ///
+    /// Records go to the `kimmy::audit` tracing target, so they can be routed
+    /// separately with a filter directive.
+    pub mode: String,
+}
+
+impl Default for AuditConfig {
+    fn default() -> Self {
+        Self { mode: "denials".to_string() }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct LogConfig {
     /// A `tracing-subscriber` env-filter directive, e.g. `info,kimmy_storage=debug`.
     pub level: String,
@@ -394,6 +417,9 @@ impl Config {
 
         self.server.rate_limit.validate()?;
         self.server.tls.validate()?;
+        // Parsed at startup so a typo is a boot failure rather than an audit
+        // log that silently records nothing.
+        kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
 
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
@@ -438,8 +464,8 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} scheme={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] cluster={} \
-             seeds=[{}] log={}/{:?}",
+            "bind={} scheme={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] audit={} \
+             cluster={} seeds=[{}] log={}/{:?}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
@@ -447,6 +473,7 @@ impl Config {
             if self.server.mcp { "enabled" } else { "off" },
             gc,
             self.server.rate_limit.describe(),
+            self.audit.mode,
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
             self.log.level,
@@ -712,6 +739,22 @@ mod tests {
         assert!(cfg.server.tls.is_enabled());
         // The startup line is how an operator confirms which one is running.
         assert!(cfg.summary().contains("scheme=https"), "summary: {}", cfg.summary());
+    }
+
+    #[test]
+    fn a_bad_audit_mode_is_refused_at_startup() {
+        // Otherwise a typo produces a server that records nothing, which looks
+        // exactly like a server nobody has attacked.
+        let mut cfg = valid();
+        cfg.audit.mode = "verbose".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("verbose"), "unhelpful error: {err}");
+        assert!(err.contains("denials"), "the error should list valid modes: {err}");
+
+        for mode in ["off", "denials", "writes", "all"] {
+            cfg.audit.mode = mode.into();
+            cfg.validate().unwrap_or_else(|e| panic!("{mode} should be valid: {e}"));
+        }
     }
 
     #[test]

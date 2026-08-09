@@ -59,6 +59,7 @@ fails fast on a bad volume mount.
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
 | `cluster.seeds` | `KIMMY_SEEDS` | `[]` | Naming seeds implies `enabled` |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | — | Required when clustering |
+| `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
 
@@ -79,6 +80,7 @@ runtime confusion:
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
 | `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |
+| An unknown `audit.mode` | A typo would produce a server recording nothing, which looks exactly like a server nobody has attacked |
 | A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |
 | `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
@@ -266,18 +268,75 @@ database is taken out of rotation rather than served traffic it cannot handle.
 
 ### Metrics
 
-```
-kimmy_databases 2
-kimmy_collections 5
-kimmy_up 1
+Unauthenticated, like the health endpoints, and deliberately **counts only** —
+exposing collection *names* would leak your schema to anything that can reach the
+port.
+
+| Series | |
+|---|---|
+| `kimmy_up` | Always 1; presence means the node is serving |
+| `kimmy_uptime_seconds` | Since this process started |
+| `kimmy_databases`, `kimmy_collections` | Counts, not names |
+| `kimmy_storage_bytes` | Size of the database file |
+| `kimmy_requests_total` | HTTP requests handled |
+| `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
+| `kimmy_authz_denied_total` | Refused by RBAC |
+| `kimmy_auth_failures_total` | Rejected credentials and tokens |
+| `kimmy_rate_limited_total` | Refused by a rate limit |
+| `kimmy_unique_violations` | Constraints broken by merging replicated writes |
+| `kimmy_backups_total` | Backups served |
+
+Counters render at zero before their first event, so a dashboard shows "nothing
+has gone wrong yet" rather than "no data".
+
+> **Not included, on purpose:** latency histograms and oplog lag. A histogram
+> needs buckets chosen from measurements that do not exist yet for end-to-end
+> requests, and lag needs a peer's version vector that the API layer does not
+> hold. Both are worth doing; neither is worth guessing. See
+> [ADR-043](decisions.md).
+
+---
+
+## The audit log
+
+A structured record of **authorization decisions** — who was allowed or refused
+what, on which collection.
+
+```toml
+[audit]
+mode = "denials"   # off | denials | writes | all
 ```
 
-Unauthenticated, like the health endpoints. Deliberately **counts only** —
-exposing collection *names* would leak your schema to anything that can reach
-the port.
+| Mode | Records |
+|---|---|
+| `off` | Nothing |
+| `denials` | Refusals only. **The default** |
+| `writes` | Refusals, plus anything that wrote or administered |
+| `all` | Every decision, including reads |
 
-> Richer metrics (request rates, latency, oplog lag, storage size) are 📋
-> planned. What is here is honest rather than complete.
+`all` writes one line per authorized operation, which on a read-heavy node is one
+per request. That is why it is not the default; a denial is rare and is the event
+worth watching for.
+
+Records go to the **`kimmy::audit`** tracing target, so they can be routed
+separately from the application log:
+
+```bash
+# JSON lines, audit at info, everything else quieter
+KIMMY_LOG_FORMAT=json KIMMY_LOG_LEVEL='warn,kimmy::audit=info' kimmyd run
+```
+
+Each record carries `user`, `action`, `db`, `collection`, `decision`, and
+`unauthenticated` — the last distinguishing "root did this" from "the server was
+started with authentication disabled".
+
+Emitted from the single authorization point rather than from each route, so a new
+route is audited by virtue of being authorized at all ([ADR-042](decisions.md)).
+An unknown mode is refused at startup, because a typo would otherwise produce a
+server that records nothing — indistinguishable from one nobody has attacked.
+
+**Logins are not in this stream.** A failed login is not an authorization
+decision; it is logged separately and counted as `kimmy_auth_failures_total`.
 
 ---
 
