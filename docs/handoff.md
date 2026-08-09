@@ -6,67 +6,68 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5: replication is encrypted; TLS complete on both fronts
+## As of 2026-08-09 — M5: online backup and restore
 
-**Branch:** `m5-cluster-tls`, off `main` (PRs #16–#21 merged). Not merged.
-**Gate:** 668 tests (662 + 6) · fmt clean · clippy clean · native-dep check
-clean · driven on two real daemons.
+**Branch:** `m5-backup-restore`, off `main` (PRs #16–#22 merged). Not merged.
+**Gate:** 677 tests (668 + 9) · fmt clean · clippy clean · native-dep check
+clean · driven end to end against a serving node.
 
 ### What this branch did
 
-Node-to-node replication runs over TLS, always. Each node generates a
-self-signed certificate at startup and **neither side verifies the other's** —
-what secures the channel is that the existing mutual HMAC handshake also signs
-the TLS session's exported keying material ([RFC 5705]):
+`GET /v1/admin/backup` streams a consistent backup **while the node serves**;
+`kimmyd restore --from <file>` writes one into a data directory that does not
+already hold a database. [ADR-041](decisions.md).
 
-```
-proof = HMAC(cluster_secret, len(nonce) || nonce || len(exporter) || exporter)
-```
+Before this, the only answer was stopping the node and copying `kimmy.redb` —
+and copying it from a *running* node captures a torn file, because redb is
+rewriting pages underneath the copy.
 
-A man-in-the-middle holds two TLS sessions with different exporters, so the
-proof it relays is over the wrong bytes and it cannot recompute one without the
-secret. Confidentiality and MITM resistance, with no PKI to run.
-[ADR-040](decisions.md).
+**Why it is an endpoint, not a command.** redb allows one process to hold a
+database, so a separate backup process cannot open a live one. The node has to
+take its own backup. The whole walk happens in one read transaction, so every
+table is read as of the same instant and writers are neither blocked nor
+affected — asserted by a test that writes concurrently while a backup runs.
 
-### The test that carries this
+**Buffered, not streamed as produced.** Streaming would hold the read
+transaction open for as long as a client took to read, pinning MVCC pages to a
+slow socket. Memory is bounded by the database rather than by the caller.
 
-`a_man_in_the_middle_cannot_relay_the_handshake` stands up a relay that
-genuinely terminates TLS on both sides and genuinely can read the frames — that
-is the point, since it demonstrates why unverified TLS alone would be
-insufficient — and requires the handshake to fail.
+**`admin` over `*` is required** — a backup is every document, so a
+database-scoped admin must not be able to take one. There is no grant-filtered
+backup, because a partial backup that looks whole is a restore that silently
+loses data.
 
-**Removing the binding from the proof makes that test fail while its control
-still passes.** The control matters more than usual here: a bug breaking *all*
-replication would make the MITM test pass for entirely the wrong reason, which
-is a trap this suite has fallen into before.
+### The identity question, and why there is no flag
 
-All 13 pre-existing replication tests now run over TLS unchanged. Two of them
-speak raw TCP and are refused one layer earlier than before; their comments were
-corrected rather than left describing what they used to prove.
+A backup carries the node id and a restore keeps it: the id is the tiebreak half
+of every write's stamp, so restoring under a fresh identity makes a node a
+stranger to its own history.
 
-### Consequences worth knowing
+The edge is that restoring one backup onto **two** nodes gives them one
+identity, and the cluster then cannot tell them apart. Restore is for replacing
+a node, not cloning one; to add a node, start an empty one and let anti-entropy
+fill it. A `--new-identity` flag is deliberately absent — one keystroke between
+recovering and corrupting a cluster's identity space. The CLI prints the warning
+on every restore.
 
-- **No switch.** `cluster_secret` must already match cluster-wide; a second
-  setting that must also match is another way to misconfigure a cluster, and its
-  failure mode would be silent plaintext.
-- **A cluster cannot be upgraded node by node across this version.** TLS and
-  plaintext nodes cannot talk. Stop the cluster, upgrade all nodes, restart —
-  no data is lost, each node holds a full copy and anti-entropy reconciles.
-  Recorded in [Operations](operations.md).
-- **Node identity is still only "holds the cluster secret."** Unchanged, and
-  what the secret always meant.
+### A test that improved an error rather than being weakened
+
+`a_file_that_is_not_a_backup_is_refused_by_name` failed at first because a short
+file hit `failed to fill whole buffer` before the magic was ever checked —
+accurate and useless, when the likeliest mistake is pointing at the wrong file.
+The magic is now read and checked on its own, first.
 
 ### What is left in M5
 
-One branch and PR each, as agreed:
+One branch and PR each:
 
 | Item | Note |
 |---|---|
-| Backup / restore | Cold file copy only today. The most operationally significant gap left |
-| Audit log, richer metrics | Both small and mostly mechanical |
-| `kimmy` CLI | Still a stub that points at the HTTP API |
+| Audit log, richer metrics | Both small and mostly mechanical. The audit log wants to hang off the single authorization point rather than each route |
+| `kimmy` CLI | Still a stub that points at the HTTP API. The largest remaining piece and the least load-bearing |
 
-[RFC 5705]: https://www.rfc-editor.org/rfc/rfc5705
+Point-in-time restore from the oplog is **not** built and is not currently
+planned — a backup is a whole-node snapshot. Worth a decision if you want it.
 
 ### Carried debt, none blocking
 

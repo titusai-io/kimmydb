@@ -9,17 +9,17 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-668 tests passing · 0 failures · clippy clean at -D warnings
+677 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 123 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 171 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
+| `kimmy-storage` | 178 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 76 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 34 end-to-end over a real socket |
+| `kimmy-api` | 78 | 42 unit (JSON boundary, errors, schema inference, rate limiting) + 36 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 24 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cluster` | 51 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
@@ -508,6 +508,7 @@ manually and are recorded so they can be repeated:
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
+| Backup and restore, end to end | ✅ 223 records taken from a **serving** node over HTTP, restored with the CLI into a fresh directory: original password worked, 39 of 40 documents (the deleted one stayed deleted), the unique index still served an index-backed query, and the node id was preserved |
 | Two daemons replicating over TLS | ✅ TLS 1.3 on the replication port (confirmed with `openssl s_client`), a document replicated, and the cluster converged |
 | Aggregation on a live server | ✅ `$match`/`$group`/`$sort`, `$unwind`+`$count`, `$avg`/`$min`/`$max`/`$addToSet`, and `$lookup` joining one document while another got an empty array |
 | `$lookup` as a caller without read on the joined collection | ✅ uniform 403, and the joined data did not appear in the response |

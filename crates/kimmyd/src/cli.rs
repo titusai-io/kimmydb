@@ -36,6 +36,17 @@ pub enum Command {
     ///
     /// Useful in CI and in a container entrypoint to fail fast on a bad mount.
     CheckConfig,
+    /// Restore a backup into a new data directory, then exit.
+    ///
+    /// Offline by necessity: redb allows one process to hold a database, so a
+    /// restore cannot run against a node that is serving. Take the backup with
+    /// `GET /v1/admin/backup` while the node runs; put it back with this while
+    /// it does not.
+    Restore {
+        /// The backup file, as written by `GET /v1/admin/backup`.
+        #[arg(long)]
+        from: PathBuf,
+    },
 }
 
 /// Flags that override config-file values. Every one is optional so that

@@ -173,6 +173,7 @@ reach than their own.
 | Password hashes never leave the crate | — |
 | Metrics expose counts, not names | Naming collections leaks the schema to an unauthenticated endpoint |
 | The last user cannot be deleted | Otherwise the server becomes unadministrable |
+| Backup requires `admin` over `*` | It is every document on the node; a database-scoped admin must not read past their own grants |
 
 Each of these has a test that would fail if the property were lost.
 

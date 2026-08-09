@@ -1015,3 +1015,54 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
     assert!(body.contains("$bucketAuto"), "the error must name what was rejected: {body}");
     assert!(body.contains("$group"), "and list what is supported: {body}");
 }
+
+#[tokio::test]
+async fn a_backup_requires_admin_over_everything() {
+    // A backup is every document on the node, so anything less than full admin
+    // would let a database-scoped administrator read past their own grants.
+    // There is deliberately no grant-filtered backup: a partial backup that
+    // looks whole is a restore that silently loses data.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":1,"v":"present"})).await;
+
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user":"dbadmin","password":"dbadmin-password",
+                   "grants":[{"db":"shop","collection":"*","actions":["admin"]}]}),
+        )
+        .await;
+    let scoped = server.login("dbadmin", "dbadmin-password").await;
+
+    assert_eq!(
+        server.get("/v1/admin/backup", Some(&scoped)).await.status,
+        403,
+        "a database-scoped admin must not be able to back up the whole node"
+    );
+    assert_eq!(server.get("/v1/admin/backup", None).await.status, 401);
+}
+
+#[tokio::test]
+async fn a_backup_downloads_and_looks_like_a_backup() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":1})).await;
+
+    let res = server.get("/v1/admin/backup", Some(&token)).await;
+    assert_eq!(res.status, 200);
+    // The body is binary, so the JSON parse yields Null; the magic is what
+    // matters and it is checked through the raw head plus content type.
+    assert!(
+        res.header("content-type").as_deref() == Some("application/octet-stream"),
+        "head was: {}",
+        res.head
+    );
+    assert!(
+        res.header("content-disposition").is_some_and(|d| d.contains(".backup")),
+        "a downloaded backup should arrive with a filename"
+    );
+}

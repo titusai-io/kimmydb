@@ -8,6 +8,7 @@
 
 #![allow(dead_code)]
 
+pub mod backup;
 pub mod codec;
 pub mod docs;
 pub mod engine;

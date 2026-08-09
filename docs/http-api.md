@@ -41,6 +41,18 @@ Default port **7878**.
 
 ---
 
+## Backup
+
+```
+GET /v1/admin/backup
+```
+
+Streams a consistent backup of the whole node as `application/octet-stream`.
+Requires `admin` over `*`. Restore it with `kimmyd restore --from <file>` while
+the target node is stopped. See [Operations](operations.md#backup-and-restore).
+
+---
+
 ## Authentication
 
 Every non-public endpoint expects a bearer token:
