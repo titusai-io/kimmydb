@@ -117,7 +117,7 @@ running server, not merely compiled.
 | Login rate limiting | ✅ Working | Token bucket per caller, checked before the password hash |
 | TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
 | Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
-| Backup / restore | ✅ Working | Online snapshot endpoint, offline restore command |
+| Backup / restore | ✅ Working | Online snapshot endpoint, offline restore, and point-in-time rewind |
 | `kimmy` CLI | 📋 Planned (M5) | The binary today prints a pointer to the HTTP API |
 
 Replication has been driven on real daemons and in containers, not only in

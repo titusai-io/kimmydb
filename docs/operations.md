@@ -379,6 +379,42 @@ Restore **refuses to overwrite an existing database**. An in-place restore turns
 a mistyped path into data loss; remove the file yourself if that is what you
 mean.
 
+### Point-in-time restore
+
+Restore a backup and rewind it to an earlier instant:
+
+```bash
+kimmyd --data-dir /var/lib/kimmy restore \
+       --from kimmy.backup \
+       --until 1786250131859      # milliseconds since the epoch
+```
+
+Take the backup **after** the incident — its oplog is what describes the
+incident, and the rewind undoes it.
+
+**What it can undo.** Any document change whose *previous* value is still in the
+oplog. `storage.oplog_retention_secs` is therefore the real point-in-time
+window.
+
+**What it refuses, rather than guessing.**
+
+| Refusal | Why |
+|---|---|
+| A target before the oplog horizon | Nothing describes the database before that point |
+| A schema change after the target | Dropping a collection purges its documents, and purged documents are not in the oplog either |
+| A document whose earlier value was collected | It existed at the target with a value that now exists nowhere. It is named in the error |
+
+The last one is the important one. The oplog stores what a document *became*,
+never what it was, and a delete stores nothing at all — so a document untouched
+since before the horizon and then changed cannot be put back. Leaving it at its
+later value would produce a database that looks restored and is not, so the
+whole rewind is refused instead. **Nothing is written until every check has
+passed**, so a refusal leaves the file exactly as the restore wrote it.
+
+> ⚠️ **A rewound database must not rejoin a cluster that still holds the undone
+> writes.** Anti-entropy would put them straight back. Run it standalone, or
+> rewind every node.
+
 ### The identity comes back with it
 
 A backup carries the node's id, and a restore keeps it. That is what you want

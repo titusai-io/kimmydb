@@ -17,6 +17,7 @@ pub mod gc;
 pub mod index;
 pub mod meta;
 pub mod migrate;
+pub mod rewind;
 pub mod snapshot;
 pub mod sync;
 pub mod tables;

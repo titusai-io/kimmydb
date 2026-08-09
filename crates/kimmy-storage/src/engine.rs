@@ -238,7 +238,7 @@ impl Engine {
     ///
     /// What it still does is repair a vector that has fallen behind: a database
     /// written before the vector existed, or one an older build appended to.
-    fn rebuild_version_vector_if_stale(db: &Database) -> Result<()> {
+    pub(crate) fn rebuild_version_vector_if_stale(db: &Database) -> Result<()> {
         let mut actual = kimmy_core::VersionVector::new();
         {
             let txn = db.begin_read()?;
@@ -266,6 +266,46 @@ impl Engine {
         txn.commit()?;
 
         info!(nodes = stored.len(), "raised the version vector to cover the oplog");
+        Ok(())
+    }
+
+    /// Replace the version vector with exactly what the oplog now covers.
+    ///
+    /// **The only legitimate lowering.** `rebuild_version_vector_if_stale`
+    /// merges, so it can only raise: the vector is authoritative, and
+    /// recomputing it during normal operation would discard coverage a snapshot
+    /// granted that the oplog never held.
+    ///
+    /// A point-in-time rewind is the exception, because it *removed* oplog
+    /// entries on purpose. Leaving the vector high afterwards would have the
+    /// node claim history it no longer holds, and no peer would ever send that
+    /// range again — the node would be permanently missing writes and would
+    /// look caught up.
+    pub(crate) fn reset_version_vector_to_oplog(db: &Database) -> Result<()> {
+        let mut actual = kimmy_core::VersionVector::new();
+        {
+            let txn = db.begin_read()?;
+            let oplog = txn.open_table(tables::OPLOG)?;
+            for row in oplog.iter()? {
+                let (key, _) = row?;
+                actual.observe(codec::decode_oplog_key(key.value())?);
+            }
+        }
+
+        let txn = db.begin_write()?;
+        {
+            let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+            // Cleared rather than overwritten: a node that appears in the old
+            // vector but no longer in the oplog has to disappear entirely, and
+            // inserting over the top would leave its stale entry behind.
+            versions.retain(|_, _| false)?;
+            for (node, hlc) in actual.iter() {
+                versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
+        }
+        txn.commit()?;
+
+        info!(nodes = actual.len(), "reset the version vector to the rewound oplog");
         Ok(())
     }
 

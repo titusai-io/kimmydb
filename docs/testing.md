@@ -9,19 +9,19 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-687 tests passing · 0 failures · clippy clean at -D warnings
+697 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
 | `kimmy-core` | 123 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 178 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
+| `kimmy-storage` | 187 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | 86 | 48 unit (JSON boundary, errors, schema inference, rate limiting) + 36 end-to-end over a real socket |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
-| `kimmyd` | 25 | Config layering and validation, TLS termination and the serving stack |
+| `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cluster` | 51 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
@@ -270,6 +270,29 @@ each one turned a named test red:
 | Never emit the `Retry-After` header | `repeated_failed_logins_are_rate_limited` |
 | Key every limiter on a constant instead of the caller | `keys_do_not_share_a_budget` |
 
+### Point-in-time restore, and the mutation that found a real gap
+
+| Injected fault | Caught by |
+|---|---|
+| Silently skip documents whose earlier value was collected | `a_document_whose_earlier_value_was_collected_is_refused_not_guessed` |
+| Ignore a schema change after the target | `a_schema_change_after_the_target_is_refused_without_writing` |
+| Leave the undone future in the oplog | `the_undone_future_leaves_the_oplog` |
+| Skip index maintenance during the rewind | `indexes_follow_the_rewind` |
+| Leave the version vector high after the oplog shrinks | `the_undone_future_leaves_the_oplog` |
+
+**The first one escaped on the first run**, and it is the most important refusal
+in the feature: without it a rewind leaves an unrecoverable document at its
+*later* value, producing a database that looks restored and is not. Nothing
+covered that path — every existing test used documents whose history was still
+in the window.
+
+Writing the missing test then hit the trap this document keeps describing. The
+first version collected the oplog and expected a refusal, but retention never
+collects the newest entry ([ADR-028](decisions.md)), so the document's insert
+was still the tail and the rewind cheerfully *removed* the document instead. The
+fixture had not built the condition it was named for. Only after adding writes
+to push the insert off the tail does removing the check turn it red.
+
 ### The cluster's channel binding
 
 | Injected fault | Caught by |
@@ -508,6 +531,7 @@ manually and are recorded so they can be repeated:
 | Half-configured TLS, missing file, and a file that is not a certificate | ✅ all three refused at startup, each naming the file |
 | Plaintext on `0.0.0.0` | ✅ warned; loopback did not |
 | The native-dependency check | ✅ all three paths driven: passes on the current tree, fails with the dependency chain when a crate is unallowlisted, and reports an allowlist entry the build no longer has |
+| Point-in-time restore, end to end | ✅ five documents wrecked by a bulk update, a backup taken after the incident, restored with `--until` a mark before it: all five back to their previous value, and the restored node served them |
 | The audit log at `mode=writes` | ✅ on a live node: the two admin actions and the write recorded, the denial recorded, and the `find` correctly absent |
 | The audit log at `mode=denials` | ✅ the same traffic produced exactly one record — the refusal |
 | Metrics against real traffic | ✅ `kimmy_authz_denied_total 1` matched the single 403, storage size and uptime populated |
