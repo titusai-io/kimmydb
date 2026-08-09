@@ -6,70 +6,75 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-08 — M5: docs audited for accuracy, planner measured
+## As of 2026-08-08 — M5: aggregation shipped; docs audited
 
 **Branch:** `m5-doc-accuracy-and-planner`, off `main` (PRs #16–#20 merged).
-Not merged.
-**Gate:** 640 tests · fmt clean · clippy clean at `-D warnings`.
+Not merged. Carries three things: the documentation audit, the planner
+measurement, and the aggregation pipeline.
+**Gate:** 662 tests (640 + 22) · fmt clean · clippy clean · driven on a live
+server.
 
-### The documentation was audited, and it was wrong in several places
+### Aggregation
+
+Nine stages: `$match`, `$project`, `$sort`, `$skip`, `$limit`, `$unwind`,
+`$group`, `$count`, `$lookup`. Eight accumulators. `POST …/aggregate`, plus the
+MCP `aggregate` tool that had been advertised as planned since M3.
+[Aggregation](aggregation.md) is the reference.
+
+**Three decisions worth carrying:**
+
+1. **Blocking stages refuse rather than truncate.** A hard 100,000-document
+   ceiling, checked on every stage's output, erroring with the stage's name. A
+   `$group` over 90% of the input looks identical to one over all of it, so a
+   partial answer is worse than none. The maintainer chose this over spill-to-disk.
+2. **`$lookup` is authorized against the collection it joins.** Without that a
+   caller with `read` on one collection could pull any other through a join —
+   a privilege escalation shaped like a query, routing around the single
+   authorization point. Tested at both edges, and a mutation removing the check
+   turns the test red.
+3. **The pure pipeline refuses `$lookup` rather than passing input through.**
+   `kimmy-query` has no storage dependency, so the executor runs joins. A join
+   that silently does nothing is a wrong answer shaped like a right one.
+
+`$lookup` scans the foreign collection **once**, keyed in memory — a
+per-document join is O(n·m). It sees the foreign collection as of when the stage
+runs; there is no cross-collection snapshot in a store without multi-document
+transactions.
+
+Five mutations injected, five caught, with a no-op control first.
+
+### The documentation audit
 
 the maintainer asked for stale and incorrect documentation to be fixed rather than left.
-A sweep found more than the one number that prompted it:
+More was wrong than the number that prompted it: `docs/README.md` still listed
+clustering as planned and said nothing transported replication;
+`docs/change-streams.md` documented a bug fixed by ADR-030 as a live
+limitation; five places still cited the 2,000-vector threshold; ADR-021 and six
+code comments still claimed a pure-Rust build; and the `coordinated` enforcement
+error told users it "lands in M4" — user-facing, and wrong.
 
-| Was | Reality |
+**The pattern:** every one was true when written. Nothing catches a document
+that goes false as code moves under it, which is the ADR-016 drift again and
+argues for the same fix — checks that fail, not claims that are asserted.
+
+### The planner, measured
+
+A scan is flat (~0.8 µs/document); the indexed path is ~1.66 µs/candidate. **A
+random read costs about twice a sequential one, so an index wins exactly when it
+eliminates more than half the collection**, and the measured crossover sits
+there. With index maintenance already free on writes, an index is close to free
+in both directions. `MAX_LIMIT = 10_000` is now checked, not guessed: a full
+10,000-document scan is ~8 ms.
+
+### What is left in M5
+
+| Item | Note |
 |---|---|
-| `docs/README.md`: "Gossip clustering — 📋 Planned (M4)" | M4 shipped three PRs ago |
-| `docs/README.md`: "nothing transports [replication] between nodes yet" | It has been driven on real daemons and in containers |
-| `docs/change-streams.md`: "replicated writes may land behind the stream position" | **Solved** by the arrival index (ADR-030) — this documented a fixed bug as a live limitation |
-| `docs/oplog.md`: "full resync needed (M4)" | Snapshot resync is built (ADR-036) |
-| Five places still citing the 2,000-vector threshold | It is 500 since the benchmark branch |
-| ADR-021 and six code comments citing the "pure-Rust property" | Corrected in ADR-016 — the build has carried `ring` since M2 |
-| `index.rs` error text: "coordinated … lands in M4" | User-facing, and wrong: M4 landed, coordinated did not |
-| `docs/operations.md`: "clustering lands in M4, run replicas: 1" | Replaced with the `KIMMY_CLUSTER_BIND` requirement that actually matters |
-
-The retracted `put_vectors` figure is now a short note that does not repeat the
-wrong numbers, since a reader skimming it could otherwise carry them away.
-
-**The pattern worth noting:** every one of these was true when written. Nothing
-in the process catches a doc that quietly becomes false because the code moved
-under it — which is the same failure mode as the ADR-016 drift, and it argues
-for the same fix: checks that fail, not claims that are asserted.
-
-### The planner's premise, measured
-
-10,000 documents, one equality filter, selectivity as the dial:
-
-| Matching | Indexed | Scan |
-|---:|---:|---:|
-| 1 | 0.003 ms | 8.085 ms |
-| 100 | 0.171 ms | 8.133 ms |
-| 1,000 | 1.670 ms | 7.905 ms |
-| 5,000 | 8.288 ms | 7.911 ms |
-
-A scan is flat at ~0.8 µs per document; the indexed path is ~1.66 µs per
-candidate. **A random read costs about twice a sequential one, so an index wins
-exactly when it eliminates more than half the collection** — and the measured
-crossover sits there.
-
-Together with "indexes are free on the write path", an index is close to free in
-both directions. The planner has no statistics and will use one whenever it
-applies, including where a scan would be marginally faster; the worst case
-measured is 8.3 ms against 7.9 ms, which is why statistics are not worth
-building.
-
-**`MAX_LIMIT = 10_000` is now checked rather than guessed** — a full scan of
-exactly 10,000 documents is ~8 ms, so the cap bounds an unindexed query at
-single-digit milliseconds. Unchanged.
-
-### Next: aggregation, the last big M5 feature
-
-Nothing is blocked. `$match`, `$group`, `$unwind`, `$project`, `$sort`,
-`$limit` — it also unblocks the MCP `aggregate` tool, which has been advertised
-as planned since M3, and the `$vectorSearch` stage.
-
-Then: node↔node TLS (needs a trust decision first), backup/restore, the `kimmy`
-CLI, audit log, and a CI check for native build dependencies.
+| TLS between nodes | The last security gap. Needs a trust decision before code: `cluster_secret` already authenticates with a mutual HMAC challenge, so TLS would add confidentiality — the question is operator certificates versus binding the channel to the existing secret |
+| Backup / restore | Cold file copy only |
+| `kimmy` CLI | Still a stub that points at the HTTP API |
+| Audit log, richer metrics | |
+| A CI check for native build dependencies | What would have caught the ADR-016 drift, and the audit above |
 
 ### Carried debt, none blocking
 

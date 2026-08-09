@@ -891,3 +891,127 @@ async fn storing_vectors_needs_write_access() {
         .await;
     assert_eq!(res.status, 403, "{:?}", res.body);
 }
+
+#[tokio::test]
+async fn an_aggregation_pipeline_groups_and_counts() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for (id, city, qty) in [(1, "London", 5), (2, "London", 15), (3, "Paris", 10)] {
+        server
+            .post(
+                "/v1/db/shop/coll/orders/docs",
+                Some(&token),
+                json!({"_id": id, "city": city, "qty": qty}),
+            )
+            .await;
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"qty": {"$gte": 5}}},
+                {"$group": {"_id": "$city", "total": {"$sum": "$qty"}, "n": {"$sum": 1}}},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["_id"], "London");
+    assert_eq!(docs[0]["total"], 20);
+    assert_eq!(docs[0]["n"], 2);
+    assert_eq!(docs[1]["_id"], "Paris");
+}
+
+#[tokio::test]
+async fn lookup_is_authorized_against_the_collection_it_joins() {
+    // The load-bearing test for $lookup. A caller granted read on one
+    // collection must not be able to pull a second one through a join —
+    // that would be a privilege escalation shaped like a query, and it
+    // would route around the single authorization point entirely.
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"customers"})).await;
+    server
+        .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "cust": "c1"}))
+        .await;
+    server
+        .post(
+            "/v1/db/shop/coll/customers/docs",
+            Some(&token),
+            json!({"_id": "c1", "secret": "not for everyone"}),
+        )
+        .await;
+
+    // Superuser can join.
+    let pipeline = json!({"pipeline": [
+        {"$lookup": {"from": "customers", "localField": "cust",
+                     "foreignField": "_id", "as": "customer"}}
+    ]});
+    let res =
+        server.post("/v1/db/shop/coll/orders/aggregate", Some(&token), pipeline.clone()).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let joined = &res.body["documents"][0]["customer"];
+    assert_eq!(joined[0]["secret"], "not for everyone", "the join must actually join");
+
+    // A principal with read on `orders` only must be refused.
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user":"limited","password":"limited-password",
+                   "grants":[{"db":"shop","collection":"orders","actions":["read"]}]}),
+        )
+        .await;
+    let limited = server.login("limited", "limited-password").await;
+
+    let plain = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&limited),
+            json!({"pipeline": [{"$match": {}}]}),
+        )
+        .await;
+    assert_eq!(plain.status, 200, "reading the granted collection must still work");
+
+    let res = server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), pipeline).await;
+    assert_eq!(
+        res.status, 403,
+        "$lookup into an unreadable collection must be refused: {:?}",
+        res.body
+    );
+    assert!(
+        !format!("{:?}", res.body).contains("not for everyone"),
+        "and must not leak the data it refused"
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_pipeline_stage_is_a_bad_request() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$bucketAuto": {}}]}),
+        )
+        .await;
+    // 400, not 501: an unknown stage is the same class as an unknown filter
+    // operator — the pipeline as written is not valid for this server. 501 is
+    // reserved for capabilities that are declared and deliberately unbuilt,
+    // like `coordinated` unique enforcement.
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let body = format!("{:?}", res.body);
+    assert!(body.contains("$bucketAuto"), "the error must name what was rejected: {body}");
+    assert!(body.contains("$group"), "and list what is supported: {body}");
+}

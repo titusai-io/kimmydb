@@ -11,7 +11,7 @@
 
 use kimmy_auth::Action;
 use kimmy_core::DocId;
-use kimmy_query::{filter, plan, shape, update};
+use kimmy_query::{aggregate, filter, plan, shape, update};
 use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
 
@@ -486,6 +486,136 @@ pub fn now_millis() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Aggregation
+// ---------------------------------------------------------------------------
+
+/// Run an aggregation pipeline.
+///
+/// # Authorization
+///
+/// The source collection is checked like any read. **`$lookup` is checked
+/// separately, against the collection it names**, because a join reads a second
+/// collection and a caller granted `read` on `orders` must not be able to pull
+/// `users` through it. That would be a privilege escalation shaped like a
+/// query, and it is exactly the kind of second path around
+/// [`authorize`](self::authorize) that ADR-024 exists to prevent.
+///
+/// A denied `$lookup` returns the same uniform 403 as any other refusal, so the
+/// pipeline cannot be used to probe which collections exist.
+///
+/// # Consistency
+///
+/// Each stage reads storage when it runs, so a `$lookup` sees the foreign
+/// collection as of *its own* execution rather than a snapshot taken when the
+/// pipeline began. In a leaderless store with no multi-document transactions
+/// there is no cross-collection snapshot to take — see ADR-006 — so this is
+/// inherent rather than an omission.
+pub fn aggregate(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+) -> Result<Value, ApiError> {
+    let meta = authorize(state, auth, Action::Read, db, coll)?;
+
+    let stages = parse_pipeline(pipeline)?;
+    let limits = aggregate::Limits::default();
+
+    // The whole collection is the pipeline's input, bounded by the same cap
+    // every stage is held to, so a pipeline over an oversized collection fails
+    // at the source rather than after allocating it.
+    let mut docs: Vec<bson::Document> = Vec::new();
+    state.engine.for_each_doc(&meta, |_id, doc| {
+        docs.push(doc);
+        Ok(true)
+    })?;
+    aggregate::check_limit("the source collection", docs.len(), &limits)?;
+
+    for stage in &stages {
+        docs = match stage {
+            aggregate::Stage::Lookup { from, local_field, foreign_field, as_field } => {
+                lookup(state, auth, db, from, local_field, foreign_field, as_field, docs, &limits)?
+            }
+            other => aggregate::apply(other, docs, &limits)?,
+        };
+    }
+
+    let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
+    Ok(json!({ "documents": documents, "count": documents.len() }))
+}
+
+fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, ApiError> {
+    let Some(array) = pipeline.as_array() else {
+        return Err(ApiError::bad_request("pipeline must be an array of stages"));
+    };
+    let stages: Vec<bson::Document> =
+        array.iter().map(json_to_document).collect::<Result<_, _>>()?;
+    Ok(aggregate::parse(&stages)?)
+}
+
+/// Join against another collection, in one pass over it.
+///
+/// The foreign side is scanned **once** and indexed in memory by the join key,
+/// rather than queried per input document. A per-document join is O(n·m), which
+/// on any real pair of collections is the difference between a query and an
+/// outage.
+#[allow(clippy::too_many_arguments)]
+fn lookup(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    from: &str,
+    local_field: &str,
+    foreign_field: &str,
+    as_field: &str,
+    input: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+) -> Result<Vec<bson::Document>, ApiError> {
+    // The second authorization point. See this function's caller.
+    let foreign = authorize(state, auth, Action::Read, db, from)?;
+
+    let wanted: std::collections::HashSet<Vec<u8>> =
+        aggregate::lookup_keys(&input, local_field).iter().filter_map(encode_key).collect();
+
+    let mut matches: std::collections::HashMap<Vec<u8>, Vec<bson::Bson>> =
+        std::collections::HashMap::new();
+    let mut held = 0usize;
+    state.engine.for_each_doc(&foreign, |_id, doc| {
+        let Some(value) = kimmy_core::path::resolve(&doc, foreign_field).into_iter().next() else {
+            return Ok(true);
+        };
+        let Some(key) = encode_key(value) else {
+            return Ok(true);
+        };
+        if wanted.contains(&key) {
+            matches.entry(key).or_default().push(bson::Bson::Document(doc));
+            held += 1;
+        }
+        Ok(true)
+    })?;
+    // The joined documents are held in memory alongside the input, so they are
+    // subject to the same ceiling.
+    aggregate::check_limit("$lookup", held, limits)?;
+
+    let mut out = Vec::with_capacity(input.len());
+    for mut doc in input {
+        let key =
+            kimmy_core::path::resolve(&doc, local_field).into_iter().next().and_then(encode_key);
+        let joined = key.and_then(|k| matches.get(&k).cloned()).unwrap_or_default();
+        // Always an array, even when empty: a field whose type depends on
+        // whether anything matched forces every caller to handle two shapes.
+        doc.insert(as_field.to_string(), bson::Bson::Array(joined));
+        out.push(doc);
+    }
+    Ok(out)
+}
+
+fn encode_key(value: &bson::Bson) -> Option<Vec<u8>> {
+    kimmy_core::keyenc::encode(value).ok()
 }
 
 #[cfg(test)]

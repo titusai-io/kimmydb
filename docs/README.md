@@ -83,6 +83,7 @@ graph TD
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |
+| [Aggregation](aggregation.md) | The pipeline: stages, accumulators, `$lookup`, and the memory ceiling |
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
@@ -114,7 +115,7 @@ running server, not merely compiled.
 | Gossip clustering | ✅ Working | SWIM membership over UDP, oplog anti-entropy over TCP, snapshot resync. **Containers must set `cluster.bind` to a routable address** — see [Operations](operations.md) |
 | Login rate limiting | ✅ Working | Token bucket per caller, checked before the password hash |
 | TLS | ✅ Clients · 📋 node↔node | Native termination for HTTP/WebSocket/MCP. Replication frames are still plaintext |
-| Aggregation pipeline | 📋 Planned (M5) | `$match`, `$group`, `$unwind`, `$project`, `$sort`, `$limit` |
+| Aggregation pipeline | ✅ Working | Nine stages including `$group`, `$unwind` and `$lookup`; hard memory ceiling. [Aggregation](aggregation.md) |
 | Backup / restore | 📋 Planned (M5) | Cold file copy only today |
 | `kimmy` CLI | 📋 Planned (M5) | The binary today prints a pointer to the HTTP API |
 

@@ -120,6 +120,16 @@ pub struct CountArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct AggregateArgs {
+    /// Database name.
+    pub database: String,
+    /// Collection the pipeline reads from.
+    pub collection: String,
+    /// The pipeline: an array of stage documents, applied in order.
+    pub pipeline: Value,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct SearchArgs {
     /// Database name.
     pub database: String,
@@ -306,6 +316,33 @@ impl KimmyMcp {
         let auth = principal(&ctx)?;
         let params = exec::FindParams { filter: args.filter, ..Default::default() };
         render(exec::count(&self.state, &auth, &args.database, &args.collection, params))
+    }
+
+    /// Group, reshape and summarise.
+    #[tool(description = "Run an aggregation pipeline: an array of stages applied in order. \
+                       Use this instead of find when you need totals, averages, counts \
+                       per group, or documents joined from another collection — it does \
+                       the work in the database rather than returning rows for you to \
+                       reduce. Stages: $match (filter, put it first so later stages see \
+                       less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
+                       $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
+                       $lookup (join; you need read access to the joined collection too). \
+                       Field references are written \"$field\". There are no computed \
+                       expressions such as $add. A pipeline that would hold too many \
+                       documents is refused, naming the stage — add an earlier $match.")]
+    async fn aggregate(
+        &self,
+        Parameters(args): Parameters<AggregateArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let auth = principal(&ctx)?;
+        render(exec::aggregate(
+            &self.state,
+            &auth,
+            &args.database,
+            &args.collection,
+            &args.pipeline,
+        ))
     }
 
     /// Semantic search.

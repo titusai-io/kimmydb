@@ -236,7 +236,8 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Certificate reload | A renewed certificate needs a restart to take effect | M5 |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
-| Aggregation pipeline | `$group`, `$unwind`, etc. absent — including the `$vectorSearch` stage, so search is endpoint-only, **and the planned MCP `aggregate` tool, which has nothing to expose** | M5 |
+| `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
+| Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
 | Backup / restore | Cold file copy only | M5 |
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
