@@ -1549,6 +1549,15 @@ cross-subscription interference the per-subscription backoff exists to prevent,
 one layer up. A webhook nobody controls decided when the ones they did control
 fired.
 
+**The bound was asked for before it could bind.** M6 planned this cap "so a
+webhook on a hot collection cannot saturate a node's outbound connections",
+which the serial dispatcher made impossible — one `.await` per subscription in a
+`for` loop is a hard limit of one request in flight. The cap became meaningful
+only once concurrency was introduced, so the two arrived together rather than
+the cap being the fix it was described as. Recorded in
+[Deviations](deviations.md), because a mitigation built for a risk that cannot
+occur is worth noticing before the next one.
+
 **An event is never dropped for being large.** Batches are trimmed to
 `webhooks.max_payload_bytes`; a single event whose document alone exceeds it is
 delivered with `fullDocument` omitted and `fullDocumentOmitted` set, so the
