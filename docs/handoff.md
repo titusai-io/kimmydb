@@ -96,6 +96,23 @@ Three tests hold this down: `a_caught_up_subscription_survives_garbage_collectio
 `a_webhook_on_a_quiet_collection_does_not_fall_past_retention`, and
 `the_position_is_written_forward_on_a_heartbeat_not_every_pass`.
 
+### A premise the plan carried for three branches, and got wrong
+
+M6 asked three times for a delivery cap "so a webhook on a hot collection cannot
+saturate a node's outbound connections". **It could not.** The dispatcher
+delivered inside a `for` loop with one `.await` per subscription, so the node
+held at most one request in flight — a bound of one, uncappable.
+
+The serial loop caused the inverse instead: one endpoint that stopped answering
+held the whole pass for the ten-second timeout and delayed every subscription
+behind it. Bounded concurrency fixes that *and* makes the original cap
+meaningful, so the task shipped as written despite its motivation being unreal.
+
+Worth carrying forward: **a risk asserted in a plan is a hypothesis about the
+code, not a fact about it.** This one was written down three times and reviewed
+each time without anyone reading the loop. The full account is in
+[Deviations](deviations.md).
+
 ### How this work has been verified
 
 Beyond the suite: a real Python receiver on a socket, verifying the HMAC. That

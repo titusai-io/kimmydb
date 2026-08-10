@@ -458,9 +458,27 @@ high-water mark per batch rather than a record per event.
 | Question | Answer |
 |---|---|
 | **Payload cap** — what happens to a single event that exceeds it | Delivered with `fullDocument` omitted and `fullDocumentOmitted` set. The receiver still learns the change happened; dropping it would leave a gap it could never detect |
-| **Per-node delivery cap** | `max_concurrent_deliveries`, default 8. The serial dispatcher it replaced could not saturate anything — it had the opposite fault, letting one stalled endpoint hold every other subscription for the delivery timeout |
+| **Per-node delivery cap** | `max_concurrent_deliveries`, default 8 — **but the question was wrong as asked.** See below |
 | **Does the registry replicate?** | Yes, being a collection — which is what lets any node take ownership. Confirmed as wanted |
 | **Rendezvous input** | Still `SocketAddr`. Hashing node ids would be stabler across a re-address; it needs a member → node-id mapping and has not been worth it. Carried in [Deviations](deviations.md) |
+
+#### Correction: the delivery cap answered a risk that did not exist
+
+This section asked for a cap "so a webhook on a hot collection cannot saturate a
+node's outbound connections". **It could not.** The dispatcher delivered inside
+a `for` loop with one `.await` per subscription, so the node held at most one
+HTTP request in flight at a time regardless of how many subscriptions existed.
+There was nothing to cap.
+
+The serial loop caused the opposite problem instead, and a worse one: one
+endpoint that stopped answering held the whole pass for the ten-second delivery
+timeout and delayed every subscription behind it — a webhook nobody controlled
+deciding when the rest fired.
+
+Bounded concurrency fixes that and makes the original request meaningful at the
+same time, so the task landed as written even though its stated motivation was
+not real. The full account, including why the premise survived three branches
+unchallenged, is in [Deviations](deviations.md).
 
 ---
 

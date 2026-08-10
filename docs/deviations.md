@@ -317,6 +317,43 @@ like one was working.
 
 ## 🟢 Closed
 
+**The webhook "saturation" risk did not exist, and the real one was its
+opposite.** M6 task notes and the roadmap's open questions both asked for a
+"per-node delivery cap, so a webhook on a hot collection cannot saturate a
+node's outbound connections". That risk was never reachable. `dispatch_once`
+delivered inside a `for` loop with one `.await` per subscription, so the node
+had **at most one HTTP request in flight at any moment**, no matter how many
+subscriptions existed or how hot the collection was. A bound of one cannot be
+exceeded, so a cap would have capped nothing.
+
+The premise came from reasoning about the design as described — "the dispatcher
+is an oplog consumer that dials out for each owned subscription" — rather than
+from the loop as written. Nothing in the code contradicted it out loud, and the
+serial `.await` is one character of syntax, so it survived three branches and a
+plan review.
+
+What the serial loop *did* cause is the inverse failure, and a worse one: one
+endpoint that stopped answering held the entire pass for the full ten-second
+`DELIVERY_TIMEOUT`, delaying **every subscription queued behind it in the loop**.
+That is exactly the cross-subscription interference the per-subscription
+`Backoff` was built to prevent, reappearing one layer up — and it means a
+webhook the operator does not control decides when the ones they do control
+fire. Backoff hid how bad it was, because a repeatedly-failing endpoint is
+skipped after its first failure; the lasting damage is from an endpoint that is
+*slow* rather than dead, which never backs off and pays the timeout every pass.
+
+Both are now addressed by the same change: deliveries run concurrently under a
+semaphore of `webhooks.max_concurrent_deliveries` (default 8). Concurrency
+removes the head-of-line blocking; the bound makes the original request true
+rather than vacuous, since there is now something that could saturate. See
+[ADR-045](decisions.md) and `a_slow_endpoint_does_not_hold_up_another_subscription`.
+
+**The lesson worth keeping:** a risk asserted in a plan is a hypothesis about
+the code, not a fact about it. This one was written down three times and
+reviewed each time without anyone reading the loop. Before building a mitigation,
+confirm the failure it mitigates can actually occur — the check costs one
+reading and would have reframed the whole task.
+
 **Backup and restore.** The only answer was a cold file copy, which meant
 stopping the node — and copying `kimmy.redb` from a running one captures a torn
 file. Now `GET /v1/admin/backup` takes a consistent snapshot inside a read
