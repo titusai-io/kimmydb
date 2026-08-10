@@ -9,7 +9,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-748 tests passing · 0 failures · clippy clean at -D warnings
+762 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
@@ -19,7 +19,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmy-query` | 102 | Filter, update, sort, projection semantics |
 | `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 133 | 78 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 45 end-to-end over a real socket + 10 webhook delivery against a real receiver |
+| `kimmy-api` | 146 | 80 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 43 end-to-end over a real socket + 23 webhook delivery against a real receiver |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
 | `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
@@ -291,6 +291,16 @@ each one turned a named test red:
 | Egress not re-checked at delivery | `the_egress_policy_is_enforced_at_delivery_not_only_at_registration` |
 | The signature omits the timestamp | `a_signature_covers_the_timestamp_as_well_as_the_body` |
 | Ownership by iteration order rather than hash | the `ownership` suite |
+| A pass delivers serially, so one dead endpoint delays the rest | `a_slow_endpoint_does_not_hold_up_another_subscription` |
+| The concurrency bound does not bind | `the_concurrency_bound_is_real` |
+| An oversized document is dropped rather than sent without itself | `an_oversized_document_is_delivered_without_it_rather_than_dropped` |
+| A batch is sent over the payload cap | `a_batch_is_trimmed_to_the_payload_cap` |
+| A bulk load becomes one request per document, or loses events | `a_bulk_load_is_batched_and_every_event_arrives_exactly_once` |
+| A removed subscription keeps delivering, or leaks its progress records | `removing_a_subscription_stops_delivery_and_clears_its_progress` |
+| The retention horizon overtakes a healthy subscription | `a_caught_up_subscription_survives_garbage_collection`, `a_webhook_on_a_quiet_collection_does_not_fall_past_retention` |
+| The position is written forward every pass, so an idle node writes forever | `the_position_is_written_forward_on_a_heartbeat_not_every_pass` |
+| Backlog measured from the resume point, so an idle webhook looks lagging | `a_caught_up_subscription_reports_no_backlog`, `backlog_is_the_age_of_the_event_not_of_the_resume_point` — **added after this escaped** |
+| A peer's progress covering ours reads as "resume from zero" | `progress_from_a_peer_that_is_ahead_does_not_invalidate_this_node` — **added after this escaped** |
 
 Delivery is tested against a **receiver on a real socket** rather than by
 calling the delivery function: a webhook *is* an outbound HTTP request, and the

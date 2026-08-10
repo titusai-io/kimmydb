@@ -1536,6 +1536,46 @@ that resolves publicly today can resolve to `169.254.169.254` tomorrow, and a
 permitted host answering `302` would otherwise walk the request straight through
 the policy.
 
+**A pass plans serially, delivers concurrently under a bound, and applies
+serially.** Only the network call overlaps; every engine read and write stays on
+one thread, so two subscriptions can never race each other's progress record.
+The bound (`webhooks.max_concurrent_deliveries`, default 8) is what stops a
+webhook on a hot collection consuming every outbound connection the node has.
+
+The concurrency is not a throughput tweak. The dispatcher was serial, which
+meant one endpoint that had stopped answering held the whole pass for the
+ten-second delivery timeout and delayed every subscription behind it — the exact
+cross-subscription interference the per-subscription backoff exists to prevent,
+one layer up. A webhook nobody controls decided when the ones they did control
+fired.
+
+**An event is never dropped for being large.** Batches are trimmed to
+`webhooks.max_payload_bytes`; a single event whose document alone exceeds it is
+delivered with `fullDocument` omitted and `fullDocumentOmitted` set, so the
+receiver still learns the change happened and can read the document itself.
+Skipping it would leave a gap the receiver could never detect — which is exactly
+what invalidation exists to avoid, so doing it silently for a large document
+would contradict the rest of the design.
+
+**The resume point is written forward on a heartbeat, even when nothing is
+delivered.** Retention collects by age, and a position that only moved on a
+successful delivery would sit still while the horizon walked toward it: a
+webhook on a quiet collection — or on a busy one that goes quiet overnight — was
+invalidated for falling behind events it was never going to be sent. Every
+healthy webhook died one retention window after its last delivery.
+
+Deciding an entry is not yours is work, and the position has to move over it.
+Advancing is safe by construction: the scan is contiguous from the resume point
+and nothing in it matched the subscription's filter, so nothing deliverable is
+stepped over. Once a minute rather than once per tick, because recording
+progress is itself a write — it appends the very entry the next pass reads, and
+doing it every two seconds would have an idle node writing to the oplog, and
+replicating it, forever.
+
+**Removing a subscription removes its progress records.** Otherwise
+`__webhook_progress` keeps one orphan per node that ever delivered it,
+replicating and being backed up, with nothing left that would ever read them.
+
 ---
 
 ## Superseded / reconsidered

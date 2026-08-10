@@ -130,12 +130,66 @@ Redirects are refused for the same reason.
 
 ---
 
+## How much a node will spend on delivery
+
+```toml
+[webhooks]
+max_concurrent_deliveries = 8        # in flight at once, all subscriptions
+max_payload_bytes = 1048576          # largest request body
+```
+
+Deliveries run **concurrently up to the bound**. That is not a throughput
+tweak: a node that delivered one at a time would let a single endpoint that has
+stopped answering hold everything else for the full ten-second timeout, so a
+webhook you do not control would decide when the ones you do control fire. The
+bound is the other half — a webhook on a hot collection cannot consume every
+outbound connection the node has.
+
+Ordering is unaffected. Each subscription still sends one batch at a time, so
+events arrive in oplog order per subscription per origin node, exactly as
+before.
+
+### When a document is too large
+
+Batches are trimmed to fit `max_payload_bytes`; whatever does not fit goes in
+the next request. A **single** event whose document alone exceeds the cap is
+delivered without it:
+
+```json
+{
+  "eventId": "1754923010455.0-9f2c…",
+  "operationType": "update",
+  "documentKey": { "_id": 42 },
+  "fullDocumentOmitted": true,
+  "omittedReason": "document exceeds webhooks.max_payload_bytes; fetch it from the collection"
+}
+```
+
+The change is still delivered — only the copy of the document is not, and the
+receiver can read it from the collection. Dropping the event instead would
+leave a gap the receiver could never detect, which is the whole reason
+invalidation exists rather than silently resuming.
+
+---
+
 ## Observability
 
 | Series | |
 |---|---|
 | `kimmy_webhook_deliveries_total{outcome}` | `delivered` / `failed` batches |
 | `kimmy_webhook_events_total` | Events pushed |
+| `kimmy_webhook_subscriptions{state}` | `active` / `invalidated`, as this node sees the registry |
+| `kimmy_webhook_backlog_seconds` | Age of the oldest undelivered event |
+
+**`kimmy_webhook_backlog_seconds` is the one to alert on.** It answers "how far
+behind is this node's delivery", which is the question a failing endpoint,
+a slow one and a saturated one all show up in. It covers only the subscriptions
+this node **owns** — a node that has stood down reports nothing, so summing
+across a cluster does not multiply one subscription's lag by the number of
+nodes.
+
+`kimmy_webhook_subscriptions` is per node and counts the whole registry, which
+replicates; take the max across nodes rather than the sum.
 
 Registering and removing a subscription, and any invalidation, are recorded on
 the `kimmy::audit` target — registering one grants ongoing egress, so it belongs

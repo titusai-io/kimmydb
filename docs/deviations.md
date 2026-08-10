@@ -253,6 +253,7 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
+| Webhook ownership hashes addresses | Rendezvous hashing takes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions — the same disruption as that node leaving and another joining. Hashing node ids would be stabler and needs a member → node-id mapping | M6 |
 
 ---
 

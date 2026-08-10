@@ -36,6 +36,9 @@ pub struct Metrics {
     webhook_delivered: AtomicU64,
     webhook_failed: AtomicU64,
     webhook_events: AtomicU64,
+    webhook_active: AtomicU64,
+    webhook_invalidated: AtomicU64,
+    webhook_backlog_secs: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -53,6 +56,9 @@ impl Default for Metrics {
             webhook_delivered: AtomicU64::new(0),
             webhook_failed: AtomicU64::new(0),
             webhook_events: AtomicU64::new(0),
+            webhook_active: AtomicU64::new(0),
+            webhook_invalidated: AtomicU64::new(0),
+            webhook_backlog_secs: AtomicU64::new(0),
         }
     }
 }
@@ -100,6 +106,23 @@ impl Metrics {
         } else {
             self.webhook_failed.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// The webhook gauges, set by the dispatcher at the end of each pass.
+    ///
+    /// Set rather than accumulated: all three describe a state at an instant,
+    /// and the dispatcher already computes them while walking the registry. The
+    /// alternative — recomputing on every `/metrics` scrape — would re-read the
+    /// progress collection once per subscription for a number the dispatcher
+    /// had in hand two seconds earlier.
+    ///
+    /// `backlog_secs` covers only subscriptions **this node owns**. A node that
+    /// has stood down must not report a backlog it is not the one working
+    /// through, or every node in a cluster would alert for the same lag.
+    pub fn set_webhook_gauges(&self, active: u64, invalidated: u64, backlog_secs: u64) {
+        self.webhook_active.store(active, Ordering::Relaxed);
+        self.webhook_invalidated.store(invalidated, Ordering::Relaxed);
+        self.webhook_backlog_secs.store(backlog_secs, Ordering::Relaxed);
     }
 
     pub fn record_backup(&self) {
@@ -150,7 +173,14 @@ impl Metrics {
              kimmy_webhook_deliveries_total{{outcome=\"failed\"}} {wh_fail}\n\
              # HELP kimmy_webhook_events_total Change events pushed to endpoints.\n\
              # TYPE kimmy_webhook_events_total counter\n\
-             kimmy_webhook_events_total {wh_events}\n",
+             kimmy_webhook_events_total {wh_events}\n\
+             # HELP kimmy_webhook_subscriptions Registered subscriptions, as this node sees the registry.\n\
+             # TYPE kimmy_webhook_subscriptions gauge\n\
+             kimmy_webhook_subscriptions{{state=\"active\"}} {wh_active}\n\
+             kimmy_webhook_subscriptions{{state=\"invalidated\"}} {wh_invalid}\n\
+             # HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns.\n\
+             # TYPE kimmy_webhook_backlog_seconds gauge\n\
+             kimmy_webhook_backlog_seconds {wh_backlog}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -163,6 +193,9 @@ impl Metrics {
             wh_ok = self.get(&self.webhook_delivered),
             wh_fail = self.get(&self.webhook_failed),
             wh_events = self.get(&self.webhook_events),
+            wh_active = self.get(&self.webhook_active),
+            wh_invalid = self.get(&self.webhook_invalidated),
+            wh_backlog = self.get(&self.webhook_backlog_secs),
         )
     }
 }
@@ -212,7 +245,7 @@ mod tests {
             assert!(value.parse::<u64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        assert_eq!(samples, 12, "expected one sample per series: {out}");
+        assert_eq!(samples, 15, "expected one sample per series: {out}");
     }
 
     #[test]

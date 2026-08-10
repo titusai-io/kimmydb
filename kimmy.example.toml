@@ -226,6 +226,36 @@ membership = true
 # not count against this.
 fanout = 3
 
+[webhooks]
+# Hosts a webhook may target beyond the public internet.
+#
+# Empty means public addresses only. Loopback, link-local (169.254.0.0/16 --
+# cloud metadata), RFC1918 and carrier-NAT ranges are refused unless the host is
+# named here, because otherwise anyone who can register a webhook can make this
+# node probe its own network.
+#
+# The host is resolved and *every* address checked, at registration and again
+# before each delivery: a name that resolves publicly today can resolve inward
+# tomorrow. Naming a host exempts it from those checks entirely, so add only the
+# ones you mean.
+allowed_hosts = []
+
+# Deliveries this node may have in flight at once, across all subscriptions.
+#
+# A bound, so a webhook on a hot collection cannot consume every outbound
+# connection the node has. It is also why one endpoint that has stopped
+# answering does not delay the subscriptions behind it -- a serial dispatcher
+# would hold the pass for the full delivery timeout.
+max_concurrent_deliveries = 8
+
+# The largest request body a delivery may carry.
+#
+# Batches are trimmed to fit. A single event whose document already exceeds this
+# is delivered with `fullDocument` omitted and `fullDocumentOmitted` set, rather
+# than dropped -- the receiver still learns the change happened and can read the
+# document itself.
+max_payload_bytes = 1048576
+
 [log]
 # A tracing-subscriber filter directive. RUST_LOG overrides this when set.
 level = "info"

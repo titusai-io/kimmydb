@@ -277,6 +277,11 @@ pub fn remove(
     }
 
     let removed = state.engine.delete(&meta, &key)?;
+    // The delivery progress goes with it. One record per node that ever
+    // delivered this subscription would otherwise sit in `__webhook_progress`
+    // forever, replicating and being backed up, with nothing left to read it.
+    crate::dispatch::forget_progress(state, id);
+
     tracing::warn!(
         target: "kimmy::audit",
         user = %auth.principal().user,
