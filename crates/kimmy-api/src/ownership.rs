@@ -71,14 +71,26 @@ pub fn owner(subscription: &str, members: &BTreeSet<SocketAddr>) -> Option<Socke
 
 /// Whether this node should deliver `subscription`.
 ///
-/// With no membership — clustering off, or SWIM not yet populated — the answer
-/// is yes. A single node must deliver its own webhooks, and a node that waited
-/// for a member set it will never have would deliver nothing at all.
+/// The candidate set is the live members **plus this node**. That is not
+/// belt-and-braces — it is the fix for a bug the cluster harness caught on
+/// its first run: the live set SWIM maintains contains *peers only*, never
+/// the node holding it, so an owner computed over it can never be `me`.
+/// Every node stood down for every subscription, and **no webhook was ever
+/// delivered in any clustered deployment** — while single-node worked
+/// (empty set, own everything), which is why nothing else caught it.
+///
+/// With clustering off the set is empty and the union is just `me`: a single
+/// node owns everything, with no special case needed.
+///
+/// The trade this makes: a node SWIM has declared dead still considers
+/// itself a candidate, so a flapping node can deliver alongside its
+/// replacement until it rejoins or stops. That is a duplicate — which
+/// at-least-once already promises receivers — where the alternative was
+/// silence.
 pub fn owns(subscription: &str, me: SocketAddr, members: &BTreeSet<SocketAddr>) -> bool {
-    match owner(subscription, members) {
-        Some(owner) => owner == me,
-        None => true,
-    }
+    let mut candidates = members.clone();
+    candidates.insert(me);
+    owner(subscription, &candidates) == Some(me)
 }
 
 #[cfg(test)]
@@ -180,11 +192,25 @@ mod tests {
     }
 
     #[test]
-    fn a_node_not_in_the_member_set_owns_nothing() {
-        // A node that SWIM considers dead must stop delivering, or a flapping
-        // node doubles up with whoever took over from it.
-        let set = members(&["10.0.0.1:7900", "10.0.0.2:7900"]);
-        assert!(!owns("wh_a", addr("10.0.0.9:7900"), &set));
+    fn peer_only_views_still_elect_exactly_one_owner() {
+        // What production actually looks like, and what the original tests
+        // never modelled: SWIM's live set holds *peers*, so each node sees the
+        // other two and never itself. `owns` must union `me` in, or an owner
+        // can never be the node computing it — the bug that left every
+        // clustered webhook undelivered until the harness caught it. Three
+        // peer-only views must still agree on exactly one owner.
+        let all = ["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"];
+        for subscription in ["wh_a", "wh_b", "wh_c", "wh_d"] {
+            let mut owners = 0;
+            for me in all {
+                let peers: BTreeSet<SocketAddr> =
+                    all.iter().filter(|a| **a != me).map(|a| a.parse().unwrap()).collect();
+                if owns(subscription, addr(me), &peers) {
+                    owners += 1;
+                }
+            }
+            assert_eq!(owners, 1, "{subscription}: peer-only views must elect exactly one owner");
+        }
     }
 
     #[test]

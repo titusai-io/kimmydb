@@ -34,3 +34,7 @@ rustls.workspace = true
 rcgen.workspace = true
 tempfile.workspace = true
 tokio-rustls.workspace = true
+# For the cluster harness: an HTTP client and JSON for driving real spawned
+# nodes. Both already in the workspace tree; no new dependencies.
+reqwest.workspace = true
+serde_json.workspace = true

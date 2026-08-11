@@ -39,6 +39,7 @@ pub struct Metrics {
     webhook_active: AtomicU64,
     webhook_invalidated: AtomicU64,
     webhook_backlog_secs: AtomicU64,
+    cluster_members: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -59,6 +60,7 @@ impl Default for Metrics {
             webhook_active: AtomicU64::new(0),
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
+            cluster_members: AtomicU64::new(0),
         }
     }
 }
@@ -125,6 +127,16 @@ impl Metrics {
         self.webhook_backlog_secs.store(backlog_secs, Ordering::Relaxed);
     }
 
+    /// How many peers this node's SWIM instance currently considers alive.
+    ///
+    /// The observable the cluster harness asserts gossip *formed* with —
+    /// replication converging is not proof, because discovery alone can
+    /// deliver convergence while gossip silently never forms, which is
+    /// exactly what the shipped compose file once did.
+    pub fn set_cluster_members(&self, n: u64) {
+        self.cluster_members.store(n, Ordering::Relaxed);
+    }
+
     pub fn record_backup(&self) {
         self.backups.fetch_add(1, Ordering::Relaxed);
     }
@@ -180,7 +192,10 @@ impl Metrics {
              kimmy_webhook_subscriptions{{state=\"invalidated\"}} {wh_invalid}\n\
              # HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns.\n\
              # TYPE kimmy_webhook_backlog_seconds gauge\n\
-             kimmy_webhook_backlog_seconds {wh_backlog}\n",
+             kimmy_webhook_backlog_seconds {wh_backlog}\n\
+             # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.\n\
+             # TYPE kimmy_cluster_members gauge\n\
+             kimmy_cluster_members {cluster}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -196,6 +211,7 @@ impl Metrics {
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
+            cluster = self.get(&self.cluster_members),
         )
     }
 }
@@ -245,7 +261,7 @@ mod tests {
             assert!(value.parse::<u64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        assert_eq!(samples, 15, "expected one sample per series: {out}");
+        assert_eq!(samples, 16, "expected one sample per series: {out}");
     }
 
     #[test]
