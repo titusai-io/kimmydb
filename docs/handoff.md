@@ -6,21 +6,38 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-09 — M6 complete: webhooks
+## As of 2026-08-10 — M7 begun: the warm-up branch
 
-**M0–M6 are complete.** Their record lives in [Decisions](decisions.md) and
-[Deviations](deviations.md).
+**M0–M6 are complete; M7 (query engine completion) is planned in
+[Roadmap](roadmap.md) and begun.** The milestone record lives in
+[Decisions](decisions.md) and [Deviations](deviations.md).
 
 ### State of the branches
 
 | | |
 |---|---|
-| `main` | PRs #16–#31 merged. Registry, dispatcher, ownership, delivery, signing, failure handling |
-| `m6-webhook-limits-and-observability` | **Not merged.** Bounded concurrent delivery, payload cap, the two gauges, the progress heartbeat, the remaining tests |
+| `main` | PRs #16–#34 merged, including the M7 plan |
+| `m7-webhook-review-fixes` | **Not merged.** The three M6 review findings: webhook events now name their database and collection (asserted on the wire), backoff state is pruned against the registry, and the egress check runs inside the delivery client's resolver (`CheckedResolver`), closing the DNS TOCTOU. Plus: the client's `unwrap_or_default()` fallback is gone — it would have silently shed the redirect refusal on a build failure |
 
-**Gate on it:** 762 tests · fmt · clippy `-D warnings` ·
+**Gate on it:** 766 tests · fmt · clippy `-D warnings` ·
 `./scripts/check-native-deps.sh` · driven against a live node with a real
 receiver.
+
+### What M7 is, and what comes next in it
+
+Read the M7 section of [Roadmap](roadmap.md) before starting the next branch —
+the reasoning is there so it is not re-derived. The remaining sequence:
+
+1. **Multikey tracking per index** — a one-way per-index flag, set in the same
+   transaction as index maintenance and by backfill. This is the gate for
+   everything after it.
+2. **Both bounds on non-multikey indexes** — closes the register's only 🔴.
+   The original multikey property test must still pass unchanged.
+3. **Ranges on descending fields** — the bound swap; failure mode is a
+   too-narrow range, so it gets its own property test.
+4. **`$in` as a union of point lookups** — new planner strategy, visible in
+   `explain`.
+5. Mutation testing on the planner and key encoding; docs; deviations 🔴→🟢.
 
 ### What webhooks are, in one paragraph
 
@@ -74,67 +91,19 @@ node delivering (N duplicates per write).
 | `kimmy-api/tests/webhooks.rs` | Delivery against a receiver on a real socket |
 | `kimmyd/src/node.rs` | Spawns the dispatcher with the live `Members` handle |
 
-### The bug this branch found, because it will look wrong otherwise
+### How this work is verified
 
-**Every healthy webhook died one retention window after its last delivery.** A
-subscription's resume point only advanced when something was delivered, so a
-webhook on a quiet collection — or on a busy one that went quiet overnight — sat
-still while the retention horizon walked toward it, and was then invalidated for
-"falling behind" events it had never been going to be sent. `behind` returning
-`None` for a fully caught-up subscription fell through to `Hlc::ZERO`, which is
-behind any horizon, so the same fate reached subscriptions that had missed
-nothing at all.
+Beyond the suite: a real receiver on a socket, verifying the HMAC exactly as a
+consumer would. It has found what tests did not — per-subscription secrets, the
+history-replay behaviour, and the empty `database`/`collection` fields, which
+every test missed because every test asserted fields that were present rather
+than reading the body a receiver actually gets. **Assert payload shape on the
+wire.**
 
-The fix is that the position moves over entries that were scanned and found not
-to belong to the subscription — deciding an entry is not yours is work — and it
-is written forward on a **one-minute heartbeat** rather than every pass, because
-recording progress is itself a write that appends the entry the next pass reads.
-Without the heartbeat an idle node writes to the oplog, and replicates it, every
-two seconds forever.
-
-Three tests hold this down: `a_caught_up_subscription_survives_garbage_collection`,
-`a_webhook_on_a_quiet_collection_does_not_fall_past_retention`, and
-`the_position_is_written_forward_on_a_heartbeat_not_every_pass`.
-
-### A premise the plan carried for three branches, and got wrong
-
-M6 asked three times for a delivery cap "so a webhook on a hot collection cannot
-saturate a node's outbound connections". **It could not.** The dispatcher
-delivered inside a `for` loop with one `.await` per subscription, so the node
-held at most one request in flight — a bound of one, uncappable.
-
-The serial loop caused the inverse instead: one endpoint that stopped answering
-held the whole pass for the ten-second timeout and delayed every subscription
-behind it. Bounded concurrency fixes that *and* makes the original cap
-meaningful, so the task shipped as written despite its motivation being unreal.
-
-Worth carrying forward: **a risk asserted in a plan is a hypothesis about the
-code, not a fact about it.** This one was written down three times and reviewed
-each time without anyone reading the loop. The full account is in
-[Deviations](deviations.md).
-
-### How this work has been verified
-
-Beyond the suite: a real Python receiver on a socket, verifying the HMAC. That
-found the useful things — per-subscription secrets being genuinely distinct, and
-the history-replay behaviour that became the "start from now" fix.
-
-**Mutation-test anything touching delivery or egress.** Mutations have been run
-across all four M6 branches; this one ran eleven by hand (no `cargo-mutants`
-installed) and **two escaped, both in the new observability code** — the backlog
-gauge measured from the resume point rather than the oldest undelivered event,
-and a peer's progress covering ours reading as "resume from zero". Both now have
-tests. The earlier escape was in the egress check:
-only the first resolved address was being tested, so a host answering
-`[public, metadata]` would have been let through. Nothing covered it because a
-unit test cannot make DNS return a chosen pair; the fix was to make the rule
-testable (`permits_addrs` takes the list) rather than to test around it.
-
-Two habits that came out of this, both worth keeping:
-
-- **Run a no-op control first.** A mutation that fails to *compile* produces no
-  `test result:` line and reads exactly like an escape.
-- **Check the mutation actually applied** before concluding a test missed it.
+**Mutation-test anything touching delivery, egress or the planner.** Run a
+no-op control first — a mutation that fails to compile produces no
+`test result:` line and reads exactly like an escape — and check the mutation
+actually applied before concluding a test missed it.
 
 ### Carried debt, none blocking
 
@@ -190,6 +159,10 @@ ids (a re-addressed node reshuffles its subscriptions).
 - **The egress policy is checked before *every* delivery**, not only at
   registration, and every resolved address is checked rather than the first. A
   hostname is not a destination.
+- **The delivery client resolves through `CheckedResolver`** — the egress check
+  and the dial share one resolution, or a zero-TTL name gets a window between
+  them. And never fall back to a default client: it follows redirects and
+  resolves unchecked, which is both egress protections gone at once.
 - **Webhook ownership hashes with FNV-1a, never `DefaultHasher`**, which is not
   stable between Rust versions — ownership shifting under a compiler upgrade
   would reshuffle every subscription on a rolling restart.

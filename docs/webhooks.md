@@ -47,9 +47,13 @@ The body is a batch:
 ```json
 { "subscription": "wh_…",
   "events": [ { "eventId": "1786…-ec4c…", "operationType": "insert",
+                "database": "shop", "collection": "orders",
                 "clusterTime": "1786…", "documentKey": {"_id": 1},
                 "fullDocument": {"_id": 1, "item": "widget"} } ] }
 ```
+
+Every event names its database and collection, so one receiver fed by several
+subscriptions routes on the body rather than on which URL was called.
 
 ---
 
@@ -127,6 +131,11 @@ allowed_hosts = ["internal.corp"]   # exempt specific hosts
 The host is resolved and **every** address checked, at registration *and* before
 each delivery — a name that resolves publicly today can resolve inward tomorrow.
 Redirects are refused for the same reason.
+
+The delivery check runs **inside the HTTP client's own resolver**, so the
+addresses it approves are, by construction, the addresses the connection uses.
+Checking on one resolution and dialling on another would leave a zero-TTL name
+a window between the two.
 
 ---
 

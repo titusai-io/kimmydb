@@ -220,6 +220,11 @@ async fn a_write_is_delivered_and_the_signature_verifies() {
     assert!(!delivery.event_id.is_empty(), "a delivery must carry an event id");
     assert!(delivery.body.contains("\"operationType\":\"insert\""), "{}", delivery.body);
     assert!(delivery.body.contains("widget"), "the document should be included: {}", delivery.body);
+    // Asserted on the wire, not on `render`'s output: these two shipped as
+    // empty strings for all of M6, and every test passed, because nothing
+    // looked at the body a receiver actually gets.
+    assert!(delivery.body.contains("\"database\":\"shop\""), "{}", delivery.body);
+    assert!(delivery.body.contains("\"collection\":\"orders\""), "{}", delivery.body);
 }
 
 #[tokio::test]
