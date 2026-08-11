@@ -9,7 +9,8 @@
 //! create a collection that shadows one.
 
 use kimmy_core::{
-    DocId, Error as CoreError, Hlc, ResumeToken, VectorConfig, VectorRecord, vector_meta,
+    CollectionId, DocId, Error as CoreError, Hlc, ResumeToken, VectorConfig, VectorRecord,
+    vector_meta,
 };
 use tracing::info;
 
@@ -55,14 +56,23 @@ impl crate::Engine {
 
         let mut meta = self.get_collection(db, collection)?;
 
-        // Changing the width would mix incompatible vectors in one index, so
-        // it needs an explicit reindex rather than a silent reconfiguration.
+        // A dimension change is safe exactly when the server can rebuild the
+        // vectors itself: the embedding worker treats every ConfigureVectors
+        // entry as a reindex trigger and re-embeds from the documents, and
+        // both search paths skip records whose width does not match, so the
+        // old vectors are invisible while the backfill replaces them.
+        //
+        // For byo the server holds vectors it can never regenerate — the
+        // client computed them — so a changed width there still requires an
+        // explicit drop, or search would quietly serve from a shrinking
+        // remnant of the old width while nothing replaces it.
         if let Some(existing) = &meta.vector
             && existing.dim != config.dim
+            && !config.provider.embeds_server_side()
         {
             return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                "vector dimension cannot change from {} to {} in place; drop the vector \
-                 configuration first, which discards the existing vectors",
+                "vector dimension cannot change from {} to {} in place for client-supplied \
+                 vectors; drop the vector configuration first, which discards them",
                 existing.dim, config.dim
             ))));
         }
@@ -215,6 +225,40 @@ impl crate::Engine {
         Ok(Some(ResumeToken::decode(text)?))
     }
 
+    /// Record which configuration a collection's vectors were last *fully*
+    /// embedded under.
+    ///
+    /// Written by the embedding worker only after a completed backfill scan —
+    /// the same position-after-work rule every consumer follows, at the scan
+    /// level. A stored fingerprint that differs from the live configuration
+    /// is how the worker knows a replayed `ConfigureVectors` entry demands a
+    /// full re-embed rather than a staleness-checked no-op: the per-document
+    /// HLC cannot see a configuration change, because configurations do not
+    /// touch documents.
+    pub fn put_vector_fingerprint(&self, collection: CollectionId, fingerprint: u64) -> Result<()> {
+        let txn = self.db().begin_write()?;
+        {
+            let mut meta = txn.open_table(crate::tables::META)?;
+            meta.insert(fingerprint_key(collection).as_str(), &fingerprint.to_be_bytes()[..])?;
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// The configuration fingerprint the last completed backfill recorded.
+    pub fn vector_fingerprint(&self, collection: CollectionId) -> Result<Option<u64>> {
+        let txn = self.db().begin_read()?;
+        let meta = txn.open_table(crate::tables::META)?;
+        let Some(raw) = meta.get(fingerprint_key(collection).as_str())? else {
+            return Ok(None);
+        };
+        let bytes: [u8; 8] = raw
+            .value()
+            .try_into()
+            .map_err(|_| StorageError::Corrupt("vector fingerprint is not 8 bytes".into()))?;
+        Ok(Some(u64::from_be_bytes(bytes)))
+    }
+
     // -----------------------------------------------------------------------
     // Vector records
     // -----------------------------------------------------------------------
@@ -342,6 +386,10 @@ impl crate::Engine {
 /// META key holding one consumer's oplog position.
 fn consumer_key(consumer: &str) -> String {
     format!("consumer_position:{consumer}")
+}
+
+fn fingerprint_key(collection: CollectionId) -> String {
+    format!("vector_config:{}", collection.0)
 }
 
 fn decode_vector(doc: bson::Document) -> Result<VectorRecord> {

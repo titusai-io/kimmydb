@@ -17,8 +17,8 @@ reload's trigger, and token revocation's semantics.
 
 | | |
 |---|---|
-| `main` | PRs #16–#43 merged: the M8 plan, the cluster harness, observability, benchmarks |
-| `m8-hnsw-snapshots` | **Not merged.** HNSW graphs persist beside the database file and reload on the first access after a restart, count-validated. `hnsw_rs` panics on a corrupt graph file, so the load runs under `catch_unwind` — a torn file costs a rebuild, never the process |
+| `main` | PRs #16–#44 merged: the M8 plan, the cluster harness, observability, benchmarks, HNSW snapshots |
+| `m8-vector-reindex` | **Not merged.** `ConfigureVectors` entries now trigger a collection-scan backfill in the worker — which also revealed that the old "re-enable backfills from the oplog" claim was always false (a long-lived worker's position was past old entries; enabling embedding on existing documents embedded nothing), and that the provider cache never evicted on reconfigure. Layered idempotency: config fingerprint per scan, HLC per document |
 
 ### The bug the harness caught on its first run
 
