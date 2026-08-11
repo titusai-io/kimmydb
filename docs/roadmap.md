@@ -19,8 +19,9 @@ graph LR
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> ✅<br/>hardening"]
     M6["<b>M6</b> ✅<br/>webhooks"]
+    M7["<b>M7</b> 🚧<br/>query engine<br/>completion"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -30,6 +31,7 @@ graph LR
     style M4 fill:#2f5d3a,color:#fff
     style M5 fill:#2f5d3a,color:#fff
     style M6 fill:#2f5d3a,color:#fff
+    style M7 fill:#2d3748,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -41,6 +43,7 @@ graph LR
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
+| **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | 🚧 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -479,6 +482,49 @@ Bounded concurrency fixes that and makes the original request meaningful at the
 same time, so the task landed as written even though its stated motivation was
 not real. The full account, including why the premise survived three branches
 unchallenged, is in [Deviations](deviations.md).
+
+---
+
+## M7 — Query engine completion 🚧
+
+The planner has carried three known gaps since M1, one of them the register's
+only 🔴. Each is *correct but slow* today — deliberately, because the wrong
+version of each is *fast but silently wrong*. M7 makes them fast **and**
+correct, and ends with zero 🔴 in [Deviations](deviations.md).
+
+Chosen over operational maturity and API ergonomics on 2026-08-10. The other
+two themes remain candidates for M8.
+
+### Why these gaps exist, so the fix is not re-derived
+
+All three trace to one fact: **an index key range over a multikey (array)
+field cannot use both bounds.** `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}`
+because *different elements* satisfy each bound — intersecting the bounds into
+one range excluded the document. That was a real bug, found by property
+testing; the fix was to use one bound and keep the range a superset.
+
+But the superset penalty is only *necessary* for fields that hold arrays.
+MongoDB's answer, and ours: track multikey-ness per index, and give the
+scalar-only majority both bounds back.
+
+### Tasks
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | **Warm-up: the M6 review findings** | Webhook payloads ship `"database": ""` and `"collection": ""` — always-empty fields the dispatcher could fill from the subscription; fill them. Drop `Backoff` entries whose subscription no longer exists. Close the egress TOCTOU below |
+| 2 | **Egress: check and dial must share one resolution** | `EgressPolicy::check` resolves the host, then `reqwest` re-resolves to dial — a rebinding attacker with a zero TTL passes the check and flips the record before the connection. Fix: a custom `dns_resolver` on the delivery client that runs `permits_addrs` inside resolution, so the addresses checked are exactly the addresses dialled |
+| 3 | **Multikey tracking per index** | A per-index flag, `false → true` the first time a write stores an array under an indexed field, maintained in the **same transaction** as the index entries, and set by backfill. One-way, so a deleted array never quietly re-tightens a range. Node-local observation that converges because the data does — and safe meanwhile, because each node plans over exactly the documents it holds |
+| 4 | **Both bounds on non-multikey indexes** | The 🔴 closes. Property test over scalar-only documents: index-backed ranges agree with a collection scan. The original multikey property test must still pass unchanged — it is the reason this is gated on task 3 |
+| 5 | **Ranges on descending fields** | Inverted encoding swaps which end each bound belongs to; getting the swap backwards yields a range that is too *narrow* — silently wrong, which is why it was deferred rather than guessed. Its own property test, generating both ascending and descending compound indexes |
+| 6 | **`$in` uses the index** | A union of point lookups rather than a single range, deduplicated by document id. New planner strategy visible in `explain`, so the win is observable rather than asserted |
+| 7 | **Mutation testing** | On the planner and key-encoding layers, where it has caught real gaps before. No-op control first; `--no-fail-fast` |
+| 8 | **Docs** | [Indexes](indexes.md) rewritten where behaviour changes; the 🔴 and both 🟡 planner entries in [Deviations](deviations.md) move to 🟢; [Handoff](handoff.md) replaced |
+
+### Deliberately out of scope
+
+`$vectorSearch` as a pipeline stage stays unbuilt — it is an API-surface
+decision, not a planner gap, and belongs with the ergonomics theme. Rate
+limiting beyond login still waits on the benchmark work, as agreed in M5.
 
 ---
 
