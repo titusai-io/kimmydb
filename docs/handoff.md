@@ -6,11 +6,11 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 in progress: Prove and Persist done, Polish next
+## As of 2026-08-11 — M8 in progress: Polish under way
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is six
-of twelve tasks in.** The open PR is task 6; tasks 7–12 remain, and three of
-them are blocked on a maintainer decision (below).
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is seven
+of twelve tasks in.** The open PR is task 7; tasks 8–12 remain, and two of them
+are blocked on a maintainer decision (below).
 
 ### How work runs here — read this first
 
@@ -30,7 +30,10 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-048**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-049**).
+  Task 7 found the register can silently lose an entry — the handoff's debt
+  table pointed at a 🟡 for bulk insert that had never been written down.
+  Check the register itself, not the summary of it.
 
 ### The one structural idea, if you read nothing else
 
@@ -56,12 +59,12 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#45 merged: through M8 task 5 (vector reindex) |
-| `m8-provider-audit` (open PR #46) | **Task 6.** Voyage = the existing `open_ai` dialect; new `cohere` and `gemini` dialects; `HttpProvider` grew an `Auth` enum for Gemini's `x-goog-api-key` header. Fixture-verified against documented shapes ([ADR-047](decisions.md)) and driven live against endpoints speaking each real shape. **This handoff commit rides on it.** |
+| `main` | PRs #16–#46 merged: through M8 task 6 (provider dialect audit) |
+| `m8-bulk-insert` (open PR) | **Task 7.** `POST /v1/db/{db}/coll/{coll}/bulk` — bare JSON array, one transaction, all-or-nothing, capped at 1000. `Engine::insert` and the new `insert_many` now share one `insert_in_txn` helper that does everything except the transaction lifecycle. **176× per document at batch 1000** ([ADR-048](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board
 
-Prove and Persist are complete; Polish is the remaining workstream.
+Prove and Persist are complete; Polish is under way.
 
 | # | Task | Status |
 |---|---|---|
@@ -70,15 +73,17 @@ Prove and Persist are complete; Polish is the remaining workstream.
 | 3 | Benchmark baseline + concurrent writers | ✅ #43 |
 | 4 | HNSW snapshot persistence | ✅ #44 |
 | 5 | Vector reindex | ✅ #45 |
-| 6 | Provider dialect audit | 🔵 open PR #46 (ADR-047) |
-| 7 | **Bulk insert** | ⏸ **needs a decision** — array body on `POST /docs` vs. a dedicated endpoint. `POST /docs` takes one document today. Benchmark finding shapes this: concurrent writers are flat (~300 docs/s, one redb writer), so a bulk API's only win is **per-commit overhead**, i.e. batching many documents into one durable commit |
+| 6 | Provider dialect audit | ✅ #46 (ADR-047) |
+| 7 | Bulk insert | 🔵 open PR (ADR-048) |
 | 8 | **Certificate reload** | ⏸ **needs a decision** — trigger is SIGHUP vs. mtime poll. ADR before code. Constraint: certs are read before the socket binds (ADR-039), so a reload must keep a bad new cert from taking down a serving node |
 | 9 | SRV discovery | `dns-srv:` parses but does not resolve; needs a resolver crate. **Must not add a second native crypto stack** — keep DNSSEC features off; `check-native-deps.sh` is the arbiter |
 | 10 | Webhook ownership by node id | Rendezvous hashes `SocketAddr` today, so re-addressing reshuffles subscriptions. Gossip the node id as member metadata and hash that. Verify with the harness; a mixed-version cluster produces duplicates, which at-least-once tolerates |
 | 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
 | 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-**Recommended next branch: task 7 (bulk insert).**
+**Recommended next branch: task 8 (certificate reload).** Bring the maintainer
+the trigger choice — SIGHUP vs. mtime poll — *before* writing code, and write
+the ADR before the code either way.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -119,6 +124,18 @@ Prove and Persist are complete; Polish is the remaining workstream.
   Gemini needed dialects. Verified against **documented** shapes with fixtures,
   not live endpoints (the bar every dialect has met since M2 — a live call
   needs a paid key and egresses text to a third party).
+- **Task 7 — bulk insert (ADR-048).** `POST .../coll/{coll}/bulk`, a bare
+  array, one transaction. `insert` and `insert_many` share a new
+  `insert_in_txn` that does everything but `begin_write`/`commit`/`abort`, so
+  the batch reuses the single-document checks rather than reimplementing them.
+  **176× per document at batch 1000** (291 → ~51,300 docs/sec): the marginal
+  document is ~13 µs against a several-millisecond commit, so the commit was
+  very nearly the *whole* cost — precisely what task 3's flat writer curve
+  implied. End to end on a live debug node, 500 documents took 0.16 s in one
+  request against 11.6 s as 500. Found while writing it: **the register never
+  held the bulk-insert debt** the handoff's own table pointed at. Also note the
+  path is `/bulk`, not `/docs/bulk`, which would shadow the document whose
+  `_id` is `"bulk"`.
 
 ### Where the code is
 
@@ -158,13 +175,13 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
 
 | Debt | |
 |---|---|
-| No bulk insert endpoint | M8 task 7 |
 | Certificate reload needs a restart | M8 task 8 |
 | SRV discovery parses but does not resolve | M8 task 9 |
 | Webhook ownership hashes `SocketAddr`, not node ids | M8 task 10 |
 | Deleting a user does not invalidate issued tokens | M8 task 11 |
 | `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
 | Rate limiting covers login only | waits on a capacity decision, not on measurement any more |
+| `update` and `delete` still apply document by document and can stop partway — bulk *insert* is atomic, they are not | by design |
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; `skip` is O(n); no minimum score threshold | simplifications inside working features |
 | No `$vectorSearch` pipeline stage; no mTLS; no computed pipeline expressions | not planned |
 
@@ -258,6 +275,18 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   buckets real traffic lands in.
 - **A metric's buckets or thresholds are measured, not chosen.** ADR-046's
   first draft was written from expectation and the measurement corrected it.
+- **A bulk insert is one transaction and one commit, and a failure anywhere
+  aborts all of it** — every document, and every oplog entry with them. The
+  version vector must not move for a batch that did not land, and nothing may
+  be published. Events go out once, after the commit, one per document.
+- **A batch is validated against itself, not only against stored state.** Two
+  documents sharing an `_id`, or colliding on a unique index, must fail the
+  batch. This works only because a redb read sees its own transaction's
+  uncommitted writes — the property the whole reuse of the single-document
+  checks rests on, so both paths have a test.
+- **`Engine::insert` and `insert_many` share `insert_in_txn`.** A check added
+  to one must not be added *beside* the other; the point of the helper is that
+  a batch cannot drift into being more permissive than a single insert.
 
 
 ## Conventions for this file

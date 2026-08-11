@@ -1688,6 +1688,79 @@ still not solve Gemini's header auth or URL-embedded model.
 
 ---
 
+## ADR-048 — Bulk insert is its own route, and one commit makes it atomic
+
+**Decision.** `POST /v1/db/{db}/coll/{coll}/bulk` takes a bare JSON array and
+inserts it in **one redb transaction**, all of it or none of it, capped at 1000
+documents. `POST /docs` is untouched. The response is
+`{"inserted": n, "insertedIds": [...]}`, in submission order.
+
+**The commit is the whole feature, and the measurement says so.** Release
+build on the development machine, `write_path` bench, Criterion medians over
+30 samples, documents of ~200 bytes with no secondary indexes:
+
+| Batch | Total | Per document | Against a lone insert |
+|---|---|---|---|
+| 1 (own commit) | 3.43 ms | 3.43 ms | — |
+| `bulk` 1 | 3.41 ms | 3.41 ms | 1.0× |
+| `bulk` 10 | 4.68 ms | 0.468 ms | 7.3× |
+| `bulk` 100 | 7.66 ms | 0.077 ms | 45× |
+| `bulk` 1000 | 19.48 ms | 0.019 ms | **176×** |
+
+That is ~291 documents/sec becoming ~51,300. Fitting the 100 and 1000 points
+puts the marginal document at ~13 µs against a fixed commit of several
+milliseconds: the durable commit is not merely the dominant cost, it is very
+nearly the *only* cost. `bulk` at batch size 1 lands on the single-insert
+number, so the batch path adds nothing when there is nothing to amortize.
+
+This is what M8 task 3 predicted. Throughput was flat from one writer to eight
+(~300 docs/sec) because redb has a single writer, so parallelism had nothing
+to give and per-commit overhead was the only cost left worth removing.
+
+**Atomicity is a consequence, not a goal — but it is promised.** One
+transaction makes all-or-nothing free, and the documentation says so, which
+means it cannot later be chunked into several commits without breaking a
+stated guarantee. That is accepted: chunking would only matter above a batch
+size the 2 MB body limit already forbids, and the alternative is worse. The
+guarantee is deliberately stronger than `update` and `delete`, which still
+apply document by document and can stop partway ([Deviations](deviations.md)).
+
+**Rejected: best-effort with per-document results.** Returning
+`{"ok": true/false}` per document requires isolating each failure in its own
+commit — which is exactly the cost the feature exists to remove. It would have
+bought a nicer error report by giving up the entire 176×. Instead the batch
+fails whole and the error names the offending position, which is the only
+thing a caller can act on when nothing was written.
+
+**Rejected: an array body on `POST /docs`.** It needs no new route, but it
+makes the response shape *and* the atomicity guarantee depend on the request
+body's type — a caller could not tell from the URL which contract they were
+getting, and the MCP tool's argument would go polymorphic with it. The
+codebase already puts multi-document verbs on their own paths (`/find`,
+`/count`, `/aggregate`, `/update`, `/delete`), so a sibling `/bulk` is the
+established pattern.
+
+**`/bulk`, not `/docs/bulk`.** `/docs/{id}` already owns that space. Static
+segments win in the router, so the two would not collide — but the document
+whose `_id` is literally `"bulk"` would become unreachable, and a public path
+that quietly shadows a legal key is a trap laid for one unlucky user.
+
+**The cap is 1000, and the body limit usually binds first.** A batch is held
+in memory whole and then published as one event per document into a bounded
+broadcast channel, so it needs a ceiling. 1000 sits well past where the
+per-document curve flattens, and for any document over ~2 KB axum's 2 MB
+request body limit stops the caller sooner. That limit is left where it is:
+raising it is a memory-pressure change, and nobody has measured it.
+
+**A batch is checked against itself.** Two documents sharing an `_id`, or
+colliding on a unique index, fail the batch — the occupancy check and the
+unique probe both read inside the transaction, and a redb read sees its own
+transaction's uncommitted writes. That property was never exercised before
+this branch; it now has a test on each of the two paths, because the whole
+correctness argument for reusing the single-document checks rests on it.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

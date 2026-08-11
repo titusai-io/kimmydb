@@ -97,6 +97,24 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// A body axum could not turn into the expected type.
+///
+/// Axum's own rejection renders bare text with no `error` code, which would
+/// make this the one route a client cannot branch on. The status axum chose is
+/// kept — it already distinguishes a syntax error from a body that is too
+/// large — and only the envelope is made to match every other route.
+impl From<axum::extract::rejection::JsonRejection> for ApiError {
+    fn from(rejection: axum::extract::rejection::JsonRejection) -> Self {
+        let status = rejection.status();
+        let code = match status {
+            StatusCode::PAYLOAD_TOO_LARGE => "payload_too_large",
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => "unsupported_media_type",
+            _ => "bad_request",
+        };
+        Self::new(status, code, rejection.body_text())
+    }
+}
+
 impl From<CoreError> for ApiError {
     fn from(e: CoreError) -> Self {
         match &e {

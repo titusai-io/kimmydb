@@ -27,6 +27,7 @@ Default port **7878**.
 | `DELETE` | `/v1/db/{db}/coll/{coll}` | `admin` |
 | `POST` | `/v1/db/{db}/coll/{coll}/docs` | `write` |
 | `GET` | `/v1/db/{db}/coll/{coll}/docs` | `read` |
+| `POST` | `/v1/db/{db}/coll/{coll}/bulk` | `write` |
 | `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}` | `read` / `write` / `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/find` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | `read` |
@@ -103,6 +104,53 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/docs -H "$A" \
 
 `_id` is generated if absent. A duplicate `_id` is **409** with
 `"error": "duplicate_key"`.
+
+### Bulk insert
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/bulk -H "$A" \
+  -d '[{"item":"widget","qty":5},{"item":"gadget","qty":2}]'
+```
+
+```json
+{
+  "inserted": 2,
+  "insertedIds": [
+    { "$oid": "6745f2a1b3c4d5e6f7081920" },
+    { "$oid": "6745f2a1b3c4d5e6f7081921" }
+  ]
+}
+```
+
+The body is a bare array, and `insertedIds` comes back in submission order.
+
+**All of the batch is written, or none of it.** The whole batch is one durable
+commit, which is the point — a document inside a batch of 1000 costs about
+1/175th of a document inserted on its own, because the commit dominates
+([ADR-048](decisions.md)). Atomicity falls out of that single transaction, and
+it is stronger than what `update` and `delete` promise: those still apply
+document by document and can stop partway.
+
+So a rejected document rejects the batch, and the message names its position:
+
+```json
+{ "error": "duplicate_key",
+  "message": "document at index 17: duplicate key: 42" }
+```
+
+Nothing is written, no oplog entry is appended, and no change event is
+published. Documents in the batch are checked against each other as well as
+against stored state, so two documents sharing an `_id` — or colliding on a
+unique index — fail the batch even though neither was there when it started.
+
+Two ceilings, whichever binds first: **1000 documents**, and the **2 MB
+request body limit** (`413`, `"error": "payload_too_large"`), which is the
+lower of the two for documents over about 2 KB. Over the document cap is
+**400**; a body that is not an array is **422**. An empty array is a no-op
+that inserts nothing and commits nothing.
+
+Measured end to end over loopback, this is what it buys: 500 documents in one
+request took **0.16 s**, against **11.6 s** as 500 separate requests.
 
 ### Get, replace, delete by id
 
@@ -328,13 +376,16 @@ round-trips exactly, and there is a test pinning it.
 
 | Status | `error` | Cause |
 |---|---|---|
-| 400 | `bad_request` | Malformed filter, update, projection, or Extended JSON |
+| 400 | `bad_request` | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents |
+| 422 | `bad_request` | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
 | 401 | `unauthorized` | Missing, malformed, invalid, or expired token; bad credentials |
 | 403 | `forbidden` | Denied by RBAC |
 | 404 | `not_found` | Document, collection, or user absent |
 | 409 | `conflict` | Collection exists; last user; self-deletion |
 | 409 | `duplicate_key` | `_id` already present |
 | 409 | `unique_violation` | A unique index would be violated |
+| 413 | `payload_too_large` | Request body over 2 MB |
+| 415 | `unsupported_media_type` | A JSON body without a JSON content type |
 | 501 | `not_implemented` | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | Resume point collected from the oplog |
 | 429 | `rate_limited` | Too many failed logins from this caller. Carries `Retry-After` in seconds |

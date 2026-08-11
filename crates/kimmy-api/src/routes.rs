@@ -1,5 +1,6 @@
 //! HTTP routes.
 
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -32,6 +33,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/collections", get(list_collections).post(create_collection))
         .route("/v1/db/{db}/coll/{coll}", delete(drop_collection))
         .route("/v1/db/{db}/coll/{coll}/docs", post(insert_doc).get(find_docs))
+        .route("/v1/db/{db}/coll/{coll}/bulk", post(bulk_insert_docs))
         .route("/v1/db/{db}/coll/{coll}/find", post(find_docs_post))
         .route("/v1/db/{db}/coll/{coll}/count", post(count_docs))
         .route("/v1/db/{db}/coll/{coll}/aggregate", post(aggregate_docs))
@@ -292,6 +294,21 @@ async fn insert_doc(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::insert(&state, &auth, &db, &coll, &body)?))
+}
+
+/// Insert an array of documents in one commit.
+///
+/// A sibling of the other multi-document verbs rather than a child of `/docs`,
+/// which is already the single-document path — `/docs/bulk` would shadow the
+/// document whose `_id` is `"bulk"`.
+async fn bulk_insert_docs(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    body: Result<Json<Vec<Value>>, JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Json(documents) = body?;
+    Ok(Json(exec::insert_many(&state, &auth, &db, &coll, &documents)?))
 }
 
 #[derive(Deserialize, Default)]

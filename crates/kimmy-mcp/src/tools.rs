@@ -163,6 +163,16 @@ pub struct InsertArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct BulkInsertArgs {
+    /// Database name.
+    pub database: String,
+    /// Collection name.
+    pub collection: String,
+    /// The documents to insert. An `_id` is generated for any that omit one.
+    pub documents: Vec<Value>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct UpdateArgs {
     /// Database name.
     pub database: String,
@@ -388,6 +398,26 @@ impl KimmyMcp {
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
         render(exec::insert(&self.state, &auth, &args.database, &args.collection, &args.document))
+    }
+
+    /// Insert many documents at once.
+    #[tool(description = "Insert many documents into a collection in one durable commit. \
+                       All of them are written or none are: if any document is rejected \
+                       the whole batch fails and the error names its position. At most \
+                       1000 documents.")]
+    async fn insert_many(
+        &self,
+        Parameters(args): Parameters<BulkInsertArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let auth = principal(&ctx)?;
+        render(exec::insert_many(
+            &self.state,
+            &auth,
+            &args.database,
+            &args.collection,
+            &args.documents,
+        ))
     }
 
     /// Update documents.

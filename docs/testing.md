@@ -524,6 +524,7 @@ Security properties are asserted as behaviour, not assumed:
 |---|---|
 | Login does not reveal whether a user exists | `a_wrong_password_does_not_reveal_whether_the_user_exists` |
 | RBAC blocks writes, DDL, and user admin | `rbac_is_enforced_on_every_route` |
+| A failed batch inserts nothing at all | `a_bulk_insert_with_a_duplicate_id_inserts_nothing` |
 | 403 does not leak existence | same test — a nonexistent collection also returns 403 |
 | Listing hides unreadable collections | `listing_hides_what_the_caller_cannot_read` |
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |
@@ -694,7 +695,7 @@ a test stays true.
 
 | Gap | Notes |
 |---|---|
-| Benchmarks are partial | The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline |
+| Benchmarks do not gate | The vector index, the write path, batched writes, concurrent writers and the planner are all measured against a recorded baseline ([Benchmarks](benchmarks.md)) — but `bench-baseline.py check` is advisory and nothing fails a build on a regression |
 | No fuzzing | The codecs are the obvious target |
 | **Nothing runs for long, or at scale** | Every test finishes in seconds against thousands of documents. Nothing has run for hours, and nothing has been tested near the sizes a real deployment reaches. Bugs that need time or volume to appear — leaks, unbounded growth, degradation as a collection grows — would not be caught by anything here |
 | No crash-consistency tests | Nothing kills a node mid-write and checks what survived. redb is *trusted* for durability rather than verified |

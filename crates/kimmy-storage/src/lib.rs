@@ -24,7 +24,7 @@ pub mod tables;
 pub mod vectors;
 pub mod watch;
 
-pub use docs::{ID_FIELD, WriteOutcome};
+pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome};
 pub use engine::Engine;
 pub use engine::physical_now_ms;
 pub use error::{Result, StorageError};

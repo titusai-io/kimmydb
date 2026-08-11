@@ -321,6 +321,93 @@ async fn a_duplicate_id_is_a_conflict() {
 }
 
 #[tokio::test]
+async fn a_bulk_insert_returns_an_id_for_every_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/bulk",
+            Some(&token),
+            json!([{"_id":1,"item":"a"}, {"_id":2,"item":"b"}, {"item":"c"}]),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["inserted"], 3);
+    assert_eq!(res.body["insertedIds"].as_array().unwrap().len(), 3);
+
+    // The generated id is returned, so the caller need not re-read to find it.
+    assert_eq!(server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body["item"], "a");
+    let res = server.post("/v1/db/shop/coll/c/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"], 3);
+}
+
+#[tokio::test]
+async fn a_bulk_insert_with_a_duplicate_id_inserts_nothing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let res = server
+        .post("/v1/db/shop/coll/c/bulk", Some(&token), json!([{"_id":1}, {"_id":2}, {"_id":1}]))
+        .await;
+
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "duplicate_key");
+    assert!(
+        res.body["message"].as_str().unwrap().contains("index 2"),
+        "the caller must be told which document failed: {:?}",
+        res.body["message"]
+    );
+
+    // All-or-nothing: the documents before the failure must not have landed.
+    let res = server.post("/v1/db/shop/coll/c/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"], 0, "a failed batch must leave the collection empty");
+}
+
+#[tokio::test]
+async fn a_bulk_insert_over_the_cap_is_rejected() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let documents: Vec<_> = (0..1001).map(|i| json!({ "_id": i })).collect();
+    let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!(documents)).await;
+
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+
+    let res = server.post("/v1/db/shop/coll/c/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"], 0, "a rejected batch must not partially apply");
+}
+
+#[tokio::test]
+async fn a_bulk_insert_of_an_empty_array_is_a_no_op() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!([])).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["inserted"], 0);
+}
+
+#[tokio::test]
+async fn a_bulk_insert_that_is_not_an_array_reports_a_stable_error_code() {
+    // Axum's own rejection is bare text; without a mapping this would be the
+    // one route a client cannot branch on.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!({"_id":1})).await;
+    assert!((400..500).contains(&res.status), "an object is not a batch: {}", res.status);
+    assert!(res.body.get("error").is_some(), "every failure carries an error code: {:?}", res.body);
+}
+
+#[tokio::test]
 async fn queries_filter_sort_and_project() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -418,6 +505,7 @@ async fn rbac_is_enforced_on_every_route() {
     // Denied, each for a different reason.
     for (method, path, body) in [
         ("POST", "/v1/db/shop/coll/orders/docs", json!({"_id": 1})),
+        ("POST", "/v1/db/shop/coll/orders/bulk", json!([{"_id": 1}])),
         ("POST", "/v1/db/shop/collections", json!({"name": "sneaky"})),
         ("POST", "/v1/users", json!({"user":"x","password":"password123"})),
     ] {

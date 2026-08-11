@@ -288,6 +288,28 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 ---
 
+## 🟢 Bulk insert exists (was a deferral the register never wrote down)
+
+**Was.** `POST /docs` took one document per request, so loading N documents
+cost N durable commits. Carried as known debt since M1 and named in the M8
+plan — but, found while closing it, **the register never held an entry for
+it**. The handoff's debt table pointed at a 🟡 in this file that was not here.
+Recorded now on the way out, because the gap in the register is the more
+useful lesson: a debt tracked only in a document that gets rewritten each
+branch is a debt that can quietly stop being tracked.
+
+**Now.** `POST /v1/db/{db}/coll/{coll}/bulk` takes an array and writes it in
+one transaction, capped at 1000 documents ([ADR-048](decisions.md)). A document
+inside a batch of 1000 costs about 1/175th of one inserted alone — 291
+documents/sec becoming ~51,300 — because the durable commit was very nearly the
+whole cost, which is what M8 task 3's flat concurrent-writer curve predicted.
+
+**Consequence.** Bulk insert is atomic and *says* it is atomic, which is a
+stronger promise than `update` and `delete` make. That asymmetry is now a
+documented part of the surface rather than an accident: see the row below.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
@@ -299,8 +321,8 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
-| Multi-document atomicity | A batch update can be partially applied | by design |
-| Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
+| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
+| Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | Webhook ownership hashes addresses | Rendezvous hashing takes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions — the same disruption as that node leaving and another joining. Hashing node ids would be stabler and needs a member → node-id mapping | M6 |
 
 ---
