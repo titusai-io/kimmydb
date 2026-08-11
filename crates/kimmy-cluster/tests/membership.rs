@@ -9,6 +9,9 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kimmy_cluster::{Members, SeedFeed};
+
+/// Every node in these tests shares one secret, as a real cluster must.
+const SECRET: &str = "a-shared-membership-test-secret";
 use tokio::net::UdpSocket;
 
 struct Node {
@@ -20,6 +23,10 @@ struct Node {
 }
 
 async fn node() -> Node {
+    node_with_secret(SECRET).await
+}
+
+async fn node_with_secret(secret: &str) -> Node {
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let addr = socket.local_addr().unwrap();
     let members = Members::default();
@@ -28,8 +35,14 @@ async fn node() -> Node {
     // file, and it is what peers key on rather than the address.
     let node_id = kimmy_core::NodeId::generate();
 
-    let handle =
-        tokio::spawn(kimmy_cluster::membership::run(socket, addr, node_id, members.clone(), feed));
+    let handle = tokio::spawn(kimmy_cluster::membership::run(
+        socket,
+        addr,
+        node_id,
+        secret.to_string(),
+        members.clone(),
+        feed,
+    ));
     Node { addr, node_id, members, announce, handle }
 }
 
@@ -122,6 +135,47 @@ async fn a_node_that_stops_answering_is_declared_down() {
     b.handle.abort();
 
     eventually("a to declare b down", || !a.members.snapshot().contains(&b.addr)).await;
+}
+
+#[tokio::test]
+async fn a_node_holding_the_wrong_secret_cannot_join() {
+    // Found by driving a five-node cluster, not by reading the code: SWIM was
+    // unauthenticated, so a node with the wrong `cluster_secret` joined the
+    // member set. Replication rejected it correctly and it could read nothing
+    // — but webhook ownership is rendezvous-hashed over exactly this set, so
+    // it won roughly 1/(N+1) of subscriptions and delivered none of them.
+    // Eight of twelve arrived; four vanished, with every real node believing
+    // it had correctly stood down. See ADR-053.
+    let a = node().await;
+    let b = node().await;
+    let impostor = node_with_secret("a-completely-different-secret").await;
+
+    // The impostor announces itself to a legitimate node, repeatedly.
+    for _ in 0..3 {
+        impostor.announce.send(a.addr).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    // ...and a legitimate node announces to it, so the refusal holds in both
+    // directions rather than only for unsolicited traffic.
+    a.announce.send(impostor.addr).await.unwrap();
+
+    // Meanwhile the two legitimate nodes must still find each other, or this
+    // test would pass on a cluster that simply never formed.
+    a.announce.send(b.addr).await.unwrap();
+    eventually("a and b to meet", || a.members.snapshot().contains(&b.addr)).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    assert!(
+        !a.members.snapshot().contains(&impostor.addr),
+        "an unauthenticated node must not reach the member set: {:?}",
+        a.members.snapshot()
+    );
+    assert!(!b.members.snapshot().contains(&impostor.addr));
+    assert!(
+        !impostor.members.node_ids().contains(&a.node_id),
+        "and it must not learn the cluster's membership either"
+    );
+    assert_eq!(a.members.snapshot().len(), 1, "a sees exactly one peer: b");
 }
 
 #[tokio::test]

@@ -501,10 +501,14 @@ async fn spawn_cluster(
 
         let live = kimmy_cluster::Members::default();
         let (tx, feed) = kimmy_cluster::SeedFeed::channel();
+        // The same secret the replication handshake uses: membership is
+        // authenticated too, so an unauthenticated node cannot join the member
+        // set that webhook ownership is computed over (ADR-053).
         cluster_tasks.push(tokio::spawn(kimmy_cluster::membership::run(
             socket,
             advertised(local),
             engine.node_id(),
+            secret.clone(),
             live.clone(),
             feed,
         )));

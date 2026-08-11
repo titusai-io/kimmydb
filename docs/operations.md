@@ -150,6 +150,20 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > while membership is down, so data keeps moving; what stops is failure
 > detection and webhook ownership.
 
+> **Upgrading a cluster to a version that authenticates SWIM.** The third
+> cutover of this shape, for the same reason. Membership datagrams now carry an
+> HMAC over the payload ([ADR-053](decisions.md)), and a tagged datagram is not
+> a valid untagged one, so old and new nodes cannot gossip. Stop the cluster,
+> upgrade every node, start it again. Replication is unaffected while
+> membership is down — it falls back to discovery — but failure detection and
+> webhook ownership are.
+>
+> **Rotating `cluster_secret` is the same operation.** A node holding a
+> different secret is now refused by membership as well as by replication,
+> which is the point: before, it joined the member set and silently won
+> ownership of a share of the webhook subscriptions it could not deliver. Roll
+> the secret with the cluster stopped, not one node at a time.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback

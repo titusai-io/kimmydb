@@ -473,6 +473,66 @@ node computes the same answer.
 
 ---
 
+## 🟢 SWIM membership is authenticated (was an open drift, found by driving a cluster)
+
+**Was.** Only the TCP replication handshake verified `cluster_secret`;
+`membership.rs` never referenced it. A node holding a *different* secret joined
+a real cluster's SWIM member set. Replication rejected it correctly and it
+could read nothing — so it looked contained.
+
+**It was not contained.** Webhook ownership is rendezvous-hashed over the live
+member set, so the impostor became an ownership candidate, won roughly
+`1/(N+1)` of subscriptions, and delivered none of them. Measured on a
+three-node cluster with twelve subscriptions: **eight delivered, four delivered
+nothing**, with every real node believing it had correctly stood down. The same
+failure shape as the M8 task-1 bug, reached from the other side.
+
+**The realistic trigger is a rolling `cluster_secret` rotation**, not an
+attacker — which is what makes it likely rather than theoretical.
+
+**Now.** Every membership datagram carries `HMAC-SHA256(cluster_secret,
+payload)` as a 32-byte prefix, verified in constant time before foca sees it
+([ADR-053](decisions.md)). Rejections are counted and logged at powers of two,
+so a misconfigured peer says so once rather than every probe interval.
+
+**Found by driving a five-node cluster, not by the suite.** Every automated
+test builds its cluster with one shared secret, so nothing ever presented a
+wrong one. There is now an integration test that does.
+
+**A wire break, and the third of its kind** — nodes must be upgraded together,
+like ADR-040 and ADR-051. Recorded in [Operations](operations.md).
+
+**Not fixed here: the datagrams are still readable.** Authentication was the
+missing property and the one the failure needed; encryption needs a key
+schedule, nonces and replay handling, and would not have changed the outcome.
+Membership topology remains visible to anyone on the path — see the row in
+[Security](security.md).
+
+---
+
+## 🟢 The HTTP reference lists every route again
+
+**Was.** `docs/http-api.md` presents a table titled **Endpoints** that reads as
+complete. It was missing **six of twenty-eight routes**: `aggregate`, `vector`
+(configure), `vector_search`, `hybrid_search`, and both `webhooks` routes. Each
+was documented on its own page, so nothing looked wrong — a reader of the API
+reference simply could not learn they existed.
+
+**Found the same way**, by reaching for `/vector_search` while driving a
+cluster and not finding it in the reference.
+
+**Now.** All twenty-eight are listed, each linking to its own page for detail.
+And the claim is **checked rather than asserted**:
+`every_route_is_in_the_http_reference` parses the router's own source and fails
+naming any route absent from the document — the lesson M8 spent twelve tasks
+relearning.
+
+**Corrected while there:** the same document's coverage table said node-to-node
+replication was "still plaintext", twenty lines above a section explaining that
+replication runs over TLS always. It had been wrong since ADR-040.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |

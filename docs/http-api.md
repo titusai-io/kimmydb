@@ -33,12 +33,23 @@ Default port **7878**.
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
+| `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` — see [Aggregation](aggregation.md) |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
+| `POST` | `/v1/db/{db}/coll/{coll}/vector` | `admin` — configure embedding ([Vectors](vectors.md)) |
 | `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
+| `POST` | `/v1/db/{db}/coll/{coll}/vector_search` | `search` ([Vectors](vectors.md)) |
+| `POST` | `/v1/db/{db}/coll/{coll}/hybrid_search` | `search` ([Vectors](vectors.md)) |
+| `GET` `POST` | `/v1/db/{db}/coll/{coll}/webhooks` | `webhook` ([Webhooks](webhooks.md)) |
+| `DELETE` | `/v1/db/{db}/coll/{coll}/webhooks/{id}` | `webhook` ([Webhooks](webhooks.md)) |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
+| `GET` | `/v1/admin/backup` | `admin` over `*` — see [Backup](#backup) |
 | `POST` | `/mcp` | authenticated; per-tool ([MCP](mcp.md)) |
+
+Every route the server registers is in that table. Several have their own page
+for the detail — the link is in the row — but a reader should not have to find
+the page to learn the endpoint exists.
 
 ---
 

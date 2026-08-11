@@ -573,3 +573,41 @@ async fn drop_index(
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::drop_index(&state, &auth, &db, &coll, &name)?))
 }
+
+#[cfg(test)]
+mod tests {
+    /// Every route the router registers must appear in the HTTP reference.
+    ///
+    /// Not pedantry: `http-api.md` presents a table titled **Endpoints** that
+    /// reads as complete, and it was missing six of twenty-eight routes —
+    /// aggregate, vector configuration, both searches, and both webhook
+    /// routes. Each was documented on its own page, so nothing looked wrong;
+    /// a reader of the API reference simply could not learn they existed.
+    ///
+    /// Found by driving a cluster and reaching for `/vector_search`, which the
+    /// reference does not mention. The claim that the table is complete is now
+    /// checked rather than asserted — the lesson M8 kept relearning.
+    #[test]
+    fn every_route_is_in_the_http_reference() {
+        const SOURCE: &str = include_str!("routes.rs");
+        const REFERENCE: &str = include_str!("../../../docs/http-api.md");
+
+        let mut missing = Vec::new();
+        for line in SOURCE.lines() {
+            let Some(rest) = line.trim().strip_prefix(".route(\"") else {
+                continue;
+            };
+            let Some(path) = rest.split('"').next() else {
+                continue;
+            };
+            if !REFERENCE.contains(path) {
+                missing.push(path.to_string());
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "these routes are registered but absent from docs/http-api.md: {missing:#?}"
+        );
+    }
+}
