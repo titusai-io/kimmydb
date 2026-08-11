@@ -141,41 +141,52 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         && let Some(bounds) = predicates.get(&field.path)
         && (bounds.lower.is_some() || bounds.upper.is_some())
     {
-        // A descending field inverts the encoding, which swaps which end of the
-        // range each bound belongs to. Rather than risk getting that backwards
-        // — the failure mode is a range that is too *narrow* — the range is
-        // dropped and only the equality prefix is used. Wider, always correct.
-        if !field.descending {
-            // Whether BOTH ends of the range may be used hangs on one fact
-            // about the data, not the query: does any document contribute more
-            // than one key?
-            //
-            // A field can hold an array — a *multikey* index — and Mongo
-            // semantics let **different elements** satisfy each end of a range.
-            // `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` because 2 satisfies
-            // the lower bound and 0 the upper, even though neither satisfies
-            // both. Intersecting the bounds into a single key range would
-            // exclude that document entirely — a range that is too narrow, and
-            // therefore silently wrong.
-            //
-            // So: a multikey index uses one bound, keeping the range a superset
-            // the recheck trims. An index that has never seen an array — the
-            // write path tracks this, see `IndexMeta::multikey` — has exactly
-            // one key per document per field, and a scalar satisfies both
-            // bounds iff that key lies in the intersection. Both bounds, and
-            // the scan stops where the range does.
-            match (&bounds.lower, &bounds.upper) {
-                (Some(lo), Some(hi)) if !index.multikey => {
-                    lower.push((lo.clone(), false));
-                    upper.push((hi.clone(), false));
-                    both_bounds = true;
-                }
-                (Some(v), _) => lower.push((v.clone(), false)),
-                (None, Some(v)) => upper.push((v.clone(), false)),
-                (None, None) => unreachable!("checked above"),
+        // Whether BOTH ends of the range may be used hangs on one fact
+        // about the data, not the query: does any document contribute more
+        // than one key?
+        //
+        // A field can hold an array — a *multikey* index — and Mongo
+        // semantics let **different elements** satisfy each end of a range.
+        // `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` because 2 satisfies
+        // the lower bound and 0 the upper, even though neither satisfies
+        // both. Intersecting the bounds into a single key range would
+        // exclude that document entirely — a range that is too narrow, and
+        // therefore silently wrong.
+        //
+        // So: a multikey index uses one bound, keeping the range a superset
+        // the recheck trims. An index that has never seen an array — the
+        // write path tracks this, see `IndexMeta::multikey` — has exactly
+        // one key per document per field, and a scalar satisfies both
+        // bounds iff that key lies in the intersection. Both bounds, and
+        // the scan stops where the range does.
+        //
+        // A descending field inverts its encoded bytes, which reverses
+        // order: the value-space lower bound caps the key-space *top*, and
+        // the upper bound its bottom. Getting this swap backwards produces
+        // a range that is too narrow — which is why, until it had its own
+        // property test, the range was dropped here rather than risked.
+        let desc = field.descending;
+        match (&bounds.lower, &bounds.upper) {
+            (Some(lo), Some(hi)) if !index.multikey => {
+                let (key_low, key_high) = if desc { (hi, lo) } else { (lo, hi) };
+                lower.push((key_low.clone(), desc));
+                upper.push((key_high.clone(), desc));
+                both_bounds = true;
             }
-            used += 1;
+            // One usable end — or a multikey index, where only one may be
+            // used. The value-space lower bound is preferred, landing on
+            // whichever key-space end the encoding sends it to.
+            (Some(v), _) => match desc {
+                true => upper.push((v.clone(), true)),
+                false => lower.push((v.clone(), false)),
+            },
+            (None, Some(v)) => match desc {
+                true => lower.push((v.clone(), true)),
+                false => upper.push((v.clone(), false)),
+            },
+            (None, None) => unreachable!("checked above"),
         }
+        used += 1;
     }
 
     if used == 0 {
@@ -364,12 +375,65 @@ mod tests {
     }
 
     #[test]
-    fn a_descending_range_falls_back_to_the_equality_prefix() {
-        // Getting the bound swap backwards would produce a range that is too
-        // narrow, so the range is dropped rather than risked.
+    fn a_descending_range_swaps_which_end_each_bound_narrows() {
+        // Descending encoding inverts bytes, reversing order — so the
+        // value-space lower bound must cap the key-space *top*. The proof is
+        // in the encoded keys: with `n >= 5`, the key for n=7 must fall
+        // inside the plan's range and the key for n=3 outside it.
+        let idx = [index(0, vec![IndexField::descending("n")])];
+        let key_of = |n: i32| keyenc::encode_compound_ordered(&[(Bson::Int32(n), true)]).unwrap();
+
+        let p = plan(doc! { "n": { "$gte": 5 } }, &idx).unwrap();
+        assert_eq!(p.fields_used, 1, "the range must be planned, not dropped");
+        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        assert!(in_range(&key_of(7)), "7 satisfies n >= 5");
+        assert!(in_range(&key_of(5)), "the bound itself is inclusive");
+        assert!(!in_range(&key_of(3)), "3 does not satisfy n >= 5");
+
+        // And the mirror: `n <= 5` keeps 3, excludes 7.
+        let p = plan(doc! { "n": { "$lte": 5 } }, &idx).unwrap();
+        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        assert!(in_range(&key_of(3)));
+        assert!(!in_range(&key_of(7)));
+    }
+
+    #[test]
+    fn a_two_sided_descending_range_uses_both_ends() {
+        let idx = [index(0, vec![IndexField::descending("n")])];
+        let key_of = |n: i32| keyenc::encode_compound_ordered(&[(Bson::Int32(n), true)]).unwrap();
+
+        let p = plan(doc! { "n": { "$gte": 5, "$lte": 9 } }, &idx).unwrap();
+        assert!(p.both_bounds, "a scalar-only descending index must intersect");
+        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        for n in 5..=9 {
+            assert!(in_range(&key_of(n)), "{n} is inside [5, 9]");
+        }
+        assert!(!in_range(&key_of(4)), "below the range");
+        assert!(!in_range(&key_of(10)), "above the range");
+    }
+
+    #[test]
+    fn a_multikey_descending_index_still_uses_only_one_end() {
+        // The multikey rule is about the data, not the direction: different
+        // array elements can satisfy each bound regardless of how the key is
+        // encoded.
+        let idx = [multikey(0, vec![IndexField::descending("n")])];
+        let two_sided = plan(doc! { "n": { "$gte": 5, "$lte": 9 } }, &idx).unwrap();
+        assert!(!two_sided.both_bounds);
+        let lower_only = plan(doc! { "n": { "$gte": 5 } }, &idx).unwrap();
+        assert_eq!(
+            two_sided, lower_only,
+            "multikey must not narrow past the value-space lower bound"
+        );
+    }
+
+    #[test]
+    fn a_descending_range_after_an_equality_prefix_is_planned() {
+        // The compound shape the old fallback dropped: `{a: 1, n: {$gt: 5}}`
+        // over (a asc, n desc) used only the equality prefix.
         let idx = [index(0, vec![IndexField::ascending("a"), IndexField::descending("n")])];
         let p = plan(doc! { "a": 1, "n": { "$gt": 5 } }, &idx).unwrap();
-        assert_eq!(p.fields_used, 1, "only the equality prefix should be used");
+        assert_eq!(p.fields_used, 2, "the descending range must be used");
     }
 
     #[test]

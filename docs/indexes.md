@@ -166,8 +166,15 @@ re-applied regardless.
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
 | `$in` | Needs a *union* of point lookups. 📋 Planned |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
-| A range on a **descending** field | Inverted encoding swaps which end each bound belongs to; getting it backwards yields a range that is too **narrow**. Falls back to the equality prefix |
-| The **second end** of a two-sided range | See below — an array field can satisfy each bound with a *different element* |
+| The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
+
+Ranges on **descending** fields are planned like any other. The inverted
+encoding swaps which end each bound narrows — the value-space lower bound caps
+the key-space *top* — and getting that swap backwards yields a range that is
+too **narrow**, which is why the planner refused these outright until the swap
+had its own tests: encoded-key assertions on the planner, equivalence and
+selectivity tests against a real engine, and the property test that caught the
+original two-sided-range bug, which generates descending indexes too.
 
 ### When an index is worth it — measured
 

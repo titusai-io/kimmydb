@@ -6,7 +6,7 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-10 — M7: multikey tracking, and the register's last 🔴 closed
+## As of 2026-08-10 — M7: descending ranges planned
 
 **M0–M6 are complete; M7 (query engine completion) is underway.** The
 milestone record lives in [Decisions](decisions.md) and
@@ -16,42 +16,40 @@ milestone record lives in [Decisions](decisions.md) and
 
 | | |
 |---|---|
-| `main` | PRs #16–#35 merged: the M7 plan and the webhook warm-up fixes |
-| `m7-multikey-tracking` | **Not merged.** `IndexMeta::multikey`, both bounds on scalar-only indexes, the snapshot-checked scan, and the stale-handle maintenance fix |
+| `main` | PRs #16–#36 merged: the M7 plan, the webhook warm-up, multikey tracking |
+| `m7-descending-ranges` | **Not merged.** Ranges on descending fields are planned: the bound swap, with encoded-key planner tests, engine equivalence + selectivity tests, and the compound ascending-prefix + descending-range shape |
 
 **Gate on it:** fmt · clippy `-D warnings` ·
 `./scripts/check-native-deps.sh` · full suite · driven against a live node.
 
 ### What this branch did, so it is not re-derived
 
-Whether a two-sided range may intersect both bounds hangs on one fact about
-the data: does any document contribute more than one index key? `{a: [2, 0]}`
-matches `{$gte: 1, $lte: 1}` through *different elements*, so intersection
-loses it. The branch tracks that fact — `IndexMeta::multikey`, set in the same
-transaction as the entries, by write, backfill, replication apply, and rewind;
-one-way — and the planner intersects only when it is false. Multikey indexes
-keep the one-bound superset.
+A descending component's encoded bytes are inverted, which reverses order: the
+value-space lower bound caps the key-space **top**, and the upper bound its
+bottom. The planner now performs that swap instead of dropping the range —
+which it had done since M1, precisely because a swap done backwards yields a
+range that is too *narrow*, the silent failure mode. The multikey rule is
+unchanged and direction-independent: a multikey index uses one bound, wherever
+the encoding sends it.
 
-Two hazards surfaced while closing it, both of the same species — **metadata
-read in one transaction proves nothing about another**:
+What holds it down: encoded-key assertions in the planner (a key for a value
+inside the range must fall inside the plan's bounds, outside must fall
+outside), engine equivalence tests that now `expect` a plan rather than
+skipping when none is chosen — the old test **passed vacuously** for the
+descending path, which is worth remembering — a selectivity test (five
+candidates for a five-value range over twenty), the compound
+ascending-prefix + descending-range shape, and the equivalence property test,
+which already generated descending indexes and two-sided ranges and began
+exercising the swap the moment the planner stopped refusing it.
 
-1. A both-bounds plan is built from a metadata read that is stale by scan
-   time. `index_candidates_unless_multikey` re-reads the flag **in the same
-   snapshot as the scan** and answers `None` if it flipped; the query falls
-   back to a collection scan. Possible at most once per index, ever.
-2. **Index maintenance trusted the caller's index list.** A write through a
-   `CollectionMeta` fetched before an index existed skipped that index
-   silently — no entries, no unique check, no multikey observation. Found by
-   this branch's own tests. `maintain` now re-reads definitions inside the
-   write's transaction (`current_indexes`).
+The multikey branch's invariants below still stand; nothing here weakened
+them.
 
 ### What comes next in M7
 
-1. **Ranges on descending fields** — the bound swap; failure mode is a
-   too-narrow range, so it gets its own property test.
-2. **`$in` as a union of point lookups** — new planner strategy, visible in
+1. **`$in` as a union of point lookups** — new planner strategy, visible in
    `explain`.
-3. Mutation testing on the planner and key encoding; final docs pass.
+2. Mutation testing on the planner and key encoding; final docs pass.
 
 ### What webhooks are, in one paragraph
 

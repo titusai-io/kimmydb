@@ -1368,9 +1368,68 @@ mod tests {
         ] {
             let scan = by_scan(&engine, &coll, &query);
             assert!(!scan.is_empty(), "{query:?} should match something, or it proves nothing");
-            if let Some(indexed) = by_index(&engine, &coll, &query) {
-                assert_eq!(indexed, scan, "descending index disagreed for {query:?}");
-            }
+            // `expect` rather than `if let`: descending ranges are planned
+            // now, so a missing plan is a regression, not a skip. This test
+            // once passed vacuously for exactly that reason.
+            let indexed =
+                by_index(&engine, &coll, &query).expect("the descending index should be used");
+            assert_eq!(indexed, scan, "descending index disagreed for {query:?}");
+        }
+    }
+
+    #[test]
+    fn a_two_sided_range_on_a_descending_scalar_index_reads_only_the_range() {
+        // The same selectivity proof as the ascending one: twenty scalars, a
+        // range covering five, five candidates. A swap done backwards shows
+        // up here as zero candidates — an empty range, silently wrong — and
+        // the equivalence tests above would catch the lost documents.
+        let (engine, coll, _dir) = engine();
+        for i in 0..20 {
+            engine.insert(&coll, doc! { "_id": i as i64, "n": i }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::descending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let filter = kimmy_query::filter::parse(&doc! { "n": { "$gte": 5, "$lte": 9 } }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes).expect("index applies");
+        assert!(plan.both_bounds);
+
+        let candidates = engine
+            .index_candidates_unless_multikey(&coll, plan.index_id, &plan.lower, &plan.upper)
+            .unwrap()
+            .expect("not multikey");
+        assert_eq!(candidates.len(), 5, "the scan must stop at both ends of the range");
+    }
+
+    #[test]
+    fn a_descending_range_after_an_equality_prefix_agrees_with_a_scan() {
+        // The compound shape the old fallback dropped entirely. The prefix is
+        // ascending, the range field descending, and the range must narrow
+        // within the prefix rather than fall back to scanning all of a == 1.
+        let (engine, coll, _dir) = engine();
+        for i in 0..10 {
+            engine.insert(&coll, doc! { "_id": i as i64, "a": i % 2, "n": i }).unwrap();
+        }
+        engine
+            .create_index(
+                "app",
+                "docs",
+                vec![IndexField::ascending("a"), IndexField::descending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        for query in [
+            doc! { "a": 1, "n": { "$gt": 2 } },
+            doc! { "a": 0, "n": { "$gte": 2, "$lte": 6 } },
+            doc! { "a": 1, "n": { "$lt": 7 } },
+        ] {
+            let scan = by_scan(&engine, &coll, &query);
+            assert!(!scan.is_empty(), "{query:?} should match something");
+            let indexed = by_index(&engine, &coll, &query).expect("the index should be used");
+            assert_eq!(indexed, scan, "compound descending disagreed for {query:?}");
         }
     }
 
