@@ -288,15 +288,16 @@ port.
 | `kimmy_rate_limited_total` | Refused by a rate limit |
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
 | `kimmy_backups_total` | Backups served |
+| `kimmy_cluster_members` | Peers SWIM currently considers alive; 0 with clustering off. A formed three-node cluster reads 2 on every node |
+| `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet applied locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero |
+| `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 
 Counters render at zero before their first event, so a dashboard shows "nothing
 has gone wrong yet" rather than "no data".
 
-> **Not included, on purpose:** latency histograms and oplog lag. A histogram
-> needs buckets chosen from measurements that do not exist yet for end-to-end
-> requests, and lag needs a peer's version vector that the API layer does not
-> hold. Both are worth doing; neither is worth guessing. See
-> [ADR-043](decisions.md).
+The two absences ADR-043 recorded — latency histograms and oplog lag — are
+filled by the last two rows, each on the terms that kept it out
+([ADR-046](decisions.md)).
 
 ---
 

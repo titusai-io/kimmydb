@@ -69,13 +69,21 @@ pub fn router(state: SharedState) -> Router {
         .with_state(state)
 }
 
-/// Count every response by status.
+/// Count every response by status, and time the ones that are real traffic.
 async fn count_request(
     State(state): State<SharedState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
+    // Health probes and scrapes are excluded from the *histogram* — every few
+    // seconds forever, they would crowd the buckets the real traffic lands in
+    // — but still counted as requests, so a scrape stays visible as traffic.
+    let timed = !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
+    let started = std::time::Instant::now();
     let response = next.run(request).await;
+    if timed {
+        state.metrics.record_latency(started.elapsed());
+    }
     state.metrics.record_request(response.status().as_u16());
     response
 }

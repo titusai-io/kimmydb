@@ -17,7 +17,7 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
-use kimmy_core::{Hlc, OpKind, OplogEntry};
+use kimmy_core::{Hlc, OpKind, OplogEntry, VersionVector};
 use tracing::{debug, warn};
 
 use crate::engine::Engine;
@@ -40,6 +40,34 @@ pub struct SyncOutcome {
     /// out of the peer's oplog — counted rather than silently dropped, because
     /// that case is a gap in coverage rather than convergence.
     pub unknown_collection: usize,
+    /// Milliseconds of the peer's history still unapplied after this round.
+    ///
+    /// Zero when caught up; non-zero when the peer holds more than one batch
+    /// of backlog. Measured from the entries' own timestamps — the age span
+    /// of undelivered work — not from any cursor. See [`lag_behind_ms`].
+    pub lag_ms: u64,
+}
+
+/// How far `mine` trails `theirs`, in milliseconds of history.
+///
+/// For every origin where the peer's coverage is ahead, the gap between the
+/// two wall clocks is the span of that origin's entries this node has not
+/// applied; the maximum over origins is what an operator alerts on.
+///
+/// An origin this node has **never** seen contributes nothing: with only the
+/// peer's *newest* timestamp to hand, the honest gap would need the oldest,
+/// and `newest − zero` is the age of the epoch, not of the backlog. A joining
+/// node's lag becomes meaningful with its first applied batch — moments in —
+/// rather than starting at a fifty-year lie.
+pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector) -> u64 {
+    theirs
+        .iter()
+        .filter_map(|(node, hlc)| {
+            let held = mine.get(node);
+            (held > Hlc::ZERO && hlc > held).then(|| hlc.wall_ms.saturating_sub(held.wall_ms))
+        })
+        .max()
+        .unwrap_or(0)
 }
 
 impl SyncOutcome {
@@ -295,6 +323,67 @@ mod tests {
     fn a_fresh_engine_has_an_empty_vector() {
         let (engine, _dir) = engine();
         assert!(engine.version_vector().unwrap().is_empty());
+    }
+
+    #[test]
+    fn lag_is_the_span_of_unapplied_history() {
+        use kimmy_core::{NodeId, Stamp};
+
+        let origin = NodeId::generate();
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(Hlc::new(10_000, 0), origin));
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin));
+
+        assert_eq!(lag_behind_ms(&mine, &theirs), 7_500, "7.5s of that origin is unapplied");
+        assert_eq!(lag_behind_ms(&theirs, &mine), 0, "being ahead is not lag");
+        assert_eq!(lag_behind_ms(&mine, &mine), 0, "caught up is zero");
+    }
+
+    #[test]
+    fn lag_takes_the_worst_origin_not_the_sum() {
+        use kimmy_core::{NodeId, Stamp};
+
+        let (a, b) = (NodeId::generate(), NodeId::generate());
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(Hlc::new(1_000, 0), a));
+        mine.observe(Stamp::new(Hlc::new(1_000, 0), b));
+        let mut theirs = mine.clone();
+        theirs.observe(Stamp::new(Hlc::new(2_000, 0), a));
+        theirs.observe(Stamp::new(Hlc::new(9_000, 0), b));
+
+        // An alert cares how far behind the worst origin is; summing origins
+        // would report a cluster-wide write burst as one enormous lag.
+        assert_eq!(lag_behind_ms(&mine, &theirs), 8_000);
+    }
+
+    #[test]
+    fn an_origin_never_seen_contributes_no_lag() {
+        use kimmy_core::{NodeId, Stamp};
+
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(Hlc::new(1_786_000_000_000, 0), NodeId::generate()));
+
+        // The peer's vector holds only the *newest* stamp per origin, so an
+        // origin this node has never seen has no honest gap to report —
+        // `newest − zero` would be the age of the epoch, a fifty-year lie a
+        // joining node would alert on. Its lag becomes real with the first
+        // applied batch.
+        assert_eq!(lag_behind_ms(&VersionVector::new(), &theirs), 0);
+    }
+
+    #[test]
+    fn a_synced_pair_reports_zero_lag() {
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let coll = a.create_collection("app", "docs").unwrap();
+        for i in 0..5 {
+            a.insert(&coll, doc! { "_id": i, "n": i }).unwrap();
+        }
+        sync(&a, &b);
+        let (va, vb) = (a.version_vector().unwrap(), b.version_vector().unwrap());
+        assert_eq!(lag_behind_ms(&vb, &va), 0, "a caught-up pair must read zero");
+        assert_eq!(lag_behind_ms(&va, &vb), 0);
     }
 
     #[test]

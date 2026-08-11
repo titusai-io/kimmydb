@@ -50,6 +50,17 @@ pub struct ReplicationConfig {
     /// tell a node that was removed from a Service from one that never
     /// answered. Discovery remains the bootstrap and the fallback.
     pub members: Option<Members>,
+    /// Called after each sync round with the round's worst replication lag,
+    /// in seconds.
+    ///
+    /// A callback rather than a metrics handle: the peer's version vector —
+    /// the only thing lag can honestly be computed from — exists nowhere but
+    /// this loop, and this crate has no business knowing what the caller does
+    /// with the number (ADR-043 called this shape out when deferring the
+    /// metric). Not called when no peer was reached: an unreachable cluster
+    /// has *unknown* lag, and overwriting the last known value with zero
+    /// would report the outage as perfect health.
+    pub on_lag: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 impl ReplicationConfig {
@@ -63,6 +74,7 @@ impl ReplicationConfig {
             fanout: DEFAULT_FANOUT,
             announce: None,
             members: None,
+            on_lag: None,
         }
     }
 }
@@ -106,6 +118,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     _ => discovered.clone(),
                 };
 
+                // The round's worst lag across the peers actually reached.
+                // `None` when nothing answered, and then nothing is reported:
+                // an unreachable cluster has unknown lag, not zero lag.
+                let mut round_lag: Option<u64> = None;
                 for peer in health.select(&peers, Instant::now()) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
@@ -113,6 +129,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     match sync_once(&engine, peer, &config.secret).await {
                         Ok(outcome) => {
                             health.succeeded(peer);
+                            round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             if outcome.total() > 0 {
                                 info!(
                                     %peer,
@@ -139,6 +156,9 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             }
                         }
                     }
+                }
+                if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
+                    on_lag(lag_ms / 1_000);
                 }
             }
         }

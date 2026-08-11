@@ -86,7 +86,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let gc_handle = spawn_collector(Arc::clone(&engine), &config);
-    let cluster = spawn_cluster(Arc::clone(&engine), &config).await?;
+    let cluster = spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config).await?;
 
     // The webhook dispatcher is an ordinary oplog consumer, like the embedding
     // worker below. It derives which subscriptions it owns from the same live
@@ -270,7 +270,11 @@ struct Cluster {
     advertised: Option<std::net::SocketAddr>,
 }
 
-async fn spawn_cluster(engine: Arc<Engine>, config: &Config) -> Result<Cluster> {
+async fn spawn_cluster(
+    engine: Arc<Engine>,
+    state: kimmy_api::SharedState,
+    config: &Config,
+) -> Result<Cluster> {
     if !config.cluster.enabled {
         return Ok(Cluster { tasks: Vec::new(), members: None, advertised: None });
     }
@@ -325,6 +329,11 @@ async fn spawn_cluster(engine: Arc<Engine>, config: &Config) -> Result<Cluster> 
             // Cloned: the replication loop and the webhook dispatcher both
             // read the same live set, and `Members` is a shared handle.
             members: members.clone(),
+            // The replication loop is the only place a peer's version vector
+            // exists, so lag is pushed from there into the gauge (ADR-046).
+            on_lag: Some(std::sync::Arc::new(move |secs| {
+                state.metrics.set_replication_lag_secs(secs);
+            })),
         },
     ));
     cluster_tasks.push(replicating);

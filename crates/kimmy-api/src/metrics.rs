@@ -6,25 +6,38 @@
 //!
 //! # What is deliberately not here
 //!
-//! **Latency histograms.** A useful one needs buckets chosen from measurements
-//! this project has for the storage layer but not for end-to-end requests, and
-//! a histogram with guessed buckets reports confidently about the wrong ranges.
-//!
-//! **Oplog lag.** Meaningful lag is "how far behind the furthest-ahead peer is
-//! this node", which needs a peer's version vector — information the API layer
-//! does not hold and would have to be pushed here by the replication loop. Worth
-//! doing; not guessed at.
-//!
 //! **Per-collection series.** `/metrics` is unauthenticated, and a series per
 //! collection would put the schema on it. The endpoint has always reported
 //! counts rather than names for that reason.
+//!
+//! The two absences ADR-043 recorded are now filled, each on the terms that
+//! kept it out. The latency histogram's buckets were **measured**, not
+//! guessed — end-to-end against a release build, conditions in ADR-046 — and
+//! replication lag is **pushed here by the replication loop**, which is the
+//! only place a peer's version vector exists.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
+/// Histogram bucket upper bounds, in microseconds.
+///
+/// Chosen from measurement, not preference (ADR-046): end-to-end against a
+/// release build, point reads (`GET /docs/{id}`) run p50 ≈ 250 µs / p99 under
+/// 1 ms, filtered finds ≈ 1.4–2.6 ms, single-document inserts p50 ≈ 6 ms —
+/// one durable commit each — and a 10k-document aggregation 10–43 ms. The
+/// buckets bracket those clusters with headroom on both ends; the wide top
+/// bucket exists so a stall shows as a shape change rather than vanishing
+/// into `+Inf`.
+const LATENCY_BUCKETS_US: [u64; 12] =
+    [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000];
+
 /// Counters for one running server.
 pub struct Metrics {
     started: Instant,
+    latency_buckets: [AtomicU64; LATENCY_BUCKETS_US.len()],
+    latency_sum_us: AtomicU64,
+    latency_count: AtomicU64,
+    replication_lag_secs: AtomicU64,
     requests: AtomicU64,
     responses_2xx: AtomicU64,
     responses_4xx: AtomicU64,
@@ -46,6 +59,10 @@ impl Default for Metrics {
     fn default() -> Self {
         Self {
             started: Instant::now(),
+            latency_buckets: std::array::from_fn(|_| AtomicU64::new(0)),
+            latency_sum_us: AtomicU64::new(0),
+            latency_count: AtomicU64::new(0),
+            replication_lag_secs: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
             responses_4xx: AtomicU64::new(0),
@@ -127,6 +144,33 @@ impl Metrics {
         self.webhook_backlog_secs.store(backlog_secs, Ordering::Relaxed);
     }
 
+    /// Record one request's end-to-end latency.
+    ///
+    /// Non-cumulative per bucket; the render accumulates, because Prometheus
+    /// buckets are cumulative on the wire but a store-time increment of every
+    /// bucket ≥ the observation would be N writes for one sample.
+    pub fn record_latency(&self, elapsed: std::time::Duration) {
+        let micros = elapsed.as_micros().min(u128::from(u64::MAX)) as u64;
+        let slot = LATENCY_BUCKETS_US.iter().position(|&upper| micros <= upper);
+        if let Some(slot) = slot {
+            self.latency_buckets[slot].fetch_add(1, Ordering::Relaxed);
+        }
+        // Above every bound: only `+Inf` (derived from the count) sees it.
+        self.latency_sum_us.fetch_add(micros, Ordering::Relaxed);
+        self.latency_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Seconds of peer oplog history this node has not yet applied.
+    ///
+    /// Pushed by the replication loop after each round, because that is the
+    /// only place a peer's version vector exists — the reason ADR-043 left
+    /// this out rather than guessing. Zero when caught up; measured from the
+    /// entries' own timestamps, so it is the age of undelivered work, not the
+    /// age of a cursor.
+    pub fn set_replication_lag_secs(&self, secs: u64) {
+        self.replication_lag_secs.store(secs, Ordering::Relaxed);
+    }
+
     /// How many peers this node's SWIM instance currently considers alive.
     ///
     /// The observable the cluster harness asserts gossip *formed* with —
@@ -155,7 +199,7 @@ impl Metrics {
     /// keeping them apart avoids giving this type a database handle purely to
     /// print two numbers.
     pub fn render(&self) -> String {
-        format!(
+        let mut out = format!(
             "# HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
@@ -195,7 +239,10 @@ impl Metrics {
              kimmy_webhook_backlog_seconds {wh_backlog}\n\
              # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.\n\
              # TYPE kimmy_cluster_members gauge\n\
-             kimmy_cluster_members {cluster}\n",
+             kimmy_cluster_members {cluster}\n\
+             # HELP kimmy_replication_lag_seconds Seconds of peer oplog history not yet applied locally, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
+             # TYPE kimmy_replication_lag_seconds gauge\n\
+             kimmy_replication_lag_seconds {lag}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -212,7 +259,39 @@ impl Metrics {
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = self.get(&self.cluster_members),
-        )
+            lag = self.get(&self.replication_lag_secs),
+        );
+        self.render_latency(&mut out);
+        out
+    }
+
+    /// The latency histogram, in Prometheus's cumulative-bucket form.
+    ///
+    /// Buckets are stored non-cumulative and summed here, and the `le` labels
+    /// are the microsecond bounds converted to seconds — `f64` prints `0.0001`
+    /// and `10` exactly for every bound in the table, so the labels stay
+    /// stable strings rather than formatting artifacts.
+    fn render_latency(&self, out: &mut String) {
+        use std::fmt::Write;
+
+        out.push_str(
+            "# HELP kimmy_request_duration_seconds End-to-end request latency. Health and \
+             metrics routes are excluded, so scrapes do not crowd the buckets the real \
+             traffic lands in.\n\
+             # TYPE kimmy_request_duration_seconds histogram\n",
+        );
+        let mut cumulative = 0u64;
+        for (slot, upper) in LATENCY_BUCKETS_US.iter().enumerate() {
+            cumulative += self.get(&self.latency_buckets[slot]);
+            let le = *upper as f64 / 1e6;
+            let _ =
+                writeln!(out, "kimmy_request_duration_seconds_bucket{{le=\"{le}\"}} {cumulative}");
+        }
+        let count = self.get(&self.latency_count);
+        let sum = self.get(&self.latency_sum_us) as f64 / 1e6;
+        let _ = writeln!(out, "kimmy_request_duration_seconds_bucket{{le=\"+Inf\"}} {count}");
+        let _ = writeln!(out, "kimmy_request_duration_seconds_sum {sum}");
+        let _ = writeln!(out, "kimmy_request_duration_seconds_count {count}");
     }
 }
 
@@ -258,10 +337,42 @@ mod tests {
                 continue;
             }
             let value = line.rsplit(' ').next().expect("a value");
-            assert!(value.parse::<u64>().is_ok(), "not a numeric sample: {line}");
+            // f64 rather than u64: the histogram's `_sum` is in seconds.
+            assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        assert_eq!(samples, 16, "expected one sample per series: {out}");
+        // 17 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 32, "expected one sample per series: {out}");
+    }
+
+    #[test]
+    fn latency_buckets_are_cumulative_and_the_sum_is_in_seconds() {
+        use std::time::Duration;
+        let m = Metrics::default();
+        m.record_latency(Duration::from_micros(200)); // ≤ 250µs
+        m.record_latency(Duration::from_micros(200));
+        m.record_latency(Duration::from_millis(3)); // ≤ 5ms
+        let out = m.render();
+
+        // Cumulative: the 250µs bucket holds 2, everything from 5ms up holds
+        // all 3 — a non-cumulative render would break every Prometheus
+        // quantile function silently.
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"0.00025\"} 2"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"0.001\"} 2"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"0.005\"} 3"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"+Inf\"} 3"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_count 3"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_sum 0.0034"), "{out}");
+    }
+
+    #[test]
+    fn an_observation_above_every_bound_reaches_only_inf() {
+        use std::time::Duration;
+        let m = Metrics::default();
+        m.record_latency(Duration::from_secs(60));
+        let out = m.render();
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"10\"} 0"), "{out}");
+        assert!(out.contains("kimmy_request_duration_seconds_bucket{le=\"+Inf\"} 1"), "{out}");
     }
 
     #[test]
