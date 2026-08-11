@@ -164,6 +164,45 @@ impl EgressPolicy {
     }
 }
 
+/// A DNS resolver for the delivery client that checks what it resolves.
+///
+/// [`EgressPolicy::check`] resolves a hostname and checks every address — but
+/// the connection is then made by the HTTP client, which resolves *again*, and
+/// two resolutions are two answers. A name with a zero TTL can resolve
+/// publicly for the check and inward for the dial, walking a blocked address
+/// through the policy. Running the check inside the client's own resolver
+/// closes that window: the addresses checked are, by construction, the
+/// addresses dialled.
+///
+/// The pre-delivery [`EgressPolicy::check`] stays. It is what refuses literal
+/// addresses — which never reach a resolver — and it fails fast without
+/// waiting for a connection attempt.
+pub struct CheckedResolver {
+    policy: EgressPolicy,
+}
+
+impl CheckedResolver {
+    pub fn new(policy: EgressPolicy) -> Self {
+        Self { policy }
+    }
+}
+
+impl reqwest::dns::Resolve for CheckedResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let policy = self.policy.clone();
+        Box::pin(async move {
+            let host = name.as_str().to_string();
+            // Port 0 is a placeholder: the client replaces it with the URL's
+            // port. Only the addresses matter here.
+            let addrs: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            let ips: Vec<IpAddr> = addrs.iter().map(|a| a.ip()).collect();
+            policy.permits_addrs(&host, &ips)?;
+            Ok(Box::new(addrs.into_iter()) as Box<dyn Iterator<Item = std::net::SocketAddr> + Send>)
+        })
+    }
+}
+
 /// Whether an address is on the public internet.
 ///
 /// Written as a deny-list of the ranges that are *not* public, because the
@@ -330,5 +369,40 @@ mod tests {
         for url in ["https://", "notaurl", "https:///path"] {
             assert!(open().check(url).is_err(), "{url}");
         }
+    }
+
+    #[tokio::test]
+    async fn the_client_refuses_a_blocked_answer_at_dial_time() {
+        // The TOCTOU this resolver exists to close: `check` resolving one
+        // answer and the client dialling another. `localhost` resolves to
+        // loopback locally, with no external DNS involved, so it stands in for
+        // the name that "resolves inward" — and the refusal must come from the
+        // resolver inside the client, because nothing else here checks it.
+        let client = reqwest::Client::builder()
+            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(EgressPolicy::default())))
+            .build()
+            .unwrap();
+        let err = client.get("http://localhost:9/").send().await.unwrap_err();
+        // The chain debug-formats the source, so the refusal appears as the
+        // `Blocked` variant rather than its Display text.
+        let chain = format!("{err:?}");
+        assert!(chain.contains("Blocked"), "expected the egress refusal: {chain}");
+    }
+
+    #[tokio::test]
+    async fn the_client_resolver_honours_the_allowlist() {
+        // The operator's escape hatch has to survive the move into the
+        // resolver, or allowlisting a private host would pass registration and
+        // then fail every delivery. Port 1 is expected to refuse the
+        // connection — what matters is that the failure is a socket error, not
+        // the policy.
+        let policy = EgressPolicy::new(vec!["localhost".into()]);
+        let client = reqwest::Client::builder()
+            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(policy)))
+            .build()
+            .unwrap();
+        let err = client.get("http://localhost:1/").send().await.unwrap_err();
+        let chain = format!("{err:?}");
+        assert!(!chain.contains("Blocked"), "the allowlist was ignored: {chain}");
     }
 }

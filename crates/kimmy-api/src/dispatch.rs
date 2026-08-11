@@ -179,6 +179,15 @@ impl Backoff {
         self.failures.remove(subscription);
     }
 
+    /// Forget subscriptions that no longer exist.
+    ///
+    /// Failure state is otherwise only cleared by a successful delivery, which
+    /// a removed subscription can never have — so a subscription deleted while
+    /// its endpoint was failing would leave its entry behind forever.
+    fn prune(&mut self, live: &std::collections::HashSet<&str>) {
+        self.failures.retain(|id, _| live.contains(id.as_str()));
+    }
+
     /// Consecutive failures recorded for a subscription.
     pub fn failure_count(&self, subscription: &str) -> u32 {
         self.failures.get(subscription).map(|(n, _)| *n).unwrap_or(0)
@@ -351,9 +360,11 @@ fn wanted(entry: &OplogEntry, collection_id: u64, operations: &[String]) -> bool
 /// The event body a receiver gets, in the change-stream shape.
 ///
 /// The same field names a WebSocket subscriber sees, so a consumer can move
-/// between the two without relearning anything.
-pub fn render(entry: &OplogEntry) -> Value {
-    let mut payload = render_without_document(entry);
+/// between the two without relearning anything — plus the database and
+/// collection names, which a WebSocket subscriber does not need (it named them
+/// to connect) but a webhook receiver fed by several subscriptions does.
+pub fn render(entry: &OplogEntry, database: &str, collection: &str) -> Value {
+    let mut payload = render_without_document(entry, database, collection);
     if let Ok(Some(document)) = entry.document() {
         payload["fullDocument"] = crate::json::document_to_json(&document);
     }
@@ -366,7 +377,7 @@ pub fn render(entry: &OplogEntry) -> Value {
 /// still carries the event id, the operation and the document key, so the
 /// change is not lost — only the copy of the document is, and the receiver can
 /// read that itself.
-fn render_without_document(entry: &OplogEntry) -> Value {
+fn render_without_document(entry: &OplogEntry, database: &str, collection: &str) -> Value {
     let operation = match entry.kind {
         OpKind::Insert => "insert",
         OpKind::Update => "update",
@@ -378,8 +389,8 @@ fn render_without_document(entry: &OplogEntry) -> Value {
         "eventId": event_id(entry),
         "operationType": operation,
         "clusterTime": entry.stamp.hlc.to_string(),
-        "database": "",
-        "collection": "",
+        "database": database,
+        "collection": collection,
     });
     if let Some(id) = &entry.doc_id {
         payload["documentKey"] = json!({ "_id": crate::json::bson_to_json(&id.to_bson()) });
@@ -415,7 +426,8 @@ fn envelope_overhead(subscription: &str) -> usize {
 /// 3. That lone event goes out even if it still does not fit, which can only
 ///    happen with an enormous `_id`. A subscription that refused to send it
 ///    would never advance past it.
-fn assemble(subscription: &str, entries: &[OplogEntry], max_payload_bytes: usize) -> Delivery {
+fn assemble(job: &Job, entries: &[OplogEntry], max_payload_bytes: usize) -> Delivery {
+    let subscription = job.id.as_str();
     let mut events: Vec<Value> = Vec::new();
     let mut stamps: Vec<Stamp> = Vec::new();
     // Accumulated rather than re-serialising the whole batch per candidate,
@@ -425,7 +437,7 @@ fn assemble(subscription: &str, entries: &[OplogEntry], max_payload_bytes: usize
     let mut used = envelope_overhead(subscription);
 
     for entry in entries.iter().take(BATCH) {
-        let candidate = render(entry);
+        let candidate = render(entry, &job.database, &job.collection);
         let cost = candidate.to_string().len() + usize::from(!events.is_empty());
         if used + cost <= max_payload_bytes {
             used += cost;
@@ -437,7 +449,7 @@ fn assemble(subscription: &str, entries: &[OplogEntry], max_payload_bytes: usize
         if events.is_empty() {
             // Rule 2: too large on its own, so the document comes off rather
             // than the event being skipped.
-            let mut stripped = render_without_document(entry);
+            let mut stripped = render_without_document(entry, &job.database, &job.collection);
             stripped["fullDocumentOmitted"] = json!(true);
             stripped["omittedReason"] =
                 json!("document exceeds webhooks.max_payload_bytes; fetch it from the collection");
@@ -494,6 +506,11 @@ struct Job {
     id: String,
     url: String,
     secret: String,
+    /// The names, kept alongside the derived id: every delivered event carries
+    /// them, so a receiver fed by several subscriptions can route without
+    /// parsing anything out of the URL it registered.
+    database: String,
+    collection: String,
     collection_id: u64,
     operations: Vec<String>,
     invalidated: bool,
@@ -525,6 +542,8 @@ fn load_jobs(state: &SharedState) -> Vec<Job> {
             id: id.to_string(),
             url: url.to_string(),
             secret: secret.to_string(),
+            database: db.to_string(),
+            collection: coll.to_string(),
             collection_id,
             operations,
             invalidated: document.get_str("state").is_ok_and(|s| s == "invalidated"),
@@ -573,7 +592,9 @@ pub async fn dispatch_once(
     let now_ms = kimmy_storage::physical_now_ms();
 
     // --- Phase 1: plan, serially -------------------------------------------
-    for job in load_jobs(state) {
+    let jobs = load_jobs(state);
+    backoff.prune(&jobs.iter().map(|j| j.id.as_str()).collect());
+    for job in jobs {
         if job.invalidated {
             invalidated_count += 1;
         } else {
@@ -681,7 +702,7 @@ pub async fn dispatch_once(
             backlog_ms = backlog_ms.max(now_ms.saturating_sub(oldest.stamp.hlc.wall_ms));
         }
 
-        let delivery = assemble(&job.id, &batch, limits.max_payload_bytes);
+        let delivery = assemble(&job, &batch, limits.max_payload_bytes);
         let events = delivery.stamps.len();
         planned.push(Planned { job, progress, delivery, events });
     }
@@ -785,10 +806,26 @@ pub async fn run(
 ) {
     // Redirects are refused: a permitted host answering `302` to
     // `169.254.169.254` would otherwise walk the request through the policy.
-    let client = reqwest::Client::builder()
+    // And the client resolves through the policy itself, so the addresses the
+    // egress check approves are the addresses the connection uses — two
+    // separate resolutions would give a zero-TTL name a window between them.
+    let client = match reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(crate::egress::CheckedResolver::new(policy.clone())))
         .build()
-        .unwrap_or_default();
+    {
+        Ok(client) => client,
+        // Not `unwrap_or_default()`: a default client follows redirects and
+        // resolves unchecked, so falling back to it would silently shed both
+        // egress protections. No client, no deliveries — loudly.
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "cannot build the webhook delivery client; webhooks will not be delivered"
+            );
+            return;
+        }
+    };
 
     info!("webhook dispatcher started");
     let mut backoff = Backoff::default();
@@ -881,9 +918,33 @@ mod tests {
 
     #[test]
     fn a_rendered_event_carries_what_a_receiver_needs() {
-        let rendered = render(&entry(OpKind::Insert, 1, 100)).to_string();
+        let rendered = render(&entry(OpKind::Insert, 1, 100), "shop", "orders").to_string();
         assert!(rendered.contains("eventId"), "{rendered}");
         assert!(rendered.contains("\"operationType\":\"insert\""), "{rendered}");
         assert!(rendered.contains("documentKey"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rendered_event_names_its_database_and_collection() {
+        // A receiver fed by several subscriptions routes on these. They
+        // shipped as empty strings for all of M6 — this is the test that was
+        // missing.
+        let rendered = render(&entry(OpKind::Insert, 1, 100), "shop", "orders");
+        assert_eq!(rendered["database"], "shop");
+        assert_eq!(rendered["collection"], "orders");
+    }
+
+    #[test]
+    fn backoff_state_does_not_outlive_its_subscription() {
+        // Failure state is otherwise only cleared by a successful delivery,
+        // which a removed subscription can never have.
+        let mut backoff = Backoff::default();
+        backoff.failed("wh_kept");
+        backoff.failed("wh_removed");
+
+        backoff.prune(&std::collections::HashSet::from(["wh_kept"]));
+
+        assert_eq!(backoff.failure_count("wh_kept"), 1, "a live subscription keeps its state");
+        assert_eq!(backoff.failure_count("wh_removed"), 0, "a removed one is forgotten");
     }
 }
