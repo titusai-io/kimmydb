@@ -689,4 +689,125 @@ mod tests {
     fn an_absent_filter_matches_everything() {
         assert_eq!(parse_filter(None).unwrap(), filter::Filter::AlwaysTrue);
     }
+
+    // -----------------------------------------------------------------------
+    // explain rendering — every branch found unwatched by mutation testing
+    // -----------------------------------------------------------------------
+
+    fn stats(index: Option<&str>, probes: usize) -> QueryStats {
+        QueryStats {
+            index: index.map(str::to_string),
+            fields_used: usize::from(index.is_some()),
+            examined: 0,
+            matched: 0,
+            probes,
+        }
+    }
+
+    #[test]
+    fn explain_names_the_strategy_by_its_shape() {
+        // Found by mutation testing: both guards in `to_json` survived every
+        // test, because nothing asserted the rendered JSON.
+        assert_eq!(stats(None, 0).to_json()["strategy"], "collectionScan");
+        assert_eq!(stats(Some("i"), 1).to_json()["strategy"], "index");
+        assert_eq!(stats(Some("i"), 2).to_json()["strategy"], "indexUnion");
+    }
+
+    #[test]
+    fn explain_reports_a_probe_count_only_for_unions() {
+        // One range is not a union: a "probes": 1 on every indexed query
+        // would be noise, and a missing count on a union would hide the one
+        // number that distinguishes the shape.
+        assert!(stats(Some("i"), 1).to_json().get("probes").is_none());
+        assert_eq!(stats(Some("i"), 3).to_json()["probes"], 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // collect_matching routing — the guards that decide which scan runs
+    // -----------------------------------------------------------------------
+
+    fn live_state(dir: &tempfile::TempDir) -> SharedState {
+        let engine = std::sync::Arc::new(
+            kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
+        );
+        let tokens = kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret", 3600).unwrap();
+        crate::state_with_egress(
+            engine,
+            tokens,
+            false,
+            crate::RateLimits::disabled(),
+            crate::egress::EgressPolicy::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_union_scans_every_probe_not_just_the_first() {
+        // Found by mutation testing: forcing the `both_bounds` guard to true
+        // sent every plan — unions included — down the single-range checked
+        // scan, which reads `ranges[0]` alone. A two-probe `$in` silently
+        // lost every match under the second probe, and no test noticed,
+        // because none ran a union through `collect_matching`.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        let meta = state.engine.get_collection("app", "docs").unwrap();
+        for i in 0..10i64 {
+            state.engine.insert(&meta, bson::doc! { "_id": i, "n": i }).unwrap();
+        }
+
+        let filter = filter::parse(&bson::doc! { "n": { "$in": [2, 8] } }).unwrap();
+        let (matched, stats) = collect_matching(&state, &meta, &filter, None).unwrap();
+
+        assert_eq!(stats.probes, 2, "the union must be planned");
+        let mut ids: Vec<i64> = matched.iter().map(|d| d.get_i64("_id").unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![2, 8], "every probe's matches must arrive, not just the first's");
+    }
+
+    #[test]
+    fn a_stale_both_bounds_plan_falls_back_rather_than_scanning_narrow() {
+        // The other half of the same guard: forcing it to false sends a
+        // both-bounds plan down the unchecked scan. This test manufactures
+        // the exact race the checked scan exists for — metadata fetched
+        // while the index was scalar-only, an array arriving before the
+        // scan — and the straddling document must still be found.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        // Fetched while the index is scalar-only: a both-bounds plan.
+        let stale = state.engine.get_collection("app", "docs").unwrap();
+        state.engine.insert(&stale, bson::doc! { "_id": 1i64, "n": 3 }).unwrap();
+        // The flip, after the metadata read: {n: [9, 0]} matches the range
+        // below through *different elements*, so a narrow scan loses it.
+        state.engine.insert(&stale, bson::doc! { "_id": 2i64, "n": [9, 0] }).unwrap();
+
+        let filter = filter::parse(&bson::doc! { "n": { "$gte": 1, "$lte": 5 } }).unwrap();
+        let (matched, stats) = collect_matching(&state, &stale, &filter, None).unwrap();
+
+        let mut ids: Vec<i64> = matched.iter().map(|d| d.get_i64("_id").unwrap()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![1, 2], "the straddling document must not be lost to a stale plan");
+        assert!(stats.index.is_none(), "the fallback is a collection scan, and explain says so");
+    }
 }

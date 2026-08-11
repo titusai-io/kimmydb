@@ -302,6 +302,31 @@ each one turned a named test red:
 | Backlog measured from the resume point, so an idle webhook looks lagging | `a_caught_up_subscription_reports_no_backlog`, `backlog_is_the_age_of_the_event_not_of_the_resume_point` — **added after this escaped** |
 | A peer's progress covering ours reads as "resume from zero" | `progress_from_a_peer_that_is_ahead_does_not_invalidate_this_node` — **added after this escaped** |
 
+### M7: `cargo-mutants` replaces the hand-rolled harness
+
+The runner is now [`cargo-mutants`](https://mutants.rs), which removes the two
+failure modes the hand-rolled era needed habits for — a mutation that fails to
+compile is reported `unviable` rather than reading as an escape, and there is
+no shell quoting to get wrong. Three runs closed M7: `plan.rs` whole (29
+mutants), `keyenc.rs` whole (21), and a diff of everything M7 changed with the
+full `kimmy-storage` + `kimmy-api` suites (81). **131 mutants, ten escapes,
+nine killed with new tests, one proven equivalent:**
+
+| Escape | Why it survived | Killed by |
+|---|---|---|
+| `>` → `>=` in `choose` — a tie between equally-covering indexes goes to the *last* listed | Either winner answers correctly; only `explain`'s stability changes | `a_tie_between_indexes_goes_to_the_first_listed` |
+| Both guards in `QueryStats::to_json` (`indexUnion`, the probe count) | Nothing asserted the rendered explain JSON | `explain_names_the_strategy_by_its_shape`, `explain_reports_a_probe_count_only_for_unions` — five mutants, two tests |
+| `both_bounds` guard in `collect_matching` forced **true** — a `$in` union scans `ranges[0]` only and **loses matches** | No test ran a union through `collect_matching`; the equivalence suite lives a layer down, against the engine | `a_union_scans_every_probe_not_just_the_first` |
+| The same guard forced **false** — a stale both-bounds plan takes the unchecked scan | The checked-scan test drove the engine method, not `exec`'s routing to it | `a_stale_both_bounds_plan_falls_back_rather_than_scanning_narrow` |
+| `dispatch::run` replaced with `()` — the webhook dispatcher never runs | Every webhook test drives `dispatch_once` by hand | `the_dispatcher_loop_delivers_without_being_driven` |
+| `+` → `-` in `encode_numeric`'s exponent bias | **Equivalent, not a gap**: `(exp + 32768) as u16` and `(exp - 32768) as u16` are identical — ±32768 are congruent mod 2¹⁶ under the truncating cast. No test can kill it |
+
+The pattern across the killable eight: each lived in a **routing or rendering
+layer above the one the strong tests guard**. The engine's equivalence suite
+is thorough, and none of these mutants could touch it — they sat in `exec`'s
+choice of which engine call to make, or in what `explain` prints about it.
+When a well-tested layer gains a caller, the caller needs its own tests.
+
 Delivery is tested against a **receiver on a real socket** rather than by
 calling the delivery function: a webhook *is* an outbound HTTP request, and the
 signature a consumer must verify, the headers it reads, and whether the egress

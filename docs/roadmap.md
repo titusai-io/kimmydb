@@ -19,7 +19,7 @@ graph LR
     M4["<b>M4</b> ✅<br/>clustering and<br/>replication"]
     M5["<b>M5</b> ✅<br/>hardening"]
     M6["<b>M6</b> ✅<br/>webhooks"]
-    M7["<b>M7</b> 🚧<br/>query engine<br/>completion"]
+    M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7
 
@@ -31,7 +31,7 @@ graph LR
     style M4 fill:#2f5d3a,color:#fff
     style M5 fill:#2f5d3a,color:#fff
     style M6 fill:#2f5d3a,color:#fff
-    style M7 fill:#2d3748,color:#fff
+    style M7 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -43,7 +43,7 @@ graph LR
 | **M4** | Discovery, replication transport, anti-entropy, snapshot resync, peer health, SWIM membership | ✅ Complete |
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
-| **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | 🚧 Planned |
+| **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -485,15 +485,15 @@ unchallenged, is in [Deviations](deviations.md).
 
 ---
 
-## M7 — Query engine completion 🚧
+## M7 — Query engine completion ✅
 
-The planner has carried three known gaps since M1, one of them the register's
-only 🔴. Each is *correct but slow* today — deliberately, because the wrong
-version of each is *fast but silently wrong*. M7 makes them fast **and**
-correct, and ends with zero 🔴 in [Deviations](deviations.md).
+The planner carried three known gaps since M1, one of them the register's
+only 🔴. Each was *correct but slow* — deliberately, because the wrong
+version of each is *fast but silently wrong*. M7 made them fast **and**
+correct, and the register now holds zero 🔴.
 
-Chosen over operational maturity and API ergonomics on 2026-08-10. The other
-two themes remain candidates for M8.
+Chosen over operational maturity and API ergonomics on 2026-08-10; those two
+themes remain the leading candidates for M8. Completed 2026-08-11.
 
 ### Why these gaps exist, so the fix is not re-derived
 
@@ -517,8 +517,8 @@ scalar-only majority both bounds back.
 | 4 | ✅ **Both bounds on non-multikey indexes** | The 🔴 closes. A both-bounds plan re-validates the flag **in the same snapshot as the scan** and falls back to a collection scan if it flipped — the plan's metadata was already stale when the scan began. Found and fixed alongside: maintenance trusted the caller's index list, so a write through a stale handle skipped a just-created index entirely — no entries, no unique check. Definitions are now re-read inside the write's transaction |
 | 5 | ✅ **Ranges on descending fields** | The swap: a descending component's inverted bytes reverse order, so the value-space lower bound caps the key-space top. Encoded-key planner tests, engine equivalence + selectivity tests (including ascending-prefix + descending-range compounds), and the original equivalence property test began exercising the path the moment the planner stopped refusing it |
 | 6 | ✅ **`$in` uses the index** | `IndexPlan` generalized to a list of ranges: one per distinct `$in` value (deduplicated on the encoded key), each carrying the equality prefix. Candidates unioned and deduplicated by document key. Equality probes are sound on multikey indexes, so no flag interaction. `explain` reports `indexUnion` with a probe count |
-| 7 | **Mutation testing** | On the planner and key-encoding layers, where it has caught real gaps before. No-op control first; `--no-fail-fast` |
-| 8 | **Docs** | [Indexes](indexes.md) rewritten where behaviour changes; the 🔴 and both 🟡 planner entries in [Deviations](deviations.md) move to 🟢; [Handoff](handoff.md) replaced |
+| 7 | ✅ **Mutation testing** | `cargo-mutants` (now installed; the hand-rolled harness era is over): full runs on `plan.rs` (29 mutants) and `keyenc.rs` (21), plus a diff-scoped run over everything M7 changed (81). **Ten escapes, nine killed with new tests, one proven equivalent** — see [Testing](testing.md) for the account |
+| 8 | ✅ **Docs** | [Indexes](indexes.md) rewritten where behaviour changed; the 🔴 and both 🟡 planner entries in [Deviations](deviations.md) moved to 🟢; [Handoff](handoff.md) replaced |
 
 ### Deliberately out of scope
 
