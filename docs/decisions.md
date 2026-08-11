@@ -1836,6 +1836,59 @@ follow-up rather than dropped.
 
 ---
 
+## ADR-050 — SRV discovery takes a resolver crate, stripped to the one thing it is for
+
+**Decision.** `dns-srv:` resolves. `hickory-resolver` provides it, with
+`default-features = false` and exactly two features: `system-config` and
+`tokio`.
+
+**The standard library could never have done this.** `tokio::net::lookup_host`
+resolves *names*, which is enough for `dns:` and `k8s:` because those pair
+every address with a port from configuration. SRV's entire purpose is that the
+record carries the port, so reading one means reading a record type the
+standard resolver does not expose. That is why this sat unimplemented from M4:
+not difficulty, but a dependency nobody wanted to take blindly.
+
+**The feature list is the whole decision, and it is load-bearing.** Every
+transport this crate speaks beyond plain DNS — DoT, DoH, QUIC, h3 — and DNSSEC
+validation each ship in a `-ring` and an `-aws-lc-rs` flavour. Selecting any
+aws-lc-rs variant would add CMake and a second implementation of primitives
+`ring` already provides, which is precisely the rule the M2 correction to
+ADR-016 left standing. None of them is needed to read an SRV record over UDP.
+`./scripts/check-native-deps.sh` still reports `cc` alone, and the default
+build still contains no `aws-lc-rs` and no `openssl` — checked rather than
+assumed, because the last time this property was asserted in prose it had
+already been false for two milestones.
+
+`system-config` earns its place separately: it reads `/etc/resolv.conf`, which
+is what makes a container inherit its cluster's resolver instead of needing one
+configured. Without it the feature would work everywhere except the place it is
+for.
+
+**Resolution is two steps, because SRV is two facts.** An SRV record names a
+*host and a port*, not an address. So: read the SRV records, then resolve each
+target and pair every address it yields with the port from the record that
+named it. Verified on two live nodes on **7911 and 7922** — neither the 7900
+default — which is the only arrangement that can tell a working implementation
+apart from one that resolved the names and quietly used the default port.
+
+**An empty answer is not a failure, and finding that out mattered.** The
+resolver reports "no records found" as an `Err`, and the discovery loop warns
+on every error it receives, once per tick. A name that exists with no SRV
+records yet is exactly what a cluster looks like before its first node
+registers — so the straightforward mapping would have produced a warning every
+few seconds, forever, while nothing was wrong. `NoRecordsFound` is therefore
+translated to an empty set. A test pins it, because the failure is a log nobody
+reads rather than a broken cluster.
+
+**A target that will not resolve is skipped, not fatal.** One pod mid-restart
+must not cost a node every other peer it was told about, so a failed address
+lookup drops that one target at `debug` and keeps the rest. The set is also
+deduplicated: two records may name one host, and a host with both A and AAAA
+records yields two addresses for one peer.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

@@ -343,11 +343,40 @@ about dependencies. See the row below.
 
 ---
 
+## 🟢 SRV discovery resolves (was a 🟡 deferral since M4)
+
+**Was.** `dns-srv:` parsed and was tested, and then returned an error when
+asked to resolve. The standard library resolves *names*, not record types, and
+SRV's whole purpose is the port inside the record — so this needed a resolver
+crate, and the open question was never difficulty but which dependency.
+
+**Now.** `hickory-resolver`, with `default-features = false` and exactly
+`system-config` + `tokio` ([ADR-050](decisions.md)). The feature list is the
+decision: every transport beyond plain DNS — DoT, DoH, QUIC, h3 — and DNSSEC
+each ship a `-ring` and an `-aws-lc-rs` flavour, and the aws-lc-rs ones would
+add CMake for primitives `ring` already provides. `check-native-deps.sh` still
+reports `cc` alone, and the default build still has no `aws-lc-rs` and no
+`openssl` — checked, not asserted, since the last prose claim about this was
+false for two milestones before anyone noticed.
+
+**Verified on two live nodes on ports 7911 and 7922**, neither the 7900
+default, seeded only by `dns-srv:` against a real DNS server. That arrangement
+is the point: with both on the default port, an implementation that resolved
+the names and ignored the ports would have looked identical.
+
+**Found while building it:** the resolver reports an empty answer as an
+**error**, and the discovery loop warns on every error once per tick. A name
+with no SRV records yet is what a cluster looks like before its first node
+registers — so the obvious mapping would have logged a warning every few
+seconds forever while nothing was wrong. `NoRecordsFound` is translated to an
+empty set, with a test on it.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
 |---|---|---|
-| SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
 | Client certificates (mTLS) | Server TLS authenticates the *server* to clients; clients still authenticate with a bearer token only | not planned |
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |

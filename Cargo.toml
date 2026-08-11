@@ -82,6 +82,18 @@ parking_lot = "0.12"
 clap = { version = "4", features = ["derive", "env"] }
 base64 = "0.23"
 
+# DNS, for SRV discovery. The standard library resolves names, not record
+# types, so reading the ports SRV carries needs a resolver.
+#
+# `default-features = false` is load-bearing, not tidiness. Every transport
+# this crate can speak beyond plain DNS — DoT, DoH, QUIC, h3 — and DNSSEC
+# validation each come in a `-ring` and an `-aws-lc-rs` flavour, and the
+# aws-lc-rs ones would add CMake for primitives `ring` already provides. None
+# is needed to read an SRV record over UDP. `system-config` reads
+# /etc/resolv.conf, which is what makes a container inherit its cluster's
+# resolver rather than needing one configured. See ADR-050.
+hickory-resolver = { version = "0.26", default-features = false, features = ["system-config", "tokio"] }
+
 # Auth. argon2 0.6 is still a release candidate; password hashing is not the
 # place to run ahead of a stable release.
 argon2 = { version = "0.5", features = ["std"] }

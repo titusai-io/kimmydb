@@ -266,10 +266,10 @@ Verified on three daemons: the third was told only about the first and learned
 the second by gossip; killing one had both survivors agree it was down within
 milliseconds of each other.
 
-### Still missing
-- **SRV discovery** — `dns-srv:` parses but does not resolve; SRV records need a
-  DNS resolver that can read record types the standard library does not expose.
-  `dns:` and `k8s:` both work.
+### Resolved in M8: SRV discovery ✅
+`dns-srv:` now resolves, via `hickory-resolver` stripped to `system-config` +
+`tokio` so no second native crypto stack comes with it ([ADR-050](decisions.md)).
+All four discovery forms work.
 
 
 ### Resolved: dropped collections leave a tombstone ✅
@@ -575,7 +575,7 @@ by a killed node is delivered by its successor. Slow tests, marked
 | 6 | Persist | ✅ **Provider dialect audit** | **Voyage** is OpenAI-compatible — the existing `openai` dialect with a Voyage endpoint, pinned by a test. **Cohere** (`texts`/`input_type`, nested v2 response) and **Gemini** (`content.parts`, `values`, `x-goog-api-key` header — the reason `HttpProvider` grew an `Auth` enum) each got a dialect. Verified against documented shapes with fixtures, not live endpoints — the bar every dialect has met since M2. [ADR-047](decisions.md) |
 | 7 | Polish | ✅ **Bulk insert** | `POST /v1/db/{db}/coll/{coll}/bulk` — a dedicated route (a sibling of `/find` and `/update`, not `/docs/bulk`, which would shadow the document whose `_id` is `"bulk"`), a bare JSON array, one transaction, capped at 1000. **176× per document at batch 1000** — 291 docs/sec becoming ~51,300 — because the durable commit was very nearly the whole cost, exactly as task 3's flat curve predicted. All-or-nothing, promised in the docs: the batch is checked against itself as well as against stored state, and a rejected document names its position. [ADR-048](decisions.md) |
 | 8 | Polish | ✅ **Certificate reload** | **Both triggers**, because neither covers both deployments: SIGHUP for systemd and bare metal, and a 60-second mtime poll for where a certificate is rotated by cert-manager rather than by a person. Almost no new machinery — `axum-server` already held the certificate behind a per-handshake handle and already exposed a reload; what was missing was something to call it. **The startup rule and the reload rule now differ on purpose**: a bad certificate is fatal at startup (nothing to fall back to) and refused at reload (something to fall back to), which is also what absorbs the window between writing a new certificate and writing its key. `kimmy_tls_reloads_total{outcome}` makes a failed rotation visible, since its consequence otherwise arrives weeks later. [ADR-049](decisions.md) |
-| 9 | Polish | **SRV discovery** | `dns-srv:` parses but does not resolve. Needs a resolver crate; **must not add a second native crypto stack** — the DNSSEC features that pull one stay off, and `check-native-deps.sh` is the arbiter |
+| 9 | Polish | ✅ **SRV discovery** | `hickory-resolver` with `default-features = false` and exactly `system-config` + `tokio`. **The feature list is the decision**: every transport beyond plain DNS and DNSSEC each ship a `-ring` and an `-aws-lc-rs` flavour, and the aws-lc-rs ones would add CMake for primitives `ring` already provides. `check-native-deps.sh` still reports `cc` alone. Resolution is two steps because SRV is two facts — read the records, then resolve each target and pair its addresses with the port from the record that named it. Verified on two live nodes on **7911 and 7922**, neither the default. Found on the way: an empty answer arrives as an *error*, which would have warned every tick forever while nothing was wrong. [ADR-050](decisions.md) |
 | 10 | Polish | **Webhook ownership by node id** | Rendezvous currently hashes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions. Gossip the node id as member metadata and hash that. Verified with the harness from task 1; a mixed-version cluster produces duplicates, which at-least-once already tolerates |
 | 11 | Polish | **Token revocation** | Deleting a user currently leaves issued tokens valid until expiry. Semantics are a design decision — ADR first; a per-user token version (bump to invalidate all outstanding) is the leading candidate over a replicated deny-list, because it adds no per-request lookup that can miss |
 | 12 | Close | **Mutation pass + docs** | `cargo-mutants` diff-scoped over everything M8 changed — the M7 lesson says the escapes will be in the new callers, not the old layers. Deviations, handoff, and this section updated |

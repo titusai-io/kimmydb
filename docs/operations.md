@@ -242,11 +242,32 @@ SWIM member needs, which is why `k8s:` discovery is a one-liner.
 |---|---|
 | `k8s:kimmy-headless.default.svc.cluster.local` | Headless Service, one A record per pod |
 | `dns:seeds.example.com` | A/AAAA records, port defaults to 7900 |
-| `dns-srv:_kimmy._udp.example.com` | SRV records carry their own ports |
+| `dns-srv:_kimmy._tcp.example.com` | SRV records carry their own ports |
 | `static:10.0.0.1:7900,10.0.0.2:7900` | Explicit list |
 | `10.0.0.1:7900` | Shorthand for one static peer |
 
-Parsing is implemented and tested; **resolution is still not implemented** — `dns-srv:` returns an error. It needs a resolver that can read SRV records, which the standard library does not expose. `dns:` and `k8s:` both work.
+All four resolve. Every form is re-resolved each `discovery_interval_secs`, so
+a peer that appears later is found without a restart.
+
+**`dns-srv:` is the one form where peers need not agree on a port**, because
+each record carries its own:
+
+```
+_kimmy._tcp.example.com. 60 IN SRV 0 10 7911 node-a.example.com.
+_kimmy._tcp.example.com. 60 IN SRV 0 10 7922 node-b.example.com.
+```
+
+Each target is then resolved to addresses, and every address is paired with the
+port from the record that named it. Priority and weight are read but not acted
+on — every peer is contacted, because this is a peer set rather than a
+failover list.
+
+Resolution uses `/etc/resolv.conf`, so a container inherits its cluster's
+resolver with nothing configured. A target that will not resolve is skipped and
+the rest are kept: one pod mid-restart should not cost a node every other peer.
+A name that exists with no SRV records is an empty set rather than an error —
+the normal state of a cluster before its first node registers
+([ADR-050](decisions.md)).
 
 ---
 
