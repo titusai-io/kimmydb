@@ -17,8 +17,8 @@ reload's trigger, and token revocation's semantics.
 
 | | |
 |---|---|
-| `main` | PRs #16–#41 merged: the M8 plan and the cluster harness |
-| `m8-observability` | **Not merged.** ADR-046: the latency histogram (buckets measured on a release build) and `kimmy_replication_lag_seconds` (pushed from the replication loop via `ReplicationConfig::on_lag`). The harness now also asserts zero lag on a converged cluster. Found while measuring, recorded 🟡: `find {_id}` is a collection scan — the planner never consults the primary key; `GET /docs/{id}` is the point path |
+| `main` | PRs #16–#42 merged: the M8 plan, the cluster harness, observability |
+| `m8-benchmarks` | **Not merged.** The `writers` bench (throughput flat from 1 to 8 concurrent writers — the single redb writer is shared cleanly, so a bulk API's win is per-commit overhead, not parallelism) and `scripts/bench-baseline.py` with the recorded baseline |
 
 ### The bug the harness caught on its first run
 
