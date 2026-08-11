@@ -64,11 +64,19 @@ pub fn state_with_egress(
     egress: egress::EgressPolicy,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
+    // Snapshots live beside the database file: the graph is state derived
+    // from that file, so it belongs on the same volume, in the same backup
+    // story (deliberately not *in* the backup — a restore rebuilds, which is
+    // always correct), and dies with the same disk.
+    let vectors = match engine.path().parent() {
+        Some(dir) => IndexCache::with_snapshot_dir(dir.join("hnsw")),
+        None => IndexCache::new(),
+    };
     Ok(Arc::new(AppState {
         engine,
         users,
         tokens,
-        vectors: IndexCache::new(),
+        vectors,
         insecure_no_auth,
         limits,
         metrics: Metrics::default(),

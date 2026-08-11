@@ -73,15 +73,30 @@ return the same nearest neighbour with a byte-identical score.
 
 ---
 
-## 🟡 Vector indexes are rebuilt from scratch after a restart
+## 🟢 Vector indexes survive a restart (was a 🟡 deferral since M2)
 
-The plan called for snapshotting the graph to `hnsw_snapshots` and replaying
-newer vector-oplog entries on startup. Not built: the cache is in-memory only.
+**Was.** The cache was in-memory only: the first search of a large collection
+after a restart paid a full O(n log n) build, served by the exact scan until
+then. Slower, never wrong — which is why it waited from M2 to M8.
 
-**Consequence.** The first search of a large collection after a restart pays a
-full O(n log n) build, and until then queries are served by the exact scan —
-slower, never wrong. Correctness does not depend on it, which is why it was
-deferred rather than blocking the wiring.
+**Now.** Every successful build is persisted beside the database file
+(`<data_dir>/hnsw/<collection-id>/`, staged and renamed so a crash mid-save
+leaves the previous snapshot rather than a torn one), and a process's first
+look at a collection loads the snapshot before paying the build. Validity
+across a restart cannot use the generation counter — it is in-memory and
+resets — so the check is the vector *count* the snapshot covered: equal
+counts adopt it as fresh; unequal counts serve it once (bounded recall loss,
+instantly) and rebuild on the next access. The corner accepted, on purpose: a
+delete-and-add while the node was down leaves the count equal, and that
+snapshot serves as fresh until the next vector write — the same class of
+bound as the 30-second staleness window, on a longer clock. A restore does
+not carry snapshots and rebuilds, which is always correct.
+
+**Found on the way, by testing the failure path:** `hnsw_rs` *panics* on a
+corrupt graph file — an `unwrap` on its magic check — so the load runs under
+`catch_unwind`, and a torn file on disk costs a rebuild rather than the
+process. The same species as `DistDot`'s assert in M2: the library's failure
+behaviour was checked rather than trusted, and it needed containing.
 
 ---
 

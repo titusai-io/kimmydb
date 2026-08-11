@@ -98,11 +98,22 @@ pub struct IndexCache {
     entries: Mutex<HashMap<CollectionId, Entry>>,
     /// Overridable so tests can exercise the threshold on small fixtures.
     min_vectors: usize,
+    /// Where graphs are persisted across restarts, when anywhere.
+    ///
+    /// `None` — the default — is the pre-M8 behaviour: in-memory only, a
+    /// restart rebuilds lazily. With a directory, every successful build is
+    /// saved and a process's first look at a collection tries the snapshot
+    /// before paying the O(n log n) build.
+    snapshot_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for IndexCache {
     fn default() -> Self {
-        Self { entries: Mutex::new(HashMap::new()), min_vectors: MIN_VECTORS_FOR_INDEX }
+        Self {
+            entries: Mutex::new(HashMap::new()),
+            min_vectors: MIN_VECTORS_FOR_INDEX,
+            snapshot_dir: None,
+        }
     }
 }
 
@@ -119,10 +130,24 @@ impl IndexCache {
         Self::default()
     }
 
+    /// A cache that persists graphs under `dir` and reloads them on the first
+    /// access after a restart.
+    pub fn with_snapshot_dir(dir: std::path::PathBuf) -> Self {
+        Self { snapshot_dir: Some(dir), ..Self::default() }
+    }
+
     /// A cache with a non-default size threshold. For tests.
     #[cfg(test)]
     fn with_min_vectors(min_vectors: usize) -> Self {
         Self { min_vectors, ..Self::default() }
+    }
+
+    /// Where one collection's snapshot lives, when snapshots are on at all.
+    fn snapshot_path(&self, collection: CollectionId) -> Option<std::path::PathBuf> {
+        // Hex of the derived collection id: stable across restarts and nodes
+        // because ids are derived from names (ADR-031), and free of anything
+        // that needs escaping in a filename.
+        self.snapshot_dir.as_ref().map(|dir| dir.join(format!("{:016x}", collection.0)))
     }
 
     /// Choose an access path, building or rebuilding the index if warranted.
@@ -161,6 +186,20 @@ impl IndexCache {
             }
         }
 
+        // A process's first look at this collection: try the snapshot before
+        // paying the build. Only on a true miss — a cache entry that has gone
+        // stale means this process has newer knowledge than any snapshot.
+        if !entries.contains_key(&shadow.id)
+            && let Some(entry) = self.try_snapshot(engine, shadow, metric, dim, generation)
+        {
+            let access = match &entry.decision {
+                Decision::Index(index) => Access::Approximate(Arc::clone(index)),
+                Decision::TooSmall => Access::Exact,
+            };
+            entries.insert(shadow.id, entry);
+            return access;
+        }
+
         // Falling back on error keeps the query correct; the alternative is
         // failing a search because an optimisation could not be built.
         let decision = match self.decide(engine, shadow, metric, dim) {
@@ -179,6 +218,57 @@ impl IndexCache {
         access
     }
 
+    /// Adopt a persisted graph, deciding how much to trust it.
+    ///
+    /// The generation counter cannot vouch for a snapshot — it is in-memory
+    /// and resets with the process — so the check is the vector *count* the
+    /// snapshot covered against the count stored now. Equal counts adopt the
+    /// snapshot as fresh. Unequal counts still adopt it — serving a stale
+    /// graph is bounded recall loss, never wrong data, and it answers this
+    /// query instantly — but marked already-stale, so the very next access
+    /// rebuilds. The corner this accepts, on purpose: a delete-and-add while
+    /// the node was down leaves the count equal, and that snapshot serves as
+    /// fresh until the next vector write bumps the generation. Same class of
+    /// bound as the 30-second staleness window, with a longer clock.
+    ///
+    /// Anything unreadable is deleted and `None` returned: a corrupt snapshot
+    /// is discarded, not trusted, and the ordinary build path takes over.
+    fn try_snapshot(
+        &self,
+        engine: &Engine,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+        generation: u64,
+    ) -> Option<Entry> {
+        let path = self.snapshot_path(shadow.id)?;
+        if !path.is_dir() {
+            return None;
+        }
+        let index = match HnswIndex::load(&path, metric, dim) {
+            Ok(index) => index,
+            Err(e) => {
+                tracing::warn!(error = %e, ?path, "discarding an unusable HNSW snapshot");
+                let _ = std::fs::remove_dir_all(&path);
+                return None;
+            }
+        };
+
+        let current = count_vectors(engine, shadow).ok()?;
+        let (generation, decided) = if current == index.len() {
+            (generation, Instant::now())
+        } else {
+            debug!(
+                snapshot = index.len(),
+                current, "snapshot is behind the store; serving it once and rebuilding"
+            );
+            // A generation no live counter returns, plus an already-expired
+            // clock: the next access falls through to a rebuild.
+            (u64::MAX, Instant::now() - MAX_STALENESS)
+        };
+        Some(Entry { decision: Decision::Index(Arc::new(index)), generation, decided })
+    }
+
     fn decide(
         &self,
         engine: &Engine,
@@ -191,12 +281,28 @@ impl IndexCache {
         }
         let index = HnswIndex::build(engine, shadow, metric, dim)?;
         debug!(collection = %shadow.name, vectors = index.len(), "rebuilt vector index");
+
+        // Every successful build is persisted, so whatever graph a restart
+        // finds is the newest one that existed. Failure to save costs the
+        // next process a rebuild, not this query an answer.
+        if let Some(path) = self.snapshot_path(shadow.id)
+            && let Err(e) = index.save(&path)
+        {
+            tracing::warn!(error = %e, ?path, "could not save the HNSW snapshot");
+        }
         Ok(Decision::Index(Arc::new(index)))
     }
 
     /// Forget a collection's index. Used when its vectors are dropped.
+    ///
+    /// The snapshot goes with it: the caller is telling us the vectors this
+    /// graph described no longer exist, and a snapshot that outlived them
+    /// would be adopted by the next restart.
     pub fn invalidate(&self, collection: CollectionId) {
         self.entries.lock().remove(&collection);
+        if let Some(path) = self.snapshot_path(collection) {
+            let _ = std::fs::remove_dir_all(&path);
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -414,5 +520,171 @@ mod tests {
     fn counting_vectors_matches_what_was_written() {
         let (engine, shadow, _dir) = setup(7);
         assert_eq!(count_vectors(&engine, &shadow).unwrap(), 7);
+    }
+
+    // -----------------------------------------------------------------------
+    // Snapshots: a restart should not pay the build again
+    // -----------------------------------------------------------------------
+
+    /// A cache with snapshots on and a low threshold, plus its snapshot dir.
+    fn snapshot_cache(dir: &tempfile::TempDir) -> IndexCache {
+        IndexCache { min_vectors: 10, ..IndexCache::with_snapshot_dir(dir.path().join("hnsw")) }
+    }
+
+    /// Simulate a restart: reopen the engine from the same directory, which
+    /// also resets the in-memory generation counters — the condition that
+    /// makes snapshot validation interesting.
+    fn reopen(dir: &tempfile::TempDir) -> (Engine, CollectionMeta) {
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        (engine, shadow)
+    }
+
+    #[test]
+    fn a_snapshot_survives_a_restart_and_is_served_not_rebuilt() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        drop(cache);
+        drop(engine);
+
+        // A vector written while the process was "down": the snapshot covers
+        // 60, the store holds 61. The first access after restart must serve
+        // the 60-vector snapshot — that is the observable proof it was loaded
+        // rather than rebuilt, since a rebuild would already hold 61.
+        let (engine, shadow) = reopen(&dir);
+        let source = DocId::Int64(999);
+        engine
+            .put_vectors(
+                &shadow,
+                &source,
+                &[VectorRecord {
+                    source: source.clone(),
+                    chunk: 0,
+                    source_hlc: Hlc::new(2, 0),
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    text: "written while down".into(),
+                }],
+            )
+            .unwrap();
+
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should serve");
+        };
+        assert_eq!(first.len(), 60, "must be the loaded snapshot, not a rebuild");
+
+        // ...and because it was behind the store, the very next access must
+        // rebuild to the current 61 rather than serving stale for a window.
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the rebuild should serve");
+        };
+        assert_eq!(second.len(), 61, "a behind snapshot is served once, then rebuilt");
+    }
+
+    #[test]
+    fn a_snapshot_matching_the_store_is_adopted_as_fresh() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+        drop(engine);
+
+        let (engine, shadow) = reopen(&dir);
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should serve");
+        };
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should keep serving");
+        };
+        assert!(Arc::ptr_eq(&first, &second), "an up-to-date snapshot must not trigger a rebuild");
+    }
+
+    #[test]
+    fn a_corrupt_snapshot_is_discarded_not_trusted() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+
+        // Torn write, disk fault, editor accident: the graph bytes are junk.
+        let snapshot = dir.path().join("hnsw").join(format!("{:016x}", shadow.id.0));
+        std::fs::write(snapshot.join("index.hnsw.graph"), b"not a graph").unwrap();
+
+        let (engine, shadow) = {
+            drop(engine);
+            reopen(&dir)
+        };
+        let cache = snapshot_cache(&dir);
+        // The query still gets an index — rebuilt — and the junk is gone.
+        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("a corrupt snapshot must fall back to a rebuild");
+        };
+        assert_eq!(index.len(), 60);
+    }
+
+    #[test]
+    fn a_reconfigured_dimension_refuses_the_old_snapshot() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+        drop(engine);
+
+        // Asking for a different dimension than the snapshot holds: the load
+        // must refuse — distances computed across widths are garbage — and
+        // the ordinary paths take over.
+        let (engine, shadow) = reopen(&dir);
+        let cache = snapshot_cache(&dir);
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(crate::index::HnswIndex::load(&path, Metric::Cosine, 8).is_err());
+        // Through the cache, the mismatch falls back cleanly too.
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+    }
+
+    #[test]
+    fn invalidating_removes_the_snapshot_too() {
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(path.is_dir(), "the build should have been persisted");
+
+        cache.invalidate(shadow.id);
+        assert!(!path.exists(), "dropped vectors must take their snapshot with them");
+    }
+
+    #[test]
+    fn the_loaded_snapshot_agrees_with_the_exact_path() {
+        // The reload must preserve what the graph *means*, not merely parse:
+        // same nearest neighbour, byte-identical score, exactly as a built
+        // index is held to.
+        use crate::search::{self, SearchOptions};
+
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &shadow, Metric::Cosine, 4);
+        drop(cache);
+        drop(engine);
+
+        let (engine, shadow) = reopen(&dir);
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(index) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the snapshot should serve");
+        };
+
+        let query = vec![37.0, 1.0, 0.0, 0.0];
+        let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
+        let approximate = index.search(&engine, &shadow, &query, &options, None).unwrap();
+        let exact = search::vector_search(&engine, &shadow, &query, &options, None).unwrap();
+        assert_eq!(approximate[0].id, exact[0].id);
+        assert_eq!(approximate[0].score, exact[0].score);
     }
 }
