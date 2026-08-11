@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kimmy_core::{Hlc, OpKind, VectorConfig, VectorRecord, path};
-use kimmy_storage::{ChangeEvent, Engine, WatchOptions, WatchScope};
+use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
 use tracing::{debug, info, warn};
 
 use crate::error::{Result, VectorError};
@@ -42,7 +42,13 @@ pub struct EmbeddingWorker {
     engine: Arc<Engine>,
     /// Providers are built once per configuration and reused — constructing a
     /// local one loads a model, which is far too expensive per document.
-    providers: HashMap<u64, Arc<dyn EmbeddingProvider>>,
+    ///
+    /// Keyed with the configuration that built each one, because a
+    /// reconfigured collection must not keep embedding through the *old*
+    /// provider — which it silently did until the reindex work made
+    /// reconfiguration a live event. `None` marks a test-injected provider
+    /// that no configuration should evict.
+    providers: HashMap<u64, (Option<VectorConfig>, Arc<dyn EmbeddingProvider>)>,
 }
 
 /// What one processed entry did, so tests and metrics can tell the cases apart.
@@ -52,6 +58,8 @@ pub enum Outcome {
     Embedded { chunks: usize },
     /// The document's vectors were removed.
     Removed,
+    /// A `ConfigureVectors` entry triggered a scan of the whole collection.
+    Backfilled { embedded: usize },
     /// Nothing to do: not a vector-enabled collection, no embeddable text, or
     /// the vectors were already current.
     Skipped,
@@ -121,6 +129,20 @@ impl EmbeddingWorker {
         if entry.kind == OpKind::UniqueViolation {
             return Ok(Outcome::Skipped);
         }
+
+        // A configuration change is the reindex trigger. The entry arrives
+        // through the same stream as every document write — the oplog is the
+        // wake-up here exactly as it is everywhere else — and the position is
+        // recorded only after the scan completes, so a crash mid-backfill
+        // replays the entry and the staleness check skips what already
+        // landed. Before this, enabling embedding on a collection that
+        // already held documents embedded *nothing*: the M2 "backfill" was
+        // the worker's first-ever run starting from zero, and a worker whose
+        // position had ever advanced was past those entries forever.
+        if entry.kind == OpKind::ConfigureVectors {
+            return self.backfill_from_entry(entry).await;
+        }
+
         let Some(source) = entry.doc_id.clone() else {
             return Ok(Outcome::Skipped);
         };
@@ -192,25 +214,198 @@ impl EmbeddingWorker {
         Ok(Outcome::Embedded { chunks: count })
     }
 
-    /// A provider for one collection, built once and reused.
+    /// React to a `ConfigureVectors` entry: scan the collection and bring
+    /// every document's vectors up to date.
+    ///
+    /// The scan walks the **collection**, not the oplog — the oplog may have
+    /// collected the entries that created these documents, and the documents
+    /// themselves are the durable source. Per document the staleness check
+    /// decides: already-current vectors are skipped, so replaying this entry
+    /// after a crash re-does only what had not landed, and a configuration
+    /// change that alters nothing a document produced (a metric change, say)
+    /// costs a scan and no embedding.
+    async fn backfill_from_entry(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
+        let Some(body) = &entry.body else {
+            return Ok(Outcome::Skipped);
+        };
+        let set: kimmy_core::VectorSet = match bson::deserialize_from_slice(body) {
+            Ok(set) => set,
+            Err(e) => {
+                warn!(error = %e, "undecodable ConfigureVectors entry; skipping");
+                return Ok(Outcome::Skipped);
+            }
+        };
+        // Disabling embeds nothing, and byo has nothing the server could
+        // compute — the client supplies vectors, so a backfill would only be
+        // able to delete theirs.
+        let Some(config) = set.config else {
+            return Ok(Outcome::Skipped);
+        };
+        if !config.provider.embeds_server_side() {
+            return Ok(Outcome::Skipped);
+        }
+        let Ok(collection) = self.engine.get_collection(&set.db, &set.collection) else {
+            // Dropped since the entry was written; nothing to scan.
+            return Ok(Outcome::Skipped);
+        };
+        let shadow = self
+            .engine
+            .get_collection(&set.db, &kimmy_core::vector_meta::shadow_name(&set.collection))?;
+
+        // Whether this scan must re-embed regardless of per-document
+        // staleness. The HLC check cannot see a configuration change —
+        // configurations do not touch documents — so the decision comes from
+        // a fingerprint of the configuration the last *completed* scan ran
+        // under. Written only after the scan, so a crash mid-backfill leaves
+        // it stale and the replayed entry redoes the whole scan: some
+        // documents embed twice, which idempotent output makes harmless,
+        // where the alternative — recording first — would leave the rest
+        // embedded under the old model with nothing to notice.
+        let fingerprint = config_fingerprint(&config);
+        let force = self.engine.vector_fingerprint(collection.id)? != Some(fingerprint);
+
+        // Ids first, documents re-read one at a time: the scan must not hold
+        // a read transaction across provider calls, and holding every
+        // document in memory would make backfill cost O(collection).
+        let mut ids = Vec::new();
+        self.engine.for_each_doc(&collection, |id, _| {
+            ids.push(id);
+            Ok(true)
+        })?;
+
+        let total = ids.len();
+        let mut embedded = 0usize;
+        for source in ids {
+            // Retry transient provider failures per document, exactly as the
+            // streaming path does; a permanent failure skips the document
+            // rather than stalling the rest of the scan.
+            loop {
+                match self.embed_one(&collection, &shadow, &config, &source, force).await {
+                    Ok(true) => {
+                        embedded += 1;
+                        break;
+                    }
+                    Ok(false) => break,
+                    Err(e) if e.is_retryable() => {
+                        warn!(error = %e, "backfill embedding failed; retrying");
+                        tokio::time::sleep(RETRY_DELAY).await;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, ?source, "backfill permanently failed for a document");
+                        break;
+                    }
+                }
+            }
+        }
+
+        // The completed scan is what the fingerprint attests. Failing to
+        // write it costs a redundant re-scan next time, never a gap.
+        self.engine.put_vector_fingerprint(collection.id, fingerprint)?;
+        info!(
+            collection = %collection.name,
+            embedded,
+            total,
+            "backfilled vectors after a configuration change"
+        );
+        Ok(Outcome::Backfilled { embedded })
+    }
+
+    /// Bring one document's vectors up to date. `Ok(true)` if work was done.
+    ///
+    /// `force` re-embeds even current-looking vectors — the configuration
+    /// changed, so "current" was measured against the wrong ruler.
+    async fn embed_one(
+        &mut self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        source: &kimmy_core::DocId,
+        force: bool,
+    ) -> Result<bool> {
+        // The stamp is the document's *current* version, read fresh — a
+        // document replaced mid-scan is embedded at whichever version the
+        // read sees, and the newer version's own oplog entry follows behind
+        // this backfill in the stream.
+        let Some(stamp) = self.engine.document_stamp(collection, source)? else {
+            return Ok(false);
+        };
+        if !force && !self.engine.vectors_are_stale(shadow, source, stamp.hlc)? {
+            return Ok(false);
+        }
+        let Some(document) = self.engine.get(collection, source)? else {
+            return Ok(false);
+        };
+
+        let text = extract_text(&document, config);
+        let chunks = config.chunk.split(&text);
+        if chunks.is_empty() {
+            self.engine.delete_vectors(shadow, source)?;
+            return Ok(false);
+        }
+
+        let provider = self.provider_for(collection.id.0, config)?;
+        let vectors = provider.embed(&chunks).await?;
+        let records: Vec<VectorRecord> = chunks
+            .into_iter()
+            .zip(vectors)
+            .enumerate()
+            .map(|(i, (text, vector))| VectorRecord {
+                source: source.clone(),
+                chunk: i as u32,
+                source_hlc: stamp.hlc,
+                vector,
+                text,
+            })
+            .collect();
+        self.engine.put_vectors(shadow, source, &records)?;
+        Ok(true)
+    }
+
+    /// A provider for one collection, built once per configuration.
+    ///
+    /// Rebuilt when the configuration it was built from no longer matches —
+    /// a collection reconfigured to a new model must not keep embedding
+    /// through the old one. A test-injected provider (`None` config) is
+    /// never evicted.
     fn provider_for(
         &mut self,
         collection: u64,
         config: &VectorConfig,
     ) -> Result<Arc<dyn EmbeddingProvider>> {
-        if let Some(existing) = self.providers.get(&collection) {
+        if let Some((built_from, existing)) = self.providers.get(&collection)
+            && built_from.as_ref().is_none_or(|c| c == config)
+        {
             return Ok(Arc::clone(existing));
         }
         let built: Arc<dyn EmbeddingProvider> =
             Arc::from(provider::build(&config.provider, config.dim)?);
-        self.providers.insert(collection, Arc::clone(&built));
+        self.providers.insert(collection, (Some(config.clone()), Arc::clone(&built)));
         Ok(built)
     }
 
     /// Replace the provider for a collection. Used by tests to inject a fake.
     pub fn set_provider(&mut self, collection: u64, provider: Arc<dyn EmbeddingProvider>) {
-        self.providers.insert(collection, provider);
+        self.providers.insert(collection, (None, provider));
     }
+}
+
+/// A stable fingerprint of a vector configuration.
+///
+/// FNV-1a over the JSON serialization. Stable across restarts, which is what
+/// the backfill decision needs; a build that changes the config's *shape*
+/// changes the fingerprint and costs one spurious full re-embed after
+/// upgrade, which is the safe direction to be wrong in.
+fn config_fingerprint(config: &VectorConfig) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x100_0000_01b3;
+
+    let bytes = serde_json::to_vec(config).unwrap_or_default();
+    let mut hash = OFFSET;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 /// Gather the configured fields into one block of text.
@@ -539,5 +734,145 @@ mod tests {
         let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
         engine.put_consumer_position(CONSUMER, token).unwrap();
         assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
+    }
+
+    // -----------------------------------------------------------------------
+    // Backfill: a ConfigureVectors entry is the reindex trigger
+    // -----------------------------------------------------------------------
+
+    /// A collection with documents written *before* embedding was configured —
+    /// the situation the streaming path structurally cannot backfill, because
+    /// a worker whose position has ever advanced is past those entries.
+    async fn setup_with_history(
+        count: usize,
+    ) -> (Arc<Engine>, CollectionMeta, EmbeddingWorker, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "docs").unwrap();
+        for i in 0..count {
+            engine.insert(&coll, doc! { "_id": i as i64, "title": format!("doc {i}") }).unwrap();
+        }
+        engine.configure_vectors("app", "docs", config(&["title", "body"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        worker.set_provider(coll.id.0, FakeProvider::new(4));
+        (engine, coll, worker, dir)
+    }
+
+    #[tokio::test]
+    async fn enabling_embedding_backfills_documents_that_predate_it() {
+        // The gap this closes: before the ConfigureVectors entry became a
+        // trigger, these three documents were never embedded at all — the
+        // "backfill" M2 recorded was the worker's first-ever run from zero,
+        // which a long-lived worker never repeats.
+        let (engine, coll, mut worker, _dir) = setup_with_history(3).await;
+
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 3 });
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for i in 0..3i64 {
+            let vectors = engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(i)).unwrap();
+            assert_eq!(vectors.len(), 1, "document {i} must be embedded");
+        }
+        let _ = coll;
+    }
+
+    #[tokio::test]
+    async fn replaying_a_backfill_entry_redoes_nothing() {
+        // The position is recorded after the scan, so a crash replays the
+        // entry. Idempotency is the staleness check, per document.
+        let (engine, _coll, mut worker, _dir) = setup_with_history(3).await;
+        let entry = last_entry(&engine);
+
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: 3 });
+        assert_eq!(
+            worker.process(&entry).await.unwrap(),
+            Outcome::Backfilled { embedded: 0 },
+            "already-current vectors must not be re-embedded on replay"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconfiguring_re_embeds_every_document() {
+        // The reindex operation itself: same collection, new configuration —
+        // here a changed field set, standing in for a changed model. Every
+        // document's vectors must be rebuilt from the documents, not from
+        // whatever the oplog still retains.
+        let (engine, coll, mut worker, _dir) = setup_with_history(2).await;
+        worker.process(&last_entry(&engine)).await.unwrap();
+
+        // Reconfigure to embed a different field; doc texts change meaning.
+        for i in 0..2i64 {
+            engine
+                .replace(
+                    &coll,
+                    &kimmy_core::DocId::Int64(i),
+                    doc! { "title": format!("doc {i}"), "body": format!("body {i}") },
+                    false,
+                )
+                .unwrap();
+        }
+        // Process the replaces so vectors are current for the old config.
+        let entries = engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap();
+        for entry in &entries {
+            worker.process(entry).await.unwrap();
+        }
+
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 2 });
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let text = &engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(0)).unwrap()[0].text;
+        assert!(text.contains("body 0"), "must be embedded under the new fields: {text}");
+        assert!(!text.contains("doc 0"), "the old field must be gone: {text}");
+    }
+
+    #[tokio::test]
+    async fn disabling_and_byo_trigger_no_backfill() {
+        let (engine, _coll, mut worker, _dir) = setup_with_history(1).await;
+
+        engine.disable_vectors("app", "docs", false).unwrap();
+        assert_eq!(
+            worker.process(&last_entry(&engine)).await.unwrap(),
+            Outcome::Skipped,
+            "disabling has nothing to embed"
+        );
+
+        let byo = VectorConfig { provider: ProviderConfig::Byo, ..config(&["title"]) };
+        engine.configure_vectors("app", "docs", byo).unwrap();
+        assert_eq!(
+            worker.process(&last_entry(&engine)).await.unwrap(),
+            Outcome::Skipped,
+            "byo vectors are the client's to supply; a backfill could only delete them"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reconfigured_collection_does_not_keep_its_old_provider() {
+        // Found while building the backfill: the provider cache had no
+        // eviction, so a collection reconfigured to a new model kept
+        // embedding through the old provider forever. The cache now stores
+        // the configuration each provider was built from and rebuilds on
+        // mismatch — asserted here through the dimension, which is the one
+        // externally visible property a provider owns.
+        let (_engine, coll, mut worker, _dir) = setup_with_history(0).await;
+
+        let first = worker.provider_for(coll.id.0, &config(&["title"])).unwrap();
+        assert_eq!(first.dim(), 4, "the injected fake is trusted while config is unqueried");
+
+        // A genuinely different configuration must evict even a cached entry
+        // built from a real config. Build one from config A, then ask with
+        // config B: the provider must be rebuilt, not reused.
+        let mut real = EmbeddingWorker::new(Arc::clone(&_engine));
+        let a = config(&["title"]);
+        let built_a = real.provider_for(coll.id.0, &a).unwrap();
+        let mut b = config(&["title"]);
+        b.dim = 8;
+        let built_b = real.provider_for(coll.id.0, &b).unwrap();
+        assert_eq!(built_a.dim(), 4);
+        assert_eq!(built_b.dim(), 8, "a changed configuration must rebuild the provider");
     }
 }

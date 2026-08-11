@@ -333,19 +333,17 @@ what a dot-product search means — so it is refused rather than redefined.
 
 ## What is not built
 
-**No on-disk graph persistence.** The cache is in-memory only. After a restart,
-the first search of a large collection pays a full O(n log n) build, and until
-then queries take the exact path — slower, never wrong. The plan called for
-snapshotting the graph and replaying newer vector-oplog entries on startup.
-
 **No `$vectorSearch` aggregation stage.** Search is its own endpoint; it does
 not yet compose inside a pipeline.
 
-**No explicit reindex operation.** Changing the model or dimension requires
-disabling with `?drop_vectors=true` and re-enabling, which backfills from the
-oplog.
-
-All tracked in [Deviations](deviations.md).
+Tracked in [Deviations](deviations.md). Two former entries here are built:
+graphs **persist across restarts** (M8 — loaded before any rebuild is paid,
+validated by vector count), and **reindexing is just `POST /vector` again** —
+every configuration change triggers a backfill that scans the collection and
+re-embeds what the new configuration demands. Changing the dimension in place
+is legal for server-embedded collections (old-width vectors are invisible to
+search while the backfill replaces them) and refused for `byo`, whose vectors
+the server cannot regenerate — drop those first.
 
 ---
 

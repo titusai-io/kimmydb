@@ -301,7 +301,6 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
 | Multi-document atomicity | A batch update can be partially applied | by design |
 | Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
-| Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 | Webhook ownership hashes addresses | Rendezvous hashing takes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions — the same disruption as that node leaving and another joining. Hashing node ids would be stabler and needs a member → node-id mapping | M6 |
 
 ---
@@ -381,6 +380,37 @@ like one was working.
 ---
 
 ## 🟢 Closed
+
+**Reindexing is `POST /vector` again — and the old escape hatch never worked.**
+The register carried "changing model or dimension needs a
+disable-with-`drop_vectors` and re-enable, which backfills from the oplog."
+The second half of that sentence was **false, and had always been false**: the
+embedding worker's backfill was its first-ever run starting from the
+beginning of the oplog, and a worker whose position has ever advanced is past
+old entries forever. Enabling embedding on a collection that already held
+documents embedded *nothing* — on any node whose worker had previously run —
+and re-enabling after a drop embedded nothing either. A claim in this
+register, recorded once and never re-checked against the code: the
+native-toolchain lesson, again.
+
+Now the worker treats every `ConfigureVectors` oplog entry as a reindex
+trigger: it scans the **collection** — the documents are the durable source;
+the oplog may have collected their entries — and re-embeds what the
+configuration demands. Idempotency is layered: per document, the HLC
+staleness check; per scan, a fingerprint of the configuration written only
+after the scan completes, because a configuration change is invisible to
+per-document HLCs (configurations do not touch documents). A crash mid-scan
+replays the entry; a replay after completion costs a scan and no embedding.
+Dimension changes are now legal in place for server-embedded collections —
+both search paths already skip width-mismatched records, so old vectors are
+invisible while the backfill replaces them — and still refused for `byo`,
+whose vectors the server can never regenerate.
+
+**Also found and fixed on the way:** the worker's provider cache had no
+eviction, so a collection reconfigured to a new model would have kept
+embedding through the *old* provider for the life of the process. The cache
+now stores the configuration each provider was built from and rebuilds on
+mismatch.
 
 **No webhook was ever delivered in any clustered deployment — found by the
 cluster harness on its first run.** The live set SWIM maintains contains
