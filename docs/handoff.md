@@ -17,8 +17,8 @@ reload's trigger, and token revocation's semantics.
 
 | | |
 |---|---|
-| `main` | PRs #16–#44 merged: the M8 plan, the cluster harness, observability, benchmarks, HNSW snapshots |
-| `m8-vector-reindex` | **Not merged.** `ConfigureVectors` entries now trigger a collection-scan backfill in the worker — which also revealed that the old "re-enable backfills from the oplog" claim was always false (a long-lived worker's position was past old entries; enabling embedding on existing documents embedded nothing), and that the provider cache never evicted on reconfigure. Layered idempotency: config fingerprint per scan, HLC per document |
+| `main` | PRs #16–#45 merged: the M8 plan, the cluster harness, observability, benchmarks, HNSW snapshots, vector reindex |
+| `m8-provider-audit` | **Not merged.** Voyage confirmed OpenAI-compatible (no new code, a pinning test); Cohere and Gemini dialects added. `HttpProvider` grew an `Auth` enum for Gemini's header key. Verified against documented shapes with fixtures ([ADR-047](decisions.md)) |
 
 ### The bug the harness caught on its first run
 
