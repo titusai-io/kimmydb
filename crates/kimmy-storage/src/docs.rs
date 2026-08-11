@@ -154,9 +154,14 @@ impl Engine {
 
         // Same transaction as the document write, so the index cannot describe
         // a state that never existed. A unique violation aborts the whole thing.
-        if let Err(e) = index::maintain(&txn, coll.id, &coll.indexes, None, Some(&doc), &key) {
-            txn.abort()?;
-            return Err(e);
+        match index::maintain(&txn, coll, None, Some(&doc), &key) {
+            Ok(newly_multikey) => {
+                index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
+            }
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
         }
 
         let entry = OplogEntry {
@@ -214,11 +219,14 @@ impl Engine {
             (existed, previous)
         };
 
-        if let Err(e) =
-            index::maintain(&txn, coll.id, &coll.indexes, previous.as_ref(), Some(&doc), &key)
-        {
-            txn.abort()?;
-            return Err(e);
+        match index::maintain(&txn, coll, previous.as_ref(), Some(&doc), &key) {
+            Ok(newly_multikey) => {
+                index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
+            }
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
         }
 
         let entry = OplogEntry {
@@ -266,8 +274,9 @@ impl Engine {
         };
 
         // A tombstoned document must leave no index entries behind, or a scan
-        // would surface a candidate whose document no longer exists.
-        index::maintain(&txn, coll.id, &coll.indexes, previous.as_ref(), None, &key)?;
+        // would surface a candidate whose document no longer exists. A delete
+        // writes no new image, so it can never flip the multikey flag.
+        index::maintain(&txn, coll, previous.as_ref(), None, &key)?;
         let existed = true;
 
         let entry = OplogEntry {
@@ -357,14 +366,13 @@ impl Engine {
             // write leaves an index-backed query unable to find a document that
             // demonstrably exists. Same transaction, so the two cannot disagree.
             let next = winner.document()?;
-            violations = index::maintain_remote(
-                &txn,
-                coll.id,
-                &coll.indexes,
-                previous.as_ref(),
-                next.as_ref(),
-                &key,
-            )?;
+            let newly_multikey;
+            (violations, newly_multikey) =
+                index::maintain_remote(&txn, coll, previous.as_ref(), next.as_ref(), &key)?;
+            // A replicated array write makes this node's index multikey exactly
+            // as a local one would — the planner here answers queries over the
+            // merged data, wherever it was written.
+            index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
             true
         };
 

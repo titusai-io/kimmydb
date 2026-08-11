@@ -283,14 +283,11 @@ impl Engine {
                 // Index entries follow the document, or an index-backed query
                 // would answer from the future the rewind just undid.
                 if let Some(meta) = collections.get(&collection_id) {
-                    index::maintain(
-                        &txn,
-                        meta.id,
-                        &meta.indexes,
-                        before.as_ref(),
-                        after.as_ref(),
-                        &key,
-                    )?;
+                    let newly_multikey =
+                        index::maintain(&txn, meta, before.as_ref(), after.as_ref(), &key)?;
+                    // A restored image can hold arrays the current one did not;
+                    // the flag is one-way, so marking is the only safe answer.
+                    index::mark_multikey(&txn, &meta.db, &meta.name, &newly_multikey)?;
                 }
             }
 

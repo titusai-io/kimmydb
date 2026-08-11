@@ -30,13 +30,34 @@ const MAX_KEYS_PER_DOCUMENT: usize = 1_000;
 /// Indexing only the elements would leave whole-array equality with no entry,
 /// and the planner would return an incomplete result.
 pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
+    Ok(index_keys_observed(index, doc)?.0)
+}
+
+/// [`index_keys`], also reporting whether this document makes the index
+/// multikey.
+///
+/// Multikey means some field contributed more than one value: it held an
+/// array, or its path fanned out through one (`a.b` over `{a: [{b: 1},
+/// {b: 2}]}`). That is the condition under which a two-sided key range stops
+/// being sound, so it is what the write path records — see
+/// [`IndexMeta::multikey`].
+pub(crate) fn index_keys_observed(
+    index: &IndexMeta,
+    doc: &Document,
+) -> Result<(Vec<Vec<u8>>, bool)> {
     // Per field, the set of values this document offers.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(index.fields.len());
     let mut array_fields = 0;
+    let mut multikey = false;
 
     for field in &index.fields {
         let resolved = path::resolve(doc, &field.path);
         let mut values: Vec<Bson> = Vec::new();
+
+        // A path that resolves to several values has fanned out through an
+        // array of documents — multikey even though no value is itself an
+        // array.
+        multikey |= resolved.len() > 1;
 
         if resolved.is_empty() {
             // A missing field indexes as null, so `{a: null}` and
@@ -46,6 +67,7 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
             for value in resolved {
                 if let Bson::Array(items) = value {
                     array_fields += 1;
+                    multikey = true;
                     values.extend(items.iter().cloned());
                     // ...and the array itself, for whole-array equality.
                     values.push(value.clone());
@@ -93,7 +115,7 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
         keys.iter().map(|k| keyenc::encode_compound_ordered(k)).collect::<Result<_, _>>()?;
     encoded.sort();
     encoded.dedup();
-    Ok(encoded)
+    Ok((encoded, multikey))
 }
 
 /// Bring every index on a collection in line with one document write.
@@ -105,16 +127,22 @@ pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
 ///
 /// Unique constraints are checked *before* anything is mutated, so a rejected
 /// write leaves the index untouched.
+///
+/// Returns the ids of indexes this write has just made multikey, which the
+/// caller must persist with [`mark_multikey`] **in the same transaction** — a
+/// flag committed later than the entries would leave a window in which the
+/// planner intersects a two-sided range over an index that already holds an
+/// array's keys.
 pub(crate) fn maintain(
     txn: &redb::WriteTransaction,
-    coll: CollectionId,
-    indexes: &[IndexMeta],
+    coll: &crate::CollectionMeta,
     old: Option<&Document>,
     new: Option<&Document>,
     doc_key: &[u8],
-) -> Result<()> {
+) -> Result<Vec<u32>> {
+    let indexes = current_indexes(txn, coll)?;
     if indexes.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     // One handle for the whole operation: redb refuses to open the same table
     // twice in a transaction, and a `Table` is readable as well as writable.
@@ -125,7 +153,7 @@ pub(crate) fn maintain(
     if let Some(new) = new {
         for index in indexes.iter().filter(|i| i.unique) {
             for key in index_keys(index, new)? {
-                for holder in holders_of(&table, coll, index.id, &key)? {
+                for holder in holders_of(&table, coll.id, index.id, &key)? {
                     if holder != doc_key {
                         return Err(StorageError::Core(CoreError::UniqueViolation {
                             index: index.name.clone(),
@@ -137,7 +165,29 @@ pub(crate) fn maintain(
         }
     }
 
-    apply_entries(&mut table, coll, indexes, old, new, doc_key)
+    apply_entries(&mut table, coll.id, &indexes, old, new, doc_key)
+}
+
+/// The index definitions as this transaction sees them.
+///
+/// Read here rather than trusted from the caller, because the caller's
+/// `CollectionMeta` was fetched in an *earlier* transaction. An index created
+/// in between would be silently skipped — no entries for this write, a unique
+/// constraint never checked, an array never observed — and the write path is
+/// the one place that can notice, since write transactions serialize. The
+/// caller's handle still names the collection; only the definitions are
+/// re-read.
+fn current_indexes(
+    txn: &redb::WriteTransaction,
+    coll: &crate::CollectionMeta,
+) -> Result<Vec<IndexMeta>> {
+    let collections = txn.open_table(tables::COLLECTIONS)?;
+    Ok(match collections.get((coll.db.as_str(), coll.name.as_str()))? {
+        Some(raw) => serde_json::from_slice::<crate::CollectionMeta>(raw.value())?.indexes,
+        // Not stored: the collection is being created or restored in this very
+        // transaction, and the caller's copy is the only truth there is.
+        None => coll.indexes.clone(),
+    })
 }
 
 /// A unique constraint that a merged write broke.
@@ -170,14 +220,14 @@ pub struct UniqueViolation {
 /// a wrong answer rather than a reported problem.
 pub(crate) fn maintain_remote(
     txn: &redb::WriteTransaction,
-    coll: CollectionId,
-    indexes: &[IndexMeta],
+    coll: &crate::CollectionMeta,
     old: Option<&Document>,
     new: Option<&Document>,
     doc_key: &[u8],
-) -> Result<Vec<UniqueViolation>> {
+) -> Result<(Vec<UniqueViolation>, Vec<u32>)> {
+    let indexes = current_indexes(txn, coll)?;
     if indexes.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), Vec::new()));
     }
     let mut table = txn.open_table(tables::INDEX_ENTRIES)?;
 
@@ -185,7 +235,7 @@ pub(crate) fn maintain_remote(
     if let Some(new) = new {
         for index in indexes.iter().filter(|i| i.unique) {
             for key in index_keys(index, new)? {
-                let mut holders: Vec<Vec<u8>> = holders_of(&table, coll, index.id, &key)?
+                let mut holders: Vec<Vec<u8>> = holders_of(&table, coll.id, index.id, &key)?
                     .into_iter()
                     .filter(|holder| holder != doc_key)
                     .collect();
@@ -201,11 +251,16 @@ pub(crate) fn maintain_remote(
         }
     }
 
-    apply_entries(&mut table, coll, indexes, old, new, doc_key)?;
-    Ok(violations)
+    let newly_multikey = apply_entries(&mut table, coll.id, &indexes, old, new, doc_key)?;
+    Ok((violations, newly_multikey))
 }
 
 /// Remove the old image's entries and add the new one's.
+///
+/// Returns the ids of indexes the **new** image has just made multikey — those
+/// where it contributed more than one key and the definition does not say so
+/// yet. The old image is not consulted: the flag is one-way, so only the state
+/// being written can flip it.
 fn apply_entries(
     table: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
     coll: CollectionId,
@@ -213,7 +268,8 @@ fn apply_entries(
     old: Option<&Document>,
     new: Option<&Document>,
     doc_key: &[u8],
-) -> Result<()> {
+) -> Result<Vec<u32>> {
+    let mut newly_multikey = Vec::new();
     for index in indexes {
         if let Some(old) = old {
             for key in index_keys(index, old)? {
@@ -221,11 +277,46 @@ fn apply_entries(
             }
         }
         if let Some(new) = new {
-            for key in index_keys(index, new)? {
+            let (keys, multikey) = index_keys_observed(index, new)?;
+            if multikey && !index.multikey {
+                newly_multikey.push(index.id);
+            }
+            for key in keys {
                 table.insert((coll.0, index.id, key.as_slice(), doc_key), ())?;
             }
         }
     }
+    Ok(newly_multikey)
+}
+
+/// Persist that these indexes are now multikey, in the caller's transaction.
+///
+/// Re-reads the definition through the transaction rather than trusting the
+/// caller's copy: the copy predates the transaction, and writing it back would
+/// resurrect anything that changed in between. Setting a flag that is already
+/// set is a harmless no-op, which is what makes racing observers safe.
+pub(crate) fn mark_multikey(
+    txn: &redb::WriteTransaction,
+    db: &str,
+    collection: &str,
+    index_ids: &[u32],
+) -> Result<()> {
+    if index_ids.is_empty() {
+        return Ok(());
+    }
+    let mut collections = txn.open_table(tables::COLLECTIONS)?;
+    let mut meta: crate::CollectionMeta = match collections.get((db, collection))? {
+        Some(raw) => serde_json::from_slice(raw.value())?,
+        // Gone mid-transaction cannot happen — writes are serialized — but a
+        // missing definition is not worth failing the document write over.
+        None => return Ok(()),
+    };
+    for index in meta.indexes.iter_mut() {
+        if index_ids.contains(&index.id) {
+            index.multikey = true;
+        }
+    }
+    collections.insert((db, collection), serde_json::to_vec(&meta)?.as_slice())?;
     Ok(())
 }
 
@@ -262,8 +353,20 @@ pub(crate) fn scan_range(
     lower: &[u8],
     upper: Option<&[u8]>,
 ) -> Result<Vec<Vec<u8>>> {
+    scan_range_in(&db.begin_read()?, coll, index_id, lower, upper)
+}
+
+/// [`scan_range`] inside a caller-held transaction, for scans that must share
+/// a snapshot with something else — see
+/// [`crate::Engine::index_candidates_unless_multikey`].
+fn scan_range_in(
+    txn: &redb::ReadTransaction,
+    coll: CollectionId,
+    index_id: u32,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>> {
     use std::ops::Bound;
-    let txn = db.begin_read()?;
     let table = txn.open_table(tables::INDEX_ENTRIES)?;
 
     let start = Bound::Included((coll.0, index_id, lower, [].as_slice()));
@@ -386,16 +489,19 @@ impl crate::Engine {
             )));
         }
 
-        let index = IndexMeta { id, name, fields, unique, enforcement };
+        let mut index = IndexMeta { id, name, fields, unique, enforcement, multikey: false };
 
         let txn = self.db().begin_write()?;
 
         // Scoped in a closure so every table borrow ends before the abort or
-        // commit below, which need to move the transaction.
-        let build = || -> Result<()> {
+        // commit below, which need to move the transaction. Returns whether the
+        // existing documents already make the index multikey — the backfill is
+        // the flag's only chance to see them.
+        let build = |index: &IndexMeta| -> Result<bool> {
             let docs = txn.open_table(tables::DOCS)?;
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
+            let mut observed_multikey = false;
 
             for entry in docs.range(crate::engine::doc_range(meta.id))? {
                 let (raw_key, raw_value) = entry?;
@@ -403,7 +509,9 @@ impl crate::Engine {
                 let Some(doc) = record.document()? else { continue };
                 let (_, doc_key) = raw_key.value();
 
-                for key in index_keys(&index, &doc)? {
+                let (keys, multikey) = index_keys_observed(index, &doc)?;
+                observed_multikey |= multikey;
+                for key in keys {
                     // A unique index over data that already violates it must
                     // not be created — it would report a constraint it does
                     // not actually hold.
@@ -418,12 +526,15 @@ impl crate::Engine {
                     entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
                 }
             }
-            Ok(())
+            Ok(observed_multikey)
         };
 
-        if let Err(e) = build() {
-            txn.abort()?;
-            return Err(e);
+        match build(&index) {
+            Ok(observed) => index.multikey = observed,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
         }
 
         meta.indexes.push(index.clone());
@@ -525,6 +636,43 @@ impl crate::Engine {
         scan_range(self.db(), coll.id, index_id, lower, Some(upper))
     }
 
+    /// Candidates for a range that is only sound while the index is **not**
+    /// multikey. `None` means the caller must re-plan.
+    ///
+    /// A two-sided range intersects both bounds, which loses documents once
+    /// any of them contributes several keys — and the plan was built from
+    /// metadata read in an *earlier* transaction. A write between that read
+    /// and this scan could have made the index multikey. So the flag is
+    /// re-read here, **in the same transaction as the scan**: what this
+    /// snapshot's flag approves is sound for exactly this snapshot's entries.
+    /// A `false` from a previous snapshot proves nothing about this one.
+    pub fn index_candidates_unless_multikey(
+        &self,
+        coll: &crate::CollectionMeta,
+        index_id: u32,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Result<Option<Vec<Vec<u8>>>> {
+        let txn = self.db().begin_read()?;
+        {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let fresh: crate::CollectionMeta =
+                match collections.get((coll.db.as_str(), coll.name.as_str()))? {
+                    Some(raw) => serde_json::from_slice(raw.value())?,
+                    // Dropped since the plan was built. This same snapshot
+                    // holds no documents either, so empty is the truth.
+                    None => return Ok(Some(Vec::new())),
+                };
+            match fresh.index_by_id(index_id) {
+                Some(index) if !index.multikey => {}
+                // Multikey now, or the index is gone: the plan's bounds no
+                // longer mean what they meant.
+                _ => return Ok(None),
+            }
+        }
+        scan_range_in(&txn, coll.id, index_id, lower, Some(upper)).map(Some)
+    }
+
     /// Fetch a document by its already-encoded key.
     ///
     /// Index entries store the encoded `_id`, and `keyenc` is one-way — but the
@@ -572,6 +720,7 @@ mod tests {
             fields,
             unique,
             enforcement: Enforcement::Local,
+            multikey: false,
         }
     }
 
@@ -859,6 +1008,224 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // Multikey tracking: what licenses a two-sided range
+    // -----------------------------------------------------------------------
+
+    fn multikey_of(engine: &Engine, name: &str) -> bool {
+        engine
+            .get_collection("app", "docs")
+            .unwrap()
+            .indexes
+            .iter()
+            .find(|i| i.name == name)
+            .unwrap()
+            .multikey
+    }
+
+    #[test]
+    fn an_array_write_marks_the_index_multikey() {
+        // The write-path half of the flag: the index exists first, and the
+        // array arrives later. Scalar writes must not set it — the flag's
+        // whole value is staying false for the scalar-only majority.
+        let (engine, _coll, _dir) = engine();
+        let idx = engine
+            .create_index("app", "docs", vec![IndexField::ascending("a")], false, None)
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        engine.insert(&coll, doc! { "_id": 1, "a": 5 }).unwrap();
+        assert!(!multikey_of(&engine, &idx.name), "a scalar write must not set the flag");
+
+        engine.insert(&coll, doc! { "_id": 2, "a": [1, 2] }).unwrap();
+        assert!(multikey_of(&engine, &idx.name), "an array write must set it");
+
+        // One-way: deleting the only array document does not clear it, because
+        // nothing proves no other document holds one without a full scan.
+        engine.delete(&coll, &DocId::Int64(2)).unwrap();
+        assert!(multikey_of(&engine, &idx.name), "the flag never clears");
+    }
+
+    #[test]
+    fn backfill_marks_an_index_multikey_when_arrays_already_exist() {
+        // The other half: the documents exist first. The backfill is the
+        // flag's only chance to see them.
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 1, "a": [1, 2] }).unwrap();
+        let idx = engine
+            .create_index("app", "docs", vec![IndexField::ascending("a")], false, None)
+            .unwrap();
+        assert!(idx.multikey, "the backfill saw an array");
+        assert!(multikey_of(&engine, &idx.name), "and the stored definition agrees");
+    }
+
+    #[test]
+    fn a_path_fanning_out_through_an_array_is_multikey() {
+        // `a.b` over `{a: [{b: 1}, {b: 2}]}` contributes two keys without any
+        // indexed value being an array itself. Same hazard, same flag.
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 1, "a": [ { "b": 1 }, { "b": 2 } ] }).unwrap();
+        let idx = engine
+            .create_index("app", "docs", vec![IndexField::ascending("a.b")], false, None)
+            .unwrap();
+        assert!(idx.multikey, "path fan-out is multikey even with no array value");
+    }
+
+    #[test]
+    fn the_multikey_flag_survives_a_restart() {
+        // It is part of the persisted definition, not a runtime observation —
+        // a restart that forgot it would resume intersecting ranges over an
+        // index that holds an array's keys.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let e = Engine::open(&path).unwrap();
+            e.create_collection("app", "docs").unwrap();
+            e.create_index("app", "docs", vec![IndexField::ascending("a")], false, None).unwrap();
+            // Re-fetched so the write sees the index; a stale handle would
+            // maintain nothing.
+            let c = e.get_collection("app", "docs").unwrap();
+            e.insert(&c, doc! { "_id": 1, "a": [1, 2] }).unwrap();
+        }
+        let e = Engine::open(&path).unwrap();
+        assert!(multikey_of(&e, "a_1"));
+    }
+
+    #[test]
+    fn a_replicated_array_write_marks_the_index_multikey() {
+        // The flag is a node-local observation, so the node applying a peer's
+        // write must make it too — its own planner answers queries over the
+        // merged data.
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+        let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+        for engine in [&a, &b] {
+            engine.create_collection("app", "docs").unwrap();
+            engine
+                .create_index("app", "docs", vec![IndexField::ascending("a")], false, None)
+                .unwrap();
+        }
+
+        let coll = a.get_collection("app", "docs").unwrap();
+        a.insert(&coll, doc! { "_id": 1, "a": [1, 2] }).unwrap();
+        let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap();
+        b.apply_batch(&entries).unwrap();
+
+        assert!(multikey_of(&b, "a_1"), "the applying node must observe what it applied");
+    }
+
+    #[test]
+    fn a_two_sided_range_stays_correct_when_arrays_arrive_after_the_index() {
+        // The order the backfill cannot cover: the index watches the arrays
+        // arrive through the write path. If the flag failed to flip, the
+        // planner would intersect both bounds over an index where different
+        // elements satisfy each one, and _id 1 would silently vanish from the
+        // result.
+        let (engine, _coll, _dir) = engine();
+        engine.create_index("app", "docs", vec![IndexField::ascending("a")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        engine.insert(&coll, doc! { "_id": 1i64, "a": [2, 0] }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2i64, "a": 1 }).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        for query in
+            [doc! { "a": { "$gte": 1, "$lte": 1 } }, doc! { "a": { "$gte": 0, "$lte": 2 } }]
+        {
+            let scan = by_scan(&engine, &coll, &query);
+            let indexed = by_index(&engine, &coll, &query).expect("the index should apply");
+            assert_eq!(indexed, scan, "index lost documents for {query:?}");
+        }
+    }
+
+    #[test]
+    fn a_two_sided_range_on_a_scalar_only_index_reads_only_the_range() {
+        // The selectivity the flag buys back — and the proof the register's
+        // one red drift is closed. Twenty scalar documents, a range covering
+        // five: the scan must touch five candidates, not everything from the
+        // lower bound up.
+        let (engine, coll, _dir) = engine();
+        for i in 0..20 {
+            engine.insert(&coll, doc! { "_id": i as i64, "n": i }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let filter = kimmy_query::filter::parse(&doc! { "n": { "$gte": 5, "$lte": 9 } }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes).expect("index applies");
+        assert!(plan.both_bounds, "a scalar-only index must use both bounds");
+
+        let candidates = engine
+            .index_candidates_unless_multikey(&coll, plan.index_id, &plan.lower, &plan.upper)
+            .unwrap()
+            .expect("the index is not multikey");
+        assert_eq!(candidates.len(), 5, "the scan must stop at the upper bound");
+    }
+
+    #[test]
+    fn a_write_through_a_stale_handle_still_maintains_a_new_index() {
+        // Found while writing this branch's tests: `maintain` used to take the
+        // caller's index list on trust, so a write through a `CollectionMeta`
+        // fetched before an index existed skipped that index entirely — no
+        // entries, no unique check, no multikey observation. The definitions
+        // are now re-read inside the write's own transaction.
+        let (engine, stale, _dir) = engine();
+        let idx = engine
+            .create_index("app", "docs", vec![IndexField::ascending("a")], false, None)
+            .unwrap();
+
+        // `stale` predates the index and lists none.
+        assert!(stale.indexes.is_empty(), "the handle must be stale for this to prove anything");
+        engine.insert(&stale, doc! { "_id": 1, "a": [1, 2] }).unwrap();
+
+        let fresh = engine.get_collection("app", "docs").unwrap();
+        assert_eq!(
+            entries_for(&engine, &fresh, idx.id).len(),
+            1,
+            "the write must reach the index it could not see"
+        );
+        assert!(multikey_of(&engine, &idx.name), "and its array must be observed");
+    }
+
+    #[test]
+    fn a_unique_constraint_holds_against_a_stale_handle() {
+        // The sharper edge of the same hazard: a duplicate slipping through a
+        // handle that predates the unique index.
+        let (engine, stale, _dir) = engine();
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("email")], true, None)
+            .unwrap();
+
+        engine.insert(&stale, doc! { "_id": 1, "email": "a@x.com" }).unwrap();
+        let err = engine.insert(&stale, doc! { "_id": 2, "email": "a@x.com" });
+        assert!(
+            matches!(err, Err(StorageError::Core(CoreError::UniqueViolation { .. }))),
+            "a stale handle must not bypass the constraint: {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_checked_scan_refuses_an_index_that_went_multikey() {
+        // The race this exists for: a plan built while the flag was false, and
+        // a write that flipped it before the scan. The scan must say
+        // "re-plan", never return candidates a too-narrow range selected.
+        let (engine, _coll, _dir) = engine();
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let stale = engine.get_collection("app", "docs").unwrap();
+
+        let filter = kimmy_query::filter::parse(&doc! { "n": { "$gte": 1, "$lte": 5 } }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &stale.indexes).expect("index applies");
+        assert!(plan.both_bounds);
+
+        // The flip happens after the plan was built — exactly the window.
+        engine.insert(&stale, doc! { "_id": 1i64, "n": [9, 0] }).unwrap();
+
+        let checked = engine
+            .index_candidates_unless_multikey(&stale, plan.index_id, &plan.lower, &plan.upper)
+            .unwrap();
+        assert_eq!(checked, None, "a flipped flag must force a re-plan, not a narrow scan");
+    }
+
+    // -----------------------------------------------------------------------
     // The invariant the whole feature rests on
     // -----------------------------------------------------------------------
 
@@ -1094,17 +1461,30 @@ mod tests {
                 span in 0i32..4,
                 shape in 0u8..3,
                 descending in any::<bool>(),
+                // Whether the index watches the writes arrive or backfills
+                // over them. The multikey flag has one code path for each,
+                // and both must license the same plans.
+                index_first in any::<bool>(),
             ) {
                 let (engine, coll, _dir) = engine();
-                for (i, v) in values.iter().enumerate() {
-                    engine.insert(&coll, doc! { "_id": i as i64, "a": v.clone() }).unwrap();
-                }
                 let field = if descending {
                     IndexField::descending("a")
                 } else {
                     IndexField::ascending("a")
                 };
-                engine.create_index("app", "docs", vec![field], false, None).unwrap();
+                let coll = if index_first {
+                    engine.create_index("app", "docs", vec![field.clone()], false, None).unwrap();
+                    // Re-fetched so the writes see the index and maintain it.
+                    engine.get_collection("app", "docs").unwrap()
+                } else {
+                    coll
+                };
+                for (i, v) in values.iter().enumerate() {
+                    engine.insert(&coll, doc! { "_id": i as i64, "a": v.clone() }).unwrap();
+                }
+                if !index_first {
+                    engine.create_index("app", "docs", vec![field], false, None).unwrap();
+                }
                 let coll = engine.get_collection("app", "docs").unwrap();
 
                 let query = match shape {

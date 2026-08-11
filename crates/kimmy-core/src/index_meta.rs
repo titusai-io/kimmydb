@@ -24,6 +24,22 @@ pub struct IndexMeta {
     /// `unique` is false.
     #[serde(default)]
     pub enforcement: Enforcement,
+    /// Whether any indexed field has ever held an array — or a path that fans
+    /// out through one — in this collection.
+    ///
+    /// Observed on the write path and at backfill, in the same transaction as
+    /// the index entries. **One-way:** clearing it safely would require proving
+    /// no document still holds an array, which is a full scan for the sake of a
+    /// planner hint. A node-local observation that converges because the data
+    /// does; while nodes disagree, each plans correctly over the documents it
+    /// holds.
+    ///
+    /// Why the planner cares: different array elements may satisfy each end of
+    /// a range — `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}` — so a two-sided
+    /// key range is only sound when no document contributes more than one key.
+    /// `false` here is what licenses using both bounds.
+    #[serde(default)]
+    pub multikey: bool,
 }
 
 /// How far a unique constraint reaches.

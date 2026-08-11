@@ -213,13 +213,32 @@ pub fn collect_matching(
     filter: &filter::Filter,
     stop_after: Option<usize>,
 ) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
-    let plan = plan::choose(filter, &meta.indexes);
+    let mut plan = plan::choose(filter, &meta.indexes);
     let mut matched = Vec::new();
     let mut examined = 0usize;
 
-    match &plan {
-        Some(p) => {
-            let candidates = state.engine.index_candidates(meta, p.index_id, &p.lower, &p.upper)?;
+    // A plan that intersected both ends of a range is only sound while the
+    // index is not multikey — and it was chosen from a metadata read that is
+    // already stale. The checked scan re-reads the flag in the same snapshot
+    // as the scan; `None` means a write flipped it in between, and the honest
+    // answer is to fall back to scanning the collection. That can happen at
+    // most once per index, ever, since the flag never clears.
+    let candidates = match &plan {
+        Some(p) if p.both_bounds => {
+            let checked = state
+                .engine
+                .index_candidates_unless_multikey(meta, p.index_id, &p.lower, &p.upper)?;
+            if checked.is_none() {
+                plan = None;
+            }
+            checked
+        }
+        Some(p) => Some(state.engine.index_candidates(meta, p.index_id, &p.lower, &p.upper)?),
+        None => None,
+    };
+
+    match candidates {
+        Some(candidates) => {
             for key in candidates {
                 let Some(doc) = state.engine.get_by_encoded_key(meta, &key)? else {
                     continue;
@@ -450,6 +469,9 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
             kimmy_storage::Enforcement::Local => "local",
             kimmy_storage::Enforcement::Coordinated => "coordinated",
         },
+        // Surfaced so an operator can see *why* a two-sided range on this
+        // index does not stop at its upper bound.
+        "multikey": index.multikey,
     })
 }
 

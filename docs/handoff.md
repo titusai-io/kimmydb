@@ -6,38 +6,52 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-10 — M7 begun: the warm-up branch
+## As of 2026-08-10 — M7: multikey tracking, and the register's last 🔴 closed
 
-**M0–M6 are complete; M7 (query engine completion) is planned in
-[Roadmap](roadmap.md) and begun.** The milestone record lives in
-[Decisions](decisions.md) and [Deviations](deviations.md).
+**M0–M6 are complete; M7 (query engine completion) is underway.** The
+milestone record lives in [Decisions](decisions.md) and
+[Deviations](deviations.md).
 
 ### State of the branches
 
 | | |
 |---|---|
-| `main` | PRs #16–#34 merged, including the M7 plan |
-| `m7-webhook-review-fixes` | **Not merged.** The three M6 review findings: webhook events now name their database and collection (asserted on the wire), backoff state is pruned against the registry, and the egress check runs inside the delivery client's resolver (`CheckedResolver`), closing the DNS TOCTOU. Plus: the client's `unwrap_or_default()` fallback is gone — it would have silently shed the redirect refusal on a build failure |
+| `main` | PRs #16–#35 merged: the M7 plan and the webhook warm-up fixes |
+| `m7-multikey-tracking` | **Not merged.** `IndexMeta::multikey`, both bounds on scalar-only indexes, the snapshot-checked scan, and the stale-handle maintenance fix |
 
-**Gate on it:** 766 tests · fmt · clippy `-D warnings` ·
-`./scripts/check-native-deps.sh` · driven against a live node with a real
-receiver.
+**Gate on it:** fmt · clippy `-D warnings` ·
+`./scripts/check-native-deps.sh` · full suite · driven against a live node.
 
-### What M7 is, and what comes next in it
+### What this branch did, so it is not re-derived
 
-Read the M7 section of [Roadmap](roadmap.md) before starting the next branch —
-the reasoning is there so it is not re-derived. The remaining sequence:
+Whether a two-sided range may intersect both bounds hangs on one fact about
+the data: does any document contribute more than one index key? `{a: [2, 0]}`
+matches `{$gte: 1, $lte: 1}` through *different elements*, so intersection
+loses it. The branch tracks that fact — `IndexMeta::multikey`, set in the same
+transaction as the entries, by write, backfill, replication apply, and rewind;
+one-way — and the planner intersects only when it is false. Multikey indexes
+keep the one-bound superset.
 
-1. **Multikey tracking per index** — a one-way per-index flag, set in the same
-   transaction as index maintenance and by backfill. This is the gate for
-   everything after it.
-2. **Both bounds on non-multikey indexes** — closes the register's only 🔴.
-   The original multikey property test must still pass unchanged.
-3. **Ranges on descending fields** — the bound swap; failure mode is a
+Two hazards surfaced while closing it, both of the same species — **metadata
+read in one transaction proves nothing about another**:
+
+1. A both-bounds plan is built from a metadata read that is stale by scan
+   time. `index_candidates_unless_multikey` re-reads the flag **in the same
+   snapshot as the scan** and answers `None` if it flipped; the query falls
+   back to a collection scan. Possible at most once per index, ever.
+2. **Index maintenance trusted the caller's index list.** A write through a
+   `CollectionMeta` fetched before an index existed skipped that index
+   silently — no entries, no unique check, no multikey observation. Found by
+   this branch's own tests. `maintain` now re-reads definitions inside the
+   write's transaction (`current_indexes`).
+
+### What comes next in M7
+
+1. **Ranges on descending fields** — the bound swap; failure mode is a
    too-narrow range, so it gets its own property test.
-4. **`$in` as a union of point lookups** — new planner strategy, visible in
+2. **`$in` as a union of point lookups** — new planner strategy, visible in
    `explain`.
-5. Mutation testing on the planner and key encoding; docs; deviations 🔴→🟢.
+3. Mutation testing on the planner and key encoding; final docs pass.
 
 ### What webhooks are, in one paragraph
 
@@ -115,6 +129,15 @@ reindex operation, and webhook ownership hashing `SocketAddr` rather than node
 ids (a re-addressed node reshuffles its subscriptions).
 
 ### Invariants a change must not break
+
+- **The multikey flag is one-way and set in the same transaction as the index
+  entries.** A flag that cleared, or lagged its entries by even one commit,
+  licenses a two-sided range that silently loses documents.
+- **A both-bounds plan is validated in the snapshot that scans it.** A `false`
+  read in an earlier transaction proves nothing about this one.
+- **Index maintenance reads its definitions inside the write's transaction**,
+  never from the caller's handle — a stale handle once skipped a just-created
+  index entirely, unique constraint included.
 
 - **The transport moves bytes and nothing else.** Convergence is tested without
   a network in `kimmy-storage/src/sync.rs`; keep it that way, or a merge bug and

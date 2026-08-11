@@ -33,6 +33,14 @@ pub struct IndexPlan {
     pub upper: Vec<u8>,
     /// How many index fields the filter constrained. Reported by `explain`.
     pub fields_used: usize,
+    /// Whether both ends of a range were intersected into the bounds.
+    ///
+    /// Intersecting is only sound while no document contributes several keys —
+    /// which the planner concluded from a metadata read that is stale by the
+    /// time anything scans. A plan carrying `true` must go through
+    /// `index_candidates_unless_multikey`, which re-checks the flag in the
+    /// same snapshot as the scan, rather than the plain candidate scan.
+    pub both_bounds: bool,
 }
 
 /// Greater than the first byte of any encoded component.
@@ -127,6 +135,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
     let mut lower = prefix.clone();
     let mut upper = prefix.clone();
     let mut used = prefix.len();
+    let mut both_bounds = false;
 
     if let Some(field) = index.fields.get(prefix.len())
         && let Some(bounds) = predicates.get(&field.path)
@@ -137,7 +146,9 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         // — the failure mode is a range that is too *narrow* — the range is
         // dropped and only the equality prefix is used. Wider, always correct.
         if !field.descending {
-            // Only ONE end of a range may be used.
+            // Whether BOTH ends of the range may be used hangs on one fact
+            // about the data, not the query: does any document contribute more
+            // than one key?
             //
             // A field can hold an array — a *multikey* index — and Mongo
             // semantics let **different elements** satisfy each end of a range.
@@ -147,11 +158,18 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
             // exclude that document entirely — a range that is too narrow, and
             // therefore silently wrong.
             //
-            // Using one bound keeps the range a superset; the recheck removes
-            // the extras. Tracking multikey-ness per index would let both
-            // bounds be used for fields that never hold arrays — a selectivity
-            // win, not a correctness one. See docs/indexes.md.
+            // So: a multikey index uses one bound, keeping the range a superset
+            // the recheck trims. An index that has never seen an array — the
+            // write path tracks this, see `IndexMeta::multikey` — has exactly
+            // one key per document per field, and a scalar satisfies both
+            // bounds iff that key lies in the intersection. Both bounds, and
+            // the scan stops where the range does.
             match (&bounds.lower, &bounds.upper) {
+                (Some(lo), Some(hi)) if !index.multikey => {
+                    lower.push((lo.clone(), false));
+                    upper.push((hi.clone(), false));
+                    both_bounds = true;
+                }
                 (Some(v), _) => lower.push((v.clone(), false)),
                 (None, Some(v)) => upper.push((v.clone(), false)),
                 (None, None) => unreachable!("checked above"),
@@ -179,6 +197,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         lower: lower_bytes,
         upper: upper_bytes,
         fields_used: used,
+        both_bounds,
     })
 }
 
@@ -196,7 +215,13 @@ mod tests {
             fields,
             unique: false,
             enforcement: Default::default(),
+            multikey: false,
         }
+    }
+
+    /// The same index, but one that has seen an array.
+    fn multikey(id: u32, fields: Vec<IndexField>) -> IndexMeta {
+        IndexMeta { multikey: true, ..index(id, fields) }
     }
 
     fn plan(query: bson::Document, indexes: &[IndexMeta]) -> Option<IndexPlan> {
@@ -254,22 +279,58 @@ mod tests {
     }
 
     #[test]
-    fn only_one_end_of_a_range_is_used() {
-        // A field may hold an array, and different elements may satisfy each
-        // bound — `{a: [2, 0]}` matches `{$gte: 1, $lte: 1}`. Intersecting both
-        // bounds would exclude it, so only the lower bound narrows the range
-        // and the upper end stays open.
-        let idx = [index(0, vec![IndexField::ascending("a")])];
+    fn a_multikey_index_uses_only_one_end_of_a_range() {
+        // Different elements of an array may satisfy each bound — `{a: [2, 0]}`
+        // matches `{$gte: 1, $lte: 1}`. Intersecting both bounds would exclude
+        // it, so once an index has seen an array, only the lower bound narrows
+        // the range and the upper end stays open.
+        let idx = [multikey(0, vec![IndexField::ascending("a")])];
         let two_sided = plan(doc! { "a": { "$gte": 1, "$lte": 1 } }, &idx).unwrap();
         let lower_only = plan(doc! { "a": { "$gte": 1 } }, &idx).unwrap();
         assert_eq!(
             two_sided, lower_only,
-            "a two-sided range must not narrow further than its lower bound alone"
+            "a two-sided range over a multikey index must not narrow further than its lower \
+             bound alone"
         );
+        assert!(!two_sided.both_bounds, "a multikey plan must not claim both bounds");
 
         // With no lower bound, the upper one is used instead.
         let upper_only = plan(doc! { "a": { "$lte": 1 } }, &idx).unwrap();
         assert_ne!(upper_only.upper, lower_only.upper);
+    }
+
+    #[test]
+    fn an_index_that_has_never_seen_an_array_uses_both_ends() {
+        // The selectivity the multikey flag exists to buy back: a scalar
+        // satisfies both bounds iff its single key lies in the intersection,
+        // so the scan can stop where the range does.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let two_sided = plan(doc! { "a": { "$gte": 1, "$lte": 5 } }, &idx).unwrap();
+        let lower_only = plan(doc! { "a": { "$gte": 1 } }, &idx).unwrap();
+
+        assert_eq!(two_sided.lower, lower_only.lower, "the lower bound is shared");
+        assert!(
+            two_sided.upper < lower_only.upper,
+            "the upper bound must actually close the range"
+        );
+        assert!(two_sided.both_bounds, "the plan must say it intersected, so the scan is checked");
+        // One-sided ranges did not intersect anything and need no check.
+        assert!(!lower_only.both_bounds);
+        assert!(!plan(doc! { "a": { "$lte": 5 } }, &idx).unwrap().both_bounds);
+    }
+
+    #[test]
+    fn both_bounds_apply_after_an_equality_prefix() {
+        // The compound shape: `{a: 1, n: {$gte: 5, $lte: 9}}` over an index on
+        // (a, n) must close the range on n, not fall back to scanning all of
+        // `a == 1`.
+        let idx = [index(0, vec![IndexField::ascending("a"), IndexField::ascending("n")])];
+        let p = plan(doc! { "a": 1, "n": { "$gte": 5, "$lte": 9 } }, &idx).unwrap();
+        assert_eq!(p.fields_used, 2);
+        assert!(p.both_bounds);
+
+        let wide = plan(doc! { "a": 1, "n": { "$gte": 5 } }, &idx).unwrap();
+        assert!(p.upper < wide.upper, "the range on n must be closed");
     }
 
     #[test]

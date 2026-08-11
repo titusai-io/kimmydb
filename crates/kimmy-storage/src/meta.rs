@@ -87,6 +87,7 @@ mod tests {
             fields: vec![IndexField::ascending("age")],
             unique: false,
             enforcement: Default::default(),
+            multikey: false,
         });
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CollectionMeta>(&text).unwrap(), m);

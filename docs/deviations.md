@@ -129,21 +129,34 @@ skipping records that no longer exist.
 
 ---
 
-## 🔴 Index ranges use only one bound
+## 🟢 Index ranges use both bounds on scalar-only indexes (was the register's last 🔴)
 
-**Cause.** A real bug, found by property testing: `{a: [2, 0]}` matches
+**Was.** A real bug, found by property testing: `{a: [2, 0]}` matches
 `{$gte: 1, $lte: 1}` because *different array elements* satisfy each bound.
-Intersecting both into one key range excluded the document.
+Intersecting both into one key range excluded the document. The fix used one
+bound only — correct, but `{qty: {$gte: 5, $lte: 9}}` scanned the index from 5
+upward rather than stopping at 9, and this register carried it as its only 🔴
+from M1 to M7.
 
-**Fix applied.** Use one bound only, keeping the range a superset.
+**Now.** Multikey-ness is tracked per index, as MongoDB does: a `multikey`
+flag on the definition, set in the same transaction as the index entries the
+first time any document contributes more than one key — by write, by backfill,
+or by applying a peer's write. Scalar-only indexes get both bounds; multikey
+ones keep the one-bound superset. One-way, because clearing it safely is a
+full scan for the sake of a planner hint. [Indexes](indexes.md).
 
-**Consequence.** `{qty: {$gte: 5, $lte: 9}}` scans the index from 5 upward
-rather than stopping at 9. Correctness is intact; selectivity is not.
+**Two things the closing surfaced, both fixed in the same change:**
 
-**To close.** Track multikey-ness per index, as MongoDB does, and use both
-bounds for fields that never hold arrays. Touches the write path.
-
-**Detail.** [Indexes](indexes.md).
+- A plan that intersected both bounds is only sound for the snapshot whose
+  flag approved it — so the scan **re-validates the flag in its own snapshot**
+  and falls back to a collection scan if a write flipped it in between. A
+  stale `false` proving nothing about the present is the same lesson the
+  register's native-toolchain entry teaches about claims generally.
+- **Index maintenance trusted the caller's index list**, so a write through a
+  `CollectionMeta` handle fetched before an index existed silently skipped
+  that index — no entries, no unique check. Found by this branch's own tests
+  tripping over it. Maintenance now re-reads the definitions inside the
+  write's transaction.
 
 ---
 
