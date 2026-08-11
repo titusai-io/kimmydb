@@ -414,20 +414,37 @@ mod tests {
     fn the_top_result_matches_exact_search() {
         // Recall can be high while the *ranking* is wrong; this checks the
         // nearest neighbour specifically.
+        //
+        // Nine of ten, not ten of ten — and the tolerance is principled, not a
+        // shrug. Scores are recomputed from the stored vectors and sorted
+        // (`scores_match_the_exact_path_exactly` pins that), so a disagreement
+        // here can only mean the true nearest neighbour was not among the
+        // graph's candidates — a recall miss, the bounded loss this index is
+        // documented to trade. Graph construction is not deterministic: levels
+        // are drawn from an RNG and insertion parallelism varies with core
+        // count, which is how this failed on a two-core CI runner while
+        // passing forty consecutive local runs. A *ranking* bug cannot hide in
+        // the tolerance: with exact scores, misordering would break most
+        // queries, not one. The 9/10 bar matches the ≥ 0.90 recall test above.
         let (engine, shadow, _dir) = setup(200, 16);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 16).unwrap();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
 
+        let mut agreed = 0;
         for q in 0..10u64 {
             let query = pseudo_random(50_000 + q, 16);
             let exact =
                 crate::search::vector_search(&engine, &shadow, &query, &options, None).unwrap();
             let approx = index.search(&engine, &shadow, &query, &options, None).unwrap();
-            assert_eq!(
-                approx[0].id, exact[0].id,
-                "query {q}: the nearest neighbour should agree with an exact scan"
-            );
+            if approx[0].id == exact[0].id {
+                agreed += 1;
+            }
         }
+        assert!(
+            agreed >= 9,
+            "only {agreed}/10 nearest neighbours agreed with the exact scan; one miss is a \
+             recall roll, this is a ranking bug"
+        );
     }
 
     #[test]

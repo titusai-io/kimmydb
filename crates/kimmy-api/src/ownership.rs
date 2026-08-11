@@ -153,7 +153,8 @@ mod tests {
 
     #[test]
     fn a_dead_owners_subscriptions_are_taken_over() {
-        // The maintainer's question, as a test: when a node dies, does someone deliver?
+        // The design-review question, as a test: when a node dies, does
+        // someone deliver?
         let before = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
         let subscription = "wh_orders";
         let dead = owner(subscription, &before).unwrap();
