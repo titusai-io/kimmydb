@@ -160,10 +160,20 @@ full scan for the sake of a planner hint. [Indexes](indexes.md).
 
 ---
 
-## 🟡 `$in` does not use an index
+## 🟢 `$in` uses the index (was a 🟡 deferral)
 
-Needs a *union* of point lookups rather than a single range. A query using
-`$in` falls back to a collection scan. Common enough to be worth doing.
+**Was.** `$in` needs a *union* of point lookups rather than a single range,
+so it fell back to a collection scan — the most common operator to do so.
+
+**Now.** An `IndexPlan` carries a list of `(lower, upper)` ranges rather than
+one: a single entry for a contiguous range, one per distinct value for `$in`.
+The executor scans each and unions the candidates, deduplicating by document
+key — one document can appear under two probes when an array holds two listed
+values. Values are deduplicated on the *encoded* key, so `[5, 5.0]` probes
+once, exactly as the index collapses them. Probes are equalities, so they are
+sound on multikey indexes with no flag interaction, and an empty `$in` plans
+an empty union — zero probes for a filter nothing can match. Visible in
+`explain` as `"strategy": "indexUnion"` with a `"probes"` count.
 
 ---
 

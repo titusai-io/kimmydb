@@ -27,10 +27,15 @@ use crate::filter::{Condition, Filter};
 pub struct IndexPlan {
     pub index_id: u32,
     pub index_name: String,
-    /// Inclusive lower bound on the encoded index key.
-    pub lower: Vec<u8>,
-    /// Inclusive upper bound on the encoded index key.
-    pub upper: Vec<u8>,
+    /// Inclusive `(lower, upper)` bounds on the encoded index key.
+    ///
+    /// One entry for a contiguous range — an equality prefix, with or without
+    /// a range on the next field. Several for `$in`, which becomes a **union
+    /// of equality probes**: one entry per distinct value, in key order. The
+    /// executor scans each and unions the candidates, deduplicating by
+    /// document key — one document can appear under several probes when an
+    /// array holds two of the listed values.
+    pub ranges: Vec<(Vec<u8>, Vec<u8>)>,
     /// How many index fields the filter constrained. Reported by `explain`.
     pub fields_used: usize,
     /// Whether both ends of a range were intersected into the bounds.
@@ -40,6 +45,9 @@ pub struct IndexPlan {
     /// time anything scans. A plan carrying `true` must go through
     /// `index_candidates_unless_multikey`, which re-checks the flag in the
     /// same snapshot as the scan, rather than the plain candidate scan.
+    ///
+    /// Always `false` for a `$in` union: equality probes select exact keys,
+    /// which is sound on a multikey index — nothing is intersected.
     pub both_bounds: bool,
 }
 
@@ -57,6 +65,8 @@ struct Bounds {
     eq: Option<Bson>,
     lower: Option<Bson>,
     upper: Option<Bson>,
+    /// The values of a `$in`, when one is present.
+    in_values: Option<Vec<Bson>>,
 }
 
 /// Pick an index for this filter, or `None` to scan.
@@ -104,15 +114,27 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
                 match condition {
                     // `$eq: null` is usable: a missing field is indexed as
                     // null, so its entry exists and will be found.
-                    Condition::Eq(v) => slot.eq.get_or_insert(v.clone()),
-                    Condition::Gt(v) | Condition::Gte(v) => slot.lower.get_or_insert(v.clone()),
-                    Condition::Lt(v) | Condition::Lte(v) => slot.upper.get_or_insert(v.clone()),
-                    // Everything else — $ne, $in, $nin, $not, $exists, $regex,
+                    Condition::Eq(v) => {
+                        slot.eq.get_or_insert(v.clone());
+                    }
+                    Condition::Gt(v) | Condition::Gte(v) => {
+                        slot.lower.get_or_insert(v.clone());
+                    }
+                    Condition::Lt(v) | Condition::Lte(v) => {
+                        slot.upper.get_or_insert(v.clone());
+                    }
+                    // `$in` is a disjunction of equalities on one field, so —
+                    // unlike `$or` — every match still satisfies "the field is
+                    // one of these", which a union of point probes can answer.
+                    Condition::In(values) => {
+                        slot.in_values.get_or_insert(values.clone());
+                    }
+                    // Everything else — $ne, $nin, $not, $exists, $regex,
                     // $size, $all, $elemMatch — either cannot narrow a range or
                     // needs care to do so safely. Ignoring them only costs
                     // selectivity, since the filter is re-applied anyway.
-                    _ => continue,
-                };
+                    _ => {}
+                }
             }
         }
         // A disjunction constrains nothing that must universally hold.
@@ -131,7 +153,43 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         }
     }
 
-    // The field just past the equality prefix may carry a range.
+    // The field just past the equality prefix may carry a `$in` or a range.
+    //
+    // `$in` is checked first: a set of equality probes is tighter than a range
+    // when both constrain the same field, and — being equalities — the probes
+    // are sound on a multikey index, which a two-sided range is not.
+    if let Some(field) = index.fields.get(prefix.len())
+        && let Some(bounds) = predicates.get(&field.path)
+        && let Some(values) = &bounds.in_values
+    {
+        // One probe per distinct value. Deduplicated on the *encoded* key, so
+        // `[5, 5.0]` — one value in two numeric spellings — probes once, the
+        // same way the index itself collapses them.
+        let mut seen = std::collections::BTreeSet::new();
+        let mut ranges = Vec::new();
+        for value in values {
+            let mut components = prefix.clone();
+            components.push((value.clone(), field.descending));
+            let encoded = keyenc::encode_compound_ordered(&components).ok()?;
+            if seen.insert(encoded.clone()) {
+                let mut upper = encoded.clone();
+                upper.push(ABOVE_ANY_CONTINUATION);
+                ranges.push((encoded, upper));
+            }
+        }
+        // Key order, so the union scans the index monotonically. An empty
+        // `$in` yields an empty union — zero probes, zero candidates — which
+        // is the right answer to a filter nothing can match.
+        ranges.sort();
+        return Some(IndexPlan {
+            index_id: index.id,
+            index_name: index.name.clone(),
+            ranges,
+            fields_used: prefix.len() + 1,
+            both_bounds: false,
+        });
+    }
+
     let mut lower = prefix.clone();
     let mut upper = prefix.clone();
     let mut used = prefix.len();
@@ -205,8 +263,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
     Some(IndexPlan {
         index_id: index.id,
         index_name: index.name.clone(),
-        lower: lower_bytes,
-        upper: upper_bytes,
+        ranges: vec![(lower_bytes, upper_bytes)],
         fields_used: used,
         both_bounds,
     })
@@ -233,6 +290,12 @@ mod tests {
     /// The same index, but one that has seen an array.
     fn multikey(id: u32, fields: Vec<IndexField>) -> IndexMeta {
         IndexMeta { multikey: true, ..index(id, fields) }
+    }
+
+    /// The single contiguous range of a non-union plan.
+    fn bounds(p: &IndexPlan) -> (&Vec<u8>, &Vec<u8>) {
+        assert_eq!(p.ranges.len(), 1, "expected one contiguous range, got {:?}", p.ranges);
+        (&p.ranges[0].0, &p.ranges[0].1)
     }
 
     fn plan(query: bson::Document, indexes: &[IndexMeta]) -> Option<IndexPlan> {
@@ -279,7 +342,8 @@ mod tests {
         let idx = [index(0, vec![IndexField::ascending("a"), IndexField::ascending("n")])];
         let p = plan(doc! { "a": 1, "n": { "$gt": 5, "$lt": 10 } }, &idx).unwrap();
         assert_eq!(p.fields_used, 2);
-        assert!(p.lower < p.upper);
+        let (lower, upper) = bounds(&p);
+        assert!(lower < upper);
     }
 
     #[test]
@@ -307,7 +371,7 @@ mod tests {
 
         // With no lower bound, the upper one is used instead.
         let upper_only = plan(doc! { "a": { "$lte": 1 } }, &idx).unwrap();
-        assert_ne!(upper_only.upper, lower_only.upper);
+        assert_ne!(bounds(&upper_only).1, bounds(&lower_only).1);
     }
 
     #[test]
@@ -319,9 +383,9 @@ mod tests {
         let two_sided = plan(doc! { "a": { "$gte": 1, "$lte": 5 } }, &idx).unwrap();
         let lower_only = plan(doc! { "a": { "$gte": 1 } }, &idx).unwrap();
 
-        assert_eq!(two_sided.lower, lower_only.lower, "the lower bound is shared");
+        assert_eq!(bounds(&two_sided).0, bounds(&lower_only).0, "the lower bound is shared");
         assert!(
-            two_sided.upper < lower_only.upper,
+            bounds(&two_sided).1 < bounds(&lower_only).1,
             "the upper bound must actually close the range"
         );
         assert!(two_sided.both_bounds, "the plan must say it intersected, so the scan is checked");
@@ -341,7 +405,7 @@ mod tests {
         assert!(p.both_bounds);
 
         let wide = plan(doc! { "a": 1, "n": { "$gte": 5 } }, &idx).unwrap();
-        assert!(p.upper < wide.upper, "the range on n must be closed");
+        assert!(bounds(&p).1 < bounds(&wide).1, "the range on n must be closed");
     }
 
     #[test]
@@ -362,12 +426,13 @@ mod tests {
 
     #[test]
     fn operators_that_cannot_narrow_are_ignored() {
+        // `$in` is absent from this list now: it narrows, as a union of
+        // point probes.
         let idx = [index(0, vec![IndexField::ascending("a")])];
         for query in [
             doc! { "a": { "$ne": 1 } },
             doc! { "a": { "$exists": true } },
             doc! { "a": { "$regex": "^x" } },
-            doc! { "a": { "$in": [1, 2] } },
             doc! { "a": { "$size": 2 } },
         ] {
             assert!(plan(query.clone(), &idx).is_none(), "{query:?} must not narrow");
@@ -385,14 +450,16 @@ mod tests {
 
         let p = plan(doc! { "n": { "$gte": 5 } }, &idx).unwrap();
         assert_eq!(p.fields_used, 1, "the range must be planned, not dropped");
-        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        let (lower, upper) = bounds(&p);
+        let in_range = |k: &Vec<u8>| k >= lower && k <= upper;
         assert!(in_range(&key_of(7)), "7 satisfies n >= 5");
         assert!(in_range(&key_of(5)), "the bound itself is inclusive");
         assert!(!in_range(&key_of(3)), "3 does not satisfy n >= 5");
 
         // And the mirror: `n <= 5` keeps 3, excludes 7.
         let p = plan(doc! { "n": { "$lte": 5 } }, &idx).unwrap();
-        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        let (lower, upper) = bounds(&p);
+        let in_range = |k: &Vec<u8>| k >= lower && k <= upper;
         assert!(in_range(&key_of(3)));
         assert!(!in_range(&key_of(7)));
     }
@@ -404,7 +471,8 @@ mod tests {
 
         let p = plan(doc! { "n": { "$gte": 5, "$lte": 9 } }, &idx).unwrap();
         assert!(p.both_bounds, "a scalar-only descending index must intersect");
-        let in_range = |k: &Vec<u8>| *k >= p.lower && *k <= p.upper;
+        let (lower, upper) = bounds(&p);
+        let in_range = |k: &Vec<u8>| k >= lower && k <= upper;
         for n in 5..=9 {
             assert!(in_range(&key_of(n)), "{n} is inside [5, 9]");
         }
@@ -460,7 +528,8 @@ mod tests {
             (Bson::String("zzz".into()), false),
         ])
         .unwrap();
-        assert!(longer >= p.lower && longer <= p.upper, "a longer key must fall in range");
+        let (lower, upper) = bounds(&p);
+        assert!(longer >= *lower && longer <= *upper, "a longer key must fall in range");
     }
 
     #[test]
@@ -468,7 +537,76 @@ mod tests {
         let idx = [index(0, vec![IndexField::ascending("n")])];
         let a = plan(doc! { "n": 5i32 }, &idx).unwrap();
         let b = plan(doc! { "n": 5.0 }, &idx).unwrap();
-        assert_eq!(a.lower, b.lower);
-        assert_eq!(a.upper, b.upper);
+        assert_eq!(a.ranges, b.ranges);
+    }
+
+    #[test]
+    fn a_dollar_in_becomes_a_union_of_point_probes() {
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let p = plan(doc! { "a": { "$in": [3, 7, 5] } }, &idx).expect("$in should be planned");
+        assert_eq!(p.ranges.len(), 3, "one probe per value");
+        assert_eq!(p.fields_used, 1);
+        assert!(!p.both_bounds, "equality probes intersect nothing");
+        // In key order, so the union scans the index monotonically.
+        let probe_lowers: Vec<_> = p.ranges.iter().map(|(lo, _)| lo.clone()).collect();
+        let mut sorted = probe_lowers.clone();
+        sorted.sort();
+        assert_eq!(probe_lowers, sorted);
+
+        // Each probe must cover exactly its value: the key for 5 falls in one
+        // probe's range and the key for 4 in none.
+        let key_of = |n: i32| keyenc::encode_compound_ordered(&[(Bson::Int32(n), false)]).unwrap();
+        let hit = |k: &Vec<u8>| p.ranges.iter().any(|(lo, hi)| k >= lo && k <= hi);
+        assert!(hit(&key_of(5)));
+        assert!(!hit(&key_of(4)));
+    }
+
+    #[test]
+    fn duplicate_in_values_probe_once() {
+        // `[5, 5.0]` is one value in two numeric spellings, and the index
+        // collapses them to one key — so the plan must too, or the union
+        // would scan the same range twice.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let p = plan(doc! { "a": { "$in": [5, 5.0, 5i64] } }, &idx).unwrap();
+        assert_eq!(p.ranges.len(), 1, "one distinct value, one probe");
+    }
+
+    #[test]
+    fn an_empty_in_list_plans_an_empty_union() {
+        // `{a: {$in: []}}` matches nothing; zero probes answer it without
+        // touching a single document.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let p = plan(doc! { "a": { "$in": [] } }, &idx).expect("still a plan");
+        assert!(p.ranges.is_empty());
+    }
+
+    #[test]
+    fn a_dollar_in_after_an_equality_prefix_probes_within_it() {
+        // `{a: 1, b: {$in: [2, 3]}}` over (a, b): each probe carries the
+        // prefix, so the union stays inside a == 1.
+        let idx = [index(0, vec![IndexField::ascending("a"), IndexField::ascending("b")])];
+        let p = plan(doc! { "a": 1, "b": { "$in": [2, 3] } }, &idx).unwrap();
+        assert_eq!(p.ranges.len(), 2);
+        assert_eq!(p.fields_used, 2);
+
+        let key = |a: i32, b: i32| {
+            keyenc::encode_compound_ordered(&[(Bson::Int32(a), false), (Bson::Int32(b), false)])
+                .unwrap()
+        };
+        let hit = |k: &Vec<u8>| p.ranges.iter().any(|(lo, hi)| k >= lo && k <= hi);
+        assert!(hit(&key(1, 2)));
+        assert!(hit(&key(1, 3)));
+        assert!(!hit(&key(2, 2)), "a different prefix value must fall outside every probe");
+        assert!(!hit(&key(1, 4)), "a value not listed must fall outside every probe");
+    }
+
+    #[test]
+    fn an_equality_on_the_same_field_beats_its_in() {
+        // `{a: 5, a: {$in: [1, 2]}}` cannot be written literally in BSON, but
+        // `$eq` alongside `$in` can. The equality is consumed by the prefix,
+        // and the plan must be the single-point one, not a union.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        let p = plan(doc! { "a": { "$eq": 5, "$in": [1, 2, 5] } }, &idx).unwrap();
+        assert_eq!(p.ranges.len(), 1, "the equality prefix answers this alone");
     }
 }

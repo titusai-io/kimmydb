@@ -164,8 +164,18 @@ re-applied regardless.
 |---|---|
 | `$or` / `$nor` branches | Their branches need not all hold; narrowing on one would drop what the other matches |
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
-| `$in` | Needs a *union* of point lookups. 📋 Planned |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
+
+`$in` **is planned**, as a union of point probes — one per distinct value,
+deduplicated on the encoded key so `[5, 5.0]` probes once, each probe carrying
+the equality prefix. `$in` differs from `$or` in the way that matters: it is a
+disjunction *on one field*, so every match still satisfies "this field is one
+of these", which a union of index probes can answer. The probes are
+equalities, so they are sound on a multikey index — a document whose array
+holds two listed values is found by both probes and deduplicated by document
+key. `explain` reports the shape as `"strategy": "indexUnion"` with a
+`"probes"` count. An empty `$in` list plans an empty union: zero probes,
+zero candidates, no documents touched.
 | The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
 
 Ranges on **descending** fields are planned like any other. The inverted

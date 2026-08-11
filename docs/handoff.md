@@ -6,9 +6,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-10 — M7: descending ranges planned
+## As of 2026-08-10 — M7: `$in` uses the index
 
-**M0–M6 are complete; M7 (query engine completion) is underway.** The
+**M0–M6 are complete; M7 (query engine completion) is nearly done.** The
 milestone record lives in [Decisions](decisions.md) and
 [Deviations](deviations.md).
 
@@ -16,40 +16,35 @@ milestone record lives in [Decisions](decisions.md) and
 
 | | |
 |---|---|
-| `main` | PRs #16–#36 merged: the M7 plan, the webhook warm-up, multikey tracking |
-| `m7-descending-ranges` | **Not merged.** Ranges on descending fields are planned: the bound swap, with encoded-key planner tests, engine equivalence + selectivity tests, and the compound ascending-prefix + descending-range shape |
+| `main` | PRs #16–#37 merged: the M7 plan, the webhook warm-up, multikey tracking, descending ranges |
+| `m7-in-index-union` | **Not merged.** `$in` as a union of point probes: `IndexPlan` generalized from one `(lower, upper)` to a list of ranges; executor unions candidates and deduplicates by document key; `explain` reports `indexUnion` with a probe count |
 
 **Gate on it:** fmt · clippy `-D warnings` ·
 `./scripts/check-native-deps.sh` · full suite · driven against a live node.
 
 ### What this branch did, so it is not re-derived
 
-A descending component's encoded bytes are inverted, which reverses order: the
-value-space lower bound caps the key-space **top**, and the upper bound its
-bottom. The planner now performs that swap instead of dropping the range —
-which it had done since M1, precisely because a swap done backwards yields a
-range that is too *narrow*, the silent failure mode. The multikey rule is
-unchanged and direction-independent: a multikey index uses one bound, wherever
-the encoding sends it.
+`$in` differs from `$or` in the way that matters to the planner: it is a
+disjunction **on one field**, so every match still satisfies "this field is
+one of these", which a union of index probes can answer. One probe per
+distinct value — deduplicated on the *encoded* key, so `[5, 5.0]` probes once,
+as the index collapses them — each carrying the equality prefix. Probes are
+equalities, so they are sound on multikey indexes with no flag interaction;
+`both_bounds` is always false for a union. A document whose array holds two
+listed values is found by both probes and deduplicated by document key. An
+empty `$in` plans an empty union: zero probes for a filter nothing matches.
 
-What holds it down: encoded-key assertions in the planner (a key for a value
-inside the range must fall inside the plan's bounds, outside must fall
-outside), engine equivalence tests that now `expect` a plan rather than
-skipping when none is chosen — the old test **passed vacuously** for the
-descending path, which is worth remembering — a selectivity test (five
-candidates for a five-value range over twenty), the compound
-ascending-prefix + descending-range shape, and the equivalence property test,
-which already generated descending indexes and two-sided ranges and began
-exercising the swap the moment the planner stopped refusing it.
+The shape change: `IndexPlan.lower/upper` became `IndexPlan.ranges:
+Vec<(Vec<u8>, Vec<u8>)>` — one entry for a contiguous range, several for a
+union. Everything downstream (executor, tests, the bench) iterates.
 
-The multikey branch's invariants below still stand; nothing here weakened
-them.
+The multikey and descending branches' invariants below still stand.
 
 ### What comes next in M7
 
-1. **`$in` as a union of point lookups** — new planner strategy, visible in
-   `explain`.
-2. Mutation testing on the planner and key encoding; final docs pass.
+1. Mutation testing on the planner and key encoding (`--no-fail-fast`; run a
+   no-op control first).
+2. Final docs pass, then the M7 close-out in the roadmap.
 
 ### What webhooks are, in one paragraph
 

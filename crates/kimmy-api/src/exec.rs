@@ -187,17 +187,32 @@ pub struct QueryStats {
     pub fields_used: usize,
     pub examined: usize,
     pub matched: usize,
+    /// Index ranges scanned: 1 for a plain index plan, several for a `$in`
+    /// union, 0 for a collection scan.
+    pub probes: usize,
 }
 
 impl QueryStats {
     pub fn to_json(&self) -> Value {
-        json!({
-            "strategy": if self.index.is_some() { "index" } else { "collectionScan" },
+        let strategy = match (&self.index, self.probes) {
+            (None, _) => "collectionScan",
+            // A union of equality probes is a different shape of work from
+            // one range scan, and the difference is what `$in` planning
+            // bought — so it is named rather than folded into "index".
+            (Some(_), n) if n > 1 => "indexUnion",
+            (Some(_), _) => "index",
+        };
+        let mut out = json!({
+            "strategy": strategy,
             "index": self.index,
             "indexFieldsUsed": self.fields_used,
             "documentsExamined": self.examined,
             "documentsMatched": self.matched,
-        })
+        });
+        if self.probes > 1 {
+            out["probes"] = json!(self.probes);
+        }
+        out
     }
 }
 
@@ -225,15 +240,26 @@ pub fn collect_matching(
     // most once per index, ever, since the flag never clears.
     let candidates = match &plan {
         Some(p) if p.both_bounds => {
-            let checked = state
-                .engine
-                .index_candidates_unless_multikey(meta, p.index_id, &p.lower, &p.upper)?;
+            // A both-bounds plan is always a single intersected range.
+            let (lower, upper) = &p.ranges[0];
+            let checked =
+                state.engine.index_candidates_unless_multikey(meta, p.index_id, lower, upper)?;
             if checked.is_none() {
                 plan = None;
             }
             checked
         }
-        Some(p) => Some(state.engine.index_candidates(meta, p.index_id, &p.lower, &p.upper)?),
+        Some(p) => {
+            // One range for a plain plan, several for a `$in` union. The set
+            // deduplicates across probes: one document can appear under two of
+            // them when an array holds two of the listed values, and examining
+            // it twice would double-count it in the result.
+            let mut union = std::collections::BTreeSet::new();
+            for (lower, upper) in &p.ranges {
+                union.extend(state.engine.index_candidates(meta, p.index_id, lower, upper)?);
+            }
+            Some(union.into_iter().collect())
+        }
         None => None,
     };
 
@@ -268,6 +294,7 @@ pub fn collect_matching(
         fields_used: plan.as_ref().map_or(0, |p| p.fields_used),
         examined,
         matched: matched.len(),
+        probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
     };
     Ok((matched, stats))
 }
