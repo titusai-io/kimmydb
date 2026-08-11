@@ -254,6 +254,9 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 | Benchmarks | Partial. The vector index, the write path and the planner are measured ([Benchmarks](benchmarks.md)); concurrent writers and batched writes are not, and there is no regression baseline | M5 |
 | Vector reindex operation | Changing model or dimension needs a disable-with-`drop_vectors` and re-enable, which backfills from the oplog | M5 |
 | Webhook ownership hashes addresses | Rendezvous hashing takes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions — the same disruption as that node leaving and another joining. Hashing node ids would be stabler and needs a member → node-id mapping | M6 |
+| Webhook events carry empty `database` and `collection` fields | `render_without_document` emits both as `""`, always — verified on the wire. A receiver routing on them silently gets the empty string. The dispatcher knows both from the subscription; fill them or drop them. Found in the 2026-08-10 review | M7 |
+| The egress check and the dial resolve DNS separately | `EgressPolicy::check` resolves and checks every address, but `reqwest` then re-resolves to connect — so a rebinding attacker with a zero TTL can pass the check and flip the record before the dial. The documented rule ("checked before each delivery") is true, but the addresses checked are not provably the addresses dialled. Close by running the check inside the client's own resolver | M7 |
+| Webhook backoff state outlives its subscription | A `Backoff` entry is removed only on a successful delivery, so a subscription deleted while its endpoint was failing leaves one map entry behind forever. Bounded by the number of subscriptions ever registered — small, but uncollected | M7 |
 
 ---
 
