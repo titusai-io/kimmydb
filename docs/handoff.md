@@ -17,8 +17,8 @@ reload's trigger, and token revocation's semantics.
 
 | | |
 |---|---|
-| `main` | PRs #16–#40 merged, including the M8 plan |
-| `m8-cluster-harness` | **Not merged.** The harness (`kimmyd/tests/cluster.rs`), the `kimmy_cluster_members` gauge it reads, a CI job running it, and the ownership fix below |
+| `main` | PRs #16–#41 merged: the M8 plan and the cluster harness |
+| `m8-observability` | **Not merged.** ADR-046: the latency histogram (buckets measured on a release build) and `kimmy_replication_lag_seconds` (pushed from the replication loop via `ReplicationConfig::on_lag`). The harness now also asserts zero lag on a converged cluster. Found while measuring, recorded 🟡: `find {_id}` is a collection scan — the planner never consults the primary key; `GET /docs/{id}` is the point path |
 
 ### The bug the harness caught on its first run
 

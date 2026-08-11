@@ -291,7 +291,22 @@ refused until M4. Raised and agreed. See [ADR-020](decisions.md).
 
 ---
 
-## 🟡 Rate limiting covers login only
+## 🟡 `find` by `_id` does not use the primary key
+
+Found while measuring latency-histogram buckets (ADR-046): `{_id: 500}`
+through `find` is a full collection scan — ~7 ms over 10k documents — because
+the planner consults *secondary* indexes only. The primary key is not in its
+candidate set. `GET /v1/db/{db}/coll/{coll}/docs/{id}` is the O(1) path and
+runs p50 ≈ 250 µs on the same data.
+
+**Consequence.** Correct but slow, the register's favourite shape. Any client
+that filters on `_id` through `find` — including via the MCP `find` tool,
+where an agent has no reason to know a second route is the fast one — pays a
+scan.
+
+**To close.** Teach the planner an `_id` equality (and `$in`) fast path that
+resolves through the primary key rather than an index. Self-contained; a
+natural M8 stretch or M9 item.
 
 **Built.** A token bucket per key, on `/v1/auth/login`, keyed on the client
 address. Closes the 🔴 that made a password guessable at network speed.

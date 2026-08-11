@@ -168,13 +168,18 @@ allowed_hosts = ["127.0.0.1"]
         res["token"].as_str().expect("a token").to_string()
     }
 
-    /// The `kimmy_cluster_members` gauge, scraped like an operator would.
-    async fn members_gauge(&self, client: &reqwest::Client) -> Option<u64> {
+    /// A gauge from `/metrics`, scraped like an operator would.
+    async fn gauge(&self, client: &reqwest::Client, name: &str) -> Option<u64> {
         let body = client.get(self.url("/metrics")).send().await.ok()?.text().await.ok()?;
+        let prefix = format!("{name} ");
         body.lines()
-            .find(|l| l.starts_with("kimmy_cluster_members "))
+            .find(|l| l.starts_with(&prefix))
             .and_then(|l| l.split_whitespace().nth(1))
             .and_then(|v| v.parse().ok())
+    }
+
+    async fn members_gauge(&self, client: &reqwest::Client) -> Option<u64> {
+        self.gauge(client, "kimmy_cluster_members").await
     }
 
     fn signal(&self, sig: &str) {
@@ -358,6 +363,24 @@ async fn replication_converges_through_gossip_discovered_peers() {
                 return false;
             };
             body["count"].as_u64() == Some(1)
+        }
+    })
+    .await;
+
+    // A converged cluster must read zero replication lag on every node — the
+    // gauge measures unapplied peer history, and there is none left. This is
+    // asserted after convergence rather than before because the gauge only
+    // updates when a sync round reaches a peer.
+    eventually("every node to report zero replication lag", || {
+        let client = &client;
+        let nodes = [&a, &b, &c];
+        async move {
+            for node in nodes {
+                if node.gauge(client, "kimmy_replication_lag_seconds").await != Some(0) {
+                    return false;
+                }
+            }
+            true
         }
     })
     .await;

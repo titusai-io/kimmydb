@@ -31,5 +31,5 @@ pub use error::{Result, StorageError};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use snapshot::{CollectionState, SNAPSHOT_PAGE, SnapshotCursor, SnapshotDoc, SnapshotPage};
-pub use sync::SyncOutcome;
+pub use sync::{SyncOutcome, lag_behind_ms};
 pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};

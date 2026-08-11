@@ -1602,6 +1602,51 @@ replicating and being backed up, with nothing left that would ever read them.
 
 ---
 
+## ADR-046 — The two metrics ADR-043 refused to guess, each built on its stated terms
+
+**Decision.** `/metrics` gains `kimmy_request_duration_seconds` (a histogram)
+and `kimmy_replication_lag_seconds` (a gauge). ADR-043 deferred both with a
+reason each; each is now built by answering that reason rather than waiving it.
+
+**The histogram's buckets were measured, not chosen.** End-to-end against a
+release build on the development machine (single client, loopback, 10k
+documents seeded, 200 samples per shape): point reads by id run p50 ≈ 250 µs
+and p99 under 1 ms; filtered finds with a limit 1.4–2.6 ms; single-document
+inserts p50 ≈ 6 ms — one durable commit each, agreeing with the M5 write
+benchmark; a 10k-document aggregation 10–43 ms. Twelve buckets bracket those
+clusters with headroom on both ends (100 µs to 10 s); the wide top bucket
+exists so a stall reads as a shape change rather than vanishing into `+Inf`.
+The conditions are stated because the numbers are only claims under them —
+and stating them mattered: the first draft of this paragraph was written from
+expectation, and the measurement corrected it.
+
+**Found while measuring.** `find {_id: …}` is a collection scan — ~7 ms over
+those same 10k documents — because the planner consults secondary indexes
+only, never the primary key. `GET /docs/{id}` is the point-read path.
+Recorded in [Deviations](deviations.md) rather than fixed here.
+
+**Health probes and scrapes are excluded from the histogram** — they run
+every few seconds forever and would crowd the buckets real traffic lands in —
+but still counted as requests, so a scrape stays visible as traffic.
+
+**Lag is pushed from the replication loop**, the only place a peer's version
+vector exists, through a callback on `ReplicationConfig` — the shape ADR-043
+predicted. It is computed *after* a sync round, against the vector the peer
+opened with: zero in the caught-up steady state, non-zero exactly when the
+backlog exceeded one batch. Measured from entry timestamps — the age span of
+unapplied work, not of a cursor, which is the lesson the webhook backlog
+gauge taught (ADR-043's successor metrics repeat it deliberately).
+
+**Two refusals inside the lag number.** An unreachable cluster reports
+nothing rather than zero — the last value stands, because overwriting it
+would report an outage as perfect health. And an origin this node has never
+seen contributes nothing: only the peer's *newest* stamp is at hand, so the
+honest gap would need the oldest, and `newest − zero` is the age of the
+epoch — a joining node would open with a fifty-year lie and every alert
+would fire.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

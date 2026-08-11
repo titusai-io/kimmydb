@@ -246,7 +246,7 @@ pub async fn sync_once(
         };
 
         write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
-        match read_frame(&mut stream).await? {
+        let mut outcome = match read_frame(&mut stream).await? {
             Message::Entries(entries) => {
                 engine.apply_batch(&entries).map_err(|e| ProtocolError::Malformed(e.to_string()))
             }
@@ -256,7 +256,17 @@ pub async fn sync_once(
                 pull_snapshot(engine, &mut stream).await
             }
             other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
-        }
+        }?;
+
+        // What still trails after the round, measured against the vector the
+        // peer opened with. Zero in the caught-up steady state; non-zero
+        // exactly when the backlog exceeded one batch, which is the condition
+        // an operator wants a gauge for. `theirs` is a round old by now, so
+        // this is a floor — a peer that raced ahead during the round shows up
+        // next round.
+        let mine = engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs);
+        Ok(outcome)
     };
 
     tokio::time::timeout(REQUEST_TIMEOUT, round)
