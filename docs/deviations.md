@@ -110,7 +110,8 @@ empty result that reads as "nothing matched". That was the more damaging half:
 M3 exposed `vector_search` to agents, which would retry a query forever against
 a collection that could never answer it.
 
-**Shape chosen by the maintainer** rather than unilaterally, since it is public API.
+**Shape chosen by the maintainer** rather than unilaterally, since it is
+public API.
 
 ---
 
@@ -304,7 +305,8 @@ and milliseconds of CPU per request.
 
 Everywhere else a limit would be a *capacity* control, and a capacity number
 picked without a measurement is a guess of exactly the kind M5's benchmarks
-exist to remove. Agreed with the maintainer: build the mechanism route-agnostic, apply it
+exist to remove. Agreed with the maintainer: build the mechanism
+route-agnostic, apply it
 where it is a security property, and let the benchmark work decide the rest.
 
 **To close.** `kimmy_api::Limiter` takes an arbitrary key and knows nothing
@@ -541,7 +543,8 @@ Single-node streams were unaffected, which is why it had not bitten.
 
 **Now.** A second ordering — `oplog_arrival` — over local arrival sequence, with
 the oplog still keyed by origin stamp for conflict resolution and anti-entropy.
-The maintainer chose this over restamping on arrival or documenting the limitation.
+The maintainer chose this over restamping on arrival or documenting the
+limitation.
 Resume tokens are unchanged; they are translated to an arrival position at watch
 time, because tokens live in clients where no migration can reach them. Detail
 in [Oplog](oplog.md).

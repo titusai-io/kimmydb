@@ -276,8 +276,9 @@ run ahead of a stable release.
 >
 > The choices above are still the right ones and still stand — picking a pure
 > option where one exists costs nothing. What is no longer true is the *claim*
-> that the whole build is free of a native toolchain. The maintainer chose to accept the
-> cost and correct the record rather than gate `reqwest` behind a feature.
+> that the whole build is free of a native toolchain. The maintainer chose to
+> accept the cost and correct the record rather than gate `reqwest` behind a
+> feature.
 >
 > The practical rule going forward: **do not add a second native crypto stack.**
 > `ring` is paid for; `aws-lc-rs` would add CMake on top of it for the same

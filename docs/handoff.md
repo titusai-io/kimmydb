@@ -6,12 +6,16 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M7 complete
+## As of 2026-08-11 — M7 complete; M8 planned
 
-**M0–M7 are complete. There is no M8 defined.** The leading candidates, both declined in favour of M7 on 2026-08-10:
-operational maturity (HNSW snapshot persistence, certificate reload, latency
-histograms, benchmark baseline, SRV discovery) and API ergonomics (bulk
-insert, vector reindex, webhook ownership by node id, token revocation).
+**M0–M7 are complete. M8 — prove, persist, polish — is planned in
+[Roadmap](roadmap.md):** both former candidate themes in one milestone, plus
+the cluster verification harness and the vector-story completion raised
+during planning. Twelve tasks; the harness leads, because everything
+cluster-adjacent after it can then be proven rather than hand-driven. Three
+decisions are reserved for the maintainer before their branches start: bulk
+insert's API shape, certificate reload's trigger, and token revocation's
+semantics.
 
 ### State of the branches
 

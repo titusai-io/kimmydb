@@ -20,8 +20,9 @@ graph LR
     M5["<b>M5</b> ✅<br/>hardening"]
     M6["<b>M6</b> ✅<br/>webhooks"]
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
+    M8["<b>M8</b> 🚧<br/>prove, persist,<br/>polish"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -32,6 +33,7 @@ graph LR
     style M5 fill:#2f5d3a,color:#fff
     style M6 fill:#2f5d3a,color:#fff
     style M7 fill:#2f5d3a,color:#fff
+    style M8 fill:#2d3748,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -44,6 +46,7 @@ graph LR
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
+| **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | 🚧 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -525,6 +528,69 @@ scalar-only majority both bounds back.
 `$vectorSearch` as a pipeline stage stays unbuilt — it is an API-surface
 decision, not a planner gap, and belongs with the ergonomics theme. Rate
 limiting beyond login still waits on the benchmark work, as agreed in M5.
+
+---
+
+## M8 — Prove, persist, polish 🚧
+
+Everything both declined M7 themes held, plus the two questions that shaped
+the milestone: *is the gossip protocol actually maintaining cluster state,
+provably?* and *is the vector story finished?* Chosen as one milestone rather
+than two on 2026-08-11 — roughly twice M7's size, deliberately.
+
+Three workstreams, ordered so that verification lands first and everything
+cluster-adjacent afterwards can be proven with it.
+
+### Why the cluster harness leads
+
+SWIM works — verified by hand on three daemons in M4, down to survivors
+agreeing a killed node was dead within 17 ms. But **nothing automated has
+ever started two nodes.** The suite's convergence tests are deliberately
+transport-free, and the two worst cluster bugs to date were both found only
+by hand-driving real processes: the compose file that left every node
+advertising loopback so gossip silently never formed, and the collection-id
+encoding that broke replication for ~48% of collection names. A risk asserted
+nowhere was hiding in both. The harness makes that class of discovery
+repeatable instead of heroic.
+
+**Shape:** an integration crate (`kimmy-harness` or `tests/cluster.rs` in
+`kimmyd`) that spawns real `kimmyd` processes on scratch ports and asserts:
+membership converges; an unseeded member is learned through gossip; a killed
+node is declared down by every survivor; a `SIGSTOP`ped node — alive but
+unresponsive, which is what a partition looks like to SWIM — is suspected and
+then declared down, and recovers on `SIGCONT` without a restart; replication
+converges through gossip-discovered (not seeded) peers; and a webhook owned
+by a killed node is delivered by its successor. Slow tests, marked
+`#[ignore]` for the default run, executed in CI and by the gate.
+
+### Tasks
+
+| # | Workstream | Task | Notes |
+|---|---|---|---|
+| 1 | Prove | **Cluster verification harness** | As above. The two historical bugs become its first regression tests: assert gossip *formed* (not merely that replication converged), and assert a high-hashing collection name replicates |
+| 2 | Prove | **Latency histograms + oplog lag** | The two metrics ADR-043 documented as missing rather than guessed. Lag follows the M6 lesson: measure undelivered work, not cursor age |
+| 3 | Prove | **Benchmark baseline + concurrent writers** | The two gaps the M5 benchmark work left: batched and concurrent writes measured, and a recorded baseline a regression can be caught against |
+| 4 | Persist | **HNSW snapshot persistence** | The M2 deferral. Snapshot the graph plus the generation it covers; startup loads the snapshot and rebuilds only if the generation disagrees. Correctness must never depend on it — the exact-scan fallback stays, and a corrupt snapshot is discarded, not trusted |
+| 5 | Persist | **Vector reindex** | Changing model or dimension without the manual drop-and-re-enable. Backfills from the *collection*, not the oplog — the oplog may be collected; the documents are the durable source |
+| 6 | Persist | **Provider dialect audit** | Byo, OpenAI, Ollama, custom HTTP and local exist. Verify whether custom HTTP genuinely covers Voyage / Cohere / Gemini response shapes; add dialects only where it does not |
+| 7 | Polish | **Bulk insert** | `POST /docs` takes one document per request. API shape is a public-surface decision, **reserved for the maintainer** (array body on the existing route vs. a dedicated endpoint) before it is built |
+| 8 | Polish | **Certificate reload** | A renewed certificate currently needs a restart. Trigger is a design decision (SIGHUP vs. mtime poll) — ADR before code |
+| 9 | Polish | **SRV discovery** | `dns-srv:` parses but does not resolve. Needs a resolver crate; **must not add a second native crypto stack** — the DNSSEC features that pull one stay off, and `check-native-deps.sh` is the arbiter |
+| 10 | Polish | **Webhook ownership by node id** | Rendezvous currently hashes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions. Gossip the node id as member metadata and hash that. Verified with the harness from task 1; a mixed-version cluster produces duplicates, which at-least-once already tolerates |
+| 11 | Polish | **Token revocation** | Deleting a user currently leaves issued tokens valid until expiry. Semantics are a design decision — ADR first; a per-user token version (bump to invalidate all outstanding) is the leading candidate over a replicated deny-list, because it adds no per-request lookup that can miss |
+| 12 | Close | **Mutation pass + docs** | `cargo-mutants` diff-scoped over everything M8 changed — the M7 lesson says the escapes will be in the new callers, not the old layers. Deviations, handoff, and this section updated |
+
+### Decisions reserved for the maintainer
+
+Bulk insert's API shape (task 7), certificate reload's trigger (task 8), and
+token revocation's semantics (task 11). Each is public surface or security
+behaviour; the plan deliberately does not pre-decide them — they are settled
+before the relevant branch starts.
+
+### Explicitly still out of M8
+
+Coordinated unique enforcement (reserved since M4), per-username rate
+limiting defaults, and everything in the not-planned table below.
 
 ---
 
