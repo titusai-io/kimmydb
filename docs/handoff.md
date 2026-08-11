@@ -6,150 +6,167 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 begun: the cluster harness, and what it caught
+## As of 2026-08-11 — M8 in progress: Prove and Persist done, Polish next
 
-**M0–M7 are complete; M8 (prove, persist, polish) is underway.** Twelve
-tasks, planned in [Roadmap](roadmap.md); three decisions reserved for the
-maintainer before their branches start: bulk insert's API shape, certificate
-reload's trigger, and token revocation's semantics.
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is six
+of twelve tasks in.** The open PR is task 6; tasks 7–12 remain, and three of
+them are blocked on a maintainer decision (below).
+
+### How work runs here — read this first
+
+The rhythm:
+
+- **One branch per task, always off fresh `main`.** `git checkout main &&
+  git pull && git checkout -b m8-<task>`.
+- **Every branch lands through a PR (`gh pr create`)**, which the maintainer
+  reviews and merges. Pushing a branch is not finishing it; the PR is.
+- **The gate, before every commit:** `cargo fmt --all -- --check` ·
+  `cargo clippy --workspace --all-targets -- -D warnings` ·
+  `./scripts/check-native-deps.sh` · `cargo test --workspace`. Then **drive
+  the change against a running node** — the live drive has caught what the
+  suite could not on nearly every branch (empty webhook fields, the reindex
+  that embedded nothing, the `open_ai` wire tag). CI additionally runs the
+  cluster harness (`cargo test -p kimmyd --test cluster -- --ignored
+  --test-threads=1`).
+- **Every deviation from plan gets a `docs/deviations.md` entry at the time
+  it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-048**).
+
+### The one structural idea, if you read nothing else
+
+**The oplog is the spine.** Every mutation appends exactly one durable,
+HLC-ordered entry *in the same redb transaction as the change itself*. Four
+independent subsystems consume that same log: change streams (WebSocket, and
+resumable by token), the embedding worker, cluster anti-entropy, and the
+webhook dispatcher. Two consequences that keep mattering:
+
+- A new background consumer is "subscribe to the log", not new machinery —
+  and backfill is not a special case, the consumer just starts earlier.
+- **Consumers record their position after doing the work, never before.**
+  Crashing replays the entry; idempotency makes the replay a no-op. Recording
+  first silently skips work — the failure mode behind three separate bugs so
+  far.
+
+This is why single-instance change streams work here when they don't in
+MongoDB: there the log is a byproduct of replication, so it needs a replica
+set. Here clustering is a *consumer* of the log, not its cause.
+[Architecture](architecture.md) and [Oplog](oplog.md) have the detail.
 
 ### State of the branches
 
 | | |
 |---|---|
-| `main` | PRs #16–#44 merged: the M8 plan, the cluster harness, observability, benchmarks, HNSW snapshots |
-| `m8-vector-reindex` | **Not merged.** `ConfigureVectors` entries now trigger a collection-scan backfill in the worker — which also revealed that the old "re-enable backfills from the oplog" claim was always false (a long-lived worker's position was past old entries; enabling embedding on existing documents embedded nothing), and that the provider cache never evicted on reconfigure. Layered idempotency: config fingerprint per scan, HLC per document |
+| `main` | PRs #16–#45 merged: through M8 task 5 (vector reindex) |
+| `m8-provider-audit` (open PR #46) | **Task 6.** Voyage = the existing `open_ai` dialect; new `cohere` and `gemini` dialects; `HttpProvider` grew an `Auth` enum for Gemini's `x-goog-api-key` header. Fixture-verified against documented shapes ([ADR-047](decisions.md)) and driven live against endpoints speaking each real shape. **This handoff commit rides on it.** |
 
-### The bug the harness caught on its first run
+### The M8 task board
 
-**No webhook was ever delivered in any clustered deployment.** SWIM's live
-set contains *peers only* — foca's `MemberUp` never fires for the node
-holding the set — so rendezvous ownership computed an owner that could never
-be `me`, and every node stood down for every subscription. Single-node
-worked (empty set → own everything), which is why all of M6's tests, its
-mutation runs, and every live drive passed. Fixed in `ownership::owns`:
-candidates are the live peers **plus this node**, which also dissolves the
-empty-set special case. Full account in [Deviations](deviations.md).
+Prove and Persist are complete; Polish is the remaining workstream.
 
-### What the harness asserts
+| # | Task | Status |
+|---|---|---|
+| 1 | Cluster verification harness | ✅ #41 |
+| 2 | Latency histograms + oplog lag | ✅ #42 (ADR-046) |
+| 3 | Benchmark baseline + concurrent writers | ✅ #43 |
+| 4 | HNSW snapshot persistence | ✅ #44 |
+| 5 | Vector reindex | ✅ #45 |
+| 6 | Provider dialect audit | 🔵 open PR #46 (ADR-047) |
+| 7 | **Bulk insert** | ⏸ **needs a decision** — array body on `POST /docs` vs. a dedicated endpoint. `POST /docs` takes one document today. Benchmark finding shapes this: concurrent writers are flat (~300 docs/s, one redb writer), so a bulk API's only win is **per-commit overhead**, i.e. batching many documents into one durable commit |
+| 8 | **Certificate reload** | ⏸ **needs a decision** — trigger is SIGHUP vs. mtime poll. ADR before code. Constraint: certs are read before the socket binds (ADR-039), so a reload must keep a bad new cert from taking down a serving node |
+| 9 | SRV discovery | `dns-srv:` parses but does not resolve; needs a resolver crate. **Must not add a second native crypto stack** — keep DNSSEC features off; `check-native-deps.sh` is the arbiter |
+| 10 | Webhook ownership by node id | Rendezvous hashes `SocketAddr` today, so re-addressing reshuffles subscriptions. Gossip the node id as member metadata and hash that. Verify with the harness; a mixed-version cluster produces duplicates, which at-least-once tolerates |
+| 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
+| 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-Real `kimmyd` processes on scratch ports: gossip formation read from the new
-`kimmy_cluster_members` gauge (peers-only — a formed three-node cluster
-reads 2 everywhere); an unseeded member learned through gossip; `SIGSTOP`
-suspicion and `SIGCONT` recovery without restart; kill detection;
-replication through gossip-discovered peers using a collection name that
-hashes above `i64::MAX`; and one webhook per node's ownership share, all
-delivered, with a killed owner's subscription taken over by a survivor.
-Ignored by default; CI runs them serialized (`--ignored --test-threads=1`).
+**Recommended next branch: task 7 (bulk insert).**
 
-### State of the branches
+### What the completed M8 branches did, and the bugs they found
 
-| | |
-|---|---|
-| `main` | PRs #16–#38 merged |
-| `m7-mutation-and-closeout` | **Not merged.** The M7 mutation-testing pass and this docs close-out. Test-and-docs only — no production code changed |
-
-**Gate on it:** fmt · clippy `-D warnings` ·
-`./scripts/check-native-deps.sh` · full suite. Nothing behavioural to drive:
-the branch adds tests and documentation.
-
-### What M7 was
-
-Four branches: the M6 review fixes (webhook payload names, backoff pruning,
-the egress DNS TOCTOU), multikey tracking per index (closing the register's
-last 🔴 — both range bounds on scalar-only indexes, snapshot-checked scans,
-and the stale-handle maintenance fix), ranges on descending fields (the bound
-swap), and `$in` as a union of point probes. The full accounts live in
-[Roadmap](roadmap.md), [Deviations](deviations.md) and [Indexes](indexes.md).
-
-### The mutation pass, and what it teaches
-
-`cargo-mutants` is now installed and replaces the hand-rolled harness. 131
-mutants over the planner, the key encoding, and everything M7 changed: ten
-escapes, nine killed with new tests, one proven equivalent. The account is in
-[Testing](testing.md); the lesson in one line: **every killable escape lived
-in a routing or rendering layer above the one the strong tests guard** —
-`exec`'s choice of which engine call to make, `explain`'s rendering, the
-dispatcher's outer loop. When a well-tested layer gains a caller, the caller
-needs its own tests.
-
-### What webhooks are, in one paragraph
-
-A client registers a URL against a collection; the cluster pushes change events
-to it. Same events as a [change stream](change-streams.md), opposite direction —
-for consumers that cannot hold a WebSocket. [Webhooks](webhooks.md) is the user
-documentation and is accurate; read it before the code.
-
-### The design, so it is not re-derived
-
-Read [ADR-045](decisions.md) for the full reasoning. The load-bearing ideas:
-
-1. **The dispatcher is an ordinary oplog consumer**, like the embedding worker.
-   Nothing about it is special machinery.
-2. **Delivery progress is replicated state.** Each node writes *only its own*
-   record — `__kimmy.__webhook_progress`, `_id = {subscription}:{node}`, holding
-   a `VersionVector` — so there are no write conflicts, and any node reads the
-   union. This is what makes a node dying survivable.
-3. **Ownership is derived, not elected.** `owner = rendezvous_hash(subscription,
-   live SWIM members)`, a pure function every node computes independently. No
-   vote, no term, no coordinator.
-4. **A pass plans serially, delivers concurrently under a bound, applies
-   serially.** Only the network call overlaps. Everything touching the engine is
-   on one thread.
-
-Two earlier designs were tried on paper and rejected, so do not re-propose them:
-the *originating* node delivering (loses events when that node dies) and *every*
-node delivering (N duplicates per write).
-
-### Decisions already taken — do not re-litigate
-
-| | |
-|---|---|
-| Delivery guarantee | **At-least-once.** Every event carries a stable `X-Kimmy-Event-Id` so receivers deduplicate |
-| Who may register | The **`webhook`** action, independent of `watch`. Only `admin` implies it |
-| Egress | Private ranges blocked by default, `webhooks.allowed_hosts` to override. Resolved address checked, every address, redirects refused |
-| Where a subscription starts | **Now**, not the beginning of the oplog. Seeded at registration |
-| Signing | `HMAC-SHA256(secret, timestamp + "." + body)`, timestamp inside the signature |
-| Delivery concurrency | Bounded, `webhooks.max_concurrent_deliveries`, default 8 |
-| An oversized document | Delivered with `fullDocument` omitted, never dropped |
-| MCP tool | Deliberately not built. Registering an egress path is not a reading act |
+- **Task 1 — cluster harness (`kimmyd/tests/cluster.rs`).** Spawns real
+  `kimmyd` processes. Its first run found **no webhook had ever been delivered
+  in any clustered deployment**: SWIM's live set holds *peers only* (foca's
+  `MemberUp` never fires for the node holding it), so rendezvous ownership
+  computed an owner that could never be `me`. Single-node worked (empty set →
+  own everything), which is why all of M6 passed. Fixed in `ownership::owns`:
+  candidates are the live peers **plus this node**. Added `kimmy_cluster_members`
+  gauge (peers-only: a formed three-node cluster reads 2). `SIGSTOP`/`SIGCONT`
+  stand in for a partition.
+- **Task 2 — observability (ADR-046).** `kimmy_request_duration_seconds`
+  histogram with **measured** buckets (the first draft was written from
+  expectation and the measurement corrected it), and
+  `kimmy_replication_lag_seconds` pushed from the replication loop via
+  `ReplicationConfig::on_lag` — the only place a peer's version vector exists.
+  Found while measuring: **`find {_id}` is a collection scan** (the planner
+  never consults the primary key; `GET /docs/{id}` is the point path) — 🟡 in
+  the register.
+- **Task 3 — benchmarks.** Concurrent writers flat 1→8 (~300 docs/s); the
+  single redb writer is shared cleanly. `scripts/bench-baseline.py record|check`
+  over Criterion medians, ±50% advisory tolerance, still recorded-not-gated.
+- **Task 4 — HNSW snapshots.** Graphs persist at `data_dir/hnsw/<id>/`
+  (staged-and-renamed), loaded before any rebuild on the first access after a
+  restart, validity checked by vector *count* (the generation counter is
+  in-memory). Found: **`hnsw_rs` panics on a corrupt graph file** → the load
+  runs under `catch_unwind`.
+- **Task 5 — vector reindex.** Every `ConfigureVectors` oplog entry now
+  triggers a collection-scan backfill in the embedding worker. Revealed the old
+  "re-enable backfills from the oplog" claim was **always false** — a
+  long-lived worker's position is past old entries, so enabling embedding on
+  existing documents embedded nothing. Also fixed: the provider cache never
+  evicted on reconfigure. Idempotency is layered: a config fingerprint per scan
+  (written after completion) + the HLC staleness check per document.
+- **Task 6 — provider audit (ADR-047).** Voyage is OpenAI-compatible (the
+  `open_ai` dialect — note the wire tag is `open_ai`, snake_case). Cohere and
+  Gemini needed dialects. Verified against **documented** shapes with fixtures,
+  not live endpoints (the bar every dialect has met since M2 — a live call
+  needs a paid key and egresses text to a third party).
 
 ### Where the code is
 
 | | |
 |---|---|
-| `kimmy-api/src/webhooks.rs` | Registry, registration API, the `__kimmy.__webhooks` collection |
-| `kimmy-api/src/dispatch.rs` | The worker, progress, delivery, signing, backoff, invalidation, limits |
-| `kimmy-api/src/ownership.rs` | Rendezvous hashing over the SWIM member set |
-| `kimmy-api/src/egress.rs` | Which URLs may be dialled |
-| `kimmy-api/tests/webhooks.rs` | Delivery against a receiver on a real socket |
-| `kimmyd/src/node.rs` | Spawns the dispatcher with the live `Members` handle |
+| `kimmy-storage/src/` | The engine: `docs.rs` (CRUD + oplog), `index.rs` (secondary indexes + multikey), `sync.rs` (transport-free anti-entropy + `lag_behind_ms`), `vectors.rs` (shadow collections, config, fingerprint), `rewind.rs` (point-in-time restore) |
+| `kimmy-query/src/plan.rs` | The rule-based planner: equality prefix, both-bounds ranges, `$in` unions |
+| `kimmy-vector/src/` | `worker.rs` (embedding + reindex backfill), `provider.rs` (the dialects + `Auth`), `index.rs` (HNSW + snapshot save/load), `cache.rs` (`IndexCache`, snapshot adoption) |
+| `kimmy-api/src/` | `exec.rs` (the single authz + query executor both edges call), `webhooks.rs` / `dispatch.rs` / `ownership.rs` / `egress.rs` (webhooks), `metrics.rs`, `routes.rs` |
+| `kimmy-cluster/src/` | `membership.rs` (SWIM/foca, `Members`), `peers.rs` (`replicate`, `ReplicationConfig`), `transport.rs` (TCP framing), `health.rs` |
+| `kimmyd/src/node.rs` | Wires everything: spawns cluster tasks, embedding worker, webhook dispatcher, GC |
+| `kimmyd/tests/cluster.rs` | The multi-node harness |
 
-### How this work is verified
+### How to run and verify things
 
-Beyond the suite: a real receiver on a socket, verifying the HMAC exactly as a
-consumer would. It has found what tests did not — per-subscription secrets, the
-history-replay behaviour, and the empty `database`/`collection` fields, which
-every test missed because every test asserted fields that were present rather
-than reading the body a receiver actually gets. **Assert payload shape on the
-wire.**
-
-**Mutation-test anything touching delivery, egress or the planner.** Run a
-no-op control first — a mutation that fails to compile produces no
-`test result:` line and reads exactly like an escape — and check the mutation
-actually applied before concluding a test missed it.
+- **Scratch server:** `KIMMY_ROOT_PASSWORD=pw ./target/debug/kimmyd --config
+  <toml>` with a non-default port and scratch `data_dir` (7878 may collide).
+  Log in at `POST /v1/auth/login`; the bootstrap user is `root`.
+- **Cluster harness:** `cargo test -p kimmyd --test cluster -- --ignored
+  --test-threads=1`. A node with `cluster.enabled` and no seeds refuses to
+  start, so the harness pre-allocates ports and cross-seeds.
+- **Benchmarks:** `cargo bench -p kimmy-storage -p kimmy-vector`, then
+  `scripts/bench-baseline.py check`.
+- **Mutation testing:** `cargo mutants --file <f> -o <outdir> -- -p <pkgs>`
+  (installed). `--in-diff <diff>` scopes to a diff. No `--no-fail-fast` flag —
+  that habit belonged to the retired hand-rolled harness; a non-compiling
+  mutant reports `unviable`. Some escapes are *equivalent mutants* no test can
+  kill — prove it, don't chase it.
+- **Live provider drive:** a fake HTTP endpoint speaking a dialect's shape;
+  set the key env var (`OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`)
+  before launching the node.
 
 ### Carried debt, none blocking
 
-**The register holds zero 🔴 — M7 closed the last one, and both 🟡 planner
-gaps with it.** What remains, all 🟡 in [Deviations](deviations.md): HNSW
-snapshot persistence (a restart pays a rebuild on first search), SRV discovery
-(needs a DNS resolver crate), a vector reindex operation, webhook ownership
-hashing `SocketAddr` rather than node ids (a re-addressed node reshuffles its
-subscriptions), rate limiting beyond login (waits on benchmarks), latency
-histograms and oplog lag metrics, certificate reload without a restart, and —
-noted while driving the server, not yet in the register — no bulk insert
-endpoint.
+**The register holds zero 🔴.** M7 closed the last one. What remains, all 🟡
+in [Deviations](deviations.md), with the M8 tasks that would close them:
+
+| Debt | |
+|---|---|
+| No bulk insert endpoint | M8 task 7 |
+| Certificate reload needs a restart | M8 task 8 |
+| SRV discovery parses but does not resolve | M8 task 9 |
+| Webhook ownership hashes `SocketAddr`, not node ids | M8 task 10 |
+| Deleting a user does not invalidate issued tokens | M8 task 11 |
+| `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
+| Rate limiting covers login only | waits on a capacity decision, not on measurement any more |
+| Keyword search is term overlap, not BM25; chunking counts characters, not tokens; `skip` is O(n); no minimum score threshold | simplifications inside working features |
+| No `$vectorSearch` pipeline stage; no mTLS; no computed pipeline expressions | not planned |
 
 ### Invariants a change must not break
 
@@ -220,6 +237,27 @@ endpoint.
 - **A cluster feature is not verified until the harness has run it on real
   nodes.** Transport-free tests and single-node drives both passed while
   clustered delivery was entirely broken.
+- **Correctness never depends on an HNSW snapshot.** A corrupt one is deleted
+  and rebuilt (the load runs under `catch_unwind` because `hnsw_rs` panics on
+  bad magic), a behind one serves once and rebuilds, a missing one builds, and
+  a restore carries none. A snapshot whose metric or dimension disagrees with
+  the live config is refused before the graph is read.
+- **Vector backfill scans the collection, never the oplog.** The oplog may
+  have been collected; the documents are the durable source. The config
+  fingerprint is written **after** the scan completes — recording it first
+  would leave the remainder embedded under the old model with nothing to
+  notice.
+- **A provider is cached against the configuration that built it.** A
+  reconfigured collection must not keep embedding through the old provider.
+- **Replication lag is pushed from the replication loop, never computed in the
+  API layer** — that loop is the only place a peer's version vector exists. An
+  unreachable cluster reports its *last* value, not zero: an outage has
+  unknown lag, and zero would read as perfect health.
+- **Health and metrics routes stay out of the latency histogram** but stay in
+  the request counter. They fire every few seconds forever and would crowd the
+  buckets real traffic lands in.
+- **A metric's buckets or thresholds are measured, not chosen.** ADR-046's
+  first draft was written from expectation and the measurement corrected it.
 
 
 ## Conventions for this file

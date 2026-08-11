@@ -92,6 +92,26 @@ pub enum ProviderConfig {
         #[serde(default)]
         api_key_env: Option<String>,
     },
+    /// Cohere `/v2/embed`. Not covered by `custom_http`: the request key is
+    /// `texts`, `input_type` is required, and the response nests under
+    /// `embeddings.float`. See ADR-047.
+    Cohere {
+        model: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default = "default_cohere_key_env")]
+        api_key_env: String,
+    },
+    /// Google Gemini `:batchEmbedContents`. Not covered by `custom_http`: the
+    /// text nests under `content.parts`, vectors return under `values`, and
+    /// auth is an `x-goog-api-key` header. See ADR-047.
+    Gemini {
+        model: String,
+        #[serde(default)]
+        endpoint: Option<String>,
+        #[serde(default = "default_gemini_key_env")]
+        api_key_env: String,
+    },
     /// In-process ONNX inference.
     ///
     /// Requires a build with the `local-embeddings` feature. The default build
@@ -104,6 +124,14 @@ fn default_openai_key_env() -> String {
     "OPENAI_API_KEY".to_string()
 }
 
+fn default_cohere_key_env() -> String {
+    "COHERE_API_KEY".to_string()
+}
+
+fn default_gemini_key_env() -> String {
+    "GEMINI_API_KEY".to_string()
+}
+
 impl ProviderConfig {
     pub fn name(&self) -> &'static str {
         match self {
@@ -111,6 +139,8 @@ impl ProviderConfig {
             Self::OpenAi { .. } => "openai",
             Self::Ollama { .. } => "ollama",
             Self::CustomHttp { .. } => "custom_http",
+            Self::Cohere { .. } => "cohere",
+            Self::Gemini { .. } => "gemini",
             Self::Local { .. } => "local",
         }
     }
@@ -136,6 +166,24 @@ impl ProviderConfig {
                 check_url(endpoint)
             }
             Self::CustomHttp { endpoint, .. } => check_url(endpoint),
+            Self::Cohere { model, endpoint, .. } => {
+                if model.is_empty() {
+                    return Err("cohere provider needs a model".into());
+                }
+                match endpoint {
+                    Some(url) => check_url(url),
+                    None => Ok(()),
+                }
+            }
+            Self::Gemini { model, endpoint, .. } => {
+                if model.is_empty() {
+                    return Err("gemini provider needs a model".into());
+                }
+                match endpoint {
+                    Some(url) => check_url(url),
+                    None => Ok(()),
+                }
+            }
             Self::Local { model } if model.is_empty() => Err("local provider needs a model".into()),
             Self::Local { .. } if !cfg!(feature = "local-embeddings") => {
                 Err("the local embedding provider requires a build with the \

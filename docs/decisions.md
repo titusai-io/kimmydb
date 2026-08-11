@@ -1647,6 +1647,47 @@ would fire.
 
 ---
 
+## ADR-047 — The provider audit: Voyage rides OpenAI, Cohere and Gemini get dialects
+
+**Decision.** The three providers the M8 plan named were checked against their
+documented API shapes. **Voyage** is OpenAI-compatible, so it is the existing
+`openai` provider with `endpoint: "https://api.voyageai.com"` — no new code,
+one test that pins it stays covered. **Cohere** and **Gemini** each differ
+enough that `custom_http` cannot reach them, so each gains a dialect.
+
+**What custom_http could not reach, precisely:**
+
+- **Cohere** sends `texts`, not `input`; requires `input_type` (omitting it on
+  a v3+ model embeds documents under the wrong role and quietly degrades
+  recall); and nests the response under `embeddings.float` on v2. The dialect
+  sends `search_document` always — the server only embeds documents; a query
+  is embedded client-side and must use `search_query`, a Cohere asymmetry
+  callers meet outside this server. The response parser accepts both the v2
+  nested shape and the v1 flat one, so an account on either version works.
+- **Gemini** nests the text under `content.parts`, returns vectors under
+  `values`, and authenticates with an `x-goog-api-key` **header** rather than a
+  bearer token — which is why `HttpProvider` grew an `Auth` enum. The model
+  rides the URL bare (`:batchEmbedContents`) and the body prefixed
+  (`models/…`).
+
+**Verified against documented shapes, with fixtures — not live endpoints.**
+The suite has never called a live embedding provider: it needs a paid key and
+would publish text to a third party, and OpenAI and Ollama have been
+fixture-tested since M2 for exactly that reason. The new dialects meet the same
+bar — the fixture tests pin the request each builds and the response each
+parses, and are where a reviewer checks the shape against current API docs. A
+provider that changes its shape is a fixture update, not a silent break; this
+is the honest verification level available, stated so the number is a claim
+under known conditions rather than a guess.
+
+**Why per-vendor dialects rather than a configurable JSON-path adapter.** The
+design already had per-vendor dialects (OpenAi, Ollama), so two more is the
+established pattern, not a new axis. A generic path-mapping adapter would be
+more surface to get wrong and harder to verify against a fixture, and it would
+still not solve Gemini's header auth or URL-embedded model.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

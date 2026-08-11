@@ -86,10 +86,22 @@ POST /v1/db/{db}/coll/{coll}/vector
 | Provider | Needs | Notes |
 |---|---|---|
 | `byo` | nothing | **The default.** The client supplies vectors through [the ingest route](#supplying-your-own-vectors); the server never embeds |
-| `openai` | an API key | Any OpenAI-compatible `/v1/embeddings` endpoint |
+| `open_ai` | an API key | Any OpenAI-compatible `/v1/embeddings` endpoint. **Voyage is this** — `{"kind":"open_ai","model":"voyage-3","endpoint":"https://api.voyageai.com","api_key_env":"VOYAGE_API_KEY"}` |
 | `ollama` | a reachable Ollama | Local or remote |
-| `custom_http` | an endpoint | Accepts `{"input": [...]}`, returns `{"embeddings": [[...]]}` |
+| `cohere` | an API key | Cohere `/v2/embed`. Sends `input_type: search_document`; accepts both v1 and v2 response shapes ([ADR-047](decisions.md)) |
+| `gemini` | an API key | Google `:batchEmbedContents`. Key goes in the `x-goog-api-key` header ([ADR-047](decisions.md)) |
+| `custom_http` | an endpoint | Accepts `{"input": [...]}`, returns `{"embeddings": [[...]]}`. The escape hatch for anything the named dialects miss |
 | `local` | `--features local-embeddings` | In-process ONNX. **Not in the default build** — see below |
+
+Default key variables: `OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`;
+override with `api_key_env`. The dialects were audited against each provider's
+documented API shape and pinned with fixture tests ([ADR-047](decisions.md)),
+which is where a shape drift shows up.
+
+> **Cohere embeds asymmetrically.** The server always uses
+> `input_type: search_document`, because it only ever embeds documents. If you
+> embed a *query* to search with — client-side, since queries arrive here as
+> raw vectors — use `search_query`, or recall suffers.
 
 API keys are read from the environment by *variable name*. The name is stored in
 collection metadata; the key itself never is, so a metadata dump cannot leak a

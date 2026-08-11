@@ -44,6 +44,16 @@ pub fn build(config: &ProviderConfig, dim: usize) -> Result<Box<dyn EmbeddingPro
         ProviderConfig::CustomHttp { endpoint, api_key_env } => {
             Ok(Box::new(HttpProvider::custom(endpoint.clone(), api_key_env.clone(), dim)?))
         }
+        ProviderConfig::Cohere { model, endpoint, api_key_env } => {
+            let base = endpoint.clone().unwrap_or_else(|| "https://api.cohere.com".into());
+            Ok(Box::new(HttpProvider::cohere(base, model.clone(), api_key_env.clone(), dim)?))
+        }
+        ProviderConfig::Gemini { model, endpoint, api_key_env } => {
+            let base = endpoint
+                .clone()
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
+            Ok(Box::new(HttpProvider::gemini(base, model.clone(), api_key_env.clone(), dim)?))
+        }
 
         ProviderConfig::Local { model } => local_provider(model, dim),
     }
@@ -63,15 +73,58 @@ fn local_provider(_model: &str, _dim: usize) -> Result<Box<dyn EmbeddingProvider
 }
 
 /// Which request and response shape a remote endpoint speaks.
+///
+/// Audited against each provider's **documented** API shape and pinned with
+/// the fixture tests below — the same verification every dialect here has had
+/// since M2, since the suite has never called a live embedding endpoint (that
+/// needs a key and would publish text to a third party). A provider that
+/// changes its shape is a fixture update, and the tests are where a reviewer
+/// checks the shape against current docs. See ADR-047.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Dialect {
-    /// `{"input": [...], "model": "..."}` → `{"data": [{"embedding": [...]}]}`
+    /// `{"input": [...], "model": "..."}` → `{"data": [{"embedding": [...]}]}`.
+    ///
+    /// **Voyage AI speaks this** — it is deliberately OpenAI-compatible — so a
+    /// Voyage collection is an `openai` provider with
+    /// `endpoint: "https://api.voyageai.com"`. No separate dialect; the test
+    /// `voyage_is_the_openai_dialect` pins that it stays covered.
     OpenAi,
     /// One text per request: `{"prompt": "...", "model": "..."}` →
-    /// `{"embedding": [...]}`
+    /// `{"embedding": [...]}`.
     Ollama,
-    /// `{"input": [...]}` → `{"embeddings": [[...]]}`
+    /// `{"input": [...]}` → `{"embeddings": [[...]]}`. The escape hatch for an
+    /// endpoint that fits neither named dialect.
     Custom,
+    /// Cohere `/v2/embed`: `{"texts": [...], "model", "input_type",
+    /// "embedding_types": ["float"]}` → `{"embeddings": {"float": [[...]]}}`,
+    /// with the v1 `{"embeddings": [[...]]}` shape accepted too.
+    ///
+    /// Not covered by `custom`: the request key is `texts` not `input`, and
+    /// `input_type` is required for the v3+ models — omitting it embeds
+    /// documents under the wrong role and quietly degrades recall. The worker
+    /// only ever embeds documents, so it always sends `search_document`; a
+    /// query embedded client-side must use `search_query`, which is a Cohere
+    /// property callers meet outside this server.
+    Cohere,
+    /// Gemini `:batchEmbedContents`: `{"requests": [{"model", "content":
+    /// {"parts": [{"text"}]}}]}` → `{"embeddings": [{"values": [...]}]}`.
+    ///
+    /// Not covered by `custom` in three ways at once: the request nests text
+    /// under `content.parts`, the vectors come back under `values`, and auth
+    /// is an `x-goog-api-key` header rather than a bearer token — which is why
+    /// [`Auth`] exists.
+    Gemini,
+}
+
+/// How a provider authenticates.
+///
+/// A bearer token covers OpenAI, Voyage, Cohere and Ollama-behind-a-proxy;
+/// Gemini wants its key in a named header instead. Split out so a new
+/// provider's auth is a variant here rather than an `if` in the send path.
+enum Auth {
+    None,
+    Bearer(String),
+    Header(&'static str, String),
 }
 
 /// A provider that calls an HTTP endpoint.
@@ -79,7 +132,7 @@ pub struct HttpProvider {
     endpoint: String,
     model: String,
     dialect: Dialect,
-    api_key: Option<String>,
+    auth: Auth,
     dim: usize,
 }
 
@@ -89,7 +142,7 @@ impl HttpProvider {
             endpoint: format!("{}/v1/embeddings", base.trim_end_matches('/')),
             model,
             dialect: Dialect::OpenAi,
-            api_key: Some(read_key(&key_env)?),
+            auth: Auth::Bearer(read_key(&key_env)?),
             dim,
         })
     }
@@ -99,17 +152,50 @@ impl HttpProvider {
             endpoint: format!("{}/api/embeddings", endpoint.trim_end_matches('/')),
             model,
             dialect: Dialect::Ollama,
-            api_key: None,
+            auth: Auth::None,
             dim,
         }
     }
 
     fn custom(endpoint: String, key_env: Option<String>, dim: usize) -> Result<Self> {
-        let api_key = match key_env {
-            Some(var) => Some(read_key(&var)?),
-            None => None,
+        let auth = match key_env {
+            Some(var) => Auth::Bearer(read_key(&var)?),
+            None => Auth::None,
         };
-        Ok(Self { endpoint, model: String::new(), dialect: Dialect::Custom, api_key, dim })
+        Ok(Self { endpoint, model: String::new(), dialect: Dialect::Custom, auth, dim })
+    }
+
+    fn cohere(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
+        Ok(Self {
+            endpoint: format!("{}/v2/embed", base.trim_end_matches('/')),
+            model,
+            dialect: Dialect::Cohere,
+            auth: Auth::Bearer(read_key(&key_env)?),
+            dim,
+        })
+    }
+
+    fn gemini(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
+        Ok(Self::gemini_with_key(&base, &model, read_key(&key_env)?, dim))
+    }
+
+    /// The Gemini shape with the key already in hand. Split from [`Self::gemini`]
+    /// so a test can build one without touching the environment.
+    fn gemini_with_key(base: &str, model: &str, key: String, dim: usize) -> Self {
+        // The model rides both the URL and the request body; the URL wants it
+        // bare, the body wants a `models/` prefix. Stored bare.
+        let bare = model.strip_prefix("models/").unwrap_or(model);
+        Self {
+            endpoint: format!(
+                "{}/v1beta/models/{bare}:batchEmbedContents",
+                base.trim_end_matches('/')
+            ),
+            model: bare.to_string(),
+            dialect: Dialect::Gemini,
+            // Gemini reads the key from a header, not a bearer token.
+            auth: Auth::Header("x-goog-api-key", key),
+            dim,
+        }
     }
 
     /// The request body for a batch, in this provider's dialect.
@@ -122,6 +208,21 @@ impl HttpProvider {
                 serde_json::json!({ "prompt": texts.first(), "model": self.model })
             }
             Dialect::Custom => serde_json::json!({ "input": texts }),
+            // `search_document` because the server only embeds documents;
+            // Cohere's asymmetric models want `search_query` for queries,
+            // which are embedded client-side and arrive here as raw vectors.
+            Dialect::Cohere => serde_json::json!({
+                "texts": texts,
+                "model": self.model,
+                "input_type": "search_document",
+                "embedding_types": ["float"],
+            }),
+            Dialect::Gemini => serde_json::json!({
+                "requests": texts.iter().map(|text| serde_json::json!({
+                    "model": format!("models/{}", self.model),
+                    "content": { "parts": [ { "text": text } ] },
+                })).collect::<Vec<_>>(),
+            }),
         }
     }
 
@@ -150,6 +251,29 @@ impl HttpProvider {
                 .ok_or_else(malformed)?
                 .iter()
                 .map(|row| numbers(Some(row)))
+                .collect::<Option<_>>()
+                .ok_or_else(malformed)?,
+            // v2 nests the rows under `embeddings.float`; v1 puts the array
+            // directly under `embeddings`. Accept either, so a user on either
+            // API version — and an account migrated between them — works.
+            Dialect::Cohere => {
+                let rows = match body.get("embeddings") {
+                    Some(serde_json::Value::Object(map)) => map.get("float"),
+                    other => other,
+                };
+                rows.and_then(|e| e.as_array())
+                    .ok_or_else(malformed)?
+                    .iter()
+                    .map(|row| numbers(Some(row)))
+                    .collect::<Option<_>>()
+                    .ok_or_else(malformed)?
+            }
+            Dialect::Gemini => body
+                .get("embeddings")
+                .and_then(|e| e.as_array())
+                .ok_or_else(malformed)?
+                .iter()
+                .map(|row| numbers(row.get("values")))
                 .collect::<Option<_>>()
                 .ok_or_else(malformed)?,
         };
@@ -198,9 +322,11 @@ impl EmbeddingProvider for HttpProvider {
 
         for batch in batches {
             let mut request = client.post(&self.endpoint).json(&self.request_body(batch));
-            if let Some(key) = &self.api_key {
-                request = request.bearer_auth(key);
-            }
+            request = match &self.auth {
+                Auth::None => request,
+                Auth::Bearer(key) => request.bearer_auth(key),
+                Auth::Header(name, key) => request.header(*name, key),
+            };
 
             let response = request.send().await.map_err(|e| VectorError::Transport {
                 provider: self.name(),
@@ -243,6 +369,8 @@ impl EmbeddingProvider for HttpProvider {
             Dialect::OpenAi => "openai",
             Dialect::Ollama => "ollama",
             Dialect::Custom => "custom_http",
+            Dialect::Cohere => "cohere",
+            Dialect::Gemini => "gemini",
         }
     }
 }
@@ -256,7 +384,7 @@ mod tests {
             endpoint: "http://example.invalid".into(),
             model: "m".into(),
             dialect,
-            api_key: None,
+            auth: Auth::None,
             dim,
         }
     }
@@ -281,6 +409,20 @@ mod tests {
 
         let custom = provider(Dialect::Custom, 2).request_body(&texts);
         assert_eq!(custom["input"], serde_json::json!(["a", "b"]));
+
+        // Cohere: `texts`, not `input`, and `input_type` is mandatory for the
+        // v3+ models — a request without it embeds under the wrong role.
+        let cohere = provider(Dialect::Cohere, 2).request_body(&texts);
+        assert_eq!(cohere["texts"], serde_json::json!(["a", "b"]));
+        assert_eq!(cohere["input_type"], "search_document");
+        assert_eq!(cohere["embedding_types"], serde_json::json!(["float"]));
+
+        // Gemini: text nests under content.parts, and the model carries a
+        // `models/` prefix in the body even though the URL wants it bare.
+        let gemini = provider(Dialect::Gemini, 2).request_body(&texts);
+        assert_eq!(gemini["requests"][0]["content"]["parts"][0]["text"], "a");
+        assert_eq!(gemini["requests"][1]["content"]["parts"][0]["text"], "b");
+        assert_eq!(gemini["requests"][0]["model"], "models/m");
     }
 
     #[test]
@@ -303,6 +445,72 @@ mod tests {
         assert_eq!(
             provider(Dialect::Custom, 2).parse_response(&custom).unwrap(),
             vec![vec![1.0, 2.0]]
+        );
+
+        // Cohere v2 nests under `embeddings.float`...
+        let cohere_v2 = serde_json::json!({ "embeddings": { "float": [[1.0, 2.0], [3.0, 4.0]] } });
+        assert_eq!(
+            provider(Dialect::Cohere, 2).parse_response(&cohere_v2).unwrap(),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
+        );
+        // ...and the v1 flat shape must still parse, so a user on either API
+        // version works.
+        let cohere_v1 = serde_json::json!({ "embeddings": [[1.0, 2.0]] });
+        assert_eq!(
+            provider(Dialect::Cohere, 2).parse_response(&cohere_v1).unwrap(),
+            vec![vec![1.0, 2.0]]
+        );
+
+        // Gemini returns each vector under `values`.
+        let gemini = serde_json::json!({
+            "embeddings": [ { "values": [1.0, 2.0] }, { "values": [3.0, 4.0] } ]
+        });
+        assert_eq!(
+            provider(Dialect::Gemini, 2).parse_response(&gemini).unwrap(),
+            vec![vec![1.0, 2.0], vec![3.0, 4.0]]
+        );
+    }
+
+    #[test]
+    fn voyage_is_the_openai_dialect() {
+        // The audit's Voyage finding, pinned: Voyage is OpenAI-compatible, so
+        // it is configured as `openai` with a Voyage endpoint — no separate
+        // dialect. If Voyage ever diverges, this is where it shows.
+        let config = ProviderConfig::OpenAi {
+            model: "voyage-3".into(),
+            endpoint: Some("https://api.voyageai.com".into()),
+            api_key_env: "VOYAGE_API_KEY".into(),
+        };
+        assert_eq!(config.name(), "openai", "voyage is configured as the openai provider");
+
+        // The request Voyage receives is OpenAI's, which the dialect already
+        // emits, and its response is OpenAI's, which the dialect already
+        // parses — so a Voyage endpoint needs nothing new.
+        let dialect = provider(Dialect::OpenAi, 2);
+        assert_eq!(dialect.request_body(&["a".into()])["input"], serde_json::json!(["a"]));
+        let voyage_response = serde_json::json!({ "data": [ { "embedding": [1.0, 2.0] } ] });
+        assert_eq!(dialect.parse_response(&voyage_response).unwrap(), vec![vec![1.0, 2.0]]);
+    }
+
+    #[test]
+    fn gemini_authenticates_by_header_and_puts_the_model_in_the_url() {
+        // The reason Auth exists: a bearer token would never authenticate a
+        // Gemini call. Constructed with a literal key so the test does not
+        // mutate the process environment.
+        let p = HttpProvider::gemini_with_key(
+            "https://generativelanguage.googleapis.com",
+            "models/text-embedding-004",
+            "k".into(),
+            768,
+        );
+        assert!(matches!(p.auth, Auth::Header("x-goog-api-key", _)));
+        // The `models/` prefix is stripped for the URL — bare there — and the
+        // URL names the batch method.
+        assert_eq!(p.model, "text-embedding-004");
+        assert!(
+            p.endpoint.ends_with("/models/text-embedding-004:batchEmbedContents"),
+            "{}",
+            p.endpoint
         );
     }
 
