@@ -310,13 +310,46 @@ documented part of the surface rather than an accident: see the row below.
 
 ---
 
+## 🟢 A renewed certificate no longer needs a restart (was a 🟡 deferral since M5)
+
+**Was.** TLS certificates were read once, before the socket was bound
+([ADR-039](decisions.md)), so rotating one meant restarting the node.
+
+**Now.** SIGHUP, or a change to either file noticed within 60 seconds, swaps
+the certificate on a running node ([ADR-049](decisions.md)). Both triggers
+exist because neither covers both deployments: there is no convenient way to
+signal PID 1 of a Kubernetes pod, and a poll alone leaves an operator who has
+just replaced a file waiting out the interval.
+
+**Almost none of this was new machinery.** `axum-server` already held the
+certificate behind a handle the acceptor reads per handshake and already
+exposed a reload; what was missing was something to call it. The branch is
+therefore about triggers, and the ADR is mostly about why there are two.
+
+**The startup rule and the reload rule now differ, on purpose.** A bad
+certificate at startup is still fatal — there is nothing to fall back to. A bad
+certificate at reload is refused and the one already serving stays, because
+there is. Verified on a live node: a truncated certificate and a
+certificate-without-its-key each left the node serving and healthy, counted a
+failure, and the following trigger completed the rotation.
+
+**To close, still open:** a failed reload is visible as
+`kimmy_tls_reloads_total{outcome="failed"}`, but a certificate **nobody ever
+tried to rotate** reports nothing, because no reload was attempted. That wants
+`kimmy_tls_cert_expiry_seconds` parsed from `notAfter` — the metric actually
+worth alerting on. Left out here because it needs `x509-parser` as a new
+runtime dependency, and a branch about triggers should not also be a branch
+about dependencies. See the row below.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
 |---|---|---|
 | SRV discovery | `dns-srv:` parses but does not resolve: SRV records need a DNS resolver that can read record types the standard library does not expose. `dns:` and `k8s:` work | M4 |
 | Client certificates (mTLS) | Server TLS authenticates the *server* to clients; clients still authenticate with a bearer token only | not planned |
-| Certificate reload | A renewed certificate needs a restart to take effect | M5 |
+| No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Token revocation | Deleting a user does not invalidate issued tokens | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |

@@ -574,7 +574,7 @@ by a killed node is delivered by its successor. Slow tests, marked
 | 5 | Persist | ✅ **Vector reindex** | `POST /vector` is the trigger: the worker treats every `ConfigureVectors` entry as a backfill, scanning the **collection** (the durable source — the oplog may be collected). Config fingerprint per scan + HLC per document give layered idempotency. **Found: the old "re-enable backfills from the oplog" claim was always false** — enabling embedding on existing documents embedded nothing on any long-lived worker — and the provider cache never evicted on reconfigure. Both fixed; account in [Deviations](deviations.md) |
 | 6 | Persist | ✅ **Provider dialect audit** | **Voyage** is OpenAI-compatible — the existing `openai` dialect with a Voyage endpoint, pinned by a test. **Cohere** (`texts`/`input_type`, nested v2 response) and **Gemini** (`content.parts`, `values`, `x-goog-api-key` header — the reason `HttpProvider` grew an `Auth` enum) each got a dialect. Verified against documented shapes with fixtures, not live endpoints — the bar every dialect has met since M2. [ADR-047](decisions.md) |
 | 7 | Polish | ✅ **Bulk insert** | `POST /v1/db/{db}/coll/{coll}/bulk` — a dedicated route (a sibling of `/find` and `/update`, not `/docs/bulk`, which would shadow the document whose `_id` is `"bulk"`), a bare JSON array, one transaction, capped at 1000. **176× per document at batch 1000** — 291 docs/sec becoming ~51,300 — because the durable commit was very nearly the whole cost, exactly as task 3's flat curve predicted. All-or-nothing, promised in the docs: the batch is checked against itself as well as against stored state, and a rejected document names its position. [ADR-048](decisions.md) |
-| 8 | Polish | **Certificate reload** | A renewed certificate currently needs a restart. Trigger is a design decision (SIGHUP vs. mtime poll) — ADR before code |
+| 8 | Polish | ✅ **Certificate reload** | **Both triggers**, because neither covers both deployments: SIGHUP for systemd and bare metal, and a 60-second mtime poll for where a certificate is rotated by cert-manager rather than by a person. Almost no new machinery — `axum-server` already held the certificate behind a per-handshake handle and already exposed a reload; what was missing was something to call it. **The startup rule and the reload rule now differ on purpose**: a bad certificate is fatal at startup (nothing to fall back to) and refused at reload (something to fall back to), which is also what absorbs the window between writing a new certificate and writing its key. `kimmy_tls_reloads_total{outcome}` makes a failed rotation visible, since its consequence otherwise arrives weeks later. [ADR-049](decisions.md) |
 | 9 | Polish | **SRV discovery** | `dns-srv:` parses but does not resolve. Needs a resolver crate; **must not add a second native crypto stack** — the DNSSEC features that pull one stay off, and `check-native-deps.sh` is the arbiter |
 | 10 | Polish | **Webhook ownership by node id** | Rendezvous currently hashes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions. Gossip the node id as member metadata and hash that. Verified with the harness from task 1; a mixed-version cluster produces duplicates, which at-least-once already tolerates |
 | 11 | Polish | **Token revocation** | Deleting a user currently leaves issued tokens valid until expiry. Semantics are a design decision — ADR first; a per-user token version (bump to invalidate all outstanding) is the leading candidate over a replicated deny-list, because it adds no per-request lookup that can miss |
@@ -582,11 +582,11 @@ by a killed node is delivered by its successor. Slow tests, marked
 
 ### Decisions reserved for the maintainer
 
-Bulk insert's API shape (task 7 — ✅ settled before the branch started, and
-recorded as [ADR-048](decisions.md)), certificate reload's trigger (task 8),
-and token revocation's semantics (task 11). Each is public surface or security
-behaviour; the plan deliberately does not pre-decide them — they are settled
-before the relevant branch starts.
+Bulk insert's API shape (task 7 — ✅ [ADR-048](decisions.md)), certificate
+reload's trigger (task 8 — ✅ [ADR-049](decisions.md)), and token revocation's
+semantics (task 11). Each is public surface or security behaviour; the plan
+deliberately does not pre-decide them — they are settled before the relevant
+branch starts, and both settled ones were decided before a line was written.
 
 ### Explicitly still out of M8
 

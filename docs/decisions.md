@@ -1761,6 +1761,81 @@ correctness argument for reusing the single-document checks rests on it.
 
 ---
 
+## ADR-049 — Certificate reload on both SIGHUP and an mtime poll, because neither alone covers both deployments
+
+**Decision.** A renewed certificate takes effect without a restart. One
+`reload` function sits behind two triggers: **SIGHUP**, and a **60-second
+timer** that reloads when either file's mtime has moved. A failed reload leaves
+the certificate currently in use serving, logs a WARN naming the file and the
+parse error, and increments
+`kimmy_tls_reloads_total{outcome="ok"|"failed"}`.
+
+**The mechanism was already there, which is why this ADR is about the trigger
+and almost nothing else.** `axum-server` holds its
+`RustlsConfig` as a shared, swappable handle that the running acceptor reads
+per handshake, and exposes `reload_from_pem_file`. So a reload is a store into
+that handle: no rebind, no restart, no dropped connections. Connections already
+in flight finish under the certificate they negotiated with; the next handshake
+gets the new one. Nothing had to be built to make that true — it had to be
+*triggered*.
+
+**ADR-039's constraint is satisfied by the API, not by code written here.**
+That ADR reads certificates before binding the socket so a bad one stops the
+node rather than failing for whoever connects first — which raises the obvious
+hazard for a reload: a bad *new* certificate must not take down a node that is
+serving perfectly well. Reading `reload_from_pem_file` rather than assuming:
+it parses the pair into a new `ServerConfig` and only then stores it, so a
+failure returns `Err` with the live configuration untouched. The startup rule
+and the reload rule are therefore different on purpose, and both are right — a
+bad certificate at startup is fatal because there is nothing to fall back to,
+and a bad certificate at reload is survivable because there is.
+
+**Why both triggers, when either alone is smaller.** They cover different
+deployments, and this project ships for both:
+
+- **SIGHUP** is the Unix convention and what an operator on systemd or bare
+  metal reaches for. It costs almost nothing here — `shutdown_signal` already
+  installs a `tokio::signal::unix` handler, so this is the same machinery
+  again. But there is no convenient way to signal PID 1 of a Kubernetes pod.
+- **The poll** is what works unattended where certificates are rotated *by*
+  something rather than by someone — cert-manager rewriting a mounted Secret,
+  which this project plausibly meets given `k8s:` discovery already exists.
+  But a poll alone leaves an operator who has just replaced a file with no way
+  to say "now"; they wait out the interval.
+
+Neither is redundant with the other, and both reduce to one `reload` call, so
+the second trigger is a `select!` arm rather than a second implementation.
+
+**The half-rotated pair is handled rather than avoided.** Replacing a
+certificate and its key is two writes, and between them the pair does not
+match. That window is not closed — it is absorbed: a mismatched pair fails to
+parse, the old certificate keeps serving, and the next tick retries. The worst
+case is up to 60 seconds more on the previous certificate, which is correct
+behaviour rather than an outage. Kubernetes Secret mounts swap a symlinked
+directory atomically and mostly do not produce the window at all; two `cp`
+commands on bare metal do.
+
+**The interval is a constant and the poll only runs with TLS configured.**
+Rotation is not urgent — a renewal lands weeks before expiry — so 60 seconds is
+far inside any window that matters, and SIGHUP already covers "now". A
+configurable interval would be public surface maintained for a knob nobody has
+asked for. With TLS off, `TlsConfig::pair()` is `None` and there is nothing to
+watch, so no task is spawned.
+
+**A counter, and deliberately not an expiry gauge — yet.** The trap this
+feature introduces is a reload that silently fails: the node keeps serving the
+old certificate perfectly, right up until it expires and every client drops at
+once. `kimmy_tls_reloads_total{outcome="failed"}` makes an attempted-and-failed
+reload visible, which is the failure this branch can create. It does *not*
+catch a certificate nobody ever tried to rotate — that wants
+`kimmy_tls_cert_expiry_seconds`, parsed from `notAfter`, which is the metric
+worth alerting on. It is left out here because it needs `x509-parser` as a new
+runtime dependency, and adding one to a branch about *triggers* is how a branch
+stops being about one thing. Recorded in [Deviations](deviations.md) as the
+follow-up rather than dropped.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
