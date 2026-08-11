@@ -6,45 +6,43 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-10 — M7: `$in` uses the index
+## As of 2026-08-11 — M7 complete
 
-**M0–M6 are complete; M7 (query engine completion) is nearly done.** The
-milestone record lives in [Decisions](decisions.md) and
-[Deviations](deviations.md).
+**M0–M7 are complete. There is no M8 defined.** The leading candidates, both declined in favour of M7 on 2026-08-10:
+operational maturity (HNSW snapshot persistence, certificate reload, latency
+histograms, benchmark baseline, SRV discovery) and API ergonomics (bulk
+insert, vector reindex, webhook ownership by node id, token revocation).
 
 ### State of the branches
 
 | | |
 |---|---|
-| `main` | PRs #16–#37 merged: the M7 plan, the webhook warm-up, multikey tracking, descending ranges |
-| `m7-in-index-union` | **Not merged.** `$in` as a union of point probes: `IndexPlan` generalized from one `(lower, upper)` to a list of ranges; executor unions candidates and deduplicates by document key; `explain` reports `indexUnion` with a probe count |
+| `main` | PRs #16–#38 merged |
+| `m7-mutation-and-closeout` | **Not merged.** The M7 mutation-testing pass and this docs close-out. Test-and-docs only — no production code changed |
 
 **Gate on it:** fmt · clippy `-D warnings` ·
-`./scripts/check-native-deps.sh` · full suite · driven against a live node.
+`./scripts/check-native-deps.sh` · full suite. Nothing behavioural to drive:
+the branch adds tests and documentation.
 
-### What this branch did, so it is not re-derived
+### What M7 was
 
-`$in` differs from `$or` in the way that matters to the planner: it is a
-disjunction **on one field**, so every match still satisfies "this field is
-one of these", which a union of index probes can answer. One probe per
-distinct value — deduplicated on the *encoded* key, so `[5, 5.0]` probes once,
-as the index collapses them — each carrying the equality prefix. Probes are
-equalities, so they are sound on multikey indexes with no flag interaction;
-`both_bounds` is always false for a union. A document whose array holds two
-listed values is found by both probes and deduplicated by document key. An
-empty `$in` plans an empty union: zero probes for a filter nothing matches.
+Four branches: the M6 review fixes (webhook payload names, backoff pruning,
+the egress DNS TOCTOU), multikey tracking per index (closing the register's
+last 🔴 — both range bounds on scalar-only indexes, snapshot-checked scans,
+and the stale-handle maintenance fix), ranges on descending fields (the bound
+swap), and `$in` as a union of point probes. The full accounts live in
+[Roadmap](roadmap.md), [Deviations](deviations.md) and [Indexes](indexes.md).
 
-The shape change: `IndexPlan.lower/upper` became `IndexPlan.ranges:
-Vec<(Vec<u8>, Vec<u8>)>` — one entry for a contiguous range, several for a
-union. Everything downstream (executor, tests, the bench) iterates.
+### The mutation pass, and what it teaches
 
-The multikey and descending branches' invariants below still stand.
-
-### What comes next in M7
-
-1. Mutation testing on the planner and key encoding (`--no-fail-fast`; run a
-   no-op control first).
-2. Final docs pass, then the M7 close-out in the roadmap.
+`cargo-mutants` is now installed and replaces the hand-rolled harness. 131
+mutants over the planner, the key encoding, and everything M7 changed: ten
+escapes, nine killed with new tests, one proven equivalent. The account is in
+[Testing](testing.md); the lesson in one line: **every killable escape lived
+in a routing or rendering layer above the one the strong tests guard** —
+`exec`'s choice of which engine call to make, `explain`'s rendering, the
+dispatcher's outer loop. When a well-tested layer gains a caller, the caller
+needs its own tests.
 
 ### What webhooks are, in one paragraph
 
@@ -114,12 +112,15 @@ actually applied before concluding a test missed it.
 
 ### Carried debt, none blocking
 
-One 🔴 in [Deviations](deviations.md): index ranges use only one bound —
-correct but less selective; closing it means tracking multikey-ness per index on
-the write path. Then `$in` not using an index, descending-field ranges, HNSW
-snapshot persistence, SRV discovery (needs a DNS resolver crate), a vector
-reindex operation, and webhook ownership hashing `SocketAddr` rather than node
-ids (a re-addressed node reshuffles its subscriptions).
+**The register holds zero 🔴 — M7 closed the last one, and both 🟡 planner
+gaps with it.** What remains, all 🟡 in [Deviations](deviations.md): HNSW
+snapshot persistence (a restart pays a rebuild on first search), SRV discovery
+(needs a DNS resolver crate), a vector reindex operation, webhook ownership
+hashing `SocketAddr` rather than node ids (a re-addressed node reshuffles its
+subscriptions), rate limiting beyond login (waits on benchmarks), latency
+histograms and oplog lag metrics, certificate reload without a restart, and —
+noted while driving the server, not yet in the register — no bulk insert
+endpoint.
 
 ### Invariants a change must not break
 

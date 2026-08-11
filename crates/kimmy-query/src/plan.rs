@@ -319,6 +319,21 @@ mod tests {
     }
 
     #[test]
+    fn a_tie_between_indexes_goes_to_the_first_listed() {
+        // Found by mutation testing: `>` → `>=` in `choose` survived the
+        // suite. Either winner answers the query correctly, which is why
+        // nothing caught it — but the choice decides what `explain` names and
+        // must not depend on which comparison operator someone typed. First
+        // listed wins, and index order in metadata is stable.
+        let idx = [
+            index(7, vec![IndexField::ascending("a")]),
+            index(9, vec![IndexField::ascending("a")]),
+        ];
+        let p = plan(doc! { "a": 1 }, &idx).unwrap();
+        assert_eq!(p.index_id, 7, "a tie must go to the first listed index");
+    }
+
+    #[test]
     fn the_index_covering_most_fields_wins() {
         let idx = [
             index(0, vec![IndexField::ascending("a")]),

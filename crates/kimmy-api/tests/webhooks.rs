@@ -194,6 +194,42 @@ async fn pass_under(
 }
 
 #[tokio::test]
+async fn the_dispatcher_loop_delivers_without_being_driven() {
+    // Every other test drives `dispatch_once` by hand, so a `run` that did
+    // nothing at all passed the entire suite — found by mutation testing
+    // (replace `run` with `()`). This spawns the loop the daemon spawns and
+    // waits for it to deliver on its own tick.
+    let dir = tempfile::tempdir().unwrap();
+    let state = state_for(&dir);
+    let (addr, _seen, hits) = receiver(200).await;
+    register(&state, &format!("http://{addr}/hook"), vec![]);
+
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1, "item": "widget" }).unwrap();
+
+    let handle = tokio::spawn(dispatch::run(
+        state.clone(),
+        EgressPolicy::new(vec!["127.0.0.1".into()]),
+        me(),
+        None,
+        dispatch::Limits::default(),
+    ));
+
+    // The first pass runs before the first sleep, so this resolves fast; the
+    // generous ceiling is for a loaded CI machine, not the loop's cadence.
+    let mut delivered = false;
+    for _ in 0..300 {
+        if hits.load(Ordering::SeqCst) > 0 {
+            delivered = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    handle.abort();
+    assert!(delivered, "the dispatcher loop must deliver on its own");
+}
+
+#[tokio::test]
 async fn a_write_is_delivered_and_the_signature_verifies() {
     let dir = tempfile::tempdir().unwrap();
     let state = state_for(&dir);
