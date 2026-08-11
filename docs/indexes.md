@@ -193,7 +193,7 @@ statistics have not been worth building. Full numbers in
 A conjunction *containing* an `$or` still uses its other conjuncts —
 `{a: 1, $or: [...]}` narrows on `a == 1`, which must hold for every match.
 
-### Only one end of a range is used
+### Ranges use both ends — unless the index is multikey
 
 A field may hold an array — a **multikey** index — and Mongo semantics let
 *different elements* satisfy each end of a range:
@@ -208,18 +208,43 @@ A field may hold an array — a **multikey** index — and Mongo semantics let
 
 Neither element satisfies *both* bounds, so intersecting them into a single key
 range `[1, 1]` excludes the document entirely — a range that is too narrow, and
-therefore silently wrong. The planner uses **one** bound only, keeping the range
-a superset; the recheck removes the extras.
+therefore silently wrong.
 
-> This was a real bug, found by the equivalence property test once it began
-> generating two-sided ranges. It had passed hundreds of one-sided cases first —
-> a one-sided range with a bad bound comes out too *wide*, which the recheck
-> silently repairs.
+So whether both ends may be used hangs on one fact about the *data*, and the
+write path tracks it: each index carries a **`multikey`** flag, set — in the
+same transaction as the index entries — the first time any document contributes
+more than one key, whether by holding an array or by a path that fans out
+through one (`a.b` over `{a: [{b: 1}, {b: 2}]}`). The backfill sets it for
+documents that predate the index, and a replicated write sets it on the node
+that applies it. It shows in `GET /indexes`.
 
-**The cost is selectivity, not correctness.** `{qty: {$gte: 5, $lte: 9}}` scans
-the index from 5 upward rather than stopping at 9. Tracking multikey-ness per
-index — as MongoDB does — would let both bounds be used for fields that never
-hold arrays. 📋 Planned.
+- **Not multikey** (the scalar-only majority): both bounds.
+  `{qty: {$gte: 5, $lte: 9}}` scans exactly `[5, 9]` and stops.
+- **Multikey**: one bound, as before — the range stays a superset and the
+  recheck removes the extras.
+
+The flag is **one-way**. Deleting the last array does not clear it, because
+proving no document still holds one is a full scan for the sake of a planner
+hint.
+
+Two details that keep this honest under concurrency, both found rather than
+designed:
+
+- A plan that intersected both bounds is re-validated **in the same storage
+  snapshot as the scan**. The plan was built from a metadata read that is
+  already stale; if a write made the index multikey in between, the scan
+  refuses and the query falls back to scanning the collection — possible at
+  most once per index, ever.
+- Index maintenance re-reads the index definitions **inside the write's own
+  transaction** rather than trusting the caller's handle. A write through a
+  handle fetched before an index existed used to skip that index silently —
+  no entries, no unique check, no multikey observation.
+
+> The one-bound rule was a real bug fix, found by the equivalence property test
+> once it began generating two-sided ranges. It had passed hundreds of
+> one-sided cases first — a one-sided range with a bad bound comes out too
+> *wide*, which the recheck silently repairs. The flag now confines that
+> penalty to the indexes that actually need it.
 
 ### Bounds
 
