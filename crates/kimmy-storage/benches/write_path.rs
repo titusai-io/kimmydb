@@ -19,6 +19,9 @@
 //!   cost of a document *and* its log record, which is the honest unit.
 //! - `insert` with one and two secondary indexes — index maintenance is on the
 //!   write path, and its cost is the argument against indexing everything.
+//! - `bulk` — the same insert, batched into one commit. Reported per document,
+//!   so the distance from `insert/secondary_indexes/0` is the per-commit
+//!   overhead a batch removes, which is the entire case for the bulk API.
 //! - `put_vectors` — replace-all per document, so it does more than an insert.
 //! - `replace` and `delete` — the other two mutations.
 
@@ -86,6 +89,40 @@ fn inserts(c: &mut Criterion) {
                 });
             },
         );
+    }
+    group.finish();
+}
+
+/// What batching into one commit is worth.
+///
+/// The whole justification for a bulk API is per-commit overhead: concurrent
+/// writers are flat because redb has a single writer, so the only cost left to
+/// remove is the commit itself. `Throughput::Elements` reports per document, so
+/// these read directly against `insert/secondary_indexes/0` — the same work,
+/// one commit each — and the gap between them *is* the feature.
+fn bulk_inserts(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bulk");
+    group.sample_size(30);
+
+    for batch in [1usize, 10, 100, 1000] {
+        group.throughput(criterion::Throughput::Elements(batch as u64));
+        group.bench_with_input(BenchmarkId::new("batch_size", batch), &batch, |b, &batch| {
+            let (engine, _dir) = open();
+            let coll = engine.create_collection("bench", "docs").unwrap();
+
+            let mut next = 0i64;
+            b.iter(|| {
+                // Ids must stay unique across iterations, so the batch walks a
+                // counter rather than reusing one range.
+                let docs: Vec<Document> = (0..batch)
+                    .map(|_| {
+                        next += 1;
+                        document(next)
+                    })
+                    .collect();
+                black_box(engine.insert_many(&coll, docs).unwrap())
+            });
+        });
     }
     group.finish();
 }
@@ -179,5 +216,5 @@ fn vector_writes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, inserts, other_mutations, vector_writes);
+criterion_group!(benches, inserts, bulk_inserts, other_mutations, vector_writes);
 criterion_main!(benches);

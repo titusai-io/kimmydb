@@ -29,6 +29,40 @@ pub struct WriteOutcome {
     pub upserted: bool,
 }
 
+/// A bulk insert's failure, and which document caused it.
+///
+/// A batch is all-or-nothing, so nothing survives to point at: without the
+/// position the caller would know only that one of their documents was bad.
+#[derive(Debug)]
+pub struct BulkInsertError {
+    /// Position in the submitted batch, absent when the transaction itself
+    /// failed rather than any one document.
+    pub index: Option<usize>,
+    pub source: StorageError,
+}
+
+impl BulkInsertError {
+    /// A failure of the transaction rather than of a document.
+    fn transaction(e: impl Into<StorageError>) -> Self {
+        Self { index: None, source: e.into() }
+    }
+}
+
+impl std::fmt::Display for BulkInsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.index {
+            Some(i) => write!(f, "document at index {i}: {}", self.source),
+            None => write!(f, "{}", self.source),
+        }
+    }
+}
+
+impl std::error::Error for BulkInsertError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 /// The conventional primary-key field name.
 pub const ID_FIELD: &str = "_id";
 
@@ -115,7 +149,84 @@ impl Engine {
     ///
     /// Generates an ObjectId when `_id` is absent, and returns the id either
     /// way so the caller need not re-read.
-    pub fn insert(&self, coll: &CollectionMeta, mut doc: Document) -> Result<DocId> {
+    pub fn insert(&self, coll: &CollectionMeta, doc: Document) -> Result<DocId> {
+        let txn = self.db().begin_write()?;
+        let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
+            Ok(pair) => pair,
+            Err(e) => {
+                txn.abort()?;
+                return Err(e);
+            }
+        };
+        txn.commit()?;
+        self.publish(vec![entry]);
+
+        Ok(id)
+    }
+
+    /// Insert many documents in a single transaction, or none of them.
+    ///
+    /// The whole point is the commit: one durable commit for the batch instead
+    /// of one per document, which is the only win available here — throughput
+    /// is flat across concurrent writers because redb has a single writer, so
+    /// per-commit overhead is the cost worth amortizing.
+    ///
+    /// Atomicity falls out of that mechanism rather than being designed for,
+    /// but it is promised: any failure aborts the batch entirely, including
+    /// every oplog entry, so the version vector does not move for a batch that
+    /// did not land. The error carries the offending document's position,
+    /// because with nothing written that is the only thing telling the caller
+    /// what to fix.
+    pub fn insert_many(
+        &self,
+        coll: &CollectionMeta,
+        docs: Vec<Document>,
+    ) -> std::result::Result<Vec<DocId>, BulkInsertError> {
+        // Nothing to do, and nothing to log: an empty batch must not open a
+        // transaction, or it would append an oplog entry for a write that
+        // never happened.
+        if docs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self.db().begin_write().map_err(BulkInsertError::transaction)?;
+        let mut ids = Vec::with_capacity(docs.len());
+        let mut entries = Vec::with_capacity(docs.len());
+
+        for (index, doc) in docs.into_iter().enumerate() {
+            // Each document is checked against this transaction's own
+            // uncommitted writes, so two documents colliding *within* the batch
+            // are caught by exactly the checks that catch a collision with
+            // stored state — redb reads see the writes of their own txn.
+            match self.insert_in_txn(&txn, coll, doc) {
+                Ok((id, entry)) => {
+                    ids.push(id);
+                    entries.push(entry);
+                }
+                Err(source) => {
+                    txn.abort().map_err(BulkInsertError::transaction)?;
+                    return Err(BulkInsertError { index: Some(index), source });
+                }
+            }
+        }
+
+        txn.commit().map_err(BulkInsertError::transaction)?;
+        self.publish(entries);
+
+        Ok(ids)
+    }
+
+    /// The whole of an insert except the transaction's lifecycle.
+    ///
+    /// The caller owns the transaction, so this returns its failure rather than
+    /// aborting: a batch has to abort once for the batch, not once per
+    /// document.
+    fn insert_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        coll: &CollectionMeta,
+        mut doc: Document,
+    ) -> Result<(DocId, OplogEntry)> {
         let id = match doc.get(ID_FIELD) {
             Some(value) => DocId::try_from_bson(value)?,
             None => {
@@ -134,7 +245,6 @@ impl Engine {
         let body = bson::serialize_to_vec(&doc)?;
         let stamp = self.next_stamp();
 
-        let txn = self.db().begin_write()?;
         {
             let mut docs = txn.open_table(tables::DOCS)?;
             // A tombstone may still occupy the key; overwriting it is a
@@ -144,8 +254,6 @@ impl Engine {
                 None => false,
             };
             if occupied {
-                drop(docs);
-                txn.abort()?;
                 return Err(CoreError::DuplicateKey(id.to_string()).into());
             }
             let record = DocRecord::live(stamp, body.clone());
@@ -153,16 +261,10 @@ impl Engine {
         }
 
         // Same transaction as the document write, so the index cannot describe
-        // a state that never existed. A unique violation aborts the whole thing.
-        match index::maintain(&txn, coll, None, Some(&doc), &key) {
-            Ok(newly_multikey) => {
-                index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
-            }
-            Err(e) => {
-                txn.abort()?;
-                return Err(e);
-            }
-        }
+        // a state that never existed. A unique violation returns here and the
+        // caller aborts, which discards the document write with it.
+        let newly_multikey = index::maintain(txn, coll, None, Some(&doc), &key)?;
+        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry {
             stamp,
@@ -171,11 +273,9 @@ impl Engine {
             doc_id: Some(id.clone()),
             body: Some(body),
         };
-        append_oplog(&txn, &entry)?;
-        txn.commit()?;
-        self.publish(vec![entry]);
+        append_oplog(txn, &entry)?;
 
-        Ok(id)
+        Ok((id, entry))
     }
 
     /// Replace a document wholesale.
@@ -545,6 +645,130 @@ mod tests {
     }
 
     #[test]
+    fn insert_many_stores_every_document_and_returns_their_ids() {
+        let (engine, coll, _dir) = engine();
+        let ids = engine
+            .insert_many(
+                &coll,
+                vec![doc! { "_id": 1, "v": "a" }, doc! { "_id": 2, "v": "b" }, doc! { "v": "c" }],
+            )
+            .unwrap();
+
+        assert_eq!(ids.len(), 3, "one id per submitted document, in order");
+        for (id, expected) in ids.iter().zip(["a", "b", "c"]) {
+            let found = engine.get(&coll, id).unwrap().expect("document should exist");
+            assert_eq!(found.get_str("v").unwrap(), expected);
+        }
+        // The third had no `_id`, so one was generated and stored.
+        assert!(engine.get(&coll, &ids[2]).unwrap().unwrap().contains_key(ID_FIELD));
+    }
+
+    #[test]
+    fn insert_many_of_nothing_writes_nothing_and_does_not_move_the_clock() {
+        let (engine, coll, _dir) = engine();
+        let before = engine.version_vector().unwrap();
+
+        assert!(engine.insert_many(&coll, vec![]).unwrap().is_empty());
+
+        // An empty batch that opened a transaction would append an oplog entry
+        // for a write that never happened.
+        assert_eq!(engine.version_vector().unwrap(), before);
+    }
+
+    #[test]
+    fn insert_many_appends_one_oplog_entry_per_document_with_increasing_stamps() {
+        let (engine, coll, _dir) = engine();
+        engine
+            .insert_many(&coll, vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }])
+            .unwrap();
+
+        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        let inserts: Vec<_> = entries.iter().filter(|e| e.kind == OpKind::Insert).collect();
+        assert_eq!(inserts.len(), 3, "the batch is three documents and three log entries");
+        for pair in inserts.windows(2) {
+            assert!(
+                pair[0].stamp.hlc < pair[1].stamp.hlc,
+                "each document in a batch takes its own stamp, in submission order"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_many_rejects_the_whole_batch_when_a_document_collides_with_a_stored_id() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 2, "v": "original" }).unwrap();
+        let before = engine.version_vector().unwrap();
+
+        let err = engine
+            .insert_many(
+                &coll,
+                vec![doc! { "_id": 1 }, doc! { "_id": 2, "v": "collides" }, doc! { "_id": 3 }],
+            )
+            .expect_err("a duplicate _id must fail the batch");
+
+        assert_eq!(err.index, Some(1), "the caller is told which document to fix");
+        assert!(matches!(err.source, StorageError::Core(CoreError::DuplicateKey(_))));
+
+        // All-or-nothing: neither the document before the failure nor the one
+        // after it may survive, and the stored document is untouched.
+        assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_none());
+        assert!(engine.get(&coll, &DocId::Int64(3)).unwrap().is_none());
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(2)).unwrap().unwrap().get_str("v").unwrap(),
+            "original"
+        );
+        assert_eq!(
+            engine.version_vector().unwrap(),
+            before,
+            "an aborted batch leaves no oplog entry, so the version vector must not move"
+        );
+    }
+
+    #[test]
+    fn insert_many_rejects_a_batch_whose_documents_collide_with_each_other() {
+        // The collision is *within* the transaction, against a write that has
+        // not committed. It is caught because a redb read sees its own txn's
+        // writes — the property the batch path depends on.
+        let (engine, coll, _dir) = engine();
+
+        let err = engine
+            .insert_many(
+                &coll,
+                vec![doc! { "_id": 7, "v": "first" }, doc! { "_id": 7, "v": "second" }],
+            )
+            .expect_err("two documents with one _id must fail the batch");
+
+        assert_eq!(err.index, Some(1), "the second occurrence is the offending one");
+        assert!(matches!(err.source, StorageError::Core(CoreError::DuplicateKey(_))));
+        assert!(engine.get(&coll, &DocId::Int64(7)).unwrap().is_none(), "nothing landed");
+    }
+
+    #[test]
+    fn insert_many_rejects_a_batch_that_breaks_a_unique_index_within_itself() {
+        // Same intra-transaction property, one layer up: the unique probe in
+        // index maintenance must see the entry written moments earlier in this
+        // very transaction.
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+
+        let err = engine
+            .insert_many(
+                &coll,
+                vec![
+                    doc! { "_id": "a", "email": "same@x" },
+                    doc! { "_id": "b", "email": "same@x" },
+                ],
+            )
+            .expect_err("a unique collision inside the batch must fail it");
+
+        assert_eq!(err.index, Some(1));
+        assert!(matches!(err.source, StorageError::Core(CoreError::UniqueViolation { .. })));
+        assert!(engine.get(&coll, &DocId::String("a".into())).unwrap().is_none());
+        assert_eq!(engine.unique_violations(), 0, "a rejected local write is not a violation");
+    }
+
+    #[test]
     fn an_id_of_the_wrong_type_is_rejected() {
         let (engine, coll, _dir) = engine();
         assert!(engine.insert(&coll, doc! { "_id": { "nested": 1 }, "x": 1 }).is_err());
@@ -701,6 +925,25 @@ mod tests {
         rx.try_recv().unwrap();
         let _ = engine.insert(&coll, doc! { "_id": 5 });
         assert!(rx.try_recv().is_err(), "a failed write must not publish an event");
+    }
+
+    #[test]
+    fn a_batch_publishes_one_event_per_document_and_an_aborted_one_publishes_none() {
+        let (engine, coll, _dir) = engine();
+        let mut rx = engine.subscribe();
+
+        let ids = engine.insert_many(&coll, vec![doc! { "_id": 1 }, doc! { "_id": 2 }]).unwrap();
+        for id in &ids {
+            let event = rx.try_recv().expect("each document in a batch reaches subscribers");
+            assert_eq!(event.kind, OpKind::Insert);
+            assert_eq!(event.doc_id.as_ref(), Some(id));
+        }
+        assert!(rx.try_recv().is_err(), "and no more than one event per document");
+
+        // A batch that never commits must be invisible to a subscriber, or a
+        // stream would report a change that was rolled back.
+        let _ = engine.insert_many(&coll, vec![doc! { "_id": 3 }, doc! { "_id": 1 }]);
+        assert!(rx.try_recv().is_err(), "an aborted batch must publish nothing at all");
     }
 
     // -----------------------------------------------------------------------

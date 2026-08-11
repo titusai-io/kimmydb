@@ -12,6 +12,7 @@ export KIMMY_TOKEN=$(echo hunter2 | kimmy login root)
 kimmy find shop.orders '{"qty":{"$gte":10}}' --sort '{"qty":-1}'
 kimmy count shop.orders '{"city":"London"}'
 echo '{"_id":4,"city":"Paris"}' | kimmy insert shop.orders
+jq -s . docs/*.json | kimmy bulk-insert shop.orders
 ```
 
 ---
@@ -44,6 +45,7 @@ grants any other client is.
 | `kimmy find <db.coll> [filter]` | `--sort --projection --limit --skip --explain` |
 | `kimmy count <db.coll> [filter]` | |
 | `kimmy insert <db.coll> [document]` | Reads stdin when the document is omitted |
+| `kimmy bulk-insert <db.coll> [documents]` | A JSON array, in one commit, all or nothing. Reads stdin when omitted; at most 1000 |
 | `kimmy update <db.coll> <filter> <update>` | `--multi` |
 | `kimmy delete <db.coll> <filter>` | `--multi` |
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |

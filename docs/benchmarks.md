@@ -224,7 +224,48 @@ What that decides:
   documents/sec, ~3.4 ms per durable commit (the larger write-path fixture
   above runs ~5–6 ms — document size is most of the difference).
 - **A bulk-insert API's win is per-commit overhead**, not concurrency — the
-  number that shapes M8's bulk-insert design when it lands.
+  number that shapes M8's bulk-insert design when it lands. It landed; the
+  next section is what it was worth.
+
+---
+
+## Batching into one commit — 176×
+
+Taken 2026-08-11 on the same machine (`cargo bench -p kimmy-storage --bench
+write_path -- bulk`; Criterion medians over 30 samples, ~200-byte documents,
+no secondary indexes). The `bulk` group inserts N documents in one
+transaction; the first row is the same document through the ordinary
+one-commit-each path, for the comparison.
+
+| Batch | Total | Per document | Throughput |
+|---:|---:|---:|---:|
+| 1, own commit | 3.43 ms | 3.43 ms | 291 docs/sec |
+| `bulk` 1 | 3.41 ms | 3.41 ms | 293 docs/sec |
+| `bulk` 10 | 4.68 ms | 0.468 ms | 2,137 docs/sec |
+| `bulk` 100 | 7.66 ms | 0.077 ms | 13,060 docs/sec |
+| `bulk` 1000 | 19.48 ms | 0.019 ms | **51,320 docs/sec** |
+
+**The commit was almost the entire cost.** Fitting the 100- and 1000-document
+points puts the marginal document at ~13 µs against a fixed per-commit cost of
+several milliseconds — a ratio of roughly 260:1. That is why the concurrent
+writer curve was flat and why this one is not: the previous section measured
+more clients sharing one commit rate, and this one measures needing far fewer
+commits.
+
+Two things worth reading off it directly:
+
+- **`bulk` at batch size 1 lands on the single-insert number.** The batch path
+  costs nothing when there is nothing to amortize, so it is not a trade.
+- **The returns flatten but do not stop.** 1→10 is 7.3×, 10→100 another 6.1×,
+  100→1000 another 3.9×. The 1000-document cap sits where the curve has mostly
+  levelled, and in practice the 2 MB request body limit binds first for any
+  document over ~2 KB ([ADR-048](decisions.md)).
+
+**End to end, over HTTP, it holds.** Driving a debug node over loopback — not
+a release build, so the absolute numbers are slower than the table above —
+500 documents took **0.16 s** in one bulk request against **11.6 s** as 500
+separate requests. A 72× gap where the storage measurement predicts ~90×, the
+difference being per-request HTTP and auth work the batch pays once.
 
 ---
 

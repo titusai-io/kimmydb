@@ -86,6 +86,9 @@ enum Command {
     Count { target: String, filter: Option<String> },
     /// Insert one document. Reads from stdin when `document` is omitted.
     Insert { target: String, document: Option<String> },
+    /// Insert an array of documents in one commit, all or nothing. Reads from
+    /// stdin when `documents` is omitted.
+    BulkInsert { target: String, documents: Option<String> },
     /// Apply update operators to matching documents.
     Update {
         target: String,
@@ -196,6 +199,16 @@ async fn run() -> Result<()> {
             let (db, coll) = split_target(target)?;
             let body = parse_json_arg("document", document.as_deref())?;
             let path = format!("/v1/db/{db}/coll/{coll}/docs");
+            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
+            emit(&cli, &out);
+        }
+        Command::BulkInsert { target, documents } => {
+            let (db, coll) = split_target(target)?;
+            let body = parse_json_arg("documents", documents.as_deref())?;
+            if !body.is_array() {
+                bail!("documents must be a JSON array");
+            }
+            let path = format!("/v1/db/{db}/coll/{coll}/bulk");
             let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
             emit(&cli, &out);
         }

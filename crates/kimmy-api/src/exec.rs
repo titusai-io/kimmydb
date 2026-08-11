@@ -24,6 +24,14 @@ use crate::state::{Auth, SharedState};
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 10_000;
 
+/// Documents accepted by one bulk insert.
+///
+/// A batch is one transaction, so the whole of it is held in memory and then
+/// published as one event per document. The ceiling is well past where the
+/// per-commit saving flattens out, and in practice the request body limit binds
+/// first for anything but tiny documents.
+pub const MAX_BULK_INSERT: usize = 1000;
+
 // ---------------------------------------------------------------------------
 // Authorization
 // ---------------------------------------------------------------------------
@@ -314,6 +322,56 @@ pub fn insert(
     let doc = json_to_document(document)?;
     let id = state.engine.insert(&meta, doc)?;
     Ok(json!({ "insertedId": crate::json::bson_to_json(&id.to_bson()) }))
+}
+
+/// Insert many documents in one durable commit, or none of them.
+///
+/// One `authorize` call for the batch, which is one audit record: a bulk load
+/// is one thing the principal asked for, not N things.
+pub fn insert_many(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    documents: &[Value],
+) -> Result<Value, ApiError> {
+    let meta = authorize(state, auth, Action::Write, db, coll)?;
+
+    if documents.len() > MAX_BULK_INSERT {
+        return Err(ApiError::bad_request(format!(
+            "a bulk insert takes at most {MAX_BULK_INSERT} documents, got {}",
+            documents.len()
+        )));
+    }
+
+    // Convert everything before opening a transaction, so a malformed document
+    // is a 400 that never touched the engine.
+    let docs = documents
+        .iter()
+        .enumerate()
+        .map(|(i, value)| json_to_document(value).map_err(|e| at_index(i, e)))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let ids = state.engine.insert_many(&meta, docs).map_err(|e| match e.index {
+        Some(i) => at_index(i, e.source.into()),
+        None => e.source.into(),
+    })?;
+
+    Ok(json!({
+        "inserted": ids.len(),
+        "insertedIds": ids
+            .iter()
+            .map(|id| crate::json::bson_to_json(&id.to_bson()))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+/// Name the offending document's position without changing the error envelope.
+///
+/// A batch is all-or-nothing, so there is no partial result to point at — the
+/// position is the only thing that tells the caller what to fix.
+fn at_index(index: usize, e: ApiError) -> ApiError {
+    ApiError { message: format!("document at index {index}: {}", e.message), ..e }
 }
 
 pub fn replace(
