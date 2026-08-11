@@ -30,6 +30,8 @@ postcard = { version = "1", features = ["alloc"] }
 # recorded in docs/decisions.md rather than left for someone to discover in a
 # licence audit.
 foca = { version = "2", default-features = false, features = ["std", "postcard-codec", "tracing"] }
+# SRV discovery. Deliberately feature-stripped — see the workspace manifest.
+hickory-resolver.workspace = true
 # foca requires rand 0.10; the workspace default is 0.9, which kimmy-auth uses.
 rand = { version = "0.10", default-features = false, features = ["std", "std_rng", "sys_rng"] }
 

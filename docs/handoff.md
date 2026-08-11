@@ -8,9 +8,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ## As of 2026-08-11 — M8 in progress: Polish under way
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is eight
-of twelve tasks in.** The open PR is task 8; tasks 9–12 remain, and one of them
-is blocked on a maintainer decision (below).
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is nine of
+twelve tasks in.** The open PR is task 9; tasks 10–12 remain, and one of them is
+blocked on a maintainer decision (below).
 
 ### How work runs here — read this first
 
@@ -30,7 +30,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-050**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-051**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -59,8 +59,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#47 merged: through M8 task 7 (bulk insert) |
-| `m8-cert-reload` (open PR) | **Task 8.** SIGHUP *and* a 60-second mtime poll, because neither covers both deployments. Almost no new machinery: `axum-server` already held the certificate behind a per-handshake handle and already exposed a reload. A bad new certificate is refused and the old one keeps serving — the opposite of the startup rule, on purpose ([ADR-049](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#48 merged: through M8 task 8 (certificate reload) |
+| `m8-srv-discovery` (open PR) | **Task 9.** `dns-srv:` resolves, via `hickory-resolver` cut to `system-config` + `tokio` — the feature list *is* the decision, since every richer transport ships an aws-lc-rs flavour. `check-native-deps.sh` still reports `cc` alone ([ADR-050](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board
 
@@ -75,16 +75,19 @@ Prove and Persist are complete; Polish is under way.
 | 5 | Vector reindex | ✅ #45 |
 | 6 | Provider dialect audit | ✅ #46 (ADR-047) |
 | 7 | Bulk insert | ✅ #47 (ADR-048) |
-| 8 | Certificate reload | 🔵 open PR (ADR-049) |
-| 9 | SRV discovery | `dns-srv:` parses but does not resolve; needs a resolver crate. **Must not add a second native crypto stack** — keep DNSSEC features off; `check-native-deps.sh` is the arbiter |
+| 8 | Certificate reload | ✅ #48 (ADR-049) |
+| 9 | SRV discovery | 🔵 open PR (ADR-050) |
 | 10 | Webhook ownership by node id | Rendezvous hashes `SocketAddr` today, so re-addressing reshuffles subscriptions. Gossip the node id as member metadata and hash that. Verify with the harness; a mixed-version cluster produces duplicates, which at-least-once tolerates |
 | 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
 | 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-**Recommended next branch: task 9 (SRV discovery).** No decision needed; the
-constraint is the whole difficulty — a resolver crate that can read SRV records
-**must not add a second native crypto stack**. Keep DNSSEC features off and let
-`./scripts/check-native-deps.sh` arbitrate before the work is called done.
+**Recommended next branch: task 10 (webhook ownership by node id).** No
+decision needed. Rendezvous hashes the `SocketAddr` SWIM publishes, so
+re-addressing a node reshuffles its subscriptions; gossip the node id as member
+metadata and hash that instead. **Verify with the cluster harness** — task 1's
+lesson is that clustered webhook behaviour passed every non-harness test while
+being entirely broken. A mixed-version cluster produces duplicate deliveries,
+which at-least-once already tolerates.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -148,6 +151,16 @@ constraint is the whole difficulty — a resolver crate that can read SRV record
   certificate and writing its key. Left undone on purpose:
   `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime
   dependency — 🟡 in the register.
+- **Task 9 — SRV discovery (ADR-050).** `hickory-resolver` with
+  `default-features = false` and exactly `system-config` + `tokio`. **The
+  feature list is the decision**: every transport past plain DNS, and DNSSEC,
+  ships a `-ring` and an `-aws-lc-rs` flavour, and the latter adds CMake for
+  primitives `ring` already provides. Resolution is two steps because SRV is
+  two facts — records, then targets, pairing each address with the port from
+  the record that named it. Found on the way: **an empty answer arrives as an
+  `Err`**, and the discovery loop warns on every error once per tick, so the
+  obvious mapping would have warned every few seconds forever while a cluster
+  waited for its first node. `NoRecordsFound` maps to an empty set.
 
 ### Where the code is
 
@@ -187,7 +200,6 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
 
 | Debt | |
 |---|---|
-| SRV discovery parses but does not resolve | M8 task 9 |
 | Webhook ownership hashes `SocketAddr`, not node ids | M8 task 10 |
 | Deleting a user does not invalidate issued tokens | M8 task 11 |
 | `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
@@ -233,7 +245,12 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   node does — and the reload half is what makes a botched rotation survivable
   rather than an outage (ADR-049).
 - **Do not add a second native crypto stack.** `ring` is already in the build;
-  anything selecting `aws-lc-rs` adds CMake for the same primitives.
+  anything selecting `aws-lc-rs` adds CMake for the same primitives. This is
+  now mostly a *feature-flag* discipline rather than a crate-choice one:
+  `hickory-resolver` and `axum-server` both ship aws-lc-rs variants of features
+  that look innocuous, so `default-features = false` plus an explicit list is
+  the pattern. `./scripts/check-native-deps.sh` is the arbiter, and it should
+  keep reporting `cc` alone.
 - **A type that crosses a format boundary needs a chosen representation, not an
   inherited one.** `NodeId` and `CollectionId` have both cost a replication
   outage by deriving serde and letting BSON decide — particularly a `u64`, which

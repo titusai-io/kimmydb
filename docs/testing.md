@@ -640,6 +640,7 @@ manually and are recorded so they can be repeated:
 | A corrupt certificate on a serving node | ✅ still served the previous certificate, still healthy, process alive, `kimmy_tls_reloads_total{outcome="failed"} 1` |
 | A half-rotated pair (new certificate, old key) | ✅ refused with `KeyMismatch`, kept serving the old pair, and the retry after the key landed completed the rotation |
 | SIGTERM on a node with the reloader running | ✅ still drained and exited cleanly |
+| **SRV discovery between two real nodes** | ✅ two daemons on **7911 and 7922** — neither the 7900 default — seeded only by `dns-srv:` against a real dnsmasq zone, in a network namespace so DNS could own port 53. Each declared the other `member up` at the port its SRV record named, a write on one was readable on the other, and neither logged a warning. The non-default ports are the point: on 7900 an implementation that ignored the record's port would look identical |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test
