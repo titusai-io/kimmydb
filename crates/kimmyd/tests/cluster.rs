@@ -64,7 +64,6 @@ struct Node {
     name: &'static str,
     child: Child,
     http: u16,
-    cluster: u16,
     dir: tempfile::TempDir,
 }
 
@@ -126,15 +125,22 @@ allowed_hosts = ["127.0.0.1"]
             .spawn()
             .expect("spawning kimmyd");
 
-        Node { name, child, http, cluster, dir }
-    }
-
-    fn cluster_addr(&self) -> std::net::SocketAddr {
-        format!("127.0.0.1:{}", self.cluster).parse().unwrap()
+        Node { name, child, http, dir }
     }
 
     fn url(&self, path: &str) -> String {
         format!("http://127.0.0.1:{}{path}", self.http)
+    }
+
+    /// This node's durable id, read from `/readyz`.
+    ///
+    /// Webhook ownership hashes node ids rather than addresses (ADR-051), so
+    /// the harness has to ask each node who it is rather than deriving it from
+    /// where it is listening.
+    async fn node_id(&self, client: &reqwest::Client) -> kimmy_core::NodeId {
+        let body: serde_json::Value =
+            client.get(self.url("/readyz")).send().await.unwrap().json().await.unwrap();
+        body["node"].as_str().expect("readyz reports a node id").parse().expect("a valid node id")
     }
 
     async fn wait_ready(&self, client: &reqwest::Client) {
@@ -460,14 +466,14 @@ async fn every_subscription_has_a_deliverer_and_a_dead_owners_are_taken_over() {
 
     // Register subscriptions until one is owned by each node. Ownership is
     // the same pure function the dispatchers compute — rendezvous over the
-    // cluster addresses — so the harness knows the intended owner without
+    // cluster's node ids — so the harness knows the intended owner without
     // asking anyone. This is the test for the standing hypothesis that a
     // node's member set might not include itself: if it does not, the
     // subscriptions owned by some node are owned by nobody in that node's
     // own view, and their events are never delivered by anyone.
-    let members: std::collections::BTreeSet<std::net::SocketAddr> =
-        [a.cluster_addr(), b.cluster_addr(), c.cluster_addr()].into();
-    let mut owned_by: std::collections::HashMap<std::net::SocketAddr, String> = Default::default();
+    let members: std::collections::BTreeSet<kimmy_core::NodeId> =
+        [a.node_id(&client).await, b.node_id(&client).await, c.node_id(&client).await].into();
+    let mut owned_by: std::collections::HashMap<kimmy_core::NodeId, String> = Default::default();
     while owned_by.len() < 3 {
         let res: serde_json::Value = client
             .post(a.url("/v1/db/shop/coll/orders/webhooks"))
@@ -510,7 +516,7 @@ async fn every_subscription_has_a_deliverer_and_a_dead_owners_are_taken_over() {
     // Kill one owner and write again: its subscription must be delivered by
     // a survivor, resuming from replicated progress. The subscription owned
     // by C is the one whose deliverer just died.
-    let doomed_id = owned_by.get(&c.cluster_addr()).expect("C owns one").clone();
+    let doomed_id = owned_by.get(&c.node_id(&client).await).expect("C owns one").clone();
     c.signal("KILL");
     eventually("the survivors to notice the death", || all_report(&client, vec![&a, &b], 1)).await;
 

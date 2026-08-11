@@ -79,12 +79,20 @@ otherwise a webhook on a busy collection would be answered with up to a whole
 ## In a cluster
 
 One node delivers each subscription. It is chosen by hashing the subscription id
-over the live SWIM member set — a pure function every node computes
-independently, so there is no leader, no election, and no coordination.
+over the **node ids** in the live SWIM member set — a pure function every node
+computes independently, so there is no leader, no election, and no coordination.
 
 **When that node dies, another takes over** and resumes from replicated
 progress, so nothing is lost and nothing is sent five times.
 [ADR-045](decisions.md) has the reasoning.
+
+**Moving a node does not move its subscriptions.** Ownership follows the node
+id, which lives in the database file — so a pod rescheduled onto a new IP, a
+changed port, or a renumbered host keeps every subscription it had. Until M8
+the address was the hash input, and re-addressing one node of three moved
+**50.8%** of all subscriptions: worse than that node dying outright (25%),
+because it counted as a departure *and* an arrival at once
+([ADR-051](decisions.md)).
 
 The only way an event is never delivered is if the write never replicated off
 the node that accepted it — in which case the data is gone from the database

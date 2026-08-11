@@ -8,9 +8,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ## As of 2026-08-11 — M8 in progress: Polish under way
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is nine of
-twelve tasks in.** The open PR is task 9; tasks 10–12 remain, and one of them is
-blocked on a maintainer decision (below).
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is ten of
+twelve tasks in.** The open PR is task 10; tasks 11 and 12 remain, and task 11
+is blocked on a maintainer decision (below).
 
 ### How work runs here — read this first
 
@@ -30,7 +30,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-051**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-052**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -59,8 +59,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#48 merged: through M8 task 8 (certificate reload) |
-| `m8-srv-discovery` (open PR) | **Task 9.** `dns-srv:` resolves, via `hickory-resolver` cut to `system-config` + `tokio` — the feature list *is* the decision, since every richer transport ships an aws-lc-rs flavour. `check-native-deps.sh` still reports `cc` alone ([ADR-050](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#49 merged: through M8 task 9 (SRV discovery) |
+| `m8-webhook-node-id` (open PR) | **Task 10.** The node id travels inside the SWIM identity foca already gossips, and ownership hashes it instead of `SocketAddr`. Re-addressing used to move **50.8%** of subscriptions — worse than the node dying (25%). **A wire break: nodes must be upgraded together** ([ADR-051](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board
 
@@ -76,18 +76,16 @@ Prove and Persist are complete; Polish is under way.
 | 6 | Provider dialect audit | ✅ #46 (ADR-047) |
 | 7 | Bulk insert | ✅ #47 (ADR-048) |
 | 8 | Certificate reload | ✅ #48 (ADR-049) |
-| 9 | SRV discovery | 🔵 open PR (ADR-050) |
-| 10 | Webhook ownership by node id | Rendezvous hashes `SocketAddr` today, so re-addressing reshuffles subscriptions. Gossip the node id as member metadata and hash that. Verify with the harness; a mixed-version cluster produces duplicates, which at-least-once tolerates |
+| 9 | SRV discovery | ✅ #49 (ADR-050) |
+| 10 | Webhook ownership by node id | 🔵 open PR (ADR-051) |
 | 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
 | 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-**Recommended next branch: task 10 (webhook ownership by node id).** No
-decision needed. Rendezvous hashes the `SocketAddr` SWIM publishes, so
-re-addressing a node reshuffles its subscriptions; gossip the node id as member
-metadata and hash that instead. **Verify with the cluster harness** — task 1's
-lesson is that clustered webhook behaviour passed every non-harness test while
-being entirely broken. A mixed-version cluster produces duplicate deliveries,
-which at-least-once already tolerates.
+**Recommended next branch: task 11 (token revocation).** ⏸ **Needs a decision
+first** — semantics. The leading candidate is a per-user token version bumped
+to invalidate every outstanding token, over a replicated deny-list, because it
+adds no per-request lookup that can miss. Bring it and write the ADR before any
+code.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -151,6 +149,18 @@ which at-least-once already tolerates.
   certificate and writing its key. Left undone on purpose:
   `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime
   dependency — 🟡 in the register.
+- **Task 10 — webhook ownership by node id (ADR-051).** The id travels inside
+  the SWIM identity foca already gossips, so no second channel and no
+  address-to-node map. **Both of the plan's assumptions here were wrong, and
+  measuring is what showed it.** ADR-045 had accepted address hashing as "the
+  same disruption as a node leaving": re-addressing one node of three actually
+  moves **50.8%** of subscriptions against 25% for that node dying, because it
+  is a departure *and* an arrival. And the plan predicted a mixed-version
+  cluster would merely double-deliver — postcard is not self-describing, so a
+  new node **rejects** an old identity and membership does not form at all.
+  Nodes must be upgraded together, like ADR-040. An announce carries an
+  all-zero placeholder id, which foca anticipates: it accepts an `Announce`
+  matching on address alone.
 - **Task 9 — SRV discovery (ADR-050).** `hickory-resolver` with
   `default-features = false` and exactly `system-config` + `tokio`. **The
   feature list is the decision**: every transport past plain DNS, and DNSSEC,
@@ -200,7 +210,6 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
 
 | Debt | |
 |---|---|
-| Webhook ownership hashes `SocketAddr`, not node ids | M8 task 10 |
 | Deleting a user does not invalidate issued tokens | M8 task 11 |
 | `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
 | Rate limiting covers login only | waits on a capacity decision, not on measurement any more |
@@ -275,9 +284,17 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   and the dial share one resolution, or a zero-TTL name gets a window between
   them. And never fall back to a default client: it follows redirects and
   resolves unchecked, which is both egress protections gone at once.
-- **Webhook ownership hashes with FNV-1a, never `DefaultHasher`**, which is not
-  stable between Rust versions — ownership shifting under a compiler upgrade
-  would reshuffle every subscription on a rolling restart.
+- **Webhook ownership hashes node ids, never addresses**, and with FNV-1a,
+  never `DefaultHasher` — which is not stable between Rust versions. Either
+  mistake reshuffles every subscription for a reason that is not a membership
+  change: a compiler upgrade, or a node moving without going anywhere. The
+  hashed form is `NodeId`'s hyphenated string, which core fixes deliberately
+  rather than inheriting from `Uuid`'s serde.
+- **The SWIM identity is a wire format.** `Member` is encoded with postcard,
+  which is not self-describing, so adding or reordering a field breaks
+  membership across versions outright — a new node rejects an old identity
+  rather than tolerating it. Any change here is a stop-the-cluster upgrade and
+  needs a note in [Operations](operations.md), as ADR-040 and ADR-051 both did.
 - **Ownership candidates are the live peers plus this node.** SWIM's live set
   never contains the node holding it, so an owner computed over it alone can
   never be `me` — the bug that silently undelivered every clustered webhook.

@@ -54,12 +54,11 @@
 //! [`invalidate`] exists to avoid.
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
 use bson::{Document, doc};
-use kimmy_core::{Hlc, OpKind, OplogEntry, Stamp, VersionVector};
+use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
 
@@ -577,8 +576,8 @@ pub async fn dispatch_once(
     state: &SharedState,
     client: &reqwest::Client,
     policy: &EgressPolicy,
-    me: SocketAddr,
-    members: &BTreeSet<SocketAddr>,
+    me: NodeId,
+    members: &BTreeSet<NodeId>,
     backoff: &mut Backoff,
     limits: Limits,
 ) -> DispatchOutcome {
@@ -800,7 +799,7 @@ async fn deliver(
 pub async fn run(
     state: SharedState,
     policy: EgressPolicy,
-    me: SocketAddr,
+    me: NodeId,
     members: Option<kimmy_cluster::Members>,
     limits: Limits,
 ) {
@@ -832,14 +831,19 @@ pub async fn run(
     loop {
         // Re-read every tick rather than once: the whole point is that
         // ownership follows the live set as it changes.
-        let live = members.as_ref().map(|m| m.snapshot()).unwrap_or_default();
+        // Node ids, not addresses: ownership must follow the node, not where
+        // it happens to be listening (ADR-051).
+        let live = members.as_ref().map(|m| m.node_ids()).unwrap_or_default();
         // Recorded here because this loop already reads the live set every
         // tick — a separate task to print one number would be machinery. The
         // gauge is what lets an operator (and the cluster harness) see that
         // gossip actually formed, rather than inferring it from replication,
         // which discovery alone can carry.
-        if members.is_some() {
-            state.metrics.set_cluster_members(live.len() as u64);
+        if let Some(members) = members.as_ref() {
+            // Counted by address rather than node id, so the gauge keeps
+            // meaning "membership entries" even during the moment a moved node
+            // is known at two addresses.
+            state.metrics.set_cluster_members(members.snapshot().len() as u64);
         }
         // The pass itself always runs on the tick. Backoff is held per
         // subscription inside it, so a failing endpoint delays only its own
