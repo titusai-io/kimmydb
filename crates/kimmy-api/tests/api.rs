@@ -562,6 +562,114 @@ async fn the_last_user_cannot_be_deleted() {
 }
 
 #[tokio::test]
+async fn a_deleted_users_token_stops_working_at_once() {
+    // The debt this closes: a deleted account kept working until its token
+    // expired, up to an hour later.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"ada","password":"ada-password",
+                   "grants":[{"db":"shop","collection":"*","actions":["read"]}]}),
+        )
+        .await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(server.get("/v1/databases", Some(&ada)).await.status, 200);
+
+    assert_eq!(server.delete("/v1/users/ada", Some(&root)).await.status, 200);
+
+    let res = server.get("/v1/databases", Some(&ada)).await;
+    assert_eq!(res.status, 401, "a deleted account must not keep working: {:?}", res.body);
+}
+
+#[tokio::test]
+async fn changing_a_password_ends_the_sessions_the_old_one_opened() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(server.get("/v1/databases", Some(&ada)).await.status, 200);
+
+    server.post("/v1/users/ada/password", Some(&root), json!({"password":"a-new-password"})).await;
+
+    assert_eq!(
+        server.get("/v1/databases", Some(&ada)).await.status,
+        401,
+        "the token issued under the old password must be refused"
+    );
+    // ...and the account itself still works.
+    let fresh = server.login("ada", "a-new-password").await;
+    assert_eq!(server.get("/v1/databases", Some(&fresh)).await.status, 200);
+}
+
+#[tokio::test]
+async fn narrowing_a_grant_takes_effect_without_waiting_for_the_token_to_expire() {
+    // Grants ride inside the token, so before ADR-052 a *revoked* permission
+    // kept working for the rest of the token's hour. This is the property that
+    // was actually dangerous, rather than merely untidy.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&root), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"ada","password":"ada-password",
+                   "grants":[{"db":"shop","collection":"*","actions":["read","write"]}]}),
+        )
+        .await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(
+        server.post("/v1/db/shop/coll/orders/docs", Some(&ada), json!({"_id":1})).await.status,
+        200
+    );
+
+    // Take the write away.
+    server
+        .post(
+            "/v1/users/ada/grants",
+            Some(&root),
+            json!({"grants":[{"db":"shop","collection":"*","actions":["read"]}]}),
+        )
+        .await;
+
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&ada), json!({"_id":2})).await;
+    assert_eq!(
+        res.status, 401,
+        "the token carrying the old grants must be refused, not honoured: {:?}",
+        res.body
+    );
+    // Logging in again picks up the narrowed grants, which now forbid the write.
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(
+        server.post("/v1/db/shop/coll/orders/docs", Some(&ada), json!({"_id":3})).await.status,
+        403
+    );
+}
+
+#[tokio::test]
+async fn a_revoked_token_does_not_say_why() {
+    // Whoever holds a stale token should not learn whether the account was
+    // deleted, disabled, or merely logged out — that reports on an account to
+    // someone who no longer has access to it.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let ada = server.login("ada", "ada-password").await;
+    server.post("/v1/users/ada/password", Some(&root), json!({"password":"a-new-password"})).await;
+    let bumped = server.get("/v1/databases", Some(&ada)).await;
+
+    server.delete("/v1/users/ada", Some(&root)).await;
+    let deleted = server.get("/v1/databases", Some(&ada)).await;
+
+    assert_eq!(bumped.status, deleted.status);
+    assert_eq!(bumped.body["error"], deleted.body["error"]);
+    assert_eq!(bumped.body["message"], deleted.body["message"]);
+}
+
+#[tokio::test]
 async fn short_passwords_are_refused() {
     let server = Server::start().await;
     let token = server.root().await;

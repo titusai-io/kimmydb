@@ -1959,6 +1959,88 @@ gone and `Cluster` no longer carries an advertised address at all.
 
 ---
 
+## ADR-052 — Token revocation is a per-user version, checked against a cache the oplog keeps honest
+
+**Decision.** The user record gains `token_version`, and the token carries the
+value it was issued under. A request is refused when the two disagree, when the
+user is `disabled`, or when the user is **gone**. Changing a password or
+changing grants bumps the version, which invalidates every outstanding token
+for that user at once.
+
+**A version rather than a deny-list, because a deny-list can fail open.** A
+list of revoked token ids must have arrived on the node handling the request to
+have any effect: replication lag, a lost entry or a node that has not caught up
+all produce a token that is honoured because the *revocation* is missing.
+Nothing about that failure is visible. A version fails the other way — the
+check is a positive match against the user's current state, so a node that is
+behind rejects tokens rather than accepting them. The cost is granularity:
+this revokes all of a user's tokens or none, and cannot end one session while
+leaving another alive.
+
+**Deleting a user needs no bump, and that is the point.** There is no record
+left to hold a version, so the absent case is the revocation: an unknown user
+is refused. `disabled` works the same way, and already existed on the record —
+it was checked at login and nowhere afterwards, which is why disabling an
+account left its live tokens working. Both close the recorded debt without a
+counter being involved.
+
+**Verification stays a pure function; the lookup lives one layer up.**
+`TokenIssuer::verify` still decodes and checks a signature and an expiry, with
+no engine and no I/O — it is the piece that must stay cheap and testable. The
+version check happens in the `Auth` extractor, which already holds state. That
+split keeps the signature check honest about what it does and does not prove.
+
+**The cache is the interesting part, and it is the oplog again.** Reading the
+user record on every authenticated request would put a storage read on a path
+that currently costs nothing — measured point reads run p50 ≈ 250 µs
+([ADR-046](decisions.md)), against authentication that does no I/O at all. So
+nodes hold a small in-memory map of user → version, and an ordinary oplog
+consumer evicts an entry whenever `__users` is written. That is the same shape
+as the embedding worker and the webhook dispatcher: a new background consumer
+is "subscribe to the log", not new machinery. It also gets cluster-wide
+propagation for free, because a *replicated* write to `__users` publishes on
+the receiving node exactly as a local one does.
+
+**Two things evict, and the second was added because the first fails
+quietly.** The consumer alone would have made revocation depend on remembering
+to spawn a task: the integration tests, which build the router without one,
+happily kept honouring revoked tokens until the routes were changed. So a route
+that edits a user now **also evicts synchronously**. A single node is then
+correct with no background task at all, and a forgotten consumer delays
+*cluster-wide* revocation rather than silently disabling revocation altogether.
+The two cover different cases — local action versus replicated arrival — so
+neither is redundant.
+
+**A miss reads through rather than rejecting.** The map is a cache with the
+store as the authority, not a replica of it. That avoids the failure the
+alternative invites: a map primed only by the log is empty at startup and
+would refuse every request until it filled. Populating on miss means a cold
+node is slow for one request per user rather than wrong for all of them.
+
+**Lag clears the cache rather than being tracked.** The broadcast channel is
+bounded, so a consumer can be told it missed entries. For a durable consumer
+that would mean resuming from a position; for a cache the correct response is
+simply to drop everything and re-read. Cheap, and it cannot silently serve a
+stale version.
+
+**Changing grants bumps the version, which is the quiet win.** Grants are
+embedded in the token, so until now a permission change — *including narrowing
+one* — did nothing until the token expired, up to an hour later. The token
+comment said as much and called short lifetimes the mitigation. Bumping makes
+edits take effect at once. The cost, accepted: there is no refresh flow, so
+every permission change forces that user to log in again.
+
+**Rejected: reading the user record per request.** Always correct and needs no
+consumer, but it is a disk read on the hot path of every authenticated request,
+which is the property this design has been protecting since M1.
+
+**Rejected: a cached read with a short TTL.** It bounds the cost without a
+consumer to write, but it makes revocation take effect *after a delay* — a
+second bolted onto a feature whose whole purpose is immediacy, and one that
+would have to be explained in the security documentation as a window.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

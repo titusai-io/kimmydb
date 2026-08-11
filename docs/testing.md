@@ -526,6 +526,9 @@ Security properties are asserted as behaviour, not assumed:
 | RBAC blocks writes, DDL, and user admin | `rbac_is_enforced_on_every_route` |
 | A failed batch inserts nothing at all | `a_bulk_insert_with_a_duplicate_id_inserts_nothing` |
 | A bad new certificate does not take down a serving node | `an_unreadable_certificate_leaves_the_one_in_use_serving` |
+| A deleted account's token stops working at once | `a_deleted_users_token_stops_working_at_once` |
+| A narrowed grant takes effect before the token expires | `narrowing_a_grant_takes_effect_without_waiting_for_the_token_to_expire` |
+| A revoked token does not say why it was revoked | `a_revoked_token_does_not_say_why` |
 | 403 does not leak existence | same test — a nonexistent collection also returns 403 |
 | Listing hides unreadable collections | `listing_hides_what_the_caller_cannot_read` |
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |
@@ -640,6 +643,7 @@ manually and are recorded so they can be repeated:
 | A corrupt certificate on a serving node | ✅ still served the previous certificate, still healthy, process alive, `kimmy_tls_reloads_total{outcome="failed"} 1` |
 | A half-rotated pair (new certificate, old key) | ✅ refused with `KeyMismatch`, kept serving the old pair, and the retry after the key landed completed the rotation |
 | SIGTERM on a node with the reloader running | ✅ still drained and exited cleanly |
+| **Cluster-wide token revocation** | ✅ two nodes: one token worked on both, changing the password on node A refused it **immediately** there (synchronous evict) and on node B within ~2s (replication + oplog consumer); the new password worked on both; deleting the user then revoked the fresh token the same way; root was unaffected throughout |
 | **Re-addressing a live node** | ✅ node C moved from cluster port 8203 to 8303 with the same data directory: its node id survived, **all 12 subscriptions kept their owner**, all three nodes reported `kimmy_cluster_members 2` again, and a write on A was readable on the moved C. Under the old address hashing this would have moved about half of them |
 | **SRV discovery between two real nodes** | ✅ two daemons on **7911 and 7922** — neither the 7900 default — seeded only by `dns-srv:` against a real dnsmasq zone, in a network namespace so DNS could own port 53. Each declared the other `member up` at the port its SRV record named, a write on one was readable on the other, and neither logged a warning. The non-default ports are the point: on 7900 an implementation that ignored the record's port would look identical |
 

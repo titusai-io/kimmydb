@@ -30,11 +30,18 @@ pub struct User {
     pub grants: Vec<Grant>,
     #[serde(default)]
     pub disabled: bool,
+    /// Bumped to invalidate every token this user currently holds.
+    ///
+    /// A token carries the value it was issued under, so a mismatch is a
+    /// refusal. `default` matters: users stored before this field existed
+    /// decode as 0, which is what their tokens also claim (ADR-052).
+    #[serde(default)]
+    pub token_version: u64,
 }
 
 impl User {
     fn to_principal(&self) -> Principal {
-        Principal::new(self.name.clone(), self.grants.clone())
+        Principal::new(self.name.clone(), self.grants.clone()).at_version(self.token_version)
     }
 }
 
@@ -85,6 +92,7 @@ impl UserStore {
             password_hash: password::hash(password)?,
             grants,
             disabled: false,
+            token_version: 0,
         };
         let doc = bson::serialize_to_document(&user)
             .map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))?;
@@ -113,22 +121,42 @@ impl UserStore {
         Ok(names)
     }
 
+    /// Store a user record as given.
+    ///
+    /// For tests that need a state no setter produces on its own — a disabled
+    /// account, most usefully, since nothing else writes that flag yet.
+    pub fn replace_for_test(&self, engine: &Engine, user: &User) -> Result<()> {
+        self.put(engine, user)
+    }
+
     pub fn delete(&self, engine: &Engine, name: &str) -> Result<bool> {
         let id = DocId::String(name.to_string());
         engine.delete(&self.collection, &id).map_err(storage_error)
     }
 
+    /// Set a new password, ending every session the old one opened.
+    ///
+    /// The bump is the conventional behaviour and the one someone expects
+    /// after a suspected compromise: changing the password logs out everyone
+    /// holding a token for this account, including whoever took it.
     pub fn set_password(&self, engine: &Engine, name: &str, password: &str) -> Result<()> {
         let mut user =
             self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
         user.password_hash = password::hash(password)?;
+        user.token_version = user.token_version.wrapping_add(1);
         self.put(engine, &user)
     }
 
+    /// Replace a user's grants, taking effect immediately.
+    ///
+    /// Grants are embedded in the token, so without the bump an edit — a
+    /// *narrowing* one especially — would do nothing until the token expired.
+    /// The cost is that there is no refresh flow, so this logs the user out.
     pub fn set_grants(&self, engine: &Engine, name: &str, grants: Vec<Grant>) -> Result<()> {
         let mut user =
             self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
         user.grants = grants;
+        user.token_version = user.token_version.wrapping_add(1);
         self.put(engine, &user)
     }
 

@@ -56,8 +56,17 @@ impl Server {
     }
 
     /// Mint a token directly, so a test can describe the grants it needs
-    /// instead of provisioning a user to get them.
+    /// instead of spelling out a login.
+    ///
+    /// The user is created too, and that is not incidental: since ADR-052 a
+    /// token for an account that does not exist is refused, which is the whole
+    /// point of the feature. A token minted for an invented principal would be
+    /// testing a state no real client can reach.
     fn token(&self, user: &str, grants: Vec<Grant>) -> String {
+        let store = kimmy_auth::UserStore::open(&self.engine).unwrap();
+        if store.get(&self.engine, user).unwrap().is_none() {
+            store.create(&self.engine, user, "harness-password", grants.clone()).unwrap();
+        }
         self.tokens.issue(&kimmy_auth::Principal::new(user, grants)).unwrap()
     }
 

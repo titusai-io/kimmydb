@@ -403,6 +403,40 @@ ADR-040's, and it is recorded in [Operations](operations.md) beside it.
 
 ---
 
+## 🟢 Tokens can be revoked (was 🟡 "not planned")
+
+**Was.** Deleting a user, disabling one, or narrowing a role did nothing until
+the token expired — up to an hour. The register listed rotating
+`KIMMY_JWT_SECRET` as the only remedy, which logs out the entire cluster.
+
+**Now.** The user record carries a token version and the token carries the one
+it was issued under; a mismatch is a 401 ([ADR-052](decisions.md)). Deleting or
+disabling a user needs no version at all — the absent or disabled record is the
+refusal. Changing a password or grants bumps it.
+
+**The grants half is the one that mattered.** Grants ride inside the token, so
+a permission that was *taken away* kept working for the rest of the token's
+hour. That was the actual exposure, rather than the untidiness of a deleted
+account lingering.
+
+**Verification is still a pure function.** `TokenIssuer::verify` does no I/O:
+the version check lives in the `Auth` extractor, which already holds state, and
+reads through a per-node cache that an oplog consumer keeps honest. Reading the
+user record per request would have put a storage read on a path that had none.
+
+**Found while building it — the consumer alone fails quietly.** The integration
+tests build a router without spawning background tasks, and happily kept
+honouring revoked tokens until the admin routes were changed to evict
+synchronously as well. Correctness that depends on remembering to spawn a task
+is the same shape as the M6 webhook bug. Now a single node is correct with no
+background task, and a missing consumer delays *cluster-wide* revocation rather
+than disabling revocation.
+
+**Measured on two live nodes:** the node taking the change refuses immediately,
+the other within about two seconds.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
@@ -410,7 +444,7 @@ ADR-040's, and it is recorded in [Operations](operations.md) beside it.
 | Client certificates (mTLS) | Server TLS authenticates the *server* to clients; clients still authenticate with a bearer token only | not planned |
 | No certificate expiry metric | A failed reload is counted, but a certificate nobody ever tried to rotate reports nothing. `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime dependency (pure Rust — not a second crypto stack, so `check-native-deps.sh` would still pass) | not scheduled |
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
-| Token revocation | Deleting a user does not invalidate issued tokens | not planned |
+| Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |

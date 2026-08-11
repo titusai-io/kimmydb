@@ -124,11 +124,22 @@ pub struct Principal {
     pub grants: Vec<Grant>,
     /// Set when the server runs with `--insecure-no-auth`.
     pub unauthenticated: bool,
+    /// The user's token version when this principal was issued a token.
+    ///
+    /// Carried so a request can be checked against the version the user
+    /// currently has: a mismatch means the token was invalidated (ADR-052).
+    pub token_version: u64,
 }
 
 impl Principal {
     pub fn new(user: impl Into<String>, grants: Vec<Grant>) -> Self {
-        Self { user: user.into(), grants, unauthenticated: false }
+        Self { user: user.into(), grants, unauthenticated: false, token_version: 0 }
+    }
+
+    /// The same principal, at a stated token version.
+    pub fn at_version(mut self, token_version: u64) -> Self {
+        self.token_version = token_version;
+        self
     }
 
     pub fn superuser(user: impl Into<String>) -> Self {
@@ -144,6 +155,7 @@ impl Principal {
             user: "insecure-no-auth".into(),
             grants: vec![Grant::superuser()],
             unauthenticated: true,
+            token_version: 0,
         }
     }
 
