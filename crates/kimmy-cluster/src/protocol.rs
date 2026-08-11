@@ -191,9 +191,109 @@ pub fn nonce(node: NodeId) -> Vec<u8> {
     out
 }
 
+/// Bytes an authentication tag adds to every membership datagram.
+pub const TAG_LEN: usize = 32;
+
+/// Tag a membership datagram: `HMAC-SHA256(secret, payload) || payload`.
+///
+/// SWIM is connectionless by design — which is what makes failure detection
+/// cheap — so there is no session to authenticate once, and every datagram
+/// carries its own proof. See [ADR-053](../../../docs/decisions.md).
+pub fn tag_datagram(secret: &str, payload: &[u8]) -> Vec<u8> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(payload);
+
+    let mut out = Vec::with_capacity(TAG_LEN + payload.len());
+    out.extend_from_slice(&mac.finalize().into_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The payload of a datagram whose tag verifies, or `None`.
+///
+/// Constant-time, for the reason [`proof_is_valid`] gives: a byte-by-byte
+/// comparison leaks how much of a forged tag was correct, which is enough to
+/// recover the rest one byte at a time.
+///
+/// This proves the sender holds the cluster secret. It does **not** prevent a
+/// captured datagram being replayed — see ADR-053 for why that is out of
+/// scope here rather than overlooked.
+pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    if datagram.len() < TAG_LEN {
+        return None;
+    }
+    let (tag, payload) = datagram.split_at(TAG_LEN);
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(payload);
+    let expected = mac.finalize().into_bytes();
+
+    bool::from(expected.ct_eq(tag)).then_some(payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_tagged_datagram_round_trips_under_the_right_secret() {
+        let payload = b"a swim probe".as_slice();
+        let wire = tag_datagram("shared-secret", payload);
+
+        assert_eq!(wire.len(), TAG_LEN + payload.len());
+        assert_eq!(&wire[TAG_LEN..], payload, "the payload rides in clear; only origin is proven");
+        assert_eq!(untag_datagram("shared-secret", &wire), Some(payload));
+    }
+
+    #[test]
+    fn a_datagram_from_the_wrong_secret_is_refused() {
+        // The whole point. A node configured with a different secret joined a
+        // real cluster's member set, became a webhook ownership candidate, and
+        // delivered nothing — found by driving a five-node cluster (ADR-053).
+        let wire = tag_datagram("their-secret", b"a swim probe");
+        assert_eq!(untag_datagram("our-secret", &wire), None);
+    }
+
+    #[test]
+    fn a_tampered_payload_is_refused() {
+        let mut wire = tag_datagram("shared-secret", b"a swim probe");
+        let last = wire.len() - 1;
+        wire[last] ^= 0xFF;
+        assert_eq!(untag_datagram("shared-secret", &wire), None, "the tag covers the payload");
+    }
+
+    #[test]
+    fn a_truncated_or_untagged_datagram_is_refused() {
+        // An old node sends the bare payload with no tag at all. It must be
+        // refused rather than misread as a tag followed by a short body —
+        // which is why this is a wire break and a stop-the-cluster upgrade.
+        assert_eq!(untag_datagram("shared-secret", b"a swim probe"), None);
+        assert_eq!(untag_datagram("shared-secret", b""), None);
+        assert_eq!(untag_datagram("shared-secret", &[0u8; TAG_LEN - 1]), None);
+
+        // Exactly a tag and nothing else is a legitimate empty payload.
+        let empty = tag_datagram("shared-secret", b"");
+        assert_eq!(empty.len(), TAG_LEN);
+        assert_eq!(untag_datagram("shared-secret", &empty), Some(b"".as_slice()));
+    }
+
+    #[test]
+    fn the_tag_is_not_the_handshake_proof() {
+        // Two constructions over one secret. If they ever coincided, a
+        // datagram captured off the wire would be a usable handshake proof.
+        let payload = b"a swim probe".as_slice();
+        let tagged = tag_datagram("shared-secret", payload);
+        assert_ne!(&tagged[..TAG_LEN], prove("shared-secret", payload, b"").as_slice());
+    }
 
     /// A vector with entries in it.
     ///

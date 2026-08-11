@@ -34,6 +34,8 @@ use std::time::Duration;
 
 use foca::{Config, Foca, Identity, Notification, PostcardCodec, Timer};
 use kimmy_core::NodeId;
+
+use crate::protocol;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use tokio::net::UdpSocket;
@@ -249,6 +251,7 @@ pub async fn run(
     socket: UdpSocket,
     local: SocketAddr,
     node: NodeId,
+    secret: String,
     members: Members,
     seeds: SeedFeed,
 ) {
@@ -267,12 +270,34 @@ pub async fn run(
     tokio::spawn({
         let socket = Arc::clone(&socket);
         let tx = tx.clone();
+        let secret = secret.clone();
         async move {
             let mut buffer = vec![0u8; MAX_DATAGRAM];
+            let mut rejected: u64 = 0;
             loop {
                 match socket.recv_from(&mut buffer).await {
-                    Ok((len, _from)) => {
-                        if tx.send(Input::Data(buffer[..len].to_vec())).await.is_err() {
+                    Ok((len, from)) => {
+                        // Verified *before* foca sees it. An unauthenticated
+                        // node that reached the member set would become a
+                        // webhook ownership candidate and deliver nothing,
+                        // which is how this was found (ADR-053).
+                        let Some(payload) = protocol::untag_datagram(&secret, &buffer[..len])
+                        else {
+                            rejected += 1;
+                            // Rate-limited: an unauthenticated peer probes on
+                            // its own schedule forever, and a line per
+                            // datagram would bury every other membership log.
+                            if rejected.is_power_of_two() {
+                                warn!(
+                                    peer = %from,
+                                    rejected,
+                                    "dropping a membership datagram that failed authentication; \
+                                     check that every node shares one cluster_secret"
+                                );
+                            }
+                            continue;
+                        };
+                        if tx.send(Input::Data(payload.to_vec())).await.is_err() {
                             return;
                         }
                     }
@@ -319,6 +344,7 @@ pub async fn run(
         // SWIM assumes loss and probes again — so a send failure is logged at
         // debug rather than treated as an error.
         for (addr, data) in collector.outgoing.drain(..) {
+            let data = protocol::tag_datagram(&secret, &data);
             if let Err(e) = socket.send_to(&data, addr).await {
                 debug!(peer = %addr, error = %e, "membership send failed");
             }

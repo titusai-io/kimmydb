@@ -6,12 +6,12 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 complete; no milestone is planned after it
+## As of 2026-08-11 — M8 complete; one post-M8 fix in flight
 
-**M0–M8 complete.** Twelve of twelve M8 tasks are done and the register holds
-zero open drifts. **There is no M9**: the next milestone is still to be
-chosen, from the carried debt below and the not-planned table in
-[Roadmap](roadmap.md).
+**M0–M8 complete.** Twelve of twelve M8 tasks are done. One branch since: **SWIM
+authentication** ([ADR-053](decisions.md)), found by driving a five-node cluster rather than
+by the suite. **There is no M9**: the next milestone is still to be chosen, from the carried
+debt below and the not-planned table in [Roadmap](roadmap.md).
 
 ### How work runs here — read this first
 
@@ -31,7 +31,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-053**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-054**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -60,8 +60,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#51 merged: through M8 task 11 (token revocation) |
-| `m8-mutation-closeout` (open PR) | **Task 12, which closes M8.** `cargo-mutants` diff-scoped over the whole M8 diff, plus the documentation closeout. **This handoff commit rides on it.** |
+| `main` | PRs #16–#52 merged: all of M8 |
+| `m9-swim-auth` (open PR) | SWIM datagrams are HMAC-authenticated with `cluster_secret`, closing a hole that let a wrong-secret node join the member set and silently swallow a share of the webhooks ([ADR-053](decisions.md)). Plus the HTTP reference's six missing routes, now guarded by a test. **This handoff commit rides on it.** |
 
 ### The M8 task board — all twelve done
 
@@ -343,6 +343,12 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   never be `me` — the bug that silently undelivered every clustered webhook.
   Any new consumer of `Members` must know it is reading *peers*, not the
   cluster.
+- **The SWIM member set must contain only authenticated peers.** Every
+  membership datagram carries an HMAC over `cluster_secret`, verified before
+  foca sees it. This is not defence in depth on top of the replication
+  handshake — ownership is computed over the member set, so an unauthenticated
+  peer in it wins a share of the webhook subscriptions and delivers none of
+  them (ADR-053). Anything new that reads `Members` inherits this.
 - **A cluster feature is not verified until the harness has run it on real
   nodes.** Transport-free tests and single-node drives both passed while
   clustered delivery was entirely broken.

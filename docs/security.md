@@ -371,7 +371,8 @@ that and is recorded as the follow-up in [Deviations](deviations.md).
 | Clients → this node | ✅ Encrypted, and the node proves its identity |
 | Change streams (WebSocket) | ✅ `wss://`, verified against a running node |
 | MCP at `/mcp` | ✅ Same listener, same certificate |
-| **Node → node replication** | ❌ Still plaintext. `cluster_secret` authenticates peers; it does not hide what they exchange |
+| **Node → node replication** | ✅ TLS 1.3 always, with the handshake bound to the session — see [below](#tls-between-nodes). *(This row said "still plaintext" until it was checked against the code; it had been wrong since ADR-040.)* |
+| **Node → node membership (SWIM)** | ⚠️ **Authenticated, not encrypted.** Every datagram carries an HMAC over `cluster_secret`, so an unauthenticated node cannot join the member set ([ADR-053](decisions.md)) — but the payload is readable, so membership topology is visible to anyone on the path |
 | **Client certificates (mTLS)** | ❌ Not planned. Clients authenticate with a bearer token |
 | **Certificate reload** | ✅ SIGHUP, or within 60s of the file changing. A bad new certificate is refused and the old one keeps serving |
 

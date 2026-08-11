@@ -2041,6 +2041,71 @@ would have to be explained in the security documentation as a window.
 
 ---
 
+## ADR-053 — SWIM datagrams are authenticated with the cluster secret
+
+**Decision.** Every membership datagram carries `HMAC-SHA256(cluster_secret,
+payload)` as a 32-byte prefix. A datagram whose tag does not verify is dropped
+before foca ever sees it, and counted.
+
+**Found by driving a five-node cluster, not by reading the code.** A node
+configured with the *wrong* `cluster_secret` joined a real cluster's member
+set. Replication rejected it correctly — `peer failed authentication` — and it
+could read nothing. But `membership.rs` never referenced the secret at all:
+only the TCP replication handshake did, so SWIM was open to anything that could
+reach the UDP port.
+
+**The cost was not a leak; it was silent webhook loss.** Ownership is
+rendezvous-hashed over the live member set ([ADR-045](decisions.md),
+[ADR-051](decisions.md)), so an unauthenticated node becomes an ownership
+candidate. It wins roughly `1/(N+1)` of subscriptions and delivers none of
+them, because it has no data to deliver. Measured on a three-node cluster with
+twelve subscriptions: **eight delivered, four delivered nothing.** Every real
+node believed it had correctly stood down. That is the same failure shape as
+the bug the cluster harness found in M8 task 1 — an owner that can never be
+the one delivering — arrived at from the opposite direction.
+
+**The realistic trigger is a misconfiguration, not an attacker.** Rotating
+`cluster_secret` across a cluster one node at a time puts a node in exactly
+this state for the length of the rollout. Nothing in any log or metric said a
+quarter of the webhooks had stopped.
+
+**Why a MAC on every datagram rather than a handshake.** SWIM is connectionless
+by design — that is what makes failure detection cheap — so there is no session
+to authenticate once. Tagging each datagram keeps the protocol's shape and adds
+32 bytes to packets foca already caps at 1400, against a 64 KB receive buffer.
+The same `hmac`/`subtle` pair the replication handshake uses, so no new
+dependency and one verification idiom in the crate.
+
+**What this does and does not defend.** It proves a datagram was produced by
+something holding the cluster secret. It does **not** prevent replay of a
+captured datagram: that would need per-peer sequence state or a synchronised
+clock, and buys little here — a replayed message is a peer's own gossip, which
+foca's incarnation numbers already order and discard when stale. Origin
+authentication was the property that was missing and the property the failure
+needed. Stated rather than implied, so nobody reads more into it later.
+
+**Verification is constant-time**, for the reason `proof_is_valid` already
+gives: a byte-by-byte comparison leaks how much of a forged tag was right.
+
+**Rejected: encrypting the datagrams too.** Membership traffic reveals a
+topology, and an operator who cares can put the cluster on a private network.
+Encryption needs a key schedule, nonces and replay handling — a materially
+larger design — and it does not fix the reported problem. Recorded in
+[Deviations](deviations.md) as a known limit rather than done badly here.
+
+**Rejected: dropping unauthenticated peers only at ownership time.** Filtering
+the member set where webhooks read it would fix the symptom found and leave the
+gauge, failure detection and any future consumer of `Members` still trusting an
+unauthenticated peer. The member set should not contain strangers in the first
+place.
+
+**This is a stop-the-cluster upgrade, the third in M8's lineage.** A tagged
+datagram is not a valid untagged one and vice versa, so old and new nodes
+cannot gossip. Same rollout as [ADR-040](decisions.md) and
+[ADR-051](decisions.md), recorded beside them in [Operations](operations.md).
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
