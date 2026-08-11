@@ -110,9 +110,11 @@ pub async fn run(config: Config) -> Result<()> {
             // file — see `Limits::DEFAULT_PROGRESS_HEARTBEAT`.
             ..Default::default()
         };
-        // With clustering off there is no advertised address and no member set;
-        // a single node owns everything, which is what an empty set means.
-        let me = cluster.advertised.unwrap_or_else(|| "127.0.0.1:7900".parse().expect("literal"));
+        // This node's own id, which exists whether or not clustering does —
+        // so ownership needs no placeholder address for the single-node case.
+        // With no member set, the union is just `me` and one node owns
+        // everything (ADR-051).
+        let me = engine.node_id();
         tokio::spawn(async move {
             kimmy_api::dispatch::run(state, egress, me, members, limits).await;
         })
@@ -434,12 +436,14 @@ fn is_loopback(addr: &std::net::SocketAddr) -> bool {
 /// Binding happens here rather than inside the task so that a port already in
 /// use is a startup failure with a clear message, not a warning in a log nobody
 /// reads while the node silently never replicates.
-/// The cluster tasks, plus what the webhook dispatcher needs to derive
-/// ownership: the live member set and this node's advertised address.
+/// The cluster tasks, plus the live member set the webhook dispatcher derives
+/// ownership from.
+///
+/// This no longer carries an advertised address: ownership hashes node ids, and
+/// this node's id exists whether or not clustering does (ADR-051).
 struct Cluster {
     tasks: Vec<tokio::task::JoinHandle<()>>,
     members: Option<kimmy_cluster::Members>,
-    advertised: Option<std::net::SocketAddr>,
 }
 
 async fn spawn_cluster(
@@ -448,7 +452,7 @@ async fn spawn_cluster(
     config: &Config,
 ) -> Result<Cluster> {
     if !config.cluster.enabled {
-        return Ok(Cluster { tasks: Vec::new(), members: None, advertised: None });
+        return Ok(Cluster { tasks: Vec::new(), members: None });
     }
 
     let secret = config.cluster.cluster_secret.clone().context(
@@ -479,6 +483,7 @@ async fn spawn_cluster(
         cluster_tasks.push(tokio::spawn(kimmy_cluster::membership::run(
             socket,
             advertised(local),
+            engine.node_id(),
             live.clone(),
             feed,
         )));
@@ -516,7 +521,7 @@ async fn spawn_cluster(
         membership = config.cluster.membership,
         "clustering enabled"
     );
-    Ok(Cluster { tasks: cluster_tasks, members, advertised: Some(local) })
+    Ok(Cluster { tasks: cluster_tasks, members })
 }
 
 /// The address peers should use to reach this node.

@@ -373,6 +373,36 @@ empty set, with a test on it.
 
 ---
 
+## 🟢 Webhook ownership follows the node, not the address (was a 🟡 deferral since M6)
+
+**Was.** Rendezvous hashing took the `SocketAddr` SWIM publishes, so
+re-addressing a node reshuffled its subscriptions. The register accepted that
+as "the same disruption as that node leaving and another joining."
+
+**That justification was wrong, and measuring it is what showed it.** Over
+100,000 subscriptions across three members: a node genuinely leaving moves
+**25.0%**, while re-addressing one node moves **50.8%** — twice as much,
+because it is a departure and an arrival at once. The old address's share
+scatters, then the new address claims a fresh share from everyone. For a node
+that never went anywhere, which in Kubernetes is what a rescheduled pod is.
+
+**Now.** The node id travels inside the SWIM identity foca already gossips, and
+ownership hashes that ([ADR-051](decisions.md)). The id lives in the database
+file, so it survives restarts and moves with a restore. Driven live: a node
+moved from port 8203 to 8303 with the same data directory, and **all twelve
+subscriptions kept their owner** while the cluster reformed and replication
+continued.
+
+**Found while building it — the M8 plan's expectation was wrong.** The plan
+said a mixed-version cluster "produces duplicates, which at-least-once
+tolerates". foca encodes identities with postcard, which is not
+self-describing, so the added field is a wire break: a new node **rejects** an
+old identity outright. A mixed-version cluster does not double-deliver, it
+fails to form membership. That makes this a stop-the-cluster upgrade, like
+ADR-040's, and it is recorded in [Operations](operations.md) beside it.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
@@ -385,7 +415,6 @@ empty set, with a test on it.
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
-| Webhook ownership hashes addresses | Rendezvous hashing takes the `SocketAddr` SWIM publishes, so re-addressing a node reshuffles its subscriptions — the same disruption as that node leaving and another joining. Hashing node ids would be stabler and needs a member → node-id mapping | M6 |
 
 ---
 

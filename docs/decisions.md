@@ -1889,6 +1889,76 @@ records yields two addresses for one peer.
 
 ---
 
+## ADR-051 — Webhook ownership hashes node ids, and the identity carries one
+
+**Decision.** `kimmy_cluster::Member` — the identity SWIM already gossips —
+gains a `NodeId`. `Members` becomes a map from address to node id, and
+`ownership::owner` hashes **node ids** instead of `SocketAddr`.
+
+**The cost of the old scheme was worse than the thing it was compared to.**
+ADR-045 accepted address hashing on the grounds that re-addressing a node was
+"the same disruption as that node leaving and a new one joining". Measured over
+100,000 subscriptions with three members, one of which changes address:
+
+| | subscriptions moved |
+|---|---|
+| A node genuinely leaving (3 → 2) | 25.0% |
+| **One node re-addressed** (3 → 3) | **50.8%** |
+
+Re-addressing was *twice* as disruptive as the node dying, because it is a
+departure and an arrival at the same time: the old address's share scatters,
+and the new address then claims a fresh share from everyone. For a node that
+never went anywhere. In Kubernetes, where a rescheduled pod routinely comes
+back on a different IP, that is not a rare event.
+
+**The node id is the right key because it is already durable.** It lives inside
+the database file, so it survives restarts and travels with a restore — the
+same property that makes it the tiebreak half of every write's stamp. Nothing
+new had to be invented to name a node; the ownership function was simply using
+the wrong noun.
+
+**Gossiping it is free.** foca disseminates identities already, so the id rides
+along inside `Member` and needs no second channel, no separate broadcast, and
+no address-to-node map to keep in step with membership. Verified end to end:
+a node learns a peer's id *second-hand*, through a third node it never
+announced to.
+
+**An announce carries a placeholder, and foca is built for that.** Discovery
+yields an address; which node answers is not known until it does. So
+`Member::announcing` uses an all-zero id, and `win_addr_conflict` lets any real
+identity displace a placeholder. This is not a workaround — foca accepts an
+`Announce` whose `dst` matches on **address alone**, precisely because the
+announcer cannot know the target's full identity. The design was anticipated.
+
+**Two nodes claiming one address now resolve.** Both start at incarnation 0, so
+the previous rule (`self.incarnation > adversary.incarnation`) made neither
+displace the other and the address stalled on whichever was seen first. With a
+node id present, ties fall through to comparing it: arbitrary, but *agreed* by
+every node, which is the only property that matters.
+
+**This is a hard cutover, and the M8 plan expected otherwise.** The plan said a
+mixed-version cluster "produces duplicates, which at-least-once tolerates".
+That is wrong, and checking rather than assuming is what found it. foca encodes
+identities with postcard, which is not self-describing, so adding a field
+changes the wire format:
+
+- a **new** node decoding an old identity fails outright
+  (`DeserializeUnexpectedEnd`)
+- an **old** node decoding a new one silently "succeeds", reading the first two
+  fields and ignoring the trailing id
+
+So a mixed-version cluster does not double-deliver — **membership does not
+form**. Nodes must be upgraded together, exactly as ADR-040 required for
+replication TLS. Recorded in [Operations](operations.md) beside that one rather
+than left to be discovered.
+
+**A simplification falls out.** The dispatcher needed an address to call `me`,
+and with clustering off there was none — so a literal `127.0.0.1:7900` stood in
+for one. A node id exists whether or not clustering does, so the placeholder is
+gone and `Cluster` no longer carries an advertised address at all.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

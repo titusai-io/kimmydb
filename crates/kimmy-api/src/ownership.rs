@@ -26,27 +26,37 @@
 //! new owner — then resumes from replicated progress rather than from the
 //! beginning. Nothing is lost, and nothing needed to elect anything.
 //!
-//! # Addresses, not node ids
+//! # Node ids, not addresses
 //!
-//! `Members` holds `SocketAddr`, and hashing those keeps this a pure function
-//! of what SWIM already publishes. The cost is that re-addressing a node
-//! reshuffles its subscriptions, which is the same disruption as that node
-//! leaving and a new one joining — acceptable, and cheaper than maintaining an
-//! address-to-node-id mapping purely to hash it.
+//! This hashed `SocketAddr` until M8. An address is where a node *is*, not
+//! which node it is: moving a node to a new address — a pod rescheduled onto a
+//! different IP, a port changed, a host renumbered — reshuffled its
+//! subscriptions as though it had left and a stranger had joined, for a node
+//! that never went anywhere.
+//!
+//! SWIM gossips identities already, so the node id rides along as part of
+//! [`kimmy_cluster::Member`] and costs no second channel and no mapping to
+//! keep in step. A node id is durable — it lives inside the database file, so
+//! it survives restarts and moves with a restore ([ADR-051](../../../docs/decisions.md)).
 
 use std::collections::BTreeSet;
-use std::net::SocketAddr;
+
+use kimmy_core::NodeId;
 
 /// FNV-1a, so the mapping is stable across processes and releases.
 ///
 /// A `DefaultHasher` is explicitly not guaranteed stable between Rust versions,
 /// and an ownership function that changed under a compiler upgrade would
 /// reshuffle every subscription in the cluster on a rolling restart.
-fn hash(subscription: &str, member: &SocketAddr) -> u64 {
+fn hash(subscription: &str, member: &NodeId) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x100_0000_01b3;
 
     let mut h = OFFSET;
+    // The hyphenated form, which `NodeId` fixes deliberately rather than
+    // inheriting from `Uuid`'s serde. Hashing the *chosen* representation is
+    // what keeps this answer the same everywhere, so the bytes cannot drift
+    // with a format's idea of whether it is human-readable.
     let member = member.to_string();
     // A separator, for the same reason `CollectionId::derive` has one: without
     // it ("ab", "c") and ("a", "bc") hash the same bytes.
@@ -59,9 +69,9 @@ fn hash(subscription: &str, member: &SocketAddr) -> u64 {
 
 /// The member that owns this subscription, or `None` when there are none.
 ///
-/// Ties break on the address, so two members hashing identically still produce
+/// Ties break on the node id, so two members hashing identically still produce
 /// one answer rather than depending on iteration order.
-pub fn owner(subscription: &str, members: &BTreeSet<SocketAddr>) -> Option<SocketAddr> {
+pub fn owner(subscription: &str, members: &BTreeSet<NodeId>) -> Option<NodeId> {
     members
         .iter()
         .map(|member| (hash(subscription, member), member))
@@ -87,7 +97,7 @@ pub fn owner(subscription: &str, members: &BTreeSet<SocketAddr>) -> Option<Socke
 /// replacement until it rejoins or stops. That is a duplicate — which
 /// at-least-once already promises receivers — where the alternative was
 /// silence.
-pub fn owns(subscription: &str, me: SocketAddr, members: &BTreeSet<SocketAddr>) -> bool {
+pub fn owns(subscription: &str, me: NodeId, members: &BTreeSet<NodeId>) -> bool {
     let mut candidates = members.clone();
     candidates.insert(me);
     owner(subscription, &candidates) == Some(me)
@@ -97,12 +107,14 @@ pub fn owns(subscription: &str, me: SocketAddr, members: &BTreeSet<SocketAddr>) 
 mod tests {
     use super::*;
 
-    fn members(addrs: &[&str]) -> BTreeSet<SocketAddr> {
-        addrs.iter().map(|a| a.parse().unwrap()).collect()
+    /// A node id from a single repeated byte, so tests read as `node(1)`
+    /// rather than as a wall of hex.
+    fn node(byte: u8) -> NodeId {
+        NodeId::from_bytes([byte; 16])
     }
 
-    fn addr(a: &str) -> SocketAddr {
-        a.parse().unwrap()
+    fn members(bytes: &[u8]) -> BTreeSet<NodeId> {
+        bytes.iter().map(|b| node(*b)).collect()
     }
 
     #[test]
@@ -110,7 +122,7 @@ mod tests {
         // The property that makes this work without coordination: three nodes
         // holding the same member set must all name the same owner, or two of
         // them deliver and one does not.
-        let set = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
+        let set = members(&[1, 2, 3]);
         for subscription in ["wh_a", "wh_b", "wh_c", "wh_d"] {
             let answers: BTreeSet<_> = (0..5).map(|_| owner(subscription, &set).unwrap()).collect();
             assert_eq!(answers.len(), 1, "{subscription} produced {answers:?}");
@@ -119,7 +131,7 @@ mod tests {
 
     #[test]
     fn exactly_one_node_owns_each_subscription() {
-        let set = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
+        let set = members(&[1, 2, 3]);
         for subscription in ["wh_a", "wh_b", "wh_c"] {
             let owners: Vec<_> = set.iter().filter(|m| owns(subscription, **m, &set)).collect();
             assert_eq!(owners.len(), 1, "{subscription} owned by {owners:?}");
@@ -130,7 +142,7 @@ mod tests {
     fn work_spreads_across_the_cluster() {
         // If every subscription hashed to one node, that node would do all the
         // delivering and the other two would idle.
-        let set = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
+        let set = members(&[1, 2, 3]);
         let used: BTreeSet<_> = (0..200).filter_map(|i| owner(&format!("wh_{i}"), &set)).collect();
         assert_eq!(used.len(), 3, "all three should own some subscriptions, got {used:?}");
     }
@@ -140,8 +152,8 @@ mod tests {
         // The reason for rendezvous rather than modulo. With `hash % len`,
         // removing one of three members remaps roughly two thirds of all
         // subscriptions; here it must move only the departed node's share.
-        let before = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
-        let gone = addr("10.0.0.3:7900");
+        let before = members(&[1, 2, 3]);
+        let gone = node(3);
         let after: BTreeSet<_> = before.iter().copied().filter(|m| *m != gone).collect();
 
         let mut moved = 0;
@@ -167,7 +179,7 @@ mod tests {
     fn a_dead_owners_subscriptions_are_taken_over() {
         // The design-review question, as a test: when a node dies, does
         // someone deliver?
-        let before = members(&["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"]);
+        let before = members(&[1, 2, 3]);
         let subscription = "wh_orders";
         let dead = owner(subscription, &before).unwrap();
 
@@ -186,9 +198,9 @@ mod tests {
     fn a_single_node_owns_everything() {
         // Clustering off, or SWIM not yet populated. A node that waited for a
         // member set it will never have would deliver nothing.
-        let me = addr("127.0.0.1:7900");
+        let me = node(1);
         assert!(owns("wh_a", me, &BTreeSet::new()), "an empty member set must not stall delivery");
-        assert!(owns("wh_a", me, &members(&["127.0.0.1:7900"])));
+        assert!(owns("wh_a", me, &members(&[1])));
     }
 
     #[test]
@@ -199,18 +211,47 @@ mod tests {
         // can never be the node computing it — the bug that left every
         // clustered webhook undelivered until the harness caught it. Three
         // peer-only views must still agree on exactly one owner.
-        let all = ["10.0.0.1:7900", "10.0.0.2:7900", "10.0.0.3:7900"];
+        let all = [1u8, 2, 3];
         for subscription in ["wh_a", "wh_b", "wh_c", "wh_d"] {
             let mut owners = 0;
             for me in all {
-                let peers: BTreeSet<SocketAddr> =
-                    all.iter().filter(|a| **a != me).map(|a| a.parse().unwrap()).collect();
-                if owns(subscription, addr(me), &peers) {
+                let peers: BTreeSet<NodeId> =
+                    all.iter().filter(|b| **b != me).map(|b| node(*b)).collect();
+                if owns(subscription, node(me), &peers) {
                     owners += 1;
                 }
             }
             assert_eq!(owners, 1, "{subscription}: peer-only views must elect exactly one owner");
         }
+    }
+
+    #[test]
+    fn re_addressing_a_node_does_not_move_its_subscriptions() {
+        // The whole point of task 10, driven through the real member set rather
+        // than asserted about this function alone: a node moves to a new
+        // address — a pod rescheduled, a port changed — and every assignment
+        // must be unchanged. Before M8 the address was the hash input, so this
+        // was the disruption of a node leaving and a stranger joining, for a
+        // node that never went anywhere.
+        let live = kimmy_cluster::Members::default();
+        live.insert_for_test("10.0.0.1:7900".parse().unwrap(), node(1));
+        live.insert_for_test("10.0.0.2:7900".parse().unwrap(), node(2));
+        live.insert_for_test("10.0.0.3:7900".parse().unwrap(), node(3));
+
+        let before: Vec<_> =
+            (0..200).map(|i| owner(&format!("wh_{i}"), &live.node_ids())).collect();
+
+        // node(2) is rescheduled onto a different address.
+        live.remove_for_test(&"10.0.0.2:7900".parse().unwrap());
+        live.insert_for_test("10.9.9.9:7911".parse().unwrap(), node(2));
+
+        let after: Vec<_> = (0..200).map(|i| owner(&format!("wh_{i}"), &live.node_ids())).collect();
+
+        assert_eq!(before, after, "an address change must not move a single subscription");
+        assert!(
+            before.iter().any(|o| *o == Some(node(2))),
+            "the moved node must actually own some subscriptions, or this proves nothing"
+        );
     }
 
     #[test]
@@ -220,9 +261,11 @@ mod tests {
         // that reshuffled every subscription would deliver a burst of
         // duplicates for no reason. Pinned to catch an accidental swap.
         //
-        // Cross-checked against an independent FNV-1a implementation rather
-        // than recorded from this one, so the value pins the algorithm and not
-        // whatever this code happens to produce.
-        assert_eq!(hash("wh_a", &addr("10.0.0.1:7900")), 0x7457_8f08_134a_f3a8);
+        // Cross-checked against an independent FNV-1a implementation over
+        // `"wh_a" || 0x00 || "01010101-0101-0101-0101-010101010101"` rather than
+        // recorded from this one, so the value pins the algorithm — and the
+        // *representation* of a `NodeId`, which is the hyphenated string form
+        // fixed in `kimmy_core::ids` rather than whatever a format would pick.
+        assert_eq!(hash("wh_a", &node(1)), 0xd7f5_9b66_b282_926a);
     }
 }

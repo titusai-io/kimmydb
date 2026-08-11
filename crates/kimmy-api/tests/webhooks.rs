@@ -164,8 +164,10 @@ fn register_as(state: &kimmy_api::SharedState, id: &str, url: &str, ops: Vec<&st
     id
 }
 
-fn me() -> std::net::SocketAddr {
-    "127.0.0.1:7900".parse().unwrap()
+/// This node's id. Ownership hashes node ids rather than addresses, so a test
+/// that wants a stable "am I the owner" answer fixes the id (ADR-051).
+fn me() -> kimmy_core::NodeId {
+    kimmy_core::NodeId::from_bytes([0xAA; 16])
 }
 
 async fn pass(state: &kimmy_api::SharedState) -> dispatch::DispatchOutcome {
@@ -360,8 +362,8 @@ async fn a_node_that_does_not_own_a_subscription_delivers_nothing() {
     let state = state_for(&dir);
     let (addr, _seen, hits) = receiver(200).await;
 
-    let others: BTreeSet<std::net::SocketAddr> =
-        ["10.0.0.1:7900", "10.0.0.2:7900"].iter().map(|a| a.parse().unwrap()).collect();
+    let others: BTreeSet<kimmy_core::NodeId> =
+        [[0x11u8; 16], [0x22u8; 16]].into_iter().map(kimmy_core::NodeId::from_bytes).collect();
     let mut candidates = others.clone();
     candidates.insert(me());
     let id = (0..)

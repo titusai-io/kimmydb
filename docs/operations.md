@@ -139,6 +139,17 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > start it again. Nodes will not lose data — each holds a full copy and
 > anti-entropy reconciles on restart — but replication stops for the duration.
 
+> **Upgrading a cluster to a version whose SWIM identity carries a node id.**
+> The same shape of cutover, for the same reason. Membership identities are
+> encoded with postcard, which is not self-describing, so the added field
+> changes the wire format ([ADR-051](decisions.md)): a new node **rejects** an
+> old node's identity outright, and an old node silently ignores the new
+> field. A mixed-version cluster therefore does not form membership at all —
+> it does not merely disagree about webhook ownership. Stop the cluster,
+> upgrade every node, start it again. Replication still runs from discovery
+> while membership is down, so data keeps moving; what stops is failure
+> detection and webhook ownership.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback
