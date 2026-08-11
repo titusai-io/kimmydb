@@ -384,6 +384,39 @@ async fn a_bulk_insert_over_the_cap_is_rejected() {
 }
 
 #[tokio::test]
+async fn a_bulk_insert_of_exactly_the_cap_is_accepted() {
+    // The boundary, not just the far side of it. `>` and `>=` differ by one
+    // document here, and a test that only sends 1001 cannot tell them apart —
+    // which is how a cap that silently rejected a legal batch would ship.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let documents: Vec<_> = (0..1000).map(|i| json!({ "_id": i })).collect();
+    let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!(documents)).await;
+
+    assert_eq!(res.status, 200, "exactly the cap must be accepted: {:?}", res.body);
+    assert_eq!(res.body["inserted"], 1000);
+}
+
+#[tokio::test]
+async fn a_bulk_body_over_the_size_limit_is_413_with_a_stable_code() {
+    // Distinct from the document cap: a batch well under 1000 documents can
+    // still be too large, and axum's own rejection carries no `error` code
+    // for a client to branch on.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let padding = "x".repeat(4000);
+    let documents: Vec<_> = (0..600).map(|i| json!({ "_id": i, "pad": padding })).collect();
+    let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!(documents)).await;
+
+    assert_eq!(res.status, 413, "a body over 2 MB must be refused: {:?}", res.body);
+    assert_eq!(res.body["error"], "payload_too_large");
+}
+
+#[tokio::test]
 async fn a_bulk_insert_of_an_empty_array_is_a_no_op() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -1298,6 +1331,67 @@ async fn the_metrics_endpoint_exposes_the_process_counters() {
     assert!(
         !raw.contains("orders"),
         "metrics is unauthenticated and must not name collections:\n{raw}"
+    );
+}
+
+#[tokio::test]
+async fn health_probes_are_counted_but_not_timed() {
+    // ADR-046's exclusion, which nothing checked: probes and scrapes fire every
+    // few seconds forever, so timing them would crowd the buckets real traffic
+    // lands in — but they must still show as traffic. Both halves matter, and
+    // inverting the condition satisfies neither.
+    let server = Server::start().await;
+
+    let scrape = |server: &Server| {
+        let base = server.base.clone();
+        async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let host = base.strip_prefix("http://").unwrap();
+            let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+            let req = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+            stream.write_all(req.as_bytes()).await.unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+    };
+
+    /// The value of a bare `name value` sample line.
+    fn sample(raw: &str, name: &str) -> u64 {
+        raw.lines()
+            .find_map(|l| l.strip_prefix(&format!("{name} "))?.trim().parse().ok())
+            .unwrap_or_else(|| panic!("no sample for {name} in:\n{raw}"))
+    }
+
+    let before = scrape(&server).await;
+    let (timed_before, counted_before) = (
+        sample(&before, "kimmy_request_duration_seconds_count"),
+        sample(&before, "kimmy_requests_total"),
+    );
+
+    for _ in 0..5 {
+        server.get("/healthz", None).await;
+        server.get("/readyz", None).await;
+    }
+
+    let after = scrape(&server).await;
+    assert_eq!(
+        sample(&after, "kimmy_request_duration_seconds_count"),
+        timed_before,
+        "health probes must not enter the latency histogram"
+    );
+    assert!(
+        sample(&after, "kimmy_requests_total") >= counted_before + 10,
+        "...but they must still be counted as requests"
+    );
+
+    // And the other half of the condition: ordinary traffic *is* timed.
+    let token = server.root().await;
+    let timed_now = sample(&scrape(&server).await, "kimmy_request_duration_seconds_count");
+    server.get("/v1/databases", Some(&token)).await;
+    assert!(
+        sample(&scrape(&server).await, "kimmy_request_duration_seconds_count") > timed_now,
+        "a real request must be timed"
     );
 }
 

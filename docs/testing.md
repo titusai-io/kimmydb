@@ -9,21 +9,21 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-762 tests passing · 0 failures · clippy clean at -D warnings
+871 tests passing · 0 failures · clippy clean at -D warnings
 ```
 
 | Crate | Tests | Focus |
 |---|---|---|
-| `kimmy-core` | 123 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata |
-| `kimmy-storage` | 187 | Codecs, engine lifecycle, document CRUD, indexes, change streams, vector storage, retention, schema migration, anti-entropy |
-| `kimmy-query` | 102 | Filter, update, sort, projection semantics |
-| `kimmy-vector` | 56 | Providers, chunking, the embedding worker, HNSW recall, index-cache policy |
+| `kimmy-core` | 126 | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata and provider configs |
+| `kimmy-storage` | 214 | Codecs, engine lifecycle, document CRUD, bulk insert, indexes, change streams, vector storage and fingerprints, retention, schema migration, anti-entropy |
+| `kimmy-query` | 113 | Filter, update, sort, projection semantics |
+| `kimmy-vector` | 72 | Providers, chunking, the embedding worker and its backfill, HNSW recall, index-cache policy |
 | `kimmy-auth` | 43 | Passwords, tokens, RBAC, user store |
-| `kimmy-api` | 146 | 80 unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics) + 43 end-to-end over a real socket + 23 webhook delivery against a real receiver |
+| `kimmy-api` | 181 | Unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics, ownership, session revocation) plus end-to-end over a real socket and webhook delivery against a real receiver |
 | `kimmy-mcp` | 22 | 5 unit (resource URIs, internal-object filter) + 17 end-to-end JSON-RPC over a real socket |
-| `kimmyd` | 26 | Config layering and validation, TLS termination and the serving stack |
+| `kimmyd` | 33 | Config layering and validation, TLS termination, certificate reload, and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
-| `kimmy-cluster` | 51 | Discovery, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
+| `kimmy-cluster` | 62 | Discovery including SRV resolution against a local DNS server, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 
 ---
 
@@ -333,6 +333,72 @@ signature a consumer must verify, the headers it reads, and whether the egress
 policy lets it out at all only exist on the wire. The test recomputes the HMAC
 exactly as a real consumer would, and a sibling test confirms a tampered body
 fails it — without that, the signature is decoration.
+
+### M8: 227 mutants over the whole milestone diff
+
+`cargo-mutants --in-diff` over everything M8 changed, run per crate so each
+mutant is scored against a fast, relevant suite rather than the whole
+workspace. **227 mutants, 47 escapes.** Seventeen new tests killed 31, one
+restructuring removed another by construction, and the remaining 15 are
+accounted for below rather than left as a number.
+
+| Crate | Tested | Escaped | After |
+|---|---:|---:|---:|
+| `kimmy-vector` | 65 | 6 | 3 |
+| `kimmy-api` | 63 | 7 | **0** |
+| `kimmy-cluster` | 38 | 10 | 7 |
+| `kimmy-storage` | 26 | 9 | 1 |
+| `kimmyd` | 16 | 6 | 3 |
+| `kimmy-auth` | 10 | 1 | 1 |
+| `kimmy-core` | 9 | 8 | **0** |
+
+The four that mattered most, and what they would have cost:
+
+| Escape | What it meant | Killed by |
+|---|---|---|
+| `^=` → `\|=` in `config_fingerprint` | The reindex idempotency check. Mixing config bytes with `\|` saturates towards all-ones, so different configurations fingerprint alike and **a reconfigured collection is never re-embedded** | `a_changed_configuration_changes_its_fingerprint` |
+| `is_retryable` forced either way in `backfill_from_entry` | Forced **true**, a permanent failure retries forever and the whole scan stalls on one document; forced **false**, a blip silently drops a document. The fake provider could only fail *retryably*, so neither was reachable | `a_permanent_failure_skips_a_document_instead_of_retrying_it_forever`, `a_transient_failure_during_a_backfill_is_retried_rather_than_skipped` |
+| `vector_fingerprint` → `Ok(None)`, and `fingerprint_key` → a constant | Nothing read a fingerprint back, and nothing checked the key carried the collection — a constant key would mark **every** collection backfilled when one was configured | `a_recorded_fingerprint_reads_back`, `fingerprints_do_not_collide_between_collections` |
+| `delete !` in `count_request` | ADR-046's exclusion inverted: health probes enter the latency histogram and real traffic does not. Nothing asserted either half | `health_probes_are_counted_but_not_timed` |
+
+**`kimmy-core` scored 8 escapes out of 9** — the worst ratio by far, and all of
+them in the provider dialects added by task 6. The dialects were verified
+against documented shapes with fixtures in `kimmy-vector`, so the *config* type
+beside them — its wire tags, its default key variables, its validation — had no
+tests at all. Three tests took it to 9 caught out of 9.
+
+Once again the escapes clustered in **new callers rather than new logic**:
+`backfill_from_entry` inherited a retry classification written for the
+streaming path, and got it wrong in the one direction that hangs.
+
+#### Left alive, with reasons
+
+- **Provably equivalent (2).** `hlc > held` → `>=` in `lag_behind_ms`: when the
+  two are equal the term contributes `wall_ms − wall_ms` = 0, which cannot
+  change a `max()` over non-negative values that defaults to 0. And in
+  `win_addr_conflict`, `self.incarnation > adversary.incarnation` → `>=` sits
+  behind a `!=` guard that already excludes equality. Neither can be killed.
+- **Arbitrary by design (2).** The node-id tiebreak in `win_addr_conflict`
+  flipped to `<` or `>=`. The direction is deliberately unspecified — what
+  matters is that every node computes the *same* answer, which the test asserts
+  and both mutants preserve. Pinning a direction would test the code against
+  itself.
+- **Test-support helpers (3).** `Members::insert_for_test`,
+  `Members::remove_for_test`, `UserStore::replace_for_test`. Public only
+  because another crate's tests need them; a mutant here breaks a test for
+  reasons unrelated to the product.
+- **Covered by the harness or a live drive, not by `cargo test` (4).**
+  `node::run` → `Ok(())`, the `!` in `spawn_cluster`, and `peers::replicate`
+  → `()` are top-level wiring that the cluster harness exercises on real
+  processes — but the harness is `#[ignore]`d, so a per-crate mutant run does
+  not see it. `resolve_srv`'s one-line delegation to `resolve_srv_with` is
+  likewise proven by the two-node SRV drive. Recorded rather than papered over: these are only defended in CI.
+- **Genuinely uncovered (4).** `Hangup::recv` → `()` and the surrounding cert
+  reload loop, plus `HttpProvider::embed` → `Ok(vec![])` and its `name`. Each
+  needs a running loop or a live HTTP endpoint to reach. The *decisions* inside them are now
+  tested — `should_reload` was extracted from the loop for exactly that reason,
+  and the `!` at its call site was removed by restructuring rather than by a
+  test — but the loops themselves are driven only by hand.
 
 ### Webhook registration, six for six after one escape
 

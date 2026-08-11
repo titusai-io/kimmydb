@@ -468,12 +468,20 @@ mod tests {
         dim: usize,
         /// Fails this many times before succeeding, to exercise retry.
         fail_times: std::sync::atomic::AtomicUsize,
+        /// Fails forever with an error retrying cannot fix, to exercise the
+        /// other half of the classification.
+        permanent: std::sync::atomic::AtomicBool,
         calls: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeProvider {
         fn new(dim: usize) -> Arc<Self> {
-            Arc::new(Self { dim, fail_times: Default::default(), calls: Default::default() })
+            Arc::new(Self {
+                dim,
+                fail_times: Default::default(),
+                permanent: Default::default(),
+                calls: Default::default(),
+            })
         }
     }
 
@@ -482,6 +490,14 @@ mod tests {
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             use std::sync::atomic::Ordering;
             self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.permanent.load(Ordering::SeqCst) {
+                // A 400 is the canonical "retrying will not help".
+                return Err(VectorError::ProviderRejected {
+                    provider: "fake",
+                    status: 400,
+                    detail: "injected permanent failure".into(),
+                });
+            }
             if self.fail_times.load(Ordering::SeqCst) > 0 {
                 self.fail_times.fetch_sub(1, Ordering::SeqCst);
                 return Err(VectorError::Transport { provider: "fake", detail: "injected".into() });
@@ -777,6 +793,101 @@ mod tests {
             assert_eq!(vectors.len(), 1, "document {i} must be embedded");
         }
         let _ = coll;
+    }
+
+    #[test]
+    fn a_changed_configuration_changes_its_fingerprint() {
+        // The whole backfill decision is "does the stored fingerprint match
+        // the live configuration". A hash that collapsed — mixing bytes with
+        // `|` rather than `^` saturates towards all-ones — would answer "yes"
+        // for configurations that differ, and a reconfigured collection would
+        // never be re-embedded.
+        let base = VectorConfig {
+            fields: vec!["title".into()],
+            provider: ProviderConfig::Byo,
+            dim: 4,
+            metric: Metric::Cosine,
+            chunk: ChunkConfig::default(),
+        };
+
+        let mut wider = base.clone();
+        wider.dim = 8;
+        let mut other_field = base.clone();
+        other_field.fields = vec!["body".into()];
+        let mut both_fields = base.clone();
+        both_fields.fields = vec!["title".into(), "body".into()];
+        let mut other_metric = base.clone();
+        other_metric.metric = Metric::Dot;
+
+        let all = [&base, &wider, &other_field, &both_fields, &other_metric];
+        let prints: std::collections::BTreeSet<u64> =
+            all.iter().map(|c| config_fingerprint(c)).collect();
+        assert_eq!(prints.len(), all.len(), "each configuration must fingerprint differently");
+
+        // ...and the same configuration must fingerprint the same, or every
+        // replay would look like a change and re-embed the collection.
+        assert_eq!(config_fingerprint(&base), config_fingerprint(&base.clone()));
+    }
+
+    #[tokio::test]
+    async fn a_permanent_failure_skips_a_document_instead_of_retrying_it_forever() {
+        // The backfill retries per document, exactly as the streaming path
+        // does — which means it inherits the classification, and gets it wrong
+        // in the worst way if the classification says everything is worth
+        // another go: the loop never exits and the whole scan stalls on one
+        // document. Nothing exercised this path, because the fake provider
+        // could only fail *retryably*.
+        let (engine, _coll, mut worker, _dir) = setup_with_history(3).await;
+        let fake = FakeProvider::new(4);
+        fake.permanent.store(true, std::sync::atomic::Ordering::SeqCst);
+        let coll = engine.get_collection("app", "docs").unwrap();
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        // A deadline rather than a bare await: the failure this guards against
+        // is a hang, and a hung test that never finishes reports nothing.
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            worker.process(&last_entry(&engine)),
+        )
+        .await
+        .expect("a permanent failure must not retry forever")
+        .unwrap();
+
+        assert_eq!(outcome, Outcome::Backfilled { embedded: 0 }, "nothing could be embedded");
+        assert_eq!(
+            fake.calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "each document is attempted exactly once, then skipped"
+        );
+    }
+
+    // Paused clock: the retry delay is five seconds of real time, and a test
+    // that waits it out is a test nobody runs. Virtual time still advances
+    // past the deadline if the loop never exits, so this keeps its teeth.
+    #[tokio::test(start_paused = true)]
+    async fn a_transient_failure_during_a_backfill_is_retried_rather_than_skipped() {
+        // The other direction: a classification that called everything
+        // permanent would drop a document on one blip, and the scan would
+        // report success having silently embedded less than it walked.
+        let (engine, _coll, mut worker, _dir) = setup_with_history(3).await;
+        let fake = FakeProvider::new(4);
+        fake.fail_times.store(2, std::sync::atomic::Ordering::SeqCst);
+        let coll = engine.get_collection("app", "docs").unwrap();
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(300),
+            worker.process(&last_entry(&engine)),
+        )
+        .await
+        .expect("retries are bounded by the documents, not unbounded")
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Backfilled { embedded: 3 },
+            "every document must land despite the transient failures"
+        );
     }
 
     #[tokio::test]

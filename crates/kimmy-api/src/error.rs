@@ -185,6 +185,42 @@ impl From<AuthError> for ApiError {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn a_body_rejection_keeps_its_status_and_gains_a_stable_code() {
+        // Axum's own rejection renders bare text, so without this mapping the
+        // bulk route would be the one endpoint a client cannot branch on. The
+        // status axum chose is kept — it already distinguishes a syntax error
+        // from a body that is too large — and only the envelope is made to
+        // match every other route.
+        //
+        // Driven through the real extractor rather than over a socket, because
+        // the test client always sends a JSON content type and 415 cannot be
+        // reached through it.
+        use axum::extract::FromRequest;
+
+        let no_content_type = axum::http::Request::builder()
+            .method("POST")
+            .body(axum::body::Body::from("[]"))
+            .unwrap();
+        let rejection = axum::Json::<Vec<serde_json::Value>>::from_request(no_content_type, &())
+            .await
+            .expect_err("a body with no JSON content type must be rejected");
+        let mapped: ApiError = rejection.into();
+        assert_eq!(mapped.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(mapped.code, "unsupported_media_type");
+
+        // And the ordinary case still lands on the generic code.
+        let malformed = axum::http::Request::builder()
+            .method("POST")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from("{not json"))
+            .unwrap();
+        let rejection = axum::Json::<Vec<serde_json::Value>>::from_request(malformed, &())
+            .await
+            .expect_err("malformed JSON must be rejected");
+        assert_eq!(ApiError::from(rejection).code, "bad_request");
+    }
+
     #[test]
     fn not_found_and_conflict_map_to_their_status_codes() {
         let e: ApiError =

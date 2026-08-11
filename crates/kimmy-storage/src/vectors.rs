@@ -411,6 +411,50 @@ mod tests {
         (engine, dir)
     }
 
+    #[test]
+    fn a_recorded_fingerprint_reads_back() {
+        // The idempotency mechanism for reindexing: a completed backfill
+        // records the configuration it ran under, and a replayed
+        // `ConfigureVectors` entry compares against it. If the read always
+        // reported "nothing recorded", every replay would re-embed the whole
+        // collection — silently, and expensively.
+        let (engine, _dir) = engine();
+        let coll = engine.get_collection("app", "docs").unwrap().id;
+
+        assert_eq!(engine.vector_fingerprint(coll).unwrap(), None, "nothing recorded yet");
+
+        engine.put_vector_fingerprint(coll, 0xDEAD_BEEF).unwrap();
+        assert_eq!(engine.vector_fingerprint(coll).unwrap(), Some(0xDEAD_BEEF));
+
+        // Replaced rather than accumulated, so a reconfigure leaves one answer.
+        engine.put_vector_fingerprint(coll, 7).unwrap();
+        assert_eq!(engine.vector_fingerprint(coll).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn fingerprints_do_not_collide_between_collections() {
+        // They share one metadata table, so the key has to carry the
+        // collection. A constant key would make configuring vectors on one
+        // collection mark every other collection as already backfilled.
+        let (engine, _dir) = engine();
+        engine.create_collection("app", "other").unwrap();
+        let a = engine.get_collection("app", "docs").unwrap().id;
+        let b = engine.get_collection("app", "other").unwrap().id;
+
+        engine.put_vector_fingerprint(a, 111).unwrap();
+
+        assert_eq!(engine.vector_fingerprint(a).unwrap(), Some(111));
+        assert_eq!(
+            engine.vector_fingerprint(b).unwrap(),
+            None,
+            "one collection's fingerprint must not answer for another"
+        );
+
+        engine.put_vector_fingerprint(b, 222).unwrap();
+        assert_eq!(engine.vector_fingerprint(a).unwrap(), Some(111), "and must not overwrite it");
+        assert_eq!(engine.vector_fingerprint(b).unwrap(), Some(222));
+    }
+
     fn config(dim: usize) -> VectorConfig {
         VectorConfig {
             fields: vec!["body".into()],
