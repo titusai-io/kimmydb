@@ -349,17 +349,30 @@ async fn an_operation_filter_is_honoured_end_to_end() {
 
 #[tokio::test]
 async fn a_node_that_does_not_own_a_subscription_delivers_nothing() {
-    // Ownership is what stops five nodes sending five copies. Here the member
-    // set deliberately excludes this node, so it must stand down.
+    // Ownership is what stops five nodes sending five copies: a subscription
+    // owned by a peer must be stood down for. The subscription id is *chosen*
+    // rather than random, because this node is always a candidate for its own
+    // subscriptions (`owns` unions `me` into the set — the harness-found fix)
+    // and a random id lands on this node a third of the time. This test once
+    // used a random id and passed four CI runs on luck. A fixture that is a
+    // hash is a sample, not a constant — assert it has the property.
     let dir = tempfile::tempdir().unwrap();
     let state = state_for(&dir);
     let (addr, _seen, hits) = receiver(200).await;
-    register(&state, &format!("http://{addr}/hook"), vec![]);
-    let coll = state.engine.create_collection("shop", "orders").unwrap();
-    state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
 
     let others: BTreeSet<std::net::SocketAddr> =
         ["10.0.0.1:7900", "10.0.0.2:7900"].iter().map(|a| a.parse().unwrap()).collect();
+    let mut candidates = others.clone();
+    candidates.insert(me());
+    let id = (0..)
+        .map(|i| format!("wh_owned_elsewhere_{i}"))
+        .find(|id| kimmy_api::ownership::owner(id, &candidates) != Some(me()))
+        .expect("two of three candidates are not this node");
+    register_as(&state, &id, &format!("http://{addr}/hook"), vec![]);
+
+    let coll = state.engine.create_collection("shop", "orders").unwrap();
+    state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+
     let client = reqwest::Client::new();
     let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
     let mut backoff = dispatch::Backoff::default();

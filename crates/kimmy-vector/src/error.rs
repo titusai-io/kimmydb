@@ -33,6 +33,9 @@ pub enum VectorError {
     #[error("expected a vector of {expected} dimensions, got {found}")]
     DimensionMismatch { expected: usize, found: usize },
 
+    #[error("HNSW snapshot unusable: {0}")]
+    Snapshot(String),
+
     #[error("embedding model {model:?} is not available: {detail}")]
     ModelUnavailable { model: String, detail: String },
 

@@ -17,8 +17,8 @@ reload's trigger, and token revocation's semantics.
 
 | | |
 |---|---|
-| `main` | PRs #16–#42 merged: the M8 plan, the cluster harness, observability |
-| `m8-benchmarks` | **Not merged.** The `writers` bench (throughput flat from 1 to 8 concurrent writers — the single redb writer is shared cleanly, so a bulk API's win is per-commit overhead, not parallelism) and `scripts/bench-baseline.py` with the recorded baseline |
+| `main` | PRs #16–#43 merged: the M8 plan, the cluster harness, observability, benchmarks |
+| `m8-hnsw-snapshots` | **Not merged.** HNSW graphs persist beside the database file and reload on the first access after a restart, count-validated. `hnsw_rs` panics on a corrupt graph file, so the load runs under `catch_unwind` — a torn file costs a rebuild, never the process |
 
 ### The bug the harness caught on its first run
 

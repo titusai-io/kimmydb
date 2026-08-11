@@ -31,6 +31,49 @@ const MAX_LAYERS: usize = 16;
 const EF_SEARCH_FACTOR: usize = 4;
 const MIN_EF_SEARCH: usize = 50;
 
+/// What a snapshot must say about itself to be trusted.
+///
+/// The keys ride along because graph ids are dense integers whose meaning
+/// lives in this map — a graph without it can find neighbours but cannot name
+/// them.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SnapshotMeta {
+    format: u32,
+    metric: Metric,
+    dim: usize,
+    keys: Vec<String>,
+}
+
+/// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
+/// migration.
+const SNAPSHOT_FORMAT: u32 = 1;
+
+/// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
+///
+/// The library `unwrap`s on a corrupt graph file — bad magic aborts the
+/// process — and a torn file on disk must cost a rebuild, never the node.
+/// Found by the corrupt-snapshot test, the same way `DistDot`'s assert was
+/// found: by testing the failure path rather than trusting the library's.
+/// `AssertUnwindSafe` is sound here: the closure touches only the leaked io
+/// and the files it reads — no engine state a mid-load panic could tear.
+fn load_graph<D>(dir: &std::path::Path) -> std::result::Result<Hnsw<'static, f32, D>, String>
+where
+    D: hnsw_rs::anndists::dist::Distance<f32> + Default + Send + Sync,
+{
+    let dir = dir.to_path_buf();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        // The io handle is leaked *inside* the closure — a captured `&mut`
+        // reborrows at the closure's lifetime, which the invariant
+        // `Hnsw<'static>` refuses; a local born `'static` does not have that
+        // problem. One small allocation per collection per process, bounded
+        // and deliberate, in exchange for not pulling in a
+        // self-referential-struct dependency to hold the pair.
+        let io = Box::leak(Box::new(hnsw_rs::hnswio::HnswIo::new(&dir, "index")));
+        io.load_hnsw::<f32, D>().map_err(|e| e.to_string())
+    }))
+    .unwrap_or_else(|_| Err("reload panicked; the file is corrupt".to_string()))
+}
+
 /// The graph, one variant per distance.
 ///
 /// `hnsw_rs` takes the distance as a type parameter, so the choice has to be
@@ -143,6 +186,91 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Persist this index into `dir`, atomically.
+    ///
+    /// Written beside the data rather than in it: redb stores the vectors —
+    /// the *source* — and the graph is derived state, exactly like the index
+    /// entries a secondary index derives from documents. The difference is
+    /// that this derivation costs O(n log n) and seconds, which is what makes
+    /// persisting it worth a file where a secondary index rebuild would not
+    /// be.
+    ///
+    /// Atomic by staging: the dump lands in a `.build` sibling that replaces
+    /// the real directory only once every file is on disk. A crash mid-save
+    /// leaves the previous snapshot (or none), never a torn one — and the
+    /// loader treats anything unreadable as absent anyway.
+    pub fn save(&self, dir: &std::path::Path) -> Result<()> {
+        use hnsw_rs::api::AnnT;
+
+        let io = |e: std::io::Error| VectorError::Snapshot(e.to_string());
+        let staging = dir.with_extension("build");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&staging).map_err(io)?;
+
+        match &self.graph {
+            Graph::Cosine(g) => g.file_dump(&staging, "index"),
+            Graph::Euclidean(g) => g.file_dump(&staging, "index"),
+        }
+        .map_err(|e| VectorError::Snapshot(e.to_string()))?;
+
+        let meta = SnapshotMeta {
+            format: SNAPSHOT_FORMAT,
+            metric: self.metric,
+            dim: self.dim,
+            keys: self.keys.clone(),
+        };
+        std::fs::write(
+            staging.join("meta.json"),
+            serde_json::to_vec(&meta).map_err(|e| VectorError::Snapshot(e.to_string()))?,
+        )
+        .map_err(io)?;
+
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::rename(&staging, dir).map_err(io)?;
+        debug!(vectors = self.keys.len(), ?dir, "saved HNSW snapshot");
+        Ok(())
+    }
+
+    /// Load a snapshot from `dir`, refusing one that describes a different
+    /// index than the caller wants.
+    ///
+    /// The metric and dimension checks are the trust boundary: a snapshot
+    /// written under an old vector configuration would compute every distance
+    /// wrongly, which is worse than the rebuild it saves. Any other failure —
+    /// missing files, torn writes, a format this build does not speak — is a
+    /// plain `Err`, and the caller discards the snapshot and rebuilds.
+    /// Correctness never depends on a load succeeding.
+    pub fn load(dir: &std::path::Path, metric: Metric, dim: usize) -> Result<Self> {
+        let corrupt = |detail: String| VectorError::Snapshot(detail);
+
+        let raw = std::fs::read(dir.join("meta.json")).map_err(|e| corrupt(e.to_string()))?;
+        let meta: SnapshotMeta =
+            serde_json::from_slice(&raw).map_err(|e| corrupt(e.to_string()))?;
+        if meta.format != SNAPSHOT_FORMAT {
+            return Err(corrupt(format!(
+                "snapshot format {} is not {SNAPSHOT_FORMAT}",
+                meta.format
+            )));
+        }
+        if meta.metric != metric || meta.dim != dim {
+            return Err(corrupt(format!(
+                "snapshot is {:?}/{}d, wanted {:?}/{}d — a reconfigured collection's snapshot \
+                 must not be trusted",
+                meta.metric, meta.dim, metric, dim
+            )));
+        }
+
+        let graph = match metric {
+            Metric::Cosine => load_graph::<DistCosine>(dir).map(Graph::Cosine),
+            Metric::Euclidean => load_graph::<DistL2>(dir).map(Graph::Euclidean),
+            Metric::Dot => Err("dot has no approximate index".to_string()),
+        }
+        .map_err(|e| corrupt(format!("graph reload: {e}")))?;
+
+        debug!(vectors = meta.keys.len(), ?dir, "loaded HNSW snapshot");
+        Ok(Self { graph, keys: meta.keys, metric, dim })
     }
 
     /// Approximate k-nearest neighbours, as chunk keys.

@@ -508,5 +508,11 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         }
         V::Storage(inner) => inner.into(),
         V::Core(inner) => inner.into(),
+        // Unreachable from a request path: the cache discards a bad snapshot
+        // and rebuilds rather than letting the error escape. Mapped anyway,
+        // because a match that must be total should not guess.
+        V::Snapshot(_) => {
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "snapshot", e.to_string())
+        }
     }
 }
