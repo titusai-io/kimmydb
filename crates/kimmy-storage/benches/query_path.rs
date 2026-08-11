@@ -78,8 +78,10 @@ fn fixture(buckets: i64, indexed: bool) -> (Engine, CollectionMeta, tempfile::Te
 /// Run a filter the way `exec` does, through the index.
 fn indexed_find(engine: &Engine, coll: &CollectionMeta, parsed: &Filter) -> usize {
     let plan = plan::choose(parsed, &coll.indexes).expect("the planner must pick the index");
-    let candidates =
-        engine.index_candidates(coll, plan.index_id, &plan.lower, &plan.upper).unwrap();
+    let mut candidates = std::collections::BTreeSet::new();
+    for (lower, upper) in &plan.ranges {
+        candidates.extend(engine.index_candidates(coll, plan.index_id, lower, upper).unwrap());
+    }
     let mut matched = 0;
     for key in candidates {
         if let Some(doc) = engine.get_by_encoded_key(coll, &key).unwrap()

@@ -1138,6 +1138,29 @@ mod tests {
     }
 
     #[test]
+    fn a_dollar_in_reads_only_its_probes() {
+        // The selectivity `$in` planning buys: twenty documents, two listed
+        // values, two candidates — where the collection scan it used to fall
+        // back to reads all twenty.
+        let (engine, coll, _dir) = engine();
+        for i in 0..20 {
+            engine.insert(&coll, doc! { "_id": i as i64, "n": i }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+
+        let filter = kimmy_query::filter::parse(&doc! { "n": { "$in": [3, 17] } }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes).expect("$in should plan");
+        assert_eq!(plan.ranges.len(), 2);
+
+        let mut candidates = std::collections::BTreeSet::new();
+        for (lower, upper) in &plan.ranges {
+            candidates.extend(engine.index_candidates(&coll, plan.index_id, lower, upper).unwrap());
+        }
+        assert_eq!(candidates.len(), 2, "two probes, two candidates, eighteen never touched");
+    }
+
+    #[test]
     fn a_two_sided_range_on_a_scalar_only_index_reads_only_the_range() {
         // The selectivity the flag buys back — and the proof the register's
         // one red drift is closed. Twenty scalar documents, a range covering
@@ -1155,7 +1178,12 @@ mod tests {
         assert!(plan.both_bounds, "a scalar-only index must use both bounds");
 
         let candidates = engine
-            .index_candidates_unless_multikey(&coll, plan.index_id, &plan.lower, &plan.upper)
+            .index_candidates_unless_multikey(
+                &coll,
+                plan.index_id,
+                &plan.ranges[0].0,
+                &plan.ranges[0].1,
+            )
             .unwrap()
             .expect("the index is not multikey");
         assert_eq!(candidates.len(), 5, "the scan must stop at the upper bound");
@@ -1220,7 +1248,12 @@ mod tests {
         engine.insert(&stale, doc! { "_id": 1i64, "n": [9, 0] }).unwrap();
 
         let checked = engine
-            .index_candidates_unless_multikey(&stale, plan.index_id, &plan.lower, &plan.upper)
+            .index_candidates_unless_multikey(
+                &stale,
+                plan.index_id,
+                &plan.ranges[0].0,
+                &plan.ranges[0].1,
+            )
             .unwrap();
         assert_eq!(checked, None, "a flipped flag must force a re-plan, not a narrow scan");
     }
@@ -1255,8 +1288,12 @@ mod tests {
         let filter = kimmy_query::filter::parse(query).unwrap();
         let plan = kimmy_query::plan::choose(&filter, &coll.indexes)?;
 
-        let candidates =
-            engine.index_candidates(coll, plan.index_id, &plan.lower, &plan.upper).unwrap();
+        // The union over the plan's ranges, exactly as `exec` performs it —
+        // one range for a plain plan, several for a `$in`.
+        let mut candidates = std::collections::BTreeSet::new();
+        for (lower, upper) in &plan.ranges {
+            candidates.extend(engine.index_candidates(coll, plan.index_id, lower, upper).unwrap());
+        }
 
         let mut ids = Vec::new();
         for key in candidates {
@@ -1327,6 +1364,16 @@ mod tests {
             doc! { "a": 1, "$or": [ { "n": 10 }, { "n": 20 } ] },
             doc! { "a": 1, "n": { "$ne": 20 } },
             doc! { "a": 1, "tags": "x" },
+            // $in: unions of point probes, over scalars, over a multikey
+            // index (a document whose array holds two listed values must
+            // appear once), with duplicate spellings, and after a prefix.
+            doc! { "a": { "$in": [1, 2] } },
+            doc! { "a": { "$in": [1, 1.0] } },
+            doc! { "a": { "$in": [999] } },
+            doc! { "a": { "$in": [] } },
+            doc! { "tags": { "$in": ["x", "y"] } },
+            doc! { "n": { "$in": [10, 40] } },
+            doc! { "a": 1, "n": { "$in": [10, 20] } },
         ];
 
         let mut exercised = 0;
@@ -1341,7 +1388,7 @@ mod tests {
             }
         }
         assert!(
-            exercised >= 12,
+            exercised >= 18,
             "only {exercised} queries used an index; test is not proving much"
         );
     }
@@ -1395,7 +1442,12 @@ mod tests {
         assert!(plan.both_bounds);
 
         let candidates = engine
-            .index_candidates_unless_multikey(&coll, plan.index_id, &plan.lower, &plan.upper)
+            .index_candidates_unless_multikey(
+                &coll,
+                plan.index_id,
+                &plan.ranges[0].0,
+                &plan.ranges[0].1,
+            )
             .unwrap()
             .expect("not multikey");
         assert_eq!(candidates.len(), 5, "the scan must stop at both ends of the range");
@@ -1518,7 +1570,7 @@ mod tests {
                 // recheck silently repairs. Both ends are needed to expose a
                 // range that is too narrow.
                 span in 0i32..4,
-                shape in 0u8..3,
+                shape in 0u8..4,
                 descending in any::<bool>(),
                 // Whether the index watches the writes arrive or backfills
                 // over them. The multikey flag has one code path for each,
@@ -1549,6 +1601,10 @@ mod tests {
                 let query = match shape {
                     0 => doc! { "a": probe },
                     1 => doc! { "a": { "$gte": probe } },
+                    // A union of point probes, including over arrays — a
+                    // document whose array holds both listed values must
+                    // appear once, not twice.
+                    2 => doc! { "a": { "$in": [probe, probe + span] } },
                     // Two-sided: the shape that catches a too-narrow range.
                     _ => doc! { "a": { "$gte": probe, "$lte": probe + span } },
                 };
