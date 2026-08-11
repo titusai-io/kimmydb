@@ -197,6 +197,58 @@ enough that a pathological query cannot occupy a core. Not changed; now checked.
 
 ---
 
+## Concurrent writers — flat, which is the answer
+
+The two measurements M5 left open, taken 2026-08-11 on the same machine class
+as the rest of this page (`cargo bench -p kimmy-storage -- writers`; a small
+three-field document, one durable commit per insert).
+
+| Writers | Aggregate throughput |
+|---:|---:|
+| 1 | 296 docs/sec |
+| 2 | 299 docs/sec |
+| 4 | 303 docs/sec |
+| 8 | 304 docs/sec |
+
+**Throughput is flat from one writer to eight.** redb has a single writer, so
+commits serialize — the question this run answers is whether concurrent
+clients merely *share* that writer's throughput or actively lose some of it
+to contention. They share it cleanly: within noise, eight writers cost
+nothing over one.
+
+What that decides:
+
+- **Parallelizing a bulk load buys nothing and costs nothing.** An operator
+  with a slow ingest should not reach for more connections.
+- **The single-writer rate is the sustained-ingest baseline**: ~300 small
+  documents/sec, ~3.4 ms per durable commit (the larger write-path fixture
+  above runs ~5–6 ms — document size is most of the difference).
+- **A bulk-insert API's win is per-commit overhead**, not concurrency — the
+  number that shapes M8's bulk-insert design when it lands.
+
+---
+
+## The baseline
+
+`scripts/bench-baseline.py` records every Criterion median to
+`scripts/bench-baseline.json` and compares a later run against it:
+
+```bash
+cargo bench -p kimmy-storage -p kimmy-vector
+scripts/bench-baseline.py check     # or `record`, to reset it
+```
+
+The tolerance is a deliberate ±50%: durable commits on a development machine
+jitter tens of percent between runs, and the baseline exists to catch a
+*shape* change — a 2×, an accidental O(n) — not a five-percent wobble.
+Still **recorded, not gated**, for the reason at the top of this page; what
+the script changes is that "check the branch didn't regress anything" is one
+command on the machine the baseline was recorded on, instead of an eyeball
+diff against these tables. Numbers from a different machine compare the
+machines.
+
+---
+
 ## A retracted figure
 
 An earlier revision of this file carried a `put_vectors` cost and an ingest rate
