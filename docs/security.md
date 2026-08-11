@@ -77,14 +77,49 @@ not the one that logged the user in. A per-node key would produce intermittent
 401s that only appear under load balancing. `KIMMY_JWT_SECRET` must be identical
 on every node — startup refuses to enable clustering without it.
 
-**Why grants are embedded.** Verification stays a pure function of the token —
-no store lookup on the hot path, and no cross-node consistency requirement for
-authorization. The cost is that **a revoked or edited role only takes effect
-when the token expires.** Hence the one-hour default lifetime.
+**Why grants are embedded.** Signature verification stays a pure function of
+the token — no store lookup to check a signature, and no cross-node consistency
+requirement for authorization.
 
-> ⚠️ There is **no revocation list**. Deleting a user or narrowing their grants
-> does not invalidate tokens already issued. To cut off access immediately you
-> must rotate `KIMMY_JWT_SECRET`, which invalidates every token cluster-wide.
+### Revoking a token
+
+A signature proves a token was issued by this cluster and has not expired. It
+cannot prove the account still exists. So the user record carries a
+**token version**, the token carries the value it was issued under, and a
+request is refused when they disagree ([ADR-052](decisions.md)).
+
+Four things end a session, and none of them needs you to rotate the cluster
+secret:
+
+| | |
+|---|---|
+| Deleting the user | No record, no version — the absence is the revocation |
+| Disabling the user | `disabled` is now checked on every request, not only at login |
+| Changing the password | Bumps the version, so sessions the old password opened end |
+| Changing grants | Bumps the version, so a **narrowed** permission takes effect at once |
+
+That last row is the one that mattered: grants ride inside the token, so before
+this a permission you took away kept working for the rest of the token's hour.
+
+```bash
+# End every session this user holds, on every node.
+curl -XPOST localhost:7878/v1/users/ada/password -H "$A" -d '{"password":"..."}'
+```
+
+**It is a per-user switch, not a per-session one.** Revoking ends *all* of that
+user's tokens; there is no way to kill one session and leave another. That is
+deliberate — a deny-list of individual tokens fails open when an entry has not
+reached the node handling the request, whereas a version mismatch fails closed.
+
+**Cluster-wide, at replication speed.** The edit is an ordinary write, so it
+replicates like any other and each node drops its cached view when it arrives.
+Measured on two nodes: the node taking the change refuses immediately, the
+other within about two seconds. Refusals are **not** distinguished — deleted,
+disabled and logged-out all return the same 401, because telling them apart
+reports on an account to whoever is holding a stale token for it.
+
+Rotating `KIMMY_JWT_SECRET` still works and is still the bigger hammer: it
+invalidates every token for every user at once.
 
 Minimum secret length is 16 bytes, enforced at construction — the whole cluster
 shares this value, so a weak one is a cluster-wide weakness.
@@ -223,7 +258,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **Client TLS** | ✅ Built | Native termination — see [TLS](#tls). A reverse proxy still works if you prefer it |
 | **Node↔node TLS** | ✅ Built | Bound to `cluster_secret` via channel binding — see below |
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
-| **No token revocation** | Not planned | Short TTLs; rotate the secret to revoke everything |
+| **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No field-level security** | Not planned | Collection is the finest granularity |

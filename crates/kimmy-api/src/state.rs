@@ -32,6 +32,10 @@ pub struct AppState {
     /// Where a webhook may be pointed. Held in state rather than read per
     /// request so the policy cannot differ between two calls.
     pub egress: crate::egress::EgressPolicy,
+    /// Whether a token is still good beyond its signature: the user still
+    /// exists, is still enabled, and has not had its tokens invalidated.
+    /// Cached, and kept honest by an oplog consumer (ADR-052).
+    pub sessions: crate::sessions::Sessions,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -63,7 +67,12 @@ impl FromRequestParts<SharedState> for Auth {
             .strip_prefix("Bearer ")
             .ok_or_else(|| ApiError::unauthorized("expected an Authorization: Bearer token"))?;
 
-        Ok(Auth(state.tokens.verify(token.trim())?))
+        let principal = state.tokens.verify(token.trim())?;
+        // The signature proves the token was issued here and has not expired.
+        // It cannot prove the account still exists, is still enabled, or has
+        // not been logged out since — which is this (ADR-052).
+        state.sessions.check(&state.engine, &principal)?;
+        Ok(Auth(principal))
     }
 }
 

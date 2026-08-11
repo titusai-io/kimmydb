@@ -8,9 +8,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ## As of 2026-08-11 — M8 in progress: Polish under way
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is ten of
-twelve tasks in.** The open PR is task 10; tasks 11 and 12 remain, and task 11
-is blocked on a maintainer decision (below).
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is eleven
+of twelve tasks in.** The open PR is task 11; only task 12 — the mutation pass
+and docs closeout — remains, and nothing is blocked on a decision.
 
 ### How work runs here — read this first
 
@@ -30,7 +30,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-052**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-053**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -59,8 +59,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#49 merged: through M8 task 9 (SRV discovery) |
-| `m8-webhook-node-id` (open PR) | **Task 10.** The node id travels inside the SWIM identity foca already gossips, and ownership hashes it instead of `SocketAddr`. Re-addressing used to move **50.8%** of subscriptions — worse than the node dying (25%). **A wire break: nodes must be upgraded together** ([ADR-051](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#50 merged: through M8 task 10 (webhook ownership by node id) |
+| `m8-token-revocation` (open PR) | **Task 11.** A per-user token version, checked in the `Auth` extractor against a cache an oplog consumer keeps honest. Deleting or disabling needs no bump — the absent record is the refusal. Admin routes evict synchronously *as well*, because the consumer alone fails quietly ([ADR-052](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board
 
@@ -77,15 +77,18 @@ Prove and Persist are complete; Polish is under way.
 | 7 | Bulk insert | ✅ #47 (ADR-048) |
 | 8 | Certificate reload | ✅ #48 (ADR-049) |
 | 9 | SRV discovery | ✅ #49 (ADR-050) |
-| 10 | Webhook ownership by node id | 🔵 open PR (ADR-051) |
-| 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
+| 10 | Webhook ownership by node id | ✅ #50 (ADR-051) |
+| 11 | Token revocation | 🔵 open PR (ADR-052) |
 | 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-**Recommended next branch: task 11 (token revocation).** ⏸ **Needs a decision
-first** — semantics. The leading candidate is a per-user token version bumped
-to invalidate every outstanding token, over a replicated deny-list, because it
-adds no per-request lookup that can miss. Bring it and write the ADR before any
-code.
+**Recommended next branch: task 12 (mutation pass + docs closeout), which
+closes M8.** `cargo-mutants` diff-scoped over everything M8 changed — the M7
+lesson says the escapes hide in the new callers, not the old layers. Then the
+closeout: [Deviations](deviations.md), this file, and the M8 section of
+[Roadmap](roadmap.md). Note that several M8 branches corrected a claim the plan
+had made (bulk insert's missing register entry, task 10's two wrong
+predictions, task 11's quiet-failure mode) — the closeout is the place to check
+no other stated expectation is still standing unverified.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -149,6 +152,17 @@ code.
   certificate and writing its key. Left undone on purpose:
   `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime
   dependency — 🟡 in the register.
+- **Task 11 — token revocation (ADR-052).** A per-user `token_version` on the
+  record, the value it was issued under in the token, and a 401 when they
+  disagree. Deleting or disabling a user needs no bump — the absent or disabled
+  record *is* the refusal. **The grants half is what mattered**: grants ride
+  inside the token, so a permission that was taken away kept working for the
+  rest of the hour. `TokenIssuer::verify` stays pure; the check lives in the
+  `Auth` extractor over a per-node cache. Found while building: **the oplog
+  consumer alone fails quietly** — the integration tests build a router with no
+  background tasks and kept honouring revoked tokens — so admin routes evict
+  synchronously too, and a missing consumer now only delays *cluster-wide*
+  revocation.
 - **Task 10 — webhook ownership by node id (ADR-051).** The id travels inside
   the SWIM identity foca already gossips, so no second channel and no
   address-to-node map. **Both of the plan's assumptions here were wrong, and
@@ -210,7 +224,6 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
 
 | Debt | |
 |---|---|
-| Deleting a user does not invalidate issued tokens | M8 task 11 |
 | `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
 | Rate limiting covers login only | waits on a capacity decision, not on measurement any more |
 | `update` and `delete` still apply document by document and can stop partway — bulk *insert* is atomic, they are not | by design |
@@ -242,6 +255,16 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   replicated entry address the same thing on every node.
 - **`kimmy_api::exec` is the single authorization point** for anything a
   principal asked for. Replication goes through `apply_remote`, not `exec`.
+- **A signature is not an authorization.** `TokenIssuer::verify` proves a token
+  was issued here and has not expired, and nothing else — the account may be
+  gone, disabled, or logged out since. The `Auth` extractor checks that, and it
+  must stay there: `verify` has no engine on purpose, which is what keeps it a
+  pure function (ADR-052).
+- **Both things that evict cached token state are load-bearing.** Admin routes
+  evict synchronously so a single node is correct with no background task; the
+  oplog consumer evicts so a *replicated* edit reaches this node at all. Drop
+  the first and revocation depends on remembering to spawn a task — which the
+  integration tests proved is easy to forget.
 - **The login rate limit is consulted before the password is verified**, or it
   stops bounding the Argon2 work that is half its purpose (ADR-038).
 - **Both serving paths use `into_make_service_with_connect_info`.** Without it

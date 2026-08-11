@@ -120,6 +120,13 @@ pub async fn run(config: Config) -> Result<()> {
         })
     };
 
+    // Keeps each node's view of "is this token still good" honest. Another
+    // ordinary oplog consumer, which is also what makes revoking on one node
+    // take effect on every node: a replicated write to `__users` publishes on
+    // the node that applied it (ADR-052).
+    let sessions_handle =
+        tokio::spawn(kimmy_api::sessions::invalidator(&engine, state.sessions.clone()));
+
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
     // as soon as its oplog entry is durable; embedding catches up behind it.
@@ -184,6 +191,8 @@ pub async fn run(config: Config) -> Result<()> {
     if let Some(handle) = cert_reloader {
         handle.abort();
     }
+    // Holds only a cache, which the next start rebuilds by reading.
+    sessions_handle.abort();
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
     worker_handle.abort();

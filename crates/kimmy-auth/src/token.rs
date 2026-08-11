@@ -30,6 +30,14 @@ pub struct Claims {
     /// only takes effect when the token expires — hence short lifetimes.
     #[serde(default)]
     pub grants: Vec<Grant>,
+    /// The user's token version at the moment this token was issued.
+    ///
+    /// Checked against the user's current version by the caller, not here:
+    /// this crate signs and decodes, and knows nothing about storage. See
+    /// ADR-052. `default` so tokens issued before the field existed decode as
+    /// 0, matching a user record that has never been bumped.
+    #[serde(default)]
+    pub tv: u64,
 }
 
 /// Signs and verifies tokens.
@@ -68,12 +76,19 @@ impl TokenIssuer {
             iat: now,
             exp: now + self.ttl_secs,
             grants: principal.grants.clone(),
+            tv: principal.token_version,
         };
         jsonwebtoken::encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)
             .map_err(|e| AuthError::TokenIssue(e.to_string()))
     }
 
     /// Verify a token and recover the principal it authorizes.
+    ///
+    /// Signature and expiry only: this stays a pure function with no engine and
+    /// no I/O, which is what keeps authentication free. The recovered principal
+    /// carries the token version it claims, and **checking that against the
+    /// user's current version is the caller's job** — it needs storage, and
+    /// this crate has none. See ADR-052.
     pub fn verify(&self, token: &str) -> Result<Principal> {
         let mut validation = Validation::new(Algorithm::HS256);
         validation.validate_exp = true;
@@ -88,7 +103,7 @@ impl TokenIssuer {
             },
         )?;
 
-        Ok(Principal::new(data.claims.sub, data.claims.grants))
+        Ok(Principal::new(data.claims.sub, data.claims.grants).at_version(data.claims.tv))
     }
 }
 
@@ -168,6 +183,7 @@ mod tests {
                 iat: now_secs(),
                 exp: now_secs() + 3600,
                 grants: vec![Grant::superuser()],
+                tv: 0,
             };
             base64::engine::general_purpose::URL_SAFE_NO_PAD
                 .encode(serde_json::to_vec(&claims).unwrap())
@@ -208,6 +224,7 @@ mod tests {
             iat: now_secs(),
             exp: now_secs() + 3600,
             grants: vec![Grant::superuser()],
+            tv: 0,
         };
         let payload = b64.encode(serde_json::to_vec(&claims).unwrap());
         let unsigned = format!("{header}.{payload}.");

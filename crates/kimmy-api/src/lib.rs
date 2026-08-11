@@ -20,6 +20,7 @@ pub mod ownership;
 pub mod ratelimit;
 pub mod routes;
 pub mod schema;
+pub mod sessions;
 pub mod state;
 pub mod users;
 pub mod vectors;
@@ -37,6 +38,7 @@ pub use audit::AuditMode;
 pub use error::ApiError;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
+pub use sessions::Sessions;
 pub use state::{AppState, SharedState};
 
 /// Assemble the shared server state.
@@ -64,6 +66,9 @@ pub fn state_with_egress(
     egress: egress::EgressPolicy,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
+    // Its own handle: the cache reads users on a miss, and threading the
+    // state's copy back into itself is not expressible.
+    let sessions = sessions::Sessions::new(UserStore::open(&engine)?);
     // Snapshots live beside the database file: the graph is state derived
     // from that file, so it belongs on the same volume, in the same backup
     // story (deliberately not *in* the backup — a restore rebuilds, which is
@@ -81,6 +86,7 @@ pub fn state_with_egress(
         limits,
         metrics: Metrics::default(),
         egress,
+        sessions,
     }))
 }
 

@@ -378,7 +378,7 @@ round-trips exactly, and there is a test pinning it.
 |---|---|---|
 | 400 | `bad_request` | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents |
 | 422 | `bad_request` | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
-| 401 | `unauthorized` | Missing, malformed, invalid, or expired token; bad credentials |
+| 401 | `unauthorized` | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | Denied by RBAC |
 | 404 | `not_found` | Document, collection, or user absent |
 | 409 | `conflict` | Collection exists; last user; self-deletion |

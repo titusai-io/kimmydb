@@ -84,7 +84,11 @@ pub async fn delete_user(
         return Err(ApiError::conflict("cannot delete the account you are signed in as"));
     }
 
-    Ok(Json(json!({ "deleted": state.users.delete(&state.engine, &name)? })))
+    let deleted = state.users.delete(&state.engine, &name)?;
+    // The account is gone, so the absence is the revocation — but only once
+    // this node stops remembering the version it used to have (ADR-052).
+    state.sessions.evict(&name);
+    Ok(Json(json!({ "deleted": deleted })))
 }
 
 #[derive(Deserialize)]
@@ -108,6 +112,7 @@ pub async fn set_password(
     }
 
     state.users.set_password(&state.engine, &name, &body.password)?;
+    state.sessions.evict(&name);
     Ok(Json(json!({ "updated": name })))
 }
 
@@ -124,6 +129,7 @@ pub async fn set_grants(
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
     state.users.set_grants(&state.engine, &name, body.grants)?;
+    state.sessions.evict(&name);
     Ok(Json(json!({ "updated": name })))
 }
 
