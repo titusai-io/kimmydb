@@ -42,7 +42,7 @@ fails fast on a bad volume mount.
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
 | `cluster.membership` | — | `true` | Gossip liveness over UDP. Off falls back to discovery-only peers |
-| `server.tls.cert_file` | `KIMMY_TLS_CERT` | — | PEM chain, leaf first. TLS is on when this and the key are both set |
+| `server.tls.cert_file` | `KIMMY_TLS_CERT` | — | PEM chain, leaf first. TLS is on when this and the key are both set. Re-read on SIGHUP, or within 60s of changing |
 | `server.tls.key_file` | `KIMMY_TLS_KEY` | — | PEM private key (PKCS#8, PKCS#1 or SEC1) |
 | `server.rate_limit.login_per_ip` | — | `10` | Failed logins per client address per window. `0` disables |
 | `server.rate_limit.login_per_ip_window_secs` | — | `60` | |
@@ -125,7 +125,10 @@ Image is ~106 MB (Debian slim runtime). Notes:
   give it a group the container can read.
 - `kimmyd` is PID 1 with **no shell wrapper**, so it receives `SIGTERM` directly
   from `docker stop` and Kubernetes. Measured: `docker stop` returns in ~290 ms
-  with exit code 0.
+  with exit code 0. It also takes **`SIGHUP` to reload the TLS certificate**
+  (`docker kill -s HUP`) — though under an orchestrator you rarely need to,
+  since a changed file is picked up within 60 seconds either way
+  ([Security](security.md)).
 - `/var/lib/kimmy` is a volume. **Losing it loses node identity**, not just data.
 - Ports: `7878/tcp` (HTTP), `7900/tcp` (replication) **and** `7900/udp` (SWIM membership). Both are needed when clustering.
 
@@ -291,6 +294,7 @@ port.
 | `kimmy_cluster_members` | Peers SWIM currently considers alive; 0 with clustering off. A formed three-node cluster reads 2 on every node |
 | `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet applied locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
+| `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 
 Counters render at zero before their first event, so a dashboard shows "nothing
 has gone wrong yet" rather than "no data".

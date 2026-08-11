@@ -8,9 +8,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ## As of 2026-08-11 — M8 in progress: Polish under way
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is seven
-of twelve tasks in.** The open PR is task 7; tasks 8–12 remain, and two of them
-are blocked on a maintainer decision (below).
+**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is eight
+of twelve tasks in.** The open PR is task 8; tasks 9–12 remain, and one of them
+is blocked on a maintainer decision (below).
 
 ### How work runs here — read this first
 
@@ -30,7 +30,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-049**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-050**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -59,8 +59,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#46 merged: through M8 task 6 (provider dialect audit) |
-| `m8-bulk-insert` (open PR) | **Task 7.** `POST /v1/db/{db}/coll/{coll}/bulk` — bare JSON array, one transaction, all-or-nothing, capped at 1000. `Engine::insert` and the new `insert_many` now share one `insert_in_txn` helper that does everything except the transaction lifecycle. **176× per document at batch 1000** ([ADR-048](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#47 merged: through M8 task 7 (bulk insert) |
+| `m8-cert-reload` (open PR) | **Task 8.** SIGHUP *and* a 60-second mtime poll, because neither covers both deployments. Almost no new machinery: `axum-server` already held the certificate behind a per-handshake handle and already exposed a reload. A bad new certificate is refused and the old one keeps serving — the opposite of the startup rule, on purpose ([ADR-049](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board
 
@@ -74,16 +74,17 @@ Prove and Persist are complete; Polish is under way.
 | 4 | HNSW snapshot persistence | ✅ #44 |
 | 5 | Vector reindex | ✅ #45 |
 | 6 | Provider dialect audit | ✅ #46 (ADR-047) |
-| 7 | Bulk insert | 🔵 open PR (ADR-048) |
-| 8 | **Certificate reload** | ⏸ **needs a decision** — trigger is SIGHUP vs. mtime poll. ADR before code. Constraint: certs are read before the socket binds (ADR-039), so a reload must keep a bad new cert from taking down a serving node |
+| 7 | Bulk insert | ✅ #47 (ADR-048) |
+| 8 | Certificate reload | 🔵 open PR (ADR-049) |
 | 9 | SRV discovery | `dns-srv:` parses but does not resolve; needs a resolver crate. **Must not add a second native crypto stack** — keep DNSSEC features off; `check-native-deps.sh` is the arbiter |
 | 10 | Webhook ownership by node id | Rendezvous hashes `SocketAddr` today, so re-addressing reshuffles subscriptions. Gossip the node id as member metadata and hash that. Verify with the harness; a mixed-version cluster produces duplicates, which at-least-once tolerates |
 | 11 | **Token revocation** | ⏸ **needs a decision** — semantics. Leading candidate: a per-user token version bumped to invalidate all outstanding tokens (no per-request lookup that can miss), over a replicated deny-list. ADR first |
 | 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
 
-**Recommended next branch: task 8 (certificate reload).** Bring the maintainer
-the trigger choice — SIGHUP vs. mtime poll — *before* writing code, and write
-the ADR before the code either way.
+**Recommended next branch: task 9 (SRV discovery).** No decision needed; the
+constraint is the whole difficulty — a resolver crate that can read SRV records
+**must not add a second native crypto stack**. Keep DNSSEC features off and let
+`./scripts/check-native-deps.sh` arbitrate before the work is called done.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -136,6 +137,17 @@ the ADR before the code either way.
   held the bulk-insert debt** the handoff's own table pointed at. Also note the
   path is `/bulk`, not `/docs/bulk`, which would shadow the document whose
   `_id` is `"bulk"`.
+- **Task 8 — certificate reload (ADR-049).** SIGHUP *and* a 60-second mtime
+  poll. Almost nothing was built: `axum-server` already held the certificate
+  behind a handle the acceptor reads per handshake and already exposed
+  `reload_from_pem_file`, so the branch is about *triggers* and the ADR is
+  mostly about why there are two — there is no way to signal PID 1 of a
+  Kubernetes pod, and a poll alone makes an operator wait out the interval.
+  The reload parses before it stores, which is what lets a bad certificate be
+  refused rather than fatal, and what absorbs the window between writing a new
+  certificate and writing its key. Left undone on purpose:
+  `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime
+  dependency — 🟡 in the register.
 
 ### Where the code is
 
@@ -175,7 +187,6 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
 
 | Debt | |
 |---|---|
-| Certificate reload needs a restart | M8 task 8 |
 | SRV discovery parses but does not resolve | M8 task 9 |
 | Webhook ownership hashes `SocketAddr`, not node ids | M8 task 10 |
 | Deleting a user does not invalidate issued tokens | M8 task 11 |
@@ -216,7 +227,11 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   there is no peer address, and every caller silently shares one rate-limit
   bucket.
 - **Certificates are read before the socket is bound**, so a bad one stops the
-  node rather than failing for whoever connects first (ADR-039).
+  node rather than failing for whoever connects first (ADR-039). **At reload
+  the rule inverts**: a bad certificate is refused and the one already serving
+  stays. Both are right — startup has nothing to fall back to and a serving
+  node does — and the reload half is what makes a botched rotation survivable
+  rather than an outage (ADR-049).
 - **Do not add a second native crypto stack.** `ring` is already in the build;
   anything selecting `aws-lc-rs` adds CMake for the same primitives.
 - **A type that crosses a format boundary needs a chosen representation, not an

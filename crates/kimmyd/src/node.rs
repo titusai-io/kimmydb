@@ -14,6 +14,13 @@ use crate::config::Config;
 /// Filename of the redb database inside the data directory.
 const DATABASE_FILE: &str = "kimmy.redb";
 
+/// How often the certificate files are checked for a change.
+///
+/// A constant rather than configuration: a renewal lands weeks before expiry,
+/// so a minute is far inside any window that matters, and SIGHUP already covers
+/// "now". See ADR-049.
+const CERT_POLL_INTERVAL: Duration = Duration::from_secs(60);
+
 pub async fn run(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
@@ -128,13 +135,29 @@ pub async fn run(config: Config) -> Result<()> {
     // than a handshake error for whoever connects first.
     let tls = load_tls(&config).await?;
 
+    // Only with TLS configured: with it off there is no file to watch, so
+    // there is no task to run (ADR-049).
+    let cert_reloader = match (&tls, config.server.tls.pair()) {
+        (Some(tls), Some((cert, key))) => Some(spawn_cert_reloader(
+            tls.clone(),
+            cert.to_path_buf(),
+            key.to_path_buf(),
+            Arc::clone(&state),
+        )),
+        _ => None,
+    };
+
     let listener = tokio::net::TcpListener::bind(config.server.bind)
         .await
         .with_context(|| format!("binding {}", config.server.bind))?;
     let local = listener.local_addr().unwrap_or(config.server.bind);
 
     if tls.is_some() {
-        info!(bind = %local, "serving HTTPS, WebSocket over TLS, and MCP");
+        info!(
+            bind = %local,
+            poll_secs = CERT_POLL_INTERVAL.as_secs(),
+            "serving HTTPS, WebSocket over TLS, and MCP; SIGHUP or a changed file reloads the certificate"
+        );
     } else {
         info!(bind = %local, "serving HTTP and WebSocket");
         if !is_loopback(&local) && !config.auth.insecure_no_auth {
@@ -154,6 +177,11 @@ pub async fn run(config: Config) -> Result<()> {
 
     serve(listener, app, tls).await.context("serving")?;
 
+    // Nothing to drain: it holds no state beyond the mtimes it last saw, and
+    // the certificate in use is already in the acceptor.
+    if let Some(handle) = cert_reloader {
+        handle.abort();
+    }
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
     worker_handle.abort();
@@ -205,6 +233,150 @@ async fn load_tls(config: &Config) -> Result<Option<RustlsConfig>> {
     })?;
     info!(cert = %cert.display(), "TLS enabled");
     Ok(Some(tls))
+}
+
+/// Watch the certificate files and swap them in without a restart.
+///
+/// Two triggers, one reload (ADR-049). SIGHUP is what an operator on systemd or
+/// bare metal reaches for; the poll is what works where a certificate is
+/// rotated *by* something rather than by someone, such as cert-manager
+/// rewriting a mounted Secret, since there is no convenient way to signal PID 1
+/// of a pod. Neither covers both deployments alone.
+///
+/// The swap itself costs nothing: `RustlsConfig` is the live handle the running
+/// acceptor reads per handshake, so connections already in flight finish under
+/// the certificate they negotiated with and the next handshake gets the new one.
+fn spawn_cert_reloader(
+    tls: RustlsConfig,
+    cert: std::path::PathBuf,
+    key: std::path::PathBuf,
+    metrics: kimmy_api::SharedState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        // The baseline is taken now, so the first tick compares against what
+        // was actually loaded rather than reloading once for no reason.
+        let mut seen = stamps(&cert, &key).await;
+
+        let mut hangup = Hangup::install();
+
+        let mut ticker = tokio::time::interval(CERT_POLL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // `interval` fires immediately; that first tick is the one we just took
+        // the baseline for.
+        ticker.tick().await;
+
+        loop {
+            let forced = tokio::select! {
+                _ = ticker.tick() => false,
+                _ = hangup.recv() => true,
+            };
+
+            let current = stamps(&cert, &key).await;
+            // An explicit SIGHUP reloads whatever is on disk. The timer only
+            // acts on a change, or every node would re-parse its certificate
+            // once a minute forever.
+            if !forced && current == seen {
+                continue;
+            }
+            if forced {
+                info!("SIGHUP received, reloading the TLS certificate");
+            }
+            reload(&tls, &cert, &key, &metrics.metrics).await;
+            // Recorded whether or not the reload succeeded: a file that cannot
+            // be parsed must not be retried every minute until it changes
+            // again, or one bad rotation would fill the log forever.
+            seen = current;
+        }
+    })
+}
+
+/// SIGHUP, where there is such a thing.
+///
+/// Wrapped so the reload loop has one shape on every platform. Where the signal
+/// is unavailable — a non-unix target, or a handler that would not install —
+/// `recv` simply never completes and the poll carries the feature alone.
+struct Hangup {
+    #[cfg(unix)]
+    signal: Option<tokio::signal::unix::Signal>,
+}
+
+impl Hangup {
+    fn install() -> Self {
+        #[cfg(unix)]
+        {
+            match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup()) {
+                Ok(signal) => Self { signal: Some(signal) },
+                Err(e) => {
+                    // Degrade rather than give up the whole feature: the poll
+                    // is still worth running without a signal.
+                    warn!(
+                        error = %e,
+                        "could not install the SIGHUP handler; certificate reload is poll-only"
+                    );
+                    Self { signal: None }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        Self {}
+    }
+
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        match self.signal.as_mut() {
+            Some(signal) => {
+                signal.recv().await;
+            }
+            None => std::future::pending().await,
+        }
+        #[cfg(not(unix))]
+        std::future::pending().await
+    }
+}
+
+/// Modification times of both files, or `None` if either could not be read.
+///
+/// A rotation can momentarily replace a file, so a failed stat is not an error
+/// here — it compares unequal to whatever was seen last, and the reload that
+/// follows reports the real problem if there is one.
+async fn stamps(
+    cert: &std::path::Path,
+    key: &std::path::Path,
+) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+    let cert = tokio::fs::metadata(cert).await.ok()?.modified().ok()?;
+    let key = tokio::fs::metadata(key).await.ok()?.modified().ok()?;
+    Some((cert, key))
+}
+
+/// Swap in the certificate on disk, or keep the one already serving.
+///
+/// A failure here must not take the node down: unlike startup, where a bad
+/// certificate is fatal because there is nothing to fall back to, a serving
+/// node has something that works. `reload_from_pem_file` parses the pair before
+/// it stores it, so a bad or half-written pair leaves the live configuration
+/// untouched — which is also what absorbs the window between writing a new
+/// certificate and writing its key. See ADR-039 and ADR-049.
+async fn reload(
+    tls: &RustlsConfig,
+    cert: &std::path::Path,
+    key: &std::path::Path,
+    metrics: &kimmy_api::Metrics,
+) {
+    match tls.reload_from_pem_file(cert, key).await {
+        Ok(()) => {
+            metrics.record_tls_reload(true);
+            info!(cert = %cert.display(), "TLS certificate reloaded");
+        }
+        Err(e) => {
+            metrics.record_tls_reload(false);
+            warn!(
+                error = %e,
+                cert = %cert.display(),
+                key = %key.display(),
+                "could not reload the TLS certificate; keeping the one currently in use"
+            );
+        }
+    }
 }
 
 /// Serve the router, with or without TLS.
@@ -479,6 +651,151 @@ mod tests {
         std::fs::write(&key_path, issued.signing_key.serialize_pem()).unwrap();
         let der = issued.cert.der().to_vec();
         (dir, cert_path, key_path, der)
+    }
+
+    /// Another self-signed certificate for `localhost`, written over the paths
+    /// an existing one occupies.
+    ///
+    /// A *different* certificate, deliberately: the only way to prove a reload
+    /// swapped anything is a client that trusts the new one and not the old.
+    fn overwrite_with_a_new_cert(
+        cert_path: &std::path::Path,
+        key_path: &std::path::Path,
+    ) -> Vec<u8> {
+        let issued = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(cert_path, issued.cert.pem()).unwrap();
+        std::fs::write(key_path, issued.signing_key.serialize_pem()).unwrap();
+        issued.cert.der().to_vec()
+    }
+
+    /// Whether a handshake against `addr` succeeds while trusting only `der`.
+    async fn handshake_trusting(addr: SocketAddr, der: Vec<u8>) -> bool {
+        let Ok(stream) = tokio::net::TcpStream::connect(addr).await else {
+            return false;
+        };
+        let name =
+            tokio_rustls::rustls::pki_types::ServerName::try_from("localhost").unwrap().to_owned();
+        client_config(der).connect(name, stream).await.is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_reload_swaps_the_certificate_the_next_handshake_gets() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_dir, cert, key, first_der) = self_signed();
+
+        let tls = RustlsConfig::from_pem_file(&cert, &key).await.unwrap();
+        let addr = serve_echoing_peer(Some(tls.clone())).await;
+        let metrics = kimmy_api::Metrics::default();
+
+        assert!(
+            handshake_trusting(addr, first_der.clone()).await,
+            "the certificate the server started with must serve"
+        );
+
+        let second_der = overwrite_with_a_new_cert(&cert, &key);
+        reload(&tls, &cert, &key, &metrics).await;
+
+        assert!(
+            handshake_trusting(addr, second_der).await,
+            "a new handshake must get the reloaded certificate, with no restart and no rebind"
+        );
+        assert!(
+            !handshake_trusting(addr, first_der).await,
+            "and the replaced certificate must be gone, or the reload only appeared to work"
+        );
+        assert!(
+            metrics.render().contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"),
+            "a successful reload is counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_certificate_leaves_the_one_in_use_serving() {
+        // The hazard this whole feature introduces. At startup a bad
+        // certificate is fatal because there is nothing to fall back to; at
+        // reload there is, and taking the node down instead would turn a
+        // botched rotation into an outage. See ADR-039 and ADR-049.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_dir, cert, key, der) = self_signed();
+
+        let tls = RustlsConfig::from_pem_file(&cert, &key).await.unwrap();
+        let addr = serve_echoing_peer(Some(tls.clone())).await;
+        let metrics = kimmy_api::Metrics::default();
+
+        std::fs::write(&cert, b"-----BEGIN CERTIFICATE-----\nnot a certificate\n").unwrap();
+        reload(&tls, &cert, &key, &metrics).await;
+
+        assert!(
+            handshake_trusting(addr, der).await,
+            "a node serving a good certificate must keep serving it when a bad one appears"
+        );
+        assert!(
+            metrics.render().contains("kimmy_tls_reloads_total{outcome=\"failed\"} 1"),
+            "and the failure must be visible, because its consequence arrives weeks later"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_half_rotated_pair_is_refused_rather_than_half_applied() {
+        // Replacing a certificate and its key is two writes, and between them
+        // the pair does not match. The window is absorbed, not closed: the
+        // mismatch fails to parse and the old pair keeps serving until the
+        // next attempt finds both halves.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (_dir, cert, key, der) = self_signed();
+
+        let tls = RustlsConfig::from_pem_file(&cert, &key).await.unwrap();
+        let addr = serve_echoing_peer(Some(tls.clone())).await;
+        let metrics = kimmy_api::Metrics::default();
+
+        // A new certificate, but still the old key.
+        let orphan = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        std::fs::write(&cert, orphan.cert.pem()).unwrap();
+
+        reload(&tls, &cert, &key, &metrics).await;
+        assert!(
+            handshake_trusting(addr, der).await,
+            "a mismatched pair must not be adopted; the previous one keeps serving"
+        );
+
+        // Now the key lands, and the pair is whole.
+        std::fs::write(&key, orphan.signing_key.serialize_pem()).unwrap();
+        reload(&tls, &cert, &key, &metrics).await;
+        assert!(
+            handshake_trusting(addr, orphan.cert.der().to_vec()).await,
+            "once both halves are on disk the retry must succeed"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_poll_notices_a_rewritten_file_and_ignores_an_untouched_one() {
+        let (_dir, cert, key, _) = self_signed();
+
+        let before = stamps(&cert, &key).await;
+        assert!(before.is_some(), "both files exist, so both stat");
+        assert_eq!(before, stamps(&cert, &key).await, "an untouched pair must not look changed");
+
+        // Filesystem timestamps are coarse enough that an immediate rewrite can
+        // land in the same tick, so the mtime is set explicitly rather than
+        // raced for.
+        overwrite_with_a_new_cert(&cert, &key);
+        let later = std::time::SystemTime::now() + Duration::from_secs(10);
+        std::fs::File::options().write(true).open(&cert).unwrap().set_modified(later).unwrap();
+
+        assert_ne!(before, stamps(&cert, &key).await, "a rewritten certificate must look changed");
+    }
+
+    #[tokio::test]
+    async fn a_missing_file_reads_as_changed_rather_than_as_an_error() {
+        // A rotation can momentarily unlink a file. That must not panic, and it
+        // must not read as "unchanged" — the reload that follows is what
+        // reports the real problem, if there is one.
+        let (_dir, cert, key, _) = self_signed();
+        let present = stamps(&cert, &key).await;
+
+        std::fs::remove_file(&cert).unwrap();
+        assert_eq!(stamps(&cert, &key).await, None);
+        assert_ne!(stamps(&cert, &key).await, present);
     }
 
     /// Serve a router that reports the caller's address, and return where it is.

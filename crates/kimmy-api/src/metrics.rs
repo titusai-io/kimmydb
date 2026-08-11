@@ -53,6 +53,8 @@ pub struct Metrics {
     webhook_invalidated: AtomicU64,
     webhook_backlog_secs: AtomicU64,
     cluster_members: AtomicU64,
+    tls_reloads_ok: AtomicU64,
+    tls_reloads_failed: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -78,6 +80,8 @@ impl Default for Metrics {
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
             cluster_members: AtomicU64::new(0),
+            tls_reloads_ok: AtomicU64::new(0),
+            tls_reloads_failed: AtomicU64::new(0),
         }
     }
 }
@@ -185,6 +189,17 @@ impl Metrics {
         self.backups.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one certificate reload attempt.
+    ///
+    /// A failed reload is the quiet failure this metric exists for: the node
+    /// keeps serving the certificate it already had, perfectly, until that one
+    /// expires and every client drops at once. Nothing about a working request
+    /// reveals that the renewal never took (ADR-049).
+    pub fn record_tls_reload(&self, succeeded: bool) {
+        let counter = if succeeded { &self.tls_reloads_ok } else { &self.tls_reloads_failed };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
     }
@@ -242,7 +257,11 @@ impl Metrics {
              kimmy_cluster_members {cluster}\n\
              # HELP kimmy_replication_lag_seconds Seconds of peer oplog history not yet applied locally, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
              # TYPE kimmy_replication_lag_seconds gauge\n\
-             kimmy_replication_lag_seconds {lag}\n",
+             kimmy_replication_lag_seconds {lag}\n\
+             # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
+             # TYPE kimmy_tls_reloads_total counter\n\
+             kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
+             kimmy_tls_reloads_total{{outcome=\"failed\"}} {tls_fail}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -260,6 +279,8 @@ impl Metrics {
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = self.get(&self.cluster_members),
             lag = self.get(&self.replication_lag_secs),
+            tls_ok = self.get(&self.tls_reloads_ok),
+            tls_fail = self.get(&self.tls_reloads_failed),
         );
         self.render_latency(&mut out);
         out
@@ -341,8 +362,8 @@ mod tests {
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 17 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 32, "expected one sample per series: {out}");
+        // 19 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 34, "expected one sample per series: {out}");
     }
 
     #[test]

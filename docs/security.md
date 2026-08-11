@@ -281,6 +281,54 @@ WARN serving plaintext HTTP on a non-loopback address; tokens and passwords
 
 Loopback binds do not warn.
 
+### Renewing a certificate without a restart
+
+A renewed certificate takes effect on a running node. Two triggers, one
+reload ([ADR-049](decisions.md)):
+
+```bash
+kill -HUP $(pidof kimmyd)      # or: systemctl reload kimmyd
+                               # or: docker kill -s HUP <container>
+```
+
+...and, with no signal at all, the node re-reads the pair **within 60 seconds**
+of either file changing. That is the trigger that matters where a certificate
+is rotated *by* something rather than by someone — cert-manager rewriting a
+mounted Secret, where there is no convenient way to signal PID 1 of a pod.
+
+The swap is free: the running listener holds the certificate behind a handle it
+reads per handshake, so nothing rebinds and nothing is dropped. Connections
+already in flight finish under the certificate they negotiated with; the next
+handshake gets the new one.
+
+**A bad new certificate cannot take the node down.** This is the opposite of
+the startup rule above, and deliberately so: at startup there is nothing to
+fall back to, and on a serving node there is. The pair is parsed *before* it is
+adopted, so anything unparseable — a truncated file, a certificate whose key
+has not landed yet — leaves the certificate already in use serving:
+
+```
+WARN could not reload the TLS certificate; keeping the one currently in use
+     error=keys may not be consistent: KeyMismatch
+```
+
+That is also what absorbs the window between writing a new certificate and
+writing its key: the mismatch is refused, and the next trigger — a second
+SIGHUP, or the next poll — completes the rotation once both halves are on disk.
+
+**Watch `kimmy_tls_reloads_total{outcome="failed"}`.** A reload that fails is
+silent in every other way: the node keeps serving the old certificate
+perfectly, right up until it expires and every client drops at once.
+
+```
+kimmy_tls_reloads_total{outcome="ok"} 2
+kimmy_tls_reloads_total{outcome="failed"} 1
+```
+
+Note what this does *not* catch — a certificate nobody ever tried to rotate
+reports nothing, because no reload was attempted. An expiry gauge would cover
+that and is recorded as the follow-up in [Deviations](deviations.md).
+
 ### What this does and does not cover
 
 | | |
@@ -290,7 +338,7 @@ Loopback binds do not warn.
 | MCP at `/mcp` | ✅ Same listener, same certificate |
 | **Node → node replication** | ❌ Still plaintext. `cluster_secret` authenticates peers; it does not hide what they exchange |
 | **Client certificates (mTLS)** | ❌ Not planned. Clients authenticate with a bearer token |
-| **Certificate reload** | ❌ A renewed certificate needs a restart |
+| **Certificate reload** | ✅ SIGHUP, or within 60s of the file changing. A bad new certificate is refused and the old one keeps serving |
 
 ### Notes
 

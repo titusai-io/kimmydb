@@ -525,6 +525,7 @@ Security properties are asserted as behaviour, not assumed:
 | Login does not reveal whether a user exists | `a_wrong_password_does_not_reveal_whether_the_user_exists` |
 | RBAC blocks writes, DDL, and user admin | `rbac_is_enforced_on_every_route` |
 | A failed batch inserts nothing at all | `a_bulk_insert_with_a_duplicate_id_inserts_nothing` |
+| A bad new certificate does not take down a serving node | `an_unreadable_certificate_leaves_the_one_in_use_serving` |
 | 403 does not leak existence | same test — a nonexistent collection also returns 403 |
 | Listing hides unreadable collections | `listing_hides_what_the_caller_cannot_read` |
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |
@@ -633,6 +634,12 @@ manually and are recorded so they can be repeated:
 | Three-node cluster in containers | ✅ collection, unique index and documents replicated to all three, bidirectionally; one JWT valid on every node; writes accepted and converged with a node down |
 | **`c.t` — the collection that would not replicate** | ✅ after the id fix, converged to both peers in 8 s with zero malformed-frame warnings |
 | SWIM under the compose defaults | ✅ **after** pinning each node's cluster bind: both survivors logged `member down` within 17 ms of each other. Before it, every node advertised `127.0.0.1` and no node was ever declared down |
+| Bulk insert on a live node | ✅ 500 documents in **0.16 s** against **11.6 s** as 500 requests; an intra-batch duplicate and a collision with stored state each 409'd naming the position with the collection unchanged; 1001 refused and 1000 accepted; a 2.4 MB body `413`; a unique index broken inside one batch left nothing behind and still served an index-backed query afterwards; 25 change events for 25 documents |
+| **Certificate reload by SIGHUP** | ✅ the served certificate changed from one to another on signal, with requests still 200 through the swap |
+| **Certificate reload by the poll, no signal sent** | ✅ picked up **~58 s** after the files changed — the trigger that matters where cert-manager rotates a mounted Secret |
+| A corrupt certificate on a serving node | ✅ still served the previous certificate, still healthy, process alive, `kimmy_tls_reloads_total{outcome="failed"} 1` |
+| A half-rotated pair (new certificate, old key) | ✅ refused with `KeyMismatch`, kept serving the old pair, and the retry after the key landed completed the rotation |
+| SIGTERM on a node with the reloader running | ✅ still drained and exited cleanly |
 
 The two M3 bugs in the table above were both found here rather than by the
 suite, which is the argument for keeping this section: the failures a test
