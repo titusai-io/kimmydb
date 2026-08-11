@@ -419,4 +419,26 @@ mod tests {
         assert!(out.contains("kimmy_authz_denied_total 0"), "{out}");
         assert!(out.contains("kimmy_rate_limited_total 0"), "{out}");
     }
+
+    #[test]
+    fn the_pushed_gauges_render_what_was_pushed() {
+        // Each of these is *set* from somewhere else — the replication loop,
+        // the dispatcher, the certificate reloader — and every existing
+        // assertion about them checks a value a broken setter would also
+        // produce: the cluster harness waits for replication lag to reach
+        // **zero**, which is exactly what a setter that does nothing reports.
+        // A non-zero value is the only one that distinguishes the two.
+        let m = Metrics::default();
+        m.set_replication_lag_secs(7);
+        m.set_cluster_members(2);
+        m.record_tls_reload(true);
+        m.record_tls_reload(false);
+        m.record_tls_reload(false);
+
+        let out = m.render();
+        assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
+        assert!(out.contains("kimmy_cluster_members 2"), "{out}");
+        assert!(out.contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"), "{out}");
+        assert!(out.contains("kimmy_tls_reloads_total{outcome=\"failed\"} 2"), "{out}");
+    }
 }

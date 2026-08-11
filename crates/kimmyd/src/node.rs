@@ -283,19 +283,17 @@ fn spawn_cert_reloader(
             };
 
             let current = stamps(&cert, &key).await;
-            // An explicit SIGHUP reloads whatever is on disk. The timer only
-            // acts on a change, or every node would re-parse its certificate
-            // once a minute forever.
-            if !forced && current == seen {
-                continue;
+            if should_reload(forced, current, seen) {
+                if forced {
+                    info!("SIGHUP received, reloading the TLS certificate");
+                }
+                reload(&tls, &cert, &key, &metrics.metrics).await;
             }
-            if forced {
-                info!("SIGHUP received, reloading the TLS certificate");
-            }
-            reload(&tls, &cert, &key, &metrics.metrics).await;
-            // Recorded whether or not the reload succeeded: a file that cannot
-            // be parsed must not be retried every minute until it changes
-            // again, or one bad rotation would fill the log forever.
+            // Recorded whether or not the reload succeeded, and whether or not
+            // one happened: a file that cannot be parsed must not be retried
+            // every minute until it changes again, or one bad rotation would
+            // fill the log forever. (When no reload happened, `current` already
+            // equals `seen`.)
             seen = current;
         }
     })
@@ -345,15 +343,29 @@ impl Hangup {
     }
 }
 
+/// Modification times of a certificate and its key, absent when either could
+/// not be read.
+type Stamps = Option<(std::time::SystemTime, std::time::SystemTime)>;
+
+/// Whether this wake-up should re-read the certificate.
+///
+/// An explicit SIGHUP reloads whatever is on disk, whether or not anything
+/// looks different — an operator who has just replaced a file is not asking a
+/// question. The timer only acts on a change, or every node would re-parse its
+/// certificate once a minute forever.
+///
+/// Extracted from the loop so it can be tested: the loop itself runs until the
+/// process ends, and the interesting part is this decision.
+fn should_reload(forced: bool, current: Stamps, seen: Stamps) -> bool {
+    forced || current != seen
+}
+
 /// Modification times of both files, or `None` if either could not be read.
 ///
 /// A rotation can momentarily replace a file, so a failed stat is not an error
 /// here — it compares unequal to whatever was seen last, and the reload that
 /// follows reports the real problem if there is one.
-async fn stamps(
-    cert: &std::path::Path,
-    key: &std::path::Path,
-) -> Option<(std::time::SystemTime, std::time::SystemTime)> {
+async fn stamps(cert: &std::path::Path, key: &std::path::Path) -> Stamps {
     let cert = tokio::fs::metadata(cert).await.ok()?.modified().ok()?;
     let key = tokio::fs::metadata(key).await.ok()?.modified().ok()?;
     Some((cert, key))
@@ -797,6 +809,25 @@ mod tests {
         std::fs::File::options().write(true).open(&cert).unwrap().set_modified(later).unwrap();
 
         assert_ne!(before, stamps(&cert, &key).await, "a rewritten certificate must look changed");
+    }
+
+    #[test]
+    fn a_signal_always_reloads_and_the_timer_only_reloads_on_a_change() {
+        let t = |secs: u64| std::time::UNIX_EPOCH + Duration::from_secs(secs);
+        let a: Stamps = Some((t(1), t(2)));
+        let b: Stamps = Some((t(9), t(2)));
+
+        // The timer: a change, and only a change.
+        assert!(should_reload(false, b, a), "a moved mtime must reload");
+        assert!(!should_reload(false, a, a), "an unchanged pair must not");
+        // A file that vanished mid-rotation reads as changed, not as nothing.
+        assert!(should_reload(false, None, a));
+        assert!(should_reload(false, a, None));
+
+        // SIGHUP: unconditional. An operator who has just replaced a file is
+        // not asking whether it looks different.
+        assert!(should_reload(true, a, a), "a signal must reload regardless");
+        assert!(should_reload(true, None, None));
     }
 
     #[tokio::test]

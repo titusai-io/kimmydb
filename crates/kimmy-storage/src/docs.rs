@@ -645,6 +645,28 @@ mod tests {
     }
 
     #[test]
+    fn a_bulk_failure_names_the_document_when_it_can() {
+        // The position is the only thing a caller can act on when nothing was
+        // written, so it has to survive into the message rather than living
+        // only in a field somebody might not read.
+        let (engine, coll, _dir) = engine();
+        let err = engine
+            .insert_many(&coll, vec![doc! { "_id": 1 }, doc! { "_id": 1 }])
+            .expect_err("a duplicate must fail the batch");
+
+        let shown = err.to_string();
+        assert!(shown.contains("index 1"), "the position must be in the message: {shown}");
+        assert!(shown.contains("duplicate"), "and so must the cause: {shown}");
+        assert!(std::error::Error::source(&err).is_some(), "the cause stays reachable");
+
+        // A failure of the transaction rather than of a document has no
+        // position, and must not invent one.
+        let plain =
+            BulkInsertError { index: None, source: CoreError::DuplicateKey("x".into()).into() };
+        assert!(!plain.to_string().contains("index"), "{}", plain);
+    }
+
+    #[test]
     fn insert_many_stores_every_document_and_returns_their_ids() {
         let (engine, coll, _dir) = engine();
         let ids = engine

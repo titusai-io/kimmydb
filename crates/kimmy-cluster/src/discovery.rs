@@ -566,6 +566,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_resolver_that_cannot_answer_is_an_error_not_an_empty_set() {
+        // The other side of the no-records rule, and the one that matters more.
+        // "No SRV records yet" is an empty set on purpose; a resolver that
+        // cannot be reached at all must **not** take the same path, or a node
+        // whose DNS is broken would look exactly like a cluster waiting for its
+        // first member — silently, every tick, forever.
+        let dead = "127.0.0.1:1".parse::<SocketAddr>().unwrap();
+        let resolved =
+            resolve_srv_with(&resolver_pointed_at(dead), "_kimmy._tcp.example.com").await;
+
+        assert!(
+            matches!(resolved, Err(ResolveError::Srv { .. })),
+            "an unreachable resolver must be reported, got {resolved:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn the_seed_source_reaches_srv_resolution_at_all() {
         // Guards the wiring rather than the resolution: `dns-srv:` returned a
         // "not implemented" error for four milestones, and the parse tests

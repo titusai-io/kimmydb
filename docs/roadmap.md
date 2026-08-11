@@ -20,7 +20,7 @@ graph LR
     M5["<b>M5</b> ✅<br/>hardening"]
     M6["<b>M6</b> ✅<br/>webhooks"]
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
-    M8["<b>M8</b> 🚧<br/>prove, persist,<br/>polish"]
+    M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8
 
@@ -33,7 +33,7 @@ graph LR
     style M5 fill:#2f5d3a,color:#fff
     style M6 fill:#2f5d3a,color:#fff
     style M7 fill:#2f5d3a,color:#fff
-    style M8 fill:#2d3748,color:#fff
+    style M8 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -46,7 +46,7 @@ graph LR
 | **M5** | Rate limiting, TLS both fronts, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
-| **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | 🚧 Planned |
+| **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -531,7 +531,7 @@ limiting beyond login still waits on the benchmark work, as agreed in M5.
 
 ---
 
-## M8 — Prove, persist, polish 🚧
+## M8 — Prove, persist, polish ✅
 
 Everything both declined M7 themes held, plus the two questions that shaped
 the milestone: *is the gossip protocol actually maintaining cluster state,
@@ -592,6 +592,32 @@ three were settled — and their ADRs written — before any code was.
 
 Coordinated unique enforcement (reserved since M4), per-username rate
 limiting defaults, and everything in the not-planned table below.
+
+### What M8 actually taught
+
+Twelve tasks, and the recurring finding was not a bug in the code but **a
+claim in the plan that nobody had checked**. Four of them:
+
+- Task 1 asked whether gossip was maintaining cluster state "provably". It was
+  not: **no webhook had ever been delivered in any clustered deployment**,
+  because SWIM's live set holds peers only and an owner computed over it could
+  never be the node computing it. Single-node worked, so all of M6 passed.
+- Task 5 found the M2 claim that backfills could be re-enabled from the oplog
+  had **always been false** — a long-lived worker's position is past the old
+  entries, so enabling embedding on existing documents embedded nothing.
+- Task 7 found the deviations register **had never held** the bulk-insert debt
+  that the handoff's own table pointed at.
+- Task 10 found ADR-045's justification for hashing addresses was wrong by a
+  factor of two (re-addressing moves 50.8% of subscriptions, a node dying 25%),
+  *and* that the M8 plan's prediction about mixed-version clusters was wrong in
+  the other direction — postcard is not self-describing, so membership does not
+  form at all rather than merely double-delivering.
+
+The pattern is one thing: **an assertion with no mechanism behind it decays
+silently.** M8's most durable output is not a feature but the harness, the
+benchmark baseline, the native-dependency check and the metric buckets — each
+of which turns a sentence somebody wrote into something that fails when it
+stops being true.
 
 ---
 

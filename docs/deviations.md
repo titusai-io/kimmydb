@@ -437,6 +437,42 @@ the other within about two seconds.
 
 ---
 
+## 🟢 M8 closed with a mutation pass over the whole milestone diff
+
+**227 mutants, 47 escapes, 32 closed.** `cargo-mutants --in-diff` over
+everything M8 changed, run per crate so each mutant scores against a fast
+relevant suite. Seventeen new tests killed 31; one restructuring removed
+another by construction. The full account, including why the remaining 15 are
+left alive, is in [Testing](testing.md).
+
+**The M7 lesson held again: escapes cluster in new callers, not new logic.**
+`backfill_from_entry` — task 5's addition — inherited the retry classification
+written for the streaming path, and nothing exercised it. Forced one way a
+permanent failure retries forever and the whole scan stalls on one document;
+forced the other, a transient blip silently drops one. The fake provider could
+only fail *retryably*, so neither direction was reachable.
+
+**Worst coverage was `kimmy-core`: 8 escapes out of 9.** All of them in the
+provider config added by task 6. The dialects were verified against documented
+shapes with fixtures over in `kimmy-vector`, and that left the type beside them
+— wire tags, default key variables, validation for Cohere and Gemini — with no
+tests at all. It now scores 9 of 9.
+
+**Two escapes were closed by changing the code rather than by adding a test.**
+`should_reload` was extracted out of the certificate-reload loop so the
+decision could be tested at all, and the `!` at its call site was removed by
+inverting the condition — a mutant that cannot be written is better than one a
+test has to chase.
+
+**Four were proven equivalent rather than chased**, per the standing rule.
+`hlc > held` → `>=` in `lag_behind_ms` contributes `wall_ms − wall_ms` = 0 when
+the two are equal, which cannot change a `max()` that already defaults to 0;
+and the node-id tiebreak in `win_addr_conflict` is *deliberately* arbitrary, so
+flipping its direction preserves the only property that matters — that every
+node computes the same answer.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |

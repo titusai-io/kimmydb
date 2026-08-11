@@ -392,6 +392,21 @@ mod tests {
     }
 
     #[test]
+    fn a_real_identity_beats_a_placeholder_even_at_a_lower_incarnation() {
+        // This is the case that makes the placeholder branch load-bearing
+        // rather than decorative. With equal incarnations the node-id
+        // comparison already favours a real identity, because the placeholder
+        // is all-zero and therefore minimal — so only a placeholder at a
+        // *higher* incarnation distinguishes having the branch from not.
+        let mut placeholder = Member::announcing(addr(7900));
+        placeholder.incarnation = 5;
+        let real = Member::identified(addr(7900), node(7));
+
+        assert!(real.win_addr_conflict(&placeholder), "a real identity must always displace one");
+        assert!(!placeholder.win_addr_conflict(&real));
+    }
+
+    #[test]
     fn a_real_identity_displaces_the_placeholder_an_announce_carries() {
         // Discovery yields an address; the identity behind it is whatever
         // answers. If the placeholder could win, a peer would be remembered as

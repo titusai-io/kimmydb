@@ -295,6 +295,80 @@ mod tests {
     }
 
     #[test]
+    fn every_provider_has_a_distinct_wire_tag() {
+        // The tag is what a stored configuration round-trips through, so two
+        // providers sharing one — or one going empty — would silently
+        // reinterpret an existing collection's configuration as another
+        // provider's. Note `open_ai`'s serde tag is snake_case while its
+        // `name()` is not; this pins the latter.
+        let all = [
+            ProviderConfig::Byo,
+            ProviderConfig::OpenAi {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: default_openai_key_env(),
+            },
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://x".into() },
+            ProviderConfig::Cohere {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: default_cohere_key_env(),
+            },
+            ProviderConfig::Gemini {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: default_gemini_key_env(),
+            },
+            ProviderConfig::Local { model: "m".into() },
+        ];
+
+        let names: std::collections::BTreeSet<_> = all.iter().map(|p| p.name()).collect();
+        assert_eq!(names.len(), all.len(), "tags must be distinct: {names:?}");
+        assert!(!names.contains(""), "and none may be empty");
+        assert_eq!(ProviderConfig::Byo.name(), "byo");
+        assert_eq!(all[3].name(), "cohere");
+        assert_eq!(all[4].name(), "gemini");
+    }
+
+    #[test]
+    fn the_default_key_variables_are_the_documented_ones() {
+        // An operator sets these; a wrong default means the provider silently
+        // finds no key and every embedding fails at request time rather than
+        // at configuration time. Pinned because they are documented in
+        // ADR-047 and in the vector docs.
+        assert_eq!(default_openai_key_env(), "OPENAI_API_KEY");
+        assert_eq!(default_cohere_key_env(), "COHERE_API_KEY");
+        assert_eq!(default_gemini_key_env(), "GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn the_dialects_added_in_m8_validate_like_the_others() {
+        // Cohere and Gemini were added with the same rules as the providers
+        // beside them, and nothing checked that: a missing model or a
+        // nonsense endpoint has to be refused at configuration time, when
+        // there is someone to tell.
+        let cohere = |model: &str, endpoint: Option<&str>| ProviderConfig::Cohere {
+            model: model.into(),
+            endpoint: endpoint.map(Into::into),
+            api_key_env: default_cohere_key_env(),
+        };
+        let gemini = |model: &str, endpoint: Option<&str>| ProviderConfig::Gemini {
+            model: model.into(),
+            endpoint: endpoint.map(Into::into),
+            api_key_env: default_gemini_key_env(),
+        };
+
+        for (label, empty, good, bad_url) in [
+            ("cohere", cohere("", None), cohere("m", None), cohere("m", Some("not a url"))),
+            ("gemini", gemini("", None), gemini("m", None), gemini("m", Some("not a url"))),
+        ] {
+            assert!(empty.validate().is_err(), "{label}: an empty model must be refused");
+            assert!(good.validate().is_ok(), "{label}: a model and no endpoint is the common case");
+            assert!(bad_url.validate().is_err(), "{label}: a malformed endpoint must be refused");
+        }
+    }
+
+    #[test]
     fn shadow_names_are_derived_and_recognizable() {
         assert_eq!(shadow_name("orders"), "orders.__vectors");
         assert!(is_shadow("orders.__vectors"));

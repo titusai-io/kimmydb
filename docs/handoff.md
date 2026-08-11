@@ -6,11 +6,12 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 in progress: Polish under way
+## As of 2026-08-11 — M8 complete; no milestone is planned after it
 
-**M0–M7 complete. M8 (prove, persist, polish — [Roadmap](roadmap.md)) is eleven
-of twelve tasks in.** The open PR is task 11; only task 12 — the mutation pass
-and docs closeout — remains, and nothing is blocked on a decision.
+**M0–M8 complete.** Twelve of twelve M8 tasks are done and the register holds
+zero open drifts. **There is no M9**: the next milestone is still to be
+chosen, from the carried debt below and the not-planned table in
+[Roadmap](roadmap.md).
 
 ### How work runs here — read this first
 
@@ -59,12 +60,10 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#50 merged: through M8 task 10 (webhook ownership by node id) |
-| `m8-token-revocation` (open PR) | **Task 11.** A per-user token version, checked in the `Auth` extractor against a cache an oplog consumer keeps honest. Deleting or disabling needs no bump — the absent record is the refusal. Admin routes evict synchronously *as well*, because the consumer alone fails quietly ([ADR-052](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#51 merged: through M8 task 11 (token revocation) |
+| `m8-mutation-closeout` (open PR) | **Task 12, which closes M8.** `cargo-mutants` diff-scoped over the whole M8 diff, plus the documentation closeout. **This handoff commit rides on it.** |
 
-### The M8 task board
-
-Prove and Persist are complete; Polish is under way.
+### The M8 task board — all twelve done
 
 | # | Task | Status |
 |---|---|---|
@@ -78,17 +77,29 @@ Prove and Persist are complete; Polish is under way.
 | 8 | Certificate reload | ✅ #48 (ADR-049) |
 | 9 | SRV discovery | ✅ #49 (ADR-050) |
 | 10 | Webhook ownership by node id | ✅ #50 (ADR-051) |
-| 11 | Token revocation | 🔵 open PR (ADR-052) |
-| 12 | Mutation pass + docs closeout | `cargo-mutants` diff-scoped over everything M8 changed; the M7 lesson says escapes hide in new callers, not old layers |
+| 11 | Token revocation | ✅ #51 (ADR-052) |
+| 12 | Mutation pass + docs closeout | 🔵 open PR |
 
-**Recommended next branch: task 12 (mutation pass + docs closeout), which
-closes M8.** `cargo-mutants` diff-scoped over everything M8 changed — the M7
-lesson says the escapes hide in the new callers, not the old layers. Then the
-closeout: [Deviations](deviations.md), this file, and the M8 section of
-[Roadmap](roadmap.md). Note that several M8 branches corrected a claim the plan
-had made (bulk insert's missing register entry, task 10's two wrong
-predictions, task 11's quiet-failure mode) — the closeout is the place to check
-no other stated expectation is still standing unverified.
+### What to do next, since there is no next task
+
+M8 is closed and nothing is queued. The material for choosing the next
+milestone:
+
+- **The carried debt below**, none of it blocking. The two with the clearest
+  shape are `find {_id}` being a collection scan (the planner never consults
+  the primary key, found while measuring in task 2) and rate limiting covering
+  login only.
+- **The not-planned table** in [Roadmap](roadmap.md), which is where mTLS,
+  computed pipeline expressions and `$vectorSearch` sit.
+- **The gaps in [Testing](testing.md)**, which name what the suite still
+  cannot see: nothing runs for long or at scale, nothing kills a node
+  mid-write, and multi-node tests are pairwise and short-lived.
+
+The one thing M8 argues for on its own evidence: **every claim that mattered
+and had no mechanism behind it turned out to be false.** Four separate branches
+found one. If a milestone is chosen for its own sake, prefer the one that turns
+another standing assertion into something that fails when it stops being
+true.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -152,6 +163,15 @@ no other stated expectation is still standing unverified.
   certificate and writing its key. Left undone on purpose:
   `kimmy_tls_cert_expiry_seconds` needs `x509-parser` as a new runtime
   dependency — 🟡 in the register.
+- **Task 12 — mutation pass + closeout.** `cargo-mutants --in-diff` over the
+  whole M8 diff, per crate: **227 mutants, 47 escapes, 32 closed** by seventeen
+  tests and one restructuring. The M7 lesson held again — the worst escape was
+  `backfill_from_entry` (task 5's addition) inheriting the streaming path's
+  retry classification, where forcing it one way makes a permanent failure
+  **retry forever and stall the scan**. Worst-covered crate was `kimmy-core` at
+  8 escapes of 9, all in task 6's provider config: the dialects were tested in
+  `kimmy-vector` and the type beside them had nothing. Full account, including
+  the 15 left alive with reasons, in [Testing](testing.md).
 - **Task 11 — token revocation (ADR-052).** A per-user `token_version` on the
   record, the value it was issued under in the token, and a 401 when they
   disagree. Deleting or disabling a user needs no bump — the absent or disabled
