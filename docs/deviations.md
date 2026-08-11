@@ -167,13 +167,23 @@ Needs a *union* of point lookups rather than a single range. A query using
 
 ---
 
-## 🟡 Ranges on descending index fields are ignored
+## 🟢 Ranges on descending index fields are planned (was a 🟡 deferral)
 
-The planner falls back to the equality prefix. Inverted encoding swaps which
-end each bound belongs to, and getting it backwards produces a range that is
-too **narrow** — silently wrong. Deliberately slow rather than possibly wrong.
+**Was.** The planner fell back to the equality prefix. Inverted encoding swaps
+which end each bound belongs to, and getting it backwards produces a range that
+is too **narrow** — silently wrong. Deliberately slow rather than possibly
+wrong, until the swap had its own tests.
 
-**To close.** Implement the swap with its own property test.
+**Now.** The swap is implemented: a descending component's inverted bytes
+reverse order, so the value-space lower bound caps the key-space *top*. Held
+down three ways — encoded-key assertions on the planner (the key for a value
+inside the range falls inside the plan's bounds, outside falls outside),
+equivalence and selectivity tests against a real engine including the compound
+ascending-prefix-descending-range shape, and the equivalence property test,
+which already generated descending indexes and two-sided ranges and began
+exercising this path the moment the planner stopped refusing it. Multikey
+descending indexes use one bound, exactly as ascending ones do — the multikey
+rule is about the data, not the direction.
 
 ---
 
