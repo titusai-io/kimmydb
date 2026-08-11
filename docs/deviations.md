@@ -352,6 +352,33 @@ like one was working.
 
 ## 🟢 Closed
 
+**No webhook was ever delivered in any clustered deployment — found by the
+cluster harness on its first run.** The live set SWIM maintains contains
+*peers only*: it is populated by foca's `MemberUp` notifications, which never
+fire for the node holding it. Rendezvous ownership computed an owner over
+that set — so `owner == me` was false on every node, for every subscription,
+and every node stood down. Three real nodes, gossip formed, webhook
+registered, document inserted: zero deliveries. Single-node worked (an empty
+set means "own everything"), which is why the whole M6 suite, every mutation
+run, and every live single-node drive passed while ADR-045's central claim —
+"when the owner dies, another takes over" — described machinery that had
+never once delivered in a cluster.
+
+Fixed in `ownership::owns`: the candidate set is the live peers **plus this
+node**, which also dissolves the empty-set special case. The trade, stated:
+a node SWIM has declared dead still considers itself a candidate, so a
+flapping node can deliver alongside its replacement — a duplicate, which
+at-least-once already promises, where the alternative was silence.
+`peer_only_views_still_elect_exactly_one_owner` now models what production
+actually looks like; the original unit tests all hand-built member sets that
+included the owner, which is precisely how the assumption survived.
+
+Two lessons, both already in the register in other clothes: a unit test that
+hand-builds its input can encode an assumption the real feed violates — the
+fixture lesson again — and a feature verified only in the topology where its
+hard path cannot occur has not been verified. The harness exists so the
+second one stops recurring.
+
 **The three findings from the M6 code review.** Recorded 2026-08-10, closed in
 the M7 warm-up branch:
 

@@ -6,16 +6,41 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M7 complete; M8 planned
+## As of 2026-08-11 — M8 begun: the cluster harness, and what it caught
 
-**M0–M7 are complete. M8 — prove, persist, polish — is planned in
-[Roadmap](roadmap.md):** both former candidate themes in one milestone, plus
-the cluster verification harness and the vector-story completion raised
-during planning. Twelve tasks; the harness leads, because everything
-cluster-adjacent after it can then be proven rather than hand-driven. Three
-decisions are reserved for the maintainer before their branches start: bulk
-insert's API shape, certificate reload's trigger, and token revocation's
-semantics.
+**M0–M7 are complete; M8 (prove, persist, polish) is underway.** Twelve
+tasks, planned in [Roadmap](roadmap.md); three decisions reserved for the
+maintainer before their branches start: bulk insert's API shape, certificate
+reload's trigger, and token revocation's semantics.
+
+### State of the branches
+
+| | |
+|---|---|
+| `main` | PRs #16–#40 merged, including the M8 plan |
+| `m8-cluster-harness` | **Not merged.** The harness (`kimmyd/tests/cluster.rs`), the `kimmy_cluster_members` gauge it reads, a CI job running it, and the ownership fix below |
+
+### The bug the harness caught on its first run
+
+**No webhook was ever delivered in any clustered deployment.** SWIM's live
+set contains *peers only* — foca's `MemberUp` never fires for the node
+holding the set — so rendezvous ownership computed an owner that could never
+be `me`, and every node stood down for every subscription. Single-node
+worked (empty set → own everything), which is why all of M6's tests, its
+mutation runs, and every live drive passed. Fixed in `ownership::owns`:
+candidates are the live peers **plus this node**, which also dissolves the
+empty-set special case. Full account in [Deviations](deviations.md).
+
+### What the harness asserts
+
+Real `kimmyd` processes on scratch ports: gossip formation read from the new
+`kimmy_cluster_members` gauge (peers-only — a formed three-node cluster
+reads 2 everywhere); an unseeded member learned through gossip; `SIGSTOP`
+suspicion and `SIGCONT` recovery without restart; kill detection;
+replication through gossip-discovered peers using a collection name that
+hashes above `i64::MAX`; and one webhook per node's ownership share, all
+delivered, with a killed owner's subscription taken over by a survivor.
+Ignored by default; CI runs them serialized (`--ignored --test-threads=1`).
 
 ### State of the branches
 
@@ -187,6 +212,14 @@ endpoint.
 - **Webhook ownership hashes with FNV-1a, never `DefaultHasher`**, which is not
   stable between Rust versions — ownership shifting under a compiler upgrade
   would reshuffle every subscription on a rolling restart.
+- **Ownership candidates are the live peers plus this node.** SWIM's live set
+  never contains the node holding it, so an owner computed over it alone can
+  never be `me` — the bug that silently undelivered every clustered webhook.
+  Any new consumer of `Members` must know it is reading *peers*, not the
+  cluster.
+- **A cluster feature is not verified until the harness has run it on real
+  nodes.** Transport-free tests and single-node drives both passed while
+  clustered delivery was entirely broken.
 
 
 ## Conventions for this file

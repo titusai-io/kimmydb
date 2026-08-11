@@ -833,6 +833,14 @@ pub async fn run(
         // Re-read every tick rather than once: the whole point is that
         // ownership follows the live set as it changes.
         let live = members.as_ref().map(|m| m.snapshot()).unwrap_or_default();
+        // Recorded here because this loop already reads the live set every
+        // tick — a separate task to print one number would be machinery. The
+        // gauge is what lets an operator (and the cluster harness) see that
+        // gossip actually formed, rather than inferring it from replication,
+        // which discovery alone can carry.
+        if members.is_some() {
+            state.metrics.set_cluster_members(live.len() as u64);
+        }
         // The pass itself always runs on the tick. Backoff is held per
         // subscription inside it, so a failing endpoint delays only its own
         // deliveries and every other subscription keeps its cadence.

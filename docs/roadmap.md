@@ -567,7 +567,7 @@ by a killed node is delivered by its successor. Slow tests, marked
 
 | # | Workstream | Task | Notes |
 |---|---|---|---|
-| 1 | Prove | **Cluster verification harness** | As above. The two historical bugs become its first regression tests: assert gossip *formed* (not merely that replication converged), and assert a high-hashing collection name replicates |
+| 1 | Prove | ✅ **Cluster verification harness** | `kimmyd/tests/cluster.rs`: real processes, gossip formation read from the new `kimmy_cluster_members` gauge, stall (`SIGSTOP`) suspicion and recovery, kill detection, replication through gossip-discovered peers with a high-hashing collection name, and webhook ownership across the cluster. **Its first run found that no webhook had ever been delivered in any clustered deployment** — SWIM's live set holds peers only, so an owner could never be the node computing it; every node stood down. Fixed in `ownership::owns` (candidates = peers ∪ self). The account is in [Deviations](deviations.md) |
 | 2 | Prove | **Latency histograms + oplog lag** | The two metrics ADR-043 documented as missing rather than guessed. Lag follows the M6 lesson: measure undelivered work, not cursor age |
 | 3 | Prove | **Benchmark baseline + concurrent writers** | The two gaps the M5 benchmark work left: batched and concurrent writes measured, and a recorded baseline a regression can be caught against |
 | 4 | Persist | **HNSW snapshot persistence** | The M2 deferral. Snapshot the graph plus the generation it covers; startup loads the snapshot and rebuilds only if the generation disagrees. Correctness must never depend on it — the exact-scan fallback stays, and a corrupt snapshot is discarded, not trusted |

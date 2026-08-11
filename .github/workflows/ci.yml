@@ -44,6 +44,27 @@ jobs:
       - name: Native build dependencies
         run: ./scripts/check-native-deps.sh
 
+  cluster:
+    name: cluster harness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Real kimmyd processes: gossip formation, kill and stall detection,
+      # replication through gossip-discovered peers, and webhook ownership
+      # across the cluster. Ignored in the default run because each test
+      # boots a three-node cluster; serialized because fifteen daemons on a
+      # two-core runner prove nothing about timing. This job exists because
+      # the two worst cluster bugs shipped while every transport-free test
+      # was green — and its first run caught a third.
+      - name: Cluster harness
+        run: cargo test -p kimmyd --test cluster -- --ignored --test-threads=1
+
   docker:
     name: docker build
     runs-on: ubuntu-latest
