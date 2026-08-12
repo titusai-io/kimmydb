@@ -584,26 +584,40 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
-## 🟡 The client story and sharding are deferred until there is experience
+## 🟢 The client story — settled on 2026-08-12 by ADR-055
+
+**Raised and postponed on 2026-08-11, decided on 2026-08-12.** The protocol is
+the HTTP/JSON and WebSocket API KimmyDB already serves, promoted to a
+specified and versioned contract with first-party clients for Rust, Python and
+Go. The MongoDB wire protocol, gRPC and GraphQL are all rejected as
+client-facing protocols. M10 is the milestone that carries it out.
+
+**The framing in the original entry was wrong, and worth preserving as the
+lesson.** It read "there is no wire protocol", which conceded a premise that
+was never true — HTTP framing, Extended JSON v2 encoding, bearer-token
+authentication, a typed error envelope and WebSocket streaming are a complete
+protocol, and `kimmy-cli` is 464 lines of working client against it. What was
+actually missing was that **nothing specified, versioned or tested it**. That
+is a documentation gap wearing an architecture gap's clothes, and describing it
+correctly is what made the decision small. Full reasoning, including why each
+alternative was rejected, is in [ADR-055](decisions.md).
+
+**Left open on purpose:** a narrow, read-mostly wire shim presenting as a
+*standalone* server, purely so Compass and `mongosh` can inspect a database.
+Not rejected — a smaller, separate decision, to be made after M10.
+
+---
+
+## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was
-compared against MongoDB's. Neither is dropped; both are decisions the
-maintainer wants to make from operational experience rather than from a
-comparison table. **A future session should not re-open either unasked.**
+compared against MongoDB's. Not dropped: a decision the maintainer wants to
+make from operational experience rather than from a comparison table. **A
+future session should not re-open it unasked.**
 
-**The client story.** There is no wire protocol, so no existing MongoDB driver
-works, and every user writes HTTP calls by hand. That is a bigger adoption
-barrier than any missing feature. The two options — a wire-protocol shim so
-Mongo drivers work unchanged, or first-party clients in a couple of languages —
-pull the project in different directions: one toward being a MongoDB
-replacement, the other toward being its own thing. The maintainer is
-deliberately interested in *parity* without building a clone, and does not yet
-want to commit. Note the not-planned table already rejects the wire protocol;
-that rejection is what a future decision would revisit.
-
-**Sharding.** Every node holds a full copy, so capacity is bounded by one
-machine and write throughput by one redb writer — ~300 documents/sec
-single-write, ~51,300/sec batched ([Benchmarks](benchmarks.md)).
+Every node holds a full copy, so capacity is bounded by one machine and write
+throughput by one redb writer — ~300 documents/sec single-write, ~51,300/sec
+batched ([Benchmarks](benchmarks.md)).
 **Replicated-not-partitioned is the current position and is considered
 correct for now.** Partitioning would be a milestone-sized architectural change
 and arguably against the leaderless simplicity that makes the rest of the
@@ -626,6 +640,10 @@ here so that the absence of a decision is visible as a decision.
 | Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | **M9 task 1** |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
+| No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |
+| No token refresh | `/v1/auth/login` is the only way to obtain a token and it expires. A long-running client has no option but to re-send credentials, which no driver should ask of an application | **M10 task 4** |
+| Clients cannot discover the cluster | SRV discovery serves *nodes finding each other*. A client is given one address and has no way to learn the others or fail over — the one thing a MongoDB driver's SDAM would have provided free | **M10 task 5** |
+| Client-facing throughput is unmeasured | Every figure in [Benchmarks](benchmarks.md) is taken at the storage engine in a release build. Nothing measures the socket: JSON and Extended JSON conversion, token verification per request, TLS, and concurrent HTTP clients are all outside the numbers. The single end-to-end figure (500 documents, 0.16 s bulk against 11.6 s individually) came from a **debug** node and is a ratio, not a rate | **M10 task 7** |
 
 ---
 

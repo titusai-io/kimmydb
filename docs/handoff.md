@@ -6,7 +6,7 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 complete and driven; **M9 planned, nothing started**
+## As of 2026-08-12 — M8 complete and driven; **M9 and M10 planned, nothing started**
 
 **M0–M8 complete**, plus two post-M8 fixes, both found by *driving a five-node
 cluster* rather than by the suite: SWIM authentication
@@ -16,12 +16,25 @@ cluster* rather than by the suite: SWIM authentication
 **M9 is planned but no branch exists.** Start at task 1 —
 [Roadmap](roadmap.md) has the board and the reserved decisions.
 
-**Two questions are deliberately deferred — do not re-open them unasked.**
-The client story (wire protocol vs. first-party drivers) and sharding. Both
-are recorded in [Deviations](deviations.md) with the reasoning: the maintainer
-wants to decide from experience of running KimmyDB, not from a feature
-comparison. Replicated-not-partitioned is the current position and is
-considered correct for now.
+**M10 is planned behind it** — the client protocol, formalized, and first-party
+Rust, Python and Go clients. Twelve tasks, six reserved decisions, same board
+in [Roadmap](roadmap.md).
+
+**The client story is settled; sharding is not.** [ADR-055](decisions.md)
+decided on 2026-08-12: the protocol is the HTTP/JSON and WebSocket API already
+served, promoted to a specified and versioned contract, and the MongoDB wire
+protocol, gRPC and GraphQL are all rejected. **Sharding remains deliberately
+deferred — do not re-open it unasked.** Replicated-not-partitioned is the
+current position and is considered correct for now; the maintainer wants to
+decide from experience of running KimmyDB, not from a feature comparison.
+
+**The correction worth carrying forward:** the register had recorded the client
+story as "there is no wire protocol", which conceded a premise that was never
+true. HTTP framing, Extended JSON v2, bearer tokens, a typed error envelope and
+WebSocket streaming *are* a protocol — `kimmy-cli` is 464 lines of working
+client against it. The real gap was that nothing specified, versioned or tested
+it. Naming the gap correctly is what turned a milestone-sized architectural
+question into a documentation task with clients on the end of it.
 
 ### How work runs here — read this first
 
@@ -41,7 +54,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-055**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-056**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -70,8 +83,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#54 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054) |
-| `m9-plan` (open PR) | Planning only — the M9 board, the two deferred decisions, and this handoff. No code. |
+| `main` | PRs #16–#55 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board |
+| `m10-client-protocol` (open PR) | Planning only — ADR-055, the M10 board, and this handoff. No code. |
 
 ### The M8 task board — all twelve done, for reference
 
@@ -112,7 +125,47 @@ where the subtle failures live. **Only task 2 carries distributed-systems
 risk** — expiry on every node independently produces N deletes for one
 document, and the interaction with the oplog is the part to design.
 
-### How to size the next thing after M9
+### The M10 board — nothing started
+
+**Theme: KimmyDB has a protocol and has never written it down.** HTTP framing,
+Extended JSON v2, bearer tokens, a typed error envelope and WebSocket streaming
+answer every question a wire protocol has to answer. Nothing specifies,
+versions or tests it — so every client would be hand-written and nothing fails
+when a route drifts. [ADR-055](decisions.md) settles the direction; this is the
+work.
+
+| # | Task | Reserved decision to settle first |
+|---|---|---|
+| 1 | **Protocol specification** (OpenAPI 3.1) + a drift test | Hand-written and checked, vs. generated from routes |
+| 2 | **Error taxonomy as public surface** | Which errors are declared retryable |
+| 3 | **Versioning and compatibility policy** | The shape of the promise |
+| 4 | **Token refresh** | Refresh token vs. sliding re-issue |
+| 5 | **Client-visible topology / discovery** | Static config vs. live SWIM membership |
+| 6 | **Cursors at the protocol level** | — (needs M9 task 5) |
+| 7 | **HTTP-level benchmark harness** | — |
+| 8 | **Rust client**, `kimmy-client`; the CLI becomes its consumer | HTTP/async stack |
+| 9 | **Python client** | HTTP/async stack |
+| 10 | **Go client** | HTTP stack |
+| 11 | **Conformance suite all three clients pass** | — |
+| 12 | **One example app per language** + mutation pass and closeout | — |
+
+**M10 follows M9**, and not only by preference: task 6 needs M9's cursors, and
+a client is a poor thing to ship against an engine that cannot `findAndModify`.
+Tasks 1–5 and 7 have no M9 dependency.
+
+**Only task 5 carries distributed-systems risk**, and it carries two known
+traps at once: `Members` holds *peers only*, and the set must contain only
+authenticated peers (ADR-053).
+
+**Task 7 is the one that answers a question currently unanswerable.** Every
+figure in [Benchmarks](benchmarks.md) is taken at the storage engine — nothing
+measures the socket, so JSON conversion, per-request token verification, TLS
+and concurrent HTTP clients are all outside the published numbers. Until it
+exists there is no honest answer to "what throughput can a client expect", and
+that file's own retracted-figure note is what happens when one gets quoted
+anyway.
+
+### How to size the next thing after M10
 
 The material, if a milestone is ever needed for its own sake:
 
@@ -304,7 +357,9 @@ one exists:
 | Computed pipeline expressions | **M9 task 1** |
 | `skip` is O(n); no cursors | **M9 task 5** |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
-| The client story (wire protocol vs. first-party drivers) and sharding | **deferred by decision** until there is operational experience — see [Deviations](deviations.md) |
+| No published protocol spec; no token refresh; clients cannot discover the cluster | **M10 tasks 1, 4, 5** |
+| Client-facing throughput is unmeasured — every benchmark is engine-level | **M10 task 7** |
+| Sharding | **deferred by decision** until there is operational experience — see [Deviations](deviations.md) |
 
 ### Invariants a change must not break
 
