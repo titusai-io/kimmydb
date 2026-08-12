@@ -584,6 +584,36 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟡 The client story and sharding are deferred until there is experience
+
+**Raised and explicitly postponed on 2026-08-11**, after the surface was
+compared against MongoDB's. Neither is dropped; both are decisions the
+maintainer wants to make from operational experience rather than from a
+comparison table. **A future session should not re-open either unasked.**
+
+**The client story.** There is no wire protocol, so no existing MongoDB driver
+works, and every user writes HTTP calls by hand. That is a bigger adoption
+barrier than any missing feature. The two options — a wire-protocol shim so
+Mongo drivers work unchanged, or first-party clients in a couple of languages —
+pull the project in different directions: one toward being a MongoDB
+replacement, the other toward being its own thing. The maintainer is
+deliberately interested in *parity* without building a clone, and does not yet
+want to commit. Note the not-planned table already rejects the wire protocol;
+that rejection is what a future decision would revisit.
+
+**Sharding.** Every node holds a full copy, so capacity is bounded by one
+machine and write throughput by one redb writer — ~300 documents/sec
+single-write, ~51,300/sec batched ([Benchmarks](benchmarks.md)).
+**Replicated-not-partitioned is the current position and is considered
+correct for now.** Partitioning would be a milestone-sized architectural change
+and arguably against the leaderless simplicity that makes the rest of the
+design work.
+
+**To close.** Run KimmyDB on something real for a while, then decide. Recorded
+here so that the absence of a decision is visible as a decision.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
@@ -593,7 +623,7 @@ than trusting the draft is what found the real universal trigger.
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
-| Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | not planned |
+| Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | **M9 task 1** |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 

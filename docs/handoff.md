@@ -6,19 +6,29 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-11 — M8 complete; one post-M8 fix in flight
+## As of 2026-08-11 — M8 complete and driven; **M9 planned, nothing started**
 
-**M0–M8 complete.** Twelve of twelve M8 tasks are done. One branch since: **SWIM
-authentication** ([ADR-053](decisions.md)), found by driving a five-node cluster rather than
-by the suite. **There is no M9**: the next milestone is still to be chosen, from the carried
-debt below and the not-planned table in [Roadmap](roadmap.md).
+**M0–M8 complete**, plus two post-M8 fixes, both found by *driving a five-node
+cluster* rather than by the suite: SWIM authentication
+([ADR-053](decisions.md)) and the witnessed version vector
+([ADR-054](decisions.md)).
+
+**M9 is planned but no branch exists.** Start at task 1 —
+[Roadmap](roadmap.md) has the board and the reserved decisions.
+
+**Two questions are deliberately deferred — do not re-open them unasked.**
+The client story (wire protocol vs. first-party drivers) and sharding. Both
+are recorded in [Deviations](deviations.md) with the reasoning: the maintainer
+wants to decide from experience of running KimmyDB, not from a feature
+comparison. Replicated-not-partitioned is the current position and is
+considered correct for now.
 
 ### How work runs here — read this first
 
 The rhythm:
 
 - **One branch per task, always off fresh `main`.** `git checkout main &&
-  git pull && git checkout -b m8-<task>`.
+  git pull && git checkout -b m9-<task>`.
 - **Every branch lands through a PR (`gh pr create`)**, which the maintainer
   reviews and merges. Pushing a branch is not finishing it; the PR is.
 - **The gate, before every commit:** `cargo fmt --all -- --check` ·
@@ -60,10 +70,10 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#53 merged: all of M8, plus SWIM authentication (ADR-053) |
-| `m9-witnessed-vector` (open PR) | A second durable version vector records what a node has **processed**, not just what it can serve. Fixes a re-sync loop that ran in **every cluster since M4** — an idle three-node cluster merged 60 times in 20 seconds — and a lag gauge that pinned at 1204s on a converged cluster ([ADR-054](decisions.md)). **This handoff commit rides on it.** |
+| `main` | PRs #16–#54 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054) |
+| `m9-plan` (open PR) | Planning only — the M9 board, the two deferred decisions, and this handoff. No code. |
 
-### The M8 task board — all twelve done
+### The M8 task board — all twelve done, for reference
 
 | # | Task | Status |
 |---|---|---|
@@ -80,26 +90,68 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | 11 | Token revocation | ✅ #51 (ADR-052) |
 | 12 | Mutation pass + docs closeout | 🔵 open PR |
 
-### What to do next, since there is no next task
+### The M9 board — nothing started
 
-M8 is closed and nothing is queued. The material for choosing the next
-milestone:
+**Theme: KimmyDB can store, replicate and search documents better than it can
+ask questions about them.** Aggregation is roughly 30% of MongoDB's surface
+against ~85% for filters and ~75% for update operators, and most of the gap is
+one thing — there are no computed expressions at all, so a pipeline can filter,
+group and join but cannot *derive*.
 
-- **The carried debt below**, none of it blocking. The two with the clearest
-  shape are `find {_id}` being a collection scan (the planner never consults
-  the primary key, found while measuring in task 2) and rate limiting covering
-  login only.
-- **The not-planned table** in [Roadmap](roadmap.md), which is where mTLS,
-  computed pipeline expressions and `$vectorSearch` sit.
-- **The gaps in [Testing](testing.md)**, which name what the suite still
-  cannot see: nothing runs for long or at scale, nothing kills a node
-  mid-write, and multi-node tests are pairwise and short-lived.
+| # | Task | Reserved decision to settle first |
+|---|---|---|
+| 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | Which operators |
+| 2 | **TTL / expiring documents** | Trigger shape (TTL index vs. collection setting vs. per-document field) |
+| 3 | **`findAndModify`** | API shape — but the *design* problem is that a filter-based match must move inside the write transaction |
+| 4 | **Partial and sparse indexes** | Partial only, or both |
+| 5 | **Cursors / efficient pagination** | Continuation-token shape |
 
-The one thing M8 argues for on its own evidence: **every claim that mattered
-and had no mechanism behind it turned out to be false.** Four separate branches
-found one. If a milestone is chosen for its own sake, prefer the one that turns
-another standing assertion into something that fails when it stops being
-true.
+Ordering is deliberate: task 1 is the highest-leverage and entirely
+self-contained; 3 and 2 are small; 4 and 5 both touch the planner, which is
+where the subtle failures live. **Only task 2 carries distributed-systems
+risk** — expiry on every node independently produces N deletes for one
+document, and the interaction with the oplog is the part to design.
+
+### How to size the next thing after M9
+
+The material, if a milestone is ever needed for its own sake:
+
+- **The carried debt below**, none of it blocking.
+- **The gaps in [Testing](testing.md)** — nothing runs for long or at scale,
+  nothing kills a node mid-write, multi-node tests are pairwise and
+  short-lived. Every serious bug of the last two sessions lived in exactly
+  those blind spots.
+- **The evidence M8 produced:** every claim that mattered and had no mechanism
+  behind it turned out to be false — four M8 branches found one, and the two
+  post-M8 fixes were two more. Prefer work that turns another standing
+  assertion into something that fails when it stops being true.
+
+### What driving a real cluster established
+
+Beyond the suite, on 3- and 5-node clusters from a release build — worth
+knowing so it is not re-derived:
+
+- Formation, one JWT cluster-wide, DDL/document/bulk replication, LWW
+  convergence under 1000 concurrent writes (~7s) and under 100 conflicting
+  writes to a single key.
+- Kill/rejoin, `SIGSTOP`/`SIGCONT`, webhook failover, snapshot resync past the
+  retention horizon, partition heal with conflicting unique values (both
+  documents survive, both nodes count the violation).
+- Change-stream resume tokens are **portable across nodes** — a token from one
+  node resumes correctly on any other.
+- **The auto-embedding pipeline end to end**: document written with no client
+  vectors → worker calls the provider → shadow collection → replicated to every
+  node in ~2s → semantic search by *text* returns the right document with exact
+  cosine scores. Each document is embedded **exactly once cluster-wide**, so an
+  N-node cluster does not pay N× for embeddings.
+- A 90-second soak with a node cycling down/up/STOP/CONT: 5,351 writes, none
+  lost, converged in 42s.
+
+**Two cautions for whoever writes the next drive script.** `PUT /docs/{id}`
+without `?upsert=true` returns `200 {"matched":0}` and writes nothing — a
+conflict test built on it wrote nothing at all and passed, because five nodes
+agreed on an error. And shadow-collection vectors take ~2s to replicate; a
+check that runs immediately reports a broken pipeline that is merely young.
 
 ### What the completed M8 branches did, and the bugs they found
 
@@ -239,16 +291,20 @@ true.
 
 ### Carried debt, none blocking
 
-**The register holds zero 🔴.** M7 closed the last one. What remains, all 🟡
-in [Deviations](deviations.md), with the M8 tasks that would close them:
+**The register holds zero 🔴.** M7 closed the last one. What remains is all 🟡
+in [Deviations](deviations.md), now with the M9 task that would close it where
+one exists:
 
 | Debt | |
 |---|---|
 | `find {_id}` is a collection scan — the planner never consults the primary key | not in M8; found during task 2 |
 | Rate limiting covers login only | waits on a capacity decision, not on measurement any more |
 | `update` and `delete` still apply document by document and can stop partway — bulk *insert* is atomic, they are not | by design |
-| Keyword search is term overlap, not BM25; chunking counts characters, not tokens; `skip` is O(n); no minimum score threshold | simplifications inside working features |
-| No `$vectorSearch` pipeline stage; no mTLS; no computed pipeline expressions | not planned |
+| Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
+| Computed pipeline expressions | **M9 task 1** |
+| `skip` is O(n); no cursors | **M9 task 5** |
+| No `$vectorSearch` pipeline stage; no mTLS | not planned |
+| The client story (wire protocol vs. first-party drivers) and sharding | **deferred by decision** until there is operational experience — see [Deviations](deviations.md) |
 
 ### Invariants a change must not break
 

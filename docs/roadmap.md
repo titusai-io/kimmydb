@@ -21,8 +21,9 @@ graph LR
     M6["<b>M6</b> ✅<br/>webhooks"]
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
     M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
+    M9["<b>M9</b> 📋<br/>finish the<br/>query engine"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -34,6 +35,7 @@ graph LR
     style M6 fill:#2f5d3a,color:#fff
     style M7 fill:#2f5d3a,color:#fff
     style M8 fill:#2f5d3a,color:#fff
+    style M9 fill:#2d3748,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -47,6 +49,7 @@ graph LR
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
 | **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
+| **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -618,6 +621,65 @@ silently.** M8's most durable output is not a feature but the harness, the
 benchmark baseline, the native-dependency check and the metric buckets — each
 of which turns a sentence somebody wrote into something that fails when it
 stops being true.
+
+---
+
+## M9 — Finish the query engine 📋
+
+**The theme: KimmyDB can store, replicate and search documents better than it
+can *ask questions about* them.** M8 proved the distributed half works by
+driving it. Comparing the surface against MongoDB afterwards put the gap in one
+place — aggregation is roughly 30% of Mongo's, against ~85% for filters and
+~75% for update operators, and the missing 70% is mostly one thing: there are
+no computed expressions at all. A pipeline can filter, group and join, but it
+cannot *derive*.
+
+Four of the five tasks are query-engine work with no distributed-systems risk.
+Task 2 is the exception and is called out below.
+
+### Tasks
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | **Computed expressions**, plus `$addFields`/`$set` and `$replaceRoot` | The highest-leverage gap by a distance. Arithmetic (`$add`, `$subtract`, `$multiply`, `$divide`, `$mod`), strings (`$concat`, `$toUpper`, `$toLower`, `$substr`, `$split`, `$strLenCP`), conditionals (`$cond`, `$ifNull`, `$switch`), comparison and boolean **as expressions** rather than as filter operators, and enough date handling to format and extract parts. Plugs into `$project` (computed fields), `$group` (`_id` expressions *and* accumulator arguments — today those are "a field path or a literal", which is the limit this removes), and the two new stages. **The operator list is a public-surface decision — reserved.** Deliberately excludes `$where`, which stays not-planned |
+| 2 | **TTL / expiring documents** | The retention machinery already exists — tombstones, a GC pass on an interval, a horizon — so this is mostly a policy layered on it. **The interesting part is replication, not expiry**: if every node expires independently, one document produces N deletes. Convergent under last-writer-wins, but noisy, and it interacts with the oplog. The likely shape is that whichever node notices first issues an ordinary delete that replicates like any other. **Trigger shape is a decision — reserved** (a TTL index on a date field, Mongo-style; a collection-level `expireAfterSeconds`; or a per-document expiry field) |
+| 3 | **`findAndModify`** | Atomic read-modify-write returning the document, before or after. The primitive behind job queues, counters and claim-a-row patterns; without it users read-then-write and silently lose atomicity. Nearly free given redb's single writer — **except for one real change**: `exec::update` today collects its targets in a *read* pass and then replaces them one at a time, so a filter-based `findAndModify` needs the match to happen inside the write transaction. That is the part to design, not the API. **Shape reserved** (its own route vs. a `returnDocument` option on update) |
+| 4 | **Partial and sparse indexes** | Cheap given the index machinery, and the motivating case is concrete: *unique only when the field is present*, which is a very common real constraint and impossible today. The subtle half is the **planner** — an index carrying a partial filter can only answer a query provably contained by that filter, and getting that wrong silently loses documents, which is the failure mode this codebase has met before with multikey. Mongo treats partial as superseding sparse; whether to build both is **reserved** |
+| 5 | **Cursors / efficient pagination** | `skip` is O(n) even with an index and `MAX_LIMIT` is 10,000, so there is currently no good way to page a large collection. Range-based continuation over the index or `_id` order fixes it. Interacts with sort: a cursor over an unsorted scan is meaningless, and *result order without an explicit sort is unspecified* (see [Deviations](deviations.md)), so this may need to state an order it did not have to before. **Token shape reserved** (opaque continuation token vs. an explicit "after this key") |
+
+### Decisions reserved for the maintainer
+
+Task 1's operator list, task 2's trigger shape, task 3's API shape, task 4's
+partial-versus-sparse question, and task 5's token shape. Each is public
+surface; settle them before the relevant branch starts, as M8 did with all
+three of its reserved decisions.
+
+### Deliberately deferred until there is operational experience
+
+Two larger questions were raised and **explicitly postponed on 2026-08-11**,
+not dropped. A future session should not re-open either without being asked:
+
+- **The client story.** No wire protocol means no existing MongoDB driver
+  works, which is a bigger adoption barrier than any feature on the list above.
+  The options — a wire-protocol shim so Mongo drivers work unchanged, versus
+  first-party clients in a couple of languages — are a strategic choice the
+  maintainer wants to make *after* running KimmyDB for a while, not before.
+  Note that "MongoDB wire protocol" already sits in the not-planned table from
+  an earlier decision; that rejection is what would be revisited.
+- **Sharding.** Every node holds a full copy, so capacity is bounded by one
+  machine and writes by one redb writer (~300/s single, ~51,300/s batched).
+  **Replicated-not-partitioned is the current position and the maintainer is
+  content with it**, with the same reasoning: decide from experience. Worth
+  stating as deliberate positioning rather than an unexamined gap, because
+  anyone arriving from MongoDB will assume sharding exists.
+
+### Not in M9, and why
+
+Geospatial, full-text and `$where` stay in the not-planned table below.
+Multi-document transactions stay out for the reason they always have: they
+need coordination, which is what a leaderless design gives up. `$vectorSearch`
+as a pipeline stage becomes *easier* once expressions exist, but is still not
+scheduled — vector search remains its own endpoint.
 
 ---
 
