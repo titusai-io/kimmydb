@@ -338,7 +338,7 @@ port.
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
 | `kimmy_backups_total` | Backups served |
 | `kimmy_cluster_members` | Peers SWIM currently considers alive; 0 with clustering off. A formed three-node cluster reads 2 on every node |
-| `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet applied locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero |
+| `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet **seen** locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero. Measured against what this node has processed rather than what it could re-serve, or entries it correctly discarded would pin it non-zero forever ([ADR-054](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 

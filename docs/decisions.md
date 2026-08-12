@@ -2106,6 +2106,109 @@ cannot gossip. Same rollout as [ADR-040](decisions.md) and
 
 ---
 
+## ADR-054 — Two vectors: what a node can serve, and what it has seen
+
+**Decision.** A node keeps a second, durable version vector — **witnessed** —
+recording the newest stamp it has *processed* per origin, whether or not that
+processing appended anything. The oplog-derived vector keeps its meaning
+(**what I can serve**) and is still what a peer receives from `AskVersions`.
+`behind` and `lag_behind_ms` switch to the witnessed vector.
+
+**One root cause, two symptoms, both found by driving a cluster.** The vector
+advances only in `append_oplog`, and two situations leave a permanent hole:
+
+- **A document that loses last-writer-wins.** `apply_remote` aborts the
+  transaction and returns `false`, so nothing is appended and the origin's
+  entry never moves past that stamp. *(Replicated DDL is **not** in this list:
+  `apply_ddl` deliberately appends the originating entry afterwards, precisely
+  to advance the vector. An early draft of this ADR said otherwise; reading the
+  code corrected it.)*
+- **An entry the sender holds but never ships.** A `UniqueViolation` is logged
+  locally — it has to be an oplog entry to reach change streams — so it is in
+  the sender's advertised vector, but `entries_for_peer` excludes it by design
+  ([ADR-029](decisions.md)) because every node observes the same collision
+  independently. A receiver therefore *cannot* cover that stamp by receiving
+  it, no matter how many times it asks.
+
+**The universal trigger is the bootstrap user.** Every node creates its own
+`__kimmy.__users` collection and inserts `root` locally, with its own stamp. So
+in every cluster, each peer's `root` insert arrives, loses last-writer-wins
+against the local one, and leaves a hole — which is why a bare cluster with no
+user data at all still re-syncs forever.
+
+**Symptom one: every cluster re-syncs forever.** `behind` returns the earliest
+point this node appears to lack, so a hole means every round re-requests
+everything from that point, re-applies it, appends nothing, and leaves the hole
+exactly where it was. Measured on an **idle, fully converged** three-node
+cluster: **60 merge rounds in 20 seconds** with no user data at all, and 40 a
+second with one collection, indefinitely. The re-sent range grows with
+everything written after the hole, so the waste grows with the database rather
+than staying constant. After the fix the same clusters report **zero**.
+
+**Symptom two: the lag gauge sticks.** After concurrent updates to one
+document, `kimmy_replication_lag_seconds` pinned at 1204 on all five nodes of a
+converged, idle cluster and stayed there — clearing only when a *winning* write
+from each origin finally advanced the vector past the discarded stamps. This is
+the symptom that was visible, and the smaller half of the problem. The gauge is
+documented as "0 is the caught-up steady state" and operators are told to alert
+on it ([ADR-046](decisions.md), [Operations](operations.md)), so a permanently
+non-zero reading is both a false alarm and a real one nobody could distinguish.
+
+Symptom two only appears once an origin has *some* recorded stamp, because
+`lag_behind_ms` deliberately ignores an origin it has never seen — the
+"fifty-year lie" rule. That is why the busy loop ran in every cluster while the
+gauge read zero.
+
+**Why two vectors rather than making the one vector mean "seen".** What a node
+can *serve* and what it has *seen* are genuinely different facts, and the sync
+protocol needs both:
+
+- The vector a peer receives must stay **servable**. If a node advertised
+  coverage it could not serve, a peer would stop asking for entries nobody
+  would then send it.
+- The vector used to decide **what to ask for** must be *seen*, or the node
+  re-asks for what it has already processed — which is the bug.
+
+Pairing them this way leaves the wire format and `AskVersions` untouched: a
+node still answers with what it holds, and only its own local comparison
+changes.
+
+**Witnessing happens in one place.** `apply_batch` records each entry's stamp
+after processing it, on every branch — applied, superseded, DDL, skipped. The
+per-entry logic moved into `apply_one` so no branch *can* forget: a `continue`
+that skipped the bookkeeping is how this class of hole appears. An entry that
+fails is not witnessed, because the batch aborts and it has not been processed.
+
+**And a short batch witnesses the whole of the peer's vector.** Per-entry
+witnessing cannot close the second hole, because the receiver never receives
+those entries. But a batch shorter than the limit means the peer sent
+everything it is willing to send from that point, so the receiver has now seen
+all of what the peer advertised — including what it will never ship. A *full*
+batch was truncated and gets no such credit.
+
+**Witnessed is always at least servable.** `append_oplog` raises both, so the
+invariant holds by construction and a node cannot claim to have served
+something it has not seen.
+
+**Existing databases start with witnessed = servable.** A lower bound, which is
+safe: the first sync round re-fetches once, witnesses what it processes, and
+goes quiet. No migration step and no schema bump — the table is created on open
+like the others.
+
+**Rejected: appending replicated DDL to the oplog.** It would advance the
+vector as a side effect and let a node serve another's schema changes
+transitively, which is arguably better. But it contradicts a standing invariant
+for a reason that still holds, it changes what change-stream subscribers see,
+and it grows every node's log by the whole cluster's DDL. A larger design than
+the bug requires.
+
+**Rejected: a per-peer high-water mark instead of a vector.** It would quiet
+the loop, since the node would remember it had already asked. It would not fix
+the gauge, which is a statement about origins rather than peers, and it adds
+state that grows with cluster churn.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

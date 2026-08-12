@@ -240,7 +240,12 @@ pub async fn sync_once(
             return Err(ProtocolError::Malformed("expected Versions".into()));
         };
 
-        let mine = engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        // What we have *seen*, not what we could serve. Asking against the
+        // servable vector re-requests everything a node processed without
+        // appending — replicated DDL, last-writer-wins losers — on every round,
+        // forever (ADR-054).
+        let mine =
+            engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         let Some(from) = mine.behind(&theirs) else {
             return Ok(SyncOutcome::default());
         };
@@ -248,7 +253,27 @@ pub async fn sync_once(
         write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
         let mut outcome = match read_frame(&mut stream).await? {
             Message::Entries(entries) => {
-                engine.apply_batch(&entries).map_err(|e| ProtocolError::Malformed(e.to_string()))
+                // A short batch means the peer sent everything it is willing to
+                // send from `from` onward, so this node has now seen all of
+                // `theirs` — including entries the peer holds but deliberately
+                // never ships. A `UniqueViolation` is the standing example
+                // (ADR-029): it is in the sender's oplog and therefore in the
+                // vector it advertised, but `entries_for_peer` excludes it, so
+                // a receiver could never cover that stamp by receiving it and
+                // would ask again every round forever.
+                //
+                // Only on a *short* batch. A full one was truncated at the
+                // limit, and there is more to come.
+                let exhausted = entries.len() < MAX_BATCH;
+                let applied = engine
+                    .apply_batch(&entries)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()));
+                if applied.is_ok() && exhausted {
+                    engine
+                        .absorb_witnessed(&theirs)
+                        .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                }
+                applied
             }
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
@@ -264,7 +289,8 @@ pub async fn sync_once(
         // an operator wants a gauge for. `theirs` is a round old by now, so
         // this is a floor — a peer that raced ahead during the round shows up
         // next round.
-        let mine = engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        let mine =
+            engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs);
         Ok(outcome)
     };

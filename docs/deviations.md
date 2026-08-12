@@ -533,6 +533,57 @@ replication runs over TLS always. It had been wrong since ADR-040.
 
 ---
 
+## 🟢 A converged cluster stops re-syncing, and the lag gauge stops lying
+
+**Was.** The version vector advances only when an oplog entry is appended, but
+`behind` and `lag_behind_ms` both read it as "what I have seen". Two things a
+node processes correctly append nothing: a document that **loses
+last-writer-wins**, and an entry the sender holds but never ships — a
+`UniqueViolation`, which is logged locally so it reaches change streams but is
+excluded from `entries_for_peer` by design ([ADR-029](decisions.md)).
+
+Either leaves a permanent hole, and `behind` then re-requests everything from
+that point on every round, forever.
+
+**The universal trigger is the bootstrap user.** Every node creates its own
+`__users` collection and inserts `root` locally. Each peer's `root` insert
+loses last-writer-wins on arrival — so **every cluster ever run** has had a
+permanent hole from the moment it formed.
+
+**Measured on an idle, fully converged three-node cluster:** 60 merge rounds in
+20 seconds with no user data at all, each re-fetching and re-applying the same
+entries. The re-sent range grows with everything written after the hole, so the
+cost grows with the database. After the fix: **zero**.
+
+**The visible symptom was the gauge.** After concurrent updates to one
+document, `kimmy_replication_lag_seconds` pinned at **1204 seconds** on all
+five nodes of a converged idle cluster and stayed there — clearing only when a
+winning write from each origin finally advanced past the discarded stamps.
+Operators are told to alert on this metric and that zero is the caught-up
+steady state, so it was both a permanent false alarm and a real signal nobody
+could distinguish from one.
+
+The gauge stayed silent in the universal case only because `lag_behind_ms`
+ignores an origin it has never seen — the "fifty-year lie" rule. So the loop
+ran everywhere while the metric read zero.
+
+**Now.** A second durable vector records what has been **processed**, and
+`behind`/`lag` read that; the oplog-derived vector keeps its meaning — what
+this node can *serve* — and is still what a peer receives
+([ADR-054](decisions.md)).
+
+**Found by driving a cluster, and only after fixing my own test.** The earlier
+evaluation reported this area clean because its conflict test used `PUT`
+without `?upsert=true` and therefore wrote nothing at all. A test that asserts
+five nodes agree can pass because they agree on an error.
+
+**Corrected during the work:** the first draft of ADR-054 claimed replicated
+DDL was one of the unlogged paths. It is not — `apply_ddl` appends the
+originating entry deliberately, to advance the vector. Reading the code rather
+than trusting the draft is what found the real universal trigger.
+
+---
+
 ## 🟡 Not yet implemented, and known
 
 | Gap | Consequence | Milestone |
