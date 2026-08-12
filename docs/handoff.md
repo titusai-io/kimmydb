@@ -31,7 +31,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-054**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-055**).
   Task 7 found the register can silently lose an entry — the handoff's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -60,8 +60,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#52 merged: all of M8 |
-| `m9-swim-auth` (open PR) | SWIM datagrams are HMAC-authenticated with `cluster_secret`, closing a hole that let a wrong-secret node join the member set and silently swallow a share of the webhooks ([ADR-053](decisions.md)). Plus the HTTP reference's six missing routes, now guarded by a test. **This handoff commit rides on it.** |
+| `main` | PRs #16–#53 merged: all of M8, plus SWIM authentication (ADR-053) |
+| `m9-witnessed-vector` (open PR) | A second durable version vector records what a node has **processed**, not just what it can serve. Fixes a re-sync loop that ran in **every cluster since M4** — an idle three-node cluster merged 60 times in 20 seconds — and a lag gauge that pinned at 1204s on a converged cluster ([ADR-054](decisions.md)). **This handoff commit rides on it.** |
 
 ### The M8 task board — all twelve done
 
@@ -266,6 +266,17 @@ in [Deviations](deviations.md), with the M8 tasks that would close them:
   a dropped packet become indistinguishable.
 - **The version vector is authoritative, not derived.** Never reintroduce a
   rebuild that lowers it — a snapshot grants coverage the oplog never held.
+- **There are two vectors, and they answer different questions.** The
+  oplog-derived one is *what I can serve* and is what a peer receives from
+  `AskVersions`. The witnessed one is *what I have processed* and is what
+  `behind` and `lag_behind_ms` must read. Swapping them either way breaks
+  something: comparing against servable re-requests everything a node
+  processed without appending, forever; advertising witnessed makes peers stop
+  sending entries nobody will then send (ADR-054).
+- **Anything that processes a replicated entry must witness it**, on every
+  branch — applied, superseded, skipped. That is why the per-entry work lives
+  in `apply_one` and the witnessing sits in the caller: a `continue` that skips
+  the bookkeeping is exactly how this bug existed since M4.
 - **Applying replicated DDL must not log**, and must carry the originating stamp
   into any tombstone it records. Both were bugs; both have tests.
 - **Retention never collects the newest oplog entry** — the clock resumes from

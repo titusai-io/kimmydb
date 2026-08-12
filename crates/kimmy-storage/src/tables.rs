@@ -92,6 +92,22 @@ pub const COLLECTIONS_DROPPED: TableDefinition<u64, &[u8]> =
 /// does not agree with the oplog, so it can be discarded without loss.
 pub const OPLOG_VERSIONS: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_versions");
 
+/// Newest stamp this node has **processed** per origin, appended or not.
+///
+/// [`OPLOG_VERSIONS`] answers "what can I serve a peer"; this answers "what
+/// have I already seen". They differ for everything a node handles correctly
+/// without writing an oplog entry: replicated DDL (deliberately not logged), a
+/// document that loses last-writer-wins, and entries skipped by design.
+///
+/// Treating the first as though it were the second is what made every cluster
+/// re-request the same entries on every sync round forever, and pinned
+/// `kimmy_replication_lag_seconds` non-zero on a converged cluster. See
+/// [ADR-054](../../../docs/decisions.md).
+///
+/// Always greater than or equal to [`OPLOG_VERSIONS`], because appending an
+/// entry raises both.
+pub const OPLOG_WITNESSED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_witnessed");
+
 // Keys within the META table.
 pub const META_NODE_ID: &str = "node_id";
 pub const META_FORMAT_VERSION: &str = "format_version";

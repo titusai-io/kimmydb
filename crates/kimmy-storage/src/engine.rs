@@ -69,6 +69,7 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_ARRIVAL)?;
             let _ = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             let _ = txn.open_table(tables::OPLOG_VERSIONS)?;
+            let _ = txn.open_table(tables::OPLOG_WITNESSED)?;
             let _ = txn.open_table(tables::COLLECTIONS_DROPPED)?;
         }
         txn.commit()?;
@@ -249,10 +250,19 @@ impl Engine {
             }
         }
 
-        let mut stored = Self::read_version_vector(db)?;
+        let mut stored = Self::read_versions(db, tables::OPLOG_VERSIONS)?;
         let before = stored.clone();
         stored.merge(&actual);
-        if stored == before {
+
+        // A database written before the witnessed vector existed has an empty
+        // one. Seeding it from the servable vector is the safe lower bound:
+        // the next sync round re-fetches once, witnesses what it processes,
+        // and goes quiet (ADR-054).
+        let mut witnessed = Self::read_versions(db, tables::OPLOG_WITNESSED)?;
+        let witnessed_before = witnessed.clone();
+        witnessed.merge(&stored);
+
+        if stored == before && witnessed == witnessed_before {
             return Ok(());
         }
 
@@ -261,6 +271,10 @@ impl Engine {
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             for (node, hlc) in stored.iter() {
                 versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
+            let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
+            for (node, hlc) in witnessed.iter() {
+                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
             }
         }
         txn.commit()?;
@@ -294,6 +308,17 @@ impl Engine {
 
         let txn = db.begin_write()?;
         {
+            // **Both** vectors. If witnessed stayed high, the node would
+            // believe it had already seen the entries the rewind removed and
+            // would never ask for them again — permanently missing writes
+            // while looking caught up, which is the very failure this function
+            // exists to prevent (ADR-054).
+            let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
+            seen.retain(|_, _| false)?;
+            for (node, hlc) in actual.iter() {
+                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
+
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             // Cleared rather than overwritten: a node that appears in the old
             // vector but no longer in the oplog has to disappear entirely, and
@@ -309,9 +334,12 @@ impl Engine {
         Ok(())
     }
 
-    fn read_version_vector(db: &Database) -> Result<kimmy_core::VersionVector> {
+    fn read_versions(
+        db: &Database,
+        table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    ) -> Result<kimmy_core::VersionVector> {
         let txn = db.begin_read()?;
-        let versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+        let versions = txn.open_table(table)?;
         let mut out = kimmy_core::VersionVector::new();
         for row in versions.iter()? {
             let (node, hlc) = row?;
@@ -357,11 +385,22 @@ impl Engine {
     /// Merged rather than replaced, so writes this node made that the sender
     /// never saw are not claimed to be forgotten.
     pub fn absorb_version_vector(&self, granted: &kimmy_core::VersionVector) -> Result<()> {
-        let mut current = Self::read_version_vector(&self.db)?;
+        let mut current = Self::read_versions(&self.db, tables::OPLOG_VERSIONS)?;
         current.merge(granted);
+
+        // Both: a snapshot hands over state, which is the strongest form of
+        // having processed everything behind it. Raising only the servable
+        // vector would leave the node still asking for the history the
+        // snapshot replaced.
+        let mut witnessed = Self::read_versions(&self.db, tables::OPLOG_WITNESSED)?;
+        witnessed.merge(&current);
 
         let txn = self.db.begin_write()?;
         {
+            let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
+            for (node, hlc) in witnessed.iter() {
+                seen.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
+            }
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
             for (node, hlc) in current.iter() {
                 versions.insert(node.to_bytes().as_slice(), hlc.to_bytes().as_slice())?;
@@ -402,7 +441,57 @@ impl Engine {
     ///
     /// The half of anti-entropy a peer needs in order to work out what to send.
     pub fn version_vector(&self) -> Result<kimmy_core::VersionVector> {
-        Self::read_version_vector(&self.db)
+        Self::read_versions(&self.db, tables::OPLOG_VERSIONS)
+    }
+
+    /// What this node has **processed**, per origin — appended or not.
+    ///
+    /// This is what "am I behind a peer" and "how far behind" must be asked
+    /// against. [`Self::version_vector`] answers a different question — what
+    /// this node can *serve* — and is what a peer receives. Conflating them
+    /// made every cluster re-request the same entries forever (ADR-054).
+    pub fn witnessed_vector(&self) -> Result<kimmy_core::VersionVector> {
+        Self::read_versions(&self.db, tables::OPLOG_WITNESSED)
+    }
+
+    /// Raise the witnessed vector to cover a whole batch, in one transaction.
+    ///
+    /// Only ever raises, like every other movement of a version vector: a
+    /// lowering would send the node back to asking for history it has already
+    /// processed.
+    pub fn absorb_witnessed(&self, seen: &kimmy_core::VersionVector) -> Result<()> {
+        if seen.is_empty() {
+            return Ok(());
+        }
+        let txn = self.db().begin_write()?;
+        {
+            let mut table = txn.open_table(tables::OPLOG_WITNESSED)?;
+            for (node, hlc) in seen.iter() {
+                let key = node.to_bytes();
+                let higher = match table.get(key.as_slice())? {
+                    Some(current) => hlc > decode_hlc(current.value())?,
+                    None => true,
+                };
+                if higher {
+                    table.insert(key.as_slice(), hlc.to_bytes().as_slice())?;
+                }
+            }
+        }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Record that a stamp has been processed, whatever came of it.
+    ///
+    /// Durable, unlike [`Self::witness`], which only nudges the in-memory
+    /// clock: a hole that survived a restart would restart the re-sync loop
+    /// with it.
+    pub fn witness_processed(&self, stamp: &Stamp) -> Result<()> {
+        self.witness(stamp);
+        let txn = self.db().begin_write()?;
+        raise_version(&txn, tables::OPLOG_WITNESSED, stamp)?;
+        txn.commit()?;
+        Ok(())
     }
 
     /// The highest stamp in the oplog, used to resume the logical clock.
@@ -776,6 +865,28 @@ fn decode_node(bytes: &[u8]) -> Result<NodeId> {
 /// Always called in the same transaction as the change it describes, so the log
 /// and the data can never disagree — there is no window in which a document is
 /// updated but unlogged, or logged but not applied.
+/// Raise one origin's entry in a version table, never lowering it.
+///
+/// Shared by both vectors, so they cannot drift in how they compare — and so a
+/// vector can only ever move forward, which is the invariant that keeps a
+/// rebuild from granting coverage the oplog never held.
+fn raise_version(
+    txn: &redb::WriteTransaction,
+    table: redb::TableDefinition<&'static [u8], &'static [u8]>,
+    stamp: &Stamp,
+) -> Result<()> {
+    let mut versions = txn.open_table(table)?;
+    let node = stamp.node.to_bytes();
+    let higher = match versions.get(node.as_slice())? {
+        Some(current) => stamp.hlc > decode_hlc(current.value())?,
+        None => true,
+    };
+    if higher {
+        versions.insert(node.as_slice(), stamp.hlc.to_bytes().as_slice())?;
+    }
+    Ok(())
+}
+
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
     let key = codec::oplog_key(&entry.stamp);
     let mut oplog = txn.open_table(tables::OPLOG)?;
@@ -791,17 +902,11 @@ pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> 
 
     // Same transaction as the entry, so the vector can never claim coverage of
     // something that was rolled back — a peer would then never be sent it.
-    {
-        let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
-        let node = entry.stamp.node.to_bytes();
-        let higher = match versions.get(node.as_slice())? {
-            Some(current) => entry.stamp.hlc > decode_hlc(current.value())?,
-            None => true,
-        };
-        if higher {
-            versions.insert(node.as_slice(), entry.stamp.hlc.to_bytes().as_slice())?;
-        }
-    }
+    //
+    // Both vectors: appending is also the strongest form of having seen it, so
+    // witnessed stays at or above servable by construction (ADR-054).
+    raise_version(txn, tables::OPLOG_VERSIONS, &entry.stamp)?;
+    raise_version(txn, tables::OPLOG_WITNESSED, &entry.stamp)?;
 
     let mut arrival = txn.open_table(tables::OPLOG_ARRIVAL)?;
     let mut by_stamp = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;

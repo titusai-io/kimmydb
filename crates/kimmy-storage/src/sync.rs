@@ -103,49 +103,20 @@ impl Engine {
     /// a range without coordinating.
     pub fn apply_batch(&self, entries: &[OplogEntry]) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
+        let mut witnessed = kimmy_core::VersionVector::new();
 
         for entry in entries {
-            // A node's own observation of a broken constraint is not a fact
-            // about the data; refuse it even if a peer sends one.
-            if entry.kind == OpKind::UniqueViolation {
-                continue;
-            }
-
-            // Schema changes come first in stamp order, so a collection exists
-            // by the time documents for it arrive.
-            if entry.kind.is_ddl() {
-                self.apply_ddl(entry)?;
-                outcome.ddl += 1;
-                continue;
-            }
-
-            // A legacy `Collection` entry names nothing and cannot be acted on.
-            if !entry.kind.is_document() {
-                continue;
-            }
-
-            // A drop the sender has not heard about yet must not be undone by
-            // the documents it is still replaying. Checked by id, because a
-            // node that dropped the collection can no longer resolve that id
-            // to a name.
-            if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
-                && entry.stamp < dropped_at
-            {
-                outcome.superseded += 1;
-                continue;
-            }
-
-            let Some(collection) = self.collection_by_id(entry.collection)? else {
-                outcome.unknown_collection += 1;
-                continue;
-            };
-
-            if self.apply_remote(&collection, entry)? {
-                outcome.applied += 1;
-            } else {
-                outcome.superseded += 1;
-            }
+            self.apply_one(entry, &mut outcome)?;
+            // **Every** entry that was processed, on every path — applied,
+            // superseded, DDL, or skipped by design. Doing this per branch is
+            // exactly how the hole appeared: three of them forgot, and the
+            // node then re-requested those entries on every round forever.
+            // See ADR-054.
+            witnessed.observe(entry.stamp);
         }
+        // One transaction for the batch rather than one per entry: a batch is
+        // up to `MAX_BATCH` entries and this is on the sync path.
+        self.absorb_witnessed(&witnessed)?;
 
         if outcome.unknown_collection > 0 {
             warn!(
@@ -175,6 +146,52 @@ impl Engine {
     /// The originating entry is appended either way, so this node's version
     /// vector advances and further peers learn of the change from it. That is
     /// the same rule `apply_remote` follows for documents.
+    /// Process one replicated entry. Witnessing is the caller's job, so that
+    /// no branch here can forget it.
+    fn apply_one(&self, entry: &OplogEntry, outcome: &mut SyncOutcome) -> Result<()> {
+        // A node's own observation of a broken constraint is not a fact
+        // about the data; refuse it even if a peer sends one.
+        if entry.kind == OpKind::UniqueViolation {
+            return Ok(());
+        }
+
+        // Schema changes come first in stamp order, so a collection exists
+        // by the time documents for it arrive.
+        if entry.kind.is_ddl() {
+            self.apply_ddl(entry)?;
+            outcome.ddl += 1;
+            return Ok(());
+        }
+
+        // A legacy `Collection` entry names nothing and cannot be acted on.
+        if !entry.kind.is_document() {
+            return Ok(());
+        }
+
+        // A drop the sender has not heard about yet must not be undone by
+        // the documents it is still replaying. Checked by id, because a
+        // node that dropped the collection can no longer resolve that id
+        // to a name.
+        if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
+            && entry.stamp < dropped_at
+        {
+            outcome.superseded += 1;
+            return Ok(());
+        }
+
+        let Some(collection) = self.collection_by_id(entry.collection)? else {
+            outcome.unknown_collection += 1;
+            return Ok(());
+        };
+
+        if self.apply_remote(&collection, entry)? {
+            outcome.applied += 1;
+        } else {
+            outcome.superseded += 1;
+        }
+        Ok(())
+    }
+
     fn apply_ddl(&self, entry: &OplogEntry) -> Result<()> {
         let Some(body) = &entry.body else {
             // A legacy `Collection` entry, which names nothing.
@@ -355,6 +372,77 @@ mod tests {
         // An alert cares how far behind the worst origin is; summing origins
         // would report a cluster-wide write burst as one enormous lag.
         assert_eq!(lag_behind_ms(&mine, &theirs), 8_000);
+    }
+
+    #[test]
+    fn a_discarded_entry_still_counts_as_witnessed() {
+        // The bug ADR-054 fixes, at its smallest. A losing write is processed
+        // correctly and appends nothing, so the *servable* vector cannot move.
+        // The *witnessed* vector must, or the node re-requests that entry on
+        // every sync round for the rest of its life.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let coll_a = a.create_collection("db", "c").unwrap();
+        let coll_b = b.create_collection("db", "c").unwrap();
+
+        // B writes second, so B's stamp wins.
+        a.insert(&coll_a, doc! { "_id": 1, "v": "from-a" }).unwrap();
+        b.insert(&coll_b, doc! { "_id": 1, "v": "from-b" }).unwrap();
+
+        let losing = a.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        let outcome = b.apply_batch(&losing).unwrap();
+        assert_eq!(outcome.applied, 0, "A's write must lose");
+        assert!(outcome.superseded > 0);
+
+        let a_origin = a.node_id();
+        let servable = b.version_vector().unwrap();
+        let witnessed = b.witnessed_vector().unwrap();
+
+        // Replicated DDL *is* appended (`apply_ddl` records the originating
+        // entry deliberately), so the servable vector moves for that. What it
+        // cannot cover is the discarded document, which is strictly newer.
+        assert!(
+            witnessed.get(a_origin) > servable.get(a_origin),
+            "the discarded insert is seen but not servable: servable={:?} witnessed={:?}",
+            servable.get(a_origin),
+            witnessed.get(a_origin)
+        );
+        assert!(
+            witnessed.get(a_origin) > Hlc::ZERO,
+            "but B has seen it, and must not ask for it again"
+        );
+        assert_eq!(
+            witnessed.behind(&a.version_vector().unwrap()),
+            None,
+            "B is not behind A any more; a second round would be pointless"
+        );
+        assert_eq!(
+            lag_behind_ms(&witnessed, &a.version_vector().unwrap()),
+            0,
+            "and the gauge must read caught-up, because it is"
+        );
+    }
+
+    #[test]
+    fn replicated_ddl_is_witnessed_even_though_it_is_never_logged() {
+        // The universal case: applying a peer's schema change deliberately
+        // appends nothing, so before ADR-054 *every* cluster re-requested
+        // every DDL entry on every round, forever — an idle three-node cluster
+        // merged 40 times in 20 seconds.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("db", "c").unwrap();
+
+        let ddl = a.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        assert!(!ddl.is_empty(), "creating a collection logs an entry");
+        let outcome = b.apply_batch(&ddl).unwrap();
+        assert!(outcome.ddl > 0);
+
+        assert_eq!(
+            b.witnessed_vector().unwrap().behind(&a.version_vector().unwrap()),
+            None,
+            "a second round must find nothing left to ask for"
+        );
     }
 
     #[test]
