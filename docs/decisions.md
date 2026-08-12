@@ -2209,6 +2209,130 @@ state that grows with cluster churn.
 
 ---
 
+## ADR-055 — The client protocol is HTTP/JSON and WebSocket, said out loud
+
+**Decision.** KimmyDB's client protocol is the HTTP/JSON and WebSocket API it
+already serves, promoted from an implementation detail to a **specified,
+versioned contract** with first-party clients for Rust, Python and Go. The
+MongoDB wire protocol, gRPC and GraphQL are all rejected as client-facing
+protocols.
+
+This closes the client story deferred on 2026-08-11 ([Deviations](deviations.md))
+and extends [ADR-011](#adr-011--httpjson--websocket-not-the-mongodb-wire-protocol),
+which chose HTTP/JSON as a *server* decision and never said what a client could
+rely on.
+
+**The protocol already existed; nothing had written it down.** Framing is HTTP,
+encoding is Extended JSON v2 (`kimmy-api/src/lib.rs`), authentication is a
+bearer token from `/v1/auth/login`, errors are `{status, tag, message}`,
+streaming is a WebSocket carrying resume tokens that are portable across nodes,
+and `kimmy-cli` is a working 464-line client built on it. Every question a wire
+protocol has to answer already has an answer here. What was missing was that
+**nothing specified, versioned or tested the protocol in use** — the same shape
+of defect as the native-dependency claim in ADR-016, which "lived in prose that
+nothing checked" and was quietly false for two milestones. The register framed
+this as "there is no wire protocol", which conceded a premise that was never
+true. There is one. It was undocumented.
+
+**Rejected: the MongoDB wire protocol.** Three of its prerequisites — cursors,
+`findAndModify`, computed expressions — are M9 tasks that are needed either
+way, so they are not the argument. What is unique to it: an OP_MSG/OP_QUERY
+codec including payload-type-1 document sequences, SASL/SCRAM, `hello` and a
+wire-version claim, Mongo's numeric error codes, and `(lsid, txnNumber)`
+deduplication without which a driver's automatic retry silently double-applies
+a write. Beyond size, three things make it wrong rather than merely expensive:
+
+- **SCRAM cannot be derived from an Argon2 hash.** It needs PBKDF2-HMAC-SHA-256
+  material from the plaintext at set time, so every account would need a second
+  stored credential obtainable only at the next password change — or `PLAIN`
+  over TLS, which is not the default any driver reaches for.
+- **Driver authentication is connection-scoped**, and a connection lives for
+  hours. ADR-052's revocation is a token check on a request; there is no token
+  to expire on a held connection.
+- **Mongo's write commands partially succeed by design** — `ordered` batches
+  report `writeErrors` per document — which contradicts ADR-048's standing
+  invariant that a bulk insert is one transaction and a failure anywhere aborts
+  all of it.
+
+**And the deciding reason is topology.** `hello` forces a claim. Presented as a
+*standalone*, drivers disable change streams — so KimmyDB's best feature
+becomes unreachable through the very drivers the shim exists to serve.
+Presented as a *replica set*, drivers run SDAM, pick the one node advertising
+`isWritablePrimary`, and funnel every write to it. **KimmyDB is leaderless and
+every node accepts writes.** The client model cannot express the architecture;
+adopting it would mean misrepresenting the cluster to every driver. Vector
+search, hybrid search, webhooks, schema inference and MCP have no
+wire-protocol representation at all, so the HTTP API would remain forever as a
+second, unequal surface.
+
+**Rejected: gRPC.** ADR-011 already listed and rejected it; two of its costs
+have sharpened since, and one argument for it has been measured away.
+
+- **Protobuf is schema-first and this store is schemaless.** An arbitrary
+  document can be `google.protobuf.Struct`, which cannot express ObjectId,
+  Decimal128, Binary, DateTime or Int64-versus-Double — reintroducing precisely
+  the fidelity problem Extended JSON already solves — or `bytes` carrying raw
+  BSON, at which point protobuf's type system contributes nothing and gRPC is
+  framing plus code generation.
+- **Code generation is available from OpenAPI**, which M10 task 1 produces
+  anyway, so that half is not exclusive to gRPC.
+- **The efficiency argument is answered by [Benchmarks](benchmarks.md).** The
+  durable commit is the cost, not the encoding — the marginal document runs
+  ~13 µs against a several-millisecond commit, roughly 260:1 — and `/bulk`
+  already converted that into 291 → 51,320 docs/sec. Encoding was never the
+  bottleneck a binary protocol would relieve.
+- **Its build cost lands on documented discipline.** `prost-build` wants a
+  `protoc` binary, and `tonic`'s TLS feature selects a rustls provider — the
+  aws-lc-rs trap already met twice, in ADR-016/ADR-039 and again in ADR-050.
+  `./scripts/check-native-deps.sh` exists to make exactly this visible.
+- **Browsers cannot speak it**, so the HTTP API stays regardless. It is purely
+  additive surface.
+
+**Rejected: GraphQL.** Never previously evaluated; recorded here so the absence
+is a decision rather than an oversight.
+
+- **Its value is the typed selection set.** Against arbitrary documents the
+  body becomes a `JSON` scalar and GraphQL degenerates into "post a query
+  string, receive JSON" — which `/find` already is, with less machinery.
+- **Generating a schema from `schema.rs` inference is the tempting move and is
+  a trap.** That module states plainly that it is "inference, not a schema.
+  Nothing here is enforced." A schema derived from a sample makes perfectly
+  valid documents unqueryable whenever a field falls outside it — a silent,
+  data-dependent failure that gets worse as a collection grows more
+  heterogeneous. It would convert a deliberate design property into an
+  accidental constraint.
+- **Nested selection is an unbounded cost surface**, so a GraphQL server owes
+  depth limiting and complexity scoring. Rate limiting here covers login only.
+- **The precedent is unanimous.** Hasura and PostGraphile are services *in
+  front of* a database, not features of one. If GraphQL is ever wanted it
+  belongs on top of the HTTP API, outside `kimmyd`.
+
+**Why the count matters more than any single comparison.** Protocols multiply
+against features. The surface is CRUD, aggregate, bulk, indexes, change
+streams, webhooks, vector search, hybrid search, schema inference and MCP —
+every additional protocol must carry all of it or leave part of it
+second-class, and this is a one-maintainer project with one branch per task.
+The question was never "is gRPC good"; it is "what does a second and third
+protocol cost on every feature after it".
+
+**What the decision costs, stated plainly.** No existing MongoDB tooling —
+Compass, `mongosh`, existing drivers. That is the same cost ADR-011 accepted,
+now paid deliberately with the alternative examined rather than assumed.
+Adoption starts from zero: nobody can point an existing application at
+KimmyDB until a client exists for their language. And three clients are three
+maintenance streams that will drift, which is why a conformance suite is a
+task in M10 rather than a nicety.
+
+**Left open on purpose.** A narrow, read-mostly wire shim presenting as a
+*standalone* server — enough for Compass and `mongosh` to inspect a database,
+without claiming replica-set topology and inheriting retryable writes,
+`$clusterTime` and primary election — is **not** rejected here. It is a much
+smaller and different decision, it does not touch the write path, and it should
+be made after M10 from experience with real clients. Sharding stays deferred on
+its original terms.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

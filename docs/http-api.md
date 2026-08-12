@@ -7,6 +7,18 @@ Everything speaks JSON over HTTP; change streams use WebSocket. Implemented in
 
 Default port **7878**.
 
+**This is KimmyDB's client protocol, not one of several.** HTTP provides
+framing, Extended JSON v2 provides the encoding for types JSON cannot express,
+a bearer token from `/v1/auth/login` provides authentication, `{status, tag,
+message}` provides errors, and the WebSocket at `/watch` provides streaming.
+The MongoDB wire protocol, gRPC and GraphQL were all considered and rejected —
+[ADR-055](decisions.md) has the reasoning.
+
+This page is a *reference*, not yet a *specification*: nothing here is
+versioned or machine-checked against the routes, so it can drift. Making it a
+contract, with a test that fails when it does, is M10 task 1 on the
+[Roadmap](roadmap.md).
+
 ---
 
 ## Endpoints

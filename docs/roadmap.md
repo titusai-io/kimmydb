@@ -22,8 +22,9 @@ graph LR
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
     M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
     M9["<b>M9</b> 📋<br/>finish the<br/>query engine"]
+    M10["<b>M10</b> 📋<br/>client protocol<br/>and clients"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -36,6 +37,7 @@ graph LR
     style M7 fill:#2f5d3a,color:#fff
     style M8 fill:#2f5d3a,color:#fff
     style M9 fill:#2d3748,color:#fff
+    style M10 fill:#2d3748,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -50,6 +52,7 @@ graph LR
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
 | **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
 | **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | 📋 Planned |
+| **M10** | The client protocol, formalized — a specified and versioned HTTP/WebSocket contract, and first-party Rust, Python and Go clients ([ADR-055](decisions.md)) | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -654,18 +657,15 @@ partial-versus-sparse question, and task 5's token shape. Each is public
 surface; settle them before the relevant branch starts, as M8 did with all
 three of its reserved decisions.
 
-### Deliberately deferred until there is operational experience
+### Deferred questions — one settled, one still open
 
-Two larger questions were raised and **explicitly postponed on 2026-08-11**,
-not dropped. A future session should not re-open either without being asked:
+Two larger questions were raised and **explicitly postponed on 2026-08-11**.
+The first has since been decided; the second stands.
 
-- **The client story.** No wire protocol means no existing MongoDB driver
-  works, which is a bigger adoption barrier than any feature on the list above.
-  The options — a wire-protocol shim so Mongo drivers work unchanged, versus
-  first-party clients in a couple of languages — are a strategic choice the
-  maintainer wants to make *after* running KimmyDB for a while, not before.
-  Note that "MongoDB wire protocol" already sits in the not-planned table from
-  an earlier decision; that rejection is what would be revisited.
+- **The client story — settled on 2026-08-12 by [ADR-055](decisions.md).** The
+  protocol is the HTTP/JSON and WebSocket API already served, promoted to a
+  specified and versioned contract with first-party clients. The MongoDB wire
+  protocol, gRPC and GraphQL are all rejected. **M10 below carries it out.**
 - **Sharding.** Every node holds a full copy, so capacity is bounded by one
   machine and writes by one redb writer (~300/s single, ~51,300/s batched).
   **Replicated-not-partitioned is the current position and the maintainer is
@@ -683,13 +683,79 @@ scheduled — vector search remains its own endpoint.
 
 ---
 
+## M10 — The client protocol, formalized 📋
+
+**The theme: KimmyDB has a protocol and has never written it down.** HTTP
+framing, Extended JSON v2 encoding, bearer-token authentication, a typed error
+envelope and WebSocket streaming are a complete answer to every question a wire
+protocol has to answer — and `kimmy-cli` is 464 lines of working client against
+it. What is missing is that **nothing specifies, versions or tests it**, so
+every client would be hand-written and nothing fails when a route drifts. That
+is the same defect shape as ADR-016's native-dependency claim, which lived in
+prose that nothing checked and was false for two milestones.
+
+[ADR-055](decisions.md) settles the direction and rejects the MongoDB wire
+protocol, gRPC and GraphQL. This milestone is the work.
+
+**M10 follows M9, and not only by preference.** Task 6 needs M9's cursors, and
+a client is a poor thing to ship against an engine that cannot `findAndModify`
+or derive a computed field. Tasks 1–5 and 7 have no M9 dependency and could
+start earlier if that ever matters.
+
+**Only task 5 carries distributed-systems risk**, and it carries two known
+traps at once: `Members` holds *peers only* — an owner computed over it can
+never be `me`, the bug that silently undelivered every clustered webhook — and
+the set must contain only authenticated peers (ADR-053). Anything new reading
+it inherits both.
+
+### Tasks
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | **Protocol specification, and a test that fails on drift** | An OpenAPI 3.1 document covering every route, the Extended JSON v2 conventions, the auth flow and the error envelope. **The test is the point, not the document** — a spec nothing checks becomes wrong the same way the "no C toolchain" claim did. Buys generated clients in most languages as a side effect. **Approach reserved**: hand-written and verified by a contract test, versus generated from the routes with `utoipa`/`aide` (which adds a dependency and annotations to every handler) |
+| 2 | **The error taxonomy becomes public surface** | Today errors are `{status, tag, message}` with tags accreted per site — `duplicate_key`, `unique_violation`, `resume_token_expired`. Clients branch on these, so the tag set becomes API: enumerate it, make it exhaustive over `ApiError`, and test that every constructor maps to a listed tag. **String tags are a genuine advantage over Mongo's numeric codes** and worth keeping. **Reserved**: which errors are declared *retryable*, since that decides what a client is allowed to retry automatically |
+| 3 | **Versioning and compatibility policy** | What `/v1` promises, what counts as additive, what forces `/v2`, and how a client learns the server's version. Cheap to write and expensive to omit — this is what lets a client be maintained by someone who is not reading the source. Note the deliberate contrast with the SWIM identity, which is postcard and *not* self-describing, so a field change there stops the cluster (ADR-040, ADR-051). The client protocol must have the opposite property, and saying so is the task |
+| 4 | **Token refresh** | `/v1/auth/login` is the only way to get a token and tokens expire. Re-sending stored credentials every hour is not something a client library may ask of an application. **The security half is the real work**: refresh must re-read the user record and re-check `token_version` and `disabled`, or it becomes a way to launder a revoked session indefinitely — the exact failure ADR-052 exists to prevent. **Shape reserved**: a separate refresh token versus sliding re-issue of the access token |
+| 5 | **Client-visible topology and node discovery** | A client is handed one address and cannot learn the others or fail over. This is the one capability a MongoDB driver's SDAM would have given free, and it is *better* here: every node accepts writes, so client-side selection is round-robin plus retry elsewhere, with none of Mongo's funnel-through-one-primary. **Reserved**: served from static configuration, or from live SWIM membership — the latter is more accurate and inherits both traps named above |
+| 6 | **Cursors at the protocol level** | Depends on M9 task 5. That task picks the *engine* shape; this one decides what crosses the wire and what a client may assume — in particular whether a continuation token is portable across nodes, as change-stream resume tokens already are. Matching that property is worth doing deliberately; silently not matching it is a trap for anyone who learns the streaming behaviour first |
+| 7 | **An HTTP-level benchmark harness** | **Every number in [Benchmarks](benchmarks.md) is taken at the storage engine.** Nothing measures the socket, so JSON and Extended JSON conversion, per-request token verification, TLS and concurrent HTTP clients are all outside the published figures. Until this exists, *there is no answer to "what throughput can a client expect"* — and this file's own retracted-figure note is what happens when one is quoted anyway. Release build, over a real socket, reads as well as writes, TLS on and off |
+| 8 | **The Rust client — `kimmy-client`** | First, because it is in-tree and because **`kimmy-cli` is a ready-made consumer**: its 464 lines currently hand-roll every HTTP call, and converting it to the new crate is what proves the client is pleasant rather than merely present. Auth with refresh, cursor iteration, change streams over WebSocket with reconnect and resume, typed errors, multi-node failover |
+| 9 | **The Python client** | The largest audience for a document store, and the one most likely to arrive from `pymongo`. Sync first; async is a second decision, not an assumption |
+| 10 | **The Go client** | Third because it is the least likely to surface a protocol gap the other two missed — which is exactly why it is a good final check on the spec |
+| 11 | **A conformance suite every client must pass** | One set of scenarios, run in CI against a real node, that all three clients execute. **Three clients without this will drift**, and the drift will be discovered by a user. This is the milestone's version of the standing lesson: prefer work that turns an assertion into something that fails when it stops being true |
+| 12 | **One example application per language, and docs closeout** | Something real end to end — documents, a change stream, a vector search — not a snippet that inserts one record. The deferred decision named *running KimmyDB on something real* as the trigger for judging this direction; these are that. Plus the mutation pass over the milestone diff, as M7 and M8 both closed |
+
+### Decisions reserved for the maintainer
+
+Task 1's specification approach, task 2's retryable classification, task 3's
+version policy, task 4's refresh shape, task 5's topology source, and the
+HTTP and async stack chosen for each client in 8–10. Each is public surface;
+settle them before the relevant branch starts, as M8 did with all three of its
+reserved decisions and as M9 is set up to do with five.
+
+### Deliberately not in M10
+
+- **A MongoDB wire shim of any kind**, including the narrow read-mostly one
+  ADR-055 leaves open. That decision waits on experience from the clients this
+  milestone builds — deciding it now would be deciding it from a comparison
+  table again.
+- **More languages.** Java, C# and TypeScript are all defensible next; none is
+  worth committing to before the conformance suite has proved it can hold three
+  clients honest.
+- **mTLS**, which stays in the not-planned table. It is client *authentication*,
+  not client *protocol*, and nothing here changes the argument.
+
+---
+
 ## Explicitly not planned
 
 | | Why |
 |---|---|
 | Multi-document transactions | Requires coordination — the thing a leaderless design forgoes |
 | `$where` / JavaScript execution | An obvious injection surface |
-| MongoDB wire protocol | Considered and rejected; see [Decisions](decisions.md) |
+| MongoDB wire protocol | Considered and rejected twice — ADR-011, and again in [ADR-055](decisions.md) with the alternative examined rather than assumed. The deciding reason is topology: drivers presented with a replica set funnel every write to one `isWritablePrimary`, which a leaderless cluster cannot express |
+| gRPC | Rejected in ADR-011 and again in [ADR-055](decisions.md). Protobuf is schema-first against a schemaless store, code generation comes from OpenAPI anyway, the efficiency case is answered by the commit being the cost, and `protoc` plus `tonic`'s TLS provider land on the native-dependency discipline |
+| GraphQL | Rejected in [ADR-055](decisions.md). Its value is the typed selection set, which arbitrary documents reduce to a `JSON` scalar; generating a schema from sampled inference would make valid documents unqueryable. Belongs in a service in front of the database, as Hasura and PostGraphile are |
 | Geospatial indexes | Out of scope |
 | Field-level encryption | Use an encrypted volume |
 | Full-text indexes | Superseded by vector and hybrid search |
