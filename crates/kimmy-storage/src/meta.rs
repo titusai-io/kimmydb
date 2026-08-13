@@ -88,6 +88,7 @@ mod tests {
             unique: false,
             enforcement: Default::default(),
             multikey: false,
+            expire_after_secs: None,
         });
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CollectionMeta>(&text).unwrap(), m);
@@ -133,5 +134,40 @@ mod tests {
         let m: CollectionMeta = serde_json::from_str(json).unwrap();
         assert!(m.indexes.is_empty());
         assert!(m.vector.is_none());
+    }
+
+    #[test]
+    fn an_index_written_before_ttl_existed_still_loads() {
+        // The same guarantee one level down, for M9's `expire_after_secs`.
+        // Both formats this crosses are self-describing — JSON here and BSON
+        // in the replicated `IndexCreate` — so an added optional field is
+        // tolerated rather than read as corruption. That is *why* a TTL could
+        // be an index option at all: a new `OpKind` would not have been,
+        // because `op_kind_from_tag` refuses an unknown tag.
+        let json = r#"{"id":1,"db":"app","name":"orders","created":{"wall_ms":10,"counter":0},
+            "indexes":[{"id":7,"name":"age_1","fields":[{"path":"age"}],"unique":false}]}"#;
+        let m: CollectionMeta = serde_json::from_str(json).unwrap();
+        let index = m.index("age_1").expect("the index still loads");
+        assert_eq!(index.expire_after_secs, None);
+        assert!(!index.is_ttl());
+        assert_eq!(index.ttl_path(), None);
+    }
+
+    #[test]
+    fn a_ttl_index_round_trips_through_json() {
+        let mut m = meta();
+        m.indexes.push(IndexMeta {
+            id: 0,
+            name: "ttl_seen".into(),
+            fields: vec![IndexField::ascending("seen")],
+            unique: false,
+            enforcement: Default::default(),
+            multikey: false,
+            expire_after_secs: Some(3600),
+        });
+        let text = serde_json::to_string(&m).unwrap();
+        let back: CollectionMeta = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.index("ttl_seen").unwrap().ttl_path(), Some("seen"));
     }
 }

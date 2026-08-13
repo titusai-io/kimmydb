@@ -487,6 +487,8 @@ pub struct IndexSpec {
     pub name: Option<String>,
     /// `"local"` (default) or `"coordinated"`.
     pub enforcement: Option<String>,
+    /// Present makes this a TTL index — see [`kimmy_storage::IndexMeta`].
+    pub expire_after_seconds: Option<i64>,
 }
 
 pub fn create_index(
@@ -514,8 +516,15 @@ pub fn create_index(
         }
     };
 
-    let index =
-        state.engine.create_index_with(db, coll, fields, spec.unique, enforcement, spec.name)?;
+    let index = state.engine.create_index_with(
+        db,
+        coll,
+        fields,
+        spec.unique,
+        enforcement,
+        spec.name,
+        spec.expire_after_seconds,
+    )?;
     Ok(index_to_json(&index))
 }
 
@@ -543,7 +552,7 @@ pub fn drop_index(
 }
 
 pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
-    json!({
+    let mut out = json!({
         "name": index.name,
         "fields": index.fields.iter().map(|f| json!({
             "path": f.path,
@@ -557,7 +566,13 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
         // Surfaced so an operator can see *why* a two-sided range on this
         // index does not stop at its upper bound.
         "multikey": index.multikey,
-    })
+    });
+    // Added only when set, so listing ordinary indexes does not suggest every
+    // one of them carries an expiry policy that happens to be null.
+    if let Some(secs) = index.expire_after_secs {
+        out["expireAfterSeconds"] = json!(secs);
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------

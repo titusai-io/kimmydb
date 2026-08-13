@@ -537,6 +537,10 @@ struct CreateIndexRequest {
     /// coordinated unique constraint needs clustering and is refused until M4.
     #[serde(default)]
     enforcement: Option<String>,
+    /// Present makes this a TTL index: documents are deleted this many seconds
+    /// after the single indexed date field.
+    #[serde(default, rename = "expireAfterSeconds")]
+    expire_after_seconds: Option<i64>,
 }
 
 async fn create_index(
@@ -554,6 +558,7 @@ async fn create_index(
         unique: body.unique,
         name: body.name,
         enforcement: body.enforcement,
+        expire_after_seconds: body.expire_after_seconds,
     };
     Ok(Json(exec::create_index(&state, &auth, &db, &coll, spec)?))
 }

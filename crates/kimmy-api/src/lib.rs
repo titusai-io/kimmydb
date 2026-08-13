@@ -14,6 +14,7 @@ pub mod dispatch;
 pub mod egress;
 pub mod error;
 pub mod exec;
+pub mod expiry;
 pub mod json;
 pub mod metrics;
 pub mod ownership;

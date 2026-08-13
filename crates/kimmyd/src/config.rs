@@ -172,6 +172,15 @@ pub struct StorageConfig {
     /// restores the pre-M5 behaviour of unbounded growth — available because an
     /// operator debugging a replication problem may want the history kept.
     pub gc_interval_secs: u64,
+    /// How often to look for documents a TTL index says have expired.
+    ///
+    /// Separate from `gc_interval_secs`: that collects *garbage* — oplog
+    /// entries and tombstones past their retention — while this deletes *live
+    /// documents* a policy says are due. Conflating them would tie how promptly
+    /// a session expires to how often disk is reclaimed.
+    ///
+    /// Zero disables expiry, which leaves any TTL index defined but inert.
+    pub ttl_interval_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -349,6 +358,10 @@ impl Default for StorageConfig {
             // Frequent enough that disk use tracks retention rather than
             // sawtoothing, rare enough that the scan is not a background load.
             gc_interval_secs: 10 * 60,
+            // Sixty seconds, as MongoDB uses. A TTL is a retention policy
+            // rather than a deadline, so a tighter interval would multiply
+            // scans for accuracy no caller can observe.
+            ttl_interval_secs: 60,
         }
     }
 }

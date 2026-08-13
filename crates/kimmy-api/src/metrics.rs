@@ -55,6 +55,8 @@ pub struct Metrics {
     cluster_members: AtomicU64,
     tls_reloads_ok: AtomicU64,
     tls_reloads_failed: AtomicU64,
+    ttl_expired: AtomicU64,
+    ttl_skipped: AtomicU64,
 }
 
 impl Default for Metrics {
@@ -76,6 +78,8 @@ impl Default for Metrics {
             webhook_delivered: AtomicU64::new(0),
             webhook_failed: AtomicU64::new(0),
             webhook_events: AtomicU64::new(0),
+            ttl_expired: AtomicU64::new(0),
+            ttl_skipped: AtomicU64::new(0),
             webhook_active: AtomicU64::new(0),
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
@@ -189,6 +193,20 @@ impl Metrics {
         self.backups.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// One collection's expiry pass.
+    ///
+    /// `expired` is what makes the ownership choice checkable: expiry is owned
+    /// by one node per collection so a document produces **one** delete
+    /// cluster-wide, and summing this counter across a cluster is how that
+    /// stops being an assertion nobody measures. `skipped` counts candidates
+    /// refused because the document was refreshed between the scan and the
+    /// write — a steady rise there means TTLs are being reset as fast as the
+    /// pass finds them.
+    pub fn record_expiry(&self, expired: u64, skipped: u64) {
+        self.ttl_expired.fetch_add(expired, Ordering::Relaxed);
+        self.ttl_skipped.fetch_add(skipped, Ordering::Relaxed);
+    }
+
     /// Count one certificate reload attempt.
     ///
     /// A failed reload is the quiet failure this metric exists for: the node
@@ -238,6 +256,12 @@ impl Metrics {
              # HELP kimmy_backups_total Backups served.\n\
              # TYPE kimmy_backups_total counter\n\
              kimmy_backups_total {backups}\n\
+             # HELP kimmy_ttl_expired_total Documents deleted by a TTL index.\n\
+             # TYPE kimmy_ttl_expired_total counter\n\
+             kimmy_ttl_expired_total {ttl_expired}\n\
+             # HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.\n\
+             # TYPE kimmy_ttl_skipped_total counter\n\
+             kimmy_ttl_skipped_total {ttl_skipped}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
              # TYPE kimmy_webhook_deliveries_total counter\n\
              kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
@@ -274,6 +298,8 @@ impl Metrics {
             wh_ok = self.get(&self.webhook_delivered),
             wh_fail = self.get(&self.webhook_failed),
             wh_events = self.get(&self.webhook_events),
+            ttl_expired = self.get(&self.ttl_expired),
+            ttl_skipped = self.get(&self.ttl_skipped),
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
@@ -362,8 +388,8 @@ mod tests {
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 19 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 34, "expected one sample per series: {out}");
+        // 21 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 36, "expected one sample per series: {out}");
     }
 
     #[test]

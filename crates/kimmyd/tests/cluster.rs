@@ -91,6 +91,9 @@ bind = "127.0.0.1:{http}"
 
 [storage]
 data_dir = "{data}"
+# Expiry runs every second rather than every sixty, so a TTL test waits on
+# ownership settling rather than on a production cadence.
+ttl_interval_secs = 1
 
 [auth]
 jwt_secret = "{JWT_SECRET}"
@@ -539,4 +542,149 @@ async fn every_subscription_has_a_deliverer_and_a_dead_owners_are_taken_over() {
         }
     })
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// TTL expiry
+// ---------------------------------------------------------------------------
+
+/// The claim the ownership decision was made for: **one expired document
+/// produces one delete cluster-wide, not one per node.**
+///
+/// Every node runs its own expiry timer, so the naive design has all three
+/// notice the same document and issue three deletes. Those converge under
+/// last-writer-wins, so correctness alone cannot tell the two designs apart —
+/// only counting can, which is why `kimmy_ttl_expired_total` exists. Summed
+/// across the cluster it must read exactly 1.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn one_expired_document_produces_one_delete_cluster_wide() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+
+    // A TTL index is DDL, so it replicates like any other index definition —
+    // every node ends up holding the policy, which is exactly why ownership
+    // has to decide who acts on it.
+    let created = client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ttl_seen",
+            "fields": [{ "path": "seen" }],
+            "expireAfterSeconds": 1,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200, "creating the TTL index");
+
+    // Dated in the past, so it is already due the moment it lands.
+    client
+        .post(a.url("/v1/db/shop/coll/sessions/docs"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "_id": 1, "seen": { "$date": 0 } }))
+        .send()
+        .await
+        .unwrap();
+
+    // Gone everywhere: the owner deletes, and the delete replicates.
+    for node in [&a, &b, &c] {
+        let token = node.login(&client).await;
+        eventually("the expired document to disappear from every node", || {
+            let client = client.clone();
+            let url = node.url("/v1/db/shop/coll/sessions/docs/1");
+            let token = token.clone();
+            async move {
+                let res = client.get(url).bearer_auth(&token).send().await.unwrap();
+                res.status() == 404
+            }
+        })
+        .await;
+    }
+
+    // The measurement. Let a few more passes run first, so that a design where
+    // every node expires independently has every chance to show itself.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+    let mut total = 0;
+    for node in [&a, &b, &c] {
+        total += node.gauge(&client, "kimmy_ttl_expired_total").await.unwrap_or(0);
+    }
+    assert_eq!(
+        total, 1,
+        "one document must produce exactly one delete cluster-wide; \
+         {total} means expiry is amplifying across nodes"
+    );
+}
+
+/// A document refreshed before the pass reaches it must survive.
+///
+/// The heartbeat case, on real nodes rather than in a unit test: the scan and
+/// the delete are separate transactions, so without the guard re-reading
+/// inside the write, a session extended in that window is deleted while live.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_refreshed_document_outlives_its_expiry() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+    client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({
+            "name": "ttl_seen",
+            "fields": [{ "path": "seen" }],
+            "expireAfterSeconds": 3600,
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // One already due, one comfortably fresh.
+    for (id, seen) in [(1, 0i64), (2, i64::from(u32::MAX) * 1000)] {
+        client
+            .post(a.url("/v1/db/shop/coll/sessions/docs"))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "_id": id, "seen": { "$date": seen } }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    eventually("the stale session to expire", || {
+        let client = client.clone();
+        let url = a.url("/v1/db/shop/coll/sessions/docs/1");
+        let token = token.clone();
+        async move { client.get(url).bearer_auth(&token).send().await.unwrap().status() == 404 }
+    })
+    .await;
+
+    // The fresh one is still here, and stays here across several passes.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let res = client
+        .get(a.url("/v1/db/shop/coll/sessions/docs/2"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "a document inside its TTL must not be expired");
 }

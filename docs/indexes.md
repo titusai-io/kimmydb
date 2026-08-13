@@ -18,6 +18,13 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/indexes -H "$A" -d '{
   "name":   "item_qty"
 }'
 
+# The same route builds a TTL index — see "TTL indexes" below.
+curl -XPOST localhost:7878/v1/db/shop/coll/sessions/indexes -H "$A" -d '{
+  "fields": [ { "path": "seen" } ],
+  "expireAfterSeconds": 3600,
+  "name":   "ttl_seen"
+}'
+
 curl        localhost:7878/v1/db/shop/coll/orders/indexes -H "$A"
 curl -XDELETE localhost:7878/v1/db/shop/coll/orders/indexes/item_qty -H "$A"
 ```
@@ -270,6 +277,92 @@ of the prefix. Type tags occupy `0x01..=0xF0`, and a descending component
 inverts them into `0x0F..=0xFE`, so `0xFF` exceeds any possible first byte. That
 is what lets a one-field equality on a two-field index still find documents
 whose key carries a second component.
+
+---
+
+## TTL indexes — expiring documents
+
+An index with `expireAfterSeconds` also becomes a **policy**: a background pass
+deletes documents whose indexed date is that many seconds in the past.
+
+```json
+{ "fields": [{ "path": "seen" }], "expireAfterSeconds": 3600, "name": "ttl_seen" }
+```
+
+`expireAfterSeconds: 0` is the absolute-deadline pattern — the document goes as
+soon as the date passes, so store the moment it should die.
+
+**Why the policy rides on an index rather than being a collection setting.**
+The pass has to *find* expired documents on every tick, forever. A collection
+scan costs ~0.8 µs per document present, so at ten million documents that is
+~8 s per pass whether anything expired or not. A range scan over the TTL index
+costs ~1.66 µs per candidate returned, and the candidates are exactly the
+expired documents ([Benchmarks](benchmarks.md)). The index is both the policy
+and the mechanism, and it still answers ordinary queries.
+
+### The rules
+
+- **One field.** A compound TTL index is refused: expiry reads one date and
+  there would be no rule for which field that is.
+- **Dates only.** A document whose indexed field holds a string, a number or
+  nothing at all is never expired. This is what stops a policy added to a
+  heterogeneous collection from deleting everything that lacks the field. Type
+  ordering in the key encoding gives it for free — non-dates sort outside the
+  scanned range.
+- **Best-effort, not a deadline.** Expiry runs every `storage.ttl_interval_secs`
+  (default 60), and a pass removes at most 1,000 documents per collection so a
+  backlog drains over several ticks instead of holding the single writer.
+  A document lives until the pass that finds it.
+- **A refreshed document survives.** The scan and the delete are separate
+  transactions, so the delete re-reads the document inside its write and
+  declines if the date has moved on. Extending a session while the pass is
+  running does not lose it.
+- **Changing the policy needs the index recreated.** Re-creating with the same
+  `expireAfterSeconds` is idempotent; a *different* value is a 409 rather than
+  a silent keep, because silently keeping it would leave documents living
+  longer than you just asked with a success in return.
+
+### In a cluster
+
+**One node expires a given collection**, chosen by rendezvous hashing over the
+live member set — the same mechanism webhook subscriptions use (ADR-045,
+ADR-051). Its deletes then replicate as ordinary deletes.
+
+The alternative, every node expiring independently, is *convergent* — N deletes
+of one document settle to the same tombstone — but N-1 of those entries are
+superseded work that still costs oplog space, replication bandwidth and
+change-stream traffic. On a five-node cluster that is 5× amplification of a
+background job.
+
+Two consequences, both deliberate:
+
+- If the owning node is stopped or partitioned, that collection **stops
+  expiring** until membership changes and ownership moves.
+- While membership settles, a brief double-delete is possible. Both converge to
+  the same tombstone, so it costs one extra oplog entry.
+
+**An expiry is an ordinary delete.** It is indistinguishable from a user delete
+in a change stream or a webhook, which is also MongoDB's behaviour. A dedicated
+op kind would have been a stop-the-cluster upgrade — `op_kind_from_tag` refuses
+an unknown tag as *corruption* — and that was not worth the audit trail.
+
+### Watching it
+
+| Metric | |
+|---|---|
+| `kimmy_ttl_expired_total` | Documents deleted by a TTL index |
+| `kimmy_ttl_skipped_total` | Candidates refused because the document was refreshed first |
+
+Summed across a cluster, `kimmy_ttl_expired_total` is what makes "one document,
+one delete" a *measured* property — the cluster harness asserts exactly that,
+because correctness alone cannot tell the two designs apart.
+
+A steadily rising `kimmy_ttl_skipped_total` means documents are being refreshed
+about as fast as the pass finds them, which is worth knowing before it looks
+like the pass is broken.
+
+`storage.ttl_interval_secs = 0` disables expiry entirely, leaving any TTL index
+defined but inert.
 
 ---
 
