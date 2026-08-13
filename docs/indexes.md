@@ -55,6 +55,11 @@ curl -XPOST .../orders/find -H "$A" -d '{"filter":{"qty":7},"explain":true}'
 `strategy` is `index` or `collectionScan`. Watching `documentsExamined` fall
 while `documentsMatched` stays the same is the whole point of an index.
 
+**`update` and `delete` take `explain` too, and plan the same way.** They did
+not until M9 — both scanned the collection however selective the filter was,
+which meant an index sped up reading a document but never changing one. If a
+write feels slow, ask it the same question you would ask a read.
+
 ---
 
 ## The rule everything follows from

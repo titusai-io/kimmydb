@@ -241,9 +241,9 @@ writer:
 would return a document the sort did not pick, with no way for a caller to tell.
 Narrow the filter, or add an index.
 
-Note that `find_and_modify` **does** use the planner while `/update` does not
-([Deviations](deviations.md)), so on the same filter the atomic operation is
-currently the faster one. That is a known drift, not a design.
+`update` and `delete` plan too, so an index applies to all three. Pass
+`"explain": true` on any of `find`, `count`, `update` or `delete` to see which
+access path was chosen.
 
 ---
 

@@ -408,38 +408,74 @@ pub fn delete_by_id(
     Ok(json!({ "deleted": u8::from(deleted) }))
 }
 
+/// A filtered write's parameters, mirroring [`FindParams`].
+///
+/// A struct rather than four positional flags for the same reason `find` has
+/// one: `update(state, auth, db, coll, json, true, false)` reads as a puzzle at
+/// every call site.
+#[derive(Default)]
+pub struct WriteParams {
+    pub filter: Option<Value>,
+    /// Change every match rather than only the first.
+    pub multi: bool,
+    /// Report how the targets were found, as `find` does.
+    pub explain: bool,
+}
+
 pub fn update(
     state: &SharedState,
     auth: &Auth,
     db: &str,
     coll: &str,
-    filter_json: Option<&Value>,
     update_json: &Value,
-    multi: bool,
+    params: WriteParams,
 ) -> Result<Value, ApiError> {
+    let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
-    let filter = parse_filter(filter_json)?;
+    let filter = parse_filter(params.filter.as_ref())?;
     let update = update::parse(&json_to_document(update_json)?)?;
 
     // Collect the targets first: mutating while scanning would mean the read
     // transaction and the write transaction disagree about what matched.
-    let mut targets = Vec::new();
-    state.engine.for_each_doc(&meta, |id, doc| {
-        if filter::matches(&filter, &doc) {
-            targets.push((id, doc));
-        }
-        Ok(multi || targets.is_empty())
-    })?;
+    //
+    // Through `collect_matching`, which is what `find` uses — so an index
+    // applies here exactly as it does to a read. This path used to call
+    // `for_each_doc` directly and scan the whole collection however selective
+    // the filter was.
+    let stop_after = if multi { None } else { Some(1) };
+    let (targets, stats) = collect_matching(state, &meta, &filter, stop_after)?;
+    let matched = targets.len() as u64;
 
     let now = now_millis();
     let mut modified = 0u64;
-    for (id, mut doc) in targets {
+    for mut doc in targets {
+        let id = document_id(&doc)?;
         update::apply(&update, &mut doc, now)?;
-        state.engine.replace(&meta, &id, doc, false)?;
-        modified += 1;
+        // Counted from the write's own answer rather than assumed. The match
+        // came from a read transaction, so a document deleted between the two
+        // reports `matched: false` and writes nothing — claiming it as
+        // modified would be a number nobody could reconcile with the data.
+        if state.engine.replace(&meta, &id, doc, false)?.modified {
+            modified += 1;
+        }
     }
 
-    Ok(json!({ "matched": modified, "modified": modified }))
+    let mut body = json!({ "matched": matched, "modified": modified });
+    if explain {
+        body["explain"] = stats.to_json();
+    }
+    Ok(body)
+}
+
+/// The `_id` of a document that came out of storage.
+///
+/// Every stored document has one — `insert` assigns it when absent — so this
+/// failing means the record is corrupt rather than the request being wrong.
+fn document_id(doc: &bson::Document) -> Result<DocId, ApiError> {
+    let value = doc
+        .get(kimmy_storage::ID_FIELD)
+        .ok_or_else(|| ApiError::internal("a stored document has no _id".to_string()))?;
+    Ok(DocId::try_from_bson(value)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -625,27 +661,29 @@ pub fn delete(
     auth: &Auth,
     db: &str,
     coll: &str,
-    filter_json: Option<&Value>,
-    multi: bool,
+    params: WriteParams,
 ) -> Result<Value, ApiError> {
+    let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
-    let filter = parse_filter(filter_json)?;
+    let filter = parse_filter(params.filter.as_ref())?;
 
-    let mut targets = Vec::new();
-    state.engine.for_each_doc(&meta, |id, doc| {
-        if filter::matches(&filter, &doc) {
-            targets.push(id);
-        }
-        Ok(multi || targets.is_empty())
-    })?;
+    // Planner-aware, for the same reason `update` is.
+    let stop_after = if multi { None } else { Some(1) };
+    let (targets, stats) = collect_matching(state, &meta, &filter, stop_after)?;
 
     let mut deleted = 0u64;
-    for id in targets {
+    for doc in targets {
+        let id = document_id(&doc)?;
         if state.engine.delete(&meta, &id)? {
             deleted += 1;
         }
     }
-    Ok(json!({ "deleted": deleted }))
+
+    let mut body = json!({ "deleted": deleted });
+    if explain {
+        body["explain"] = stats.to_json();
+    }
+    Ok(body)
 }
 
 // ---------------------------------------------------------------------------

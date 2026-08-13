@@ -584,26 +584,37 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
-## 🟡 `update` and `delete` never consult the planner
+## 🟢 `update` and `delete` use the planner (was a 🟡 raised one branch earlier)
 
-**Found while building `find_and_modify` (M9 task 3).** `exec::update` and
-`exec::delete` collect their targets with `for_each_doc` — a straight collection
-scan. Neither calls `plan::choose`, so **an index never speeds up a filtered
-update or delete**, however selective the filter is.
+**Raised while building `find_and_modify`, fixed here.** `exec::update` and
+`exec::delete` collected their targets with `for_each_doc` — a straight
+collection scan — so **an index never sped up a filtered update or delete**,
+however selective the filter was. Both now go through `collect_matching`, the
+same helper `find` uses, which brings the index plan, the `$in` union with its
+per-document deduplication, and the multikey both-bounds re-check with them.
 
-The register already said these were "found by a scan", but inside a row about
-*atomicity*, where it reads as a statement about partial application rather than
-about indexes being ignored. Recorded properly here.
+Measured on 200 documents, ten of which match:
 
-The consequence is now visible rather than merely latent: `find_and_modify`
-*does* plan, so on the same filter and the same collection it is **faster than
-`update`** — 0.003 ms against ~8 ms per 10,000 documents ([Benchmarks](benchmarks.md)).
-An operator reasonably expects the atomic one to be the expensive one.
+| | Documents examined |
+|---|---|
+| Before | 200 |
+| After, index applies | 10 |
+| After, no index | 200 (unchanged, and it must be) |
 
-**Not fixed here**, deliberately — it is a change to two working code paths
-with their own partial-application semantics, and this branch is already the
-one that moved matching into a write transaction. It wants its own branch and
-its own tests.
+**`explain` came with it**, on both routes, mirroring `find`. That is what
+turns "an index applies here now" from a sentence into something a test
+asserts and an operator can check — the standing lesson from ADR-016, where a
+claim nothing verified stayed false for two milestones.
+
+**A second, quieter bug went with it.** `update` counted `modified` by
+incrementing per target rather than reading the write's own answer, so a
+document deleted between the read pass and the write was still reported as
+modified. It now counts `WriteOutcome::modified`. `delete` already did the
+equivalent, which is why only one of the two was wrong.
+
+**What deliberately did not change:** both still apply document by document and
+can stop partway. That is the atomicity limitation recorded below, and it is a
+separate question from which access path finds the targets.
 
 ---
 
@@ -777,7 +788,7 @@ here so that the absence of a decision is visible as a decision.
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
 | Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`) and type conversion | Deliberately outside M9 task 1's agreed operator list. Variable binding needs an evaluation *scope*, not another operator | not scheduled |
-| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
+| Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is committed on its own. Note this is about *commits*, not about how the matches are found — that is planned now | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |
 | No token refresh | `/v1/auth/login` is the only way to obtain a token and it expires. A long-running client has no option but to re-send credentials, which no driver should ask of an application | **M10 task 4** |

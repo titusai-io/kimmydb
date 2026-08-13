@@ -70,7 +70,7 @@ impl ApiError {
         Self::new(StatusCode::FORBIDDEN, "forbidden", "not authorized for this operation")
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal", message)
     }
 }

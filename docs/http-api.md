@@ -327,7 +327,8 @@ A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 `"enforcement": "coordinated"` returns **501** until clustering lands — a
 `local` unique index is a single-node guarantee. See [Indexes](indexes.md).
 
-Add `"explain": true` to `find` or `count` to see whether an index was used:
+Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
+an index was used:
 
 ```json
 { "explain": { "strategy": "index", "index": "qty_1", "indexFieldsUsed": 1,
