@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use bson::Bson;
-use kimmy_core::{IndexMeta, keyenc};
+use kimmy_core::{IndexMeta, PartialOp, keyenc};
 
 use crate::filter::{Condition, Filter};
 
@@ -79,8 +79,19 @@ pub fn choose(filter: &Filter, indexes: &[IndexMeta]) -> Option<IndexPlan> {
         return None;
     }
 
+    // Worked out once, not per index: what the query lets us *prove*, in the
+    // partial-filter vocabulary.
+    let proven = containment_predicates(filter);
+
     let mut best: Option<IndexPlan> = None;
     for index in indexes {
+        // A partial index holds only some of the collection, so it may answer
+        // only a query provably contained by its filter. Unproven means scan:
+        // using it anyway would return a subset, which is the silent
+        // document loss this whole design is arranged to prevent.
+        if !usable_partial(index, &proven) {
+            continue;
+        }
         if let Some(plan) = plan_for(index, &predicates)
             && best.as_ref().is_none_or(|b| plan.fields_used > b.fields_used)
         {
@@ -88,6 +99,80 @@ pub fn choose(filter: &Filter, indexes: &[IndexMeta]) -> Option<IndexPlan> {
         }
     }
     best
+}
+
+/// Whether a partial index may be used for a query proving `proven`.
+///
+/// `true` for an ordinary index, always. A partial index whose stored filter
+/// cannot be parsed is refused rather than trusted — it was validated at
+/// creation, so an unparseable one means the metadata is not what this build
+/// understands, and guessing is exactly what must not happen here.
+fn usable_partial(index: &IndexMeta, proven: &[(String, PartialOp)]) -> bool {
+    match index.partial() {
+        None => true,
+        Some(Ok(filter)) => filter.covered_by(proven),
+        Some(Err(_)) => false,
+    }
+}
+
+/// The predicates a query imposes, expressed in the partial-filter language.
+///
+/// Only what must hold for **every** matching document, so disjunctions
+/// contribute nothing — the same rule [`extract`] follows, for the same reason.
+///
+/// Two exclusions carry the safety of this whole feature:
+///
+/// - **`{a: null}` contributes nothing.** It matches an explicit null *and* a
+///   missing field, so it cannot prove `a` exists — and a sparse-style index
+///   does not hold the documents missing it.
+/// - **Any predicate whose operand is null contributes nothing**, for the same
+///   reason one step removed: null is where the query language's treatment of
+///   absence and the index's stop agreeing.
+///
+/// Everything else is safe because a comparison never matches an absent field:
+/// `condition_matches` evaluates them over the resolved values, which are empty
+/// when the path is missing.
+fn containment_predicates(filter: &Filter) -> Vec<(String, PartialOp)> {
+    let mut out = Vec::new();
+    gather_containment(filter, &mut out);
+    out
+}
+
+fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
+    match filter {
+        Filter::And(branches) => {
+            for branch in branches {
+                gather_containment(branch, out);
+            }
+        }
+        Filter::Field { path, conditions } => {
+            for condition in conditions {
+                // A null operand proves nothing about presence.
+                let op = match condition {
+                    Condition::Exists(true) => Some(PartialOp::Exists),
+                    Condition::Eq(Bson::Null) => None,
+                    Condition::Eq(v) => Some(PartialOp::Eq(v.clone())),
+                    Condition::Gt(Bson::Null)
+                    | Condition::Gte(Bson::Null)
+                    | Condition::Lt(Bson::Null)
+                    | Condition::Lte(Bson::Null) => None,
+                    Condition::Gt(v) => Some(PartialOp::Gt(v.clone())),
+                    Condition::Gte(v) => Some(PartialOp::Gte(v.clone())),
+                    Condition::Lt(v) => Some(PartialOp::Lt(v.clone())),
+                    Condition::Lte(v) => Some(PartialOp::Lte(v.clone())),
+                    // $ne, $nin, $in, $not, $regex, $size, $all, $elemMatch,
+                    // $type, $exists: false — none of them narrow to a shape
+                    // the containment check can use, and a guess here is the
+                    // failure mode.
+                    _ => None,
+                };
+                if let Some(op) = op {
+                    out.push((path.clone(), op));
+                }
+            }
+        }
+        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue => {}
+    }
 }
 
 /// Collect the predicates that must hold for *every* matching document.
@@ -285,6 +370,7 @@ mod tests {
             enforcement: Default::default(),
             multikey: false,
             expire_after_secs: None,
+            partial_filter: None,
         }
     }
 

@@ -180,6 +180,7 @@ mod tests {
                 Default::default(),
                 Some("ttl_seen".into()),
                 Some(secs),
+                None,
             )
             .unwrap();
         (engine.get_collection("app", "sessions").unwrap(), index)
@@ -283,6 +284,7 @@ mod tests {
                 Default::default(),
                 Some("ttl_desc".into()),
                 Some(60),
+                None,
             )
             .unwrap();
         let coll = engine.get_collection("app", "sessions").unwrap();

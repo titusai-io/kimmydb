@@ -594,6 +594,10 @@ struct CreateIndexRequest {
     /// after the single indexed date field.
     #[serde(default, rename = "expireAfterSeconds")]
     expire_after_seconds: Option<i64>,
+    /// Present makes this a partial index: only matching documents are held,
+    /// and the planner uses it only for queries provably contained by it.
+    #[serde(default, rename = "partialFilterExpression")]
+    partial_filter_expression: Option<Value>,
 }
 
 async fn create_index(
@@ -612,6 +616,7 @@ async fn create_index(
         name: body.name,
         enforcement: body.enforcement,
         expire_after_seconds: body.expire_after_seconds,
+        partial_filter_expression: body.partial_filter_expression,
     };
     Ok(Json(exec::create_index(&state, &auth, &db, &coll, spec)?))
 }

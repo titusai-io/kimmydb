@@ -4,6 +4,7 @@
 //! entries) and `kimmy-query` (which plans against them) need this shape, and
 //! neither should depend on the other.
 
+use bson::Document;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +61,23 @@ pub struct IndexMeta {
     /// at creation.
     #[serde(default)]
     pub expire_after_secs: Option<i64>,
+    /// Index only the documents matching this filter.
+    ///
+    /// `None` indexes everything. `Some(_)` makes it a **partial** index, and
+    /// the planner may then use it only for a query provably contained by the
+    /// filter — see [`crate::PartialFilter`], whose deliberately small language
+    /// is what makes that containment a decision rather than a guess.
+    ///
+    /// A *sparse* index is this with `{field: {$exists: true}}`, which is why
+    /// there is no separate `sparse` flag: MongoDB treats partial as
+    /// superseding sparse and so does this.
+    ///
+    /// Stored as the filter document. Verified to round-trip losslessly
+    /// through both boundaries it crosses — canonical Extended JSON in the
+    /// collection metadata, BSON in the replicated [`crate::IndexCreate`] —
+    /// including dates and integers above 2^53.
+    #[serde(default)]
+    pub partial_filter: Option<Document>,
 }
 
 /// How far a unique constraint reaches.
@@ -115,6 +133,20 @@ impl IndexField {
 }
 
 impl IndexMeta {
+    /// Whether this index holds only some of the collection.
+    pub fn is_partial(&self) -> bool {
+        self.partial_filter.is_some()
+    }
+
+    /// The parsed partial filter, if there is one.
+    ///
+    /// Parsed on use rather than stored parsed: the document form is what
+    /// serialises, and validation already happened at index creation, so a
+    /// failure here means stored metadata was tampered with.
+    pub fn partial(&self) -> Option<crate::Result<crate::PartialFilter>> {
+        self.partial_filter.as_ref().map(crate::PartialFilter::parse)
+    }
+
     /// Whether this index expires documents.
     pub fn is_ttl(&self) -> bool {
         self.expire_after_secs.is_some()

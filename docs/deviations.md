@@ -584,6 +584,44 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟢 Partial indexes exist, and sparse falls out of them (M9 task 4)
+
+**Two decisions settled before code.** Partial only — a sparse index is
+`{field: {$exists: true}}`, which is where MongoDB has been steering for years,
+so there is one mechanism rather than two overlapping ones. And the partial
+filter language is **deliberately bounded**: `$exists: true`, equality, the four
+comparisons against a literal, conjunction. Nothing else.
+
+**The bound is the safety property, not a shortcut.** A partial index may answer
+only a query provably contained by its filter, and general implication between
+filters is not decidable — so a general language forces a best-effort
+containment check whose mistakes return a *subset* with nothing to indicate it.
+That is the multikey failure again, and it is the one this codebase is least
+able to notice. Restricting the language makes containment a decision. The
+refusal lands at index creation, where an operator can act on it, rather than at
+query time where the symptom would be a plan that quietly stopped applying.
+
+**Two things were verified rather than assumed**, both of which would have been
+silent bugs:
+
+- **`bson::Document` round-trips losslessly through the collection metadata's
+  JSON**, as canonical Extended JSON — checked with a date and an integer above
+  2^53 before choosing to store the filter as a document. The standing rule is
+  that a type crossing a format boundary needs a *chosen* representation, and
+  `NodeId` has cost a replication outage by inheriting one.
+- **A comparison never matches an absent field**, because `condition_matches`
+  evaluates over resolved values that are empty when the path is missing. That
+  is what makes `$gt`/`$lt` safe to treat as proving existence. The exception is
+  **`{a: null}`, which matches an explicit null *and* a missing field** — so it
+  contributes nothing to containment. Answering it from a presence-filtered
+  index would drop exactly the documents it is meant to find.
+
+**`impl Eq for Bson`** exists in `bson` despite the `f64`, which is what lets
+`IndexMeta` keep its derives with a `Document` inside. Checked, because the
+obvious assumption was the opposite.
+
+---
+
 ## 🟢 `update` and `delete` use the planner (was a 🟡 raised one branch earlier)
 
 **Raised while building `find_and_modify`, fixed here.** `exec::update` and

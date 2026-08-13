@@ -1121,6 +1121,359 @@ async fn storing_vectors_needs_write_access() {
     assert_eq!(res.status, 403, "{:?}", res.body);
 }
 
+#[tokio::test]
+async fn a_unique_index_can_apply_only_where_the_field_is_present() {
+    // The motivating case, and impossible before partial indexes: a missing
+    // field indexes as null, so two documents lacking it collided.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"users"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/users/indexes",
+            Some(&token),
+            json!({
+                "name": "email_unique_present",
+                "fields": [{"path": "email"}],
+                "unique": true,
+                "partialFilterExpression": {"email": {"$exists": true}},
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["partialFilterExpression"]["email"]["$exists"], true);
+
+    // Several documents with no email at all: all fine, none collide.
+    for id in 1..=3 {
+        let res = server.post("/v1/db/app/coll/users/docs", Some(&token), json!({"_id": id})).await;
+        assert_eq!(res.status, 200, "document {id} should not collide: {:?}", res.body);
+    }
+
+    // The constraint still bites where the field is present.
+    let ok = server
+        .post("/v1/db/app/coll/users/docs", Some(&token), json!({"_id": 4, "email": "a@b.c"}))
+        .await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    let dup = server
+        .post("/v1/db/app/coll/users/docs", Some(&token), json!({"_id": 5, "email": "a@b.c"}))
+        .await;
+    assert_eq!(dup.status, 409, "a duplicate present value must still be refused: {:?}", dup.body);
+}
+
+#[tokio::test]
+async fn an_unsupported_partial_filter_is_refused_at_creation() {
+    // The refusal has to land here, where an operator can act on it — not at
+    // query time, where the only symptom is a plan that quietly stopped
+    // applying.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"users"})).await;
+
+    for bad in [
+        json!({"$or": [{"a": 1}, {"b": 2}]}),
+        json!({"a": {"$ne": 1}}),
+        json!({"a": {"$in": [1, 2]}}),
+        json!({"a": {"$regex": "^x"}}),
+        json!({"a": {"$exists": false}}),
+        json!({}),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/app/coll/users/indexes",
+                Some(&token),
+                json!({"name": "bad", "fields": [{"path": "a"}], "partialFilterExpression": bad}),
+            )
+            .await;
+        assert_eq!(res.status, 400, "should have been refused: {bad:?} -> {:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn creating_a_partial_unique_index_judges_only_the_documents_it_covers() {
+    // Existing data that violates the constraint *outside* the filter is not a
+    // violation, because those documents are not in the index. Refusing here
+    // would advertise a constraint stricter than the one being created.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"users"})).await;
+    server
+        .post(
+            "/v1/db/app/coll/users/bulk",
+            Some(&token),
+            json!([
+                {"_id": 1, "email": "dup@x.com", "status": "archived"},
+                {"_id": 2, "email": "dup@x.com", "status": "archived"},
+                {"_id": 3, "email": "solo@x.com", "status": "active"},
+            ]),
+        )
+        .await;
+
+    // Covers only the active one, so the archived duplicates do not count.
+    let ok = server
+        .post(
+            "/v1/db/app/coll/users/indexes",
+            Some(&token),
+            json!({
+                "name": "email_active_unique",
+                "fields": [{"path": "email"}],
+                "unique": true,
+                "partialFilterExpression": {"status": "active"},
+            }),
+        )
+        .await;
+    assert_eq!(ok.status, 200, "duplicates outside the filter must not block it: {:?}", ok.body);
+
+    // A plain unique index over the same data is still refused.
+    let refused = server
+        .post(
+            "/v1/db/app/coll/users/indexes",
+            Some(&token),
+            json!({"name": "email_unique", "fields": [{"path": "email"}], "unique": true}),
+        )
+        .await;
+    assert_eq!(refused.status, 409, "{:?}", refused.body);
+}
+
+/// A collection of 100 documents, half `active`, indexed partially on status.
+async fn partial_seeded(server: &Server) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({
+                "name": "qty_active",
+                "fields": [{"path": "qty"}],
+                "partialFilterExpression": {"status": "active"},
+            }),
+        )
+        .await;
+    let batch: Vec<Value> = (0..100)
+        .map(|i| {
+            json!({
+                "_id": i,
+                "qty": i % 10,
+                "status": if i % 2 == 0 { "active" } else { "done" },
+            })
+        })
+        .collect();
+    server.post("/v1/db/shop/coll/orders/bulk", Some(&token), json!(batch)).await;
+    token
+}
+
+#[tokio::test]
+async fn a_partial_index_is_used_only_when_the_query_proves_containment() {
+    let server = Server::start().await;
+    let token = partial_seeded(&server).await;
+
+    // Proven: the query pins the same equality the filter does.
+    let used = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"status": "active", "qty": 4}, "explain": true}),
+        )
+        .await;
+    assert_eq!(used.body["explain"]["strategy"], "index", "{:?}", used.body);
+    assert_eq!(used.body["explain"]["index"], "qty_active");
+
+    // Unproven: no predicate on `status` at all, so the index would return a
+    // subset. Falls back to a scan.
+    let scanned = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"qty": 4}, "explain": true}),
+        )
+        .await;
+    assert_eq!(scanned.body["explain"]["strategy"], "collectionScan", "{:?}", scanned.body);
+
+    // Unproven: the wrong value.
+    let other = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"status": "done", "qty": 4}, "explain": true}),
+        )
+        .await;
+    assert_eq!(other.body["explain"]["strategy"], "collectionScan", "{:?}", other.body);
+}
+
+#[tokio::test]
+async fn a_partial_index_never_changes_an_answer() {
+    // The property that matters most: whichever access path is chosen, the
+    // documents returned must be identical. A containment bug shows up here
+    // as a short result, which is the failure mode this design is arranged
+    // to prevent.
+    let server = Server::start().await;
+    let token = partial_seeded(&server).await;
+
+    // The same data with no index at all.
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"plain"})).await;
+    let batch: Vec<Value> = (0..100)
+        .map(|i| {
+            json!({
+                "_id": i,
+                "qty": i % 10,
+                "status": if i % 2 == 0 { "active" } else { "done" },
+            })
+        })
+        .collect();
+    server.post("/v1/db/shop/coll/plain/bulk", Some(&token), json!(batch)).await;
+
+    for filter in [
+        json!({"status": "active", "qty": 4}),
+        json!({"qty": 4}),
+        json!({"status": "done", "qty": 4}),
+        json!({"status": "active"}),
+        json!({"qty": {"$gte": 5}, "status": "active"}),
+        json!({"qty": null}),
+        json!({"status": {"$ne": "active"}}),
+        json!({}),
+    ] {
+        let a = server
+            .post(
+                "/v1/db/shop/coll/orders/find",
+                Some(&token),
+                json!({"filter": filter, "sort": {"_id": 1}, "limit": 1000}),
+            )
+            .await;
+        let b = server
+            .post(
+                "/v1/db/shop/coll/plain/find",
+                Some(&token),
+                json!({"filter": filter, "sort": {"_id": 1}, "limit": 1000}),
+            )
+            .await;
+        assert_eq!(
+            a.body["documents"], b.body["documents"],
+            "partial index changed the answer for {filter:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_document_leaving_the_filter_loses_its_index_entries() {
+    // Membership is not decided once at insert: a document updated out of the
+    // filter must stop being a candidate, or a later query finds a candidate
+    // whose document no longer belongs.
+    let server = Server::start().await;
+    let token = partial_seeded(&server).await;
+
+    // _id 0 is active with qty 0, so the index holds it.
+    let before = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"status": "active", "qty": 0}, "explain": true}),
+        )
+        .await;
+    assert_eq!(before.body["explain"]["strategy"], "index");
+    let seen: Vec<i64> = before.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert!(seen.contains(&0), "{seen:?}");
+
+    // Move it out of the filter.
+    server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"_id": 0}, "update": {"$set": {"status": "done"}}}),
+        )
+        .await;
+
+    let after = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"status": "active", "qty": 0}, "explain": true}),
+        )
+        .await;
+    let seen: Vec<i64> = after.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert!(!seen.contains(&0), "a document that left the filter is still indexed: {seen:?}");
+
+    // And back in again: entries must reappear.
+    server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"_id": 0}, "update": {"$set": {"status": "active"}}}),
+        )
+        .await;
+    let again = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {"status": "active", "qty": 0}}),
+        )
+        .await;
+    let seen: Vec<i64> = again.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert!(seen.contains(&0), "rejoining the filter did not re-index: {seen:?}");
+}
+
+#[tokio::test]
+async fn a_null_query_does_not_get_answered_by_a_sparse_style_index() {
+    // The specific trap: `{email: null}` matches an explicit null *and* a
+    // missing field, so it cannot prove `email` exists. Answering it from an
+    // index that omits the absent ones would silently drop them.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"users"})).await;
+    server
+        .post(
+            "/v1/db/app/coll/users/indexes",
+            Some(&token),
+            json!({
+                "name": "email_present",
+                "fields": [{"path": "email"}],
+                "partialFilterExpression": {"email": {"$exists": true}},
+            }),
+        )
+        .await;
+    server
+        .post(
+            "/v1/db/app/coll/users/bulk",
+            Some(&token),
+            json!([
+                {"_id": 1, "email": "a@b.c"},
+                {"_id": 2, "email": Value::Null},
+                {"_id": 3},
+            ]),
+        )
+        .await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/users/find",
+            Some(&token),
+            json!({"filter": {"email": null}, "sort": {"_id": 1}, "explain": true}),
+        )
+        .await;
+    assert_eq!(
+        res.body["explain"]["strategy"], "collectionScan",
+        "a null query must not use a presence-filtered index: {:?}",
+        res.body
+    );
+    // Both the explicit null and the missing one.
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+}
+
 /// Seed a collection of 200 documents, indexed on `sku` unless `indexed` is
 /// false, and return the token.
 async fn seeded(server: &Server, coll: &str, indexed: bool) -> String {
