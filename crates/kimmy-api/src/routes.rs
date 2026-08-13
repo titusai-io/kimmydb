@@ -504,6 +504,9 @@ struct UpdateRequest {
     update: Value,
     #[serde(default)]
     multi: bool,
+    /// Report how the targets were found, as `find` does.
+    #[serde(default)]
+    explain: bool,
 }
 
 async fn update_docs(
@@ -512,15 +515,9 @@ async fn update_docs(
     Path((db, coll)): Path<(String, String)>,
     Json(body): Json<UpdateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::update(
-        &state,
-        &auth,
-        &db,
-        &coll,
-        body.filter.as_ref(),
-        &body.update,
-        body.multi,
-    )?))
+    let params =
+        exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
+    Ok(Json(exec::update(&state, &auth, &db, &coll, &body.update, params)?))
 }
 
 #[derive(Deserialize)]
@@ -529,6 +526,9 @@ struct DeleteRequest {
     filter: Option<Value>,
     #[serde(default)]
     multi: bool,
+    /// Report how the targets were found, as `find` does.
+    #[serde(default)]
+    explain: bool,
 }
 
 async fn delete_docs(
@@ -537,7 +537,9 @@ async fn delete_docs(
     Path((db, coll)): Path<(String, String)>,
     Json(body): Json<DeleteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::delete(&state, &auth, &db, &coll, body.filter.as_ref(), body.multi)?))
+    let params =
+        exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
+    Ok(Json(exec::delete(&state, &auth, &db, &coll, params)?))
 }
 
 // ---------------------------------------------------------------------------

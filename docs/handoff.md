@@ -83,8 +83,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#58 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
-| `m9-find-and-modify` (open PR) | **M9 task 3.** Atomic find-modify-return, matching inside the write transaction. |
+| `main` | PRs #16–#59 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
+| `m9-plan-update-delete` (open PR) | Closes the 🟡 task 3 raised: `update` and `delete` now use the planner, and take `explain`. |
 
 ### The M8 task board — all twelve done, for reference
 
@@ -115,7 +115,7 @@ group and join but cannot *derive*.
 |---|---|---|
 | 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | ✅ #57 |
 | 2 | **TTL / expiring documents** | ✅ #58 |
-| 3 | **`findAndModify`** | 🔵 open PR — decisions settled: one `/find_and_modify` route, match inside the write transaction, sort supported |
+| 3 | **`findAndModify`** | ✅ #59 |
 | 4 | **Partial and sparse indexes** | Partial only, or both |
 | 5 | **Cursors / efficient pagination** | Continuation-token shape |
 

@@ -431,14 +431,17 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
+        // `explain` is not surfaced to an agent: `find` already offers it for
+        // working out whether an index applies, and a write is not the place
+        // to go looking.
+        let params = exec::WriteParams { filter: args.filter, multi: args.multi, explain: false };
         render(exec::update(
             &self.state,
             &auth,
             &args.database,
             &args.collection,
-            args.filter.as_ref(),
             &args.update,
-            args.multi,
+            params,
         ))
     }
 
@@ -451,14 +454,8 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::delete(
-            &self.state,
-            &auth,
-            &args.database,
-            &args.collection,
-            args.filter.as_ref(),
-            args.multi,
-        ))
+        let params = exec::WriteParams { filter: args.filter, multi: args.multi, explain: false };
+        render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
     }
 
     /// Create a collection.

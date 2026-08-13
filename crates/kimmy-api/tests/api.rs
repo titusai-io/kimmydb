@@ -1121,6 +1121,205 @@ async fn storing_vectors_needs_write_access() {
     assert_eq!(res.status, 403, "{:?}", res.body);
 }
 
+/// Seed a collection of 200 documents, indexed on `sku` unless `indexed` is
+/// false, and return the token.
+async fn seeded(server: &Server, coll: &str, indexed: bool) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": coll})).await;
+    if indexed {
+        server
+            .post(
+                &format!("/v1/db/shop/coll/{coll}/indexes"),
+                Some(&token),
+                json!({"name": "sku_1", "fields": [{"path": "sku"}]}),
+            )
+            .await;
+    }
+    let batch: Vec<Value> =
+        (0..200).map(|i| json!({"_id": i, "sku": format!("sku-{}", i % 20), "n": 0})).collect();
+    server.post(&format!("/v1/db/shop/coll/{coll}/bulk"), Some(&token), json!(batch)).await;
+    token
+}
+
+#[tokio::test]
+async fn update_uses_an_index_when_one_applies() {
+    // The drift this fixes: `update` used to scan the collection however
+    // selective the filter was, while `find` on the same filter planned.
+    let server = Server::start().await;
+    let token = seeded(&server, "orders", true).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({
+                "filter": {"sku": "sku-7"},
+                "update": {"$set": {"n": 1}},
+                "multi": true,
+                "explain": true,
+            }),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
+    assert_eq!(res.body["explain"]["index"], "sku_1");
+    // Ten of the two hundred carry this sku, and only those were examined.
+    assert_eq!(res.body["explain"]["documentsExamined"], 10, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 10);
+    assert_eq!(res.body["modified"], 10);
+}
+
+#[tokio::test]
+async fn delete_uses_an_index_when_one_applies() {
+    let server = Server::start().await;
+    let token = seeded(&server, "orders", true).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/delete",
+            Some(&token),
+            json!({"filter": {"sku": "sku-3"}, "multi": true, "explain": true}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
+    assert_eq!(res.body["explain"]["documentsExamined"], 10);
+    assert_eq!(res.body["deleted"], 10);
+}
+
+#[tokio::test]
+async fn without_an_index_the_write_paths_still_scan_and_still_agree() {
+    // The index must be an optimisation, not a change of answer.
+    let server = Server::start().await;
+    let indexed = seeded(&server, "with_index", true).await;
+    let plain = seeded(&server, "no_index", false).await;
+
+    let body = json!({
+        "filter": {"sku": "sku-11"},
+        "update": {"$set": {"n": 42}},
+        "multi": true,
+        "explain": true,
+    });
+    let a = server.post("/v1/db/shop/coll/with_index/update", Some(&indexed), body.clone()).await;
+    let b = server.post("/v1/db/shop/coll/no_index/update", Some(&plain), body).await;
+
+    assert_eq!(a.body["explain"]["strategy"], "index");
+    assert_eq!(b.body["explain"]["strategy"], "collectionScan");
+    assert_eq!(b.body["explain"]["documentsExamined"], 200, "a scan examines everything");
+
+    // Same answer either way, which is the whole point.
+    assert_eq!(a.body["matched"], b.body["matched"]);
+    assert_eq!(a.body["modified"], b.body["modified"]);
+
+    for coll in ["with_index", "no_index"] {
+        let res = server
+            .post(
+                &format!("/v1/db/shop/coll/{coll}/find"),
+                Some(&indexed),
+                json!({"filter": {"n": 42}, "sort": {"_id": 1}}),
+            )
+            .await;
+        assert_eq!(res.body["count"], 10, "{coll}: {:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_single_update_still_touches_exactly_one_document() {
+    // `multi: false` stops after the first match on the indexed path too.
+    let server = Server::start().await;
+    let token = seeded(&server, "orders", true).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"sku": "sku-5"}, "update": {"$set": {"n": 9}}, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 1, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    assert_eq!(res.body["explain"]["documentsExamined"], 1, "stopped at the first match");
+
+    let counted = server
+        .post("/v1/db/shop/coll/orders/count", Some(&token), json!({"filter": {"n": 9}}))
+        .await;
+    assert_eq!(counted.body["count"], 1);
+}
+
+#[tokio::test]
+async fn explain_is_absent_unless_asked_for() {
+    let server = Server::start().await;
+    let token = seeded(&server, "orders", true).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"sku": "sku-1"}, "update": {"$set": {"n": 1}}}),
+        )
+        .await;
+    assert!(res.body.get("explain").is_none(), "{:?}", res.body);
+
+    let res = server
+        .post("/v1/db/shop/coll/orders/delete", Some(&token), json!({"filter": {"sku": "sku-1"}}))
+        .await;
+    assert!(res.body.get("explain").is_none(), "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn an_indexed_update_over_an_array_field_still_matches_every_document() {
+    // Multikey is where an index-backed range quietly loses documents, and it
+    // is the failure this codebase has already met once. An update through the
+    // index must agree with a scan over array values too.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"tagged"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/tagged/indexes",
+            Some(&token),
+            json!({"name": "tags_1", "fields": [{"path": "tags"}]}),
+        )
+        .await;
+    server
+        .post(
+            "/v1/db/shop/coll/tagged/bulk",
+            Some(&token),
+            json!([
+                {"_id": 1, "tags": ["a", "b"]},
+                {"_id": 2, "tags": ["b"]},
+                {"_id": 3, "tags": ["c"]},
+                {"_id": 4, "tags": ["b", "b"]},
+            ]),
+        )
+        .await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/tagged/update",
+            Some(&token),
+            json!({
+                "filter": {"tags": "b"},
+                "update": {"$set": {"seen": true}},
+                "multi": true,
+                "explain": true,
+            }),
+        )
+        .await;
+
+    // Three documents carry "b"; _id 4 carries it twice and must be counted
+    // once, not twice — the union deduplicates by document key.
+    assert_eq!(res.body["matched"], 3, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 3);
+
+    let counted = server
+        .post("/v1/db/shop/coll/tagged/count", Some(&token), json!({"filter": {"seen": true}}))
+        .await;
+    assert_eq!(counted.body["count"], 3);
+}
+
 /// Seed a small job queue and return a token.
 async fn jobs(server: &Server) -> String {
     let token = server.root().await;
