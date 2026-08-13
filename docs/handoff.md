@@ -83,8 +83,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#55 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board |
-| `m10-client-protocol` (open PR) | Planning only — ADR-055, the M10 board, and this handoff. No code. |
+| `main` | PRs #16–#56 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
+| `m9-computed-expressions` (open PR) | **M9 task 1.** `kimmy-query/src/expr.rs`, the new stages, and a latent `$sum` precision bug fixed on the way. |
 
 ### The M8 task board — all twelve done, for reference
 
@@ -113,7 +113,7 @@ group and join but cannot *derive*.
 
 | # | Task | Reserved decision to settle first |
 |---|---|---|
-| 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | Which operators |
+| 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | 🔵 open PR — decisions settled: the ~25-operator planned list, and integer-preserving `i64` arithmetic |
 | 2 | **TTL / expiring documents** | Trigger shape (TTL index vs. collection setting vs. per-document field) |
 | 3 | **`findAndModify`** | API shape — but the *design* problem is that a filter-based match must move inside the write transaction |
 | 4 | **Partial and sparse indexes** | Partial only, or both |

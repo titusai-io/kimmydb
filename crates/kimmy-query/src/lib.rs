@@ -7,6 +7,7 @@
 #![allow(dead_code)]
 
 pub mod aggregate;
+pub mod expr;
 pub mod filter;
 
 /// Dot-path resolution. Lives in `kimmy-core` because index maintenance in
@@ -17,6 +18,7 @@ pub mod shape;
 pub mod update;
 
 pub use aggregate::{Accumulator, Limits, Stage};
+pub use expr::{Expr, Op};
 pub use filter::{Condition, Filter, matches};
 pub use plan::{IndexPlan, choose};
 pub use shape::{Projection, SortKey};
