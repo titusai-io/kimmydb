@@ -138,7 +138,8 @@ impl From<CoreError> for ApiError {
             | CoreError::InvalidUpdate(_)
             | CoreError::InvalidDocumentId { .. }
             | CoreError::UnsupportedOperator(_)
-            | CoreError::MalformedResumeToken => ApiError::bad_request(e.to_string()),
+            | CoreError::MalformedResumeToken
+            | CoreError::MalformedCursor => ApiError::bad_request(e.to_string()),
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, "resume_token_expired", e.to_string())
             }

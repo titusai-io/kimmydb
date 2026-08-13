@@ -310,7 +310,8 @@ query cannot accidentally pull an entire collection into memory.
 ```
 
 > **Sharp edge.** `skip` is O(n) even with an index: skipped documents are still
-> visited. Deep paging over a large collection is expensive.
+> visited. Deep paging over a large collection is expensive — **use a cursor
+> instead.**
 >
 > **Order without a sort is unspecified.** Which documents a `limit` returns can
 > differ between an index-backed query and a scan, because they visit documents
@@ -319,6 +320,53 @@ query cannot accidentally pull an entire collection into memory.
 
 An unsorted query can stop scanning once it has `skip + limit` matches. A sorted
 one must see every match before it can page.
+
+### Cursors
+
+A full page comes back with a **`nextCursor`**. Send it as `cursor` to get the
+page after it, and keep going until no cursor comes back.
+
+```javascript
+// first request — no cursor
+{ "filter": { "status": "active" }, "limit": 100 }
+
+// -> { "documents": [ ... ], "count": 100,
+//      "nextCursor": "AoAAAAAAAAAq" }
+
+// next request
+{ "filter": { "status": "active" }, "limit": 100,
+  "cursor": "AoAAAAAAAAAq" }
+```
+
+**A cursor costs the size of the page, not the size of everything before it.**
+Where `skip` re-visits every document it steps over, a cursor is a range bound
+handed to storage — so walking a whole collection is linear in the collection
+rather than quadratic in it.
+
+| Paging 1,000,000 documents at 100 per page | Total documents visited |
+|---|---:|
+| `skip` | ~5,000,000,000 |
+| `cursor` | ~1,000,000 |
+
+### What a cursor is, and what it is not
+
+- **Opaque.** It is the encoded key of the page's last document, base64url —
+  the same convention change-stream resume tokens use. Do not parse it; the
+  encoding is free to change.
+- **Portable between nodes.** It carries no server state, so a page fetched
+  from one node continues correctly on another. That matters because clients
+  round-robin across a leaderless cluster.
+- **`_id` order, always.** `sort` other than `{"_id": 1}` is refused with a
+  cursor, and a query carrying one gets **no `nextCursor`** rather than a token
+  that would silently page in a different order from the one asked for. Sorting
+  by another field still uses `skip`.
+- **Not a snapshot.** A document inserted ahead of the cursor is seen; one
+  inserted behind it is not. What is guaranteed is that a document present for
+  the whole walk is returned exactly once — never skipped, never repeated.
+- **`skip` and `cursor` cannot be combined**; both claim to say where to resume.
+
+`nextCursor` appears only when the page filled *and* the query is one a cursor
+can continue. A short page is the end.
 
 ---
 

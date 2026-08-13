@@ -83,8 +83,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#60 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
-| `m9-partial-indexes` (open PR) | **M9 task 4.** Partial indexes, a bounded filter language, and planner containment. |
+| `main` | PRs #16–#62 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
+| `m9-cursors` (open PR) | **M9 task 5**, the last. Opaque `_id`-order continuation tokens. |
 
 ### The M8 task board — all twelve done, for reference
 
@@ -116,8 +116,8 @@ group and join but cannot *derive*.
 | 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | ✅ #57 |
 | 2 | **TTL / expiring documents** | ✅ #58 |
 | 3 | **`findAndModify`** | ✅ #59 |
-| 4 | **Partial and sparse indexes** | 🔵 open PR — decisions settled: partial only, and a bounded filter language so containment is decidable |
-| 5 | **Cursors / efficient pagination** | Continuation-token shape |
+| 4 | **Partial and sparse indexes** | ✅ #61 |
+| 5 | **Cursors / efficient pagination** | 🔵 open PR — decisions settled: opaque token, `_id` order only |
 
 Ordering is deliberate: task 1 is the highest-leverage and entirely
 self-contained; 3 and 2 are small; 4 and 5 both touch the planner, which is
@@ -355,7 +355,7 @@ one exists:
 | `update` and `delete` still apply document by document and can stop partway — bulk *insert* is atomic, they are not | by design |
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
 | Computed pipeline expressions | **M9 task 1** |
-| `skip` is O(n); no cursors | **M9 task 5** |
+| Sorted paging still uses `skip`, which is O(n). `_id`-order cursors are constant work per page | index-ordered scans would close the rest |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
 | No published protocol spec; no token refresh; clients cannot discover the cluster | **M10 tasks 1, 4, 5** |
 | Client-facing throughput is unmeasured — every benchmark is engine-level | **M10 task 7** |

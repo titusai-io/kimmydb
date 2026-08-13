@@ -584,6 +584,41 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟢 A collection can be paged without `skip` (M9 task 5)
+
+**Two decisions settled before code.** The token is **opaque**, following the
+`ResumeToken` convention next door — a client treats it as a blob, so the
+encoding can change without breaking anyone. And a cursor pages in **`_id`
+order only**, because that is the order both access paths already produce.
+
+**The implementation is smaller than the feature**, which is the point. A
+cursor is the encoded document key of the page's last row, and nothing else.
+`keyenc` is order-preserving, so byte order *is* `_id` order — "the next page"
+becomes a range bound the storage engine already knows how to take. No new
+comparison logic, no sorting, no server state, and portability between nodes
+falls out because the token is a pure function of the `_id`.
+
+The honest numbers, paging 1,000,000 documents at 100 per page: `skip` visits
+~5×10⁹ documents, a cursor ~10⁶.
+
+**Arbitrary sort keys were deliberately excluded**, and the reason is worth
+keeping. A token *can* bound the start of a sorted scan — but index candidates
+come back in document-key order (`scan_range_in` ends with `out.sort()`), so a
+sorted page still materialises and sorts whatever remains. That is roughly 2×
+better than `skip` rather than a fix, and shipping it would have promised
+efficient sorted paging while delivering a constant factor. Making sorted
+paging genuinely cheap needs index-ordered scans, which would also make every
+sorted `find` cheaper — it is the obvious next thing, and it is not in M9.
+
+**A design fault was found by writing the test.** The first draft returned
+`nextCursor` only when a cursor had been *sent*, so the test had to invent a
+magic first-page constant to start a walk — something no client could have
+discovered. `nextCursor` is now offered whenever the page filled and the query
+is one a cursor can continue, so a client's first request needs no cursor and
+no flag. The test that needed a magic constant was the design review.
+
+---
+
 ## 🟢 Partial indexes exist, and sparse falls out of them (M9 task 4)
 
 **Two decisions settled before code.** Partial only — a sparse index is

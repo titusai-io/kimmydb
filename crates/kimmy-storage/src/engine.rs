@@ -921,6 +921,26 @@ pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> 
 }
 
 /// Key range covering every document in a collection.
+/// [`doc_range`], starting strictly after `after` when one is given.
+///
+/// Exclusive on purpose: a cursor names the last row already delivered, so
+/// including it would hand the caller a duplicate at every page boundary.
+pub(crate) fn doc_range_after(
+    id: CollectionId,
+    after: Option<&[u8]>,
+) -> impl std::ops::RangeBounds<(u64, &[u8])> {
+    use std::ops::Bound;
+    let start = match after {
+        Some(key) => Bound::Excluded((id.0, key)),
+        None => Bound::Included((id.0, [].as_slice())),
+    };
+    let end = match id.0.checked_add(1) {
+        Some(next) => Bound::Excluded((next, [].as_slice())),
+        None => Bound::Unbounded,
+    };
+    (start, end)
+}
+
 pub(crate) fn doc_range(id: CollectionId) -> impl std::ops::RangeBounds<(u64, &'static [u8])> {
     use std::ops::Bound;
     let start = Bound::Included((id.0, [].as_slice()));

@@ -1121,6 +1121,206 @@ async fn storing_vectors_needs_write_access() {
     assert_eq!(res.status, 403, "{:?}", res.body);
 }
 
+/// A collection of `n` documents, half of them `even`.
+async fn paged(server: &Server, coll: &str, n: i64) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": coll})).await;
+    let batch: Vec<Value> = (0..n)
+        .map(|i| json!({"_id": i, "parity": if i % 2 == 0 { "even" } else { "odd" }}))
+        .collect();
+    server.post(&format!("/v1/db/shop/coll/{coll}/bulk"), Some(&token), json!(batch)).await;
+    token
+}
+
+/// Walk every page, returning the `_id`s in the order they were delivered.
+///
+/// Exactly what a client does: ask for a page, follow `nextCursor` until it
+/// stops coming. The first request carries no cursor.
+async fn walk(server: &Server, token: &str, coll: &str, body: Value) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..200 {
+        let mut req = body.clone();
+        if let Some(c) = &cursor {
+            req["cursor"] = json!(c);
+        }
+        let res = server.post(&format!("/v1/db/shop/coll/{coll}/find"), Some(token), req).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        out.extend(
+            res.body["documents"].as_array().unwrap().iter().map(|d| d["_id"].as_i64().unwrap()),
+        );
+        match res.body.get("nextCursor").and_then(|c| c.as_str()) {
+            Some(next) => cursor = Some(next.to_string()),
+            None => return out,
+        }
+    }
+    panic!("pagination did not terminate");
+}
+
+#[tokio::test]
+async fn paging_sees_every_document_exactly_once() {
+    // The property that matters. A boundary bug shows up here as a missing or
+    // repeated id, which is exactly what a range cursor gets wrong when the
+    // bound is inclusive on the wrong side.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 250).await;
+
+    let seen = walk(&server, &token, "orders", json!({"filter": {}, "limit": 37})).await;
+
+    assert_eq!(seen.len(), 250, "wrong number of documents: {}", seen.len());
+    assert_eq!(seen, (0..250).collect::<Vec<i64>>(), "wrong order or contents");
+}
+
+#[tokio::test]
+async fn paging_a_filtered_query_sees_every_match_exactly_once() {
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 250).await;
+
+    let seen =
+        walk(&server, &token, "orders", json!({"filter": {"parity": "even"}, "limit": 13})).await;
+
+    let expected: Vec<i64> = (0..250).filter(|i| i % 2 == 0).collect();
+    assert_eq!(seen, expected);
+}
+
+#[tokio::test]
+async fn paging_through_an_index_agrees_with_paging_through_a_scan() {
+    // Index candidates arrive in document-key order too, so the cursor bound
+    // applies to both paths — and both must produce the same walk.
+    let server = Server::start().await;
+    let token = paged(&server, "scanned", 200).await;
+    let _ = paged(&server, "indexed", 200).await;
+    server
+        .post(
+            "/v1/db/shop/coll/indexed/indexes",
+            Some(&token),
+            json!({"name": "parity_1", "fields": [{"path": "parity"}]}),
+        )
+        .await;
+
+    let body = json!({"filter": {"parity": "odd"}, "limit": 11});
+    let a = walk(&server, &token, "indexed", body.clone()).await;
+    let b = walk(&server, &token, "scanned", body).await;
+
+    // Confirm the index really was used, so this is not two scans agreeing.
+    let plan = server
+        .post(
+            "/v1/db/shop/coll/indexed/find",
+            Some(&token),
+            json!({"filter": {"parity": "odd"}, "explain": true}),
+        )
+        .await;
+    assert_eq!(plan.body["explain"]["strategy"], "index", "{:?}", plan.body);
+
+    assert_eq!(a, b, "the index path and the scan path paged differently");
+    assert_eq!(a, (0..200).filter(|i| i % 2 == 1).collect::<Vec<i64>>());
+}
+
+#[tokio::test]
+async fn the_last_page_carries_no_cursor() {
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 10).await;
+
+    let res = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"filter": {}, "limit": 100}))
+        .await;
+    assert_eq!(res.body["count"], 10);
+    assert!(
+        res.body.get("nextCursor").is_none(),
+        "a short page is the end; offering a cursor invites a round trip to learn nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_full_page_offers_a_continuation_without_being_asked() {
+    // A client's first request carries no cursor, so the first reply has to
+    // be the thing that hands one over. Requiring a cursor to receive a
+    // cursor would leave no way to start.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 50).await;
+
+    let res = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"filter": {}, "limit": 10}))
+        .await;
+    assert_eq!(res.body["count"], 10);
+    assert!(res.body.get("nextCursor").is_some(), "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn no_continuation_is_offered_for_a_query_a_cursor_cannot_page() {
+    // The dangerous case: a caller sorts by a field, sees a token, follows
+    // it, and silently gets _id order instead of the order they asked for.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 50).await;
+
+    for body in [
+        json!({"filter": {}, "limit": 10, "sort": {"parity": -1}}),
+        json!({"filter": {}, "limit": 10, "skip": 5}),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/find", Some(&token), body.clone()).await;
+        assert_eq!(res.body["count"], 10);
+        assert!(res.body.get("nextCursor").is_none(), "{body:?} -> {:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn a_cursor_refuses_what_it_cannot_honour() {
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 20).await;
+
+    for (body, why) in [
+        (json!({"cursor": "AA", "skip": 5}), "skip and cursor both say where to resume"),
+        (json!({"cursor": "AA", "sort": {"parity": 1}}), "a cursor pages in _id order"),
+        (json!({"cursor": "!!! not base64"}), "malformed"),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/find", Some(&token), body).await;
+        assert_eq!(res.status, 400, "{why}: {:?}", res.body);
+    }
+
+    // `_id` ascending is the order a cursor already pages in, so it is allowed.
+    let ok = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"sort": {"_id": 1}, "limit": 5}))
+        .await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(ok.body["count"], 5);
+}
+
+#[tokio::test]
+async fn a_cursor_survives_writes_behind_and_ahead_of_it() {
+    // Paging is not a snapshot, and should not pretend to be. What it must
+    // guarantee is that it never skips or repeats a document that was present
+    // for the whole walk.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 100).await;
+
+    let first = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({"filter": {}, "limit": 50}))
+        .await;
+    let cursor = first.body["nextCursor"].as_str().expect("a cursor").to_string();
+
+    // One behind the cursor, one ahead of it.
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": -1})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1000})).await;
+
+    let rest = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({"filter": {}, "limit": 1000, "cursor": cursor}),
+        )
+        .await;
+    let ids: Vec<i64> = rest.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+
+    assert!(!ids.contains(&-1), "an insert behind the cursor must not reappear");
+    assert!(ids.contains(&1000), "an insert ahead of the cursor is seen, as any scan would");
+    assert_eq!(ids.iter().filter(|&&i| i == 50).count(), 1, "no document repeats");
+}
+
 #[tokio::test]
 async fn a_unique_index_can_apply_only_where_the_field_is_present() {
     // The motivating case, and impossible before partial indexes: a missing

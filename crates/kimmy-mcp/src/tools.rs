@@ -310,6 +310,11 @@ impl KimmyMcp {
             limit: args.limit,
             skip: args.skip,
             explain: args.explain,
+            // Not offered to an agent. A cursor exists to walk a whole
+            // collection cheaply, and walking one into a context window is
+            // the thing these tool descriptions already steer away from —
+            // `limit` and a narrower filter are the right answers here.
+            cursor: None,
         };
         render(exec::find(&self.state, &auth, &args.database, &args.collection, params))
     }

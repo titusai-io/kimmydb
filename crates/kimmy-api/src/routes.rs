@@ -322,6 +322,8 @@ struct FindRequest {
     skip: Option<usize>,
     /// Report how the query was answered alongside the results.
     explain: bool,
+    /// Resume after a previous page, using the `nextCursor` it returned.
+    cursor: Option<String>,
 }
 
 impl From<FindRequest> for exec::FindParams {
@@ -333,6 +335,7 @@ impl From<FindRequest> for exec::FindParams {
             limit: r.limit,
             skip: r.skip,
             explain: r.explain,
+            cursor: r.cursor,
         }
     }
 }
