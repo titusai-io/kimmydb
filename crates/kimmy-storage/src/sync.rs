@@ -294,6 +294,7 @@ impl Engine {
             target.index.unique,
             target.index.enforcement,
             Some(target.index.name.clone()),
+            target.index.expire_after_secs,
             false,
         )?;
         Ok(())

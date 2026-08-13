@@ -1122,6 +1122,79 @@ async fn storing_vectors_needs_write_access() {
 }
 
 #[tokio::test]
+async fn a_ttl_index_round_trips_through_the_api() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"sessions"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/sessions/indexes",
+            Some(&token),
+            json!({"name":"ttl_seen","fields":[{"path":"seen"}],"expireAfterSeconds":3600}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["expireAfterSeconds"], 3600);
+
+    let res = server.get("/v1/db/app/coll/sessions/indexes", Some(&token)).await;
+    let listed = res.body["indexes"]
+        .as_array()
+        .expect("indexes")
+        .iter()
+        .find(|i| i["name"] == "ttl_seen")
+        .expect("the TTL index is listed")
+        .clone();
+    assert_eq!(listed["expireAfterSeconds"], 3600);
+}
+
+#[tokio::test]
+async fn an_ordinary_index_carries_no_expiry_key_at_all() {
+    // Absent rather than null: listing indexes must not suggest every one of
+    // them has an expiry policy that happens to be unset.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/orders/indexes",
+            Some(&token),
+            json!({"name":"item_1","fields":[{"path":"item"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body.get("expireAfterSeconds").is_none(), "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_malformed_ttl_index_is_a_400() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"sessions"})).await;
+
+    // Compound: expiry reads one date, and there is no rule for which.
+    let res = server
+        .post(
+            "/v1/db/app/coll/sessions/indexes",
+            Some(&token),
+            json!({"name":"ttl_ab","fields":[{"path":"a"},{"path":"b"}],"expireAfterSeconds":60}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+
+    // Negative.
+    let res = server
+        .post(
+            "/v1/db/app/coll/sessions/indexes",
+            Some(&token),
+            json!({"name":"ttl_neg","fields":[{"path":"seen"}],"expireAfterSeconds":-1}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn computed_expressions_derive_fields_over_http() {
     let server = Server::start().await;
     let token = server.root().await;

@@ -120,6 +120,31 @@ pub async fn run(config: Config) -> Result<()> {
         })
     };
 
+    // TTL expiry. Ownership is rendezvous-hashed per collection through the
+    // same live member set the dispatcher uses, so one node expires a given
+    // collection and one expired document produces one delete cluster-wide
+    // rather than one per node.
+    let expiry_handle = {
+        let state = Arc::clone(&state);
+        let members = cluster.members.clone();
+        let me = engine.node_id();
+        let interval = match config.storage.ttl_interval_secs {
+            0 => None,
+            secs => Some(Duration::from_secs(secs)),
+        };
+        match interval {
+            None => {
+                warn!(
+                    "TTL expiry is disabled; documents with an expiry policy will not be removed"
+                );
+                None
+            }
+            Some(interval) => Some(tokio::spawn(async move {
+                kimmy_api::expiry::run(state, me, members, interval).await;
+            })),
+        }
+    };
+
     // Keeps each node's view of "is this token still good" honest. Another
     // ordinary oplog consumer, which is also what makes revoking on one node
     // take effect on every node: a replicated write to `__users` publishes on
@@ -199,6 +224,13 @@ pub async fn run(config: Config) -> Result<()> {
     // Likewise the collector: a pass is a transaction, so an aborted one either
     // committed or did not, and the next start simply finds the same garbage.
     if let Some(handle) = gc_handle {
+        handle.abort();
+    }
+    // And expiry: each delete is its own commit, so an aborted pass leaves a
+    // prefix of the batch removed and the rest still due. The next pass finds
+    // them, which is the same property that lets a bounded pass drain a
+    // backlog over several ticks.
+    if let Some(handle) = expiry_handle {
         handle.abort();
     }
     // And replication: anti-entropy is idempotent and resumes from version

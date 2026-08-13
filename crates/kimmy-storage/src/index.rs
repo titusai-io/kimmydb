@@ -409,14 +409,19 @@ impl crate::Engine {
         unique: bool,
         name: Option<String>,
     ) -> Result<IndexMeta> {
-        self.create_index_with(db, collection, fields, unique, Enforcement::Local, name)
+        self.create_index_with(db, collection, fields, unique, Enforcement::Local, name, None)
     }
 
-    /// Create an index, choosing how far a unique constraint reaches.
+    /// Create an index, choosing how far a unique constraint reaches and
+    /// whether it expires documents.
     ///
     /// See [`Enforcement`]: `Coordinated` requires cluster machinery that does
     /// not exist yet, so it is refused rather than silently downgraded to a
     /// weaker guarantee than the caller asked for.
+    ///
+    /// `expire_after_secs` makes this a TTL index — see
+    /// [`IndexMeta::expire_after_secs`].
+    #[allow(clippy::too_many_arguments)]
     pub fn create_index_with(
         &self,
         db: &str,
@@ -425,8 +430,18 @@ impl crate::Engine {
         unique: bool,
         enforcement: Enforcement,
         name: Option<String>,
+        expire_after_secs: Option<i64>,
     ) -> Result<IndexMeta> {
-        self.create_index_inner(db, collection, fields, unique, enforcement, name, true)
+        self.create_index_inner(
+            db,
+            collection,
+            fields,
+            unique,
+            enforcement,
+            name,
+            expire_after_secs,
+            true,
+        )
     }
 
     /// `log = false` when applying a replicated definition.
@@ -444,12 +459,29 @@ impl crate::Engine {
         unique: bool,
         enforcement: Enforcement,
         name: Option<String>,
+        expire_after_secs: Option<i64>,
         log: bool,
     ) -> Result<IndexMeta> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
             )));
+        }
+        if let Some(secs) = expire_after_secs {
+            if secs < 0 {
+                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                    "expireAfterSeconds cannot be negative, found {secs}"
+                ))));
+            }
+            // A compound TTL index has no meaning: expiry reads one date, and
+            // there would be no rule for which field that is. Mongo refuses it
+            // too, and refusing is better than silently reading the first.
+            if fields.len() != 1 {
+                return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                    "a TTL index takes exactly one field, found {}",
+                    fields.len()
+                ))));
+            }
         }
         if enforcement == Enforcement::Coordinated {
             return Err(StorageError::Core(CoreError::Unsupported(
@@ -467,7 +499,13 @@ impl crate::Engine {
             // Idempotent when the definition matches, a conflict when it does
             // not — silently keeping the old shape under a reused name would be
             // worse than either.
-            if existing.fields == fields && existing.unique == unique {
+            // The TTL is part of the definition: re-creating the same index
+            // with a different `expireAfterSeconds` must not quietly return the
+            // old policy and leave documents living longer than asked.
+            if existing.fields == fields
+                && existing.unique == unique
+                && existing.expire_after_secs == expire_after_secs
+            {
                 return Ok(existing.clone());
             }
             return Err(StorageError::Core(CoreError::CollectionExists {
@@ -489,7 +527,8 @@ impl crate::Engine {
             )));
         }
 
-        let mut index = IndexMeta { id, name, fields, unique, enforcement, multikey: false };
+        let mut index =
+            IndexMeta { id, name, fields, unique, enforcement, multikey: false, expire_after_secs };
 
         let txn = self.db().begin_write()?;
 
@@ -721,6 +760,7 @@ mod tests {
             unique,
             enforcement: Enforcement::Local,
             multikey: false,
+            expire_after_secs: None,
         }
     }
 
@@ -1003,8 +1043,107 @@ mod tests {
             true,
             Enforcement::Coordinated,
             None,
+            None,
         );
         assert!(matches!(err, Err(StorageError::Core(CoreError::Unsupported(_)))));
+    }
+
+    #[test]
+    fn a_ttl_index_must_be_single_field() {
+        // A compound TTL index has no meaning: expiry reads one date and there
+        // is no rule for which field that is. Refusing beats reading the first.
+        let (engine, _coll, _dir) = engine();
+        let err = engine.create_index_with(
+            "app",
+            "docs",
+            vec![IndexField::ascending("a"), IndexField::ascending("b")],
+            false,
+            Enforcement::Local,
+            Some("ttl_ab".into()),
+            Some(60),
+        );
+        assert!(matches!(err, Err(StorageError::Core(CoreError::InvalidQuery(_)))), "{err:?}");
+    }
+
+    #[test]
+    fn a_negative_expiry_is_refused() {
+        let (engine, _coll, _dir) = engine();
+        let err = engine.create_index_with(
+            "app",
+            "docs",
+            vec![IndexField::ascending("seen")],
+            false,
+            Enforcement::Local,
+            Some("ttl_seen".into()),
+            Some(-1),
+        );
+        assert!(matches!(err, Err(StorageError::Core(CoreError::InvalidQuery(_)))), "{err:?}");
+    }
+
+    #[test]
+    fn zero_seconds_is_a_valid_policy() {
+        // "expire as soon as the date passes" is a real thing to want, and is
+        // how Mongo's `expireAfterSeconds: 0` absolute-deadline pattern works.
+        let (engine, _coll, _dir) = engine();
+        let index = engine
+            .create_index_with(
+                "app",
+                "docs",
+                vec![IndexField::ascending("expiresAt")],
+                false,
+                Enforcement::Local,
+                Some("ttl_at".into()),
+                Some(0),
+            )
+            .unwrap();
+        assert!(index.is_ttl(), "zero must not be read as absent");
+        assert_eq!(index.ttl_path(), Some("expiresAt"));
+    }
+
+    #[test]
+    fn recreating_with_a_different_expiry_is_a_conflict_not_a_silent_keep() {
+        // Returning the old definition here would leave documents living
+        // longer than the caller just asked for, with a 200 saying otherwise.
+        let (engine, _coll, _dir) = engine();
+        let fields = vec![IndexField::ascending("seen")];
+        engine
+            .create_index_with(
+                "app",
+                "docs",
+                fields.clone(),
+                false,
+                Enforcement::Local,
+                Some("ttl_seen".into()),
+                Some(60),
+            )
+            .unwrap();
+
+        // Same policy: idempotent.
+        assert!(
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    fields.clone(),
+                    false,
+                    Enforcement::Local,
+                    Some("ttl_seen".into()),
+                    Some(60),
+                )
+                .is_ok()
+        );
+
+        // Different policy: refused.
+        let err = engine.create_index_with(
+            "app",
+            "docs",
+            fields,
+            false,
+            Enforcement::Local,
+            Some("ttl_seen".into()),
+            Some(30),
+        );
+        assert!(err.is_err(), "a changed TTL must not be silently ignored");
     }
 
     // -----------------------------------------------------------------------

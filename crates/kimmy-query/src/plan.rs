@@ -284,6 +284,7 @@ mod tests {
             unique: false,
             enforcement: Default::default(),
             multikey: false,
+            expire_after_secs: None,
         }
     }
 

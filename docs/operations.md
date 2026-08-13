@@ -38,6 +38,7 @@ fails fast on a bad volume mount.
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents *and* dropped collections |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
+| `storage.ttl_interval_secs` | — | `60` | How often TTL indexes are checked for expired documents. Separate from `gc_interval_secs`: that reclaims *garbage*, this deletes *live documents* a policy says are due. `0` leaves any TTL index defined but inert |
 | `cluster.sync_interval_secs` | — | `5` | How often to run an anti-entropy round against each peer |
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
@@ -504,6 +505,7 @@ partially read.
 | `skip` | O(n) even with an index; deep paging is expensive |
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
+| TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
 

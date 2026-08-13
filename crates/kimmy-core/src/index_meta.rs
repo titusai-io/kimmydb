@@ -40,6 +40,26 @@ pub struct IndexMeta {
     /// `false` here is what licenses using both bounds.
     #[serde(default)]
     pub multikey: bool,
+    /// Delete a document this many seconds after the indexed date.
+    ///
+    /// `None` is an ordinary index. `Some(n)` additionally makes the index a
+    /// **TTL** index: a background pass range-scans it for entries older than
+    /// `n` seconds and deletes the documents behind them. The index is both the
+    /// policy and the mechanism, which is what keeps expiry proportional to the
+    /// number of *expired* documents rather than to the size of the collection.
+    ///
+    /// **`i64` deliberately, not `u64`.** This crosses two format boundaries —
+    /// JSON in the collection metadata and BSON in the replicated
+    /// [`crate::IndexCreate`] — and BSON cannot hold a `u64` above `i64::MAX`.
+    /// Letting the encoder decide has cost this project a replication outage
+    /// twice (ADR-031 and the `NodeId` note in [Handoff](../../../docs/handoff.md)),
+    /// so the representation is chosen here rather than inherited. Validated
+    /// positive where an index is created.
+    ///
+    /// Only meaningful on a single-field index over a date, which is enforced
+    /// at creation.
+    #[serde(default)]
+    pub expire_after_secs: Option<i64>,
 }
 
 /// How far a unique constraint reaches.
@@ -95,6 +115,22 @@ impl IndexField {
 }
 
 impl IndexMeta {
+    /// Whether this index expires documents.
+    pub fn is_ttl(&self) -> bool {
+        self.expire_after_secs.is_some()
+    }
+
+    /// The dot path a TTL index reads its date from.
+    ///
+    /// Single-field is enforced where an index is created, so a TTL index has
+    /// exactly one field and this is it.
+    pub fn ttl_path(&self) -> Option<&str> {
+        if !self.is_ttl() {
+            return None;
+        }
+        self.fields.first().map(|f| f.path.as_str())
+    }
+
     /// The id of an index called `name`, on every node, without coordination.
     ///
     /// Same reasoning as [`crate::CollectionId::derive`] and the same hash

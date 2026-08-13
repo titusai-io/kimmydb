@@ -584,6 +584,53 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟢 Documents can expire (M9 task 2)
+
+**Three decisions were settled before any code**, and each is recorded where it
+is enforced rather than only here.
+
+**The trigger is a TTL index**, not a collection setting or a magic document
+field, because the pass has to *find* expired documents every tick: a collection
+scan is ~8 s per pass at ten million documents whether or not anything expired,
+against ~1.66 µs per candidate through an index range scan. The index is both
+the policy and the mechanism.
+
+**One node expires a given collection**, by rendezvous hashing over live
+members — the webhook ownership machinery, reused. Every node expiring
+independently is convergent but produces N deletes per document, of which N-1
+are superseded entries that still cost oplog, replication and change-stream
+bandwidth. The cost is that expiry stalls for a collection whose owner is
+partitioned; TTL is best-effort by nature and that was judged the better trade.
+
+**An expiry is an ordinary `OpKind::Delete`.** A dedicated op kind would be a
+**stop-the-cluster upgrade**: `op_kind_from_tag` (`codec.rs`) rejects an unknown
+tag as *corruption*, so an old node would treat a new node's expiry as a corrupt
+oplog rather than tolerating it — the same class as ADR-040 and ADR-051. The
+audit value did not justify it, and MongoDB does not distinguish either.
+
+**Two things came out of building it.**
+
+**The obvious middle path on the third decision was a data-loss bug.** Marking
+an expiry by putting a payload in the delete's body looks harmless, and
+`apply_remote` branches on exactly that: a delete carrying a body is decoded as
+a **live document**. Every "marked" expiry would have resurrected itself on
+every node. Found by reading the apply path before offering the option, not
+after taking it.
+
+**The scan and the delete cannot share a transaction**, so a document refreshed
+in between — a session heartbeat, which is the main reason to have a TTL at
+all — would be deleted while live. `delete_guarded` re-reads inside the write
+transaction and declines. The ordinary delete shares that body rather than
+having a second one beside it, for the same reason `insert` and `insert_many`
+share `insert_in_txn`.
+
+**`kimmy_ttl_expired_total` was added** so "one document, one delete" is
+measured rather than asserted: the cluster harness sums it across three nodes
+and requires exactly 1. Correctness alone cannot distinguish the two designs,
+because N deletes converge.
+
+---
+
 ## 🟢 The pipeline can derive (was the largest gap against MongoDB)
 
 **M9 task 1.** Expressions were a field path or a literal, so a pipeline could

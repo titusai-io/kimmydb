@@ -496,6 +496,12 @@ impl KimmyMcp {
             // `coordinated` needs clustering and is refused until M4, so there
             // is nothing for an agent to choose between yet.
             enforcement: None,
+            // Deliberately not exposed. A TTL index arms a background pass
+            // that *deletes documents*, and this tool is described to an agent
+            // as a query-performance aid — an agent reaching for an index to
+            // make a query faster must not be able to schedule data loss as a
+            // side effect. Creating one stays an administrative act over HTTP.
+            expire_after_seconds: None,
         };
         render(exec::create_index(&self.state, &auth, &args.database, &args.collection, spec))
     }

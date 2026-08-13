@@ -351,6 +351,29 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
+        self.delete_guarded(coll, id, |_| true)
+    }
+
+    /// [`Engine::delete`], but only if `guard` still approves the document it
+    /// is about to remove.
+    ///
+    /// The guard runs **inside the write transaction**, on the image about to
+    /// be tombstoned. That placement is the whole point: TTL expiry scans an
+    /// index in one transaction and deletes in another, so a document whose
+    /// date is bumped in between — a session heartbeat, which is the canonical
+    /// reason to have a TTL at all — would otherwise be deleted while live.
+    /// Re-reading here means what the guard approves is exactly what the
+    /// commit removes.
+    ///
+    /// One delete body, shared: a check added to expiry must not be added
+    /// *beside* the ordinary delete, for the same reason `insert` and
+    /// `insert_many` share `insert_in_txn`.
+    pub(crate) fn delete_guarded(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        guard: impl Fn(&Document) -> bool,
+    ) -> Result<bool> {
         let key = doc_key(id)?;
         let stamp = self.next_stamp();
 
@@ -362,6 +385,14 @@ impl Engine {
                 None => None,
             };
             if previous.is_none() {
+                drop(docs);
+                txn.abort()?;
+                return Ok(false);
+            }
+            if !previous.as_ref().is_some_and(&guard) {
+                // Still here, but no longer eligible. Nothing is written and
+                // no oplog entry is minted, so a refused expiry is invisible
+                // to replication and to change streams.
                 drop(docs);
                 txn.abort()?;
                 return Ok(false);
