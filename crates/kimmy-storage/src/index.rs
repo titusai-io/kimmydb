@@ -359,6 +359,41 @@ pub(crate) fn scan_range(
 /// [`scan_range`] inside a caller-held transaction, for scans that must share
 /// a snapshot with something else — see
 /// [`crate::Engine::index_candidates_unless_multikey`].
+/// [`scan_range`] inside a **write** transaction.
+///
+/// Separate from the read-transaction twin because redb's two transaction
+/// types are distinct: `find_and_modify` matches inside the write it is about
+/// to commit, which is the whole reason it is atomic.
+pub(crate) fn scan_range_in_write(
+    txn: &redb::WriteTransaction,
+    coll: CollectionId,
+    index_id: u32,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+) -> Result<Vec<Vec<u8>>> {
+    use std::ops::Bound;
+    let table = txn.open_table(tables::INDEX_ENTRIES)?;
+
+    let start = Bound::Included((coll.0, index_id, lower, [].as_slice()));
+    let mut out = Vec::new();
+    for entry in table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))? {
+        let (found, _) = entry?;
+        let (c, i, k, doc_key) = found.value();
+        if c != coll.0 || i != index_id {
+            break;
+        }
+        if let Some(upper) = upper
+            && k > upper
+        {
+            break;
+        }
+        out.push(doc_key.to_vec());
+    }
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
 fn scan_range_in(
     txn: &redb::ReadTransaction,
     coll: CollectionId,

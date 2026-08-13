@@ -185,6 +185,68 @@ document:
 
 ---
 
+## `find_and_modify` — atomic claim-and-return
+
+`POST /v1/db/{db}/coll/{coll}/find_and_modify` finds one document, changes it,
+and returns it — **atomically**. It is the primitive behind job queues,
+counters and claim-a-row patterns.
+
+```javascript
+{ "filter":  { "status": "pending" },
+  "sort":    { "created": 1 },              // which one, when several match
+  "update":  { "$set": { "status": "claimed" } },
+  "returnDocument": "before",               // or "after"; "before" is default
+  "upsert":  false,
+  "remove":  false,
+  "projection": { "payload": 1 } }
+```
+
+```javascript
+// -> matched 0 or 1; document is null when nothing matched
+{ "document": { "_id": 2, "status": "pending", ... }, "matched": 1 }
+```
+
+**Why this exists rather than read-then-write.** Two clients running
+`find` then `update` both see the same pending job and both claim it. Here the
+match happens **inside the write transaction**, and redb has a single writer —
+so nothing can take the document between the match and the commit. Draining a
+queue never hands out the same job twice.
+
+### The rules
+
+- **`update` or `remove: true`, not both**, and not neither. `update` takes
+  operators or a whole replacement document, exactly as `/update` does.
+- **`remove` cannot be combined with `upsert`**, and cannot ask for
+  `returnDocument: "after"` — there is no document after a removal.
+- **`sort` decides which match wins.** Without it the choice is the scan's own
+  order, which is [unspecified](deviations.md). A FIFO queue wants a sort.
+- **`upsert` seeds the filter's equalities.** `{filter: {_id: "hits", scope:
+  "global"}, update: {$inc: {n: 1}}, upsert: true}` creates
+  `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
+  seeded, because a match does not imply it.
+- **A removal is an ordinary delete** in the change stream and to replication.
+
+### The cost, stated plainly
+
+The writer is held for the *match* as well as the commit, and matches are
+materialised so they can be sorted. That is the price of atomicity on a single
+writer:
+
+| Filter | Writer held |
+|---|---|
+| Index-backed | ~0.003 ms + commit |
+| Collection scan, 10,000 documents | ~8 ms + commit |
+
+**More than 10,000 matches is refused**, not truncated — choosing from a prefix
+would return a document the sort did not pick, with no way for a caller to tell.
+Narrow the filter, or add an index.
+
+Note that `find_and_modify` **does** use the planner while `/update` does not
+([Deviations](deviations.md)), so on the same filter the atomic operation is
+currently the faster one. That is a known drift, not a design.
+
+---
+
 ## Sort and projection
 
 ```javascript

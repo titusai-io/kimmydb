@@ -221,7 +221,7 @@ impl Engine {
     /// The caller owns the transaction, so this returns its failure rather than
     /// aborting: a batch has to abort once for the batch, not once per
     /// document.
-    fn insert_in_txn(
+    pub(crate) fn insert_in_txn(
         &self,
         txn: &redb::WriteTransaction,
         coll: &CollectionMeta,
@@ -598,7 +598,7 @@ pub(crate) fn doc_key(id: &DocId) -> Result<Vec<u8>> {
 }
 
 /// Pull the `_id` out of a stored document.
-fn extract_id(doc: &Document) -> Result<DocId> {
+pub(crate) fn extract_id(doc: &Document) -> Result<DocId> {
     match doc.get(ID_FIELD) {
         Some(value) => Ok(DocId::try_from_bson(value)?),
         None => Err(StorageError::Corrupt("stored document has no _id".into())),

@@ -44,6 +44,7 @@ contract, with a test that fails when it does, is M10 task 1 on the
 | `POST` | `/v1/db/{db}/coll/{coll}/find` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/count` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/update` | `write` |
+| `POST` | `/v1/db/{db}/coll/{coll}/find_and_modify` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` — see [Aggregation](aggregation.md) |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |

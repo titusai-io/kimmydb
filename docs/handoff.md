@@ -83,8 +83,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 
 | | |
 |---|---|
-| `main` | PRs #16–#56 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
-| `m9-ttl-expiry` (open PR) | **M9 task 2.** TTL indexes, the ownership-gated expiry pass, and `kimmy_ttl_expired_total`. |
+| `main` | PRs #16–#58 merged: all of M8, SWIM authentication (ADR-053), the witnessed vector (ADR-054), the M9 board, ADR-055 and the M10 board |
+| `m9-find-and-modify` (open PR) | **M9 task 3.** Atomic find-modify-return, matching inside the write transaction. |
 
 ### The M8 task board — all twelve done, for reference
 
@@ -114,8 +114,8 @@ group and join but cannot *derive*.
 | # | Task | Reserved decision to settle first |
 |---|---|---|
 | 1 | **Computed expressions** + `$addFields`/`$set` + `$replaceRoot` | ✅ #57 |
-| 2 | **TTL / expiring documents** | 🔵 open PR — decisions settled: TTL index, one owner per collection, ordinary `OpKind::Delete` |
-| 3 | **`findAndModify`** | API shape — but the *design* problem is that a filter-based match must move inside the write transaction |
+| 2 | **TTL / expiring documents** | ✅ #58 |
+| 3 | **`findAndModify`** | 🔵 open PR — decisions settled: one `/find_and_modify` route, match inside the write transaction, sort supported |
 | 4 | **Partial and sparse indexes** | Partial only, or both |
 | 5 | **Cursors / efficient pagination** | Continuation-token shape |
 

@@ -40,6 +40,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/webhooks", get(list_webhooks).post(register_webhook))
         .route("/v1/db/{db}/coll/{coll}/webhooks/{id}", delete(remove_webhook))
         .route("/v1/db/{db}/coll/{coll}/update", post(update_docs))
+        .route("/v1/db/{db}/coll/{coll}/find_and_modify", post(find_and_modify))
         .route("/v1/db/{db}/coll/{coll}/delete", post(delete_docs))
         .route(
             "/v1/db/{db}/coll/{coll}/docs/{id}",
@@ -444,6 +445,56 @@ async fn delete_doc(
     Path((db, coll, id)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id)?))
+}
+
+#[derive(Deserialize)]
+struct FindAndModifyRequest {
+    #[serde(default)]
+    filter: Option<Value>,
+    /// Chooses which document when several match. Without it the choice is the
+    /// scan's own order, which is unspecified.
+    #[serde(default)]
+    sort: Option<Value>,
+    /// Operators, or a whole replacement document.
+    #[serde(default)]
+    update: Option<Value>,
+    #[serde(default)]
+    remove: bool,
+    #[serde(default)]
+    upsert: bool,
+    /// `"before"` (default) or `"after"`.
+    #[serde(default, rename = "returnDocument")]
+    return_document: Option<String>,
+    #[serde(default)]
+    projection: Option<Value>,
+}
+
+async fn find_and_modify(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    Json(body): Json<FindAndModifyRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let return_document = match body.return_document.as_deref() {
+        None | Some("before") => exec::ReturnDocument::Before,
+        Some("after") => exec::ReturnDocument::After,
+        Some(other) => {
+            return Err(ApiError::bad_request(format!(
+                "unknown returnDocument {other:?}: expected \"before\" or \"after\""
+            )));
+        }
+    };
+
+    let spec = exec::FindAndModifySpec {
+        filter: body.filter,
+        sort: body.sort,
+        update: body.update,
+        remove: body.remove,
+        upsert: body.upsert,
+        return_document,
+        projection: body.projection,
+    };
+    Ok(Json(exec::find_and_modify(&state, &auth, &db, &coll, spec)?))
 }
 
 #[derive(Deserialize)]
