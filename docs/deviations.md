@@ -584,6 +584,62 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟡 `update` and `delete` never consult the planner
+
+**Found while building `find_and_modify` (M9 task 3).** `exec::update` and
+`exec::delete` collect their targets with `for_each_doc` — a straight collection
+scan. Neither calls `plan::choose`, so **an index never speeds up a filtered
+update or delete**, however selective the filter is.
+
+The register already said these were "found by a scan", but inside a row about
+*atomicity*, where it reads as a statement about partial application rather than
+about indexes being ignored. Recorded properly here.
+
+The consequence is now visible rather than merely latent: `find_and_modify`
+*does* plan, so on the same filter and the same collection it is **faster than
+`update`** — 0.003 ms against ~8 ms per 10,000 documents ([Benchmarks](benchmarks.md)).
+An operator reasonably expects the atomic one to be the expensive one.
+
+**Not fixed here**, deliberately — it is a change to two working code paths
+with their own partial-application semantics, and this branch is already the
+one that moved matching into a write transaction. It wants its own branch and
+its own tests.
+
+---
+
+## 🟢 `findAndModify` exists (M9 task 3)
+
+**Three decisions settled before code**, and the second is the substance.
+
+**One `/find_and_modify` route** carrying Mongo's flags, rather than three
+`find_one_and_*` routes or an option on `/update`: every existing route is named
+for a server operation, and `findAndModify` is the server command all three
+driver methods map onto — which matters for the first-party clients M10 builds.
+
+**The match happens inside the write transaction.** `update` collects targets in
+a read pass and writes them one at a time, so two callers claiming the same job
+both succeed. redb has a single writer, so a match found *inside* the write
+cannot be taken between the match and the commit: atomic by construction, with
+no retry loop and no way to report "nothing matched" while something did. The
+cost is that the writer is held for the match; an unindexed filter over a large
+collection blocks every other write for the length of the scan.
+
+**Sort is supported**, so FIFO job queues work — which is most of why the
+operation exists. It materialises every match inside the transaction to do it.
+
+**`MAX_CANDIDATES` bounds the damage those two combine into.** Ten thousand,
+matching `find`'s `MAX_LIMIT` and the ~8 ms scan it was chosen from — as a
+**refusal**, not a truncation, because choosing from a prefix would return a
+document the sort did not pick and no caller could tell.
+
+**The crate boundary held.** `kimmy-query` is a dev-only dependency of
+`kimmy-storage` on purpose, so filtering, ordering and update operators could
+not move into the engine. They arrive as `ModifySpec` — pure functions over
+documents that the engine calls inside its transaction — which is the same shape
+as the guard `delete_guarded` took for TTL, one step further.
+
+---
+
 ## 🟢 Documents can expire (M9 task 2)
 
 **Three decisions were settled before any code**, and each is recorded where it

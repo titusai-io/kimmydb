@@ -9,6 +9,7 @@
 //! So every function here takes an [`Auth`] and checks it *first*. A caller
 //! cannot reach the engine without passing through one of these.
 
+use bson::Document;
 use kimmy_auth::Action;
 use kimmy_core::DocId;
 use kimmy_query::{aggregate, filter, plan, shape, update};
@@ -439,6 +440,184 @@ pub fn update(
     }
 
     Ok(json!({ "matched": modified, "modified": modified }))
+}
+
+// ---------------------------------------------------------------------------
+// find_and_modify
+// ---------------------------------------------------------------------------
+
+/// Which image the caller wants back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ReturnDocument {
+    #[default]
+    Before,
+    After,
+}
+
+/// A `find_and_modify` request, already parsed.
+#[derive(Default)]
+pub struct FindAndModifySpec {
+    pub filter: Option<Value>,
+    pub sort: Option<Value>,
+    /// Update operators, or a whole replacement document.
+    pub update: Option<Value>,
+    pub remove: bool,
+    pub upsert: bool,
+    pub return_document: ReturnDocument,
+    pub projection: Option<Value>,
+}
+
+/// The caller's half of [`kimmy_storage::ModifySpec`] — pure functions over
+/// documents, evaluated inside the engine's write transaction.
+struct Modify<'a> {
+    filter: &'a filter::Filter,
+    sort: &'a [shape::SortKey],
+    /// `None` means remove.
+    update: Option<&'a update::Update>,
+    upsert: Option<Document>,
+    now: i64,
+}
+
+impl kimmy_storage::ModifySpec for Modify<'_> {
+    fn matches(&self, doc: &Document) -> bool {
+        filter::matches(self.filter, doc)
+    }
+
+    fn compare(&self, a: &Document, b: &Document) -> std::cmp::Ordering {
+        shape::compare(self.sort, a, b)
+    }
+
+    fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
+        let Some(update) = self.update else {
+            return Ok(None);
+        };
+        let mut next = doc.clone();
+        update::apply(update, &mut next, self.now).map_err(|e| e.to_string())?;
+        Ok(Some(next))
+    }
+
+    fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+        self.upsert.clone().map(Ok)
+    }
+}
+
+/// Equality constraints a match necessarily satisfies, for seeding an upsert.
+///
+/// Only `$and`-reachable `$eq` on a plain path counts. An equality inside `$or`
+/// is **not** implied by a match, so seeding from it would invent a field the
+/// caller never asked for — the kind of quiet wrongness that is hard to notice
+/// in a document that otherwise looks right.
+fn implied_equalities(filter: &filter::Filter, out: &mut Document) {
+    match filter {
+        filter::Filter::And(branches) => {
+            for branch in branches {
+                implied_equalities(branch, out);
+            }
+        }
+        filter::Filter::Field { path, conditions } => {
+            for condition in conditions {
+                if let filter::Condition::Eq(value) = condition {
+                    // Dotted paths go through `path::set` so `{"a.b": 1}`
+                    // seeds a nested document rather than a literal key.
+                    let _ = kimmy_core::path::set(out, path, value.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+pub fn find_and_modify(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    spec: FindAndModifySpec,
+) -> Result<Value, ApiError> {
+    let meta = authorize(state, auth, Action::Write, db, coll)?;
+
+    // Mutually exclusive rather than silently preferring one: a request that
+    // asks to both change and remove a document has no defensible reading.
+    if spec.remove && spec.update.is_some() {
+        return Err(ApiError::bad_request(
+            "find_and_modify takes either `update` or `remove: true`, not both",
+        ));
+    }
+    if !spec.remove && spec.update.is_none() {
+        return Err(ApiError::bad_request("find_and_modify needs an `update`, or `remove: true`"));
+    }
+    if spec.remove && spec.upsert {
+        return Err(ApiError::bad_request("`remove` cannot be combined with `upsert`"));
+    }
+    if spec.remove && spec.return_document == ReturnDocument::After {
+        return Err(ApiError::bad_request(
+            "`remove` has no document after it; use returnDocument \"before\"",
+        ));
+    }
+
+    let filter = parse_filter(spec.filter.as_ref())?;
+    let sort = match &spec.sort {
+        Some(value) => shape::parse_sort(&json_to_document(value)?)?,
+        None => Vec::new(),
+    };
+    let projection = match &spec.projection {
+        Some(value) => shape::parse_projection(&json_to_document(value)?)?,
+        None => None,
+    };
+    let update = match &spec.update {
+        Some(value) => Some(update::parse(&json_to_document(value)?)?),
+        None => None,
+    };
+
+    let now = now_millis();
+
+    // The upsert image is built here rather than in the engine, because it
+    // needs the filter and the update operators — both query-language things.
+    let upsert_doc = if spec.upsert {
+        let mut seed = Document::new();
+        implied_equalities(&filter, &mut seed);
+        if let Some(update) = &update {
+            update::apply(update, &mut seed, now)?;
+        }
+        Some(seed)
+    } else {
+        None
+    };
+
+    // The planner runs out here; the engine re-validates a both-bounds plan
+    // inside the transaction that scans, which is stricter than the read path
+    // can be.
+    let candidates = match plan::choose(&filter, &meta.indexes) {
+        Some(p) => kimmy_storage::Candidates::Index {
+            index_id: p.index_id,
+            ranges: p.ranges.clone(),
+            both_bounds: p.both_bounds,
+        },
+        None => kimmy_storage::Candidates::Scan,
+    };
+
+    let modify =
+        Modify { filter: &filter, sort: &sort, update: update.as_ref(), upsert: upsert_doc, now };
+
+    let outcome = state.engine.find_and_modify(&meta, &candidates, &modify)?;
+
+    let returned = match spec.return_document {
+        ReturnDocument::Before => outcome.before.clone(),
+        ReturnDocument::After => outcome.after.clone(),
+    };
+    let document = match returned {
+        Some(doc) => document_to_json(&shape::project(projection.as_ref(), &doc)),
+        None => Value::Null,
+    };
+
+    let mut body = json!({
+        "document": document,
+        "matched": u64::from(outcome.matched),
+    });
+    if let Some(id) = outcome.upserted {
+        body["upsertedId"] = crate::json::bson_to_json(&id.to_bson());
+    }
+    Ok(body)
 }
 
 pub fn delete(

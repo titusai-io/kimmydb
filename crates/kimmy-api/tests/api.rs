@@ -1121,6 +1121,226 @@ async fn storing_vectors_needs_write_access() {
     assert_eq!(res.status, 403, "{:?}", res.body);
 }
 
+/// Seed a small job queue and return a token.
+async fn jobs(server: &Server) -> String {
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"jobs"})).await;
+    for (id, created, status) in
+        [(1, 30, "pending"), (2, 10, "pending"), (3, 20, "done"), (4, 20, "pending")]
+    {
+        server
+            .post(
+                "/v1/db/app/coll/jobs/docs",
+                Some(&token),
+                json!({"_id": id, "created": created, "status": status}),
+            )
+            .await;
+    }
+    token
+}
+
+#[tokio::test]
+async fn find_and_modify_claims_the_sorted_first_match() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/jobs/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"status": "pending"},
+                "sort": {"created": 1},
+                "update": {"$set": {"status": "claimed"}},
+            }),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    // Before-image by default, and the lowest `created` among pending.
+    assert_eq!(res.body["document"]["_id"], 2);
+    assert_eq!(res.body["document"]["status"], "pending");
+
+    // The write really landed.
+    let after = server.get("/v1/db/app/coll/jobs/docs/2", Some(&token)).await;
+    assert_eq!(after.body["status"], "claimed");
+}
+
+#[tokio::test]
+async fn return_document_after_gives_the_new_image() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/jobs/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"status": "pending"},
+                "sort": {"created": 1},
+                "update": {"$set": {"status": "claimed"}},
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["status"], "claimed");
+}
+
+#[tokio::test]
+async fn draining_the_queue_never_repeats_a_job() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+
+    let mut claimed = Vec::new();
+    for _ in 0..3 {
+        let res = server
+            .post(
+                "/v1/db/app/coll/jobs/find_and_modify",
+                Some(&token),
+                json!({
+                    "filter": {"status": "pending"},
+                    "sort": {"created": 1},
+                    "update": {"$set": {"status": "claimed"}},
+                }),
+            )
+            .await;
+        assert_eq!(res.body["matched"], 1, "{:?}", res.body);
+        claimed.push(res.body["document"]["_id"].as_i64().unwrap());
+    }
+    claimed.sort();
+    assert_eq!(claimed, vec![1, 2, 4]);
+
+    // Queue empty: matched 0 and a null document, not an error.
+    let res = server
+        .post(
+            "/v1/db/app/coll/jobs/find_and_modify",
+            Some(&token),
+            json!({"filter": {"status": "pending"}, "update": {"$set": {"status": "claimed"}}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 0);
+    assert!(res.body["document"].is_null());
+}
+
+#[tokio::test]
+async fn find_and_modify_can_remove_and_can_project() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/jobs/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"status": "pending"},
+                "sort": {"created": 1},
+                "remove": true,
+                "projection": {"_id": 1, "created": 1},
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["_id"], 2);
+    assert!(res.body["document"].get("status").is_none(), "projection applied");
+
+    let gone = server.get("/v1/db/app/coll/jobs/docs/2", Some(&token)).await;
+    assert_eq!(gone.status, 404);
+}
+
+#[tokio::test]
+async fn upsert_seeds_the_filters_equalities() {
+    // The Mongo behaviour people rely on: the created document carries the
+    // fields the filter pinned, not just the update's.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"counters"})).await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": "hits", "scope": "global"},
+                "update": {"$inc": {"n": 1}},
+                "upsert": true,
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["document"]["_id"], "hits");
+    assert_eq!(res.body["document"]["scope"], "global");
+    assert_eq!(res.body["document"]["n"], 1);
+    assert_eq!(res.body["matched"], 0, "an upsert did not match, it created");
+
+    // A second call now matches and increments rather than creating again.
+    let res = server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": "hits", "scope": "global"},
+                "update": {"$inc": {"n": 1}},
+                "upsert": true,
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["document"]["n"], 2);
+}
+
+#[tokio::test]
+async fn contradictory_find_and_modify_requests_are_refused() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+
+    for body in [
+        // Both an update and a removal.
+        json!({"filter": {}, "update": {"$set": {"a": 1}}, "remove": true}),
+        // Neither.
+        json!({"filter": {}}),
+        // A removal has no "after".
+        json!({"filter": {}, "remove": true, "returnDocument": "after"}),
+        // Nothing to upsert into on a removal.
+        json!({"filter": {}, "remove": true, "upsert": true}),
+        // An unknown returnDocument, rather than silently defaulting.
+        json!({"filter": {}, "update": {"$set": {"a": 1}}, "returnDocument": "sideways"}),
+    ] {
+        let res = server.post("/v1/db/app/coll/jobs/find_and_modify", Some(&token), body).await;
+        assert_eq!(res.status, 400, "{:?}", res.body);
+    }
+}
+
+#[tokio::test]
+async fn find_and_modify_needs_write_permission() {
+    let server = Server::start().await;
+    let token = jobs(&server).await;
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({
+                "user": "reader", "password": "reader-password",
+                "grants": [{"db":"app","collection":"*","actions":["read"]}]
+            }),
+        )
+        .await;
+    let reader = server.login("reader", "reader-password").await;
+
+    let res = server
+        .post(
+            "/v1/db/app/coll/jobs/find_and_modify",
+            Some(&reader),
+            json!({"filter": {}, "update": {"$set": {"status": "claimed"}}}),
+        )
+        .await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+}
+
 #[tokio::test]
 async fn a_ttl_index_round_trips_through_the_api() {
     let server = Server::start().await;
