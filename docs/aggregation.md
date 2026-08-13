@@ -20,7 +20,9 @@ costs: **put `$match` first**, so every later stage sees less.
 | Stage | Notes |
 |---|---|
 | `$match` | The same filter language as `find` — all 17 operators |
-| `$project` | The same projection language as `find` |
+| `$project` | The same projection language as `find`, **plus computed fields** |
+| `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
+| `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$sort` | The same sort language. Blocking |
 | `$skip`, `$limit` | Non-negative whole numbers |
 | `$unwind` | One output document per array element |
@@ -43,6 +45,71 @@ costs: **put `$match` first**, so every later stage sees less.
 ```
 
 `{"_id": null}` groups everything into one bucket.
+
+---
+
+## Expressions
+
+Anywhere a value is computed — a `$project` field, `$addFields`, `$replaceRoot`,
+a `$group` key, an accumulator's argument — takes an **expression**, not just a
+field path.
+
+| Group | Operators |
+|---|---|
+| Arithmetic | `$add` `$subtract` `$multiply` `$divide` `$mod` |
+| Strings | `$concat` `$toUpper` `$toLower` `$substr` (`$substrCP`) `$split` `$strLenCP` |
+| Conditional | `$cond` `$ifNull` `$switch` |
+| Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
+| Boolean | `$and` `$or` `$not` |
+| Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
+| Escape | `$literal` |
+
+```json
+[ { "$addFields": {
+      "value": { "$multiply": ["$qty", "$price"] },
+      "label": { "$toUpper": "$city" },
+      "band":  { "$cond": [ { "$gte": ["$qty", 10] }, "bulk", "single" ] },
+      "month": { "$dateToString": { "date": "$placed", "format": "%Y-%m" } } } },
+  { "$group": { "_id": "$month", "revenue": { "$sum": "$value" } } } ]
+```
+
+### How a value is read
+
+- `"$field"` is a **field path**; a bare string is a literal.
+- A document whose **first key starts with `$`** is an **operator**, and it may
+  not carry any other key.
+- **Any other document is computed** — its values are expressions. This is what
+  makes a compound `$group` key work.
+- `{$literal: x}` yields `x` untouched, which is how you produce the *string*
+  `"$total"` or a document with a `$`-prefixed key.
+
+### Behaviours worth knowing
+
+**`$cond` and `$ifNull` do not evaluate the branch they do not take.** A guard
+like `{$cond: [{$gt: ["$n", 0]}, {$divide: [100, "$n"]}, null]}` works, rather
+than failing on exactly the inputs it exists to protect.
+
+**Null propagates; a type violation refuses.** `{$add: ["$typo", 1]}` is null
+because a missing field is null. `{$add: ["text", 1]}` is a 400. Returning null
+for both would make a typo and a type error indistinguishable in the output.
+
+**Integer arithmetic is exact.** `$add`, `$subtract` and `$multiply` compute in
+64-bit integers whenever every operand is integral, promoting to a double only
+on overflow or when a double is involved. `$divide` is always a double — an
+integer result would make `{$divide: [1, 2]}` zero.
+
+**Date arithmetic works.** `$add` shifts a date by milliseconds, `$subtract`
+between two dates gives the interval in milliseconds, and `$subtract` of a
+number from a date shifts it back.
+
+**Strings are counted in code points, not bytes.** `$substr` is `$substrCP`;
+there is no byte-oriented variant, because it can split a character and produce
+invalid UTF-8.
+
+**`$dateToString` supports `%Y %m %d %H %M %S %L %%`, all UTC.** An unknown
+specifier is an error rather than being copied through — a literal `%q` in every
+row of a report is the kind of wrong output nobody notices. BSON dates carry no
+zone, so there is nothing for `%z` to convert to.
 
 ---
 
@@ -125,7 +192,9 @@ documents holding large arrays can exceed the cap long before the stage ends.
 
 | | Why |
 |---|---|
-| Computed expressions (`$add`, `$concat`, `$cond`, …) | An expression language wants its own design pass. Accumulator arguments are a field path or a literal |
+| Array and set operators (`$size`, `$arrayElemAt`, `$slice`, `$filter`, `$map`, `$reduce`) | Deliberately out of the first expression pass. `$map`/`$filter`/`$reduce` also need `$$this`-style variable binding, which is an evaluation *scope* rather than another operator |
+| Variable expressions — `$$ROOT`, `$$this`, `$let` | Same reason. Refused explicitly rather than read as a field named `$ROOT`, which would silently yield null |
+| Type conversion (`$convert`, `$toInt`, `$toString`, `$toDate`) | Not built |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
 | Index-aware `$match` | A pipeline reads the collection; the planner is not consulted. A selective `$match` still helps, by shrinking what later stages see |

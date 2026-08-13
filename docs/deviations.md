@@ -584,6 +584,42 @@ than trusting the draft is what found the real universal trigger.
 
 ---
 
+## 🟢 The pipeline can derive (was the largest gap against MongoDB)
+
+**M9 task 1.** Expressions were a field path or a literal, so a pipeline could
+filter, group and join but could not *compute*. `kimmy-query/src/expr.rs` is now
+a recursive tree over the agreed operator list — arithmetic, strings,
+conditionals, comparison, boolean and date parts — plugged into `$project`,
+`$group` keys, accumulator arguments and the new `$addFields`/`$set` and
+`$replaceRoot` stages.
+
+**Three things came out of building it that were not in the plan.**
+
+**A latent `$sum` bug, found by reading the code the decision touched.**
+`finish()` carried an `all_int` flag and a comment citing ADR-002 about not
+losing precision above 2^53 — while accumulating in `f64` and casting back, which
+loses precision above 2^53. A sum of `2^53 + 1` and `1` returned
+`9007199254740992`. Fixed by accumulating in `i64` and widening only on a double
+operand or an overflow; both the unit test and a pipeline-level test pin it.
+**The comment was right and the code was wrong, and nothing failed when they
+disagreed** — the same shape as the "no C toolchain" claim (ADR-016).
+
+**A deliberate behaviour change.** A document-valued expression now *computes*
+its values, so `{$group: {_id: {c: "$city"}}}` groups by city. Previously that
+was a constant document and **every input landed in one bucket** — a wrong answer
+rather than a refusal. `$literal` is the escape hatch and exists because the rule
+requires one: without it there is no way to produce the string `"$city"`.
+
+**`$literal` was not on the agreed list** and was added anyway, because the list
+is incomplete without it. Noted rather than slipped in.
+
+**Deliberately excluded**, and recorded in the table below: arrays and sets,
+variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`), and type
+conversion. `$$`-prefixed strings are **refused** rather than parsed as a field
+named `$ROOT`, which would silently evaluate to null.
+
+---
+
 ## 🟢 The client story — settled on 2026-08-12 by ADR-055
 
 **Raised and postponed on 2026-08-11, decided on 2026-08-12.** The protocol is
@@ -637,7 +673,7 @@ here so that the absence of a decision is visible as a decision.
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
-| Computed expressions in the pipeline | `$add`, `$concat`, `$cond` and friends. Accumulator arguments are a field path or a literal | **M9 task 1** |
+| Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`) and type conversion | Deliberately outside M9 task 1's agreed operator list. Variable binding needs an evaluation *scope*, not another operator | not scheduled |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is found by a scan and committed on its own | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |

@@ -9,7 +9,7 @@ use std::cmp::Ordering;
 use crate::path;
 
 /// The `_id` field, which projection treats specially.
-const ID_FIELD: &str = "_id";
+pub(crate) const ID_FIELD: &str = "_id";
 
 // ---------------------------------------------------------------------------
 // Sort

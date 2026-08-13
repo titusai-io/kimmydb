@@ -1122,6 +1122,110 @@ async fn storing_vectors_needs_write_access() {
 }
 
 #[tokio::test]
+async fn computed_expressions_derive_fields_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for (id, city, qty, price) in [(1, "london", 5, 2.5), (2, "london", 15, 1.0)] {
+        server
+            .post(
+                "/v1/db/shop/coll/orders/docs",
+                Some(&token),
+                json!({"_id": id, "city": city, "qty": qty, "price": price}),
+            )
+            .await;
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$addFields": {
+                    "value": {"$multiply": ["$qty", "$price"]},
+                    "label": {"$toUpper": "$city"},
+                    "band": {"$cond": [{"$gte": ["$qty", 10]}, "bulk", "single"]},
+                }},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs[0]["value"], 12.5);
+    assert_eq!(docs[0]["label"], "LONDON");
+    assert_eq!(docs[0]["band"], "single");
+    assert_eq!(docs[1]["band"], "bulk");
+}
+
+#[tokio::test]
+async fn a_computed_date_survives_the_extended_json_boundary() {
+    // Dates are the type JSON cannot express, so a date expression is where a
+    // working evaluator and a working edge are hardest to tell apart.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"events"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/events/docs",
+            Some(&token),
+            // 2026-08-12T13:45:07.250Z
+            json!({"_id": 1, "at": {"$date": {"$numberLong": "1786542307250"}}}),
+        )
+        .await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/events/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$project": {
+                    "_id": 0,
+                    "y": {"$year": "$at"},
+                    "stamp": {"$dateToString": {"date": "$at", "format": "%Y-%m-%d"}},
+                    "later": {"$add": ["$at", 86400000i64]},
+                }}
+            ]}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let d = &res.body["documents"][0];
+    assert_eq!(d["y"], 2026);
+    assert_eq!(d["stamp"], "2026-08-12");
+    // A date in, a date out — still wrapped as a date, not a bare number.
+    assert_eq!(d["later"]["$date"], 1_786_628_707_250i64);
+}
+
+#[tokio::test]
+async fn a_bad_expression_is_a_400_naming_the_problem() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "qty": 5})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$addFields": {"n": {"$nope": ["$qty", 1]}}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+
+    // A type violation refuses rather than quietly producing null.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$addFields": {"n": {"$divide": ["$qty", 0]}}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn an_aggregation_pipeline_groups_and_counts() {
     let server = Server::start().await;
     let token = server.root().await;

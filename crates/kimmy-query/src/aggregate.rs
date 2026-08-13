@@ -29,21 +29,22 @@
 //! no caller could detect — a `$group` over 90% of the input looks exactly like
 //! a `$group` over all of it.
 //!
-//! # Expressions are deliberately shallow
+//! # Expressions live next door
 //!
-//! An accumulator argument is a field path (`"$qty"`) or a literal. There is no
-//! `$add`, `$concat` or nested expression tree. Those are a language, and a
-//! language wants its own design pass; the stages below cover the reporting
-//! shapes people actually reach for, and the boundary is documented rather than
-//! discovered.
+//! An accumulator argument, a `$group` key and a computed field are all
+//! [`crate::expr::Expr`], which is a full tree — arithmetic, strings,
+//! conditionals, comparison, boolean and date parts. That module owns the
+//! operator set and its evaluation; this one owns stages and the flow of
+//! documents between them.
 
 use std::collections::HashSet;
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
+use crate::expr::{Expr, Total, type_name};
 use crate::filter::{self, Filter};
-use crate::shape::{self, Projection, SortKey};
+use crate::shape::{self, ID_FIELD, Projection, SortKey};
 
 /// How many documents a single stage may hold or emit.
 ///
@@ -67,41 +68,6 @@ impl Default for Limits {
     }
 }
 
-/// An accumulator's argument: a field reference or a constant.
-#[derive(Clone, Debug, PartialEq)]
-pub enum Expr {
-    /// `"$qty"` — the value at a dot path in the incoming document.
-    Field(String),
-    /// Any other BSON value, used as-is.
-    Literal(Bson),
-}
-
-impl Expr {
-    /// Parse the `"$field"` convention.
-    ///
-    /// A bare string that does not start with `$` is a literal string, which is
-    /// what MongoDB does and what callers expect — `{$sum: "total"}` sums the
-    /// constant `"total"`, not the field.
-    pub fn parse(value: &Bson) -> Self {
-        match value {
-            Bson::String(s) => match s.strip_prefix('$') {
-                Some(field) if !field.is_empty() => Expr::Field(field.to_string()),
-                _ => Expr::Literal(value.clone()),
-            },
-            other => Expr::Literal(other.clone()),
-        }
-    }
-
-    /// Resolve against a document. A missing field is `Null`, matching how the
-    /// filter layer treats absence.
-    pub fn eval(&self, doc: &Document) -> Bson {
-        match self {
-            Expr::Field(p) => value_at(doc, p).cloned().unwrap_or(Bson::Null),
-            Expr::Literal(v) => v.clone(),
-        }
-    }
-}
-
 /// What a `$group` computes per bucket.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Accumulator {
@@ -119,7 +85,16 @@ pub enum Accumulator {
 #[derive(Clone, Debug)]
 pub enum Stage {
     Match(Box<Filter>),
-    Project(Option<Projection>),
+    /// Reshape. `computed` is applied **after** `projection`, so a computed
+    /// field may overwrite a projected one and never sees its own output.
+    Project {
+        projection: Option<Projection>,
+        computed: Vec<(String, Expr)>,
+    },
+    /// `$addFields` and its alias `$set` — every input field kept, these added.
+    AddFields(Vec<(String, Expr)>),
+    /// `$replaceRoot` — the computed document *becomes* the document.
+    ReplaceRoot(Expr),
     Sort(Vec<SortKey>),
     Limit(usize),
     Skip(usize),
@@ -152,7 +127,9 @@ impl Stage {
     pub fn name(&self) -> &'static str {
         match self {
             Stage::Match(_) => "$match",
-            Stage::Project(_) => "$project",
+            Stage::Project { .. } => "$project",
+            Stage::AddFields(_) => "$addFields",
+            Stage::ReplaceRoot(_) => "$replaceRoot",
             Stage::Sort(_) => "$sort",
             Stage::Limit(_) => "$limit",
             Stage::Skip(_) => "$skip",
@@ -180,7 +157,11 @@ fn parse_stage(stage: &Document) -> Result<Stage> {
 
     match name.as_str() {
         "$match" => Ok(Stage::Match(Box::new(filter::parse(as_document(name, value)?)?))),
-        "$project" => Ok(Stage::Project(shape::parse_projection(as_document(name, value)?)?)),
+        "$project" => parse_project(as_document(name, value)?),
+        "$addFields" | "$set" => {
+            Ok(Stage::AddFields(parse_computed(name, as_document(name, value)?)?))
+        }
+        "$replaceRoot" => parse_replace_root(as_document(name, value)?),
         "$sort" => Ok(Stage::Sort(shape::parse_sort(as_document(name, value)?)?)),
         "$limit" => Ok(Stage::Limit(as_count(name, value)?)),
         "$skip" => Ok(Stage::Skip(as_count(name, value)?)),
@@ -198,10 +179,79 @@ fn parse_stage(stage: &Document) -> Result<Stage> {
         // format composes with a sentence. Both are a 400; this is about the
         // message a caller actually reads.
         other => Err(Error::InvalidQuery(format!(
-            "{other} is not a pipeline stage; supported: $match, $project, $sort, $limit, \
-             $skip, $unwind, $group, $count, $lookup"
+            "{other} is not a pipeline stage; supported: $match, $project, $addFields, $set, \
+             $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup"
         ))),
     }
+}
+
+/// `{field: <expression>, ...}` — every value is an expression.
+fn parse_computed(stage: &str, doc: &Document) -> Result<Vec<(String, Expr)>> {
+    if doc.is_empty() {
+        return Err(Error::InvalidQuery(format!("{stage} needs at least one field")));
+    }
+    doc.iter().map(|(name, value)| Ok((name.clone(), Expr::parse(value)?))).collect()
+}
+
+/// `$project` is two things at once: the include/exclude flags it always was,
+/// and computed fields.
+///
+/// **A number or boolean stays a flag**, as it has always been here, and
+/// anything else is an expression. `{$literal: 5}` is how a caller asks for a
+/// constant number, which is the reason that operator exists.
+///
+/// Computed fields force inclusion mode. Excluding some fields while computing
+/// others is refused for the same reason mixing inclusion and exclusion is —
+/// the result would be ambiguous about every field nobody named.
+fn parse_project(doc: &Document) -> Result<Stage> {
+    let mut computed = Vec::new();
+    let mut include = Vec::new();
+    let mut excluded_id = false;
+    let mut excluded_other = false;
+
+    for (key, value) in doc {
+        match value {
+            Bson::Int32(0) | Bson::Int64(0) | Bson::Double(0.0) | Bson::Boolean(false) => {
+                if key == ID_FIELD {
+                    excluded_id = true;
+                } else {
+                    excluded_other = true;
+                }
+            }
+            Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => {
+                include.push(key.clone());
+            }
+            other => computed.push((key.clone(), Expr::parse(other)?)),
+        }
+    }
+
+    // With no computed fields this is exactly the projection it always was,
+    // so defer to the one parser rather than growing a second dialect.
+    if computed.is_empty() {
+        return Ok(Stage::Project { projection: shape::parse_projection(doc)?, computed });
+    }
+
+    if excluded_other {
+        return Err(Error::InvalidQuery(
+            "$project cannot exclude fields and compute others in one stage \
+             (excluding _id is the exception)"
+                .into(),
+        ));
+    }
+    if !excluded_id && !include.iter().any(|p| p == ID_FIELD) {
+        include.push(ID_FIELD.to_string());
+    }
+
+    Ok(Stage::Project { projection: Some(Projection::Include(include)), computed })
+}
+
+fn parse_replace_root(spec: &Document) -> Result<Stage> {
+    let Some(new_root) = spec.get("newRoot") else {
+        return Err(Error::InvalidQuery(
+            "$replaceRoot needs a `newRoot`, e.g. {newRoot: \"$address\"}".into(),
+        ));
+    };
+    Ok(Stage::ReplaceRoot(Expr::parse(new_root)?))
 }
 
 fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
@@ -235,9 +285,9 @@ fn parse_unwind(value: &Bson) -> Result<Stage> {
     // accepted, because the shorthand is what people write and the document
     // form is the only way to ask for the empty-array behaviour.
     match value {
-        Bson::String(_) => match Expr::parse(value) {
+        Bson::String(_) => match Expr::parse(value)? {
             Expr::Field(p) => Ok(Stage::Unwind { path: p, preserve_null_and_empty: false }),
-            Expr::Literal(_) => Err(Error::InvalidQuery(
+            _ => Err(Error::InvalidQuery(
                 "$unwind takes a field path beginning with $, e.g. {$unwind: \"$tags\"}".into(),
             )),
         },
@@ -245,7 +295,7 @@ fn parse_unwind(value: &Bson) -> Result<Stage> {
             let field = d.get("path").ok_or_else(|| {
                 Error::InvalidQuery("$unwind needs a `path`, e.g. {path: \"$tags\"}".into())
             })?;
-            let Expr::Field(p) = Expr::parse(field) else {
+            let Expr::Field(p) = Expr::parse(field)? else {
                 return Err(Error::InvalidQuery(
                     "$unwind `path` must begin with $, e.g. \"$tags\"".into(),
                 ));
@@ -269,7 +319,7 @@ fn parse_group(spec: &Document) -> Result<Stage> {
                 .into(),
         )
     })?;
-    let id = Expr::parse(id);
+    let id = Expr::parse(id)?;
 
     let mut fields = Vec::new();
     for (name, value) in spec {
@@ -287,7 +337,7 @@ fn parse_group(spec: &Document) -> Result<Stage> {
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
-        let expr = Expr::parse(arg);
+        let expr = Expr::parse(arg)?;
         let accumulator = match op.as_str() {
             "$sum" => Accumulator::Sum(expr),
             "$avg" => Accumulator::Avg(expr),
@@ -347,19 +397,6 @@ fn group_key(value: &Bson) -> Vec<u8> {
     kimmy_core::keyenc::encode(value).unwrap_or_else(|_| format!("raw:{value:?}").into_bytes())
 }
 
-fn type_name(value: &Bson) -> &'static str {
-    match value {
-        Bson::Double(_) => "a double",
-        Bson::String(_) => "a string",
-        Bson::Array(_) => "an array",
-        Bson::Document(_) => "a document",
-        Bson::Boolean(_) => "a boolean",
-        Bson::Null => "null",
-        Bson::Int32(_) | Bson::Int64(_) => "an integer",
-        _ => "that type",
-    }
-}
-
 /// Run one stage.
 ///
 /// Every stage checks its **output** against the cap, so a stage that grows its
@@ -367,7 +404,46 @@ fn type_name(value: &Bson) -> &'static str {
 pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec<Document>> {
     let out = match stage {
         Stage::Match(f) => input.into_iter().filter(|d| filter::matches(f, d)).collect(),
-        Stage::Project(p) => input.iter().map(|d| shape::project(p.as_ref(), d)).collect(),
+        Stage::Project { projection, computed } => {
+            let mut out = Vec::with_capacity(input.len());
+            for doc in &input {
+                let mut projected = shape::project(projection.as_ref(), doc);
+                // Computed fields read the *input*, not the projection's
+                // output — otherwise `{$project: {a: 0, b: "$a"}}` would
+                // depend on key order, which BSON preserves and nobody
+                // reasons about.
+                set_computed(&mut projected, computed, doc)?;
+                out.push(projected);
+            }
+            out
+        }
+        Stage::AddFields(computed) => {
+            let mut out = Vec::with_capacity(input.len());
+            for doc in &input {
+                let mut with = doc.clone();
+                set_computed(&mut with, computed, doc)?;
+                out.push(with);
+            }
+            out
+        }
+        Stage::ReplaceRoot(expr) => {
+            let mut out = Vec::with_capacity(input.len());
+            for doc in &input {
+                match expr.eval(doc)? {
+                    Bson::Document(new_root) => out.push(new_root),
+                    // Refused rather than wrapped: a root that is not a
+                    // document would have to be given a field name this stage
+                    // has no business inventing.
+                    other => {
+                        return Err(Error::InvalidQuery(format!(
+                            "$replaceRoot needs a document, found {}",
+                            type_name(&other)
+                        )));
+                    }
+                }
+            }
+            out
+        }
         Stage::Sort(keys) => {
             let mut docs = input;
             shape::sort(keys, &mut docs);
@@ -395,6 +471,25 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
     };
     check_limit(stage.name(), out.len(), limits)?;
     Ok(out)
+}
+
+/// Write computed fields into `target`, evaluating each against `source`.
+///
+/// A dotted name writes into a nested document, matching `$set`'s behaviour on
+/// paths. A path that cannot be written — into an array without an index —
+/// is an error rather than a silent no-op, because a field the caller asked
+/// for and did not get is exactly the failure this codebase keeps meeting.
+fn set_computed(
+    target: &mut Document,
+    computed: &[(String, Expr)],
+    source: &Document,
+) -> Result<()> {
+    for (name, expr) in computed {
+        let value = expr.eval(source)?;
+        path::set(target, name, value)
+            .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
+    }
+    Ok(())
 }
 
 /// Refuse rather than truncate.
@@ -455,7 +550,10 @@ struct Bucket {
 }
 
 enum AccState {
-    Sum(f64, bool),
+    /// Exact while every input is integral — see [`Total`]. The previous
+    /// `(f64, bool)` accumulated in a double and cast back, so a total above
+    /// 2^53 was silently wrong despite the flag saying it was an integer.
+    Sum(Total),
     Avg(f64, usize),
     MinMax(Option<Bson>),
     FirstLast(Option<Bson>),
@@ -476,7 +574,7 @@ fn group(
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
 
     for doc in &input {
-        let key = id.eval(doc);
+        let key = id.eval(doc)?;
         let encoded = group_key(&key);
         let slot = match index.get(&encoded) {
             Some(&slot) => slot,
@@ -491,7 +589,7 @@ fn group(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
-            accumulate(state, acc, doc);
+            accumulate(state, acc, doc)?;
         }
     }
 
@@ -510,7 +608,7 @@ fn group(
 
 fn init((_, acc): &(String, Accumulator)) -> AccState {
     match acc {
-        Accumulator::Sum(_) => AccState::Sum(0.0, true),
+        Accumulator::Sum(_) => AccState::Sum(Total::default()),
         Accumulator::Avg(_) => AccState::Avg(0.0, 0),
         Accumulator::Min(_) | Accumulator::Max(_) => AccState::MinMax(None),
         Accumulator::First(_) | Accumulator::Last(_) => AccState::FirstLast(None),
@@ -519,25 +617,19 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
     }
 }
 
-fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) {
+fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) -> Result<()> {
     match (state, acc) {
-        (AccState::Sum(total, all_int), Accumulator::Sum(e)) => {
-            let v = e.eval(doc);
-            if !matches!(v, Bson::Int32(_) | Bson::Int64(_)) {
-                *all_int = false;
-            }
-            *total += numeric(&v).unwrap_or(0.0);
-        }
+        (AccState::Sum(total), Accumulator::Sum(e)) => total.add(&e.eval(doc)?),
         (AccState::Avg(total, n), Accumulator::Avg(e)) => {
             // Non-numeric values are skipped rather than counted as zero, or a
             // field that is missing on half the documents would halve the mean.
-            if let Some(x) = numeric(&e.eval(doc)) {
+            if let Some(x) = numeric(&e.eval(doc)?) {
                 *total += x;
                 *n += 1;
             }
         }
         (AccState::MinMax(current), Accumulator::Min(e)) => {
-            let v = e.eval(doc);
+            let v = e.eval(doc)?;
             if !matches!(v, Bson::Null)
                 && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_lt())
             {
@@ -545,7 +637,7 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) {
             }
         }
         (AccState::MinMax(current), Accumulator::Max(e)) => {
-            let v = e.eval(doc);
+            let v = e.eval(doc)?;
             if !matches!(v, Bson::Null)
                 && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_gt())
             {
@@ -554,15 +646,15 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) {
         }
         (AccState::FirstLast(current), Accumulator::First(e)) => {
             if current.is_none() {
-                *current = Some(e.eval(doc));
+                *current = Some(e.eval(doc)?);
             }
         }
         (AccState::FirstLast(current), Accumulator::Last(e)) => {
-            *current = Some(e.eval(doc));
+            *current = Some(e.eval(doc)?);
         }
-        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval(doc)),
+        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval(doc)?),
         (AccState::AddToSet(items), Accumulator::AddToSet(e)) => {
-            let v = e.eval(doc);
+            let v = e.eval(doc)?;
             // Linear scan rather than a hash set: `Bson` is not `Hash`, and a
             // set is small in every case that is not already refused by the cap.
             if !items.iter().any(|existing| existing == &v) {
@@ -572,17 +664,15 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) {
         // Unreachable: `init` pairs each accumulator with its own state.
         _ => {}
     }
+    Ok(())
 }
 
 fn finish(state: AccState) -> Bson {
     match state {
-        // An integer sum stays an integer. Widening every total to a double
-        // would lose precision above 2^53 and break `$type` on the result,
-        // which is the same reasoning as ADR-002.
-        AccState::Sum(total, all_int) if all_int && total.fract() == 0.0 => {
-            Bson::Int64(total as i64)
-        }
-        AccState::Sum(total, _) => Bson::Double(total),
+        // An integer sum stays an integer, exactly rather than approximately:
+        // `Total` accumulates in i64 and only widens when an operand is a
+        // double or the addition overflows. Same reasoning as ADR-002.
+        AccState::Sum(total) => total.to_bson(),
         AccState::Avg(_, 0) => Bson::Null,
         AccState::Avg(total, n) => Bson::Double(total / n as f64),
         AccState::MinMax(v) | AccState::FirstLast(v) => v.unwrap_or(Bson::Null),
@@ -804,7 +894,203 @@ mod tests {
 
     #[test]
     fn a_bare_string_is_a_literal_not_a_field() {
-        assert_eq!(Expr::parse(&Bson::String("total".into())), Expr::Literal("total".into()));
-        assert_eq!(Expr::parse(&Bson::String("$total".into())), Expr::Field("total".into()));
+        assert_eq!(
+            Expr::parse(&Bson::String("total".into())).unwrap(),
+            Expr::Literal("total".into())
+        );
+        assert_eq!(
+            Expr::parse(&Bson::String("$total".into())).unwrap(),
+            Expr::Field("total".into())
+        );
+    }
+
+    // -- computed expressions in stages -----------------------------------
+
+    #[test]
+    fn add_fields_keeps_everything_and_adds() {
+        let out = run(
+            vec![doc! {"$addFields": {"double": {"$multiply": ["$qty", 2]}}}],
+            vec![doc! {"_id": 1, "city": "London", "qty": 5}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": 1, "city": "London", "qty": 5, "double": 10i64}]);
+    }
+
+    #[test]
+    fn set_is_an_alias_for_add_fields() {
+        let by_set = run(vec![doc! {"$set": {"n": {"$add": ["$qty", 1]}}}], sample()).unwrap();
+        let by_add =
+            run(vec![doc! {"$addFields": {"n": {"$add": ["$qty", 1]}}}], sample()).unwrap();
+        assert_eq!(by_set, by_add);
+    }
+
+    #[test]
+    fn add_fields_can_overwrite_an_existing_field() {
+        let out = run(
+            vec![doc! {"$addFields": {"qty": {"$multiply": ["$qty", 10]}}}],
+            vec![doc! {"_id": 1, "qty": 5}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": 1, "qty": 50i64}]);
+    }
+
+    #[test]
+    fn add_fields_writes_a_dotted_path_into_a_subdocument() {
+        let out = run(
+            vec![doc! {"$addFields": {"totals.doubled": {"$multiply": ["$qty", 2]}}}],
+            vec![doc! {"_id": 1, "qty": 5}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": 1, "qty": 5, "totals": {"doubled": 10i64}}]);
+    }
+
+    #[test]
+    fn project_computes_alongside_inclusions() {
+        let out = run(
+            vec![doc! {"$project": {"city": 1, "double": {"$multiply": ["$qty", 2]}}}],
+            vec![doc! {"_id": 1, "city": "London", "qty": 5}],
+        )
+        .unwrap();
+        // `_id` rides along by default, exactly as an ordinary projection.
+        assert_eq!(out, vec![doc! {"city": "London", "_id": 1, "double": 10i64}]);
+    }
+
+    #[test]
+    fn project_can_drop_id_while_computing() {
+        let out = run(
+            vec![doc! {"$project": {"_id": 0, "double": {"$multiply": ["$qty", 2]}}}],
+            vec![doc! {"_id": 1, "qty": 5}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"double": 10i64}]);
+    }
+
+    #[test]
+    fn project_refuses_to_exclude_and_compute_at_once() {
+        // Ambiguous about every field nobody named, exactly as mixing
+        // inclusion and exclusion is.
+        assert!(
+            parse(&[doc! {"$project": {"city": 0, "double": {"$multiply": ["$qty", 2]}}}]).is_err()
+        );
+    }
+
+    #[test]
+    fn a_project_without_expressions_behaves_exactly_as_before() {
+        let out = run(vec![doc! {"$project": {"city": 1}}], sample()).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                doc! {"city": "London", "_id": 1},
+                doc! {"city": "London", "_id": 2},
+                doc! {"city": "Paris", "_id": 3},
+            ]
+        );
+    }
+
+    #[test]
+    fn project_computed_fields_read_the_input_not_the_projection() {
+        // `qty` is not projected, so reading it from the output would give
+        // null and make the result depend on key order.
+        let out = run(
+            vec![doc! {"$project": {"city": 1, "double": {"$multiply": ["$qty", 2]}}}],
+            vec![doc! {"_id": 1, "city": "London", "qty": 5}],
+        )
+        .unwrap();
+        assert_eq!(out[0].get("double"), Some(&Bson::Int64(10)));
+    }
+
+    #[test]
+    fn replace_root_promotes_a_subdocument() {
+        let out = run(
+            vec![doc! {"$replaceRoot": {"newRoot": "$address"}}],
+            vec![doc! {"_id": 1, "address": {"city": "London", "zip": "E1"}}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"city": "London", "zip": "E1"}]);
+    }
+
+    #[test]
+    fn replace_root_builds_a_new_document_from_an_expression() {
+        let out = run(
+            vec![doc! {"$replaceRoot": {"newRoot": {"name": {"$toUpper": "$city"}}}}],
+            vec![doc! {"_id": 1, "city": "london"}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"name": "LONDON"}]);
+    }
+
+    #[test]
+    fn replace_root_refuses_a_non_document() {
+        // Wrapping it would mean inventing a field name.
+        let err =
+            run(vec![doc! {"$replaceRoot": {"newRoot": "$qty"}}], vec![doc! {"_id": 1, "qty": 5}]);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn replace_root_needs_a_new_root() {
+        assert!(parse(&[doc! {"$replaceRoot": {}}]).is_err());
+    }
+
+    #[test]
+    fn group_takes_an_expression_as_its_key() {
+        let out =
+            run(vec![doc! {"$group": {"_id": {"$toUpper": "$city"}, "n": {"$sum": 1}}}], sample())
+                .unwrap();
+        assert_eq!(out, vec![doc! {"_id": "LONDON", "n": 2i64}, doc! {"_id": "PARIS", "n": 1i64}]);
+    }
+
+    #[test]
+    fn group_takes_an_expression_as_an_accumulator_argument() {
+        // The limit this milestone removes: an accumulator argument used to be
+        // a field path or a literal and nothing else.
+        let out = run(
+            vec![
+                doc! {"$group": {"_id": Bson::Null, "total": {"$sum": {"$multiply": ["$qty", 2]}}}},
+            ],
+            sample(),
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": Bson::Null, "total": 60i64}]);
+    }
+
+    #[test]
+    fn a_compound_group_key_now_computes_instead_of_being_one_bucket() {
+        // Behaviour change, deliberately: `{_id: {c: "$city"}}` used to be a
+        // constant document, so every input landed in a single bucket.
+        let out = run(vec![doc! {"$group": {"_id": {"c": "$city"}, "n": {"$sum": 1}}}], sample())
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![doc! {"_id": {"c": "London"}, "n": 2i64}, doc! {"_id": {"c": "Paris"}, "n": 1i64},]
+        );
+    }
+
+    #[test]
+    fn sum_of_large_integers_is_exact_through_the_pipeline() {
+        // The precision fix, end to end rather than only on `Total`.
+        let big = 9_007_199_254_740_993i64; // 2^53 + 1
+        let out = run(
+            vec![doc! {"$group": {"_id": Bson::Null, "total": {"$sum": "$n"}}}],
+            vec![doc! {"n": big}, doc! {"n": 1i64}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": Bson::Null, "total": big + 1}]);
+    }
+
+    #[test]
+    fn an_expression_error_fails_the_stage_rather_than_yielding_null() {
+        let err = run(
+            vec![doc! {"$addFields": {"bad": {"$divide": ["$qty", 0]}}}],
+            vec![doc! {"_id": 1, "qty": 5}],
+        );
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn the_unsupported_stage_message_lists_the_new_stages() {
+        let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
+        assert!(err.contains("$addFields"), "got: {err}");
+        assert!(err.contains("$replaceRoot"), "got: {err}");
     }
 }
