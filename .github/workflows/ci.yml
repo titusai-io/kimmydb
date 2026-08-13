@@ -24,7 +24,17 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      # Restore on every run; **save only from main**.
+      #
+      # A cache is scoped to the ref that wrote it, and a pull request can
+      # already read the base branch's. Saving from PR branches too was
+      # writing a second copy of a cache byte-identical to main's under
+      # `refs/pull/N/merge` — the repo sat at exactly the 10 GiB ceiling with
+      # 87% of it duplicate Rust caches, so GitHub was evicting main's entries
+      # to make room for copies of them.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
         run: cargo fmt --all --check
@@ -53,7 +63,10 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      # Save only from main — see the note on the `check` job above.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Real kimmyd processes: gossip formation, kill and stall detection,
       # replication through gossip-discovered peers, and webhook ownership
@@ -81,7 +94,17 @@ jobs:
           load: true
           tags: kimmydb:ci
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # `mode=min`, and only written from main, for the same scoping reason
+          # as the Rust cache above.
+          #
+          # `mode=max` was storing every intermediate stage — 224 blobs and
+          # 1.26 GiB — to cache almost nothing that matters: the Dockerfile
+          # builds under `--mount=type=cache`, and BuildKit cache mounts are
+          # **not** exported by `type=gha`. With `COPY crates ./crates`
+          # changing on every commit, the `cargo build --release` layer misses
+          # every run regardless. What is left worth caching is the base images
+          # and the apt layer, which `mode=min` covers.
+          cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=min' || '' }}
 
       - name: Smoke test the image
         run: |
