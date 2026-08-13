@@ -21,7 +21,7 @@ graph LR
     M6["<b>M6</b> ✅<br/>webhooks"]
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
     M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
-    M9["<b>M9</b> 📋<br/>finish the<br/>query engine"]
+    M9["<b>M9</b> ✅<br/>finish the<br/>query engine"]
     M10["<b>M10</b> 📋<br/>client protocol<br/>and clients"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10
@@ -36,7 +36,7 @@ graph LR
     style M6 fill:#2f5d3a,color:#fff
     style M7 fill:#2f5d3a,color:#fff
     style M8 fill:#2f5d3a,color:#fff
-    style M9 fill:#2d3748,color:#fff
+    style M9 fill:#2f5d3a,color:#fff
     style M10 fill:#2d3748,color:#fff
 ```
 
@@ -51,7 +51,7 @@ graph LR
 | **M6** | Webhooks — registration and push delivery of change events | ✅ Complete |
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
 | **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
-| **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | 📋 Planned |
+| **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | ✅ Complete |
 | **M10** | The client protocol, formalized — a specified and versioned HTTP/WebSocket contract, and first-party Rust, Python and Go clients ([ADR-055](decisions.md)) | 📋 Planned |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
@@ -627,7 +627,7 @@ stops being true.
 
 ---
 
-## M9 — Finish the query engine 📋
+## M9 — Finish the query engine ✅
 
 **The theme: KimmyDB can store, replicate and search documents better than it
 can *ask questions about* them.** M8 proved the distributed half works by
@@ -644,18 +644,30 @@ Task 2 is the exception and is called out below.
 
 | # | Task | Notes |
 |---|---|---|
-| 1 | **Computed expressions**, plus `$addFields`/`$set` and `$replaceRoot` | The highest-leverage gap by a distance. Arithmetic (`$add`, `$subtract`, `$multiply`, `$divide`, `$mod`), strings (`$concat`, `$toUpper`, `$toLower`, `$substr`, `$split`, `$strLenCP`), conditionals (`$cond`, `$ifNull`, `$switch`), comparison and boolean **as expressions** rather than as filter operators, and enough date handling to format and extract parts. Plugs into `$project` (computed fields), `$group` (`_id` expressions *and* accumulator arguments — today those are "a field path or a literal", which is the limit this removes), and the two new stages. **The operator list is a public-surface decision — reserved.** Deliberately excludes `$where`, which stays not-planned |
-| 2 | **TTL / expiring documents** | The retention machinery already exists — tombstones, a GC pass on an interval, a horizon — so this is mostly a policy layered on it. **The interesting part is replication, not expiry**: if every node expires independently, one document produces N deletes. Convergent under last-writer-wins, but noisy, and it interacts with the oplog. The likely shape is that whichever node notices first issues an ordinary delete that replicates like any other. **Trigger shape is a decision — reserved** (a TTL index on a date field, Mongo-style; a collection-level `expireAfterSeconds`; or a per-document expiry field) |
-| 3 | **`findAndModify`** | Atomic read-modify-write returning the document, before or after. The primitive behind job queues, counters and claim-a-row patterns; without it users read-then-write and silently lose atomicity. Nearly free given redb's single writer — **except for one real change**: `exec::update` today collects its targets in a *read* pass and then replaces them one at a time, so a filter-based `findAndModify` needs the match to happen inside the write transaction. That is the part to design, not the API. **Shape reserved** (its own route vs. a `returnDocument` option on update) |
-| 4 | **Partial and sparse indexes** | Cheap given the index machinery, and the motivating case is concrete: *unique only when the field is present*, which is a very common real constraint and impossible today. The subtle half is the **planner** — an index carrying a partial filter can only answer a query provably contained by that filter, and getting that wrong silently loses documents, which is the failure mode this codebase has met before with multikey. Mongo treats partial as superseding sparse; whether to build both is **reserved** |
-| 5 | **Cursors / efficient pagination** | `skip` is O(n) even with an index and `MAX_LIMIT` is 10,000, so there is currently no good way to page a large collection. Range-based continuation over the index or `_id` order fixes it. Interacts with sort: a cursor over an unsorted scan is meaningless, and *result order without an explicit sort is unspecified* (see [Deviations](deviations.md)), so this may need to state an order it did not have to before. **Token shape reserved** (opaque continuation token vs. an explicit "after this key") |
+| 1 | ✅ **Computed expressions**, plus `$addFields`/`$set` and `$replaceRoot` (#57) | The highest-leverage gap by a distance. Arithmetic (`$add`, `$subtract`, `$multiply`, `$divide`, `$mod`), strings (`$concat`, `$toUpper`, `$toLower`, `$substr`, `$split`, `$strLenCP`), conditionals (`$cond`, `$ifNull`, `$switch`), comparison and boolean **as expressions** rather than as filter operators, and enough date handling to format and extract parts. Plugs into `$project` (computed fields), `$group` (`_id` expressions *and* accumulator arguments — today those are "a field path or a literal", which is the limit this removes), and the two new stages. **The operator list is a public-surface decision — reserved.** Deliberately excludes `$where`, which stays not-planned |
+| 2 | ✅ **TTL / expiring documents** (#58) | The retention machinery already exists — tombstones, a GC pass on an interval, a horizon — so this is mostly a policy layered on it. **The interesting part is replication, not expiry**: if every node expires independently, one document produces N deletes. Convergent under last-writer-wins, but noisy, and it interacts with the oplog. The likely shape is that whichever node notices first issues an ordinary delete that replicates like any other. **Trigger shape is a decision — reserved** (a TTL index on a date field, Mongo-style; a collection-level `expireAfterSeconds`; or a per-document expiry field) |
+| 3 | ✅ **`findAndModify`** (#59) | Atomic read-modify-write returning the document, before or after. The primitive behind job queues, counters and claim-a-row patterns; without it users read-then-write and silently lose atomicity. Nearly free given redb's single writer — **except for one real change**: `exec::update` today collects its targets in a *read* pass and then replaces them one at a time, so a filter-based `findAndModify` needs the match to happen inside the write transaction. That is the part to design, not the API. **Shape reserved** (its own route vs. a `returnDocument` option on update) |
+| 4 | ✅ **Partial indexes** (#61), sparse expressible as `{field: {$exists: true}}` | Cheap given the index machinery, and the motivating case is concrete: *unique only when the field is present*, which is a very common real constraint and impossible today. The subtle half is the **planner** — an index carrying a partial filter can only answer a query provably contained by that filter, and getting that wrong silently loses documents, which is the failure mode this codebase has met before with multikey. Mongo treats partial as superseding sparse; whether to build both is **reserved** |
+| 5 | ✅ **Cursors / efficient pagination** (#63) | `skip` is O(n) even with an index and `MAX_LIMIT` is 10,000, so there is currently no good way to page a large collection. Range-based continuation over the index or `_id` order fixes it. Interacts with sort: a cursor over an unsorted scan is meaningless, and *result order without an explicit sort is unspecified* (see [Deviations](deviations.md)), so this may need to state an order it did not have to before. **Token shape reserved** (opaque continuation token vs. an explicit "after this key") |
 
-### Decisions reserved for the maintainer
+### Decisions reserved for the maintainer — all five settled
 
-Task 1's operator list, task 2's trigger shape, task 3's API shape, task 4's
-partial-versus-sparse question, and task 5's token shape. Each is public
-surface; settle them before the relevant branch starts, as M8 did with all
-three of its reserved decisions.
+Each was settled before its branch started, and each is recorded as a 🟢 entry
+in [Deviations](deviations.md) rather than an ADR: they were feature decisions
+with reasoning, not architectural choices with alternatives.
+
+| Task | Settled as |
+|---|---|
+| 1 | The ~25-operator planned list, and integer-preserving `i64` arithmetic |
+| 2 | A TTL index; one owner per collection; an ordinary `OpKind::Delete` |
+| 3 | One `/find_and_modify` route; match inside the write transaction; sort supported |
+| 4 | Partial only, with a bounded filter language so containment is decidable |
+| 5 | An opaque token; `_id` order only |
+
+**Two things M9 deliberately did not build**, both recorded with reasons:
+arbitrary sort keys for cursors, and array/variable-binding/type-conversion
+expression operators. The first needs index-ordered scans, which is the largest
+known outstanding performance item — see [Handoff](handoff.md).
 
 ### Deferred questions — one settled, one still open
 
@@ -666,7 +678,7 @@ The first has since been decided; the second stands.
   protocol is the HTTP/JSON and WebSocket API already served, promoted to a
   specified and versioned contract with first-party clients. The MongoDB wire
   protocol, gRPC and GraphQL are all rejected. **M10 below carries it out.**
-- **Sharding.** Every node holds a full copy, so capacity is bounded by one
+- **Sharding**, still open. Every node holds a full copy, so capacity is bounded by one
   machine and writes by one redb writer (~300/s single, ~51,300/s batched).
   **Replicated-not-partitioned is the current position and the maintainer is
   content with it**, with the same reasoning: decide from experience. Worth
