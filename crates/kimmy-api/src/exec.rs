@@ -111,6 +111,8 @@ pub struct FindParams {
     pub skip: Option<usize>,
     /// Report how the query was answered alongside the results.
     pub explain: bool,
+    /// Resume after a previous page. See [`kimmy_core::Cursor`].
+    pub cursor: Option<String>,
 }
 
 pub fn find(
@@ -134,25 +136,84 @@ pub fn find(
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT).min(MAX_LIMIT);
     let skip = params.skip.unwrap_or(0);
 
+    // A cursor pages in `_id` order, which is the order both access paths
+    // already produce. Combining it with anything that reorders or re-offsets
+    // the result is refused rather than silently ignored: a page that quietly
+    // dropped the sort it was given would be wrong in a way the caller would
+    // read as data.
+    let cursor = match &params.cursor {
+        Some(raw) => {
+            if skip > 0 {
+                return Err(ApiError::bad_request(
+                    "`cursor` and `skip` cannot be combined: a cursor already says where to \
+                     resume",
+                ));
+            }
+            if !sort.is_empty() && !sort_is_id_ascending(&sort) {
+                return Err(ApiError::bad_request(
+                    "`cursor` pages in _id order, so it takes no `sort` other than {\"_id\": 1}. \
+                     Sorting by another field still uses `skip`",
+                ));
+            }
+            Some(kimmy_core::Cursor::decode(raw)?)
+        }
+        None => None,
+    };
+
     // A sort has to see every match before it can page, so early exit is only
-    // safe for unsorted queries.
-    let stop_after = sort.is_empty().then_some(skip + limit);
-    let (mut matched, stats) = collect_matching(state, &meta, &filter, stop_after)?;
+    // safe for unsorted queries. A cursor is `_id`-ordered, which the scan
+    // already delivers, so it may stop early too.
+    let stop_after = (sort.is_empty() || cursor.is_some()).then_some(skip + limit);
+    let (mut matched, stats) = collect_matching_after(
+        state,
+        &meta,
+        &filter,
+        stop_after,
+        cursor.as_ref().map(|c| c.key()),
+    )?;
 
     shape::sort(&sort, &mut matched);
 
-    let page: Vec<Value> = matched
-        .into_iter()
-        .skip(skip)
-        .take(limit)
-        .map(|doc| document_to_json(&shape::project(projection.as_ref(), &doc)))
+    let page_docs: Vec<bson::Document> = matched.into_iter().skip(skip).take(limit).collect();
+
+    // Offered whenever this query *could* be continued, so a caller's first
+    // request needs no cursor and no flag — it asks for a page, and the reply
+    // says how to get the next one. Requiring a cursor to receive a cursor
+    // would leave a client with no way to start except a magic constant.
+    //
+    // Three conditions, and each of them is a way of being wrong otherwise:
+    // a short page is the end; a `skip` means the caller is offsetting rather
+    // than paging; and a sort other than `_id` ascending would hand back a
+    // token that silently pages in a different order from the one asked for.
+    let continuable = skip == 0 && (sort.is_empty() || sort_is_id_ascending(&sort));
+    let next =
+        (continuable && page_docs.len() == limit).then(|| next_cursor(page_docs.last())).flatten();
+
+    let page: Vec<Value> = page_docs
+        .iter()
+        .map(|doc| document_to_json(&shape::project(projection.as_ref(), doc)))
         .collect();
 
     let mut body = json!({ "documents": page, "count": page.len() });
+    if let Some(next) = next {
+        body["nextCursor"] = json!(next.encode());
+    }
     if params.explain {
         body["explain"] = stats.to_json();
     }
     Ok(body)
+}
+
+/// Whether a sort specification is exactly `_id` ascending.
+fn sort_is_id_ascending(sort: &[shape::SortKey]) -> bool {
+    matches!(sort, [key] if key.path == kimmy_storage::ID_FIELD && !key.descending)
+}
+
+/// The cursor pointing just past a page's last document.
+fn next_cursor(last: Option<&bson::Document>) -> Option<kimmy_core::Cursor> {
+    let id = DocId::try_from_bson(last?.get(kimmy_storage::ID_FIELD)?).ok()?;
+    let key = kimmy_core::keyenc::encode(&id.to_bson()).ok()?;
+    Some(kimmy_core::Cursor::from_key(key))
 }
 
 pub fn count(
@@ -237,6 +298,22 @@ pub fn collect_matching(
     filter: &filter::Filter,
     stop_after: Option<usize>,
 ) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
+    collect_matching_after(state, meta, filter, stop_after, None)
+}
+
+/// [`collect_matching`], resuming strictly after an encoded document key.
+///
+/// Both access paths are already in `_id` order — the documents table by its
+/// key, an index candidate list because `scan_range_in` sorts by document key —
+/// so resuming is a bound rather than a filter, and a page costs its own size
+/// rather than everything before it.
+pub fn collect_matching_after(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    stop_after: Option<usize>,
+    after: Option<&[u8]>,
+) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
     let mut plan = plan::choose(filter, &meta.indexes);
     let mut matched = Vec::new();
     let mut examined = 0usize;
@@ -275,6 +352,11 @@ pub fn collect_matching(
     match candidates {
         Some(candidates) => {
             for key in candidates {
+                // Candidates arrive in document-key order, so this skips a
+                // prefix rather than filtering the whole list.
+                if after.is_some_and(|bound| key.as_slice() <= bound) {
+                    continue;
+                }
                 let Some(doc) = state.engine.get_by_encoded_key(meta, &key)? else {
                     continue;
                 };
@@ -288,7 +370,7 @@ pub fn collect_matching(
             }
         }
         None => {
-            state.engine.for_each_doc(meta, |_, doc| {
+            state.engine.for_each_doc_after(meta, after, |_, doc| {
                 examined += 1;
                 if filter::matches(filter, &doc) {
                     matched.push(doc);

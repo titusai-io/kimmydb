@@ -7,6 +7,7 @@
 
 pub mod cmp;
 pub mod conflict;
+pub mod cursor;
 pub mod ddl;
 pub mod error;
 pub mod hlc;
@@ -23,6 +24,7 @@ pub mod version;
 
 pub use cmp::canonical_cmp;
 pub use conflict::UniqueViolationDetail;
+pub use cursor::Cursor;
 pub use ddl::{CollectionRef, IndexCreate, IndexDrop, VectorSet};
 pub use error::{Error, Result};
 pub use hlc::{HLC_ENCODED_LEN, Hlc, HlcClock, Stamp};

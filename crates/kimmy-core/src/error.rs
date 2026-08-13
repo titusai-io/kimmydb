@@ -48,6 +48,9 @@ pub enum Error {
     #[error("malformed resume token")]
     MalformedResumeToken,
 
+    #[error("malformed cursor")]
+    MalformedCursor,
+
     #[error("bson error: {0}")]
     Bson(String),
 

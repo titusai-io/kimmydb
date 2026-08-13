@@ -15,7 +15,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
 use crate::codec;
-use crate::engine::{Engine, append_oplog, doc_range};
+use crate::engine::{Engine, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
@@ -91,13 +91,31 @@ impl Engine {
     /// borrows its transaction; this keeps the transaction's lifetime contained
     /// and lets a caller stop early without materializing the whole collection.
     /// Return `false` from `f` to stop.
-    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, mut f: F) -> Result<()>
+    pub fn for_each_doc<F>(&self, coll: &CollectionMeta, f: F) -> Result<()>
+    where
+        F: FnMut(DocId, Document) -> Result<bool>,
+    {
+        self.for_each_doc_after(coll, None, f)
+    }
+
+    /// [`Engine::for_each_doc`], resuming strictly after an encoded key.
+    ///
+    /// The bound goes to redb rather than being filtered afterwards, which is
+    /// what makes paging cost the size of the *page* instead of the size of
+    /// everything before it. `keyenc` is order-preserving, so "after these
+    /// bytes" and "after this `_id`" are the same statement.
+    pub fn for_each_doc_after<F>(
+        &self,
+        coll: &CollectionMeta,
+        after: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()>
     where
         F: FnMut(DocId, Document) -> Result<bool>,
     {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
-        for entry in docs.range(doc_range(coll.id))? {
+        for entry in docs.range(doc_range_after(coll.id, after))? {
             let (_, value) = entry?;
             let record = codec::decode_doc_record(value.value())?;
             if record.deleted {
