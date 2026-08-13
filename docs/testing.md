@@ -759,8 +759,24 @@ cargo test -p kimmy-api --test api       # integration only
 PROPTEST_CASES=10000 cargo test -p kimmy-core   # deeper property search
 ```
 
-CI runs fmt, clippy, and tests, then builds the Docker image and smoke-tests it
-with `check-config`.
+CI runs fmt, clippy, and tests, then the cluster harness in its own job, then
+builds the Docker image and smoke-tests it with `check-config`.
+
+**Caches are written only from `main`.** A GitHub Actions cache is scoped to the
+ref that wrote it, and a pull request can already read the base branch's — so
+saving from PR branches too wrote a second copy of a cache byte-identical to
+main's under `refs/pull/N/merge`. The repo sat at exactly the 10 GiB ceiling
+with 87% of it duplicate Rust caches, which meant eviction was removing *main's*
+entries to make room for copies of them. `save-if` on the Rust cache and a
+conditional `cache-to` on the Docker build fix that; `cache-cleanup.yml` removes
+a pull request's caches when it closes.
+
+Worth knowing if the Docker job ever looks slow: the Dockerfile builds under
+`--mount=type=cache`, and **BuildKit cache mounts are not exported by
+`type=gha`**. The `cargo build --release` layer therefore misses on every run
+regardless of caching, because `COPY crates ./crates` changes with every commit.
+What the registry cache buys is the base images and the apt layer, which is why
+it is `mode=min`.
 
 ---
 

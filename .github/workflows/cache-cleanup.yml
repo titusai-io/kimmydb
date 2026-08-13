@@ -1,0 +1,51 @@
+# Delete a pull request's Actions caches once it closes.
+#
+# Caches are scoped to the ref that wrote them, so a merged or abandoned
+# branch's entries linger until GitHub's 7-day eviction — and while the repo is
+# near the 10 GiB ceiling, that eviction is what removes *main's* caches, since
+# it is least-recently-used and takes no account of which entries are still
+# worth having.
+#
+# CI saves caches only from main, so on a normal PR there is usually nothing
+# here to remove. This exists for the ones that do accumulate: buildx blobs,
+# and anything a workflow change starts writing from a branch before someone
+# notices.
+name: cache cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+jobs:
+  cleanup:
+    name: delete this branch's caches
+    runs-on: ubuntu-latest
+    permissions:
+      # The only permission this needs, and the only one it gets.
+      actions: write
+    steps:
+      - name: Delete caches for the closed pull request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          # The ref a pull request's caches are written under.
+          REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          set -euo pipefail
+
+          ids=$(gh api --paginate \
+            "/repos/$REPO/actions/caches?ref=$REF&per_page=100" \
+            --jq '.actions_caches[].id')
+
+          if [ -z "$ids" ]; then
+            echo "no caches for $REF"
+            exit 0
+          fi
+
+          for id in $ids; do
+            # Best-effort: a cache can be evicted between listing and deleting,
+            # and a 404 for something already gone is not a failure.
+            gh api --method DELETE "/repos/$REPO/actions/caches/$id" \
+              && echo "deleted $id" \
+              || echo "could not delete $id (already gone?)"
+          done
