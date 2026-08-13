@@ -499,6 +499,10 @@ impl KimmyMcp {
             // make a query faster must not be able to schedule data loss as a
             // side effect. Creating one stays an administrative act over HTTP.
             expire_after_seconds: None,
+            // Same reasoning as the TTL option above: a partial index changes
+            // which documents a unique constraint covers, which is an
+            // administrative decision rather than a query-tuning one.
+            partial_filter_expression: None,
         };
         render(exec::create_index(&self.state, &auth, &args.database, &args.collection, spec))
     }

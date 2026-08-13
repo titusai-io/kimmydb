@@ -706,6 +706,8 @@ pub struct IndexSpec {
     pub enforcement: Option<String>,
     /// Present makes this a TTL index — see [`kimmy_storage::IndexMeta`].
     pub expire_after_seconds: Option<i64>,
+    /// Present makes this a partial index, holding only matching documents.
+    pub partial_filter_expression: Option<Value>,
 }
 
 pub fn create_index(
@@ -733,6 +735,11 @@ pub fn create_index(
         }
     };
 
+    let partial_filter = match &spec.partial_filter_expression {
+        Some(value) => Some(json_to_document(value)?),
+        None => None,
+    };
+
     let index = state.engine.create_index_with(
         db,
         coll,
@@ -741,6 +748,7 @@ pub fn create_index(
         enforcement,
         spec.name,
         spec.expire_after_seconds,
+        partial_filter,
     )?;
     Ok(index_to_json(&index))
 }
@@ -788,6 +796,9 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
     // one of them carries an expiry policy that happens to be null.
     if let Some(secs) = index.expire_after_secs {
         out["expireAfterSeconds"] = json!(secs);
+    }
+    if let Some(filter) = &index.partial_filter {
+        out["partialFilterExpression"] = document_to_json(filter);
     }
     out
 }

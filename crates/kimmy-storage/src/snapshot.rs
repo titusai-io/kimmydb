@@ -226,6 +226,7 @@ impl Engine {
                 // A restored TTL index keeps its policy: dropping it here
                 // would leave a collection that silently stopped expiring.
                 index.expire_after_secs,
+                index.partial_filter.clone(),
                 false,
             )?;
         }

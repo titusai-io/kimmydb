@@ -45,6 +45,20 @@ pub(crate) fn index_keys_observed(
     index: &IndexMeta,
     doc: &Document,
 ) -> Result<(Vec<Vec<u8>>, bool)> {
+    // A partial index holds only the documents its filter selects. Returning
+    // no keys here is what makes membership fall out of the ordinary
+    // maintenance path: entering the filter adds entries, leaving it removes
+    // them, because `apply_entries` derives both sides from this function.
+    //
+    // The early return also keeps a document outside the index from flipping
+    // the multikey flag — an array it holds is not in the index, so it cannot
+    // make an index range unsound.
+    if let Some(filter) = index.partial()
+        && !filter?.matches(doc)
+    {
+        return Ok((Vec::new(), false));
+    }
+
     // Per field, the set of values this document offers.
     let mut per_field: Vec<Vec<Bson>> = Vec::with_capacity(index.fields.len());
     let mut array_fields = 0;
@@ -444,7 +458,7 @@ impl crate::Engine {
         unique: bool,
         name: Option<String>,
     ) -> Result<IndexMeta> {
-        self.create_index_with(db, collection, fields, unique, Enforcement::Local, name, None)
+        self.create_index_with(db, collection, fields, unique, Enforcement::Local, name, None, None)
     }
 
     /// Create an index, choosing how far a unique constraint reaches and
@@ -466,6 +480,7 @@ impl crate::Engine {
         enforcement: Enforcement,
         name: Option<String>,
         expire_after_secs: Option<i64>,
+        partial_filter: Option<bson::Document>,
     ) -> Result<IndexMeta> {
         self.create_index_inner(
             db,
@@ -475,6 +490,7 @@ impl crate::Engine {
             enforcement,
             name,
             expire_after_secs,
+            partial_filter,
             true,
         )
     }
@@ -495,12 +511,20 @@ impl crate::Engine {
         enforcement: Enforcement,
         name: Option<String>,
         expire_after_secs: Option<i64>,
+        partial_filter: Option<bson::Document>,
         log: bool,
     ) -> Result<IndexMeta> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
             )));
+        }
+        // Parsed now and discarded: the point is to refuse an unsupported
+        // shape *here*, with an operator watching, rather than at query time
+        // where the only symptom would be a plan that quietly stopped
+        // applying.
+        if let Some(filter) = &partial_filter {
+            kimmy_core::PartialFilter::parse(filter).map_err(StorageError::Core)?;
         }
         if let Some(secs) = expire_after_secs {
             if secs < 0 {
@@ -540,6 +564,7 @@ impl crate::Engine {
             if existing.fields == fields
                 && existing.unique == unique
                 && existing.expire_after_secs == expire_after_secs
+                && existing.partial_filter == partial_filter
             {
                 return Ok(existing.clone());
             }
@@ -562,8 +587,16 @@ impl crate::Engine {
             )));
         }
 
-        let mut index =
-            IndexMeta { id, name, fields, unique, enforcement, multikey: false, expire_after_secs };
+        let mut index = IndexMeta {
+            id,
+            name,
+            fields,
+            unique,
+            enforcement,
+            multikey: false,
+            expire_after_secs,
+            partial_filter,
+        };
 
         let txn = self.db().begin_write()?;
 
@@ -796,6 +829,7 @@ mod tests {
             enforcement: Enforcement::Local,
             multikey: false,
             expire_after_secs: None,
+            partial_filter: None,
         }
     }
 
@@ -1079,6 +1113,7 @@ mod tests {
             Enforcement::Coordinated,
             None,
             None,
+            None,
         );
         assert!(matches!(err, Err(StorageError::Core(CoreError::Unsupported(_)))));
     }
@@ -1096,6 +1131,7 @@ mod tests {
             Enforcement::Local,
             Some("ttl_ab".into()),
             Some(60),
+            None,
         );
         assert!(matches!(err, Err(StorageError::Core(CoreError::InvalidQuery(_)))), "{err:?}");
     }
@@ -1111,6 +1147,7 @@ mod tests {
             Enforcement::Local,
             Some("ttl_seen".into()),
             Some(-1),
+            None,
         );
         assert!(matches!(err, Err(StorageError::Core(CoreError::InvalidQuery(_)))), "{err:?}");
     }
@@ -1129,6 +1166,7 @@ mod tests {
                 Enforcement::Local,
                 Some("ttl_at".into()),
                 Some(0),
+                None,
             )
             .unwrap();
         assert!(index.is_ttl(), "zero must not be read as absent");
@@ -1150,6 +1188,7 @@ mod tests {
                 Enforcement::Local,
                 Some("ttl_seen".into()),
                 Some(60),
+                None,
             )
             .unwrap();
 
@@ -1164,6 +1203,7 @@ mod tests {
                     Enforcement::Local,
                     Some("ttl_seen".into()),
                     Some(60),
+                    None,
                 )
                 .is_ok()
         );
@@ -1177,6 +1217,7 @@ mod tests {
             Enforcement::Local,
             Some("ttl_seen".into()),
             Some(30),
+            None,
         );
         assert!(err.is_err(), "a changed TTL must not be silently ignored");
     }

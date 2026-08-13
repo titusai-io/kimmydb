@@ -285,6 +285,96 @@ whose key carries a second component.
 
 ---
 
+## Partial indexes — indexing only some documents
+
+An index with a `partialFilterExpression` holds **only the documents matching
+it**. Smaller index, and a unique constraint that applies to a subset.
+
+```json
+{ "fields": [{ "path": "email" }],
+  "unique": true,
+  "partialFilterExpression": { "email": { "$exists": true } },
+  "name": "email_unique_present" }
+```
+
+That example is the motivating case: **unique only where the field is present**.
+It was impossible before, because a missing field indexes as null and two
+documents lacking it collided on that null entry.
+
+**There is no separate `sparse` flag.** A sparse index is exactly
+`{field: {$exists: true}}`, which is where MongoDB has been steering people for
+years, so there is one mechanism rather than two overlapping ones.
+
+### The filter language is deliberately small
+
+| Allowed | |
+|---|---|
+| `{field: {$exists: true}}` | the sparse case |
+| `{field: <value>}` | equality |
+| `{field: {$eq\|$gt\|$gte\|$lt\|$lte: <value>}}` | comparison against a literal |
+| any conjunction of the above | |
+
+**Refused at index creation:** `$or`, `$ne`, `$in`, `$nin`, `$regex`, `$not`,
+`$elemMatch`, `$exists: false`, and more than one operator on a field.
+
+This is not laziness — it is the safety property. A partial index may answer a
+query only if the query is **provably contained** by the filter, and general
+implication between filters is not decidable. Restricting the language makes
+containment a *decision* rather than a best effort, and a wrong best effort here
+returns a **subset** with nothing to indicate it. That is the same failure this
+codebase already met with multikey.
+
+The refusal lands at creation, where an operator is present to read it, rather
+than at query time where the only symptom would be a plan that quietly stopped
+applying.
+
+### When the planner will use one
+
+It must prove every predicate of the filter from the query:
+
+```javascript
+// index: {status: "active"}
+{ "status": "active", "qty": 4 }      // index      — proven
+{ "qty": 4 }                          // scan       — nothing about status
+{ "status": "done", "qty": 4 }        // scan       — wrong value
+{ "status": {"$in": ["active"]} }     // scan       — equivalent, not proven
+```
+
+Bounds compare by strictness, and the edges matter:
+
+```javascript
+// index: {qty: {$gte: 10}}
+{ "qty": {"$gte": 50} }   // index
+{ "qty": {"$gt": 10} }    // index
+{ "qty": {"$gte": 5} }    // scan  — looser
+
+// index: {qty: {$gt: 10}}
+{ "qty": {"$gte": 10} }   // scan  — the document holding exactly 10
+                          //         satisfies the query and is not indexed
+```
+
+**`{field: null}` never proves anything.** It matches an explicit null *and* a
+missing field, so it cannot imply the field exists — answering it from a
+presence-filtered index would silently drop every document missing the field.
+`explain` will report `collectionScan` for it, and that is correct.
+
+### Other behaviours
+
+- **Membership is maintained, not decided once.** A document updated *out* of
+  the filter loses its entries; updated back *in*, it regains them.
+- **Creating a partial unique index judges only the documents it covers.**
+  Duplicates outside the filter do not block creation, because they are not in
+  the index.
+- **A document outside the filter cannot make the index multikey**, since the
+  array it holds is not indexed.
+- `listIndexes` reports `partialFilterExpression` when there is one.
+
+If a partial index is not being used and you expected it to be, ask `find` with
+`"explain": true` — the answer is almost always that the query does not pin
+enough to prove containment.
+
+---
+
 ## TTL indexes — expiring documents
 
 An index with `expireAfterSeconds` also becomes a **policy**: a background pass
