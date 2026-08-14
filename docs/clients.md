@@ -11,7 +11,7 @@ independent readers keeping it honest.
 |---|---|---|
 | Rust | `kimmy-client` | ✅ M10 task 8 |
 | Python | `kimmydb` | ✅ M10 task 9 |
-| Go | — | 📋 M10 task 10 |
+| Go | `clients/go/kimmydb` | ✅ M10 task 10 |
 
 ---
 
@@ -178,6 +178,62 @@ it. Python's natural shape here is a lazy generator, and a lazy one would open
 the socket on the first `next()` — so anything written between `watch()` and
 that first read would be missed silently. Found by a test that wrote a document
 immediately after opening a stream and then waited for it forever.
+
+---
+
+## Go — `clients/go/kimmydb`
+
+```go
+import "github.com/titusai-io/kimmydb/clients/go/kimmydb"
+
+db, err := kimmydb.New(ctx, "http://localhost:7878",
+    kimmydb.WithCredentials("root", "hunter2"),
+    kimmydb.WithDiscovery(true),
+)
+defer db.Close()
+
+for document, err := range db.Documents(ctx, "shop", "orders", kimmydb.Query{}) {
+    if err != nil { return err }
+    fmt.Println(document)
+}
+
+for event, err := range db.Watch(ctx, "shop", "orders", kimmydb.WatchOptions{}) {
+    if err != nil { return err }
+    fmt.Println(event.Operation, event.DocumentID())
+}
+```
+
+**One dependency.** `net/http` pools connections, so the reasoning that ruled
+out Python's standard library does not apply — the only thing Go's does not
+have is WebSocket framing.
+
+**`coder/websocket` rather than `gorilla/websocket`**, and for a specific
+reason: it handshakes through an ordinary `*http.Client`, so a change stream
+inherits the same client, TLS configuration, proxy and timeouts as every other
+request. `gorilla` dials with its own `Dialer`, which means two configurations
+that can drift apart — the class of split this project has been bitten by
+before.
+
+### Idioms, not translations
+
+Paging and streaming are **range-over-function iterators**, which is where a Go
+caller expects them and which makes the error impossible to skip — it is the
+second loop variable:
+
+```go
+for page, err := range db.Pages(...)      // pages
+for document, err := range db.Documents(...)  // documents
+for event, err := range db.Watch(...)     // events
+```
+
+Errors are values, and `*APIError` carries `Status`, `Code`, `Retry` and
+`Message`. `Code` is a **plain string** rather than a set of constants, for the
+same reason it is a string in Python: codes are additive, and making an
+unfamiliar one an error in itself is exactly what the retry class exists to
+prevent.
+
+Everything takes a `context.Context`, including the change stream — cancelling
+it is how a caller stops watching.
 
 ---
 
