@@ -10,7 +10,7 @@ independent readers keeping it honest.
 | Language | Crate / package | Status |
 |---|---|---|
 | Rust | `kimmy-client` | ✅ M10 task 8 |
-| Python | — | 📋 M10 task 9 |
+| Python | `kimmydb` | ✅ M10 task 9 |
 | Go | — | 📋 M10 task 10 |
 
 ---
@@ -119,6 +119,65 @@ token loops forever.
 `Client::request` reaches any route by path. It exists because a client that
 covers a subset of an API and cannot reach the rest sends people back to `curl`
 for one call; every named method above is a convenience over it.
+
+---
+
+## Python — `kimmydb`
+
+```python
+from kimmydb import Client
+
+db = Client("http://localhost:7878", user="root", password="hunter2",
+            discover_nodes=True)
+
+db.create_collection("shop", "orders")
+db.insert("shop", "orders", {"sku": "widget", "qty": 5})
+
+for document in db.documents("shop", "orders"):
+    print(document)
+
+for event in db.watch("shop", "orders", full_document=True):
+    print(event.operation, event.document_id)
+```
+
+**Synchronous.** `httpx` and `websockets` both have async APIs behind nearly
+the same surface, so an async client is a second class over the same request
+path rather than a different design — a decision for when someone wants it, not
+an assumption made now.
+
+**Two dependencies, and connection pooling is why there are two rather than
+zero.** The stdlib can speak HTTP, but `urllib` opens a connection per request:
+against a measured ~0.1 ms request, a handshake per call would dominate
+everything the client does.
+
+**It shares no code with the Rust client.** They are independent readers of one
+specification, which is what makes a disagreement between them mean something.
+The test suites are deliberately the same scenario list for the same reason.
+
+### Idioms, not translations
+
+The behaviour matches the Rust client; the surface does not pretend to.
+Iteration is where a Python caller expects it, and `documents()` exists because
+the shape most people want is "every matching document" rather than "a sequence
+of pages":
+
+```python
+for page in db.pages("shop", "orders", limit=500):   # pages
+for document in db.documents("shop", "orders"):      # documents
+```
+
+Errors are raised, not returned. `KimmyError` carries `.code`, `.retry`,
+`.status` and `.message`; `.code` is a **plain string** rather than an enum,
+because codes are additive and an enum would turn "a code I have not heard of"
+into an error in itself.
+
+### One thing that had to fight the idiom
+
+A change stream connects **when you ask for it**, not when you first read from
+it. Python's natural shape here is a lazy generator, and a lazy one would open
+the socket on the first `next()` — so anything written between `watch()` and
+that first read would be missed silently. Found by a test that wrote a document
+immediately after opening a stream and then waited for it forever.
 
 ---
 

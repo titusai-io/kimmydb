@@ -1,0 +1,51 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "kimmydb"
+version = "0.1.0"
+description = "Python client for KimmyDB"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Chris Gruber", email = "chris@titusai.io" }]
+keywords = ["kimmydb", "database", "document", "vector"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: Database :: Front-Ends",
+]
+
+# Two, and both were chosen for the same reason: each ships a sync *and* an
+# async API behind nearly the same surface. "Sync first" therefore costs
+# nothing later — async becomes a second class over the same code rather than a
+# second dependency and a parallel implementation.
+#
+# `httpx` also pools connections, which is not a detail here: the HTTP
+# benchmark puts a whole request at ~0.1 ms, so a handshake per call would
+# dominate everything the client does.
+dependencies = [
+    "httpx>=0.27",
+    "websockets>=13",
+]
+
+[project.optional-dependencies]
+# `pytest-timeout` so a change stream that never delivers fails in seconds
+# rather than stalling a CI job for as long as it is allowed to run. A
+# hang is a failure mode this client can genuinely have.
+dev = ["pytest>=8", "pytest-timeout>=2"]
+
+[project.urls]
+Homepage = "https://github.com/titusai-io/kimmydb"
+Documentation = "https://github.com/titusai-io/kimmydb/blob/main/docs/clients.md"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/kimmydb"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# The tests drive a real node, so a failure is worth reading in full.
+addopts = "-ra --tb=short"
+# No single test should take anywhere near this; anything that does is stuck.
+timeout = 60
