@@ -41,4 +41,6 @@ kimmy-auth.workspace = true
 kimmy-storage.workspace = true
 http-body-util.workspace = true
 tempfile.workspace = true
+serde_norway.workspace = true
+jsonschema.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }

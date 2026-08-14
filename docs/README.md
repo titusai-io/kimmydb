@@ -18,8 +18,9 @@ around three things that are usually awkward to have together:
 **New to the project?** Read [Architecture](architecture.md) first — it explains
 the one structural idea everything else follows from.
 
-**Trying to use it?** [HTTP API](http-api.md), then [Query Language](query-language.md)
+**Trying to use it?** [HTTP API](http-api.md), then [Query Language](query-language.md),
 [Vectors](vectors.md), and — if you are wiring up an agent — [MCP](mcp.md).
+Generating a client? Start from [`openapi.yaml`](openapi.yaml).
 
 **Running it?** [Operations](operations.md), then [Security](security.md).
 
@@ -79,6 +80,7 @@ graph TD
 | [Change Streams](change-streams.md) | The replay/live splice, resume tokens, lag recovery |
 | [Query Language](query-language.md) | Filter and update operators, array semantics, Mongo compatibility |
 | [HTTP API](http-api.md) | Endpoint reference, request and response shapes, status codes |
+| [`openapi.yaml`](openapi.yaml) | The protocol *specification* — OpenAPI 3.1, checked against the running server by a contract test |
 | [Security](security.md) | Authentication, RBAC, what is and is not defended against |
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |

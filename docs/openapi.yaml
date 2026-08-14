@@ -1,0 +1,2122 @@
+openapi: 3.1.0
+
+# KimmyDB's client protocol, written down.
+#
+# This document is hand-written and checked by a contract test
+# (`crates/kimmy-api/tests/openapi.rs`), which fails when the router and this
+# file disagree about which operations exist, and when a real response does not
+# validate against the schema declared here. See ADR-056 for why it is written
+# rather than generated.
+#
+# Scope: every route `kimmy_api::routes::router` registers. `/mcp` is
+# deliberately absent — it is a different protocol (JSON-RPC over streamable
+# HTTP, specified by MCP itself), it is gated on `mcp.enabled`, and describing
+# it here would put a second, weaker description of it in the repository. See
+# `docs/mcp.md`.
+
+info:
+  title: KimmyDB HTTP API
+  version: 1.0.0
+  summary: The client protocol for KimmyDB — HTTP/JSON with WebSocket change streams.
+  description: |
+    KimmyDB speaks JSON over HTTP. Change streams are a WebSocket. There is no
+    second protocol: the MongoDB wire protocol, gRPC and GraphQL were all
+    considered and rejected (ADR-011, ADR-055).
+
+    ## Authentication
+
+    `POST /v1/auth/login` exchanges a username and password for a bearer token.
+    Every other route except `/healthz`, `/readyz` and `/metrics` requires
+    `Authorization: Bearer <token>`.
+
+    A token proves only that this server issued it and that it has not expired.
+    Every request re-checks that the account still exists, is not disabled, and
+    has not had its sessions revoked since (ADR-052) — so a token stops working
+    the moment the account behind it does, without waiting for expiry.
+
+    Tokens expire and there is no refresh route yet; a client re-authenticates.
+    That is M10 task 4.
+
+    ## Encoding: Extended JSON v2
+
+    Documents cross this boundary as JSON using MongoDB's Extended JSON v2
+    conventions for the types JSON cannot express. The server accepts either
+    plain JSON or the wrapped forms on input, and always emits the wrapped
+    forms on output.
+
+    | BSON type | On the wire |
+    |---|---|
+    | ObjectId | `{"$oid": "507f1f77bcf86cd799439011"}` |
+    | Int64 | `{"$numberLong": "9007199254740993"}` |
+    | Decimal128 | `{"$numberDecimal": "1.25"}` |
+    | DateTime | `{"$date": {"$numberLong": "1700000000000"}}` |
+    | Binary | `{"$binary": {"base64": "...", "subType": "00"}}` |
+
+    An integer small enough to be exact in a double may arrive as a plain JSON
+    number; a client that round-trips values must preserve the wrapped form it
+    was given rather than re-encoding from a parsed float. This is the fidelity
+    problem a schema-first protocol would have reintroduced — see ADR-055.
+
+    ## Errors
+
+    Every failure — including a body the server could not parse — is a JSON
+    object with a stable `error` code and a human `message`. The HTTP status
+    carries the class; the `error` code is what a client branches on. Codes are
+    strings rather than numbers on purpose: a client's `match` arm reads as
+    what it means.
+
+    ```json
+    { "error": "duplicate_key", "message": "duplicate _id" }
+    ```
+
+    Enumerating the code set and declaring which failures are retryable is M10
+    task 2. Until then, treat an unlisted code as its HTTP status class.
+
+    ## Paging
+
+    `POST .../find` returns `nextCursor` whenever the page filled and the query
+    is one a cursor can continue. The token is opaque and **portable across
+    nodes** — it encodes the last row's document key and nothing else, so a
+    round-robin client may send it to any node in the cluster. A query a cursor
+    cannot continue returns no `nextCursor` at all, rather than a token that
+    would silently page in a different order than the one asked for.
+
+    ## Versioning
+
+    The path carries the major version. `/v1` is the current one. Adding a
+    route, an optional request field, or a response field is additive and does
+    not change the version. The formal compatibility promise is M10 task 3.
+
+servers:
+  - url: http://localhost:7878
+    description: A node's default HTTP address.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: health
+    description: Liveness, readiness and metrics. Unauthenticated so a load balancer needs no credentials.
+  - name: auth
+    description: Obtaining a token and inspecting the principal behind it.
+  - name: users
+    description: Server-wide user administration. Requires `admin` over `*`.
+  - name: collections
+    description: Databases, collections and their metadata.
+  - name: documents
+    description: Reading and writing documents.
+  - name: indexes
+    description: Secondary indexes, including unique, TTL and partial ones.
+  - name: vectors
+    description: Embedding configuration, client-supplied vectors, and search.
+  - name: webhooks
+    description: Push delivery of change events to an HTTP endpoint.
+  - name: streaming
+    description: Change streams over WebSocket.
+  - name: admin
+    description: Node-level operations.
+
+paths:
+  /healthz:
+    get:
+      tags: [health]
+      operationId: healthz
+      summary: Liveness.
+      description: Answers as long as the process is serving. Says nothing about storage.
+      security: []
+      responses:
+        "200":
+          description: The node is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    const: ok
+
+  /readyz:
+    get:
+      tags: [health]
+      operationId: readyz
+      summary: Readiness.
+      description: |
+        Proves the storage engine responds, so a node with a wedged database is
+        taken out of rotation rather than served. Also the cheapest way for a
+        client to learn which node it reached.
+      security: []
+      responses:
+        "200":
+          description: The node is serving and storage responds.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, node]
+                properties:
+                  status:
+                    const: ready
+                  node:
+                    type: string
+                    description: This node's id.
+
+  /metrics:
+    get:
+      tags: [health]
+      operationId: metrics
+      summary: Prometheus metrics.
+      description: |
+        Deliberately limited to counts. Collection *names* are not exposed here
+        — that would leak the schema to anything that can reach the port.
+      security: []
+      responses:
+        "200":
+          description: Metrics in Prometheus text exposition format.
+          content:
+            text/plain:
+              schema:
+                type: string
+
+  /v1/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Exchange credentials for a bearer token.
+      description: |
+        Rate-limited per source address and per username, and the limit is
+        checked *before* the password is verified: every attempt costs a full
+        Argon2id verification, including for a user that does not exist, which
+        is what stops timing from revealing whether one does (ADR-038).
+
+        Only failed attempts count against the limit.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user, password]
+              properties:
+                user:
+                  type: string
+                password:
+                  type: string
+      responses:
+        "200":
+          description: Authenticated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [token, user]
+                properties:
+                  token:
+                    type: string
+                    description: "Bearer token. Send as `Authorization: Bearer <token>`."
+                  user:
+                    type: string
+        "401":
+          description: |
+            Wrong password, or no such user. The two are indistinguishable by
+            design — body and status are identical.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "429":
+          $ref: "#/components/responses/RateLimited"
+
+  /v1/auth/whoami:
+    get:
+      tags: [auth]
+      operationId: whoami
+      summary: The principal behind the token, and what it may do.
+      responses:
+        "200":
+          description: The authenticated principal.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, grants, authenticated]
+                properties:
+                  user:
+                    type: string
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Grant" }
+                  authenticated:
+                    type: boolean
+                    description: |
+                      False only on a node started with `--insecure-no-auth`,
+                      where every caller is an unauthenticated superuser.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /v1/users:
+    get:
+      tags: [users]
+      operationId: listUsers
+      summary: List users.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: |
+            The name of every user on the node. Names only — grants come from
+            `GET /v1/users/{name}`, and a password hash is never served at all.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [users]
+                properties:
+                  users:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [users]
+      operationId: createUser
+      summary: Create a user.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [user, password]
+              properties:
+                user:
+                  type: string
+                password:
+                  type: string
+                  minLength: 8
+                grants:
+                  type: array
+                  items: { $ref: "#/components/schemas/Grant" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [user, grants]
+                properties:
+                  user:
+                    type: string
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Grant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: A user of that name already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/users/{name}:
+    parameters:
+      - $ref: "#/components/parameters/UserName"
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: One user.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: The user.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/User" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [users]
+      operationId: deleteUser
+      summary: Delete a user.
+      description: |
+        Refused for the last remaining user, and for the account the caller is
+        signed in as. Deleting revokes the account's live tokens on this node
+        immediately; other nodes drop them as the change replicates.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: Deleted, or no such user.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: boolean
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: The last user, or the caller's own account.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/users/{name}/password:
+    parameters:
+      - $ref: "#/components/parameters/UserName"
+    post:
+      tags: [users]
+      operationId: setPassword
+      summary: Set a password.
+      description: |
+        A user may always change their own password; changing anyone else's
+        requires `admin` over `*`. Either way the account's existing tokens
+        stop working.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [password]
+              properties:
+                password:
+                  type: string
+                  minLength: 8
+      responses:
+        "200":
+          description: Changed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Updated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/users/{name}/grants:
+    parameters:
+      - $ref: "#/components/parameters/UserName"
+    post:
+      tags: [users]
+      operationId: setGrants
+      summary: Replace a user's grants.
+      description: The whole set, not a delta. Existing tokens are re-evaluated against the new grants.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grants]
+              properties:
+                grants:
+                  type: array
+                  items: { $ref: "#/components/schemas/Grant" }
+      responses:
+        "200":
+          description: Replaced.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Updated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/databases:
+    get:
+      tags: [collections]
+      operationId: listDatabases
+      summary: List databases.
+      description: Filtered by grant — a database the caller cannot read is not named.
+      x-kimmy-action: read (filtered)
+      responses:
+        "200":
+          description: The visible databases.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [databases]
+                properties:
+                  databases:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /v1/db/{db}/collections:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+    get:
+      tags: [collections]
+      operationId: listCollections
+      summary: List collections in a database.
+      description: Filtered by grant, and excluding system and shadow collections.
+      x-kimmy-action: read (filtered)
+      responses:
+        "200":
+          description: The visible collections.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [collections]
+                properties:
+                  collections:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [collections]
+      operationId: createCollection
+      summary: Create a collection.
+      x-kimmy-action: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  description: |
+                    A leading `__` is reserved for system collections and is
+                    refused here.
+      responses:
+        "200":
+          description: Created, or already present — creation is idempotent.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [created, id]
+                properties:
+                  created:
+                    type: string
+                  id:
+                    type: integer
+                    description: |
+                      The collection id, derived from `(database, name)` so
+                      every node in a cluster computes the same value.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/db/{db}/coll/{coll}:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    delete:
+      tags: [collections]
+      operationId: dropCollection
+      summary: Drop a collection and everything in it.
+      x-kimmy-action: admin
+      responses:
+        "200":
+          description: Dropped, or there was nothing to drop.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dropped]
+                properties:
+                  dropped:
+                    type: boolean
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/db/{db}/coll/{coll}/describe:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [collections]
+      operationId: describeCollection
+      summary: Inferred shape of a collection.
+      description: |
+        **Inference, not a schema.** Nothing here is enforced, and `presence`
+        is a fraction of the *sampled* documents rather than of the collection.
+        A field absent from the sample is not a field the collection may not
+        contain.
+      x-kimmy-action: read
+      parameters:
+        - name: sample
+          in: query
+          required: false
+          schema: { type: integer, minimum: 1 }
+          description: Documents to sample. Defaults to a bounded sample.
+        - name: examples
+          in: query
+          required: false
+          schema: { type: boolean }
+          description: Include one example value per field.
+      responses:
+        "200":
+          description: The inferred shape.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CollectionDescription" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/docs:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [documents]
+      operationId: listDocuments
+      summary: Read documents without a filter.
+      description: |
+        The convenience form. Anything with a filter, sort, projection or
+        cursor goes to `POST .../find`, because a query belongs in a body
+        rather than in a URL.
+      x-kimmy-action: read
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+        - name: skip
+          in: query
+          required: false
+          schema: { type: integer, minimum: 0 }
+      responses:
+        "200":
+          description: A page of documents.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FindResponse" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [documents]
+      operationId: insertDocument
+      summary: Insert one document.
+      description: |
+        An absent `_id` is assigned. A duplicate `_id`, or a value that would
+        break a unique index, is refused with `409`.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Document" }
+      responses:
+        "200":
+          description: Inserted, and durable.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [insertedId]
+                properties:
+                  insertedId: {}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/db/{db}/coll/{coll}/bulk:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: bulkInsert
+      summary: Insert many documents in one commit.
+      description: |
+        **All or nothing.** One transaction, one commit, and a failure anywhere
+        aborts the whole batch — no document lands, no event is published, and
+        the version vector does not move. That includes conflicts *within* the
+        batch: two documents sharing an `_id`, or colliding on a unique index,
+        fail it.
+
+        This is the throughput path. The commit is the cost, not the encoding,
+        so batching is worth roughly two orders of magnitude over inserting one
+        at a time.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items: { $ref: "#/components/schemas/Document" }
+      responses:
+        "200":
+          description: Every document landed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [inserted, insertedIds]
+                properties:
+                  inserted:
+                    type: integer
+                  insertedIds:
+                    type: array
+                    items: {}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: |
+            Nothing was written. The message names the offending document's
+            position in the batch, which is the only thing that can point at
+            what to fix — there is no partial result.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/db/{db}/coll/{coll}/find:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: find
+      summary: Query a collection.
+      x-kimmy-action: read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FindRequest" }
+      responses:
+        "200":
+          description: A page of documents, with a continuation token when one applies.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FindResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/count:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: count
+      summary: Count matching documents.
+      x-kimmy-action: read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/FindRequest" }
+      responses:
+        "200":
+          description: The number of matches.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count]
+                properties:
+                  count:
+                    type: integer
+                  explain: { $ref: "#/components/schemas/Explain" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/aggregate:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: aggregate
+      summary: Run an aggregation pipeline.
+      description: See `docs/aggregation.md` for the stages and expression operators.
+      x-kimmy-action: read
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pipeline]
+              properties:
+                pipeline:
+                  type: array
+                  items: { $ref: "#/components/schemas/Document" }
+      responses:
+        "200":
+          description: The pipeline's output.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [documents, count]
+                properties:
+                  documents:
+                    type: array
+                    items: { $ref: "#/components/schemas/Document" }
+                  count:
+                    type: integer
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/update:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: update
+      summary: Update matching documents.
+      description: |
+        **Not atomic across documents.** Updates apply one document at a time
+        and can stop partway on an error, leaving earlier ones changed. Bulk
+        *insert* is all-or-nothing; this is not.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [update]
+              properties:
+                filter: { $ref: "#/components/schemas/Document" }
+                update:
+                  $ref: "#/components/schemas/Document"
+                  description: Update operators, or a whole replacement document.
+                multi:
+                  type: boolean
+                  default: false
+                explain:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: What changed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [matched, modified]
+                properties:
+                  matched:
+                    type: integer
+                  modified:
+                    type: integer
+                    description: |
+                      Matched but unchanged documents count in `matched` and
+                      not here — an update that sets a field to the value it
+                      already holds modifies nothing.
+                  explain: { $ref: "#/components/schemas/Explain" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/db/{db}/coll/{coll}/find_and_modify:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: findAndModify
+      summary: Find one document and update or remove it, atomically.
+      description: |
+        The match happens *inside* the write transaction. Storage has a single
+        writer, so a document found inside the write cannot be taken by anyone
+        else before the commit — atomic by construction, with no retry loop and
+        no client-visible contention.
+
+        The candidate set is bounded. A filter matching more than 10,000
+        documents is **refused** rather than answered from a prefix, which
+        would return a document the sort did not pick.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: "#/components/schemas/Document" }
+                sort:
+                  $ref: "#/components/schemas/Document"
+                  description: |
+                    Chooses which document when several match. Without it the
+                    choice is the scan's own order, which is unspecified.
+                update: { $ref: "#/components/schemas/Document" }
+                remove:
+                  type: boolean
+                  default: false
+                upsert:
+                  type: boolean
+                  default: false
+                returnDocument:
+                  type: string
+                  enum: [before, after]
+                  default: before
+                projection: { $ref: "#/components/schemas/Document" }
+      responses:
+        "200":
+          description: |
+            The chosen document, before or after the change as asked. `document`
+            is null when nothing matched.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [document, matched]
+                properties:
+                  document:
+                    oneOf:
+                      - $ref: "#/components/schemas/Document"
+                      - type: "null"
+                  matched:
+                    type: integer
+                  upsertedId: {}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
+  /v1/db/{db}/coll/{coll}/delete:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [documents]
+      operationId: deleteDocuments
+      summary: Delete matching documents.
+      description: Like `update`, applies document by document and can stop partway.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                filter: { $ref: "#/components/schemas/Document" }
+                multi:
+                  type: boolean
+                  default: false
+                explain:
+                  type: boolean
+                  default: false
+      responses:
+        "200":
+          description: How many were deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+                  explain: { $ref: "#/components/schemas/Explain" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/docs/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+      - $ref: "#/components/parameters/DocId"
+    get:
+      tags: [documents]
+      operationId: getDocument
+      summary: Read one document by `_id`.
+      description: |
+        The point path. `find` with a filter on `_id` is a collection scan —
+        the planner does not consult the primary key — so this is the route to
+        reach for when the id is known.
+      x-kimmy-action: read
+      responses:
+        "200":
+          description: The document.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Document" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [documents]
+      operationId: replaceDocument
+      summary: Replace one document by `_id`.
+      description: |
+        **Without `?upsert=true` a missing document is not an error.** The
+        response is `200 {"matched": 0}` and nothing is written. A test built
+        on the assumption that this creates the document writes nothing and
+        passes.
+      x-kimmy-action: write
+      parameters:
+        - name: upsert
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Insert the document when no existing one matches.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/Document" }
+      responses:
+        "200":
+          description: |
+            What happened. `matched` is 0 when nothing was there and `upsert`
+            was not asked for.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [matched, modified, upserted]
+                properties:
+                  matched:
+                    type: integer
+                    enum: [0, 1]
+                    description: |
+                      A count, as on `/update` and `/find_and_modify`, though a
+                      replace touches at most one document. One concept, one
+                      type, across every route that reports a write.
+                  modified:
+                    type: integer
+                    enum: [0, 1]
+                  upserted:
+                    type: boolean
+                    description: Genuinely a yes/no, so it stays one.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+    delete:
+      tags: [documents]
+      operationId: deleteDocument
+      summary: Delete one document by `_id`.
+      x-kimmy-action: write
+      responses:
+        "200":
+          description: 1 if a document was deleted, 0 if there was none.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+                    enum: [0, 1]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/indexes:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [indexes]
+      operationId: listIndexes
+      summary: List the indexes on a collection.
+      x-kimmy-action: read
+      responses:
+        "200":
+          description: The indexes.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [indexes]
+                properties:
+                  indexes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Index" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [indexes]
+      operationId: createIndex
+      summary: Create an index.
+      description: |
+        The backfill is blocking: the response means the index is built and
+        usable, not scheduled.
+
+        `expireAfterSeconds` makes it a TTL index — single-field and
+        dates-only, and a document whose indexed field holds anything else is
+        never expired. `partialFilterExpression` makes it partial, and the
+        filter language is deliberately bounded (`$exists: true`, equality,
+        `$gt`/`$gte`/`$lt`/`$lte`, and conjunction) so that "does this query
+        provably fall inside the index" is a decision rather than a guess.
+        Anything outside that language is refused here rather than producing an
+        index that silently answers with a subset.
+      x-kimmy-action: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fields]
+              properties:
+                fields:
+                  type: array
+                  minItems: 1
+                  description: |
+                    An array rather than a `{field: 1}` object, deliberately:
+                    field order decides which queries a compound index can
+                    answer, and JSON object key order is not something a client
+                    can rely on surviving serialization.
+                  items:
+                    type: object
+                    required: [path]
+                    properties:
+                      path:
+                        type: string
+                      descending:
+                        type: boolean
+                        default: false
+                unique:
+                  type: boolean
+                  default: false
+                name:
+                  type: string
+                  description: Derived from the fields when absent.
+                enforcement:
+                  type: string
+                  enum: [local, coordinated]
+                  default: local
+                expireAfterSeconds:
+                  type: integer
+                  description: Makes this a TTL index.
+                partialFilterExpression:
+                  $ref: "#/components/schemas/Document"
+                  description: Makes this a partial index.
+      responses:
+        "200":
+          description: The index, built and in use.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Index" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: Existing documents break a unique constraint the index would impose.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/db/{db}/coll/{coll}/indexes/{name}:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+      - $ref: "#/components/parameters/IndexName"
+    delete:
+      tags: [indexes]
+      operationId: dropIndex
+      summary: Drop an index.
+      x-kimmy-action: admin
+      responses:
+        "200":
+          description: Dropped, or there was nothing to drop.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dropped]
+                properties:
+                  dropped:
+                    type: boolean
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/vector:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [vectors]
+      operationId: getVectorConfig
+      summary: The collection's embedding configuration.
+      x-kimmy-action: read
+      responses:
+        "200":
+          description: The configuration, or null when embedding is not enabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [vector]
+                properties:
+                  vector:
+                    oneOf:
+                      - $ref: "#/components/schemas/VectorConfig"
+                      - type: "null"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [vectors]
+      operationId: configureVectors
+      summary: Enable or reconfigure embeddings on a collection.
+      description: |
+        Creates a shadow collection `{coll}.__vectors`, maintained by a worker
+        that is an ordinary change-stream subscriber — so existing documents
+        are backfilled rather than needing a separate command, and each
+        document is embedded exactly once cluster-wide.
+
+        Embedding is off the write path: a write returns as soon as its oplog
+        entry is durable, and vectors follow.
+      x-kimmy-action: admin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/VectorConfig" }
+      responses:
+        "200":
+          description: Configured.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [collection, vector, shadow]
+                properties:
+                  collection:
+                    type: string
+                  vector: { $ref: "#/components/schemas/VectorConfig" }
+                  shadow:
+                    type: string
+                    description: Name of the collection holding the vectors.
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [vectors]
+      operationId: disableVectors
+      summary: Stop embedding a collection.
+      x-kimmy-action: admin
+      parameters:
+        - name: drop_vectors
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Discard the stored vectors as well as the configuration.
+      responses:
+        "200":
+          description: Disabled.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [disabled, droppedVectors]
+                properties:
+                  disabled:
+                    type: boolean
+                  droppedVectors:
+                    type: boolean
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/docs/{id}/vectors:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+      - $ref: "#/components/parameters/DocId"
+    get:
+      tags: [vectors]
+      operationId: getDocumentVectors
+      summary: The chunks stored for one document.
+      x-kimmy-action: read
+      responses:
+        "200":
+          description: Every chunk, in split order.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [count, chunks]
+                properties:
+                  count:
+                    type: integer
+                  chunks:
+                    type: array
+                    items:
+                      type: object
+                      required: [chunk, vector, text]
+                      properties:
+                        chunk: { type: integer }
+                        vector:
+                          type: array
+                          items: { type: number }
+                        text: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [vectors]
+      operationId: putDocumentVectors
+      summary: Store vectors a client computed itself.
+      description: |
+        What makes the `byo` provider — the default — usable.
+
+        **Replace-all, per document.** The body is the complete set of chunks
+        for this document; anything previously stored under it and not named
+        here is removed. That is the only semantics under which a shortened
+        document cannot leave orphan chunks matching text it no longer
+        contains.
+
+        The server supplies the source document's HLC itself, so staleness
+        detection keeps working and a client never has to know the internal
+        record shape.
+      x-kimmy-action: write
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: array
+              items:
+                type: object
+                required: [chunk, vector]
+                properties:
+                  chunk:
+                    type: integer
+                    description: Chunk number within the document, in split order.
+                  vector:
+                    type: array
+                    items: { type: number }
+                  text:
+                    type: string
+                    description: |
+                      The text this vector was produced from. Used by the
+                      keyword half of hybrid search.
+      responses:
+        "200":
+          description: Stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [stored, _id]
+                properties:
+                  stored:
+                    type: integer
+                  _id: {}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [vectors]
+      operationId: deleteDocumentVectors
+      summary: Discard one document's vectors.
+      x-kimmy-action: write
+      responses:
+        "200":
+          description: How many chunks were removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted]
+                properties:
+                  deleted:
+                    type: integer
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/vector_search:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [vectors]
+      operationId: vectorSearch
+      summary: k-nearest-neighbour search.
+      description: |
+        Send `query` text to have the server embed it, or `vector` to search by
+        a vector you computed. A `byo` collection has no server-side provider,
+        so it requires `vector`.
+
+        `filter` post-filters: the graph search widens to compensate, because a
+        pre-filter would need the index to know about document state it
+        deliberately does not track. Filtering requires `read` alongside
+        `search`.
+      x-kimmy-action: search (plus read when filtering)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: The matches, best first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: An embedding provider failed. The upstream's fault, not the caller's.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/db/{db}/coll/{coll}/hybrid_search:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    post:
+      tags: [vectors]
+      operationId: hybridSearch
+      summary: Vector and keyword search, fused.
+      description: |
+        Reciprocal rank fusion over a dense half and a lexical half, each
+        retrieved wider than `k` so a document ranked modestly by both can beat
+        one ranked first by only one.
+
+        **`query` text is required.** The lexical half cannot be derived from a
+        bare vector, so that request is refused rather than silently degrading
+        to plain vector search.
+      x-kimmy-action: search (plus read when filtering)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/SearchRequest" }
+      responses:
+        "200":
+          description: The fused matches, best first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SearchResponse" }
+        "400":
+          description: Missing `query`, or an otherwise unanswerable request.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502":
+          description: An embedding provider failed.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/db/{db}/coll/{coll}/webhooks:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [webhooks]
+      operationId: listWebhooks
+      summary: List the subscriptions on a collection.
+      description: Secrets are never included.
+      x-kimmy-action: webhook
+      responses:
+        "200":
+          description: The subscriptions.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [webhooks, count]
+                properties:
+                  webhooks:
+                    type: array
+                    items: { $ref: "#/components/schemas/Webhook" }
+                  count:
+                    type: integer
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [webhooks]
+      operationId: registerWebhook
+      summary: Register a webhook.
+      description: |
+        Requires the `webhook` action rather than `watch`: this hands out an
+        ongoing egress path to an address the grant never named, which outlives
+        the token that created it.
+
+        Delivery starts from *now*, not from the beginning of the retained
+        oplog — registering on a busy collection does not produce a flood of
+        history at whatever endpoint was just wired up.
+
+        The signing secret is generated here, returned **once**, and never
+        again. A caller who loses it re-registers.
+      x-kimmy-action: webhook
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  description: |
+                    Checked against the egress policy here, and again before
+                    every delivery — a name that resolves publicly now can
+                    resolve inward later.
+                operations:
+                  type: array
+                  description: Absent means every operation.
+                  items:
+                    type: string
+                    enum: [insert, update, replace, delete]
+      responses:
+        "200":
+          description: Registered. The secret appears here and nowhere else.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [id, url, secret]
+                properties:
+                  id: { type: string }
+                  url: { type: string }
+                  secret:
+                    type: string
+                    description: HMAC key for verifying deliveries. Shown once.
+                  note: { type: string }
+        "400":
+          description: A malformed URL, an unknown operation, or a destination the egress policy refuses.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/webhooks/{id}:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+      - $ref: "#/components/parameters/WebhookId"
+    delete:
+      tags: [webhooks]
+      operationId: removeWebhook
+      summary: Remove a subscription.
+      description: |
+        A subscription registered on another collection cannot be removed by
+        guessing its id from a collection the caller does hold a grant on — the
+        record is read and checked before it is deleted.
+      x-kimmy-action: webhook
+      responses:
+        "200":
+          description: Removed.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [removed]
+                properties:
+                  removed:
+                    type: boolean
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/db/{db}/coll/{coll}/watch:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [streaming]
+      operationId: watchCollection
+      summary: Open a change stream (WebSocket).
+      description: |
+        A WebSocket upgrade. Once open, the server sends one JSON text frame
+        per change; the client sends nothing but may close.
+
+        **Resume tokens are portable across nodes.** A token taken from one
+        node resumes correctly on any other, which is what makes a
+        round-robin client workable.
+
+        Authorization happens *before* the upgrade, and so does opening the
+        stream — an expired resume token is a `410` rather than an
+        unexplained socket close after a successful handshake.
+
+        Every event carries `resumeToken` and `clusterTime`. `fullDocument` is
+        included only when asked for, and is dropped from an oversized event
+        rather than dropping the event.
+
+        OpenAPI cannot describe a WebSocket session, so the frame schema is in
+        `components.schemas.ChangeEvent` and this operation documents the
+        handshake alone.
+      x-kimmy-action: watch
+      parameters:
+        - name: resume_after
+          in: query
+          required: false
+          schema: { type: string }
+          description: Resume immediately after this token.
+        - name: from_start
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Replay from the beginning of the retained oplog.
+        - name: full_document
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Include the full post-image on every event.
+      responses:
+        "101":
+          description: |
+            Upgraded. Frames from here on are `ChangeEvent` objects as JSON
+            text.
+        "400":
+          description: Not a WebSocket upgrade request, or a malformed resume token.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "410":
+          description: |
+            The resume token points past the retention horizon. The stream
+            cannot be continued; the client must start again and reconcile.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/admin/backup:
+    get:
+      tags: [admin]
+      operationId: backup
+      summary: Stream a consistent backup of this node.
+      description: |
+        Requires `admin` over `*` — the same bar as managing users, and for the
+        same reason: a backup is *every* document on the node, so anything less
+        would let a database-scoped administrator read past their own grants.
+        There is no filtered backup, because a partial backup that looks like a
+        whole one is a restore that silently loses data.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: The backup, as an attachment.
+          headers:
+            Content-Disposition:
+              schema: { type: string }
+              description: '`attachment; filename="kimmy-{node}-{created}.backup"`'
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: A token from `POST /v1/auth/login`.
+
+  parameters:
+    Db:
+      name: db
+      in: path
+      required: true
+      schema: { type: string }
+      description: Database name.
+    Coll:
+      name: coll
+      in: path
+      required: true
+      schema: { type: string }
+      description: Collection name.
+    DocId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: |
+        The document's `_id` as a path segment. A 24-character hex string is
+        read as an ObjectId, a bare integer as an Int64, and anything else as a
+        string.
+    UserName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: Username.
+    IndexName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: Index name.
+    WebhookId:
+      name: id
+      in: path
+      required: true
+      schema: { type: string }
+      description: Subscription id, as returned by registration.
+
+  responses:
+    BadRequest:
+      description: The request could not be understood or is not answerable as asked.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: |
+        No token, an invalid or expired token, or a token whose account has
+        since been deleted, disabled, or had its sessions revoked.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: |
+        Denied by RBAC. Deliberately identical whether or not the target
+        exists — a distinct 404 would let a caller probe for collections they
+        cannot access.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: No such database, collection, document or record.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Conflict:
+      description: |
+        A duplicate `_id`, or a value that would break a unique index.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Over a rate limit. Carries `Retry-After`.
+      headers:
+        Retry-After:
+          schema: { type: integer }
+          description: |
+            Seconds to wait. Always present on a 429 — a refusal that does not
+            say when to come back leaves a client to guess, and clients guess
+            badly.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+
+  schemas:
+    Error:
+      type: object
+      description: |
+        The envelope every failure uses, including a body the framework itself
+        rejected. The HTTP status carries the class; `error` is what a client
+        branches on.
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: |
+            A stable, machine-readable code. Currently in use: `bad_request`,
+            `unauthorized`, `forbidden`, `not_found`, `conflict`,
+            `duplicate_key`, `unique_violation`, `rate_limited`,
+            `payload_too_large`, `unsupported_media_type`,
+            `resume_token_expired`, `not_implemented`, `misconfigured`,
+            `provider_error`, `snapshot`, `internal`. Enumerating this set as a
+            closed, tested contract — and saying which codes are retryable — is
+            M10 task 2, so a client should treat an unlisted code as its HTTP
+            status class.
+        message:
+          type: string
+          description: Human-readable. Not stable; do not parse it.
+
+    Document:
+      type: object
+      description: |
+        An arbitrary document, encoded as Extended JSON v2. There is no schema:
+        the store is schemaless by design, and a schema inferred from a sample
+        would make perfectly valid documents unrepresentable (ADR-055).
+      additionalProperties: true
+
+    Grant:
+      type: object
+      description: |
+        One grant: a set of actions over a database and a collection pattern.
+        `*` matches anything; a collection pattern may end in a single `*`.
+      required: [db, actions]
+      properties:
+        db:
+          type: string
+        collection:
+          type: string
+          default: "*"
+        actions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, watch, search, webhook, admin]
+            description: |
+              `admin` implies everything and `write` implies `read`, so those
+              do not need listing separately. `watch`, `search` and `webhook`
+              are independent: a webhook hands out an ongoing egress path,
+              which is a different act from being allowed to read.
+
+    User:
+      type: object
+      required: [user, grants]
+      properties:
+        user: { type: string }
+        grants:
+          type: array
+          items: { $ref: "#/components/schemas/Grant" }
+        disabled: { type: boolean }
+
+    Updated:
+      type: object
+      required: [updated]
+      properties:
+        updated:
+          type: string
+          description: The name of what changed.
+
+    FindRequest:
+      type: object
+      description: |
+        Every read parameter. `filter`, `sort` and `projection` follow the
+        query language in `docs/query-language.md`.
+      properties:
+        filter: { $ref: "#/components/schemas/Document" }
+        sort: { $ref: "#/components/schemas/Document" }
+        projection: { $ref: "#/components/schemas/Document" }
+        limit:
+          type: integer
+          minimum: 0
+        skip:
+          type: integer
+          minimum: 0
+          description: |
+            Costs work proportional to what it skips. Use `cursor` for paging;
+            `skip` is for jumping.
+        explain:
+          type: boolean
+          default: false
+          description: Report how the query was answered alongside the results.
+        cursor:
+          type: string
+          description: |
+            A `nextCursor` from a previous page. Opaque, node-portable, and
+            carries no server state.
+
+    FindResponse:
+      type: object
+      required: [documents, count]
+      properties:
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/Document" }
+        count:
+          type: integer
+          description: Documents in *this page*, not in the collection.
+        nextCursor:
+          type: string
+          description: |
+            Present when the page filled and the query is one a cursor can
+            continue. Absent means either the end of the results or a query
+            whose order a cursor cannot express — never a token that would
+            page in a different order than the one asked for.
+        explain: { $ref: "#/components/schemas/Explain" }
+
+    Explain:
+      type: object
+      description: How a query was answered. Present only when `explain` was requested.
+      required: [strategy, index, indexFieldsUsed, documentsExamined, documentsMatched]
+      properties:
+        strategy:
+          type: string
+          enum: [collectionScan, index, indexUnion]
+          description: |
+            `indexUnion` is a union of equality probes — the shape `$in`
+            planning produces — and is named rather than folded into `index`
+            because it is a different amount of work.
+        index:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: The index used, or null for a collection scan.
+        indexFieldsUsed: { type: integer }
+        documentsExamined: { type: integer }
+        documentsMatched: { type: integer }
+        probes:
+          type: integer
+          description: Index ranges scanned. Present only when more than one.
+
+    Index:
+      type: object
+      required: [name, fields, unique, enforcement, multikey]
+      properties:
+        name: { type: string }
+        fields:
+          type: array
+          items:
+            type: object
+            required: [path, descending]
+            properties:
+              path: { type: string }
+              descending: { type: boolean }
+        unique: { type: boolean }
+        enforcement:
+          type: string
+          enum: [local, coordinated]
+        multikey:
+          type: boolean
+          description: |
+            Set once any indexed document held an array at an indexed path, and
+            never cleared. Surfaced so an operator can see *why* a two-sided
+            range on this index does not stop at its upper bound.
+        expireAfterSeconds:
+          type: integer
+          description: Present only on a TTL index.
+        partialFilterExpression:
+          $ref: "#/components/schemas/Document"
+          description: Present only on a partial index.
+
+    CollectionDescription:
+      type: object
+      required: [database, collection, documentCount, sampled, fields, indexes, vector]
+      properties:
+        database: { type: string }
+        collection: { type: string }
+        documentCount: { type: integer }
+        sampled:
+          type: integer
+          description: Documents actually examined to produce this.
+        fields:
+          type: array
+          items:
+            type: object
+            required: [path, types, presence]
+            properties:
+              path:
+                type: string
+                description: Dotted for nested fields.
+              types:
+                type: array
+                items: { type: string }
+              presence:
+                type: number
+                description: |
+                  Fraction of the *sampled* documents holding this field,
+                  rounded to three decimals — the raw ratio carries false
+                  precision.
+              example: {}
+        indexes:
+          type: array
+          items: { $ref: "#/components/schemas/Index" }
+        vector:
+          oneOf:
+            - $ref: "#/components/schemas/VectorConfig"
+            - type: "null"
+
+    VectorConfig:
+      type: object
+      required: [fields, provider, dim]
+      properties:
+        fields:
+          type: array
+          minItems: 1
+          items: { type: string }
+          description: Document fields whose text is embedded, in order. Dot paths allowed.
+        provider: { $ref: "#/components/schemas/ProviderConfig" }
+        dim:
+          type: integer
+          minimum: 1
+          maximum: 16384
+          description: |
+            Vector width, pinned at configuration time. Changing a model
+            changes this, and mixing widths in one index is meaningless, so a
+            change requires an explicit reindex.
+        metric:
+          type: string
+          enum: [cosine, euclidean, dot]
+          default: cosine
+        chunk:
+          type: object
+          properties:
+            max_chars:
+              type: integer
+              default: 2000
+              description: |
+                Characters rather than tokens: a token count depends on the
+                model's tokenizer, which storage has no business knowing about.
+            overlap:
+              type: integer
+              default: 200
+
+    ProviderConfig:
+      type: object
+      description: |
+        Tagged by `kind`. `byo` is the default and the only one needing nothing
+        external — no API key, no network, no model download. API keys are
+        named by environment variable and never stored in collection metadata.
+      required: [kind]
+      properties:
+        kind:
+          type: string
+          enum: [byo, openai, ollama, custom_http, cohere, gemini, local]
+        model: { type: string }
+        endpoint: { type: string }
+        api_key_env: { type: string }
+
+    SearchRequest:
+      type: object
+      properties:
+        query:
+          type: string
+          description: Query text, embedded server-side. Needs a server-side provider.
+        vector:
+          type: array
+          items: { type: number }
+          description: A pre-computed query vector. Required when the provider is `byo`.
+        filter:
+          $ref: "#/components/schemas/Document"
+          description: Restrict results to documents matching this filter.
+        k:
+          type: integer
+          minimum: 1
+          maximum: 1000
+          default: 10
+        per_document:
+          type: integer
+          description: Chunks per document allowed into the results.
+
+    SearchResponse:
+      type: object
+      required: [count, matches]
+      properties:
+        count: { type: integer }
+        matches:
+          type: array
+          items:
+            type: object
+            required: [_id, score, chunk, text]
+            properties:
+              _id: {}
+              score: { type: number }
+              chunk: { type: integer }
+              text: { type: string }
+
+    Webhook:
+      type: object
+      description: A registered subscription. The signing secret is never included.
+      required: [id, database, collection, url, operations, createdBy, createdMs]
+      properties:
+        id: { type: string }
+        database: { type: string }
+        collection: { type: string }
+        url: { type: string }
+        operations:
+          type: array
+          description: Empty means every operation.
+          items:
+            type: string
+            enum: [insert, update, replace, delete]
+        createdBy:
+          type: string
+          description: |
+            Who registered it. A subscription outlives the token that created
+            it, so the record of who asked for it matters.
+        createdMs: { type: integer }
+
+    ChangeEvent:
+      description: |
+        One frame on a change-stream WebSocket. Not reachable through any HTTP
+        response — it is here because OpenAPI has nowhere else to put a
+        WebSocket frame, and a client needs the shape.
+
+        DDL is not delivered: clients see data, not schema changes.
+      oneOf:
+        - type: object
+          title: change
+          required: [operationType, resumeToken, clusterTime]
+          properties:
+            operationType:
+              type: string
+              enum: [insert, update, replace, delete]
+            resumeToken:
+              type: string
+              description: Portable across nodes. Send it as `resume_after` to continue.
+            clusterTime:
+              type: string
+              description: The originating node's HLC.
+            documentKey:
+              type: object
+              properties:
+                _id: {}
+            fullDocument:
+              $ref: "#/components/schemas/Document"
+              description: |
+                Only when `full_document` was requested. Dropped from an
+                oversized event — the event still goes.
+        - type: object
+          title: uniqueViolation
+          description: |
+            A constraint that a merge of replicated writes broke. Not a
+            document change, so it carries no `documentKey`; both documents
+            remain, and every node that merges reports it.
+          required: [operationType, resumeToken, clusterTime, index, merged, documentKeys]
+          properties:
+            operationType:
+              const: uniqueViolation
+            resumeToken: { type: string }
+            clusterTime: { type: string }
+            index: { type: string }
+            merged: {}
+            documentKeys:
+              type: array
+              items:
+                type: object
+                properties:
+                  _id: {}
+        - type: object
+          title: invalidate
+          description: |
+            The stream cannot continue — the collection was dropped, or the
+            resume point fell past the retention horizon. The server closes the
+            socket after this frame.
+          required: [operationType, reason]
+          properties:
+            operationType:
+              const: invalidate
+            reason: { type: string }

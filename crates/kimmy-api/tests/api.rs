@@ -308,6 +308,59 @@ async fn documents_round_trip_through_the_api() {
 }
 
 #[tokio::test]
+async fn replacing_by_id_reports_counts_and_needs_upsert_to_create() {
+    // Two things nothing covered until the protocol was specified, both
+    // client-visible:
+    //
+    // **Without `upsert` a missing document is not an error.** The answer is
+    // `200 {"matched": 0}` and nothing is written — which is how a cluster
+    // drive once built a whole conflict test on this route, wrote nothing, and
+    // passed because five nodes agreed on the same non-answer.
+    //
+    // **`matched` and `modified` are counts**, as on `/update` and
+    // `/find_and_modify`. This route used to serialize `WriteOutcome`'s bools
+    // straight to the wire, so one protocol carried two types under one field
+    // name (ADR-056).
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let missing = server
+        .put("/v1/db/shop/coll/orders/docs/ghost", Some(&token), json!({ "item": "widget" }))
+        .await;
+    assert_eq!(missing.status, 200, "{:?}", missing.body);
+    assert_eq!(missing.body["matched"], 0, "a miss is a count, not `false`");
+    assert_eq!(missing.body["modified"], 0);
+    assert_eq!(missing.body["upserted"], false);
+    assert_eq!(
+        server.get("/v1/db/shop/coll/orders/docs/ghost", Some(&token)).await.status,
+        404,
+        "nothing may be written without ?upsert=true"
+    );
+
+    let created = server
+        .put(
+            "/v1/db/shop/coll/orders/docs/ghost?upsert=true",
+            Some(&token),
+            json!({ "item": "widget" }),
+        )
+        .await;
+    assert_eq!(created.body["matched"], 0, "an upsert did not match, it created");
+    assert_eq!(created.body["upserted"], true);
+
+    let replaced = server
+        .put("/v1/db/shop/coll/orders/docs/ghost", Some(&token), json!({ "item": "sprocket" }))
+        .await;
+    assert_eq!(replaced.body["matched"], 1);
+    assert_eq!(replaced.body["modified"], 1);
+    assert_eq!(replaced.body["upserted"], false);
+    assert_eq!(
+        server.get("/v1/db/shop/coll/orders/docs/ghost", Some(&token)).await.body["item"],
+        "sprocket"
+    );
+}
+
+#[tokio::test]
 async fn a_duplicate_id_is_a_conflict() {
     let server = Server::start().await;
     let token = server.root().await;

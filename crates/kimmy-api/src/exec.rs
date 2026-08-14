@@ -470,9 +470,17 @@ pub fn replace(
     let doc_id = parse_id(id)?;
     let doc = json_to_document(document)?;
     let outcome = state.engine.replace(&meta, &doc_id, doc, upsert)?;
+    // Counts, not booleans, even though a replace touches at most one document.
+    //
+    // `WriteOutcome` is three bools and this route used to serialize them
+    // straight through, so `matched` was `true` here and `3` on `/update` —
+    // the same field name carrying two types on one protocol. Nothing stated
+    // the type, so nothing disagreed until the specification's contract test
+    // drove both routes and compared them (ADR-056). `upserted` stays a
+    // boolean because it genuinely is one.
     Ok(json!({
-        "matched": outcome.matched,
-        "modified": outcome.modified,
+        "matched": u8::from(outcome.matched),
+        "modified": u8::from(outcome.modified),
         "upserted": outcome.upserted,
     }))
 }
