@@ -798,6 +798,22 @@ hanging.
 
 ---
 
+## Benchmarks are not tests, and one of them drives the server
+
+`cargo bench -p kimmyd --bench http` is the odd one out: it spawns the shipped
+`kimmyd` binary and drives it with concurrent HTTP clients, so it exercises the
+same surface the integration tests do — but it asserts nothing. It is a
+measurement, recorded by hand in [Benchmarks](benchmarks.md), and deliberately
+not a gate: a threshold on a shared runner produces failures people learn to
+ignore.
+
+It is listed here because it is the only thing in the repository that answers
+"how fast is this from a client's seat", and because it found something no test
+did — a single write costs about twice as much through the daemon as at the
+engine, which is recorded as an open question rather than explained.
+
+---
+
 ## Running
 
 ```bash

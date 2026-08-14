@@ -6,12 +6,13 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 6 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 task 7 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–6 are done: #65–#69 merged, task 6 is on
-`m10-protocol-cursors` with a PR open and unmerged. **Every reserved decision
-in the milestone is settled** — tasks 7–12 have none, and the remaining work is
-building against a contract that is now written down and checked.
+**M0–M9 complete.** M10 tasks 1–7 are done: #65–#70 merged, task 7 is on
+`m10-http-bench` with a PR open and unmerged. **Every reserved decision in the
+milestone is settled** — the protocol half of M10 is finished, and tasks 8–12
+are the clients, built against a contract that is written down, checked, and
+now measured.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -32,17 +33,19 @@ price ([ADR-060](decisions.md)).
 Task 6: the paging contract, and **node portability tested on three real nodes**
 rather than argued from the encoding.
 
-**Next is task 7**, the HTTP-level benchmark harness, off fresh `main` once task
-6 merges. No reserved decision. It is the task that answers a question currently
-unanswerable: **every figure in [Benchmarks](benchmarks.md) is taken at the
-storage engine**, so JSON and Extended JSON conversion, per-request token
-verification, TLS and concurrent clients are all outside the published numbers.
-Until it exists there is no honest answer to "what throughput can a client
-expect" — and that file's own retracted-figure note is what happens when one
-gets quoted anyway. Release build, real socket, reads and writes, TLS on and
-off. Note the first-request warm-up: the cursor drive measured 20.7 ms on page
-zero and sub-millisecond after, so discard the first sample or say plainly that
-you did.
+Task 7: the HTTP benchmark harness, and the numbers it produced.
+
+**Next is task 8**, the Rust client `kimmy-client`, off fresh `main` once task 7
+merges. No reserved decision beyond the HTTP/async stack, and that one is
+effectively settled by the tree: `reqwest` with `rustls-tls` is already a
+workspace dependency and adding a second HTTP stack would undo the native-deps
+discipline. **`kimmy-cli` is the ready-made consumer** — its 464 lines hand-roll
+every HTTP call, and converting it is what proves the client is pleasant rather
+than merely present. The client owes: auth with refresh (task 4), cursor
+iteration (task 6), change streams over WebSocket with reconnect and resume,
+typed errors carrying the retry class (task 2), and multi-node failover driven
+by `/v1/topology` (task 5). Every one of those is now a specified, tested
+server-side promise — which is what tasks 1–7 were for.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -109,7 +112,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-versioning` | ✅ Merged as #67. M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
 | `m10-token-refresh` | ✅ Merged as #68. M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
 | `m10-topology` | ✅ Merged as #69. M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
-| `m10-protocol-cursors` | **Open, PR raised, not merged.** M10 task 6: the paging contract in the specification, and cross-node paging in the harness |
+| `m10-protocol-cursors` | ✅ Merged as #70. M10 task 6: the paging contract, and cross-node paging in the harness |
+| `m10-http-bench` | **Open, PR raised, not merged.** M10 task 7: `cargo bench -p kimmyd --bench http`, and the numbers in [Benchmarks](benchmarks.md) |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -234,7 +238,7 @@ work.
 | 4 | ✅ **Token refresh** | Settled: sliding re-issue, no grace for an expired token (ADR-059) |
 | 5 | ✅ **Client-visible topology / discovery** | Settled: replicated registry for addresses, SWIM for liveness (ADR-060) |
 | 6 | ✅ **Cursors at the protocol level** | — (M9 settled the shape; this settled the wire contract) |
-| 7 | **HTTP-level benchmark harness** | — |
+| 7 | ✅ **HTTP-level benchmark harness** | — |
 | 8 | **Rust client**, `kimmy-client`; the CLI becomes its consumer | HTTP/async stack |
 | 9 | **Python client** | HTTP/async stack |
 | 10 | **Go client** | HTTP stack |
@@ -470,19 +474,44 @@ after the same key. Enforcing it would mean putting the query inside the token,
 which makes it large and gives clients structure to depend on in something they
 are told to treat as opaque.
 
+### What task 7 did, and the one thing it could not explain
+
+`cargo bench -p kimmyd --bench http` spawns the **shipped binary** and drives it
+with concurrent clients over a real socket — plaintext and TLS, reads and
+writes, warm-up discarded, percentiles rather than a mean. Not a Criterion
+bench: throughput under contention is not a shape Criterion measures. Recorded,
+not gated, like everything else in [Benchmarks](benchmarks.md).
+
+- **TLS is close to free** — within noise at one client, ~10% at thirty-two.
+- **The protocol costs ~0.1 ms per request**, measured as a point read's p50.
+- **Reads scale, writes do not**: 8,001/s → 70,660/s against 143/s → 602/s,
+  with write p99 going 10 ms → 246 ms. One redb writer, experienced by a client
+  as tail latency.
+- **`count` is a collection scan** at 30/s over 10,000 documents, and barely
+  scales. Worth knowing before a client polls one.
+
+**And a gap it could not explain.** A single insert is 7.0 ms over HTTP against
+~3.4 ms at the engine. It is *not* protocol overhead — the read numbers bound
+that at 0.1 ms — and not per-document encoding, since the gap is fixed per
+request rather than growing with batch size. Candidates: the background oplog
+consumers a daemon runs and a bare `Engine` does not, or a commit's fsync on a
+runtime worker thread. **Recorded as a 🟡 question**, because a cause that has
+not been measured is not a cause. Halving it would double single-write
+throughput for every client that does not batch.
+
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because
 `Members` holds *peers only*, and the authenticated-peers invariant (ADR-053)
 now also stops an unauthenticated node being advertised to clients as somewhere
 to send credentials. Anything new reading `Members` still inherits both.
 
-**Task 7 is the one that answers a question currently unanswerable.** Every
-figure in [Benchmarks](benchmarks.md) is taken at the storage engine — nothing
-measures the socket, so JSON conversion, per-request token verification, TLS
-and concurrent HTTP clients are all outside the published numbers. Until it
-exists there is no honest answer to "what throughput can a client expect", and
-that file's own retracted-figure note is what happens when one gets quoted
-anyway.
+**Task 7 answered the question that had been unanswerable**, and the numbers
+are in [Benchmarks](benchmarks.md): TLS is close to free, the protocol costs
+~0.1 ms per request, reads scale with clients (8,001/s → 70,660/s) and writes
+do not (143/s → 602/s, p99 10 ms → 246 ms). It also found something no
+engine-level benchmark could: a single write costs about **twice** as much
+through the daemon as at the engine, which is neither protocol overhead nor
+encoding, and is recorded as an open question rather than explained.
 
 ### How to size the next thing after M10
 
