@@ -46,6 +46,19 @@ pub struct ServerConfig {
     pub mcp_allowed_hosts: Vec<String>,
     pub rate_limit: RateLimitConfig,
     pub tls: TlsConfig,
+    /// The URL clients should use to reach *this* node, published to the
+    /// cluster so `/v1/topology` can hand it to them.
+    ///
+    /// Cannot be inferred, which is why it is configuration rather than
+    /// something the node works out: a node bound to `0.0.0.0` has no single
+    /// address, and the address clients actually reach may belong to a proxy,
+    /// a load balancer or a Kubernetes service rather than to this process. A
+    /// wrong guess here is published to every client in the cluster, so a node
+    /// with a wildcard bind and no value set advertises nothing and says so.
+    ///
+    /// With a concrete bind it defaults to that address, with the scheme
+    /// following whether this node terminates TLS.
+    pub advertise: Option<String>,
 }
 
 /// Native TLS termination for the HTTP, WebSocket and MCP listener.
@@ -324,6 +337,7 @@ impl Default for ServerConfig {
             mcp_allowed_hosts: Vec::new(),
             rate_limit: RateLimitConfig::default(),
             tls: TlsConfig::default(),
+            advertise: None,
         }
     }
 }

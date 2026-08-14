@@ -36,6 +36,36 @@ pub struct AppState {
     /// exists, is still enabled, and has not had its tokens invalidated.
     /// Cached, and kept honest by an oplog consumer (ADR-052).
     pub sessions: crate::sessions::Sessions,
+    /// The live member set, once clustering has started.
+    ///
+    /// Set late rather than passed in, because the router is built before the
+    /// cluster task exists. A `OnceLock` rather than a lock that can be
+    /// rewritten: there is one member set for the life of the process, and
+    /// making that expressible is worth more than the flexibility.
+    ///
+    /// **It holds peers, never this node.** Anything derived from it has to
+    /// add `me` explicitly — the omission that silently undelivered every
+    /// clustered webhook (ADR-051).
+    pub(crate) members: std::sync::OnceLock<kimmy_cluster::Members>,
+}
+
+impl AppState {
+    /// Hand the state the live member set. Called once, after the cluster
+    /// starts; a second call is ignored.
+    pub fn set_members(&self, members: kimmy_cluster::Members) {
+        let _ = self.members.set(members);
+    }
+
+    /// The live member set, if this node is clustered.
+    ///
+    /// Reading it is safe **because every member is authenticated** — every
+    /// membership datagram carries an HMAC over `cluster_secret`, verified
+    /// before foca sees it (ADR-053). That invariant now protects more than
+    /// webhook ownership: an unauthenticated peer in this set would be
+    /// advertised to clients as a node to send credentials to.
+    pub fn members(&self) -> Option<&kimmy_cluster::Members> {
+        self.members.get()
+    }
 }
 
 pub type SharedState = Arc<AppState>;

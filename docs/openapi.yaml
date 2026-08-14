@@ -330,6 +330,54 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /v1/topology:
+    get:
+      tags: [health]
+      operationId: topology
+      summary: The nodes a client may use.
+      description: |
+        **Every node accepts writes**, so client-side node selection here is
+        round-robin plus retry elsewhere — there is no primary to funnel
+        through, and none of the machinery a driver needs to find one.
+
+        Two sources, because neither answers alone. The **address** of a node
+        comes from a replicated registry each node writes itself into;
+        **liveness** comes from SWIM membership. So `endpoint` says where, and
+        `status` says whether this node currently sees it.
+
+        `status` is `live` or `unknown`, never `down`: a node whose gossip is
+        partitioned while its HTTP is perfectly reachable is a real state in a
+        leaderless cluster, and `unknown` is the honest word for "this node has
+        not heard from it". A client may still try one — a failed request costs
+        one round trip, and `retry: elsewhere` already covers it.
+
+        **The answering node always appears, marked `self`, and first.** A
+        client reading the list top-down should not be moved off the node
+        already serving it.
+
+        A node that has not been told what to advertise appears with a null
+        `endpoint`. That happens when it binds a wildcard address and no
+        `server.advertise` is configured — a node guessing its own address
+        would publish a wrong one to every client in the cluster.
+
+        Authenticated, unlike `/v1/version`: a version is a fact about
+        software, and this is a map of where a deployment's data lives.
+      responses:
+        "200":
+          description: Every node this one knows about.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [nodes, count]
+                properties:
+                  nodes:
+                    type: array
+                    items: { $ref: "#/components/schemas/Node" }
+                  count:
+                    type: integer
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
   /v1/auth/whoami:
     get:
       tags: [auth]
@@ -1990,6 +2038,7 @@ components:
         | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
         | `partial-indexes` | `partialFilterExpression` on index creation |
         | `token-refresh` | `POST /v1/auth/refresh`, so an active client never re-sends credentials |
+        | `topology` | `GET /v1/topology`, the nodes a client may fail over to |
         | `ttl-indexes` | `expireAfterSeconds` on index creation |
         | `vector-search` | `POST .../vector_search` |
         | `webhooks` | Registering an endpoint to push change events to |
@@ -2005,6 +2054,7 @@ components:
         - local-embeddings
         - partial-indexes
         - token-refresh
+        - topology
         - ttl-indexes
         - vector-search
         - webhooks
@@ -2062,6 +2112,42 @@ components:
               do not need listing separately. `watch`, `search` and `webhook`
               are independent: a webhook hands out an ongoing egress path,
               which is a different act from being allowed to read.
+
+    Node:
+      type: object
+      description: |
+        One node of the cluster, as this node understands it.
+      required: [node, endpoint, version, status, self]
+      properties:
+        node:
+          type: string
+          description: The node id, stable across restarts and address changes.
+        endpoint:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: |
+            The URL clients should use, as the node itself advertises it. Null
+            when the node has not been told what to advertise; the answering
+            node may be null this way and still be usable, since a client that
+            reached it already knows its address.
+        version:
+          oneOf:
+            - type: string
+            - type: "null"
+          description: |
+            The build the node was running when it last registered, which is at
+            its last start. Useful mid-rolling-upgrade.
+        status:
+          type: string
+          enum: [live, unknown]
+          description: |
+            `live` if the answering node currently sees it in the cluster, or if
+            it *is* the answering node. `unknown` otherwise — registered, but
+            not currently vouched for.
+        self:
+          type: boolean
+          description: Whether this is the node that answered.
 
     Token:
       type: object

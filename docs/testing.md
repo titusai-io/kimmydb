@@ -624,11 +624,22 @@ a *document*.
 | Every versioned route is under `/v1/`, and the server, the routes and `info.version` agree | `every_versioned_route_carries_the_protocol_major` |
 | No response schema forbids unknown properties, so adding a field stays additive | `no_response_schema_forbids_the_fields_it_has_not_seen` |
 | The advertised capabilities are the documented ones, each with an explanation | `the_capability_set_is_the_documented_one` |
+| Topology lists the answering node, which the member set never contains | `topology_lists_this_node_even_though_the_member_set_never_contains_it` |
+| A registered peer reads `unknown` until membership sees it | `a_registered_peer_is_reported_unknown_until_membership_sees_it` |
 
 The coverage assertion is the load-bearing part: it means a route cannot be
 added to the router and the specification without also being driven here. A
 specification entry nothing executes is the failure mode this whole file exists
 to prevent — a claim with no mechanism behind it.
+
+**Two of those rows belong to a claim only the cluster harness can settle.**
+`every_node_can_tell_a_client_about_every_node` boots three real nodes and
+requires each to list all three as `live` with its real address — including one
+whose seed list never named it, which only replication explains — then uses a
+token from one node at every advertised address, then kills a node and requires
+it to be reported `unknown` rather than to vanish. The in-process tests prove
+the assembly is right; the harness proves the assembled thing is true, which is
+the distinction M8 task 1 was built on.
 
 ---
 

@@ -36,6 +36,7 @@ has been incomplete before.
 | `GET` | `/metrics` | — public |
 | `POST` | `/v1/auth/login` | — public |
 | `POST` | `/v1/auth/refresh` | authenticated — see [Tokens](#tokens) |
+| `GET` | `/v1/topology` | authenticated — see [Topology](#topology) |
 | `GET` | `/v1/version` | — public — see [Version and capabilities](#version-and-capabilities) |
 | `GET` | `/v1/auth/whoami` | authenticated |
 | `GET` `POST` | `/v1/users` | server admin |
@@ -443,6 +444,53 @@ token version and invalidates every token that user holds.
 
 **The new token carries current authority**, read from the user record rather
 than copied from the old token's claims.
+
+---
+
+## Topology
+
+```bash
+curl localhost:7878/v1/topology -H "$A"
+```
+
+```json
+{ "nodes": [
+    { "node": "c88b8984-…", "endpoint": "http://10.0.0.5:7878",
+      "version": "0.1.0", "status": "live", "self": true },
+    { "node": "fa5b2a9e-…", "endpoint": "http://10.0.0.6:7878",
+      "version": "0.1.0", "status": "unknown", "self": false } ],
+  "count": 2 }
+```
+
+**Every node accepts writes**, so client-side selection is round-robin plus
+retry elsewhere. There is no primary to find and none of the machinery a driver
+needs to find one — which is the one thing this is straightforwardly better at
+than a replica-set driver, rather than merely different.
+
+Two sources, deliberately ([ADR-060](decisions.md)):
+
+- **Where** a node is comes from a replicated registry each node writes itself
+  into. Addresses are not in SWIM: its identity carries the *gossip* address,
+  and it is postcard-encoded, so adding a field there is a stop-the-cluster
+  upgrade.
+- **Whether** it is there comes from SWIM membership.
+
+`status` is `live` or `unknown`, never `down`. A node whose gossip is
+partitioned while its HTTP is perfectly reachable is a real state here, and
+`unknown` is the honest word for "this node has not heard from it". Trying one
+costs a round trip, and `retry: elsewhere` already covers the outcome.
+
+**The answering node is always listed, marked `self`, and first** — a client
+reading top-down should not be moved off the node already serving it.
+
+A node appears with a null `endpoint` when it has not been told what to
+advertise. Set `server.advertise` to the URL clients should use; it cannot be
+inferred, because a node bound to `0.0.0.0` has no single address and the
+address clients reach may belong to a proxy. A node that guessed would publish
+a wrong address to every client in the cluster.
+
+Authenticated, unlike `/v1/version`: a version is a fact about software, this
+is a map of where a deployment's data lives.
 
 ---
 

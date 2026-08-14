@@ -9,6 +9,19 @@
 # Address for HTTP, WebSocket change streams, and the MCP endpoint.
 bind = "0.0.0.0:7878"
 
+# The URL clients should use to reach *this* node.
+#
+# Published to the cluster so `/v1/topology` can hand it to clients that want to
+# fail over. It cannot be inferred: a node bound to 0.0.0.0 has no single
+# address, and the address clients actually reach may belong to a proxy, a load
+# balancer or a Kubernetes service rather than to this process. A wrong guess
+# would be published to every client in the cluster, so a node with a wildcard
+# bind and no value here advertises nothing and says so at startup.
+#
+# With a concrete bind this defaults to that address, with the scheme following
+# whether this node terminates TLS.
+# advertise = "https://db-1.internal:7878"
+
 # Serve the MCP endpoint at /mcp, for AI agents.
 #
 # Every MCP tool call runs as the authenticated principal, through the same

@@ -6,10 +6,11 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 4 done, on a branch awaiting review**
+## As of 2026-08-13 — **M10 task 5 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–4 are done: #65, #66 and #67 merged, task 4 is
-on `m10-token-refresh` with a PR open and unmerged.
+**M0–M9 complete.** M10 tasks 1–5 are done: #65–#68 merged, task 5 is on
+`m10-topology` with a PR open and unmerged. **All five reserved decisions are
+settled**, so tasks 6–12 have none left to bring.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -23,14 +24,19 @@ features ([ADR-058](decisions.md)).
 Task 4: **sliding re-issue** of the access token rather than a second
 credential, with no grace for an expired one ([ADR-059](decisions.md)).
 
-**Next is task 5**, client-visible topology and discovery, off fresh `main`
-once task 4 merges. Its reserved decision — static configuration versus live
-SWIM membership — comes first, and **it is the one M10 task carrying
-distributed-systems risk**. Two traps at once, both already documented and both
-having cost an outage before: `Members` holds *peers only*, so a set computed
-from it can never contain `me`, and the set must contain only authenticated
-peers (ADR-053). Anything new reading it inherits both. It owes a capability
-too, like refresh did.
+Task 5: **addresses from a replicated registry, liveness from SWIM**, because
+reading client addresses out of membership was not available at any acceptable
+price ([ADR-060](decisions.md)).
+
+**Next is task 6**, cursors at the protocol level, off fresh `main` once task 5
+merges. **No reserved decision** — M9 task 5 settled the shape, and the
+specification already documents `nextCursor` as an opaque, node-portable token.
+The work is deciding what a client may *assume*: that it can send a cursor to
+any node, that a query a cursor cannot page gets none rather than a misleading
+one, and that a token outlives nothing in particular. Much of that is already
+written; the task is making it checked, and it plausibly wants a cluster-harness
+test that pages across nodes, since node portability is currently asserted for
+cursors and only *tested* for change-stream resume tokens.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -95,7 +101,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-protocol-spec` | ✅ Merged as #65. M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056 |
 | `m10-error-taxonomy` | ✅ Merged as #66. M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
 | `m10-versioning` | ✅ Merged as #67. M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
-| `m10-token-refresh` | **Open, PR raised, not merged.** M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
+| `m10-token-refresh` | ✅ Merged as #68. M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
+| `m10-topology` | **Open, PR raised, not merged.** M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -218,7 +225,7 @@ work.
 | 2 | ✅ **Error taxonomy as public surface** | Settled: three-valued `no`/`wait`/`elsewhere`, closed by an enum (ADR-057) |
 | 3 | ✅ **Versioning and compatibility policy** | Settled: path-major, `/v1` never breaks, capabilities over version numbers (ADR-058) |
 | 4 | ✅ **Token refresh** | Settled: sliding re-issue, no grace for an expired token (ADR-059) |
-| 5 | **Client-visible topology / discovery** | Static config vs. live SWIM membership |
+| 5 | ✅ **Client-visible topology / discovery** | Settled: replicated registry for addresses, SWIM for liveness (ADR-060) |
 | 6 | **Cursors at the protocol level** | — (M9 task 5 settled the shape) |
 | 7 | **HTTP-level benchmark harness** | — |
 | 8 | **Rust client**, `kimmy-client`; the CLI becomes its consumer | HTTP/async stack |
@@ -388,9 +395,46 @@ token it is told to treat as opaque. It is also the first spend of the
 compatibility promise written one task earlier: a new response field, shipped
 in `/v1` without ceremony.
 
-**Only task 5 carries distributed-systems risk**, and it carries two known
-traps at once: `Members` holds *peers only*, and the set must contain only
-authenticated peers (ADR-053).
+### What task 5 did — the one with distributed-systems risk
+
+`GET /v1/topology` lists the cluster. **Addresses come from a replicated
+registry** each node writes itself into; **liveness comes from SWIM**. Two
+sources because neither answers alone, and because the single-source version
+was not available: `Member` carries the *gossip* address and is postcard-
+encoded, so putting a client address in it is a stop-the-cluster upgrade — the
+fourth in three milestones — and inferring one from the gossip address is a
+guess that breaks on separate interfaces, TLS termination and container
+networking ([ADR-060](decisions.md)).
+
+**Both inherited traps were handled on purpose, not survived by luck:**
+
+- `Members` holds **peers only**, so the answering node is added explicitly and
+  listed first. A list derived from membership alone would tell a client the
+  cluster does not include the node it is talking to.
+- The set holds **only authenticated peers** (ADR-053), and that invariant now
+  guards something new: an unauthenticated peer would be advertised to clients
+  as a node to send credentials to.
+
+**`status` is `live` or `unknown`, never `down`**, because a node whose gossip
+is partitioned while its HTTP works is a real state here. Hiding it removes an
+option exactly when a client wants one.
+
+**The registry is an address book, not a heartbeat** — written at startup and
+only when the content changes, so an idle cluster appends nothing. Freshness of
+liveness is SWIM's job.
+
+**Verified in the cluster harness**, which is the only thing that could verify
+it: three real nodes, each listing all three as `live` with real addresses —
+including a node whose seed list never named it, which only replication
+explains — then a token from one node used at every advertised address, then a
+node killed and required to read `unknown` rather than vanish. All six harness
+tests pass.
+
+**Task 5 carried the milestone's distributed-systems risk and is done.** Both
+traps were handled deliberately — the answering node is added explicitly because
+`Members` holds *peers only*, and the authenticated-peers invariant (ADR-053)
+now also stops an unauthenticated node being advertised to clients as somewhere
+to send credentials. Anything new reading `Members` still inherits both.
 
 **Task 7 is the one that answers a question currently unanswerable.** Every
 figure in [Benchmarks](benchmarks.md) is taken at the storage engine — nothing

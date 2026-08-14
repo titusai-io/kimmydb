@@ -53,6 +53,7 @@ pub enum Capability {
     HybridSearch,
     PartialIndexes,
     TokenRefresh,
+    Topology,
     TtlIndexes,
     VectorSearch,
     Webhooks,
@@ -63,7 +64,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Capability; 14] = [
+    pub const ALL: [Capability; 15] = [
         Self::Aggregation,
         Self::BulkInsert,
         Self::Backup,
@@ -74,6 +75,7 @@ impl Capability {
         Self::HybridSearch,
         Self::PartialIndexes,
         Self::TokenRefresh,
+        Self::Topology,
         Self::TtlIndexes,
         Self::VectorSearch,
         Self::Webhooks,
@@ -92,6 +94,7 @@ impl Capability {
             Self::HybridSearch => "hybrid-search",
             Self::PartialIndexes => "partial-indexes",
             Self::TokenRefresh => "token-refresh",
+            Self::Topology => "topology",
             Self::TtlIndexes => "ttl-indexes",
             Self::VectorSearch => "vector-search",
             Self::Webhooks => "webhooks",

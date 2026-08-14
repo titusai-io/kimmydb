@@ -27,6 +27,9 @@ pub fn router(state: SharedState) -> Router {
         // Public for the same reason the health routes are: a client has to be
         // able to ask what a node supports before it holds a token.
         .route("/v1/version", get(crate::version::version))
+        // Authenticated, unlike /v1/version: a version is a fact about
+        // software, this is a map of where a deployment's data lives.
+        .route("/v1/topology", get(crate::topology::topology))
         .route("/v1/admin/backup", get(backup))
         .route("/v1/auth/whoami", get(crate::users::whoami))
         .route("/v1/users", get(crate::users::list_users).post(crate::users::create_user))

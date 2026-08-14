@@ -1021,6 +1021,67 @@ that promise was spent.
 
 ---
 
+## 🟢 A client can discover the cluster (M10 task 5)
+
+**Was.** A client was handed one address and could not learn the others. It
+could not fail over, and the one capability a MongoDB driver's SDAM would have
+given free was missing — while being *easier* here, because every node accepts
+writes and there is no primary to find.
+
+**Now.** `GET /v1/topology`. **Addresses** come from a replicated registry each
+node writes itself into; **liveness** comes from SWIM. [ADR-060](decisions.md)
+has the reasoning.
+
+**Reading addresses from SWIM was not available.** `Member` carries the
+*gossip* address and is postcard-encoded, so adding a client address to it is a
+stop-the-cluster upgrade — the fourth in three milestones — and would put
+client-facing configuration inside the cluster's internal wire. Deriving a
+client address from a gossip address is a guess that breaks on separate
+interfaces, TLS termination and container networking.
+
+**Both known traps were inherited deliberately rather than met by accident:**
+
+- `Members` holds **peers only**, so the answering node is added explicitly. A
+  list derived from membership alone would tell a client the cluster does not
+  include the node it is talking to — the shape of the bug that silently
+  undelivered every clustered webhook.
+- The member set must contain **only authenticated peers** (ADR-053), and that
+  invariant now protects more than ownership: an unauthenticated peer in the
+  set would be advertised to clients as a node to send credentials to.
+
+**Verified on real nodes, not only in-process.** A cluster-harness test boots
+three nodes and requires every one to list all three as `live` with its real
+address — including a node whose seed list never named it, which only
+replication can explain — then checks a token from one node works at every
+advertised address, then kills a node and requires it to be reported `unknown`
+rather than vanishing. The in-process tests prove the assembly; only the
+harness proves the assembled thing, which is the distinction M8 task 1 was
+built on.
+
+**`status` is `live` or `unknown`, never `down`**, because a node whose gossip
+is partitioned while its HTTP works is a real state here and hiding it removes
+an option exactly when a client wants one.
+
+---
+
+## 🟡 A decommissioned node stays in the topology
+
+**Raised 2026-08-13, with M10 task 5.** A node's registry record outlives the
+node: a machine that is removed from the cluster keeps appearing in
+`/v1/topology` as `unknown` forever.
+
+**Not solvable by age.** Records are written at startup and only when their
+content changes — deliberately, so an idle cluster does not append to the oplog
+every tick — so a record's age measures uptime, and collecting old ones would
+delete the longest-running healthy nodes first.
+
+**The workaround needs no new surface**, which is why it is a 🟡 rather than a
+task: the registry is an ordinary collection, so removing a decommissioned node
+is deleting its document. An explicit route belongs with whatever operational
+tooling comes after M10, not inside the client protocol.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

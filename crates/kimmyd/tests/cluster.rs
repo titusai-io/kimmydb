@@ -688,3 +688,134 @@ async fn a_refreshed_document_outlives_its_expiry() {
         .unwrap();
     assert_eq!(res.status(), 200, "a document inside its TTL must not be expired");
 }
+
+// ---------------------------------------------------------------------------
+// Client-visible topology
+// ---------------------------------------------------------------------------
+
+/// Every node can tell a client about every node, with its real address.
+///
+/// The reason this belongs in the harness rather than in an in-process test:
+/// the two halves of the answer come from two different mechanisms that only
+/// both exist on real nodes. Addresses arrive by **replication** of the node
+/// registry, and liveness by **SWIM**, and a single process has neither. An
+/// in-process test can prove the assembly is right and cannot prove the
+/// assembled thing is true — which is the distinction M8 task 1 was built on,
+/// where transport-free tests passed while clustered delivery was entirely
+/// broken.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn every_node_can_tell_a_client_about_every_node() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    let token = a.login(&client).await;
+
+    let ids = [
+        a.node_id(&client).await.to_string(),
+        b.node_id(&client).await.to_string(),
+        c.node_id(&client).await.to_string(),
+    ];
+    let endpoints = [
+        format!("http://127.0.0.1:{}", a.http),
+        format!("http://127.0.0.1:{}", b.http),
+        format!("http://127.0.0.1:{}", c.http),
+    ];
+
+    // The registry replicates like any other collection, so a node knows about
+    // peers it was never told about — C's seed list never names B.
+    eventually("every node to list all three", || {
+        let client = &client;
+        let nodes = [&a, &b, &c];
+        async move {
+            for node in nodes {
+                let token = node.login(client).await;
+                let Ok(res) = client.get(node.url("/v1/topology")).bearer_auth(&token).send().await
+                else {
+                    return false;
+                };
+                let body: serde_json::Value = res.json().await.unwrap();
+                if body["count"].as_u64() != Some(3) {
+                    return false;
+                }
+                // Every entry must be `live`: all three are up, so anything
+                // `unknown` means membership and the registry disagree.
+                let all_live =
+                    body["nodes"].as_array().unwrap().iter().all(|n| n["status"] == "live");
+                if !all_live {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+
+    let body: serde_json::Value = client
+        .get(a.url("/v1/topology"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let listed = body["nodes"].as_array().unwrap();
+
+    // The answering node is first and marked `self` — `Members` holds peers
+    // only, so a list derived from it alone would omit the node a client is
+    // already talking to (ADR-051).
+    assert_eq!(listed[0]["self"], true, "the answering node comes first: {body}");
+    assert_eq!(listed[0]["node"], ids[0]);
+    assert_eq!(listed.iter().filter(|n| n["self"] == true).count(), 1);
+
+    // Real addresses, from the registry rather than inferred from a gossip
+    // port. Each is the node's actual HTTP listener.
+    for (id, endpoint) in ids.iter().zip(endpoints.iter()) {
+        let entry = listed.iter().find(|n| n["node"] == *id).expect("every node is listed");
+        assert_eq!(entry["endpoint"], *endpoint, "{id} advertises where it really is");
+    }
+
+    // And the addresses work: a client handed this list can use any of them.
+    for endpoint in &endpoints {
+        let res = client
+            .get(format!("{endpoint}/v1/auth/whoami"))
+            .bearer_auth(&token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            200,
+            "a token from one node is accepted by another at {endpoint} — one cluster, one \
+             signing secret"
+        );
+    }
+
+    // A node that dies is still listed, with its status downgraded rather than
+    // disappearing: a client keeps the address and learns not to prefer it.
+    drop(c);
+    eventually("the dead node to be reported unknown", || {
+        let client = &client;
+        let a = &a;
+        let token = token.clone();
+        let dead = ids[2].clone();
+        async move {
+            let body: serde_json::Value = client
+                .get(a.url("/v1/topology"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            body["count"].as_u64() == Some(3)
+                && body["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|n| n["node"] == dead && n["status"] == "unknown")
+        }
+    })
+    .await;
+}
