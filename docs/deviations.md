@@ -1227,6 +1227,61 @@ the CLI the first consumer:
 
 ---
 
+## 🟢 There is a Python client (M10 task 9)
+
+**Now.** `clients/python`, package `kimmydb`, synchronous, on `httpx` and
+`websockets` — both chosen because each has a sync *and* an async API behind
+nearly the same surface, so "sync first" costs nothing later. The stdlib was
+considered and rejected for one measured reason: `urllib` opens a connection
+per request, and against a ~0.1 ms request a handshake per call would dominate
+everything the client does.
+
+**It shares no code with the Rust client**, which is the point. Two independent
+readers of one specification make a disagreement between them mean something.
+The test suites are deliberately the same scenario list.
+
+**The surface is Python, not a translation.** Iteration where a Python caller
+expects it, `documents()` for the shape most people actually want, exceptions
+rather than returned errors, and `.code` as a plain string rather than an enum
+— because codes are additive and an enum would make an unfamiliar one an error
+in itself.
+
+**One thing had to fight the idiom.** A change stream connects when it is
+asked for, not on the first read. Python's natural shape is a lazy generator,
+which would open the socket at the first `next()` — so anything written between
+`watch()` and that read would be missed, silently. Found by a test that wrote a
+document immediately after opening a stream and then waited for it forever.
+
+**CI runs it** against a real `kimmyd`, like every other client test here: a
+mocked server would only assert what the client already believes.
+
+---
+
+## 🟡 A dropped collection leaves a change stream open and silent
+
+**Found 2026-08-14 while writing the Python client's tests**, which assumed the
+MongoDB behaviour: there, dropping a collection invalidates the streams
+watching it.
+
+**Here it does not.** A change stream carries *data*, not DDL — schema changes
+are filtered out before a client sees them — and the server's only two
+invalidate reasons are `ConsumerLagged` and `ResumeTokenExpired`. So a stream
+whose collection is dropped receives no event, no close and no error. It waits
+for changes to something that no longer exists.
+
+**Not obviously wrong**, which is why this is a 🟡 rather than a bug: a
+collection can be recreated under the same name and the stream would then be
+watching the right thing again, and the "clients see data, not DDL" rule is
+deliberate and load-bearing elsewhere. But it is a surprise for anyone arriving
+from MongoDB, and a client library cannot paper over it — there is nothing to
+observe.
+
+**Both clients now have a test asserting the real behaviour**, so the day it
+changes, something fails. Deciding whether it *should* change is a
+change-stream question rather than a client one.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

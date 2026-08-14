@@ -78,6 +78,32 @@ jobs:
       - name: Cluster harness
         run: cargo test -p kimmyd --test cluster -- --ignored --test-threads=1
 
+  python-client:
+    name: python client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `check` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # The Python tests drive a real `kimmyd`, the same way the Rust client's
+      # do. A mocked server would only assert what the client already
+      # believes, which is the half that was never in doubt.
+      - name: Build kimmyd
+        run: cargo build --release --bin kimmyd
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Test
+        working-directory: clients/python
+        run: uv run --extra dev pytest -q
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

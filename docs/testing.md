@@ -827,6 +827,31 @@ fail over, and a public API that forced consumers to depend on `reqwest`.
 
 ---
 
+## The Python client, tested the same way
+
+`clients/python/tests` spawns a real `kimmyd` and talks to it over a socket —
+the same arrangement as the Rust client's tests, and deliberately the **same
+scenario list**. Two clients that pass the same scenarios independently are
+evidence about the protocol; two clients tested differently are two opinions.
+
+```bash
+cargo build --release            # the tests drive a real node
+cd clients/python && uv run --extra dev pytest
+```
+
+Seventeen tests, about nine seconds. `pytest-timeout` caps a test at 60 s,
+which is not a formality: a change stream that never delivers hangs rather than
+fails, and the first version of the invalidate test ran for ten minutes before
+anyone learned anything.
+
+Two of these found real defects on their first run — a change stream that
+connected lazily and so missed everything written before the first read, and
+the discovery that **a dropped collection leaves a stream open and silent**,
+which is a server behaviour rather than a client one (a 🟡 in
+[Deviations](deviations.md)).
+
+---
+
 ## Benchmarks are not tests, and one of them drives the server
 
 `cargo bench -p kimmyd --bench http` is the odd one out: it spawns the shipped

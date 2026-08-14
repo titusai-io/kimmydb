@@ -6,13 +6,12 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 task 8 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 task 9 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–8 are done: #65–#71 merged, task 8 is on
-`m10-rust-client` with a PR open and unmerged. The protocol half of the
-milestone is finished and **the first client exists**; tasks 9–12 are the other
-two languages, the conformance suite that keeps all three honest, and the
-closeout.
+**M0–M9 complete.** M10 tasks 1–9 are done: #65–#72 merged, task 9 is on
+`m10-python-client` with a PR open and unmerged. **Two clients exist and share
+no code**, which is the arrangement task 11's conformance suite depends on.
+Tasks 10–12 are Go, the suite, and the closeout.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -37,19 +36,25 @@ Task 7: the HTTP benchmark harness, and the numbers it produced.
 
 Task 8: `kimmy-client`, and `kimmy-cli` converted into a consumer of it.
 
-**Next is task 9**, the Python client, off fresh `main` once task 8 merges. Its
-reserved decision is the HTTP stack, and the roadmap already frames the other
-half: **sync first; async is a second decision, not an assumption.** Two things
-carry over from the Rust client rather than needing rediscovery. First,
-[Clients](clients.md) now states what a client is *expected* to do — the same
-list the conformance suite in task 11 will hold all three to. Second, the
-`kimmy-client` tests are a ready-made scenario list: token renewal, failover
-past a dead endpoint, a walk that ends on an empty page, a write that is not
-retried, and a change stream that resumes. A Python client that passes the
-equivalents is one the conformance suite will not be the first to exercise.
+Task 9: `clients/python`, package `kimmydb`, synchronous on `httpx` and
+`websockets`, with its own CI job driving a real node.
 
-**Where Python lives is an open choice** — nothing in this repository is Python
-except `scripts/`, so task 9 also decides packaging, layout and how CI runs it.
+**Next is task 10**, the Go client, off fresh `main` once task 9 merges. Its
+reserved decision is the HTTP stack, and Go's standard library genuinely
+answers it — `net/http` pools connections, so the argument that ruled out
+Python's stdlib does not apply. A WebSocket library is the real choice
+(`nhooyr.io/websocket` or `gorilla/websocket`).
+
+**It goes in `clients/go/`**, beside Python, and it needs a CI job of its own on
+the same pattern: build `kimmyd`, then run the tests against it. The roadmap
+puts Go third because it is *least* likely to surface a protocol gap the other
+two missed — which is exactly what makes it a good final check before the
+conformance suite in task 11.
+
+**The scenario list is settled by now.** Both existing clients pass the same
+one, and [Clients](clients.md) states it in prose. A third that passes it makes
+task 11 a matter of running one set of scenarios three ways rather than
+inventing them.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -118,7 +123,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-topology` | ✅ Merged as #69. M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
 | `m10-protocol-cursors` | ✅ Merged as #70. M10 task 6: the paging contract, and cross-node paging in the harness |
 | `m10-http-bench` | ✅ Merged as #71. M10 task 7: the HTTP benchmark, and the numbers in [Benchmarks](benchmarks.md) |
-| `m10-rust-client` | **Open, PR raised, not merged.** M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
+| `m10-rust-client` | ✅ Merged as #72. M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
+| `m10-python-client` | **Open, PR raised, not merged.** M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -245,7 +251,7 @@ work.
 | 6 | ✅ **Cursors at the protocol level** | — (M9 settled the shape; this settled the wire contract) |
 | 7 | ✅ **HTTP-level benchmark harness** | — |
 | 8 | ✅ **Rust client**, `kimmy-client`; the CLI is its consumer | Settled: `reqwest`, already in the tree |
-| 9 | **Python client** | HTTP/async stack |
+| 9 | ✅ **Python client** | Settled: `httpx` + `websockets`, sync first |
 | 10 | **Go client** | HTTP stack |
 | 11 | **Conformance suite all three clients pass** | — |
 | 12 | **One example app per language** + mutation pass and closeout | — |
@@ -539,6 +545,44 @@ made it the first consumer:
 
 `kimmy watch` and `kimmy topology` came along with the conversion, because the
 client made them a few lines each.
+
+### What task 9 did, and the two things it found
+
+`clients/python`, package `kimmydb`, synchronous, on `httpx` and `websockets`.
+Both were chosen for the same reason: each has a sync *and* an async API behind
+nearly the same surface, so "sync first" costs nothing when async is wanted.
+The stdlib was rejected for a measured reason rather than a taste — `urllib`
+opens a connection per request, and against a ~0.1 ms request a handshake per
+call would dominate everything.
+
+**It shares no code with the Rust client, and passes the same scenario list.**
+That is the arrangement task 11 depends on: two independent readers of one
+specification, so a disagreement between them means something.
+
+**The surface is Python rather than a translation** — iteration where a Python
+caller expects it, `documents()` for the shape most callers want, exceptions
+rather than returned errors, and `.code` as a plain string because codes are
+additive.
+
+Two findings:
+
+- **A lazy change stream misses events.** Python's natural shape is a
+  generator, which would open the socket at the first `next()` — so anything
+  written between `watch()` and that read is lost silently. It connects when it
+  is asked for now. Found by a test that hung for ten minutes.
+- **A dropped collection leaves a stream open and silent.** No event, no close,
+  no error: the stream waits for changes to something that no longer exists.
+  This is a *server* behaviour — change streams carry data, not DDL, and the
+  only invalidate reasons are `ConsumerLagged` and `ResumeTokenExpired` — and
+  it surprises anyone arriving from MongoDB, where dropping a collection
+  invalidates its streams. Recorded as a 🟡 and asserted in both clients'
+  tests, so the day it changes something fails. **Whether it should change is
+  worth a decision**, and it is a change-stream question rather than a client
+  one.
+
+**CI runs the Python tests against a real `kimmyd`**, on the same reasoning as
+every other client test here: a mocked server asserts only what the client
+already believes.
 
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because
