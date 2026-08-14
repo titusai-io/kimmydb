@@ -11,8 +11,8 @@ use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::ApiError;
-use crate::json::json_to_document;
+use crate::error::{ApiError, ErrorCode};
+use crate::json::{JsonBody, json_to_document};
 use crate::state::{Auth, SharedState};
 
 // ---------------------------------------------------------------------------
@@ -23,7 +23,7 @@ pub async fn configure_vectors(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<VectorConfig>,
+    JsonBody(body): JsonBody<VectorConfig>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Admin, &db, Some(&coll))?;
     let meta = state.engine.configure_vectors(&db, &coll, body)?;
@@ -107,7 +107,7 @@ pub async fn put_document_vectors(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
-    Json(body): Json<Vec<ChunkInput>>,
+    JsonBody(body): JsonBody<Vec<ChunkInput>>,
 ) -> Result<Json<Value>, ApiError> {
     // Writing derived data about a document is a write on that collection, not
     // an administrative act.
@@ -265,7 +265,7 @@ pub async fn vector_search(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<SearchRequest>,
+    JsonBody(body): JsonBody<SearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(run_vector_search(&state, &auth, &db, &coll, &body).await?))
 }
@@ -313,7 +313,7 @@ pub async fn hybrid_search(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<SearchRequest>,
+    JsonBody(body): JsonBody<SearchRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(run_hybrid_search(&state, &auth, &db, &coll, &body).await?))
 }
@@ -385,7 +385,7 @@ fn prepare(
     if state.engine.count(&shadow)? == 0 {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
-            "no_vectors",
+            ErrorCode::NoVectors,
             empty_collection_message(db, coll, &config),
         ));
     }
@@ -431,7 +431,7 @@ async fn resolve_query_vector(
     vectors.pop().ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
-            "provider_error",
+            ErrorCode::ProviderError,
             "the embedding provider returned no vector for the query",
         )
     })
@@ -498,13 +498,15 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
     match e {
         V::NoProvider | V::DimensionMismatch { .. } => ApiError::bad_request(e.to_string()),
         V::LocalUnavailable | V::ModelUnavailable { .. } => {
-            ApiError::new(StatusCode::NOT_IMPLEMENTED, "not_implemented", e.to_string())
+            ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, e.to_string())
         }
-        V::MissingApiKey { .. } => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "misconfigured", e.to_string())
-        }
+        V::MissingApiKey { .. } => ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            ErrorCode::Misconfigured,
+            e.to_string(),
+        ),
         V::Transport { .. } | V::ProviderRejected { .. } | V::MalformedResponse { .. } => {
-            ApiError::new(StatusCode::BAD_GATEWAY, "provider_error", e.to_string())
+            ApiError::new(StatusCode::BAD_GATEWAY, ErrorCode::ProviderError, e.to_string())
         }
         V::Storage(inner) => inner.into(),
         V::Core(inner) => inner.into(),
@@ -512,7 +514,7 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         // and rebuilds rather than letting the error escape. Mapped anyway,
         // because a match that must be total should not guess.
         V::Snapshot(_) => {
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "snapshot", e.to_string())
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
         }
     }
 }

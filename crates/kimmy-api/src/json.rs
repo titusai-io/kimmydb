@@ -13,6 +13,35 @@ use serde_json::{Map, Value};
 
 use crate::error::ApiError;
 
+/// A JSON request body whose refusals are the API's error envelope.
+///
+/// Axum's `Json<T>` rejects a malformed or wrong-shaped body with bare text and
+/// no `error` code. `From<JsonRejection> for ApiError` has existed since M5 to
+/// fix that — but a handler only reaches it by taking `Result<Json<T>, _>`, and
+/// exactly one of nineteen did. The other eighteen answered `422` in
+/// `text/plain`, outside the taxonomy entirely, which is not something a
+/// specification can be written about honestly.
+///
+/// So the mapping lives in the extractor rather than in a shape each handler
+/// has to remember to write: `JsonBody<T>` cannot be used without it. Found by
+/// driving a real node, because every conformance scenario that exercised a
+/// wrong-shaped body happened to use the one route that had it right.
+pub struct JsonBody<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for JsonBody<T>
+where
+    axum::Json<T>:
+        axum::extract::FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
+        let axum::Json(value) = axum::Json::<T>::from_request(req, state).await?;
+        Ok(Self(value))
+    }
+}
+
 /// Convert a JSON value into BSON, honouring Extended JSON wrappers.
 pub fn json_to_bson(value: &Value) -> Result<Bson, ApiError> {
     Ok(match value {

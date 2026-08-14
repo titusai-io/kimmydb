@@ -30,8 +30,13 @@ pub async fn watch_collection(
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
     Query(q): Query<WatchQuery>,
-    upgrade: WebSocketUpgrade,
+    // Taken as a `Result` so a request that is not an upgrade is refused with
+    // the same envelope as every other route. Left to axum it renders bare
+    // text with no `error` code, which made this the one refusal a client
+    // could not branch on.
+    upgrade: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
 ) -> Result<Response, ApiError> {
+    let upgrade = upgrade?;
     // Authorize *before* upgrading. Once the socket is open the client has a
     // connection it can hold, and refusing after the handshake is both harder
     // to report and easy to get wrong.

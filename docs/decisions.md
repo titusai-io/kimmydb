@@ -2413,6 +2413,96 @@ the intended cost: it is the mechanism, not friction around it.
 
 ---
 
+## ADR-057 — The error taxonomy is closed, and retryability is three-valued
+
+**Decision.** The error code set is a Rust enum, `kimmy_api::error::ErrorCode`,
+and every code carries a **retry class**: `no`, `wait`, or `elsewhere`. The
+class travels in the error envelope beside the code, and
+`components.schemas.ErrorCode` in `docs/openapi.yaml` documents the whole set,
+checked against the enum by the contract test from
+[ADR-056](#adr-056--the-protocol-specification-is-hand-written-and-a-contract-test-keeps-it-true).
+
+This is M10 task 2 of [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud).
+
+**Three-valued rather than a boolean, and the reason is the architecture.**
+KimmyDB is leaderless: every node accepts writes, and every node holds a full
+copy. So "ask a different node" is a genuine answer to a failure, and it is the
+*correct* answer for a failure that belongs to the node rather than to the
+request — a storage error on this disk, a missing API key in this node's
+environment, an unusable snapshot in this node's directory. A boolean
+`retryable` collapses that: a client told `internal` is retryable retries the
+one machine that just failed it, which is the worst available choice. A client
+told it is not retryable gives up while N−1 nodes could have answered.
+
+The classes divide as follows, and the division is a claim about *what action
+could possibly work*, not about how likely it is:
+
+- **`no`** — twelve codes. The request must change, or the state it asks about
+  must. `duplicate_key` does not become un-duplicate; `resume_token_expired`
+  cannot be un-collected, and a client that retries the same token loops
+  forever.
+- **`wait`** — `rate_limited`, which says how long in `Retry-After`, and
+  `provider_error`, which does not. Both are the same node later: every node
+  calls the same embedding provider, so moving accomplishes nothing.
+- **`elsewhere`** — `internal`, `misconfigured`, `snapshot`. Node-local
+  conditions that replication makes recoverable.
+
+`not_implemented` takes the conservative answer, `no`, though it has two
+sources that disagree: `CoreError::Unsupported` is a capability that exists
+nowhere, while a node built without `local-embeddings` would be recoverable on
+a peer that has it. Optimizing for the second means sending every client around
+the whole cluster for an answer that will not change, to serve a cluster
+assembled inconsistently. One code cannot carry two classes; the common case
+wins and the nuance is documented rather than encoded.
+
+**The class is on the wire, not only in the document.** A client that acts on
+`retry` handles a code released after it was written; a client that acts on a
+table it compiled at release time does not. That is precisely what has to be
+true for "adding an error code" to be an additive change under task 3's
+compatibility policy — so the field is what makes the promise keepable.
+
+**Closed by the compiler.** `ErrorCode` is an enum, and both the wire string
+and the retry class come from exhaustive matches, so a new variant does not
+build until both are answered. The second is the one that matters: it is a
+decision about client behaviour that would otherwise be made by whoever was
+adding an unrelated feature, silently, by picking a string.
+
+**The alternative was a string constant plus a test that scans for
+`ApiError::new` literals.** Rejected because it is a text scan over source, and
+task 1 had just found a text scan that had been green for two milestones while
+never looking at the busiest route on the API. A code assembled with `format!`
+or produced through a helper would be invisible to it.
+
+**The envelope has to reach every refusal, which turned out not to be true.**
+Axum rejects a malformed or wrong-shaped body with bare text and no code.
+`From<JsonRejection> for ApiError` has existed since M5 to fix that, but a
+handler only reaches it by taking `Result<Json<T>, JsonRejection>`, and exactly
+one of nineteen did — so eighteen routes answered `422 text/plain`, outside the
+taxonomy entirely. The mapping now lives in an extractor, `json::JsonBody<T>`,
+which cannot be used without it; the same applies to the WebSocket upgrade
+rejection on `/watch`, which was the one refusal on the API that carried no
+code at all. A taxonomy that sixteen routes bypass is not public surface, and
+neither defect was visible from the code — both were found by driving a node,
+because every test that exercised a wrong-shaped body used the one route that
+had it right.
+
+**The set had already drifted, which is the argument for all of this.**
+`no_vectors` — a 409 returned when searching a collection whose vectors were
+never ingested — existed in `vectors.rs` and appeared in neither
+`docs/http-api.md` nor the first draft of `docs/openapi.yaml`. Both lists were
+assembled by reading `error.rs`, and the codes accrete across five modules. The
+same pass found 422 documented in the HTTP reference and specified nowhere: a
+body that is valid JSON of the wrong shape is a different failure from a body
+that is not JSON, and seventeen operations can return it.
+
+**Cost.** The envelope gained a field, which is additive but is still a wire
+change; `ApiError.code` changed type, which touched six construction sites and
+four assertions and nothing else, because the sixty-one other sites go through
+named constructors. And every future error must be classified — deliberately,
+since that is the mechanism rather than an overhead beside it.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

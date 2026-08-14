@@ -1,6 +1,5 @@
 //! HTTP routes.
 
-use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
@@ -11,6 +10,7 @@ use tracing::warn;
 
 use crate::error::ApiError;
 use crate::exec;
+use crate::json::JsonBody;
 use crate::ratelimit::{self, Decision};
 use crate::state::{Auth, SharedState};
 use crate::watch;
@@ -169,7 +169,7 @@ struct LoginRequest {
 async fn login(
     State(state): State<SharedState>,
     client: crate::state::ClientAddr,
-    Json(body): Json<LoginRequest>,
+    JsonBody(body): JsonBody<LoginRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let limits = &state.limits;
     if let Decision::Limited { retry_after } = limits.login_ip.check(client.as_str()) {
@@ -271,7 +271,7 @@ async fn create_collection(
     State(state): State<SharedState>,
     auth: Auth,
     Path(db): Path<String>,
-    Json(body): Json<CreateCollectionRequest>,
+    JsonBody(body): JsonBody<CreateCollectionRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::create_collection(&state, &auth, &db, &body.name)?))
 }
@@ -292,7 +292,7 @@ async fn insert_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::insert(&state, &auth, &db, &coll, &body)?))
 }
@@ -306,9 +306,11 @@ async fn bulk_insert_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    body: Result<Json<Vec<Value>>, JsonRejection>,
+    // `JsonBody` rather than the `Result<Json<_>, JsonRejection>` this route
+    // used to spell out: the envelope now comes from the extractor, so it is
+    // not something eighteen other handlers can forget.
+    JsonBody(documents): JsonBody<Vec<Value>>,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(documents) = body?;
     Ok(Json(exec::insert_many(&state, &auth, &db, &coll, &documents)?))
 }
 
@@ -361,7 +363,7 @@ async fn find_docs_post(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<FindRequest>,
+    JsonBody(body): JsonBody<FindRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::find(&state, &auth, &db, &coll, body.into())?))
 }
@@ -370,7 +372,7 @@ async fn count_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<FindRequest>,
+    JsonBody(body): JsonBody<FindRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::count(&state, &auth, &db, &coll, body.into())?))
 }
@@ -384,7 +386,7 @@ async fn aggregate_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<AggregateRequest>,
+    JsonBody(body): JsonBody<AggregateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::aggregate(&state, &auth, &db, &coll, &body.pipeline)?))
 }
@@ -397,7 +399,7 @@ async fn register_webhook(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<crate::webhooks::RegisterRequest>,
+    JsonBody(body): JsonBody<crate::webhooks::RegisterRequest>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(crate::webhooks::register(&state, &auth, &db, &coll, &body, &state.egress)?))
 }
@@ -437,7 +439,7 @@ async fn replace_doc(
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
     Query(q): Query<ReplaceQuery>,
-    Json(body): Json<Value>,
+    JsonBody(body): JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::replace(&state, &auth, &db, &coll, &id, &body, q.upsert)?))
 }
@@ -476,7 +478,7 @@ async fn find_and_modify(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<FindAndModifyRequest>,
+    JsonBody(body): JsonBody<FindAndModifyRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let return_document = match body.return_document.as_deref() {
         None | Some("before") => exec::ReturnDocument::Before,
@@ -516,7 +518,7 @@ async fn update_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<UpdateRequest>,
+    JsonBody(body): JsonBody<UpdateRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let params =
         exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
@@ -538,7 +540,7 @@ async fn delete_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<DeleteRequest>,
+    JsonBody(body): JsonBody<DeleteRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let params =
         exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
@@ -607,7 +609,7 @@ async fn create_index(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Json(body): Json<CreateIndexRequest>,
+    JsonBody(body): JsonBody<CreateIndexRequest>,
 ) -> Result<Json<Value>, ApiError> {
     let spec = exec::IndexSpec {
         fields: body

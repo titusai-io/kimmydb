@@ -407,25 +407,44 @@ round-trips exactly, and there is a test pinning it.
 
 ```json
 { "error": "duplicate_key",
-  "message": "duplicate key: document with _id 1 already exists" }
+  "message": "duplicate key: document with _id 1 already exists",
+  "retry": "no" }
 ```
 
-| Status | `error` | Cause |
-|---|---|---|
-| 400 | `bad_request` | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents |
-| 422 | `bad_request` | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
-| 401 | `unauthorized` | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
-| 403 | `forbidden` | Denied by RBAC |
-| 404 | `not_found` | Document, collection, or user absent |
-| 409 | `conflict` | Collection exists; last user; self-deletion |
-| 409 | `duplicate_key` | `_id` already present |
-| 409 | `unique_violation` | A unique index would be violated |
-| 413 | `payload_too_large` | Request body over 2 MB |
-| 415 | `unsupported_media_type` | A JSON body without a JSON content type |
-| 501 | `not_implemented` | A reserved capability that does not exist yet |
-| 410 | `resume_token_expired` | Resume point collected from the oplog |
-| 429 | `rate_limited` | Too many failed logins from this caller. Carries `Retry-After` in seconds |
-| 500 | `internal` | Storage failure — details logged, never returned |
+The status carries the class of failure, `error` is what a client branches on,
+and **`retry` is what a client library can act on without knowing the code**.
+The set is closed by an enum in the server ([ADR-057](decisions.md)), so a new
+failure cannot appear without its retry class being decided in the same commit.
+
+| Status | `error` | `retry` | Cause |
+|---|---|---|---|
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents |
+| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
+| 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
+| 403 | `forbidden` | no | Denied by RBAC |
+| 404 | `not_found` | no | Document, collection, or user absent |
+| 409 | `conflict` | no | Collection exists; last user; self-deletion |
+| 409 | `duplicate_key` | no | `_id` already present |
+| 409 | `unique_violation` | no | A unique index would be violated |
+| 409 | `no_vectors` | no | A search against a collection whose vectors were never ingested. A refusal rather than an empty result, which would be indistinguishable from "nothing matched" |
+| 413 | `payload_too_large` | no | Request body over 2 MB |
+| 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
+| 501 | `not_implemented` | no | A reserved capability that does not exist yet |
+| 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |
+| 429 | `rate_limited` | wait | Too many failed logins from this caller. Carries `Retry-After` in seconds |
+| 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
+| 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
+| 500 | `misconfigured` | elsewhere | This node lacks something it needs, such as an API key its vector configuration names |
+| 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |
+
+**`retry` is three-valued because KimmyDB is leaderless.** Every node accepts
+writes, so `elsewhere` — ask a different node — is an answer a primary-based
+database cannot give, and it is the right one for a failure that belongs to the
+node that answered rather than to the request. A boolean would tell a client
+that `internal` is "retryable" and have it hammer the machine that just failed.
+
+Act on `retry`, not on a table of codes compiled into a client at release time.
+That is what makes adding a code an additive change.
 
 Three deliberate properties:
 

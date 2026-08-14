@@ -878,6 +878,70 @@ this protocol both described it wrongly, and it took driving it to notice.
 
 ---
 
+## 🟢 The error codes are a closed set, and say what to do about them (M10 task 2)
+
+**Was.** Codes were `&'static str` literals written at call sites across five
+modules. Nothing enumerated them, so both documents that tried to list them
+were wrong, and nothing said what a client should *do* about any of them.
+
+**Now.** `ErrorCode` is an enum; the wire string and the retry class both come
+from exhaustive matches on it, so a new code does not compile until both are
+answered. The specification carries the full set and the class of each, checked
+against the enum by the contract test. [ADR-057](decisions.md) has the
+reasoning, including why the retry class is three-valued.
+
+**`no` / `wait` / `elsewhere`, not a boolean**, because every node accepts
+writes and holds a full copy — so "ask a different node" is a real answer, and
+the right one for `internal`, `misconfigured` and `snapshot`, which are
+conditions of the node rather than of the request. A boolean would tell a
+client that `internal` is retryable and have it retry the machine that just
+failed.
+
+**The class travels in the envelope**, so a client that acts on `retry` handles
+a code released after it was written. That is what has to be true for "adding a
+code" to be additive under task 3's compatibility policy.
+
+**Two omissions found while enumerating**, both of the kind that only a list
+compared against the code can find:
+
+- **`no_vectors` was in neither document.** A 409 returned when searching a
+  collection whose vectors were never ingested — deliberately a refusal rather
+  than an empty result, because an empty result is indistinguishable from
+  "nothing matched", which is how a `byo` collection can look like it works
+  while returning nothing forever. It is in `vectors.rs`, and both lists had
+  been written by reading `error.rs`.
+- **422 was documented in the prose reference and specified nowhere.** A body
+  that is valid JSON of the wrong shape is a different failure from a body that
+  is not JSON, and seventeen operations can return it. All seventeen now
+  declare it.
+
+**And four more, every one of them found by driving a real node** rather than by
+the suite — which had passed the whole time:
+
+- **Sixteen routes were outside the taxonomy.** Axum's body rejection is bare
+  text with no code, and the M5 mapping that fixes it is only reached by a
+  handler taking `Result<Json<T>, JsonRejection>`. **One handler of nineteen
+  did.** Every other typed body answered `422 text/plain`. The mapping now
+  lives in an extractor — `json::JsonBody<T>` — which cannot be used without
+  it. The conformance test had exercised a wrong-shaped body only against
+  `/bulk`, the one route that was right.
+- **`/watch` refused non-upgrade requests with no envelope at all**, for the
+  same reason and with the same fix. It was the single refusal on the API a
+  client could not branch on.
+- **The specification said the OpenAI provider's tag was `openai`.** It is
+  **`open_ai`** — `openai` is the display name from `ProviderConfig::name()`,
+  which is what the spec was written from. `docs/vectors.md` had it right all
+  along, and the project had already been caught by this exact distinction once
+  before.
+- **`no` is not a string in YAML 1.1.** `enum: [no, wait, elsewhere]` reads as
+  `[False, "wait", "elsewhere"]` in PyYAML while Rust's reader gives the
+  string, so **two readers of the specification disagreed about a value on the
+  wire**. Quoted now, with the reason beside it. This is the whole argument for
+  the live drive being a second, independently written reader: nothing inside
+  the Rust test could have seen it.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

@@ -615,6 +615,9 @@ a *document*.
 | A 429 carries `Retry-After` | `a_rate_limited_login_matches_its_documented_response` |
 | Every route is in the prose reference too | `every_route_is_in_the_http_reference` |
 | The specification's own `$ref`s resolve | `the_specification_is_well_formed` |
+| The server's error codes and the specification's are the same set, with the same retry class | `every_error_code_is_specified_with_the_retry_class_the_server_uses` |
+| A wrong-shaped body carries the envelope on a route that is not `/bulk` | inside `documented_refusals_use_the_documented_envelope` |
+| A non-upgrade request to `/watch` carries the envelope | same test |
 
 The coverage assertion is the load-bearing part: it means a route cannot be
 added to the router and the specification without also being driven here. A
