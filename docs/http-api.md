@@ -35,6 +35,7 @@ has been incomplete before.
 | `GET` | `/readyz` | — public |
 | `GET` | `/metrics` | — public |
 | `POST` | `/v1/auth/login` | — public |
+| `POST` | `/v1/auth/refresh` | authenticated — see [Tokens](#tokens) |
 | `GET` | `/v1/version` | — public — see [Version and capabilities](#version-and-capabilities) |
 | `GET` | `/v1/auth/whoami` | authenticated |
 | `GET` `POST` | `/v1/users` | server admin |
@@ -401,6 +402,47 @@ round-trips exactly, and there is a test pinning it.
 
 **Non-finite doubles** come back as `{"$numberDouble": "NaN"}` rather than
 `null`, so a number never silently becomes a missing value.
+
+---
+
+## Tokens
+
+```bash
+curl -XPOST localhost:7878/v1/auth/login -d '{"user":"root","password":"…"}'
+```
+
+```json
+{ "token": "eyJhbGciOi…", "user": "root", "expiresIn": 3600 }
+```
+
+`expiresIn` is seconds. A token is **opaque** — do not decode it to find the
+expiry; that shape is not promised.
+
+```bash
+curl -XPOST localhost:7878/v1/auth/refresh -H "$A"
+```
+
+Returns the same shape with a fresh token. **Sliding re-issue, not a second
+credential**: there is no refresh token to store, and an application using the
+API never re-sends its password. One idle longer than `expiresIn` logs in
+again.
+
+Three properties worth stating plainly:
+
+**Refresh cannot revive a revoked session.** The presented token goes through
+the same check every route does, so an account deleted, disabled, or whose
+password or grants changed is refused *before* refresh runs
+([ADR-052](decisions.md), [ADR-059](decisions.md)). A grant change therefore
+means logging in again, which is the deliberate cost of grants being carried
+in the token.
+
+**The old token keeps working until it expires.** Refreshing does not recall
+it, because a stateless token cannot be recalled. To end a session early,
+change the password or the grants, or delete the account — each bumps the
+token version and invalidates every token that user holds.
+
+**The new token carries current authority**, read from the user record rather
+than copied from the old token's claims.
 
 ---
 

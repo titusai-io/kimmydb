@@ -63,6 +63,16 @@ impl TokenIssuer {
         })
     }
 
+    /// How long an issued token lasts.
+    ///
+    /// Told to the client at login rather than left to be discovered by
+    /// decoding the token: a bearer token is opaque to the protocol, and a
+    /// client that has to parse one to know when to refresh is a client
+    /// depending on a shape nothing promised it.
+    pub fn ttl_secs(&self) -> u64 {
+        self.ttl_secs
+    }
+
     /// Issue a token for a principal.
     pub fn issue(&self, principal: &Principal) -> Result<String> {
         self.issue_at(principal, now_secs())

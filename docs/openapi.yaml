@@ -34,8 +34,12 @@ info:
     has not had its sessions revoked since (ADR-052) — so a token stops working
     the moment the account behind it does, without waiting for expiry.
 
-    Tokens expire and there is no refresh route yet; a client re-authenticates.
-    That is M10 task 4.
+    Tokens expire. `POST /v1/auth/refresh` exchanges a valid one for a fresh
+    one, so an application never re-sends credentials while it is using the
+    API. It is **not** a way back into a revoked session: the presented token
+    goes through the same check every route does, so an account deleted,
+    disabled, or whose password or grants changed is refused before refresh
+    runs. A client idle past `expiresIn` logs in again.
 
     ## Encoding: Extended JSON v2
 
@@ -229,14 +233,7 @@ paths:
           content:
             application/json:
               schema:
-                type: object
-                required: [token, user]
-                properties:
-                  token:
-                    type: string
-                    description: "Bearer token. Send as `Authorization: Bearer <token>`."
-                  user:
-                    type: string
+                $ref: "#/components/schemas/Token"
         "401":
           description: |
             Wrong password, or no such user. The two are indistinguishable by
@@ -291,6 +288,47 @@ paths:
                   capabilities:
                     type: array
                     items: { $ref: "#/components/schemas/Capability" }
+
+  /v1/auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: Exchange a valid token for a fresh one.
+      description: |
+        Sliding re-issue: the request carries the current token in the usual
+        `Authorization` header and carries no body. The new token is built from
+        a fresh read of the user record, so grants and validity come from
+        storage rather than from the old token's claims.
+
+        **This cannot revive a revoked session.** The presented token is
+        checked exactly as it would be on any other route — signature, expiry,
+        and the storage read that makes deletion, disabling and a version bump
+        take effect immediately. A token refused there never reaches this
+        route.
+
+        **The old token keeps working until it expires.** Refreshing does not
+        recall it; a stateless token cannot be recalled. To end a session
+        before its expiry, change the account's password or grants, or delete
+        it — each bumps the token version and invalidates every token the user
+        holds.
+
+        Not rate-limited: there is no password verification here, which is what
+        the login limiter exists to bound.
+      responses:
+        "200":
+          description: A fresh token, with the same authority the account has now.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Token" }
+        "400":
+          description: |
+            The node runs with authentication disabled, so there is no token to
+            refresh.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401":
+          $ref: "#/components/responses/Unauthorized"
 
   /v1/auth/whoami:
     get:
@@ -1951,6 +1989,7 @@ components:
         | `hybrid-search` | `POST .../hybrid_search` |
         | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
         | `partial-indexes` | `partialFilterExpression` on index creation |
+        | `token-refresh` | `POST /v1/auth/refresh`, so an active client never re-sends credentials |
         | `ttl-indexes` | `expireAfterSeconds` on index creation |
         | `vector-search` | `POST .../vector_search` |
         | `webhooks` | Registering an endpoint to push change events to |
@@ -1965,6 +2004,7 @@ components:
         - hybrid-search
         - local-embeddings
         - partial-indexes
+        - token-refresh
         - ttl-indexes
         - vector-search
         - webhooks
@@ -2022,6 +2062,26 @@ components:
               do not need listing separately. `watch`, `search` and `webhook`
               are independent: a webhook hands out an ongoing egress path,
               which is a different act from being allowed to read.
+
+    Token:
+      type: object
+      description: |
+        A bearer token and how long it lasts. `expiresIn` is reported rather
+        than left to be discovered by decoding the token: the token is opaque
+        to this protocol, and a client that parses one to schedule its refresh
+        is depending on a shape nothing promised it.
+      required: [token, user, expiresIn]
+      properties:
+        token:
+          type: string
+          description: "Send as `Authorization: Bearer <token>`."
+        user:
+          type: string
+        expiresIn:
+          type: integer
+          description: |
+            Seconds from now until this token stops working. Refresh before
+            then; after it, log in again.
 
     User:
       type: object

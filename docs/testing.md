@@ -595,6 +595,9 @@ Security properties are asserted as behaviour, not assumed:
 | A deleted account's token stops working at once | `a_deleted_users_token_stops_working_at_once` |
 | A narrowed grant takes effect before the token expires | `narrowing_a_grant_takes_effect_without_waiting_for_the_token_to_expire` |
 | A revoked token does not say why it was revoked | `a_revoked_token_does_not_say_why` |
+| Refresh cannot revive a deleted account's session | `refresh_cannot_revive_a_revoked_session` |
+| A changed grant stops refresh rather than being carried forward | `a_changed_grant_stops_refresh_rather_than_being_carried_forward` |
+| An expired token cannot be refreshed | `an_expired_token_cannot_be_refreshed` |
 | 403 does not leak existence | same test — a nonexistent collection also returns 403 |
 | Listing hides unreadable collections | `listing_hides_what_the_caller_cannot_read` |
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |

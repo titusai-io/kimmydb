@@ -685,6 +685,12 @@ async fn every_documented_operation_answers_as_the_specification_says() {
 
     // -- auth --------------------------------------------------------------
     let root = c.login("root", ROOT_PASSWORD).await;
+    let refreshed =
+        c.check("POST", "/v1/auth/refresh", "/v1/auth/refresh", Some(&root), None, 200).await;
+    assert_eq!(refreshed["user"], "root");
+    assert!(refreshed["expiresIn"].as_u64().is_some_and(|s| s > 0));
+    // The fresh token works, which is the only claim that matters about it.
+    let root = refreshed["token"].as_str().expect("a token").to_string();
     c.check("GET", "/v1/auth/whoami", "/v1/auth/whoami", Some(&root), None, 200).await;
 
     // -- users -------------------------------------------------------------

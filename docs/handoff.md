@@ -6,10 +6,10 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 3 done, on a branch awaiting review**
+## As of 2026-08-13 — **M10 task 4 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–3 are done: #65 and #66 merged, task 3 is on
-`m10-versioning` with a PR open and unmerged.
+**M0–M9 complete.** M10 tasks 1–4 are done: #65, #66 and #67 merged, task 4 is
+on `m10-token-refresh` with a PR open and unmerged.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -20,14 +20,17 @@ real answer ([ADR-057](decisions.md)). Task 3: `/v1` does not break, and a node
 advertises **capabilities** rather than expecting clients to map versions to
 features ([ADR-058](decisions.md)).
 
-**Next is task 4**, token refresh, off fresh `main` once task 3 merges. Its
-reserved decision — a separate refresh token versus sliding re-issue of the
-access token — comes first, and **the security half is the real work**: refresh
-must re-read the user record and re-check `token_version` and `disabled`, or it
-launders a revoked session indefinitely, which is the exact failure ADR-052
-exists to prevent. Task 4 also owes a new `Capability` variant, because a
-client needs to discover refresh before it can use it — that is now the pattern
-for every client-visible feature.
+Task 4: **sliding re-issue** of the access token rather than a second
+credential, with no grace for an expired one ([ADR-059](decisions.md)).
+
+**Next is task 5**, client-visible topology and discovery, off fresh `main`
+once task 4 merges. Its reserved decision — static configuration versus live
+SWIM membership — comes first, and **it is the one M10 task carrying
+distributed-systems risk**. Two traps at once, both already documented and both
+having cost an outage before: `Members` holds *peers only*, so a set computed
+from it can never contain `me`, and the set must contain only authenticated
+peers (ADR-053). Anything new reading it inherits both. It owes a capability
+too, like refresh did.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -91,7 +94,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `main` | PRs #16–#63 merged: all of M8 and all of M9, SWIM authentication (ADR-053), the witnessed vector (ADR-054), ADR-055 and the M10 board |
 | `m10-protocol-spec` | ✅ Merged as #65. M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056 |
 | `m10-error-taxonomy` | ✅ Merged as #66. M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
-| `m10-versioning` | **Open, PR raised, not merged.** M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
+| `m10-versioning` | ✅ Merged as #67. M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
+| `m10-token-refresh` | **Open, PR raised, not merged.** M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -213,7 +217,7 @@ work.
 | 1 | ✅ **Protocol specification** (OpenAPI 3.1) + a contract test | Settled: hand-written, checked by inventory *and* live responses (ADR-056) |
 | 2 | ✅ **Error taxonomy as public surface** | Settled: three-valued `no`/`wait`/`elsewhere`, closed by an enum (ADR-057) |
 | 3 | ✅ **Versioning and compatibility policy** | Settled: path-major, `/v1` never breaks, capabilities over version numbers (ADR-058) |
-| 4 | **Token refresh** | Refresh token vs. sliding re-issue |
+| 4 | ✅ **Token refresh** | Settled: sliding re-issue, no grace for an expired token (ADR-059) |
 | 5 | **Client-visible topology / discovery** | Static config vs. live SWIM membership |
 | 6 | **Cursors at the protocol level** | — (M9 task 5 settled the shape) |
 | 7 | **HTTP-level benchmark harness** | — |
@@ -351,6 +355,38 @@ window, which is a promise about calendar time, and "changing what a route
 means is breaking", which nothing reading shapes can detect. Naming them is the
 point — the failure this milestone keeps finding is a claim that reads like a
 mechanism and is not one.
+
+### What task 4 did
+
+`POST /v1/auth/refresh` exchanges a valid token for a fresh one — **sliding
+re-issue, not a second credential**. Nothing new for a client to store, no
+second lifetime, nothing kept server-side. A stored rotating refresh token was
+rejected for an architectural reason worth remembering: rotation is a
+compare-and-set on a replicated record, which a leaderless store does not
+offer, and two concurrent rotations resolve by last-writer-wins — discarding a
+credential a client is holding ([ADR-059](decisions.md)).
+
+**The security half is structural rather than written.** The route takes the
+`Auth` extractor, so a token whose account was deleted, disabled, or had its
+password or grants changed is refused *before the handler runs*. Refresh cannot
+launder a revoked session by construction, not by remembering to check — which
+matters, because the remembering version is one deleted line away from being an
+indefinite session-laundering endpoint.
+
+**Three deliberate non-features**, all now written down and tested:
+
+- The old token keeps working until it expires. A stateless token cannot be
+  recalled; ending a session early is what the version bump is for.
+- A grant change stops refresh along with everything else, because grants live
+  in the token. That is the cost of carrying them rather than looking them up.
+- No grace for an expired token, so `exp` means one thing on every route. A
+  client idle past the lifetime logs in again — a thing a library may ask of an
+  application, where re-sending credentials hourly is not.
+
+**`expiresIn` is reported at login and refresh**, so a client never decodes a
+token it is told to treat as opaque. It is also the first spend of the
+compatibility promise written one task earlier: a new response field, shipped
+in `/v1` without ceremony.
 
 **Only task 5 carries distributed-systems risk**, and it carries two known
 traps at once: `Members` holds *peers only*, and the set must contain only

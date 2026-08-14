@@ -648,6 +648,105 @@ async fn the_last_user_cannot_be_deleted() {
 }
 
 #[tokio::test]
+async fn refresh_returns_a_working_token_and_says_how_long_it_lasts() {
+    let server = Server::start().await;
+    let root = server.root().await;
+
+    let res = server.post("/v1/auth/refresh", Some(&root), json!({})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["user"], "root");
+    assert_eq!(res.body["expiresIn"], 3600, "the lifetime is told, not left to be decoded");
+
+    let fresh = res.body["token"].as_str().expect("a token");
+    assert_eq!(server.get("/v1/databases", Some(fresh)).await.status, 200);
+
+    // Refreshing does not recall the old token. A stateless token cannot be
+    // recalled, and saying so is better than implying otherwise.
+    assert_eq!(server.get("/v1/databases", Some(&root)).await.status, 200);
+}
+
+#[tokio::test]
+async fn refresh_cannot_revive_a_revoked_session() {
+    // The failure this route most needed not to have. Refresh takes `Auth`, so
+    // the presented token goes through the ADR-052 storage check before the
+    // handler runs — a deleted account cannot refresh its way back in.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(server.post("/v1/auth/refresh", Some(&ada), json!({})).await.status, 200);
+
+    server.delete("/v1/users/ada", Some(&root)).await;
+
+    let res = server.post("/v1/auth/refresh", Some(&ada), json!({})).await;
+    assert_eq!(res.status, 401, "a deleted account must not refresh: {:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_changed_grant_stops_refresh_rather_than_being_carried_forward() {
+    // Grants live in the token, so changing them bumps the token version and
+    // every token the user holds stops working — including for refresh. That
+    // is the deliberate cost of embedding grants: a narrowed permission takes
+    // effect at once, and the price is logging in again.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"ada","password":"ada-password",
+                   "grants":[{"db":"shop","collection":"*","actions":["read","write"]}]}),
+        )
+        .await;
+    let ada = server.login("ada", "ada-password").await;
+
+    server
+        .post(
+            "/v1/users/ada/grants",
+            Some(&root),
+            json!({"grants":[{"db":"shop","collection":"*","actions":["read"]}]}),
+        )
+        .await;
+
+    let res = server.post("/v1/auth/refresh", Some(&ada), json!({})).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+
+    // And logging in again gets the narrowed authority, not the old one.
+    let ada = server.login("ada", "ada-password").await;
+    let refreshed = server.post("/v1/auth/refresh", Some(&ada), json!({})).await;
+    assert_eq!(refreshed.status, 200);
+    let after = refreshed.body["token"].as_str().expect("a token");
+    let whoami = server.get("/v1/auth/whoami", Some(after)).await;
+    assert_eq!(whoami.body["grants"][0]["actions"], json!(["read"]));
+}
+
+#[tokio::test]
+async fn an_expired_token_cannot_be_refreshed() {
+    // No grace window: `exp` means the same thing on this route as on every
+    // other one. A client idle past the lifetime logs in again.
+    let server = Server::start().await;
+    let issuer = TokenIssuer::new(SECRET, 3600).unwrap();
+    let principal = kimmy_auth::Principal::superuser("root");
+    // Issued two hours ago, so it expired an hour ago — without sleeping.
+    let stale = issuer
+        .issue_at(&principal, kimmy_storage::physical_now_ms() / 1000 - 7200)
+        .expect("a token");
+
+    let res = server.post("/v1/auth/refresh", Some(&stale), json!({})).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    assert_eq!(res.body["error"], "unauthorized");
+}
+
+#[tokio::test]
+async fn refresh_is_refused_when_authentication_is_disabled() {
+    // There is no token to refresh, and answering with one would suggest the
+    // node cares about it.
+    let server = Server::start_with(true).await;
+    let res = server.post("/v1/auth/refresh", None, json!({})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn a_deleted_users_token_stops_working_at_once() {
     // The debt this closes: a deleted account kept working until its token
     // expired, up to an hour later.

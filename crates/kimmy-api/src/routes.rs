@@ -23,6 +23,7 @@ pub fn router(state: SharedState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/auth/login", post(login))
+        .route("/v1/auth/refresh", post(refresh))
         // Public for the same reason the health routes are: a client has to be
         // able to ask what a node supports before it holds a token.
         .route("/v1/version", get(crate::version::version))
@@ -196,7 +197,61 @@ async fn login(
     };
 
     let token = state.tokens.issue(&principal)?;
-    Ok(Json(json!({ "token": token, "user": principal.user })))
+    Ok(Json(json!({
+        "token": token,
+        "user": principal.user,
+        "expiresIn": state.tokens.ttl_secs(),
+    })))
+}
+
+/// Exchange a valid token for a fresh one.
+///
+/// **Sliding re-issue, not a second credential** (ADR-059). A client that is
+/// using the API never has to hold credentials past login; one that has been
+/// idle longer than the lifetime logs in again, which is a thing a library may
+/// ask of an application where doing it every hour is not.
+///
+/// # This is not a way back into a revoked session
+///
+/// The route takes `Auth`, so the presented token goes through the whole check
+/// every other route does — signature, expiry, and then the storage read that
+/// ADR-052 exists for. A token whose account was deleted, disabled, or had its
+/// password or grants changed is refused *before this runs*. Refresh cannot
+/// launder any of that, which is the failure this route most needed not to
+/// have.
+///
+/// The new token is built from a **fresh read of the user record**, not from
+/// the old token's claims: grants and token version come from storage. Today
+/// those cannot have changed — a change bumps the version and the extractor
+/// would have refused — but the day that stops being true, this route must not
+/// be the place that carries stale authority forward.
+///
+/// Not rate-limited. The login limiter exists to bound Argon2 work, and there
+/// is none here; this route verifies a signature and reads one record.
+async fn refresh(State(state): State<SharedState>, auth: Auth) -> Result<Json<Value>, ApiError> {
+    if auth.principal().unauthenticated {
+        return Err(ApiError::bad_request(
+            "this node runs with authentication disabled, so there is no token to refresh",
+        ));
+    }
+
+    let name = &auth.principal().user;
+    let user = state
+        .users
+        .get(&state.engine, name)?
+        // Unreachable through the extractor, which checks the same record —
+        // but the record is the authority and this is the read that uses it.
+        .filter(|u| !u.disabled)
+        .ok_or_else(|| ApiError::unauthorized("this token is no longer valid; log in again"))?;
+
+    let principal =
+        kimmy_auth::Principal::new(user.name, user.grants).at_version(user.token_version);
+    let token = state.tokens.issue(&principal)?;
+    Ok(Json(json!({
+        "token": token,
+        "user": principal.user,
+        "expiresIn": state.tokens.ttl_secs(),
+    })))
 }
 
 // ---------------------------------------------------------------------------

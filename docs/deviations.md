@@ -981,6 +981,46 @@ breaking", which nothing that reads shapes can detect.
 
 ---
 
+## 🟢 A token can be refreshed without re-sending credentials (M10 task 4)
+
+**Was.** `/v1/auth/login` was the only way to get a token, and tokens expire —
+so a client library's only options were to hold the password and re-send it
+every hour, or to hand every application an hourly outage.
+
+**Now.** `POST /v1/auth/refresh` exchanges a valid token for a fresh one.
+**Sliding re-issue, not a second credential**: nothing new to store, no second
+lifetime to reason about, nothing kept server-side.
+[ADR-059](decisions.md) has the reasoning, including why a stored, rotating
+refresh token fits a leaderless store badly — rotation is a compare-and-set on
+a replicated record, and two concurrent rotations resolve by last-writer-wins,
+discarding a credential a client is holding.
+
+**The security half is a property of the route's shape.** Refresh takes the
+`Auth` extractor, so the token goes through the same ADR-052 check every route
+applies and a revoked session is refused *before the handler runs*. That is the
+difference between "cannot launder a revocation" and "does not, as long as
+nobody deletes a line".
+
+**Three things it deliberately does not do**, each written down rather than
+discovered later:
+
+- **It does not recall the old token**, which keeps working until it expires. A
+  stateless token cannot be recalled; ending a session early is what the
+  version bump is for.
+- **It does not survive a grant change.** Grants live in the token, so changing
+  them bumps the version and refresh is refused along with everything else —
+  the cost of grants being carried rather than looked up.
+- **It offers no grace for an expired token**, so `exp` means one thing on
+  every route. A client idle past the lifetime logs in again, which is a thing
+  a library may ask of an application where doing it hourly is not.
+
+**Login and refresh both report `expiresIn`**, so a client schedules renewal
+without decoding a token it is told to treat as opaque. An added response field
+is additive under the policy written one task earlier, which is the first time
+that promise was spent.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was
