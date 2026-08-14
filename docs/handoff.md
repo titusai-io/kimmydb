@@ -6,13 +6,24 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M9 complete**; M10 planned, nothing started
+## As of 2026-08-13 — **M10 task 1 done, on a branch awaiting review**
 
 **M0–M9 complete.** M9 finished on 2026-08-13 with all five tasks merged, plus
 two unplanned fixes found while doing them.
 
-**M10 is planned and no branch exists.** Start at task 1 — [Roadmap](roadmap.md)
-has the board and the six reserved decisions.
+**M10 has started.** Task 1 — the protocol specification — is on
+`m10-protocol-spec` with a PR open and unmerged. Its reserved decision was put
+to the maintainer first, as every M8 and M9 reserved decision was: **hand-written
+and checked by a contract test**, with the test validating **live responses**
+rather than only the route inventory ([ADR-056](decisions.md)). A second
+decision came up mid-branch, from something the test found, and went the same
+way — see the board below.
+
+**Next is task 2**, the error taxonomy, off fresh `main` once task 1 merges.
+Its reserved decision — which errors are declared retryable — comes first.
+`docs/openapi.yaml` lists the sixteen codes currently in use and says plainly
+that closing the set is task 2's job, so the enumeration starts there rather
+than from a grep.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -38,7 +49,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-056**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-057**).
   M8 task 7 found the register can silently lose an entry — this file's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -74,7 +85,7 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | | |
 |---|---|
 | `main` | PRs #16–#63 merged: all of M8 and all of M9, SWIM authentication (ADR-053), the witnessed vector (ADR-054), ADR-055 and the M10 board |
-| — | No branch open. M10 task 1 is next, and its reserved decision comes first. |
+| `m10-protocol-spec` | **Open, PR raised, not merged.** M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056, and the one wire change the test turned up |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -99,8 +110,9 @@ milestone was two behind. [Decisions](decisions.md) and
 **M9 wrote no ADRs.** Every decision was recorded as a 🟢 entry in
 [Deviations](deviations.md) instead, because each was a feature decision with
 its reasoning rather than an architectural choice with alternatives. Next ADR
-number is still **ADR-056**. If an M10 decision supersedes something — task 1's
-spec approach or task 3's versioning policy plausibly will — that is an ADR.
+number is **ADR-057**; M10 task 1 wrote ADR-056, because its reserved decision
+had real alternatives to weigh rather than being a feature choice with a
+reason. Task 3's versioning policy plausibly wants one too.
 
 ### What the M9 branches did, and what they found
 
@@ -192,7 +204,7 @@ work.
 
 | # | Task | Reserved decision to settle first |
 |---|---|---|
-| 1 | **Protocol specification** (OpenAPI 3.1) + a drift test | Hand-written and checked, vs. generated from routes |
+| 1 | ✅ **Protocol specification** (OpenAPI 3.1) + a contract test | Settled: hand-written, checked by inventory *and* live responses (ADR-056) |
 | 2 | **Error taxonomy as public surface** | Which errors are declared retryable |
 | 3 | **Versioning and compatibility policy** | The shape of the promise |
 | 4 | **Token refresh** | Refresh token vs. sliding re-issue |
@@ -208,6 +220,45 @@ work.
 **M9 is done, so nothing blocks M10.** Task 6 inherits the cursor design
 directly: an opaque `_id`-order token, already node-portable, which is most of
 what "cursors at the protocol level" has to decide.
+
+### What task 1 did, and what it found
+
+`docs/openapi.yaml` describes every route the router registers — the auth flow,
+Extended JSON v2, the error envelope, cursors, and the WebSocket frame shapes
+that OpenAPI has nowhere else to put. `/mcp` is deliberately absent: a
+different protocol, config-gated, specified by MCP itself.
+
+**The document is not the deliverable; `crates/kimmy-api/tests/openapi.rs` is.**
+It checks inventory both directions, then drives every documented operation
+against a real server and validates each response against the declared schema,
+and **ends by asserting every documented operation was exercised** — so a route
+cannot be added to the router and the spec without also being driven. That
+last assertion is what every later task pays: changing the wire now means
+editing the document and the scenario together.
+
+Three findings, all from the live half, all in the same shape as M9's:
+
+- **`PUT /docs/{id}` returned `matched` and `modified` as booleans** while
+  `/update` and `/find_and_modify` return them as counts — one field name,
+  two types, on one protocol, because the route serialized `WriteOutcome`'s
+  bools straight through. **The route had no integration test at all**, and
+  this file described it as `{"matched": 0}`, which was wrong in a way nothing
+  could contradict. Normalized to counts by the maintainer's decision, at the
+  cheapest possible moment: no client exists and nothing in-tree reads them.
+  `upserted` stays a boolean because it is one.
+- **`GET /v1/users` returns names, not user objects** — the spec's first draft
+  was written from the handler rather than the store.
+- **The M8 inventory test had a hole.** It matched `.route("` at the start of a
+  line, so it skipped the three registrations rustfmt breaks across lines,
+  including `/docs/{id}`. Green while never checking the busiest route on the
+  API. There is one scanner now, in the new test, and it covers `http-api.md`
+  too.
+
+**Verified beyond the suite**, as every branch is: a release node on port 7911,
+driven by a Python script that parses `docs/openapi.yaml` itself and checks 32
+real responses against it — a second reader, independently implemented, of the
+same document. It also walked a two-page cursor and confirmed the three
+`PUT` shapes on the wire. No disagreements, and the node log was clean.
 
 **Only task 5 carries distributed-systems risk**, and it carries two known
 traps at once: `Members` holds *peers only*, and the set must contain only
@@ -265,7 +316,7 @@ knowing so it is not re-derived:
   lost, converged in 42s.
 
 **Three cautions for whoever writes the next drive script.** `PUT /docs/{id}`
-without `?upsert=true` returns `200 {"matched":0}` and writes nothing — a
+without `?upsert=true` returns `200 {"matched": 0}` and writes nothing — a
 conflict test built on it wrote nothing at all and passed, because five nodes
 agreed on an error. Shadow-collection vectors take ~2s to replicate; a check
 that runs immediately reports a broken pipeline that is merely young. And a
@@ -311,7 +362,14 @@ on every page after it. Discard the first sample or say plainly that you did.
   Python script. Where a claim is about cost, measure it against a **release**
   build; a debug build's numbers are anecdotes. Check the node log for
   warnings before stopping it, then `pkill -f "kimmyd --config <path>"`.
-- **The suite is ~1,042 tests** across the workspace, plus 5 ignored cluster
+- **Driving the protocol specifically.** `docs/openapi.yaml` is machine
+  readable, so a drive can validate against it rather than eyeballing: task 1's
+  script parsed the document with `yaml` and checked required fields and
+  declared types on 32 real responses from a release node. Python has `yaml`
+  here but **not** `jsonschema`, so a full validator has to be the Rust test —
+  the shallow check is still worth having, because it is a second reader of the
+  same document.
+- **The suite is ~1,048 tests** across the workspace, plus 5 ignored cluster
   tests. A full `cargo test --workspace` is about two minutes.
 
 ### Carried debt, none blocking
@@ -328,7 +386,7 @@ in [Deviations](deviations.md):
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
 | Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`), type conversion | outside M9 task 1's agreed list; variable binding needs an evaluation *scope*, not another operator |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
-| No published protocol spec; no token refresh; clients cannot discover the cluster | **M10 tasks 1, 4, 5** |
+| No token refresh; clients cannot discover the cluster | **M10 tasks 4, 5**. The protocol *is* published now — `docs/openapi.yaml` |
 | Client-facing throughput is unmeasured — every benchmark is engine-level | **M10 task 7** |
 | Sharding | **deferred by decision** until there is operational experience |
 
@@ -539,6 +597,25 @@ in [Deviations](deviations.md):
   it as caller-supplied pure functions (`ModifySpec`, `delete_guarded`'s
   guard), evaluated inside its own transaction. Do not add the production
   dependency; the boundary has improved every design that met it.
+
+**From M10 — the protocol as a contract:**
+
+- **`docs/openapi.yaml` is the protocol's authority, and changing the wire
+  means changing it in the same commit.** `crates/kimmy-api/tests/openapi.rs`
+  fails when the router and the document disagree about which operations
+  exist, when a real response does not match its declared schema, **and when a
+  documented operation is not driven by the test at all**. That last one is
+  what stops the document becoming prose again; it is also what every new route
+  now costs (ADR-056).
+- **One concept, one type, across every route that reports a write.**
+  `matched` and `modified` are counts everywhere, including on `PUT
+  /docs/{id}`, which touches at most one document. `upserted` is a boolean
+  because it is one. This was not true until the specification's test drove
+  both routes and compared them.
+- **A route inventory built by scanning source must handle multi-line
+  registrations.** The check that missed them was green for two milestones
+  while never looking at `/docs/{id}`. If a scan can silently match nothing,
+  assert that it matched something.
 
 
 ## Reading order for someone new

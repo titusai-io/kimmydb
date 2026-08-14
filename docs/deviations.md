@@ -831,6 +831,53 @@ Not rejected — a smaller, separate decision, to be made after M10.
 
 ---
 
+## 🟢 The protocol is specified, and the specification is checked (M10 task 1)
+
+**Was.** The protocol existed and nothing wrote it down. `docs/http-api.md` said
+so itself: "a *reference*, not yet a *specification* — nothing here is
+versioned or machine-checked against the routes, so it can drift."
+
+**Now.** `docs/openapi.yaml`, hand-written, with `crates/kimmy-api/tests/openapi.rs`
+as the gate. The approach was the task's reserved decision and the maintainer
+chose hand-written over generated; the reasoning, including why generation is
+weaker *here* specifically, is [ADR-056](decisions.md).
+
+**The test checks two different things**, because a specification can be wrong
+two ways. Inventory — every registered route is described and every described
+operation is registered — and behaviour: every documented operation is driven
+against a real server and its response validated against the declared schema.
+It ends by asserting every documented operation was exercised, so an entry
+nothing executes cannot be added.
+
+**Three findings, all from the behavioural half:**
+
+- **`PUT /docs/{id}` returned booleans where every sibling route returns
+  counts.** `{"matched": true, "modified": true}` against `/update`'s
+  `{"matched": 3, "modified": 2}` — one field name carrying two types on one
+  protocol, because the route serialized `WriteOutcome`'s three bools straight
+  to the wire. Nothing had stated the type, so nothing disagreed, and the route
+  had **no integration test at all**. `docs/handoff.md` described it as
+  `{"matched": 0}`, which was wrong in a way nothing could contradict.
+  Normalized to counts by decision — the cheapest possible moment, since no
+  client exists yet and nothing in-tree reads the fields. `upserted` stays a
+  boolean because it genuinely is one, and the route now has a test naming both
+  behaviours.
+- **`GET /v1/users` returns names, not user objects.** The specification's
+  first draft said objects, written from the handler's shape rather than the
+  store's return type. Caught on the first run.
+- **The M8 inventory test had a hole.** `every_route_is_in_the_http_reference`
+  matched `.route("` at the start of a line, which skips the three
+  registrations rustfmt breaks across lines — `/docs/{id}`, `/docs/{id}/vectors`
+  and `/vector`. It had been green while never checking the busiest route on
+  the API. There is now one scanner, in the new test, and it checks the prose
+  reference as well.
+
+**The pattern is the milestone's own thesis, one task in:** every claim that
+mattered and had no mechanism behind it was false. The two documents describing
+this protocol both described it wrongly, and it took driving it to notice.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

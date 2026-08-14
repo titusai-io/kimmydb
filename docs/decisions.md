@@ -2222,6 +2222,15 @@ and extends [ADR-011](#adr-011--httpjson--websocket-not-the-mongodb-wire-protoco
 which chose HTTP/JSON as a *server* decision and never said what a client could
 rely on.
 
+> **Corrected 2026-08-13.** The envelope below was written as
+> `{status, tag, message}`. The wire carries
+> `{"error": "<code>", "message": "…"}` — the status is the HTTP status and the
+> field is `error`, not `tag`. Three documents and this ADR all described it
+> the same wrong way, which is the point ADR-055 was making about prose nothing
+> checks, made against ADR-055. `docs/openapi.yaml` is now the authority, and
+> [ADR-056](#adr-056--the-protocol-specification-is-hand-written-and-a-contract-test-keeps-it-true)
+> is what keeps it true.
+
 **The protocol already existed; nothing had written it down.** Framing is HTTP,
 encoding is Extended JSON v2 (`kimmy-api/src/lib.rs`), authentication is a
 bearer token from `/v1/auth/login`, errors are `{status, tag, message}`,
@@ -2330,6 +2339,77 @@ without claiming replica-set topology and inheriting retryable writes,
 smaller and different decision, it does not touch the write path, and it should
 be made after M10 from experience with real clients. Sharding stays deferred on
 its original terms.
+
+---
+
+## ADR-056 — The protocol specification is hand-written, and a contract test keeps it true
+
+**Decision.** `docs/openapi.yaml` is an OpenAPI 3.1 document written by hand,
+not generated from the route handlers. What makes it a contract rather than
+prose is `crates/kimmy-api/tests/openapi.rs`, which fails when the router and
+the document disagree — on which operations exist, and on what a response
+actually contains.
+
+This carries out M10 task 1 of [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud).
+
+**The alternative was generation** — `utoipa` or `aide`, annotating each
+handler so the specification falls out of the build. Rejected for a reason
+specific to this codebase rather than a general preference:
+
+- **Thirty-eight of thirty-nine handlers return `Json<Value>`.** There are no
+  response types to derive from. Generation would supply paths, path
+  parameters and the thirteen typed request bodies; every response schema
+  would still be hand-written, inside a macro attribute, next to the handler
+  instead of in a document anyone can read. The half it automates is the half
+  a text scan already checks, and the half it cannot automate is the half that
+  drifts.
+- **A generated document cannot disagree with the code, which is exactly what
+  makes it weaker here.** It would have recorded that `PUT /docs/{id}` returns
+  `{"matched": true}` and been *correct*, and the inconsistency below would
+  have survived into three client libraries as a documented feature. The
+  value of writing the specification by hand is that writing down what a route
+  ought to return is what makes it visible that it does not.
+- **It adds a dependency to the shipped crate** for something the server never
+  reads. Both test dependencies here are dev-only; the daemon does not carry
+  its own specification.
+
+**Two conditions make this safe rather than optimistic**, because a
+hand-written document that nothing checks is precisely the ADR-016 failure
+this project has already paid for once:
+
+1. **Inventory, both directions.** Every registered route is described, and
+   every described operation is registered.
+2. **Behaviour, against a running server.** Every documented operation is
+   driven over a real socket and its response validated against the declared
+   schema, and the test ends by asserting that *every* documented operation
+   was exercised. A specification entry nothing executes cannot be added.
+
+**What it found immediately**, which is the argument for the second condition:
+
+- `GET /v1/users` returns an array of **names**; the first draft of the
+  document said user objects, from reading the handler rather than the store.
+- **`PUT /docs/{id}` returned `matched` and `modified` as booleans** while
+  `/update` and `/find_and_modify` return them as counts — one field name,
+  two types, on one protocol. `WriteOutcome` is three bools and the route
+  serialized them straight through. No document had ever stated the type, so
+  nothing disagreed; `docs/handoff.md` described it as `{"matched": 0}`, which
+  was wrong in a way no test could contradict. The route had **no integration
+  test at all**. Normalized to counts by decision, before a client existed to
+  break — `upserted` stays a boolean because it genuinely is one.
+- The inventory check that had lived in `routes.rs` since M8 matched
+  `.route("` at the start of a line, so it **silently skipped the three
+  registrations rustfmt breaks across lines** — including `/docs/{id}`. It had
+  been passing while never checking the busiest route on the API.
+
+**`/mcp` is deliberately not in the document.** It is a different protocol,
+specified by MCP itself, mounted conditionally on `mcp.enabled` — describing it
+here would put a second and weaker description of it in the repository.
+[MCP](mcp.md) is its reference.
+
+**The cost, stated plainly.** The document is maintained by hand, so every
+later task that changes the wire must edit it, and the coverage assertion means
+every new route needs a scenario in the test before it can be merged. That is
+the intended cost: it is the mechanism, not friction around it.
 
 ---
 

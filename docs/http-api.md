@@ -9,15 +9,21 @@ Default port **7878**.
 
 **This is KimmyDB's client protocol, not one of several.** HTTP provides
 framing, Extended JSON v2 provides the encoding for types JSON cannot express,
-a bearer token from `/v1/auth/login` provides authentication, `{status, tag,
-message}` provides errors, and the WebSocket at `/watch` provides streaming.
-The MongoDB wire protocol, gRPC and GraphQL were all considered and rejected —
-[ADR-055](decisions.md) has the reasoning.
+a bearer token from `/v1/auth/login` provides authentication,
+`{"error": "<code>", "message": "…"}` provides errors, and the WebSocket at
+`/watch` provides streaming. The MongoDB wire protocol, gRPC and GraphQL were
+all considered and rejected — [ADR-055](decisions.md) has the reasoning.
 
-This page is a *reference*, not yet a *specification*: nothing here is
-versioned or machine-checked against the routes, so it can drift. Making it a
-contract, with a test that fails when it does, is M10 task 1 on the
-[Roadmap](roadmap.md).
+**The specification is [`openapi.yaml`](openapi.yaml)**, and it is the
+authority: an OpenAPI 3.1 document covering every route, checked by a contract
+test that drives each operation against a running server and validates the
+response against the declared schema ([ADR-056](decisions.md)). Point a client
+generator at it.
+
+This page stays as the *reference* — the one to read to learn the API, with the
+reasoning a schema cannot carry. The same test requires every registered route
+to appear here too, because a table titled **Endpoints** that reads as complete
+has been incomplete before.
 
 ---
 
@@ -188,9 +194,14 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/docs/42 -H "$A"
 The `{id}` segment is interpreted by shape: 24 hex characters → ObjectId, an
 integer → integer, anything else → string.
 
-`PUT` returns `{"matched": …, "modified": …, "upserted": …}`. Replacement is
-**not** a merge — unnamed fields are dropped — and `_id` always comes from the
-path, never the body.
+`PUT` returns `{"matched": 0|1, "modified": 0|1, "upserted": true|false}` —
+**counts**, as `update` and `find_and_modify` return, even though a replace
+touches at most one document. Replacement is **not** a merge — unnamed fields
+are dropped — and `_id` always comes from the path, never the body.
+
+**Without `?upsert=true` a missing document is not an error.** The answer is
+`200 {"matched": 0}` and nothing is written. A test built on the assumption
+that this creates the document writes nothing and passes.
 
 ### Find
 

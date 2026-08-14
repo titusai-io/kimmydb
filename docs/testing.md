@@ -600,6 +600,27 @@ Security properties are asserted as behaviour, not assumed:
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |
 | The last user cannot be deleted | `the_last_user_cannot_be_deleted` |
 
+### The protocol contract
+
+`crates/kimmy-api/tests/openapi.rs` holds `docs/openapi.yaml` to the server it
+describes ([ADR-056](decisions.md)). It is the only test here whose subject is
+a *document*.
+
+| Property | Test |
+|---|---|
+| Every registered route is specified, and every specified operation registered | `the_specification_and_the_router_describe_the_same_operations` |
+| Every documented operation answers, and its response validates against the declared schema | `every_documented_operation_answers_as_the_specification_says` |
+| Every documented operation is actually exercised | the coverage assertion closing that test |
+| Refusals use the documented envelope and status | `documented_refusals_use_the_documented_envelope` |
+| A 429 carries `Retry-After` | `a_rate_limited_login_matches_its_documented_response` |
+| Every route is in the prose reference too | `every_route_is_in_the_http_reference` |
+| The specification's own `$ref`s resolve | `the_specification_is_well_formed` |
+
+The coverage assertion is the load-bearing part: it means a route cannot be
+added to the router and the specification without also being driven here. A
+specification entry nothing executes is the failure mode this whole file exists
+to prevent — a claim with no mechanism behind it.
+
 ---
 
 ## Tests that caught real bugs
