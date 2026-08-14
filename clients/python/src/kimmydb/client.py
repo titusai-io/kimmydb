@@ -132,11 +132,19 @@ class Client:
     # -- documents ---------------------------------------------------------
 
     def create_collection(self, db: str, collection: str) -> Dict[str, Any]:
+        """Create a collection.
+
+        Creating one that already exists raises :class:`KimmyError` with code
+        ``conflict`` rather than succeeding a second time — so "make sure this
+        exists" means catching that, not assuming the call is idempotent.
+
+        Still marked idempotent for *retry* purposes: repeating it cannot
+        create two collections, because the id is derived from the name.
+        """
         return self.request(
             "POST",
             f"/v1/db/{db}/collections",
             json={"name": collection},
-            # Creating a collection twice is creating it once.
             idempotent=True,
         )
 

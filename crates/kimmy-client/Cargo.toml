@@ -27,6 +27,11 @@ tokio-tungstenite = { version = "0.29", default-features = false, features = ["h
 tokio-rustls.workspace = true
 webpki-roots = "1"
 
+# The conformance driver is an example rather than a bin: built only on demand
+# by `cargo build --example conformance`, never part of what ships.
+[[example]]
+name = "conformance"
+
 [dev-dependencies]
 # A server to talk to. Dev-only: the shipped crate depends on no kimmy crate.
 kimmy-api.workspace = true

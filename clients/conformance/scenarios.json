@@ -1,0 +1,87 @@
+{
+  "description": "One set of scenarios, run three ways. See README.md.",
+  "password": "conformance-password",
+  "scenarios": [
+    {
+      "id": "capabilities",
+      "why": "A client must be able to ask what a node supports before assuming a feature exists.",
+      "expect": { "protocol": "v1", "has_cursor_paging": true, "has_invented_capability": false }
+    },
+    {
+      "id": "documents_round_trip",
+      "why": "Insert, read back, and a missing document that is absent rather than an error.",
+      "expect": { "qty": 3, "missing_is_absent": true, "count": 5 }
+    },
+    {
+      "id": "unlimited_find_is_a_page",
+      "why": "Omitting a limit returns 100 documents, not the collection. A client that hides this moves the surprise.",
+      "expect": { "page": 100, "offers_cursor": true, "total": 150 }
+    },
+    {
+      "id": "paging_walks_everything",
+      "why": "The walk sees every document exactly once, in order.",
+      "expect": { "documents_seen": 250, "first_id": 0, "last_id": 249, "ordered": true }
+    },
+    {
+      "id": "walk_ends_on_empty_page",
+      "why": "A final page that is exactly full still carries a token. A walk that stops when the token stops arriving reads one page too few.",
+      "expect": { "pages": 1, "documents_seen": 100 }
+    },
+    {
+      "id": "cursor_refuses_what_it_cannot_page",
+      "why": "A sort other than _id ascending cannot be paged, and the client says so rather than letting the second page fail.",
+      "expect": { "sorted_walk_refused": true, "id_sort_allowed": true }
+    },
+    {
+      "id": "creating_a_collection_twice_is_a_conflict",
+      "why": "The specification claimed creation was idempotent and the server has always returned 409. Found by this suite, so it is a scenario now.",
+      "expect": { "first_created": true, "second_code": "conflict", "second_status": 409 }
+    },
+    {
+      "id": "duplicate_key_is_typed",
+      "why": "A refusal arrives with its code and retry class, not as a status a caller has to interpret.",
+      "expect": { "code": "duplicate_key", "retry": "no", "status": 409 }
+    },
+    {
+      "id": "token_is_renewed",
+      "why": "A client holding credentials survives its own token expiring, without the caller noticing.",
+      "node": { "token_ttl_secs": 1 },
+      "expect": { "token_changed": true, "request_succeeded": true }
+    },
+    {
+      "id": "failover_past_a_dead_endpoint",
+      "why": "A dead address in front of a live one must not stop the client — including at login, which is the first request it makes.",
+      "expect": { "answered": true, "live_endpoint_first_after": true }
+    },
+    {
+      "id": "write_is_not_retried_elsewhere",
+      "why": "`elsewhere` says this node did not answer, not that the work did not happen. A helpful retry would apply an insert twice.",
+      "expect": { "write_failed": true, "retry_class": "elsewhere", "idempotent_retry_succeeded": true }
+    },
+    {
+      "id": "change_stream_delivers",
+      "why": "Events arrive, in order, with the post-image when asked for.",
+      "expect": { "events": 3, "ids": [100, 101, 102], "all_inserts": true, "has_full_document": true }
+    },
+    {
+      "id": "change_stream_resumes",
+      "why": "A token is a position with no server state, so a stream started from it sees what the first missed.",
+      "expect": { "resumed_id": 201 }
+    },
+    {
+      "id": "dropped_collection_ends_stream",
+      "why": "A dropped collection ends its streams rather than leaving them open and silent.",
+      "expect": { "operation": "invalidate", "reason": "CollectionDropped" }
+    },
+    {
+      "id": "recreated_collection_serves_its_own_history",
+      "why": "Ids are derived from the name, so a recreated collection reuses one. Its predecessor's entries are not its history.",
+      "expect": { "first_id": 99 }
+    },
+    {
+      "id": "stale_resume_token_is_refused",
+      "why": "A token from before a drop names a position in a collection that no longer exists. Refused rather than moved forward silently, because the gap is real.",
+      "expect": { "code": "resume_token_expired" }
+    }
+  ]
+}

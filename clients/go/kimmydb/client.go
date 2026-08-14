@@ -246,8 +246,13 @@ func (c *Client) RefreshTopology(ctx context.Context) ([]string, error) {
 
 // -- documents --------------------------------------------------------------
 
-// CreateCollection creates a collection. Creating one twice is creating it
-// once.
+// CreateCollection creates a collection.
+//
+// Creating one that already exists is a conflict, not a second success — so a
+// caller that wants "make sure this exists" treats *APIError with code
+// "conflict" as the good case. Still marked idempotent for retry purposes:
+// repeating it cannot create two collections, because the id is derived from
+// the name.
 func (c *Client) CreateCollection(ctx context.Context, db, collection string) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, "/v1/db/"+db+"/collections",
 		map[string]any{"name": collection}, idempotent)

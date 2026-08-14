@@ -668,7 +668,11 @@ paths:
                     refused here.
       responses:
         "200":
-          description: Created, or already present — creation is idempotent.
+          description: |
+            Created. **Creating one that already exists is a `409`**, not a
+            second success — so a caller that wants "make sure this exists"
+            treats `conflict` as the good case rather than assuming the call is
+            idempotent.
           content:
             application/json:
               schema:
@@ -686,6 +690,11 @@ paths:
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: A collection of that name already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/db/{db}/coll/{coll}:
     parameters:

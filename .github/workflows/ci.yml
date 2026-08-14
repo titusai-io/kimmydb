@@ -140,6 +140,39 @@ jobs:
         working-directory: clients/go
         run: go test ./...
 
+  conformance:
+    name: client conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `check` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - uses: astral-sh/setup-uv@v5
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: clients/go/go.sum
+
+      # One set of scenarios, three clients. This is the job that would catch
+      # the day one client starts paging differently from the other two —
+      # which no per-language suite can, because each would still pass its own.
+      - name: Build the server and the drivers
+        run: |
+          cargo build --release --bin kimmyd
+          cargo build --release --example conformance -p kimmy-client
+          cd clients/go && go build -o conformance-driver ./conformance
+
+      - name: Conformance
+        run: ./clients/conformance/run.py
+
   docker:
     name: docker build
     runs-on: ubuntu-latest
