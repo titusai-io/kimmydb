@@ -1316,6 +1316,39 @@ description, which turned out to describe behaviour the server did not have.
 
 ---
 
+## 🟢 There is a Go client (M10 task 10)
+
+**Now.** `clients/go`, package `kimmydb`, import path
+`github.com/titusai-io/kimmydb/clients/go/kimmydb`. **One dependency**, and it
+is the WebSocket framing: Go's `net/http` pools connections, so the argument
+that ruled out Python's standard library does not apply.
+
+**`coder/websocket` rather than `gorilla/websocket`**, for a reason specific to
+this design rather than a preference: it handshakes through an ordinary
+`*http.Client`, so a change stream inherits the same client, TLS configuration,
+proxy and timeouts as every other request. `gorilla` dials with its own
+`Dialer`, which is two configurations that can drift — the split this project
+has been bitten by before.
+
+**Idioms, not a translation.** Paging and streaming are range-over-function
+iterators, so the error is the second loop variable rather than something to
+remember to check; everything takes a `context.Context`, including the change
+stream, and cancelling it is how a caller stops watching. `Code` is a plain
+string rather than a constant set, for the same reason it is in Python — codes
+are additive, and an unfamiliar one must not be an error in itself.
+
+**Three clients now pass the same scenario list**, written three times against
+one specification, sharing no code. That is the arrangement task 11 was waiting
+for: the conformance suite becomes a matter of running one set of scenarios
+three ways rather than inventing them.
+
+**It found nothing new**, which the roadmap predicted: Go was placed third
+because it is the least likely to surface a protocol gap the other two missed.
+That prediction holding is itself worth recording — the specification and the
+two earlier clients had already taken the surprises.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

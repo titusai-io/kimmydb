@@ -858,6 +858,27 @@ one — see [Deviations](deviations.md).
 
 ---
 
+## The Go client, tested the same way again
+
+`clients/go/kimmydb` spawns a real `kimmyd` and talks to it over a socket — the
+third suite to do so, running deliberately the **same scenario list** as the
+Rust and Python ones.
+
+```bash
+cargo build --release
+cd clients/go && go test ./...
+```
+
+Eighteen tests, about five seconds, each bounded by a `context.WithTimeout` so
+a change stream that never delivers fails rather than stalling the package.
+
+It found nothing new, which is the point: the roadmap put Go third because it
+was least likely to surface a gap the other two had missed, and that turned out
+to be true. Three independent implementations agreeing about one specification
+is the evidence the conformance suite is built on.
+
+---
+
 ## Benchmarks are not tests, and one of them drives the server
 
 `cargo bench -p kimmyd --bench http` is the odd one out: it spawns the shipped

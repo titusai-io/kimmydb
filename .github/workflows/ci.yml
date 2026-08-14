@@ -104,6 +104,42 @@ jobs:
         working-directory: clients/python
         run: uv run --extra dev pytest -q
 
+  go-client:
+    name: go client
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `check` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Same reasoning as the Python job: the tests drive a real `kimmyd`,
+      # because a mocked server asserts only what the client already believes.
+      - name: Build kimmyd
+        run: cargo build --release --bin kimmyd
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: clients/go/go.sum
+
+      - name: Format
+        working-directory: clients/go
+        run: test -z "$(gofmt -l .)" || { gofmt -d .; exit 1; }
+
+      - name: Vet
+        working-directory: clients/go
+        run: go vet ./...
+
+      - name: Test
+        working-directory: clients/go
+        run: go test ./...
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

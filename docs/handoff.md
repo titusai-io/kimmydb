@@ -6,18 +6,16 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 tasks 1–9 merged; a change-stream fix awaiting review**
+## As of 2026-08-14 — **M10 task 10 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–9 are done and merged (#65–#73). **Two clients
-exist and share no code**, which is the arrangement task 11's conformance suite
-depends on.
+**M0–M9 complete.** M10 tasks 1–9 are merged (#65–#74, including the
+change-stream fixes that came out of task 9), and task 10 is on
+`m10-go-client` with a PR open and unmerged.
 
-**Open, and not an M10 task:** `drop-invalidates-change-streams`, which closes
-a 🟡 raised one day earlier by the Python client's tests. A dropped collection
-left its streams open and silent, and fixing that exposed a second defect —
-replicated schema changes were appended to the receiving node's oplog but never
-published, so a drop ended streams only on the node that performed it. Both are
-closed. **Tasks 10–12 are next**: Go, the conformance suite, and the closeout.
+**Three clients now exist, share no code, and pass the same scenario list.**
+That is exactly the arrangement task 11 was waiting for: the conformance suite
+is a matter of running one set of scenarios three ways rather than inventing
+them. Tasks 11 and 12 are what remain.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -45,22 +43,20 @@ Task 8: `kimmy-client`, and `kimmy-cli` converted into a consumer of it.
 Task 9: `clients/python`, package `kimmydb`, synchronous on `httpx` and
 `websockets`, with its own CI job driving a real node.
 
-**Next is task 10**, the Go client, off fresh `main` once task 9 merges. Its
-reserved decision is the HTTP stack, and Go's standard library genuinely
-answers it — `net/http` pools connections, so the argument that ruled out
-Python's stdlib does not apply. A WebSocket library is the real choice
-(`nhooyr.io/websocket` or `gorilla/websocket`).
+Task 10: `clients/go`, package `kimmydb`, one dependency, with its own CI job.
 
-**It goes in `clients/go/`**, beside Python, and it needs a CI job of its own on
-the same pattern: build `kimmyd`, then run the tests against it. The roadmap
-puts Go third because it is *least* likely to surface a protocol gap the other
-two missed — which is exactly what makes it a good final check before the
-conformance suite in task 11.
+**Next is task 11**, the conformance suite, off fresh `main` once task 10
+merges. No reserved decision, but one worth settling early: **what the suite
+*is*.** Three languages already run the same scenarios in three test suites, so
+the honest question is whether task 11 writes a fourth thing that drives all
+three, or turns the existing three into one declared list they each execute.
+The first is a new harness; the second is a shared file of scenarios plus a
+thin runner per language, which is closer to what the milestone was after —
+"one set of scenarios, run three ways" — and much harder to let drift.
 
-**The scenario list is settled by now.** Both existing clients pass the same
-one, and [Clients](clients.md) states it in prose. A third that passes it makes
-task 11 a matter of running one set of scenarios three ways rather than
-inventing them.
+**The scenario list already exists** in three places: `crates/kimmy-client/tests`,
+`clients/python/tests`, and `clients/go/kimmydb`. They match today because they
+were written to match. Nothing enforces that, which is the gap task 11 closes.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -131,7 +127,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-http-bench` | ✅ Merged as #71. M10 task 7: the HTTP benchmark, and the numbers in [Benchmarks](benchmarks.md) |
 | `m10-rust-client` | ✅ Merged as #72. M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
 | `m10-python-client` | ✅ Merged as #73. M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
-| `drop-invalidates-change-streams` | **Open, PR raised, not merged.** Not an M10 task: `InvalidateReason::CollectionDropped`, and the unpublished replicated DDL it exposed |
+| `drop-invalidates-change-streams` | ✅ Merged as #74. Three change-stream defects: the drop invalidate, the unpublished replicated DDL, and a recreated collection serving the dead one's history |
+| `m10-go-client` | **Open, PR raised, not merged.** M10 task 10: `clients/go`, package `kimmydb`, a CI job |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -259,7 +256,7 @@ work.
 | 7 | ✅ **HTTP-level benchmark harness** | — |
 | 8 | ✅ **Rust client**, `kimmy-client`; the CLI is its consumer | Settled: `reqwest`, already in the tree |
 | 9 | ✅ **Python client** | Settled: `httpx` + `websockets`, sync first |
-| 10 | **Go client** | HTTP stack |
+| 10 | ✅ **Go client** | Settled: stdlib `net/http` + `coder/websocket` |
 | 11 | **Conformance suite all three clients pass** | — |
 | 12 | **One example app per language** + mutation pass and closeout | — |
 
@@ -590,6 +587,28 @@ Two findings:
 **CI runs the Python tests against a real `kimmyd`**, on the same reasoning as
 every other client test here: a mocked server asserts only what the client
 already believes.
+
+### What task 10 did
+
+`clients/go`, package `kimmydb`, **one dependency** — Go's `net/http` pools
+connections, so the reasoning that ruled out Python's standard library does not
+apply, and the only thing missing is WebSocket framing.
+
+`coder/websocket` rather than `gorilla/websocket` for a reason specific to this
+design: it handshakes through an ordinary `*http.Client`, so a change stream
+inherits the same client, TLS configuration, proxy and timeouts as every other
+request. `gorilla` dials with its own `Dialer` — two configurations that can
+drift, which is a split this project has paid for before.
+
+**Idioms rather than a translation.** Paging and streaming are
+range-over-function iterators, so the error is the second loop variable rather
+than something a caller has to remember; everything takes a `context.Context`,
+including the change stream, and cancelling it is how watching stops.
+
+**It found nothing new, and that is the result.** The roadmap put Go third
+because it was least likely to surface a gap the other two had missed. Two
+clients and a specification had already taken the surprises, and the third
+agreeing is the evidence task 11 rests on.
 
 ### The change-stream fix, and the second defect it exposed
 
