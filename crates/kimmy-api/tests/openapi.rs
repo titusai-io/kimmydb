@@ -265,6 +265,119 @@ fn every_error_code_is_specified_with_the_retry_class_the_server_uses() {
 }
 
 // ---------------------------------------------------------------------------
+// The compatibility policy
+// ---------------------------------------------------------------------------
+
+/// The major version is in the path, and everything agrees about what it is.
+///
+/// `docs/compatibility.md` promises that `/v1` does not break and that the path
+/// carries the major version. This is the part of that promise a test can hold:
+/// the route prefixes, the version the server reports, and the specification's
+/// own `info.version` cannot drift apart.
+#[test]
+fn every_versioned_route_carries_the_protocol_major() {
+    // The unversioned routes, and why each one is allowed to be: an
+    // infrastructure probe is not part of the client protocol and must not
+    // move when the protocol majors.
+    const UNVERSIONED: [&str; 3] = ["/healthz", "/readyz", "/metrics"];
+
+    let protocol = kimmy_api::version::PROTOCOL;
+    let stray: Vec<_> = documented_operations()
+        .into_iter()
+        .map(|(_, path)| path)
+        .filter(|path| !UNVERSIONED.contains(&path.as_str()))
+        .filter(|path| !path.starts_with(&format!("/{protocol}/")))
+        .collect();
+    assert!(stray.is_empty(), "these routes are outside /{protocol}/: {stray:#?}");
+
+    let declared = spec()["info"]["version"].as_str().expect("info.version is a string");
+    let major = declared.split('.').next().expect("a major component");
+    assert_eq!(
+        format!("v{major}"),
+        protocol,
+        "the specification is version {declared} and the server serves /{protocol}"
+    );
+}
+
+/// A response schema may not forbid unknown properties.
+///
+/// This is what makes "a new response field is additive" true rather than
+/// merely intended: a client validating against today's document has to keep
+/// validating tomorrow's responses. `additionalProperties: false` anywhere in a
+/// response would make the next added field a breaking change for every
+/// validating client, silently, and only for them.
+#[test]
+fn no_response_schema_forbids_the_fields_it_has_not_seen() {
+    let mut closed = Vec::new();
+    find_closed_schemas(spec(), String::new(), &mut closed);
+    assert!(
+        closed.is_empty(),
+        "these schemas forbid unknown properties, which makes adding a response field \
+         breaking for a validating client: {closed:#?}"
+    );
+}
+
+fn find_closed_schemas(node: &Value, path: String, closed: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            if map.get("additionalProperties") == Some(&Value::Bool(false)) {
+                closed.push(path.clone());
+            }
+            for (key, value) in map {
+                // Request bodies are allowed to be strict — several reject
+                // unknown fields on purpose, so a typo is an error rather than
+                // a silent no-op. It is *responses* that must stay open.
+                if key == "requestBody" {
+                    continue;
+                }
+                find_closed_schemas(value, format!("{path}/{key}"), closed);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                find_closed_schemas(item, format!("{path}/{i}"), closed);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The capabilities a node advertises are the ones the specification names.
+///
+/// Same mechanism as the error codes, for the same reason: the set is public
+/// surface and a hand-kept list drifts. A node cannot advertise a capability
+/// the document does not define, and a feature added without naming it here is
+/// a visible omission.
+#[test]
+fn the_capability_set_is_the_documented_one() {
+    use kimmy_api::version::Capability;
+
+    let documented: BTreeSet<String> = spec()["components"]["schemas"]["Capability"]["enum"]
+        .as_array()
+        .expect("Capability is an enum")
+        .iter()
+        .map(|v| v.as_str().expect("a capability is a string").to_string())
+        .collect();
+    let known: BTreeSet<String> = Capability::ALL.iter().map(|c| c.as_str().to_string()).collect();
+
+    assert_eq!(known.len(), Capability::ALL.len(), "two capabilities share a name");
+    assert_eq!(known, documented, "the server's capabilities and the specification's disagree");
+
+    // Every capability is also explained, not just listed. A bare name tells a
+    // client nothing about what it may then do.
+    let table = spec()["components"]["schemas"]["Capability"]["description"]
+        .as_str()
+        .expect("the Capability schema explains its values");
+    for capability in Capability::ALL {
+        assert!(
+            table.contains(&format!("| `{}` |", capability.as_str())),
+            "{} is advertised with no explanation of what it means",
+            capability.as_str()
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Schema validation
 // ---------------------------------------------------------------------------
 
@@ -548,6 +661,27 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     );
     assert!(String::from_utf8_lossy(&metrics.raw).contains("kimmy_up 1"));
     c.covered.insert(("GET".into(), "/metrics".into()));
+
+    // Unauthenticated on purpose: a client negotiates before it holds a token.
+    let advertised = c.check("GET", "/v1/version", "/v1/version", None, None, 200).await;
+    assert_eq!(advertised["protocol"], kimmy_api::version::PROTOCOL);
+    assert_eq!(advertised["version"], env!("CARGO_PKG_VERSION"));
+    let served: Vec<&str> = advertised["capabilities"]
+        .as_array()
+        .expect("a list")
+        .iter()
+        .map(|c| c.as_str().unwrap())
+        .collect();
+    assert_eq!(
+        served,
+        kimmy_api::version::capabilities(),
+        "the wire and the server's own list disagree"
+    );
+    assert!(
+        !served.contains(&"local-embeddings"),
+        "the default build has no in-process embedding, so it must not advertise it — \
+         this is the capability that proves the list is answered rather than asserted"
+    );
 
     // -- auth --------------------------------------------------------------
     let root = c.login("root", ROOT_PASSWORD).await;

@@ -35,6 +35,7 @@ has been incomplete before.
 | `GET` | `/readyz` | — public |
 | `GET` | `/metrics` | — public |
 | `POST` | `/v1/auth/login` | — public |
+| `GET` | `/v1/version` | — public — see [Version and capabilities](#version-and-capabilities) |
 | `GET` | `/v1/auth/whoami` | authenticated |
 | `GET` `POST` | `/v1/users` | server admin |
 | `GET` `DELETE` | `/v1/users/{name}` | server admin |
@@ -400,6 +401,41 @@ round-trips exactly, and there is a test pinning it.
 
 **Non-finite doubles** come back as `{"$numberDouble": "NaN"}` rather than
 `null`, so a number never silently becomes a missing value.
+
+---
+
+## Version and capabilities
+
+```bash
+curl localhost:7878/v1/version
+```
+
+```json
+{ "protocol": "v1",
+  "version": "0.1.0",
+  "node": "3e98120f-66df-4cf0-9fa0-690e3d57fcea",
+  "capabilities": ["aggregation", "backup", "bulk-insert", "change-streams",
+                   "client-supplied-vectors", "cursor-paging", "find-and-modify",
+                   "hybrid-search", "partial-indexes", "ttl-indexes",
+                   "vector-search", "webhooks"] }
+```
+
+**Branch on `capabilities`, not on `version`.** A version number only answers
+"can I use this" if the client also carries a table mapping versions to
+features — the table this endpoint replaces. Nodes are upgraded one at a time,
+so a client round-robining across a cluster can reach an older node right after
+a newer one; the answer describes *the node that answered* and is worth caching
+per node.
+
+`local-embeddings` appears only on a build compiled with that feature, which is
+what makes this a question rather than a constant: a `local` provider is
+accepted on such a node and refused everywhere else.
+
+Unauthenticated, so a client can negotiate before it holds a token. It names no
+database, collection or user.
+
+[Compatibility](compatibility.md) is the policy this serves: what `/v1`
+promises, what counts as additive, and what a correct client must tolerate.
 
 ---
 

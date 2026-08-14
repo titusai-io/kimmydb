@@ -92,9 +92,20 @@ info:
 
     ## Versioning
 
-    The path carries the major version. `/v1` is the current one. Adding a
-    route, an optional request field, or a response field is additive and does
-    not change the version. The formal compatibility promise is M10 task 3.
+    **The path carries the major version, and `/v1` does not break.** Adding a
+    route, an optional request field, a response field, an error code, or a
+    value to an enum a client is told to tolerate is additive and ships without
+    ceremony. Anything that would break a correct `/v1` client mints `/v2`,
+    served alongside `/v1` for a stated window.
+
+    `GET /v1/version` reports the protocol version, the build, the node that
+    answered, and a **capability list** — which is what a client should branch
+    on, because during a rolling upgrade the node answering the next request
+    may be older than the one that answered the last.
+
+    [Compatibility](compatibility.md) is the whole policy: what counts as
+    additive, what forces `/v2`, what a client must tolerate to be considered
+    correct, and what a node does with a request from a newer client.
 
 servers:
   - url: http://localhost:7878
@@ -236,6 +247,50 @@ paths:
         "422": { $ref: "#/components/responses/WrongShape" }
         "429":
           $ref: "#/components/responses/RateLimited"
+
+  /v1/version:
+    get:
+      tags: [health]
+      operationId: version
+      summary: What this node is, and what it can do.
+      description: |
+        **Ask this before assuming a feature exists.** A client is handed one
+        address and may end up round-robining across a cluster; during a
+        rolling upgrade the node answering the next request can be older than
+        the one that answered the last. `capabilities` is what a client should
+        branch on — a version number only answers the question if the client
+        also carries a table mapping versions to features, which is the table
+        this endpoint replaces.
+
+        Unauthenticated, because a client must be able to negotiate before it
+        holds a token. It names no database, collection or user.
+      security: []
+      responses:
+        "200":
+          description: This node's protocol version, build, identity and capabilities.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [protocol, version, node, capabilities]
+                properties:
+                  protocol:
+                    type: string
+                    description: |
+                      The protocol major version, matching the path prefix
+                      every versioned route carries.
+                    const: v1
+                  version:
+                    type: string
+                    description: |
+                      The build version. For operators; a client should branch
+                      on `capabilities` instead.
+                  node:
+                    type: string
+                    description: The node that answered.
+                  capabilities:
+                    type: array
+                    items: { $ref: "#/components/schemas/Capability" }
 
   /v1/auth/whoami:
     get:
@@ -1865,6 +1920,54 @@ components:
         - snapshot
         - not_implemented
         - provider_error
+
+    Capability:
+      type: string
+      description: |
+        A named, client-visible feature. Closed in the server by an enum, so a
+        capability cannot be advertised that the build does not have, and
+        adding a feature without naming it here is a visible omission rather
+        than a silent one.
+
+        Most are constant for a given build; `local-embeddings` is the one that
+        genuinely varies today, because in-process embedding is a compile-time
+        feature and a `local` provider is refused on a build without it. The
+        rest matter across *versions*: a client may be talking to a node from
+        before the feature existed.
+
+        **A client should treat an unknown capability as one it does not use,
+        and a missing capability as a feature to avoid** — not as an error.
+        Both are how this list stays additive.
+
+        | Capability | What it means |
+        |---|---|
+        | `aggregation` | `POST .../aggregate` and the pipeline stages |
+        | `backup` | `GET /v1/admin/backup` |
+        | `bulk-insert` | `POST .../bulk`, one commit, all or nothing |
+        | `change-streams` | The `/watch` WebSocket, with resume tokens portable across nodes |
+        | `client-supplied-vectors` | `PUT .../docs/{id}/vectors`, which is what makes the `byo` provider usable |
+        | `cursor-paging` | `nextCursor` on `find`, and the `cursor` parameter that continues it |
+        | `find-and-modify` | `POST .../find_and_modify` |
+        | `hybrid-search` | `POST .../hybrid_search` |
+        | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
+        | `partial-indexes` | `partialFilterExpression` on index creation |
+        | `ttl-indexes` | `expireAfterSeconds` on index creation |
+        | `vector-search` | `POST .../vector_search` |
+        | `webhooks` | Registering an endpoint to push change events to |
+      enum:
+        - aggregation
+        - backup
+        - bulk-insert
+        - change-streams
+        - client-supplied-vectors
+        - cursor-paging
+        - find-and-modify
+        - hybrid-search
+        - local-embeddings
+        - partial-indexes
+        - ttl-indexes
+        - vector-search
+        - webhooks
 
     Retry:
       type: string
