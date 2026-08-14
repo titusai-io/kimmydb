@@ -312,6 +312,34 @@ async fn a_change_stream_delivers_and_carries_a_resume_token() {
 }
 
 #[tokio::test]
+async fn a_dropped_collection_ends_the_stream() {
+    // Until the server invalidated on a drop, this hung: no event, no close,
+    // no error, and a collection recreated under the same name would silently
+    // adopt the stream. The client's job is to surface the end rather than
+    // reconnect into nothing, which is what `is_invalidate` is for.
+    let (_server, client) = connected().await;
+    seeded(&client, 1).await;
+
+    let mut stream = client.watch("shop", "orders", WatchOptions::new()).await.unwrap();
+
+    client
+        .request(Method::Delete, "/v1/db/shop/coll/orders", None, Safety::Idempotent)
+        .await
+        .expect("dropping the collection");
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .expect("a dropped collection ends the stream rather than stalling it")
+        .expect("an event")
+        .expect("the invalidate");
+    assert!(event.is_invalidate(), "{event:?}");
+    assert_eq!(event.raw["reason"], "CollectionDropped");
+
+    // And it is the end: nothing after it, and no reconnection attempt.
+    assert!(stream.next().await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn a_change_stream_resumes_from_where_it_stopped() {
     // What makes reconnection safe: a token is portable and carries no server
     // state, so a second stream started from it sees what the first missed

@@ -2540,11 +2540,30 @@ components:
         - type: object
           title: invalidate
           description: |
-            The stream cannot continue — the collection was dropped, or the
-            resume point fell past the retention horizon. The server closes the
-            socket after this frame.
+            The stream is over. The server closes the socket after this frame.
+
+            **A client must act on this rather than reconnect blindly.**
+            `CollectionDropped` means there is nothing left to watch;
+            `ConsumerLagged` and `ResumeTokenExpired` mean events existed and
+            cannot be read, so whatever the client missed is a gap it has to
+            reconcile some other way.
+
+            Resuming from a token taken *before* the invalidate is allowed and
+            replays up to it — the token is a position in a log that still
+            exists, so it invalidates again at the same place. An invalidate
+            ends a stream; it is not a permanent wall.
           required: [operationType, reason]
           properties:
             operationType:
               const: invalidate
-            reason: { type: string }
+            reason:
+              type: string
+              description: |
+                | Value | Meaning |
+                |---|---|
+                | `CollectionDropped` | The collection being watched was dropped. Only streams scoped to it end; a node that learns of the drop by replication ends its streams too |
+                | `ConsumerLagged` | Retention collected the range this stream was about to read |
+                | `ResumeTokenExpired` | The resume point has been collected from the oplog |
+
+                Treat an unrecognized value as "this stream is over", which is
+                what every value means. New ones are additive.

@@ -647,7 +647,10 @@ the distinction M8 task 1 was built on.
 
 `a_page_from_one_node_continues_on_another` is the other: it walks a collection
 across three nodes, changing node on every page, and requires the walk to see
-every document exactly once and in order. Cursor portability had been argued
+every document exactly once and in order. A third,
+`a_replicated_drop_ends_a_stream_on_another_node`, watches on one node and
+drops on another — the only arrangement that could have shown that replicated
+schema changes were appended without being published. Cursor portability had been argued
 from the encoding and inherited from resume tokens; the protocol now tells
 clients to round-robin, so it needed to be a measurement.
 
@@ -846,9 +849,12 @@ anyone learned anything.
 
 Two of these found real defects on their first run — a change stream that
 connected lazily and so missed everything written before the first read, and
-the discovery that **a dropped collection leaves a stream open and silent**,
-which is a server behaviour rather than a client one (a 🟡 in
-[Deviations](deviations.md)).
+the discovery that **a dropped collection left a stream open and silent**. The
+second was a server behaviour rather than a client one, and fixing it turned up
+a third: a replicated schema change was never published, so a drop ended
+streams on the node that performed it and nowhere else. Both are closed, both
+are tested at three levels, and the cluster harness is what caught the second
+one — see [Deviations](deviations.md).
 
 ---
 
