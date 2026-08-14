@@ -929,8 +929,8 @@ worth an hour of someone's time, not an emergency.
 
 | Class | Count | |
 |---|---:|---|
-| Change-stream reconnect internals | 17 | Attempt counters and backoff arithmetic. Killing them needs a server that refuses a controlled number of times; the *observable* behaviour — reconnect resumes, an expired token is not retried — is tested |
-| The `retry: wait` path in `send` | 4 | The client suite has no rate-limited server, so the wait branch is never taken. A real gap, and a cheap one to close whenever a harness grows a limiter |
+| Change-stream reconnect internals | 17 | Attempt counters and backoff arithmetic. Killing them needs a server that refuses a controlled number of times — which **now exists**: `Stalling` was built to close the `wait` row below and is the same shape. Still open, but no longer blocked on a harness. The *observable* behaviour — reconnect resumes, an expired token is not retried — is tested |
+| ~~The `retry: wait` path in `send`~~ | ~~4~~ | **Closed.** All nine mutants in the branch are caught. Writing the test found the branch was also *wrong* — it failed over instead of waiting, so `wait` and `elsewhere` behaved alike; see [Deviations](deviations.md). The lesson generalizes: an untested branch is not only unverified, it is where a claim goes to stop being true |
 | Genuinely equivalent | ~6 | `promote`'s early return when the endpoint is already first; the far-future expiry a supplied token gets, where `*`, `+` and `/` are all still far future |
 | Renewal arithmetic | 1 | The one-second-lifetime test clamps to the floor either way, so `-` and `+` agree there |
 

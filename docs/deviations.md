@@ -1449,24 +1449,39 @@ detail.
 
 ---
 
-## 🟡 The client's `retry: wait` path has no test that reaches it
+## 🟢 The client's `retry: wait` path is tested — and was broken (was a 🟡)
 
-**Found by the M10 mutation pass, not by review.** `Client::send` branches on
-the retry class the server returns, and the `wait` arm — back off, then try the
-same node again — can have its guard replaced with `true` or `false` without a
-test failing. No harness in the client's suite ever answers `429`, so the
-branch is never taken.
+**Closed on 2026-08-14, and the untested branch turned out to be wrong.** The
+🟡 recorded a missing test. Writing it found that `Client::send` did not do
+what the comment directly above it said, which is the failure mode this project
+keeps meeting: a claim with nothing that fails when it stops being true.
 
-Four of the thirty-four surviving mutants are this one path. It is a **real
-gap**, not an equivalent mutant: a client that mishandles `wait` turns a
-recoverable overload into an error the caller sees, which is precisely the
-failure the three-valued taxonomy (ADR-057) exists to prevent.
+The comment read *"The same node, after the delay it named."* The code slept
+and then `break`, and that `break` left the inner `loop` — advancing the outer
+`for endpoint`. So `wait` moved to the **next node**, exactly like `elsewhere`
+and only slower; with a single endpoint it slept and then returned the error,
+so the wait bought a delayed failure and nothing else. That is precisely the
+outcome the three-valued taxonomy (ADR-057) exists to prevent: `wait` means
+*this* node will serve the request shortly, so failing over abandons the one
+node that said how long to wait.
 
-**To close**: a test server that returns `429` with `retry: wait` a fixed
-number of times and then succeeds, asserting the call returns the eventual
-success and that it went to the *same* endpoint — the distinction from
-`elsewhere` is the whole point. Cheap; deferred only because it wants a small
-harness change and the milestone was closing.
+`wait` now retries the same endpoint, **bounded to one wait per endpoint**, and
+a node that refuses twice is left for the next one.
+
+**Four tests, and the second endpoint is what makes three of them tests at
+all.** With one node, "gave up" and "failed over and found nowhere to go"
+produce the same error, so the mutation pass could rewrite the guards either
+way unnoticed. Adding a second stub separated them — including the sharpest
+case, an **unsafe write** that must not be repeated to a peer that might commit
+it a second time. All nine mutants in the changed region are now caught, from
+zero.
+
+The harness is `Stalling` in `crates/kimmy-client/tests/client.rs`: a stub that
+answers `429` a fixed number of times and counts its hits. It is not
+`kimmy_api::router` because a real node's rate limiter bounds *login*, so no
+arrangement of one makes an ordinary request answer `rate_limited` on demand —
+which is also why this path has no live drive, and the conformance suite's 48
+runs stand as the regression instead.
 
 The rest of the residue is classified in [Testing](testing.md): reconnect
 backoff arithmetic that needs fault injection to reach, and a handful of
