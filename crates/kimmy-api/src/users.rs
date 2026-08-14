@@ -11,6 +11,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
+use crate::json::JsonBody;
 use crate::state::{Auth, SharedState};
 
 /// The scope required to administer users.
@@ -29,7 +30,7 @@ pub struct CreateUserRequest {
 pub async fn create_user(
     State(state): State<SharedState>,
     auth: Auth,
-    Json(body): Json<CreateUserRequest>,
+    JsonBody(body): JsonBody<CreateUserRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     require_server_admin(&auth)?;
 
@@ -100,7 +101,7 @@ pub async fn set_password(
     State(state): State<SharedState>,
     auth: Auth,
     Path(name): Path<String>,
-    Json(body): Json<PasswordRequest>,
+    JsonBody(body): JsonBody<PasswordRequest>,
 ) -> Result<Json<Value>, ApiError> {
     // A user may always change their own password; changing anyone else's is
     // an administrative act.
@@ -125,7 +126,7 @@ pub async fn set_grants(
     State(state): State<SharedState>,
     auth: Auth,
     Path(name): Path<String>,
-    Json(body): Json<GrantsRequest>,
+    JsonBody(body): JsonBody<GrantsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
     state.users.set_grants(&state.engine, &name, body.grants)?;

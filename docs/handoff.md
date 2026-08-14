@@ -6,24 +6,24 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 1 done, on a branch awaiting review**
+## As of 2026-08-13 — **M10 task 2 done, on a branch awaiting review**
 
-**M0–M9 complete.** M9 finished on 2026-08-13 with all five tasks merged, plus
-two unplanned fixes found while doing them.
+**M0–M9 complete.** M10 tasks 1 and 2 are done: task 1 merged as #65, task 2 is
+on `m10-error-taxonomy` with a PR open and unmerged.
 
-**M10 has started.** Task 1 — the protocol specification — is on
-`m10-protocol-spec` with a PR open and unmerged. Its reserved decision was put
-to the maintainer first, as every M8 and M9 reserved decision was: **hand-written
-and checked by a contract test**, with the test validating **live responses**
-rather than only the route inventory ([ADR-056](decisions.md)). A second
-decision came up mid-branch, from something the test found, and went the same
-way — see the board below.
+Both reserved decisions went to the maintainer first, as every M8 and M9
+reserved decision did. Task 1: hand-written specification, checked by a contract
+test that validates **live responses** rather than only the route inventory
+([ADR-056](decisions.md)). Task 2: a typed `ErrorCode` enum, and retryability
+declared **three-valued** — `no` / `wait` / `elsewhere` — because leaderless
+replication makes "ask a different node" a real answer ([ADR-057](decisions.md)).
 
-**Next is task 2**, the error taxonomy, off fresh `main` once task 1 merges.
-Its reserved decision — which errors are declared retryable — comes first.
-`docs/openapi.yaml` lists the sixteen codes currently in use and says plainly
-that closing the set is task 2's job, so the enumeration starts there rather
-than from a grep.
+**Next is task 3**, the versioning and compatibility policy, off fresh `main`
+once task 2 merges. Its reserved decision — the shape of the promise — comes
+first. Two pieces of it are already load-bearing and should be stated rather
+than rediscovered: the error envelope carries `retry`, which is what makes
+adding a code additive rather than breaking, and `docs/openapi.yaml` plus its
+contract test are what make any compatibility claim checkable at all.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -85,7 +85,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | | |
 |---|---|
 | `main` | PRs #16–#63 merged: all of M8 and all of M9, SWIM authentication (ADR-053), the witnessed vector (ADR-054), ADR-055 and the M10 board |
-| `m10-protocol-spec` | **Open, PR raised, not merged.** M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056, and the one wire change the test turned up |
+| `m10-protocol-spec` | ✅ Merged as #65. M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056 |
+| `m10-error-taxonomy` | **Open, PR raised, not merged.** M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -205,7 +206,7 @@ work.
 | # | Task | Reserved decision to settle first |
 |---|---|---|
 | 1 | ✅ **Protocol specification** (OpenAPI 3.1) + a contract test | Settled: hand-written, checked by inventory *and* live responses (ADR-056) |
-| 2 | **Error taxonomy as public surface** | Which errors are declared retryable |
+| 2 | ✅ **Error taxonomy as public surface** | Settled: three-valued `no`/`wait`/`elsewhere`, closed by an enum (ADR-057) |
 | 3 | **Versioning and compatibility policy** | The shape of the promise |
 | 4 | **Token refresh** | Refresh token vs. sliding re-issue |
 | 5 | **Client-visible topology / discovery** | Static config vs. live SWIM membership |
@@ -259,6 +260,53 @@ driven by a Python script that parses `docs/openapi.yaml` itself and checks 32
 real responses against it — a second reader, independently implemented, of the
 same document. It also walked a two-page cursor and confirmed the three
 `PUT` shapes on the wire. No disagreements, and the node log was clean.
+
+### What task 2 did, and what it found
+
+The seventeen error codes are a closed set: `ErrorCode` is an enum, and both the
+wire string and the **retry class** come from exhaustive matches on it, so a new
+code does not compile until both are answered. The class is `no`, `wait` or
+`elsewhere`, and it **rides in the envelope** — `{"error", "message", "retry"}`
+— so a client acts on it without a table of codes compiled at release time.
+That is what has to be true for task 3 to call "adding a code" additive.
+
+`elsewhere` exists because this is a leaderless cluster. `internal`,
+`misconfigured` and `snapshot` are conditions of the node that answered, and a
+peer holds the same data; a boolean `retryable` would tell a client to retry the
+machine that just failed it. [ADR-057](decisions.md) has the full division.
+
+Six findings, and **four of them came from the live drive, not the suite**:
+
+- **`no_vectors` was in neither document** — the enumeration's first catch, and
+  the reason the roadmap's "enumerate it" had to be exhaustive over the code
+  rather than over `error.rs`.
+- **422 was in the prose reference and specified nowhere.** Seventeen
+  operations can return it; all seventeen declare it now.
+- **Sixteen routes were outside the taxonomy entirely.** Axum's body rejection
+  is bare text, and the M5 mapping that fixes it is only reached by a handler
+  taking `Result<Json<T>, JsonRejection>` — **one handler of nineteen did**. It
+  now lives in an extractor, `json::JsonBody<T>`, which cannot be used without
+  it. The conformance test had only ever driven a wrong-shaped body against
+  `/bulk`, the one route that was right.
+- **`/watch` refused non-upgrade requests with no envelope at all**, same
+  reason, same fix.
+- **The specification had the OpenAI provider tag as `openai`.** It is
+  `open_ai`; `openai` is the *display* name from `ProviderConfig::name()`, and
+  the spec was written from it. This project had already been caught by that
+  exact distinction once.
+- **`no` is not a string in YAML 1.1.** `enum: [no, wait, elsewhere]` reads as
+  `[False, "wait", "elsewhere"]` in PyYAML and as the string in Rust's reader,
+  so two readers of the specification disagreed about a value that goes on the
+  wire. Quoted now. Nothing inside the Rust test could have seen it — this is
+  the argument for the drive being an *independently written* second reader,
+  not a rerun of the same logic.
+
+**Verified beyond the suite**: two release nodes, two scripts. The task 1 drive
+re-run unchanged (32 responses, no disagreements) as a regression against the
+new envelope, and a second that parses the retry table out of the specification
+and checks it against the wire — seven codes observed, including `misconfigured`
+as `elsewhere`, provoked by pointing a collection at an API key environment
+variable the node does not have.
 
 **Only task 5 carries distributed-systems risk**, and it carries two known
 traps at once: `Members` holds *peers only*, and the set must contain only
@@ -616,6 +664,22 @@ in [Deviations](deviations.md):
   registrations.** The check that missed them was green for two milestones
   while never looking at `/docs/{id}`. If a scan can silently match nothing,
   assert that it matched something.
+- **Every refusal carries the envelope, and the mapping lives in the extractor
+  rather than in each handler.** `json::JsonBody<T>` is the only way a typed
+  body enters, and `/watch` maps the upgrade rejection the same way. A mapping a
+  handler has to remember to reach is a mapping eighteen of nineteen handlers
+  did not reach.
+- **The error code set is closed by the compiler, and the retry class is part
+  of adding a code.** `ErrorCode` is an enum with exhaustive matches for the
+  wire string and the class; the class goes on the wire so a client handles a
+  code released after it was written (ADR-057).
+- **`elsewhere` is only meaningful because every node accepts writes.** Anything
+  that reclassifies `internal`, `misconfigured` or `snapshot` is claiming a
+  peer cannot answer, which for a full-copy cluster needs a reason.
+- **A specification is a wire format, so its own encoding has to be checked.**
+  `no` is boolean `false` in YAML 1.1. Quote scalars that could be read as
+  something else, and keep the live drive an *independently written* reader —
+  a second run of the same parser proves nothing about the document.
 
 
 ## Reading order for someone new

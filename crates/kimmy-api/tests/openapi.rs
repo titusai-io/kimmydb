@@ -202,6 +202,69 @@ fn every_route_is_in_the_http_reference() {
 }
 
 // ---------------------------------------------------------------------------
+// The error taxonomy
+// ---------------------------------------------------------------------------
+
+/// The code set in the server and the code set in the document are the same
+/// set, and they agree on what a client may do about each one.
+///
+/// This is what makes the taxonomy public surface rather than an accident of
+/// where `ApiError::new` happens to be called. `ErrorCode` is an enum, so the
+/// compiler already refuses an unlisted code and forces its retry class to be
+/// decided; this closes the remaining gap, which is the document falling
+/// behind the enum.
+///
+/// It would have caught `no_vectors`, which existed in `vectors.rs` and in
+/// neither document — both were written by reading `error.rs`, and the codes
+/// accrete across five modules.
+#[test]
+fn every_error_code_is_specified_with_the_retry_class_the_server_uses() {
+    use kimmy_api::error::ErrorCode;
+
+    let schema = &spec()["components"]["schemas"]["ErrorCode"];
+    let documented: BTreeSet<String> = schema["enum"]
+        .as_array()
+        .expect("the ErrorCode schema is an enum")
+        .iter()
+        .map(|v| v.as_str().expect("a code is a string").to_string())
+        .collect();
+    let served: BTreeSet<String> = ErrorCode::ALL.iter().map(|c| c.as_str().to_string()).collect();
+
+    assert_eq!(
+        served.len(),
+        ErrorCode::ALL.len(),
+        "two variants of ErrorCode render to the same wire string"
+    );
+    assert_eq!(served, documented, "the server's codes and the specification's disagree");
+
+    // The retry class travels in the envelope, so the table in the document is
+    // a promise about what the server sends, not a description of it.
+    let table = schema["description"].as_str().expect("the ErrorCode schema documents its codes");
+    for code in ErrorCode::ALL {
+        let row = table
+            .lines()
+            .find(|line| line.starts_with(&format!("| `{}` |", code.as_str())))
+            .unwrap_or_else(|| panic!("{} has no row in the ErrorCode table", code.as_str()));
+        let declared = row.split('|').nth(3).expect("a retry column").trim();
+        assert_eq!(
+            declared,
+            code.retry().as_str(),
+            "{} is served as `{}` and documented as `{declared}`",
+            code.as_str(),
+            code.retry().as_str()
+        );
+    }
+
+    let classes: BTreeSet<&str> = spec()["components"]["schemas"]["Retry"]["enum"]
+        .as_array()
+        .expect("Retry is an enum")
+        .iter()
+        .map(|v| v.as_str().expect("a class is a string"))
+        .collect();
+    assert_eq!(classes, BTreeSet::from(["no", "wait", "elsewhere"]));
+}
+
+// ---------------------------------------------------------------------------
 // Schema validation
 // ---------------------------------------------------------------------------
 
@@ -864,6 +927,84 @@ async fn documented_refusals_use_the_documented_envelope() {
     let conflict =
         c.check("POST", docs_t, docs, Some(&root), Some(json!({ "_id": "a" })), 409).await;
     assert_eq!(conflict["error"], "duplicate_key", "the code is what a client branches on");
+    assert_eq!(conflict["retry"], "no", "a duplicate key does not become un-duplicate");
+
+    // Valid JSON of the wrong shape. 422 rather than 400, and it was in the
+    // HTTP reference but in no specification until the taxonomy was written
+    // down: `/bulk` takes an array, and an object is not one.
+    let shape = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/bulk",
+            "/v1/db/shop/coll/orders/bulk",
+            Some(&root),
+            Some(json!({ "_id": "b" })),
+            422,
+        )
+        .await;
+    assert_eq!(shape["error"], "bad_request");
+
+    // A wrong-shaped body on a route that is *not* `/bulk`. Until the
+    // extractor carried the mapping, `/bulk` was the only one of nineteen
+    // handlers that reached it, and every other route answered 422 as bare
+    // text with no code — outside the taxonomy entirely. Found by driving a
+    // real node, because this scenario had only ever been run against `/bulk`.
+    let typed = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/vector",
+            "/v1/db/shop/coll/orders/vector",
+            Some(&root),
+            Some(json!({ "fields": "title", "provider": { "kind": "byo" }, "dim": 3 })),
+            422,
+        )
+        .await;
+    assert_eq!(typed["error"], "bad_request", "a wrong-shaped body is still in the envelope");
+    assert_eq!(typed["retry"], "no");
+
+    // `no_vectors`: the code that existed in the server and in neither
+    // document. A search against a collection nobody ingested vectors for is a
+    // refusal, not an empty result — an empty result is indistinguishable from
+    // "nothing matched", which is how a `byo` collection silently returns
+    // nothing forever.
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/vector",
+        "/v1/db/shop/coll/orders/vector",
+        Some(&root),
+        Some(json!({ "fields": ["title"], "provider": { "kind": "byo" }, "dim": 3 })),
+        200,
+    )
+    .await;
+    let empty = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/vector_search",
+            "/v1/db/shop/coll/orders/vector_search",
+            Some(&root),
+            Some(json!({ "vector": [1.0, 0.0, 0.0] })),
+            409,
+        )
+        .await;
+    assert_eq!(empty["error"], "no_vectors");
+    assert_eq!(empty["retry"], "no", "ingesting vectors is the fix, not repeating the search");
+
+    // A plain GET to the change-stream route. Found by driving a real node:
+    // the framework's own rejection is bare text with no code, so this was the
+    // one refusal on the API a client could not branch on. Same fix, and the
+    // same reason, as the JSON body rejection.
+    let not_upgraded = c
+        .check(
+            "GET",
+            "/v1/db/{db}/coll/{coll}/watch",
+            "/v1/db/shop/coll/orders/watch",
+            Some(&root),
+            None,
+            400,
+        )
+        .await;
+    assert_eq!(not_upgraded["error"], "bad_request");
+    assert_eq!(not_upgraded["retry"], "no");
 }
 
 /// A 429 carries `Retry-After`, and the spec says so.
@@ -880,12 +1021,19 @@ async fn a_rate_limited_login_matches_its_documented_response() {
 
     let limited = server.request("POST", "/v1/auth/login", None, Some(&attempt)).await;
     assert_eq!(limited.status, 429, "the second attempt is over the limit");
-    validate_response("POST", "/v1/auth/login", 429, &limited.json());
+    let body = limited.json();
+    validate_response("POST", "/v1/auth/login", 429, &body);
     assert!(
         limited.header("retry-after").is_some(),
         "the spec declares Retry-After on a 429, and a refusal without one leaves a client \
          to guess"
     );
+
+    // The one code whose answer is "the same node, later". `Retry-After` says
+    // how much later; the class is what tells a client to wait at all rather
+    // than moving on to a peer that shares nothing about this limit.
+    assert_eq!(body["error"], "rate_limited");
+    assert_eq!(body["retry"], "wait");
 }
 
 /// The document is a specification, so it has to be one.

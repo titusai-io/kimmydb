@@ -60,17 +60,26 @@ info:
     ## Errors
 
     Every failure — including a body the server could not parse — is a JSON
-    object with a stable `error` code and a human `message`. The HTTP status
-    carries the class; the `error` code is what a client branches on. Codes are
-    strings rather than numbers on purpose: a client's `match` arm reads as
-    what it means.
+    object with a stable `error` code, a human `message`, and a `retry` class.
+    The HTTP status carries the class of failure, `error` is what a client
+    branches on, and `retry` is what a client library can act on without
+    knowing the code at all. Codes are strings rather than numbers on purpose:
+    a client's `match` arm reads as what it means.
 
     ```json
-    { "error": "duplicate_key", "message": "duplicate _id" }
+    { "error": "duplicate_key", "message": "duplicate _id", "retry": "no" }
     ```
 
-    Enumerating the code set and declaring which failures are retryable is M10
-    task 2. Until then, treat an unlisted code as its HTTP status class.
+    `retry` is three-valued — `no`, `wait`, `elsewhere` — because KimmyDB is
+    leaderless. Every node accepts writes, so "ask a different node" is a real
+    answer here, and it is the right one for a failure local to the node that
+    answered. `components.schemas.ErrorCode` is the complete set with the class
+    of each; it is closed in the server by an enum, so a code cannot be added
+    without its class being decided at the same time.
+
+    **A client should act on `retry` and not on a table of codes it compiled at
+    release time.** That is what makes adding a code additive rather than
+    breaking.
 
     ## Paging
 
@@ -224,6 +233,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "429":
           $ref: "#/components/responses/RateLimited"
 
@@ -312,6 +322,7 @@ paths:
                     type: array
                     items: { $ref: "#/components/schemas/Grant" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
@@ -394,6 +405,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Updated" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -425,6 +437,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Updated" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -507,6 +520,7 @@ paths:
                       The collection id, derived from `(database, name)` so
                       every node in a cluster computes the same value.
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -669,6 +683,7 @@ paths:
                     type: array
                     items: {}
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -702,6 +717,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/FindResponse" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -733,6 +749,7 @@ paths:
                     type: integer
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -773,6 +790,7 @@ paths:
                   count:
                     type: integer
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -827,6 +845,7 @@ paths:
                       already holds modifies nothing.
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -894,6 +913,7 @@ paths:
                     type: integer
                   upsertedId: {}
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -936,6 +956,7 @@ paths:
                     type: integer
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1123,6 +1144,7 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Index" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1216,6 +1238,7 @@ paths:
                     type: string
                     description: Name of the collection holding the vectors.
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1333,6 +1356,7 @@ paths:
                     type: integer
                   _id: {}
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1386,9 +1410,11 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SearchResponse" }
         "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/NoVectors" }
         "502":
           description: An embedding provider failed. The upstream's fault, not the caller's.
           content:
@@ -1428,9 +1454,11 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/NoVectors" }
         "502":
           description: An embedding provider failed.
           content:
@@ -1519,6 +1547,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
+        "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1602,7 +1631,22 @@ paths:
             Upgraded. Frames from here on are `ChangeEvent` objects as JSON
             text.
         "400":
-          description: Not a WebSocket upgrade request, or a malformed resume token.
+          description: |
+            A malformed resume token, or a request that is not a WebSocket
+            upgrade — a missing or wrong `Connection`, `Upgrade`,
+            `Sec-WebSocket-Version` or `Sec-WebSocket-Key` header.
+
+            The second kind is refused by the framework, and is mapped onto
+            this envelope deliberately: left alone it renders as bare text with
+            no `error` code, which made this the one refusal on the API that a
+            client could not branch on.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "426":
+          description: |
+            The connection cannot be upgraded at all — an HTTP/1.0 request, or
+            a proxy that has already consumed the upgrade.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -1698,6 +1742,24 @@ components:
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
+    NoVectors:
+      description: |
+        The collection has a vector configuration but no stored vectors, so a
+        search cannot match anything. A refusal rather than an empty result:
+        empty is indistinguishable from "nothing matched", which is how a `byo`
+        collection returns nothing forever while looking like it works.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    WrongShape:
+      description: |
+        The body is valid JSON but not the shape this route takes — an object
+        where an array is wanted, or a missing required field. Carries the
+        `bad_request` code: the status distinguishes "not JSON" from "not this
+        JSON", and the code says what a client should do about either.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
     Unauthorized:
       description: |
         No token, an invalid or expired token, or a token whose account has
@@ -1742,25 +1804,90 @@ components:
       type: object
       description: |
         The envelope every failure uses, including a body the framework itself
-        rejected. The HTTP status carries the class; `error` is what a client
-        branches on.
-      required: [error, message]
+        rejected. The HTTP status carries the class, `error` is what a client
+        branches on, and `retry` is what a client library acts on without
+        having to know the code.
+      required: [error, message, retry]
       properties:
         error:
-          type: string
-          description: |
-            A stable, machine-readable code. Currently in use: `bad_request`,
-            `unauthorized`, `forbidden`, `not_found`, `conflict`,
-            `duplicate_key`, `unique_violation`, `rate_limited`,
-            `payload_too_large`, `unsupported_media_type`,
-            `resume_token_expired`, `not_implemented`, `misconfigured`,
-            `provider_error`, `snapshot`, `internal`. Enumerating this set as a
-            closed, tested contract — and saying which codes are retryable — is
-            M10 task 2, so a client should treat an unlisted code as its HTTP
-            status class.
+          $ref: "#/components/schemas/ErrorCode"
         message:
           type: string
           description: Human-readable. Not stable; do not parse it.
+        retry:
+          $ref: "#/components/schemas/Retry"
+
+    ErrorCode:
+      type: string
+      description: |
+        The complete set. Closed in the server by an enum, so a new failure
+        cannot invent a code without also declaring its retry class — the two
+        answers are made at the same moment or the build fails.
+
+        Codes are strings rather than numbers deliberately: a client's branch
+        reads as what it means, where MongoDB's numeric codes need a lookup
+        table to be legible.
+
+        | Code | Status | Retry | Meaning |
+        |---|---|---|---|
+        | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
+        | `payload_too_large` | 413 | no | Request body over 2 MB |
+        | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
+        | `unauthorized` | 401 | no | Missing, invalid or expired token; bad credentials; an account deleted, disabled or re-credentialed since the token was issued |
+        | `forbidden` | 403 | no | Denied by RBAC. Identical whether or not the target exists |
+        | `not_found` | 404 | no | No such database, collection, document or user |
+        | `conflict` | 409 | no | Collection exists; the last user; deleting your own account |
+        | `duplicate_key` | 409 | no | `_id` already present |
+        | `unique_violation` | 409 | no | A unique index would be broken |
+        | `no_vectors` | 409 | no | Searching a collection whose vectors were never ingested — distinguished from an empty result, which is indistinguishable from "nothing matched" |
+        | `resume_token_expired` | 410 | no | The resume point has been collected. Resubscribe; retrying the token loops forever |
+        | `rate_limited` | 429 | wait | Over a limit. Carries `Retry-After` |
+        | `not_implemented` | 501 | no | A reserved capability that does not exist |
+        | `provider_error` | 502 | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
+        | `internal` | 500 | elsewhere | A storage failure on this node. Details are logged, never returned |
+        | `misconfigured` | 500 | elsewhere | This node lacks something it needs, such as an API key named by its vector configuration |
+        | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
+      enum:
+        - bad_request
+        - payload_too_large
+        - unsupported_media_type
+        - unauthorized
+        - forbidden
+        - not_found
+        - conflict
+        - duplicate_key
+        - unique_violation
+        - no_vectors
+        - resume_token_expired
+        - rate_limited
+        - internal
+        - misconfigured
+        - snapshot
+        - not_implemented
+        - provider_error
+
+    Retry:
+      type: string
+      description: |
+        What a client may do about a failure. **Three-valued rather than a
+        boolean, because KimmyDB is leaderless** — every node accepts writes,
+        so "ask a different node" is an answer available here that a
+        primary-based database cannot give, and it is the right answer for a
+        node-local failure. Telling a client only "retryable" would have it
+        retry the one machine that just failed (ADR-057).
+
+        It travels in the envelope rather than living only in this document, so
+        a client meeting a code added after its release still knows what to do
+        with it. That is what makes adding a code an additive change.
+      # Quoted, and it matters: in YAML 1.1 a bare `no` is the boolean false.
+      # Rust's reader parsed it as the string and PyYAML as `False`, so two
+      # readers of this document disagreed about a value on the wire — found by
+      # driving a real node with a second, independently written validator.
+      enum: ["no", "wait", "elsewhere"]
+      x-kimmy-meanings:
+        "no": Nothing to retry. The request must change, or the condition must.
+        wait: The same node, after a delay — `Retry-After` when the server knows it, otherwise the client's own backoff.
+        elsewhere: A different node. The failure is local to this one and a peer holds the same data.
 
     Document:
       type: object
@@ -1994,7 +2121,13 @@ components:
       properties:
         kind:
           type: string
-          enum: [byo, openai, ollama, custom_http, cohere, gemini, local]
+          description: |
+            The wire tag, which is **`open_ai`** for the OpenAI-compatible
+            provider — not `openai`. The display name in logs and metrics is
+            `openai`, and the two have been confused before; this is the one
+            that goes in a request body. Any OpenAI-compatible `/v1/embeddings`
+            endpoint uses it, Voyage included.
+          enum: [byo, open_ai, ollama, custom_http, cohere, gemini, local]
         model: { type: string }
         endpoint: { type: string }
         api_key_env: { type: string }
