@@ -6,11 +6,12 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 5 done, on a branch awaiting review**
+## As of 2026-08-13 — **M10 task 6 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–5 are done: #65–#68 merged, task 5 is on
-`m10-topology` with a PR open and unmerged. **All five reserved decisions are
-settled**, so tasks 6–12 have none left to bring.
+**M0–M9 complete.** M10 tasks 1–6 are done: #65–#69 merged, task 6 is on
+`m10-protocol-cursors` with a PR open and unmerged. **Every reserved decision
+in the milestone is settled** — tasks 7–12 have none, and the remaining work is
+building against a contract that is now written down and checked.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -28,15 +29,20 @@ Task 5: **addresses from a replicated registry, liveness from SWIM**, because
 reading client addresses out of membership was not available at any acceptable
 price ([ADR-060](decisions.md)).
 
-**Next is task 6**, cursors at the protocol level, off fresh `main` once task 5
-merges. **No reserved decision** — M9 task 5 settled the shape, and the
-specification already documents `nextCursor` as an opaque, node-portable token.
-The work is deciding what a client may *assume*: that it can send a cursor to
-any node, that a query a cursor cannot page gets none rather than a misleading
-one, and that a token outlives nothing in particular. Much of that is already
-written; the task is making it checked, and it plausibly wants a cluster-harness
-test that pages across nodes, since node portability is currently asserted for
-cursors and only *tested* for change-stream resume tokens.
+Task 6: the paging contract, and **node portability tested on three real nodes**
+rather than argued from the encoding.
+
+**Next is task 7**, the HTTP-level benchmark harness, off fresh `main` once task
+6 merges. No reserved decision. It is the task that answers a question currently
+unanswerable: **every figure in [Benchmarks](benchmarks.md) is taken at the
+storage engine**, so JSON and Extended JSON conversion, per-request token
+verification, TLS and concurrent clients are all outside the published numbers.
+Until it exists there is no honest answer to "what throughput can a client
+expect" — and that file's own retracted-figure note is what happens when one
+gets quoted anyway. Release build, real socket, reads and writes, TLS on and
+off. Note the first-request warm-up: the cursor drive measured 20.7 ms on page
+zero and sub-millisecond after, so discard the first sample or say plainly that
+you did.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -102,7 +108,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-error-taxonomy` | ✅ Merged as #66. M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
 | `m10-versioning` | ✅ Merged as #67. M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
 | `m10-token-refresh` | ✅ Merged as #68. M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
-| `m10-topology` | **Open, PR raised, not merged.** M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
+| `m10-topology` | ✅ Merged as #69. M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
+| `m10-protocol-cursors` | **Open, PR raised, not merged.** M10 task 6: the paging contract in the specification, and cross-node paging in the harness |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -226,7 +233,7 @@ work.
 | 3 | ✅ **Versioning and compatibility policy** | Settled: path-major, `/v1` never breaks, capabilities over version numbers (ADR-058) |
 | 4 | ✅ **Token refresh** | Settled: sliding re-issue, no grace for an expired token (ADR-059) |
 | 5 | ✅ **Client-visible topology / discovery** | Settled: replicated registry for addresses, SWIM for liveness (ADR-060) |
-| 6 | **Cursors at the protocol level** | — (M9 task 5 settled the shape) |
+| 6 | ✅ **Cursors at the protocol level** | — (M9 settled the shape; this settled the wire contract) |
 | 7 | **HTTP-level benchmark harness** | — |
 | 8 | **Rust client**, `kimmy-client`; the CLI becomes its consumer | HTTP/async stack |
 | 9 | **Python client** | HTTP/async stack |
@@ -429,6 +436,39 @@ including a node whose seed list never named it, which only replication
 explains — then a token from one node used at every advertised address, then a
 node killed and required to read `unknown` rather than vanish. All six harness
 tests pass.
+
+### What task 6 did
+
+M9 built cursors and documented them well — as *engine* behaviour. The wire
+carried three claims nothing checked, and the specification said nothing about
+page size at all.
+
+**Node portability is now tested, not argued.** A harness test walks a
+collection across three nodes, changing node every page, and requires the walk
+to see every document exactly once and in order. The claim was sound — a token
+is a pure function of the `_id` — but the protocol now *tells* clients to
+round-robin, so paging that broke when they did would be a data bug reached by
+following the protocol's own advice.
+
+**Two silent behaviours were in no specification**, both of the kind a client
+author meets in production:
+
+- **An unlimited `find` returns 100 documents, not all of them.** The prose
+  said so; the machine-readable document a client is generated from did not.
+  `count` has no cap and is the honest source for a total.
+- **A `limit` over 10,000 is clamped rather than refused** — the request
+  succeeds and returns less than was asked for.
+
+**And one real trap, now stated and tested:** a final page that is exactly full
+still carries a token, because the server cannot know it is the last without
+looking further. **A client ends its walk on a short or empty page, not on a
+token no longer being offered.**
+
+**One property is documented rather than enforced, on purpose.** A token is a
+*position*, not a query: sent with a different filter it resumes that filter
+after the same key. Enforcing it would mean putting the query inside the token,
+which makes it large and gives clients structure to depend on in something they
+are told to treat as opaque.
 
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because

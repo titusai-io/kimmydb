@@ -305,6 +305,13 @@ bad pattern in an `$or` should not take down the whole request.
 `find` defaults to **100** documents and caps at **10,000**, so an unbounded
 query cannot accidentally pull an entire collection into memory.
 
+**Both are silent.** Omitting `limit` returns 100 documents, not all of them,
+and asking for more than 10,000 is *clamped rather than refused* — the request
+succeeds and returns fewer than were asked for. A client that reads an
+unlimited `find` as "the whole collection" processes a prefix and is told
+nothing. `count` has no cap, because a count that stopped early would be a
+wrong number rather than a short list.
+
 ```json
 { "filter": {}, "limit": 50, "skip": 100 }
 ```
@@ -353,8 +360,11 @@ rather than quadratic in it.
 - **Opaque.** It is the encoded key of the page's last document, base64url —
   the same convention change-stream resume tokens use. Do not parse it; the
   encoding is free to change.
-- **Portable between nodes.** It carries no server state, so a page fetched
-  from one node continues correctly on another. That matters because clients
+- **Portable between nodes**, and this is *tested* rather than argued: a
+  cluster-harness test walks a collection changing node on every page and
+  requires the walk to see every document exactly once. It carries no server
+  state, so a page fetched from one node continues correctly on another — which
+  matters because [`/v1/topology`](http-api.md#topology) exists to make clients
   round-robin across a leaderless cluster.
 - **`_id` order, always.** `sort` other than `{"_id": 1}` is refused with a
   cursor, and a query carrying one gets **no `nextCursor`** rather than a token
@@ -364,9 +374,21 @@ rather than quadratic in it.
   inserted behind it is not. What is guaranteed is that a document present for
   the whole walk is returned exactly once — never skipped, never repeated.
 - **`skip` and `cursor` cannot be combined**; both claim to say where to resume.
+- **A position, not a query.** The token encodes a key, so sending it with a
+  *different* filter resumes that filter after the same key. The server does
+  not check that a token came from the query it is used with, and a client
+  should not expect it to.
+- **It does not expire**, and nothing on the server holds it. There is no
+  session to keep alive and none to lose.
 
-`nextCursor` appears only when the page filled *and* the query is one a cursor
-can continue. A short page is the end.
+`nextCursor` appears when the page filled *and* the query is one a cursor can
+continue.
+
+> **End the walk on a short or empty page, not on a missing token.** A
+> collection of exactly 200 documents read 100 at a time hands back a token on
+> the second page too — the server cannot know it is the last without looking
+> further, and looking further is work the caller did not ask for. The next
+> request returns zero documents and no token.
 
 ---
 

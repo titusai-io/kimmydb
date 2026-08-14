@@ -1538,6 +1538,100 @@ async fn a_cursor_refuses_what_it_cannot_honour() {
 }
 
 #[tokio::test]
+async fn an_unlimited_find_returns_a_page_and_not_the_collection() {
+    // The trap the specification now names: a client that reads `find` with no
+    // `limit` as "everything" processes a prefix of 100 and is told nothing.
+    // `count` is the honest source for a total — it has no cap, because a count
+    // that stopped early would be a wrong number rather than a short list.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 150).await;
+
+    let all =
+        server.post("/v1/db/shop/coll/orders/find", Some(&token), json!({ "filter": {} })).await;
+    assert_eq!(all.body["count"], 100, "the default page is 100, not the collection");
+    assert!(all.body["nextCursor"].is_string(), "and it says how to get the rest");
+
+    let counted =
+        server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({ "filter": {} })).await;
+    assert_eq!(counted.body["count"], 150);
+
+    // Over the cap is clamped rather than refused: the request succeeds and
+    // returns fewer documents than were asked for.
+    let over = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({ "filter": {}, "limit": 50_000 }),
+        )
+        .await;
+    assert_eq!(over.status, 200, "over the cap is not an error: {:?}", over.body);
+    assert_eq!(over.body["count"], 150, "everything there was, and no complaint about the ask");
+}
+
+#[tokio::test]
+async fn a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty() {
+    // A client must end its walk on a short page or a missing token, not on a
+    // token stopping being offered. A collection whose size is an exact
+    // multiple of the page size is where the two rules differ, and it is the
+    // case a client author is most likely to get wrong.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 20).await;
+
+    let page = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({ "filter": {}, "limit": 20 }))
+        .await;
+    assert_eq!(page.body["count"], 20);
+    let cursor = page.body["nextCursor"].as_str().expect("a full page offers one").to_string();
+
+    let past_the_end = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({ "filter": {}, "limit": 20, "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(past_the_end.status, 200);
+    assert_eq!(past_the_end.body["count"], 0, "the page after the last one is empty, not an error");
+    assert!(past_the_end.body["nextCursor"].is_null(), "and it ends the walk");
+}
+
+#[tokio::test]
+async fn a_cursor_is_a_position_rather_than_a_query() {
+    // Deliberate, and documented rather than enforced: the token encodes a
+    // key, so it resumes *any* query after that key. The server does not check
+    // that it came from the query it is used with, and a client should not
+    // expect it to.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 20).await;
+
+    let first = server
+        .post("/v1/db/shop/coll/orders/find", Some(&token), json!({ "filter": {}, "limit": 10 }))
+        .await;
+    let cursor = first.body["nextCursor"].as_str().expect("a cursor").to_string();
+
+    // The same token, a different filter: it resumes that filter after the
+    // same position rather than being refused.
+    let filtered = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({ "filter": { "parity": "even" }, "limit": 100, "cursor": cursor }),
+        )
+        .await;
+    assert_eq!(filtered.status, 200, "{:?}", filtered.body);
+    let ids: Vec<i64> = filtered.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert!(
+        ids.iter().all(|id| *id >= 10 && id % 2 == 0),
+        "resumed after the key, filtered: {ids:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_cursor_survives_writes_behind_and_ahead_of_it() {
     // Paging is not a snapshot, and should not pretend to be. What it must
     // guarantee is that it never skips or repeats a document that was present
