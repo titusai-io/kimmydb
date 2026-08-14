@@ -139,9 +139,13 @@ fn render(event: &ChangeEvent, full_document: bool) -> Option<Value> {
             }
             Some(payload)
         }
+        // `as_str`, not `{:?}`. The reason is a value clients branch on, so it
+        // needs a chosen representation rather than one inherited from a
+        // derive that a rename would silently change (the mistake `NodeId` and
+        // `CollectionId` each made at the cost of a replication outage).
         ChangeEvent::Invalidate { reason } => Some(json!({
             "operationType": "invalidate",
-            "reason": format!("{reason:?}"),
+            "reason": reason.as_str(),
         })),
     }
 }

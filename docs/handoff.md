@@ -6,12 +6,18 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 task 9 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 tasks 1–9 merged; a change-stream fix awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–9 are done: #65–#72 merged, task 9 is on
-`m10-python-client` with a PR open and unmerged. **Two clients exist and share
-no code**, which is the arrangement task 11's conformance suite depends on.
-Tasks 10–12 are Go, the suite, and the closeout.
+**M0–M9 complete.** M10 tasks 1–9 are done and merged (#65–#73). **Two clients
+exist and share no code**, which is the arrangement task 11's conformance suite
+depends on.
+
+**Open, and not an M10 task:** `drop-invalidates-change-streams`, which closes
+a 🟡 raised one day earlier by the Python client's tests. A dropped collection
+left its streams open and silent, and fixing that exposed a second defect —
+replicated schema changes were appended to the receiving node's oplog but never
+published, so a drop ended streams only on the node that performed it. Both are
+closed. **Tasks 10–12 are next**: Go, the conformance suite, and the closeout.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -124,7 +130,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-protocol-cursors` | ✅ Merged as #70. M10 task 6: the paging contract, and cross-node paging in the harness |
 | `m10-http-bench` | ✅ Merged as #71. M10 task 7: the HTTP benchmark, and the numbers in [Benchmarks](benchmarks.md) |
 | `m10-rust-client` | ✅ Merged as #72. M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
-| `m10-python-client` | **Open, PR raised, not merged.** M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
+| `m10-python-client` | ✅ Merged as #73. M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
+| `drop-invalidates-change-streams` | **Open, PR raised, not merged.** Not an M10 task: `InvalidateReason::CollectionDropped`, and the unpublished replicated DDL it exposed |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -583,6 +590,54 @@ Two findings:
 **CI runs the Python tests against a real `kimmyd`**, on the same reasoning as
 every other client test here: a mocked server asserts only what the client
 already believes.
+
+### The change-stream fix, and the second defect it exposed
+
+The 🟡 above lasted a day. A dropped collection now ends the streams watching
+it — `InvalidateReason::CollectionDropped`, decided **in storage** rather than
+at the HTTP edge, because that is where the other two reasons live and where
+`finished` is set. Scoped: only a stream watching that collection ends, so a
+`Cluster` stream — the embedding worker's — is untouched, and a test says so.
+
+The sharp part was never the stall. **Ids are derived from `(database,
+name)`**, so a collection recreated under the same name has the same id, and
+the old stream would silently resume delivering for it — one stream spanning
+two different collections with nothing in between.
+
+**Then fixing it exposed a second defect.** A replicated schema change was
+appended to the receiving node's oplog but **never published**, while a
+replicated document was. So a drop ended its own node's watchers immediately
+and left every other node's waiting for an unrelated write to nudge them.
+Invisible for as long as streams filtered DDL out, because "delivered late" and
+"not delivered" looked identical — and **only the cluster harness could have
+found it**, since a single node applies its own drop directly. That is the
+third time the harness has caught something every transport-free test agreed
+was fine.
+
+**One representation fixed on the way past.** The invalidate reason went onto
+the wire through `{:?}`, so renaming a variant would have silently renamed a
+value clients branch on. It has an `as_str` now, with the existing two names
+kept exactly as `Debug` rendered them — the invariant `NodeId` and
+`CollectionId` each cost a replication outage to learn.
+
+**And a third defect, older than both, found by checking a claim.** A pull
+request description said a client could resume past an invalidate and would
+replay to it again. Probing a real node showed that was not what happened —
+and what *did* happen was worse. Because ids are derived from
+`(database, name)`, a recreated collection reuses its id, so the oplog still
+held the dead incarnation's entries and streams still matched them:
+`from_start` on a healthy recreated collection replayed a dead collection's
+documents and then invalidated immediately, never showing the live data.
+
+A stream now never reads across a drop, and a resume token from before one is
+**refused** with `resume_token_expired` rather than moved forward silently —
+between that token and this collection's first event is a gap, and a silent gap
+is what the invalidate machinery exists to prevent.
+
+**The pattern across all three:** each was found by asking a running node what
+it did, not by reading what it was supposed to do. The third one came from
+verifying a sentence I had written in a PR description, which turned out to
+describe a system that does not exist.
 
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because

@@ -938,3 +938,89 @@ async fn a_page_from_one_node_continues_on_another() {
     assert_eq!(unique, (0..TOTAL).collect::<Vec<_>>(), "the walk missed documents");
     assert!(seen.windows(2).all(|w| w[0] < w[1]), "pages arrived out of _id order: {seen:?}");
 }
+
+/// A drop on one node ends the streams watching that collection on every node.
+///
+/// The half an in-process test cannot reach. A drop reaches other nodes as a
+/// replicated oplog entry rather than as a local call, so "the node that
+/// dropped it invalidates its own streams" says nothing about the node a
+/// client happens to be connected to — and with `/v1/topology` telling clients
+/// to spread out, that is frequently a different one.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_replicated_drop_ends_a_stream_on_another_node() {
+    use futures::{SinkExt, StreamExt};
+
+    let client = reqwest::Client::new();
+    let (a, b, _c) = three_nodes(&client).await;
+    let token = a.login(&client).await;
+
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "watched" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Node B must know the collection before it can be watched there.
+    eventually("node B to learn the collection", || {
+        let client = &client;
+        let b = &b;
+        let token = token.clone();
+        async move {
+            client
+                .get(b.url("/v1/db/shop/coll/watched/indexes"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false)
+        }
+    })
+    .await;
+
+    // Watch on B, using B's own token — one cluster, one signing secret, but
+    // asking B for it keeps the test honest about what it is exercising.
+    let b_token = b.login(&client).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(
+        tokio_tungstenite::tungstenite::http::Request::builder()
+            .uri(format!("ws://127.0.0.1:{}/v1/db/shop/coll/watched/watch", b.http))
+            .header("Host", format!("127.0.0.1:{}", b.http))
+            .header("Authorization", format!("Bearer {b_token}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tokio_tungstenite::tungstenite::handshake::client::generate_key(),
+            )
+            .body(())
+            .unwrap(),
+    )
+    .await
+    .expect("opening a change stream on node B");
+
+    // Dropped on A.
+    let dropped =
+        client.delete(a.url("/v1/db/shop/coll/watched")).bearer_auth(&token).send().await.unwrap();
+    assert_eq!(dropped.status(), 200);
+
+    // B's stream must end, and say why.
+    let event = tokio::time::timeout(PATIENCE, async {
+        while let Some(Ok(message)) = socket.next().await {
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+                if value["operationType"] == "invalidate" {
+                    return value;
+                }
+            }
+        }
+        panic!("the socket closed without an invalidate");
+    })
+    .await
+    .expect("a replicated drop must invalidate a stream on another node");
+
+    assert_eq!(event["reason"], "CollectionDropped", "{event}");
+    let _ = socket.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
+}

@@ -38,6 +38,11 @@ tokio-rustls.workspace = true
 # nodes. Both already in the workspace tree; no new dependencies.
 reqwest.workspace = true
 serde_json.workspace = true
+# For the one harness test that opens a change stream against a real node: a
+# replicated drop has to end a stream on a *different* node from the one that
+# dropped it, and only a real socket can show that.
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake", "connect"] }
+futures.workspace = true
 
 # The HTTP-level benchmark. `harness = false` and not a Criterion bench: it
 # spawns the shipped binary and drives it over a socket with N concurrent

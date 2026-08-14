@@ -1785,7 +1785,12 @@ paths:
           in: query
           required: false
           schema: { type: boolean, default: false }
-          description: Replay from the beginning of the retained oplog.
+          description: |
+            Replay from the beginning of the retained oplog — **for this
+            collection's current incarnation.** A collection dropped and
+            recreated under the same name reuses its id, so its predecessor's
+            entries are still in the log; they are not this collection's
+            history and are never delivered.
         - name: full_document
           in: query
           required: false
@@ -1821,8 +1826,15 @@ paths:
         "404": { $ref: "#/components/responses/NotFound" }
         "410":
           description: |
-            The resume token points past the retention horizon. The stream
-            cannot be continued; the client must start again and reconcile.
+            The resume point cannot be continued from, for one of two reasons:
+            retention collected it, or it belongs to a **previous incarnation**
+            of this collection — one dropped and recreated under the same name.
+
+            Both mean the same thing to a client: there is a gap between where
+            it was and where this collection now begins, so it must start again
+            and reconcile. Refused here rather than quietly resumed at the
+            boundary, because a silent gap is what the invalidate machinery
+            exists to prevent.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2006,7 +2018,7 @@ components:
         | `duplicate_key` | 409 | no | `_id` already present |
         | `unique_violation` | 409 | no | A unique index would be broken |
         | `no_vectors` | 409 | no | Searching a collection whose vectors were never ingested — distinguished from an empty result, which is indistinguishable from "nothing matched" |
-        | `resume_token_expired` | 410 | no | The resume point has been collected. Resubscribe; retrying the token loops forever |
+        | `resume_token_expired` | 410 | no | The resume point cannot be continued from — collected by retention, or belonging to a previous incarnation of a collection that was dropped and recreated. Resubscribe |
         | `rate_limited` | 429 | wait | Over a limit. Carries `Retry-After` |
         | `not_implemented` | 501 | no | A reserved capability that does not exist |
         | `provider_error` | 502 | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
@@ -2540,11 +2552,30 @@ components:
         - type: object
           title: invalidate
           description: |
-            The stream cannot continue — the collection was dropped, or the
-            resume point fell past the retention horizon. The server closes the
-            socket after this frame.
+            The stream is over. The server closes the socket after this frame.
+
+            **A client must act on this rather than reconnect blindly.**
+            `CollectionDropped` means there is nothing left to watch;
+            `ConsumerLagged` and `ResumeTokenExpired` mean events existed and
+            cannot be read, so whatever the client missed is a gap it has to
+            reconcile some other way.
+
+            Resuming from a token taken *before* the invalidate is allowed and
+            replays up to it — the token is a position in a log that still
+            exists, so it invalidates again at the same place. An invalidate
+            ends a stream; it is not a permanent wall.
           required: [operationType, reason]
           properties:
             operationType:
               const: invalidate
-            reason: { type: string }
+            reason:
+              type: string
+              description: |
+                | Value | Meaning |
+                |---|---|
+                | `CollectionDropped` | The collection being watched was dropped. Only streams scoped to it end; a node that learns of the drop by replication ends its streams too |
+                | `ConsumerLagged` | Retention collected the range this stream was about to read |
+                | `ResumeTokenExpired` | The resume point has been collected from the oplog |
+
+                Treat an unrecognized value as "this stream is over", which is
+                what every value means. New ones are additive.

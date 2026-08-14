@@ -1257,28 +1257,62 @@ mocked server would only assert what the client already believes.
 
 ---
 
-## 🟡 A dropped collection leaves a change stream open and silent
+## 🟢 A dropped collection now ends the streams watching it (was a 🟡, one day old)
 
-**Found 2026-08-14 while writing the Python client's tests**, which assumed the
-MongoDB behaviour: there, dropping a collection invalidates the streams
-watching it.
+**Was.** A change stream whose collection was dropped received no event, no
+close and no error: it waited for changes to something that no longer existed.
+And because ids are derived from `(database, name)` ([ADR-031](decisions.md)),
+a collection recreated under the same name has the *same id* — so the stream
+would silently resume delivering for it, bridging two different collections
+with nothing in between. The stall was the visible half; the bridge was the
+dangerous one.
 
-**Here it does not.** A change stream carries *data*, not DDL — schema changes
-are filtered out before a client sees them — and the server's only two
-invalidate reasons are `ConsumerLagged` and `ResumeTokenExpired`. So a stream
-whose collection is dropped receives no event, no close and no error. It waits
-for changes to something that no longer exists.
+**Now.** `InvalidateReason::CollectionDropped`, decided in storage rather than
+at the HTTP edge, because storage is where the other two reasons live and where
+`finished` is set — an in-process consumer of `Engine::watch` would otherwise
+keep a stream it believes is live. **Scoped deliberately**: only a stream
+watching *that* collection ends. A `Cluster` or `Database` stream keeps going,
+and a test says so, because ending those would take the embedding worker down
+with the first dropped collection anywhere.
 
-**Not obviously wrong**, which is why this is a 🟡 rather than a bug: a
-collection can be recreated under the same name and the stream would then be
-watching the right thing again, and the "clients see data, not DDL" rule is
-deliberate and load-bearing elsewhere. But it is a surprise for anyone arriving
-from MongoDB, and a client library cannot paper over it — there is nothing to
-observe.
+**Fixing it exposed a second defect that had been invisible.** A replicated
+schema change was appended to the receiving node's oplog but **never
+published**, while a replicated *document* was — so a drop ended its own
+node's watchers immediately and left every other node's waiting for an
+unrelated write to wake them. Change streams filter schema entries out, so
+"delivered late" and "not delivered" had looked the same for as long as the
+asymmetry existed. It stopped looking the same the moment a drop became
+something a stream cares about.
 
-**Both clients now have a test asserting the real behaviour**, so the day it
-changes, something fails. Deciding whether it *should* change is a
-change-stream question rather than a client one.
+**The cluster harness is what found it**, and nothing else could have: a single
+node applies its own drop directly, so every in-process test passed. This is
+the third time that harness has caught a cluster behaviour that every
+transport-free test agreed was fine.
+
+**One representation fixed while there.** The invalidate reason was rendered
+onto the wire with `{:?}` — a `Debug` derive, so renaming a variant would have
+silently renamed a value clients branch on. It has an `as_str` now, with the
+two existing names kept exactly as `Debug` produced them, so nothing already on
+the wire changed. That is the same invariant `NodeId` and `CollectionId` each
+cost a replication outage to learn.
+
+**Both clients assert the new behaviour**, and the specification documents all
+three reasons with what a client should do about each.
+
+**And a third defect, older than both.** Because ids are derived from
+`(database, name)`, a collection recreated under the same name reuses its id —
+so the oplog still held the dead incarnation's entries and streams still
+matched them. `from_start` on a healthy recreated collection replayed a dead
+collection's documents and then invalidated immediately, never showing the live
+data. A stream now never reads across a drop, and a resume token from before
+one is **refused** rather than moved forward silently: the gap between that
+token and this collection's first event is exactly what a client must not be
+left unaware of.
+
+**All three were found by asking a running node rather than reading the code.**
+The first came from a client test that hung; the second from the cluster
+harness; the third from a probe written to check a claim in a pull request
+description, which turned out to describe behaviour the server did not have.
 
 ---
 

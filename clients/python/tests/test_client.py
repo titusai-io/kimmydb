@@ -231,19 +231,54 @@ def test_a_change_stream_resumes_from_where_it_stopped(db):
     resumed.close()
 
 
-def test_a_dropped_collection_leaves_the_stream_open_and_silent(db):
-    """What actually happens, which is not what a MongoDB user would expect.
+def test_a_recreated_collection_serves_only_its_own_history(db):
+    """The symptom a client actually meets.
 
-    A change stream carries *data*, not DDL — schema changes are filtered out
-    before a client sees them — and the server's only two invalidate reasons
-    are a consumer that lagged past the retention horizon and a resume token
-    that did the same. So dropping the collection out from under a stream
-    delivers nothing: no event, no close, no error. The stream waits for
-    changes to a collection that no longer exists.
+    Ids are derived from `(database, name)`, so a collection recreated under
+    the same name has the same id and the oplog still holds the dead one's
+    entries. Watching from the start used to replay those and then invalidate
+    immediately — a healthy collection handing back documents that no longer
+    exist and never showing the live ones.
+    """
+    db.create_collection("shop", "orders")
+    db.insert("shop", "orders", {"_id": 1, "ghost": True})
+    db.request("DELETE", "/v1/db/shop/coll/orders")
 
-    Written after the opposite was assumed and the test hung for ten minutes.
-    Recorded as a 🟡 in docs/deviations.md rather than fixed here: it is a
-    server-side change-stream decision, not a client one.
+    db.create_collection("shop", "orders")
+    db.insert("shop", "orders", {"_id": 99, "live": True})
+
+    stream = db.watch("shop", "orders", from_start=True)
+    event = next(iter(stream))
+    assert event.document_id == 99, "the dead incarnation's history is not this collection's"
+    stream.close()
+
+
+def test_a_resume_token_from_before_a_drop_is_refused(db):
+    # Refused rather than quietly moved forward: between that token and this
+    # collection's first event is a gap the client would otherwise never learn
+    # about.
+    db.create_collection("shop", "orders")
+    stream = db.watch("shop", "orders")
+    db.insert("shop", "orders", {"_id": 1})
+    token = next(iter(stream)).resume_token
+    stream.close()
+
+    db.request("DELETE", "/v1/db/shop/coll/orders")
+    db.create_collection("shop", "orders")
+
+    with pytest.raises(KimmyError) as caught:
+        db.watch("shop", "orders", resume_after=token)
+    assert caught.value.code == "resume_token_expired"
+
+
+def test_a_dropped_collection_ends_the_stream(db):
+    """A drop invalidates the streams watching that collection.
+
+    It did not, once: the stream went silent with no event, no close and no
+    error, and — because ids are derived from `(database, name)` — a collection
+    recreated under the same name would silently adopt it. Found while writing
+    this file's first version, which asserted the MongoDB behaviour and then
+    hung for ten minutes.
     """
     seed(db, 1)
 
@@ -251,10 +286,10 @@ def test_a_dropped_collection_leaves_the_stream_open_and_silent(db):
     events = iter(stream)
     db.request("DELETE", "/v1/db/shop/coll/orders")
 
-    # Nothing arrives. Bounded rather than blocking, because the assertion is
-    # about silence and silence has to be waited for.
-    with pytest.raises(TimeoutError):
-        stream._socket.recv(timeout=2)  # noqa: SLF001 - the point of the test
-
-    assert not stream._ended, "the stream still believes it is live"
+    final = None
+    for event in events:
+        final = event
+    assert final is not None
+    assert final.is_invalidate
+    assert final.raw["reason"] == "CollectionDropped"
     stream.close()

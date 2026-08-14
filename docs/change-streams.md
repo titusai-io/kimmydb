@@ -167,10 +167,59 @@ and asserting all 2,500 arrive in order.
 Recovery is bounded by a **resume floor** — the position the stream started at —
 so a stream that deliberately skipped history cannot resurrect it by lagging.
 
-> **`Invalidate` is reachable in exactly one way:** retention collected the
-> range the stream was about to read. A stream checks the oldest retained
-> position before each read and emits `ConsumerLagged` rather than skipping the
-> gap silently. Before retention landed there was no way to reach it at all.
+> **`Invalidate` is reachable two ways, and they mean different things.**
+> Retention collecting the range the stream was about to read is a **gap**:
+> events existed and cannot be read, so the stream emits `ConsumerLagged`
+> rather than skipping it silently. The collection being dropped is an **end**:
+> there is nothing left to watch, and the stream emits `CollectionDropped`.
+>
+> The second was added after a client author found the alternative: a dropped
+> collection used to leave its streams open and silent — no event, no close,
+> no error. Worse than the stall, **ids are derived from `(database, name)`**
+> ([ADR-031](decisions.md)), so a collection recreated under the same name has
+> the same id and the old stream would silently resume delivering for it,
+> bridging two different collections with nothing in between.
+>
+> Only a stream scoped to *that* collection ends. A `Database` or `Cluster`
+> stream keeps going, because for those a dropped collection is one of the
+> things being watched rather than the end of what is watched — and ending
+> them would take the embedding worker down with the first drop anywhere.
+
+### A recreated collection is not the old one
+
+Ids are derived from `(database, name)` ([ADR-031](decisions.md)), so a
+collection dropped and recreated under the same name **reuses its id** — and
+the oplog is keyed by id, so the dead incarnation's entries are still there and
+still match.
+
+Two consequences, both fixed rather than documented:
+
+- **`from_start` means the start of *this* collection.** It used to replay the
+  previous incarnation's history and then invalidate immediately: a healthy
+  collection handing back documents that no longer exist, and never showing the
+  live ones.
+- **A resume token from before the drop is refused** with `410
+  resume_token_expired`, rather than quietly resuming at the boundary. Between
+  that token and this collection's first event is a gap the client would
+  otherwise never learn about, and hiding a gap is what the invalidate
+  machinery exists to prevent.
+
+Found by driving a real node and asking what actually happened, after a written
+claim about it turned out to describe something else entirely.
+
+### A drop that arrives by replication ends streams too
+
+Fixing the local case exposed a second one. A replicated schema change was
+appended to the receiving node's oplog but **never published**, while a
+replicated *document* was — so a drop on one node ended its own watchers at
+once and left every other node's waiting for some unrelated write to nudge
+them.
+
+It had been invisible because change streams filter schema entries out, so
+"delivered late" and "not delivered" looked identical. It stopped being
+invisible the moment a drop became something a stream cares about. The
+cluster harness is what found it: a single node applies its own drop directly,
+so no in-process test could have.
 
 ---
 

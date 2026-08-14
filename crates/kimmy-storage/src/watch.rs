@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use kimmy_core::{CollectionId, Hlc, OplogEntry, ResumeToken, Stamp};
+use kimmy_core::{CollectionId, Hlc, OpKind, OplogEntry, ResumeToken, Stamp};
 use redb::{ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
 use tracing::{debug, warn};
@@ -60,14 +60,15 @@ pub enum ChangeEvent {
         entry: Arc<OplogEntry>,
         token: ResumeToken,
     },
-    /// The stream can no longer be trusted to be gap-free; the client must
-    /// resubscribe. Delivered rather than silently dropping events.
+    /// This stream is over; the client must decide what to do rather than wait.
+    /// Delivered rather than silently dropping events, or silently delivering
+    /// none.
     ///
-    /// Reachable in exactly one way: retention collected the range this stream
-    /// was about to read. Falling behind the live channel is *not* one of them —
-    /// that channel is only a wake-up, so a slow consumer simply re-reads from
-    /// disk. A resume point that predates the log is refused up front by
-    /// [`Engine::watch`] instead, so it never becomes a mid-stream event.
+    /// Two shapes of reason, and they are different in kind. Retention
+    /// collecting the range is a *gap*: events existed and cannot be read.
+    /// The collection being dropped is an *end*: there is nothing further to
+    /// watch. Falling behind the live channel is neither — that channel is
+    /// only a wake-up, so a slow consumer re-reads from disk.
     Invalidate {
         reason: InvalidateReason,
     },
@@ -79,6 +80,42 @@ pub enum InvalidateReason {
     ConsumerLagged,
     /// The resume point has been collected from the oplog.
     ResumeTokenExpired,
+    /// The collection being watched was dropped.
+    ///
+    /// Only a stream scoped to *that* collection ends. A `Cluster` or
+    /// `Database` stream keeps going, because for those a dropped collection
+    /// is one of the things they are watching for rather than the end of what
+    /// they watch.
+    ///
+    /// **Ids are derived from `(database, name)`** ([ADR-031]), so a
+    /// collection recreated under the same name has the same id — and without
+    /// this, a stream opened before the drop would silently resume delivering
+    /// for the new collection, bridging two different collections that merely
+    /// share a name. The stall was the visible half of that; this was the
+    /// dangerous one.
+    ///
+    /// [ADR-031]: ../../../docs/decisions.md
+    CollectionDropped,
+}
+
+impl InvalidateReason {
+    /// The name on the wire.
+    ///
+    /// Written out rather than derived from `Debug`, which is what the HTTP
+    /// layer used to format. A type that crosses a format boundary needs a
+    /// *chosen* representation: `NodeId` and `CollectionId` have each cost a
+    /// replication outage by inheriting one, and a `Debug` string means
+    /// renaming a variant silently renames a value clients branch on.
+    ///
+    /// The two existing names are kept exactly as `Debug` rendered them, so
+    /// this changes nothing already on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ConsumerLagged => "ConsumerLagged",
+            Self::ResumeTokenExpired => "ResumeTokenExpired",
+            Self::CollectionDropped => "CollectionDropped",
+        }
+    }
 }
 
 impl Engine {
@@ -104,6 +141,24 @@ impl Engine {
             (None, None) => self.next_arrival_seq()?,
         };
 
+        // Step 3: never read across a drop.
+        //
+        // Ids are derived from `(database, name)` (ADR-031), so a collection
+        // recreated under the same name has the same id — and the oplog is
+        // keyed by id, so entries from the *previous* incarnation are still
+        // there and still match. Without this floor, `from_start` on a healthy
+        // recreated collection replayed a dead collection's history and then
+        // ended, and never showed the live data at all.
+        //
+        // A resume token from before the drop is **refused** rather than
+        // quietly moved forward: there is a real gap between where the client
+        // was and where this collection begins, and hiding a gap is the thing
+        // `Invalidate` exists to avoid.
+        let start = match scope {
+            WatchScope::Collection(id) => self.clamp_to_incarnation(id, start, &options)?,
+            _ => start,
+        };
+
         Ok(ChangeStream {
             rx,
             scope,
@@ -114,6 +169,34 @@ impl Engine {
             db_of_collection: HashMap::new(),
             finished: false,
         })
+    }
+
+    /// Move a start position forward past a drop of this collection.
+    ///
+    /// Returns the arrival position of the drop's successor when the requested
+    /// start predates the collection's most recent drop, and the requested
+    /// position otherwise. A resume token that predates it is an error: the
+    /// client asked to continue from a point in a collection that no longer
+    /// exists, and everything between that point and now is a gap.
+    fn clamp_to_incarnation(
+        &self,
+        id: CollectionId,
+        start: u64,
+        options: &WatchOptions,
+    ) -> Result<u64> {
+        let Some(dropped_at) = self.collection_dropped_at(id)? else {
+            return Ok(start);
+        };
+        // The arrival position of the drop entry itself; the incarnation
+        // begins after it.
+        let after_drop = self.arrival_after(&ResumeToken::from_stamp(dropped_at))?;
+        if start >= after_drop {
+            return Ok(start);
+        }
+        if options.resume_after.is_some() {
+            return Err(kimmy_core::Error::ResumeTokenExpired.into());
+        }
+        Ok(after_drop)
     }
 
     /// The arrival position just after the entry a token names.
@@ -377,6 +460,21 @@ impl ChangeStream {
             return None;
         }
 
+        // The collection this stream is watching has gone. Ending here rather
+        // than at the edge that renders events, because *this* is where
+        // `finished` lives: a consumer of `Engine::watch` that is not the HTTP
+        // layer would otherwise keep a stream it believes is live.
+        //
+        // Scoped deliberately. A `Cluster` or `Database` stream sees drops of
+        // collections it is not defined by, and ending those would take the
+        // embedding worker down with the first dropped collection.
+        if entry.kind == OpKind::DropCollection
+            && matches!(self.scope, WatchScope::Collection(id) if id == entry.collection)
+        {
+            self.finished = true;
+            return Some(ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped });
+        }
+
         self.last_delivered = Some(entry.stamp);
         let token = entry.resume_token();
         Some(ChangeEvent::Change { entry, token })
@@ -517,6 +615,132 @@ mod tests {
 
         let events = take(&engine, &mut stream, 2).await;
         assert_eq!(doc_ids(&events), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn dropping_the_collection_ends_a_stream_watching_it() {
+        // Before this, the stream simply went quiet: no event, no end, nothing
+        // to observe. Worse than the silence, ids are derived from
+        // `(database, name)` — so a collection recreated under the same name
+        // has the same id, and the stream would resume delivering for it,
+        // bridging two different collections with nothing in between.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![1]);
+
+        engine.drop_collection("app", "docs").unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next(&engine))
+            .await
+            .expect("a dropped collection must end the stream rather than stall it")
+            .expect("an event");
+        assert!(
+            matches!(
+                event,
+                ChangeEvent::Invalidate { reason: InvalidateReason::CollectionDropped }
+            ),
+            "expected an invalidate, got {event:?}"
+        );
+
+        // And it stays ended: recreating the collection must not silently
+        // adopt the stream that was watching the old one.
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        assert_eq!(recreated.id, coll.id, "the id is derived from the name");
+        engine.insert(&recreated, doc! { "_id": 2i64 }).unwrap();
+        assert!(stream.next(&engine).await.is_none(), "the stream is over");
+    }
+
+    #[tokio::test]
+    async fn a_recreated_collection_does_not_serve_the_dead_one_s_history() {
+        // Ids are derived from `(database, name)`, so the recreated collection
+        // has the same id and the old entries still match it. Before this, a
+        // `from_start` stream on a perfectly healthy collection replayed a
+        // dead collection's documents and then invalidated — never showing the
+        // live data at all. Found by driving a real node.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+        engine.drop_collection("app", "docs").unwrap();
+
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        assert_eq!(recreated.id, coll.id, "the id is derived from the name");
+        engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(recreated.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+
+        // Only this incarnation's data, and no invalidate for a drop that
+        // happened before the stream existed.
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![99]);
+    }
+
+    #[tokio::test]
+    async fn a_resume_token_from_before_a_drop_is_refused() {
+        // Not clamped forward silently: between that token and this
+        // collection's first event there is a gap the client would otherwise
+        // never learn about — which is the failure `Invalidate` exists to
+        // prevent, so producing it here would be inconsistent.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1i64 }).unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Collection(coll.id),
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+        take(&engine, &mut stream, 1).await;
+        let token = stream.resume_token().expect("a delivered event yields a token");
+
+        engine.drop_collection("app", "docs").unwrap();
+        let recreated = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&recreated, doc! { "_id": 99i64 }).unwrap();
+
+        let refused = engine.watch(
+            WatchScope::Collection(recreated.id),
+            WatchOptions { resume_after: Some(token), ..Default::default() },
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(crate::StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+            ),
+            "a token from a previous incarnation must be refused"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_one_collection_does_not_end_a_cluster_stream() {
+        // The scope condition, stated as a test. A cluster-wide stream is the
+        // embedding worker's, and ending it on the first dropped collection
+        // anywhere would stop embedding for the whole node.
+        let (engine, coll, _dir) = setup();
+        let other = engine.create_collection("app", "other").unwrap();
+
+        let mut stream = engine
+            .watch(
+                WatchScope::Cluster,
+                WatchOptions { start_at: Some(Hlc::ZERO), ..Default::default() },
+            )
+            .unwrap();
+
+        engine.drop_collection("app", "docs").unwrap();
+        engine.insert(&other, doc! { "_id": 7i64 }).unwrap();
+
+        // The drop is not delivered as a document change, and the stream is
+        // still live enough to deliver the write that followed it.
+        assert_eq!(doc_ids(&take(&engine, &mut stream, 1).await), vec![7]);
+        let _ = coll;
     }
 
     #[tokio::test]

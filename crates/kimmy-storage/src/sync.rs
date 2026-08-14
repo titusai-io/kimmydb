@@ -277,6 +277,17 @@ impl Engine {
         crate::engine::append_oplog(&txn, entry)?;
         txn.commit()?;
         self.witness(&entry.stamp);
+        // Published, like a replicated *document* is (`apply_remote`). Without
+        // this, a replicated schema change sat in the arrival index until some
+        // unrelated write happened to wake a stream — so a collection dropped
+        // on one node ended its watchers there immediately and left the ones
+        // on every other node waiting indefinitely for a nudge.
+        //
+        // Invisible until change streams had a reason to care about DDL: they
+        // filter schema entries out, so "delivered late" and "not delivered"
+        // looked the same. Found by the cluster harness, which is the only
+        // thing that could have: a single node applies its own drop directly.
+        self.publish(vec![entry.clone()]);
         Ok(())
     }
 
