@@ -2332,9 +2332,11 @@ name = "kimmy-client"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bson",
  "futures",
  "kimmy-api",
  "kimmy-auth",
+ "kimmy-cluster",
  "kimmy-core",
  "kimmy-storage",
  "reqwest",

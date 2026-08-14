@@ -38,6 +38,8 @@ kimmy-api.workspace = true
 kimmy-auth.workspace = true
 kimmy-storage.workspace = true
 kimmy-core.workspace = true
+kimmy-cluster.workspace = true
+bson.workspace = true
 axum.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }

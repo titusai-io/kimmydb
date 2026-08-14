@@ -6,15 +6,16 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 task 11 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 complete**; the closeout is on a branch awaiting review
 
-**M0–M9 complete.** M10 tasks 1–10 are merged (#65–#75), and task 11 is on
-`m10-conformance` with a PR open and unmerged.
+**M0–M10 complete.** Tasks 1–11 are merged (#65–#76); task 12 — the examples,
+the mutation pass and this closeout — is on `m10-examples-closeout` with a PR
+open and unmerged.
 
-**Three clients are now held to one set of scenarios** rather than to three of
-their own — sixteen scenarios, forty-eight runs, one oracle. **Task 12 is all
-that remains**: an example application per language, a mutation pass over the
-milestone diff, and the closeout.
+**KimmyDB now has a written, versioned and tested client protocol, and three
+first-party clients held to one set of scenarios.** What to do next is an open
+question rather than a plan: see "How to size the next thing" below, which is
+now the most useful section of this file.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -44,20 +45,15 @@ Task 9: `clients/python`, package `kimmydb`, synchronous on `httpx` and
 
 Task 10: `clients/go`, package `kimmydb`, one dependency, with its own CI job.
 
-Task 11: `clients/conformance` — a declared scenario list, a driver per client,
-and a runner that compares.
+Task 12: `shelf`, one application written three times and run in CI, plus the
+mutation pass and this closeout.
 
-**Next is task 12**, the last one: an example application per language, a
-mutation pass over the milestone diff, and the closeout. No reserved decision.
-
-Two notes for it. The examples are meant to be **something real end to end** —
-documents, a change stream, a vector search — not a snippet that inserts one
-record; the deferred decision named *running KimmyDB on something real* as the
-trigger for judging this whole direction, and these are that. And the mutation
-pass is `cargo mutants --in-diff` over the milestone's Rust diff, as M7 and M8
-both closed; the clients are not Rust, so what it covers is the server-side
-half — the specification's contract test, the error taxonomy, the topology
-registry and the change-stream fixes.
+**There is no M11.** The milestone that has just finished was the last one
+planned, and choosing the next thing is a decision for the maintainer rather
+than something to infer. The material for that choice is in
+[Roadmap](roadmap.md) and in "How to size the next thing" below — the carried
+debt, the gaps in [Testing](testing.md), and the one performance item M10
+measured and did not chase.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -130,7 +126,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-python-client` | ✅ Merged as #73. M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
 | `drop-invalidates-change-streams` | ✅ Merged as #74. Three change-stream defects: the drop invalidate, the unpublished replicated DDL, and a recreated collection serving the dead one's history |
 | `m10-go-client` | ✅ Merged as #75. M10 task 10: `clients/go`, package `kimmydb`, a CI job |
-| `m10-conformance` | **Open, PR raised, not merged.** M10 task 11: `clients/conformance`, three drivers, a CI job |
+| `m10-conformance` | ✅ Merged as #76. M10 task 11: `clients/conformance`, three drivers, a CI job |
+| `m10-examples-closeout` | **Open, PR raised, not merged.** M10 task 12: `shelf` in three languages, the mutation pass, the closeout |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -260,7 +257,7 @@ work.
 | 9 | ✅ **Python client** | Settled: `httpx` + `websockets`, sync first |
 | 10 | ✅ **Go client** | Settled: stdlib `net/http` + `coder/websocket` |
 | 11 | ✅ **Conformance suite all three clients pass** | — |
-| 12 | **One example app per language** + mutation pass and closeout | — |
+| 12 | ✅ **One example app per language** + mutation pass and closeout | — |
 
 **M9 is done, so nothing blocks M10.** Task 6 inherits the cursor design
 directly: an opaque `_id`-order token, already node-portable, which is most of
@@ -705,6 +702,59 @@ do not (143/s → 602/s, p99 10 ms → 246 ms). It also found something no
 engine-level benchmark could: a single write costs about **twice** as much
 through the daemon as at the engine, which is neither protocol overhead nor
 encoding, and is recorded as an open question rather than explained.
+
+### What task 12 did, and what the mutation pass found
+
+`shelf`, a small library catalogue, **written three times** — Rust, Python, Go.
+Not three snippets: one application that stocks a shelf in a single commit,
+groups it by decade, pages it five at a time, searches it by vector, and
+watches it change while another thread writes to it. All three print the same
+three nearest titles with the same scores to three decimals, which is a
+stronger statement about the clients than any of them passing its own tests.
+They run in CI against a real node, because an example nobody runs decays into
+a document that used to be true.
+
+The embedding is a **deliberate toy** — a normalized bag-of-words FNV-1a hash,
+sixteen wide, identical in all three languages — and says so in every file. It
+buys a real pipeline (configure vectors, store per document, search, score)
+with no API key, no model and no network. Swapping in a real provider does not
+change the application code above the search.
+
+**The mutation pass, split by scope.** Running every client mutant against the
+workspace suite was a nine-hour job; running the client's mutants against the
+client's tests is twenty minutes. The client's first pass caught 101 of 167
+viable mutants, and the misses were not marginal:
+
+- **Seven convenience methods had no test at all** — `find`, `update`,
+  `delete`, `aggregate`, `replace_document`, `delete_document`, `download`.
+  Each could be stubbed out entirely and the suite stayed green, because the
+  tests reached the server through `pages`, `insert`, `count` and `request`.
+  One-line wrappers are exactly where a wrong verb or a wrong path hides.
+- **Topology filtering was untested**, because a one-node harness has nothing
+  to filter: every comparison in `refresh_topology` could be inverted with no
+  observable effect. It has three nodes to choose between now.
+- **Thirteen of the seventeen error codes were never produced by any test**,
+  so any of them could have been renamed silently — on public surface that
+  callers branch on.
+
+Five new tests took it to **133 caught of 167 viable** (190 mutants: 34
+missed, 20 unviable, 3 timeouts). What is left is classified rather than
+absorbed, in [Testing](testing.md): reconnect-backoff internals that need
+fault injection, the `retry: wait` branch the client suite has no rate-limited
+server to reach, and a handful of provably equivalent mutants.
+
+**The rule from M7 held again**: the value was not the score, it was that
+mutation testing asked "which of these lines could I delete?" and the answer
+included seven public methods.
+
+**The server-side half of the pass was abandoned, and that is a debt.** The 90
+mutants in `kimmy-api`, `kimmy-storage` and `kimmy-auth` are unclassified: the
+run re-ran all three suites for every mutant at a parallelism that pushed each
+past its timeout, and produced 3 caught and 15 timeouts out of 47 before it was
+stopped. Those crates had full passes in M7 and M8 and their share of this diff
+is small, so it is not alarming — but the new code in them is branch-heavy and
+deserves it. One pass per crate with tests scoped to that crate closes it in
+about an hour; it is in [Deviations](deviations.md) so it does not get lost.
 
 ### How to size the next thing after M10
 

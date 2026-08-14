@@ -173,6 +173,13 @@ jobs:
       - name: Conformance
         run: ./clients/conformance/run.py
 
+      # The example applications, run against a real node. An example nobody
+      # runs rots into a document that used to be true, and this one is the
+      # answer to "what does using KimmyDB look like" — so it fails the build
+      # rather than the reader.
+      - name: Examples
+        run: ./examples/run-all.sh
+
   docker:
     name: docker build
     runs-on: ubuntu-latest

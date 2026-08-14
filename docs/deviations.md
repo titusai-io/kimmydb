@@ -1399,6 +1399,81 @@ Four places, because the claim was in four places.
 
 ---
 
+## 🟢 One application, written three times, and run (M10 task 12)
+
+**Now.** `examples/shelf` — a small library catalogue in Rust, Python and Go.
+It uses what KimmyDB exists for rather than what every database has: bulk
+insert in one commit, cursor paging, an aggregation, semantic search over
+client-supplied vectors, and a change stream watching the collection while it
+is written to.
+
+**They run in CI**, against a real node, all three in sequence — so the second
+and third exercise the "already stocked" path and re-runnability is checked
+rather than assumed. An example nobody runs rots into a document that used to
+be true.
+
+**The embedding is a toy and says so**: a deterministic bag-of-words hash, the
+same algorithm in all three languages, so the pipeline is real without an API
+key or a model download. All three produce identical scores, which is a
+pleasant way to notice that nothing language-specific leaks into the protocol.
+
+**Why an application rather than three snippets.** The deferred decision that
+became M10 named *running KimmyDB on something real* as the trigger for judging
+whether the client direction was right. A snippet that inserts one document
+does not test that; something that has to find, page and react does.
+
+---
+
+## 🟡 The M10 mutation pass covered the client, not the server crates
+
+**M10 task 12 called for a mutation pass over the milestone diff. It covers
+`kimmy-client` only.** The client pass is complete and its findings are real —
+seven untested public methods, untested topology filtering, thirteen never-produced
+error codes — but the 90 mutants in `kimmy-api`, `kimmy-storage` and
+`kimmy-auth` are **unclassified**.
+
+**Why**: the run was misconfigured — every mutant re-ran all three crates'
+suites at a parallelism that pushed each past the timeout. It produced 3 caught
+and 15 timeouts out of 47 before being abandoned rather than left to burn hours
+for no data.
+
+**Not alarming**: those three crates had full passes in M7 and M8, and their
+share of the M10 diff is small. **Not nothing either**: the new code in them —
+the error taxonomy, `/v1/version`, `/v1/topology`, the node registry, the
+change-stream invalidate — is exactly the kind of branch-heavy logic mutation
+testing is good at.
+
+**To close**: one pass per crate, tests scoped to that crate (`-- -p kimmy-api`),
+`-j 4`, timeout set from a contended baseline. [Testing](testing.md) has the
+detail.
+
+---
+
+## 🟡 The client's `retry: wait` path has no test that reaches it
+
+**Found by the M10 mutation pass, not by review.** `Client::send` branches on
+the retry class the server returns, and the `wait` arm — back off, then try the
+same node again — can have its guard replaced with `true` or `false` without a
+test failing. No harness in the client's suite ever answers `429`, so the
+branch is never taken.
+
+Four of the thirty-four surviving mutants are this one path. It is a **real
+gap**, not an equivalent mutant: a client that mishandles `wait` turns a
+recoverable overload into an error the caller sees, which is precisely the
+failure the three-valued taxonomy (ADR-057) exists to prevent.
+
+**To close**: a test server that returns `429` with `retry: wait` a fixed
+number of times and then succeeds, asserting the call returns the eventual
+success and that it went to the *same* endpoint — the distinction from
+`elsewhere` is the whole point. Cheap; deferred only because it wants a small
+harness change and the milestone was closing.
+
+The rest of the residue is classified in [Testing](testing.md): reconnect
+backoff arithmetic that needs fault injection to reach, and a handful of
+provably equivalent mutants.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was
