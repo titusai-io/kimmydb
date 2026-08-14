@@ -8,9 +8,9 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ## As of 2026-08-14 — **M10 complete**; the closeout is on a branch awaiting review
 
-**M0–M10 complete.** Tasks 1–11 are merged (#65–#76); task 12 — the examples,
-the mutation pass and this closeout — is on `m10-examples-closeout` with a PR
-open and unmerged.
+**M0–M10 complete — every milestone that was ever planned.** Tasks 1–11 are
+merged (#65–#76); task 12 — the examples, the mutation pass and this closeout —
+is on `m10-examples-closeout` as **PR #77**, open and unmerged.
 
 **KimmyDB now has a written, versioned and tested client protocol, and three
 first-party clients held to one set of scenarios.** What to do next is an open
@@ -61,6 +61,86 @@ correct for now; the maintainer wants to decide from experience of running
 KimmyDB, not from a feature comparison. The *client story* half of that old
 deferral was settled by [ADR-055](decisions.md) and is what M10 carries out.
 
+### Getting oriented
+
+#### 1. Find out where the tree actually is
+
+```bash
+cd /path/to/kimmydb
+git checkout main && git pull
+gh pr list --state open            # is #77 still open?
+gh pr view 77 --json state,title
+```
+
+**If #77 is still open**, the tree you want is that branch and the work is
+waiting on review.
+
+**If #77 is merged**, `main` holds all of M0–M10 and there is **no next task
+queued**. That is the real state: the project has finished everything that was
+ever planned, and what happens next is a decision the maintainer makes.
+
+#### 2. What this project is, in one paragraph
+
+KimmyDB is a document and vector database in Rust — MongoDB-shaped query
+surface, leaderless replication, HNSW vector search with server-side embedding,
+change streams, webhooks, and a full HTTP/WebSocket protocol. Eleven crates in
+one workspace, three first-party clients (Rust, Python, Go), ~1,100 tests, and
+a specification (`docs/openapi.yaml`) that a contract test holds to the running
+server. **[The oplog is the spine](#the-one-structural-idea-if-you-read-nothing-else)**
+— read that section, because nearly every subsystem is a consumer of one log
+and the design only makes sense once that lands.
+
+#### 3. Verify the tree is healthy before you believe anything
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+./scripts/check-native-deps.sh          # must report `cc` alone, nothing more
+cargo test --workspace                  # ~2 minutes, ~1,103 tests
+```
+
+Then, if the change is anything but documentation, **drive a real node** — the
+live drive has caught what the suite could not on nearly every branch. "How to
+run and verify things" below has the recipes, including the cluster harness,
+the three client suites, the conformance runner and the examples.
+
+#### 4. What is already decided — do not re-open these unasked
+
+- **Sharding.** Replicated-not-partitioned is the position, deliberately, until
+  there is operational experience. Not an oversight.
+- **The 60 ADRs in [Decisions](decisions.md).** M10 added ADR-056 through
+  ADR-060: the hand-written specification, the three-valued retry taxonomy,
+  path-major versioning with capability discovery, sliding token re-issue, and
+  the replicated node registry. Each was put to the maintainer first.
+- **The register in [Deviations](deviations.md)** holds **zero 🔴**. Everything
+  open is a 🟡 that was agreed. Read the register itself, not a summary — M8
+  found a debt that existed only there.
+
+#### 5. The two failure modes that keep catching people here
+
+**A claim with no mechanism behind it is usually false.** M8 found one in four
+branches, M9 in every task, M10 in four more — including a sentence in a PR
+description that turned out to describe a system that does not exist, and a
+specification paragraph about creating a collection twice that no test had ever
+done. When you find an assertion in a comment, a doc or a spec, the useful
+question is "what fails if this stops being true?" If the answer is "nothing",
+that is the next bug.
+
+**Transport-free tests agree with each other and lie about clusters.** Three
+separate defects passed every single-node test and were only ever visible on
+real nodes — most recently a replicated schema change that was appended to the
+oplog and never published, so a dropped collection ended its own node's
+watchers and left every other node's hanging. Use `cargo test -p kimmyd --test
+cluster -- --ignored --test-threads=1`.
+
+#### 6. Picking the next milestone
+
+"How to size the next thing after M10" below is written for exactly that, and
+the strongest single candidate named in it is **index-ordered scans** —
+`scan_range_in` sorts by document key, so sorted paging still uses `skip` and
+every sorted `find` materialises its whole match set. It is the largest known
+performance item and it makes two things better at once.
+
 ### How work runs here — read this first
 
 The rhythm:
@@ -79,7 +159,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-057**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-061**).
   M8 task 7 found the register can silently lose an entry — this file's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -127,7 +207,7 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `drop-invalidates-change-streams` | ✅ Merged as #74. Three change-stream defects: the drop invalidate, the unpublished replicated DDL, and a recreated collection serving the dead one's history |
 | `m10-go-client` | ✅ Merged as #75. M10 task 10: `clients/go`, package `kimmydb`, a CI job |
 | `m10-conformance` | ✅ Merged as #76. M10 task 11: `clients/conformance`, three drivers, a CI job |
-| `m10-examples-closeout` | **Open, PR raised, not merged.** M10 task 12: `shelf` in three languages, the mutation pass, the closeout |
+| `m10-examples-closeout` | **Open as PR #77, not merged.** M10 task 12: `shelf` in three languages, the client mutation pass, the closeout. The server-side mutation pass is *not* in it — see the debt table |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -151,10 +231,10 @@ milestone was two behind. [Decisions](decisions.md) and
 
 **M9 wrote no ADRs.** Every decision was recorded as a 🟢 entry in
 [Deviations](deviations.md) instead, because each was a feature decision with
-its reasoning rather than an architectural choice with alternatives. Next ADR
-number is **ADR-057**; M10 task 1 wrote ADR-056, because its reserved decision
-had real alternatives to weigh rather than being a feature choice with a
-reason. Task 3's versioning policy plausibly wants one too.
+its reasoning rather than an architectural choice with alternatives. **M10 in
+turn wrote five** — ADR-056 through ADR-060 — because each of its reserved
+decisions had real alternatives to weigh rather than being a feature choice
+with a reason. Next ADR number is **ADR-061**.
 
 ### What the M9 branches did, and what they found
 
@@ -235,7 +315,7 @@ claimed but did not do, and in four of five cases the claim was in a comment
 sitting directly above the code contradicting it. Read the comment, then check
 the code does what it says.
 
-### The M10 board — nothing started, and it is next
+### The M10 board — all twelve done
 
 **Theme: KimmyDB has a protocol and has never written it down.** HTTP framing,
 Extended JSON v2, bearer tokens, a typed error envelope and WebSocket streaming
@@ -259,9 +339,11 @@ work.
 | 11 | ✅ **Conformance suite all three clients pass** | — |
 | 12 | ✅ **One example app per language** + mutation pass and closeout | — |
 
-**M9 is done, so nothing blocks M10.** Task 6 inherits the cursor design
-directly: an opaque `_id`-order token, already node-portable, which is most of
-what "cursors at the protocol level" has to decide.
+**All twelve landed, in twelve PRs (#65–#77) plus one unplanned fix (#74).**
+Task 12 is the only one not yet merged. The protocol is now written down
+(`docs/openapi.yaml`), versioned, and held to the running server by a contract
+test — so a route that drifts fails a build instead of silently breaking a
+client.
 
 ### What task 1 did, and what it found
 
@@ -820,6 +902,19 @@ on every page after it. Discard the first sample or say plainly that you did.
 | `kimmy-cluster/src/` | `membership.rs` (SWIM/foca, `Members`), `peers.rs` (`replicate`, `ReplicationConfig`), `transport.rs` (TCP framing), `health.rs` |
 | `kimmyd/src/node.rs` | Wires everything: spawns cluster tasks, embedding worker, webhook dispatcher, GC, TTL expiry |
 | `kimmyd/tests/cluster.rs` | The multi-node harness |
+| `kimmy-client/src/` | The Rust client: `lib.rs` (`Client`, `Builder`, `Safety`, `Method`, failover and token renewal), `error.rs` (the mirrored `ErrorCode`), `page.rs` (`Query`, `Pages`), `watch.rs` (`ChangeStream` and its reconnect) |
+| `kimmy-api/src/` (M10) | `error.rs` (the 17-code taxonomy and three-valued `Retry`), `version.rs` (`GET /v1/version`, `Capability`), `topology.rs` (`GET /v1/topology`, the node registry in `__kimmy.__nodes`), `json.rs` (`JsonBody`, so typed bodies get the envelope) |
+
+**And outside `crates/`, all of it new in M10:**
+
+| | |
+|---|---|
+| `docs/openapi.yaml` | **The protocol specification, and the authority.** ~2,100 hand-written lines. If code and this disagree, one of them is a bug — decide which, don't paper over it |
+| `crates/kimmy-api/tests/openapi.rs` | The contract test that holds it true: inventory in *both* directions, live response validation, a coverage assertion, and the error-code/retry cross-check |
+| `clients/python/` | Package `kimmydb`, synchronous, `httpx` + `websockets`, built with `uv`/hatchling. 19 tests |
+| `clients/go/` | Module `github.com/titusai-io/kimmydb/clients/go`, package `kimmydb`, one dependency (`coder/websocket`). 18 tests |
+| `clients/conformance/` | `scenarios.json` (16 scenarios), a shared oracle, `run.py`, and one driver per client. **The only test that compares the clients to each other** |
+| `examples/` | `shelf` — one application in three languages, plus `run-all.sh`. The Rust one lives at `crates/kimmy-client/examples/shelf.rs` because Cargo wants it there |
 
 ### How to run and verify things
 
@@ -836,6 +931,26 @@ on every page after it. Discard the first sample or say plainly that you did.
   that habit belonged to the retired hand-rolled harness; a non-compiling
   mutant reports `unviable`. Some escapes are *equivalent mutants* no test can
   kill — prove it, don't chase it.
+  **Scope the test command to the mutant's own crate** (`--file
+  'crates/kimmy-client/src/**' -- -p kimmy-client`). Unscoped, every client
+  mutant re-runs the storage and cluster suites: a nine-hour job instead of
+  twenty minutes. Set `--timeout` from a *contended* baseline, not an idle one
+  — M10 lost most of a day to a run at `-j 8` with a 300s cap that produced 15
+  timeouts and 3 caught out of 47, where every "timeout" was `cargo test` still
+  linking. And note the binary is `cargo-mutants`: **`pkill -f "cargo mutants"`
+  does not match it**, so an abandoned run survives and competes with its
+  replacement.
+- **The Python client:** `cd clients/python && uv run --extra dev pytest`.
+  Needs a `kimmyd` binary; `conftest.py` starts one. Timeout is 60s per test,
+  because a change-stream bug once hung a test for ten minutes.
+- **The Go client:** `cd clients/go && go test ./...`. Same arrangement.
+- **The conformance suite:** `python3 clients/conformance/run.py` — starts a
+  node, runs all three drivers over `scenarios.json`, compares each to the
+  shared oracle *and* to the others. This is the test that catches a client
+  quietly disagreeing with its siblings.
+- **The examples:** `./examples/run-all.sh` — builds nothing, starts a fresh
+  node, runs all three `shelf` programs against it in sequence. The second and
+  third exercise the "already stocked" path. Requires `target/debug/kimmyd`.
 - **Live provider drive:** a fake HTTP endpoint speaking a dialect's shape;
   set the key env var (`OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`)
   before launching the node.
@@ -853,8 +968,9 @@ on every page after it. Discard the first sample or say plainly that you did.
   here but **not** `jsonschema`, so a full validator has to be the Rust test —
   the shallow check is still worth having, because it is a second reader of the
   same document.
-- **The suite is ~1,048 tests** across the workspace, plus 5 ignored cluster
-  tests. A full `cargo test --workspace` is about two minutes.
+- **The suite is ~1,103 Rust tests** across the workspace, plus 8 ignored
+  cluster tests, 19 Python and 18 Go client tests and 16 conformance scenarios.
+  A full `cargo test --workspace` is about two minutes.
 
 ### Carried debt, none blocking
 
@@ -870,9 +986,14 @@ in [Deviations](deviations.md):
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
 | Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`), type conversion | outside M9 task 1's agreed list; variable binding needs an evaluation *scope*, not another operator |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
-| No token refresh; clients cannot discover the cluster | **M10 tasks 4, 5**. The protocol *is* published now — `docs/openapi.yaml` |
-| Client-facing throughput is unmeasured — every benchmark is engine-level | **M10 task 7** |
+| **The M10 mutation pass covered `kimmy-client` only** — 90 mutants in `kimmy-api`, `kimmy-storage` and `kimmy-auth` are unclassified | new in M10 task 12. Misconfigured run, not a finding; about an hour to redo properly. Those crates had full passes in M7 and M8 |
+| **The client's `retry: wait` path has no test that reaches it** — 4 surviving mutants are this one branch | new in M10 task 12. Wants a test server answering `429`, asserting the retry goes to the *same* endpoint |
+| A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **recorded as an open question rather than explained** |
 | Sharding | **deferred by decision** until there is operational experience |
+
+Three rows left this table in M10 and are noted here so nobody re-opens them:
+token refresh (task 4), cluster discovery for clients (task 5), and
+client-facing throughput, which is now measured and in [Benchmarks](benchmarks.md).
 
 ### Invariants a change must not break
 
@@ -1120,11 +1241,14 @@ in [Deviations](deviations.md):
 
 ## Reading order for someone new
 
-1. **This file's first three sections** — the status, how work runs, and the
+1. **"Getting oriented"** above, then how work runs and the
    oplog-as-spine idea. Nothing else makes sense without them.
-2. **[Roadmap](roadmap.md)'s M10 board** and its reserved decisions.
+2. **[Roadmap](roadmap.md)** — every milestone through M10 is closed, so read
+   it for what was built and what was ruled out, not for a task to pick up.
+   There is no queued work; the next milestone is the maintainer's call.
 3. **[Deviations](deviations.md)** — the register, not a summary of it. Every
-   decision M9 made is a 🟢 entry there with its reasoning.
+   decision M9 and M10 made is a 🟢 entry there with its reasoning, and the
+   two debts M10 created are 🟡 entries.
 4. **The invariants above**, before touching the query engine, the index path
    or anything that writes.
 5. **[Architecture](architecture.md)** and **[Testing](testing.md)** when you
