@@ -1127,6 +1127,59 @@ for a client to depend on structure it is told to treat as opaque.
 
 ---
 
+## 🟢 Client-facing throughput is measured (M10 task 7)
+
+**Was.** Every figure in [Benchmarks](benchmarks.md) was taken at the storage
+engine, so JSON and Extended JSON conversion, per-request token verification,
+HTTP framing, TLS and concurrent clients were all outside the published
+numbers. There was **no honest answer to "what throughput can a client
+expect"** — and that file's retracted-figure note is what happened the last
+time one was quoted anyway.
+
+**Now.** `cargo bench -p kimmyd --bench http` spawns the **shipped binary** and
+drives it with concurrent clients over a real socket, plaintext and TLS, reads
+and writes. Recorded rather than gated, like every benchmark here.
+
+**Four findings**, all of which needed the socket to be visible:
+
+- **TLS is close to free** — within noise at one client, about 10% at
+  thirty-two. Whatever the reason to terminate TLS elsewhere, throughput is not
+  it.
+- **The protocol costs about 0.1 ms per request.** A point read, end to end
+  through HTTP, token verification, storage and Extended JSON, has a p50 of
+  0.09 ms. That is the number "what does the API cost" was missing.
+- **Reads scale with clients (8,001/s → 70,660/s) and writes do not**
+  (143/s → 602/s), with p99 rising from 10 ms to 246 ms. redb has one writer;
+  concurrency queues rather than parallelizes. The engine benchmarks said this;
+  the socket confirms a client experiences it as tail latency.
+- **`count` is a collection scan** — 30 requests a second over 10,000
+  documents, and it barely scales. A client polling a count asks the server to
+  read everything, every time.
+
+---
+
+## 🟡 A write costs twice as much through the daemon as at the engine
+
+**Raised 2026-08-14 by M10 task 7.** A single insert is **7.0 ms** over HTTP
+against **~3.4 ms** for the same insert at the engine on the same machine.
+
+**What it is not.** Not protocol overhead — the read numbers bound that at
+~0.1 ms per request. Not per-document encoding — a batch of 100 costs 12.2 ms
+against 6.9 ms at the engine, so the gap is roughly fixed per *request* rather
+than growing with the documents in it.
+
+**Candidates, none verified**: the background oplog consumers the daemon runs
+and a bare `Engine` does not — the embedding worker and the webhook dispatcher
+both wake on every write — or a commit's fsync landing on a runtime worker
+thread rather than a dedicated one.
+
+**Left as a question on purpose.** A cause that has not been measured is not a
+cause, which is the rule the retracted figure produced. It is the first thing
+for whoever picks up performance work; halving it would double single-write
+throughput for every client that does not batch.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

@@ -16,7 +16,14 @@ repetition — these are the checks.
 cargo bench -p kimmy-vector                  # vector search and index build
 cargo bench -p kimmy-storage                 # write path and query path
 cargo bench -p kimmy-vector -- hnsw_build    # one group
+cargo bench -p kimmyd --bench http           # what a client gets, over a socket
 ```
+
+The last one is not a Criterion benchmark. It **spawns the shipped `kimmyd`
+binary** and drives it with concurrent HTTP clients for a fixed duration per
+cell, because throughput under contention is not a shape Criterion measures.
+`KIMMY_BENCH_MS` and `KIMMY_BENCH_CONCURRENCY` change the duration and the
+client counts.
 
 **Recorded, not gated.** Numbers land here by hand rather than failing CI.
 Criterion on a shared runner is noisy enough that a threshold gate produces
@@ -102,8 +109,8 @@ re-read if that judgement needs revisiting.
 | | Why it matters |
 |---|---|
 | Dimensions other than 384 | 768 and 1536 are both common, and the crossover depends on width |
-| Batched writes | Nothing commits more than one mutation per transaction, and the commit is the entire cost — see [The write path](#the-write-path) |
-| Concurrent writers | Every number here is single-threaded; redb allows one writer, so the ceiling under contention is unknown |
+| Larger-than-memory collections | Every figure here fits in page cache |
+| A cluster under load | These are single-node numbers; replication's cost to the write path is unmeasured |
 
 **Recall was the gap, and it is now closed.** Lowering the threshold routes more
 collections through the graph, so the ≥ 90% recall claim covers more traffic
@@ -266,6 +273,95 @@ a release build, so the absolute numbers are slower than the table above —
 500 documents took **0.16 s** in one bulk request against **11.6 s** as 500
 separate requests. A 72× gap where the storage measurement predicts ~90×, the
 difference being per-request HTTP and auth work the batch pays once.
+
+---
+
+## Over a socket: what a client actually gets
+
+**Every other number on this page is taken at the storage engine.** This one is
+taken at the client's end of a TCP connection, which is the only place a
+question like "how many writes a second" has an answer someone can act on. It
+includes JSON and Extended JSON conversion both ways, per-request token
+verification, HTTP framing, TLS when on, and the contention of several clients
+at once.
+
+| | |
+|---|---|
+| Machine | Linux 7.0.11, same as every table above |
+| Date | 2026-08-14 |
+| Build | `cargo bench` profile — the **shipped `kimmyd` binary**, spawned as a child process |
+| Fixture | 10,000 documents of six fields, the same shape the write-path benchmarks use |
+| Method | 3 s per cell after 200 discarded warm-up requests; the load generator shares the machine with the server |
+
+### Reads
+
+| Scenario | Clients | Plaintext req/s | TLS req/s | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| point read by `_id` | 1 | 8,001 | 7,651 | 0.09 | 0.31 |
+| point read by `_id` | 8 | 42,665 | 37,928 | 0.17 | 0.43 |
+| point read by `_id` | 32 | **70,660** | 63,401 | 0.41 | 1.14 |
+| `find`, page of 100 | 1 | 1,276 | 1,119 | 0.71 | 1.98 |
+| `find`, page of 100 | 8 | 5,016 | 4,710 | 1.52 | 3.05 |
+| `find`, page of 100 | 32 | **7,149** | 6,308 | 4.34 | 8.54 |
+| `count`, whole collection | 1 | 30 | 29 | 32.38 | 61.91 |
+| `count`, whole collection | 32 | 154 | 148 | 203.26 | 342.29 |
+
+### Writes
+
+| Scenario | Clients | Plaintext req/s | TLS req/s | p50 ms | p99 ms |
+|---|---:|---:|---:|---:|---:|
+| insert one | 1 | 143 | 138 | 7.00 | 10.01 |
+| insert one | 8 | 383 | 322 | 23.15 | 82.12 |
+| insert one | 32 | 602 | 529 | 1.62 | 246.06 |
+| bulk of 100 | 1 | 73 (7,300 docs/s) | 71 | 12.20 | 33.88 |
+| bulk of 100 | 32 | 244 (**24,400 docs/s**) | 248 | 27.91 | 482.08 |
+
+### What it says
+
+**TLS is close to free.** Within noise at one client and about 10% at
+thirty-two. Whatever the reason to terminate TLS elsewhere, throughput is not
+it.
+
+**The protocol costs about 0.1 ms per request.** A point read — HTTP framing,
+token verification, a storage read, BSON to Extended JSON and back out — has a
+p50 of 0.09 ms. That is the honest number for "what does going through the API
+cost", and it is small.
+
+**Reads scale with clients and writes do not.** Reads go from 8,001/s to
+70,660/s across thirty-two clients. Writes go from 143/s to 602/s — better than
+flat, because commits batch opportunistically, but nothing like linear, and the
+tail pays for it: p99 rises from 10 ms to 246 ms. redb has one writer, and
+concurrency queues rather than parallelizes ([ADR-001](decisions.md)). This is
+the socket-level confirmation of what
+[Concurrent writers](#concurrent-writers--flat-which-is-the-answer) measured at
+the engine.
+
+**Batching is still the answer, and by more than the engine numbers suggest.**
+Through the same socket, one client gets 143 documents a second inserting one
+at a time and **7,300 a second in batches of 100** — a 51× difference that
+costs a client nothing but a loop. At thirty-two clients it is 24,400/s.
+
+**`count` is a collection scan.** 30 requests a second over 10,000 documents,
+and it is the one read that barely scales. A client that polls a count is
+asking the server to read everything, every time.
+
+### One thing measured here and not explained
+
+A single insert takes **7.0 ms** through the API against **~3.4 ms** for the
+same insert at the engine ([The write path](#the-write-path), re-measured on
+this machine while writing this section) — the write costs about twice as much
+through the daemon as in a bare harness.
+
+**It is not protocol overhead**: the read numbers bound that at ~0.1 ms. It is
+not per-document encoding either, since a batch of 100 costs 12.2 ms against
+6.9 ms at the engine, so the gap is roughly fixed per *request* rather than
+growing with the documents in it. Candidates, none of them verified: the background oplog consumers the
+daemon runs and a bare `Engine` does not — the embedding worker and the webhook
+dispatcher both wake on every write — or a commit's fsync landing on a runtime
+worker thread rather than a dedicated one.
+
+**Recorded as a question rather than an answer**, which is the rule this file
+was rewritten under: a cause that has not been measured is not a cause.
 
 ---
 

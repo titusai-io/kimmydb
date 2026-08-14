@@ -38,3 +38,12 @@ tokio-rustls.workspace = true
 # nodes. Both already in the workspace tree; no new dependencies.
 reqwest.workspace = true
 serde_json.workspace = true
+
+# The HTTP-level benchmark. `harness = false` and not a Criterion bench: it
+# spawns the shipped binary and drives it over a socket with N concurrent
+# clients for a fixed duration, which is not a shape Criterion measures.
+# Never built by a release image — `cargo bench` is the only thing that
+# compiles it.
+[[bench]]
+name = "http"
+harness = false
