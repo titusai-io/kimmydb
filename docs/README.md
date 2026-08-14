@@ -81,6 +81,7 @@ graph TD
 | [Query Language](query-language.md) | Filter and update operators, array semantics, Mongo compatibility |
 | [HTTP API](http-api.md) | Endpoint reference, request and response shapes, status codes |
 | [`openapi.yaml`](openapi.yaml) | The protocol *specification* — OpenAPI 3.1, checked against the running server by a contract test |
+| [Clients](clients.md) | The first-party client libraries, and what they do for you |
 | [Compatibility](compatibility.md) | What `/v1` promises, what counts as additive, what forces `/v2` |
 | [Security](security.md) | Authentication, RBAC, what is and is not defended against |
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
