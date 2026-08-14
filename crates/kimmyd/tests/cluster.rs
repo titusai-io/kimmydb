@@ -819,3 +819,122 @@ async fn every_node_can_tell_a_client_about_every_node() {
     })
     .await;
 }
+
+/// A page from one node continues correctly on another.
+///
+/// The property cursors were designed for and never verified: a token is the
+/// encoded `_id` of a page's last row, which is a pure function of the
+/// document, so any node holding that document computes the same bound. Until
+/// now that was an argument. Change-stream resume tokens have been checked on a
+/// real cluster since M4; cursors inherited the claim by construction and
+/// nothing exercised it.
+///
+/// It matters because a client handed `/v1/topology` is *expected* to spread
+/// requests across nodes. Paging that silently repeated or skipped documents
+/// when a client moved would be a data bug reached by taking the protocol's own
+/// advice.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_page_from_one_node_continues_on_another() {
+    const TOTAL: i64 = 60;
+    const PAGE: usize = 10;
+
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    let token = a.login(&client).await;
+
+    // Seeded through one node, in one commit.
+    let batch: Vec<serde_json::Value> =
+        (0..TOTAL).map(|i| serde_json::json!({ "_id": i, "n": i })).collect();
+    let created = client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "orders" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    let inserted = client
+        .post(a.url("/v1/db/shop/coll/orders/bulk"))
+        .bearer_auth(&token)
+        .json(&batch)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inserted.status(), 200, "seeding: {:?}", inserted.text().await);
+
+    // Every node holds every document before paging starts, so a missing one
+    // later is a paging fault rather than replication lag.
+    let nodes = [&a, &b, &c];
+    eventually("all three nodes to hold the whole collection", || {
+        let client = &client;
+        let token = token.clone();
+        async move {
+            for node in nodes {
+                let Ok(res) = client
+                    .post(node.url("/v1/db/shop/coll/orders/count"))
+                    .bearer_auth(&token)
+                    .json(&serde_json::json!({ "filter": {} }))
+                    .send()
+                    .await
+                else {
+                    return false;
+                };
+                let body: serde_json::Value = res.json().await.unwrap();
+                if body["count"].as_i64() != Some(TOTAL) {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+
+    // Walk the collection, changing node on every page — the round-robin
+    // client `/v1/topology` exists to enable.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut visited: Vec<&'static str> = Vec::new();
+
+    for page in 0..20 {
+        let node = nodes[page % nodes.len()];
+        visited.push(node.name);
+
+        let mut body = serde_json::json!({ "filter": {}, "limit": PAGE });
+        if let Some(c) = &cursor {
+            body["cursor"] = serde_json::json!(c);
+        }
+        let res: serde_json::Value = client
+            .post(node.url("/v1/db/shop/coll/orders/find"))
+            .bearer_auth(&node.login(&client).await)
+            .json(&body)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+
+        for doc in res["documents"].as_array().expect("documents") {
+            seen.push(doc["_id"].as_i64().expect("an integer id"));
+        }
+        match res["nextCursor"].as_str() {
+            Some(next) => cursor = Some(next.to_string()),
+            None => break,
+        }
+    }
+
+    assert!(visited.len() >= 3, "the walk has to cross nodes to prove anything: {visited:?}");
+    assert_eq!(
+        seen.len(),
+        TOTAL as usize,
+        "a walk across nodes saw {} of {TOTAL} documents (order: {visited:?})",
+        seen.len()
+    );
+    let mut unique = seen.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), seen.len(), "a document was returned twice across nodes");
+    assert_eq!(unique, (0..TOTAL).collect::<Vec<_>>(), "the walk missed documents");
+    assert!(seen.windows(2).all(|w| w[0] < w[1]), "pages arrived out of _id order: {seen:?}");
+}

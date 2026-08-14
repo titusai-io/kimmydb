@@ -1082,6 +1082,51 @@ tooling comes after M10, not inside the client protocol.
 
 ---
 
+## 🟢 Cursors are a protocol promise, and the promise is tested (M10 task 6)
+
+**Was.** M9 built cursors and documented them well, but as *engine* behaviour.
+The wire contract carried three claims nothing checked — node portability,
+never-repeat-never-miss, and what a full page means — and the specification
+said nothing at all about page size.
+
+**Now.** The specification carries the contract a client may rely on, and the
+three claims are checked.
+
+**Node portability is verified on real nodes**, which is the one that mattered.
+It was argued from the design — a token is a pure function of the `_id`, so any
+node computes the same bound — and inherited from change-stream resume tokens,
+which *had* been verified on a cluster. A cluster-harness test now walks a
+collection changing node on every page and requires the walk to see every
+document exactly once, in order. The protocol tells clients to round-robin
+([ADR-060](decisions.md)); paging that broke when they did would be a data bug
+reached by following the protocol's own advice.
+
+**Two silent behaviours were specified nowhere**, and both are the kind a
+client author discovers in production:
+
+- **A `find` with no `limit` returns 100 documents, not all of them.** The
+  prose reference said so; the machine-readable specification a client is
+  generated from did not, so a generated client had no way to know. A caller
+  treating an unlimited `find` as "the collection" processes a prefix and is
+  told nothing. `count` has no cap, and is the honest source for a total.
+- **A `limit` over 10,000 is clamped rather than refused.** The request
+  succeeds and returns less than was asked for.
+
+**And one that is a real trap:** a final page that is exactly full still
+carries a token, because the server cannot know it is the last without looking
+further, and looking further is work the caller did not ask for. A client must
+end its walk on a short or empty page, not on a token no longer being offered.
+Now stated in both documents and tested.
+
+**One property is documented rather than enforced, deliberately.** A token
+encodes a position, not a query: sending it with a different filter resumes
+that filter after the same key, and the server does not check that the token
+came from the query it is used with. Enforcing it would mean putting the query
+in the token, which would make it large, node-specific in spirit, and a place
+for a client to depend on structure it is told to treat as opaque.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

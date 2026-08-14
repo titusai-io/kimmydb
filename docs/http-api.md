@@ -222,9 +222,25 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/find -H "$A" -d '{
 { "count": 2, "documents": [ { "item": "gadget", "qty": 12 }, … ] }
 ```
 
-Every field is optional. Default limit **100**, maximum **10,000**. `count` is
-the size of the returned page, not the total match count — use `/count` for
-that. Operator reference: [Query Language](query-language.md).
+Every field is optional. `count` is the size of the returned page, not the
+total match count — use `/count` for that. Operator reference:
+[Query Language](query-language.md).
+
+**Default limit 100, maximum 10,000, and both are silent.** Omitting `limit`
+returns a page of 100 rather than the collection, and a larger `limit` is
+clamped rather than refused. To read everything, walk with a cursor:
+
+```json
+{ "filter": {}, "limit": 100 }
+// -> { "documents": [...], "count": 100, "nextCursor": "AoAAAAAAAAAq" }
+{ "filter": {}, "limit": 100, "cursor": "AoAAAAAAAAAq" }
+```
+
+The token is opaque, carries no server state, and is **portable across
+nodes** — a page fetched from one node continues on another, which is what
+makes the node list from [Topology](#topology) usable for reads as well as
+failover. End the walk on a short or empty page, not on a missing token.
+[Cursors](query-language.md#cursors) has the full contract.
 
 ### Count, update, delete by filter
 

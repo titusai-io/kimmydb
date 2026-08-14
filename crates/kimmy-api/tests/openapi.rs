@@ -1091,6 +1091,27 @@ async fn documented_refusals_use_the_documented_envelope() {
         .await;
     assert_eq!(shape["error"], "bad_request");
 
+    // A cursor combined with something that contradicts it. Refused rather
+    // than honoured in part: a page that quietly dropped the sort it was given
+    // would be wrong in a way a caller reads as data.
+    for body in [
+        json!({ "cursor": "AA", "skip": 5 }),
+        json!({ "cursor": "AA", "sort": { "qty": 1 } }),
+        json!({ "cursor": "!!! not a token" }),
+    ] {
+        let refused = c
+            .check(
+                "POST",
+                "/v1/db/{db}/coll/{coll}/find",
+                "/v1/db/shop/coll/orders/find",
+                Some(&root),
+                Some(body),
+                400,
+            )
+            .await;
+        assert_eq!(refused["error"], "bad_request");
+    }
+
     // A wrong-shaped body on a route that is *not* `/bulk`. Until the
     // extractor carried the mapping, `/bulk` was the only one of nineteen
     // handlers that reached it, and every other route answered 422 as bare

@@ -632,6 +632,10 @@ added to the router and the specification without also being driven here. A
 specification entry nothing executes is the failure mode this whole file exists
 to prevent — a claim with no mechanism behind it.
 
+| A cursor's refusals — with `skip`, with a foreign `sort`, malformed | inside `documented_refusals_use_the_documented_envelope` |
+| An unlimited `find` is a page, not the collection | `an_unlimited_find_returns_a_page_and_not_the_collection` |
+| A final full page still offers a token, and the next page is empty | `a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty` |
+
 **Two of those rows belong to a claim only the cluster harness can settle.**
 `every_node_can_tell_a_client_about_every_node` boots three real nodes and
 requires each to list all three as `live` with its real address — including one
@@ -640,6 +644,12 @@ token from one node at every advertised address, then kills a node and requires
 it to be reported `unknown` rather than to vanish. The in-process tests prove
 the assembly is right; the harness proves the assembled thing is true, which is
 the distinction M8 task 1 was built on.
+
+`a_page_from_one_node_continues_on_another` is the other: it walks a collection
+across three nodes, changing node on every page, and requires the walk to see
+every document exactly once and in order. Cursor portability had been argued
+from the encoding and inherited from resume tokens; the protocol now tells
+clients to round-robin, so it needed to be a measurement.
 
 ---
 
