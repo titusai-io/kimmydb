@@ -185,6 +185,28 @@ so a stream that deliberately skipped history cannot resurrect it by lagging.
 > things being watched rather than the end of what is watched — and ending
 > them would take the embedding worker down with the first drop anywhere.
 
+### A recreated collection is not the old one
+
+Ids are derived from `(database, name)` ([ADR-031](decisions.md)), so a
+collection dropped and recreated under the same name **reuses its id** — and
+the oplog is keyed by id, so the dead incarnation's entries are still there and
+still match.
+
+Two consequences, both fixed rather than documented:
+
+- **`from_start` means the start of *this* collection.** It used to replay the
+  previous incarnation's history and then invalidate immediately: a healthy
+  collection handing back documents that no longer exist, and never showing the
+  live ones.
+- **A resume token from before the drop is refused** with `410
+  resume_token_expired`, rather than quietly resuming at the boundary. Between
+  that token and this collection's first event is a gap the client would
+  otherwise never learn about, and hiding a gap is what the invalidate
+  machinery exists to prevent.
+
+Found by driving a real node and asking what actually happened, after a written
+claim about it turned out to describe something else entirely.
+
 ### A drop that arrives by replication ends streams too
 
 Fixing the local case exposed a second one. A replicated schema change was

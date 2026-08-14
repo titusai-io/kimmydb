@@ -1299,6 +1299,21 @@ cost a replication outage to learn.
 **Both clients assert the new behaviour**, and the specification documents all
 three reasons with what a client should do about each.
 
+**And a third defect, older than both.** Because ids are derived from
+`(database, name)`, a collection recreated under the same name reuses its id —
+so the oplog still held the dead incarnation's entries and streams still
+matched them. `from_start` on a healthy recreated collection replayed a dead
+collection's documents and then invalidated immediately, never showing the live
+data. A stream now never reads across a drop, and a resume token from before
+one is **refused** rather than moved forward silently: the gap between that
+token and this collection's first event is exactly what a client must not be
+left unaware of.
+
+**All three were found by asking a running node rather than reading the code.**
+The first came from a client test that hung; the second from the cluster
+harness; the third from a probe written to check a claim in a pull request
+description, which turned out to describe behaviour the server did not have.
+
 ---
 
 ## 🟡 Sharding is deferred until there is experience

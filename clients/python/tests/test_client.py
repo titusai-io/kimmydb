@@ -231,6 +231,46 @@ def test_a_change_stream_resumes_from_where_it_stopped(db):
     resumed.close()
 
 
+def test_a_recreated_collection_serves_only_its_own_history(db):
+    """The symptom a client actually meets.
+
+    Ids are derived from `(database, name)`, so a collection recreated under
+    the same name has the same id and the oplog still holds the dead one's
+    entries. Watching from the start used to replay those and then invalidate
+    immediately — a healthy collection handing back documents that no longer
+    exist and never showing the live ones.
+    """
+    db.create_collection("shop", "orders")
+    db.insert("shop", "orders", {"_id": 1, "ghost": True})
+    db.request("DELETE", "/v1/db/shop/coll/orders")
+
+    db.create_collection("shop", "orders")
+    db.insert("shop", "orders", {"_id": 99, "live": True})
+
+    stream = db.watch("shop", "orders", from_start=True)
+    event = next(iter(stream))
+    assert event.document_id == 99, "the dead incarnation's history is not this collection's"
+    stream.close()
+
+
+def test_a_resume_token_from_before_a_drop_is_refused(db):
+    # Refused rather than quietly moved forward: between that token and this
+    # collection's first event is a gap the client would otherwise never learn
+    # about.
+    db.create_collection("shop", "orders")
+    stream = db.watch("shop", "orders")
+    db.insert("shop", "orders", {"_id": 1})
+    token = next(iter(stream)).resume_token
+    stream.close()
+
+    db.request("DELETE", "/v1/db/shop/coll/orders")
+    db.create_collection("shop", "orders")
+
+    with pytest.raises(KimmyError) as caught:
+        db.watch("shop", "orders", resume_after=token)
+    assert caught.value.code == "resume_token_expired"
+
+
 def test_a_dropped_collection_ends_the_stream(db):
     """A drop invalidates the streams watching that collection.
 

@@ -620,6 +620,25 @@ value clients branch on. It has an `as_str` now, with the existing two names
 kept exactly as `Debug` rendered them — the invariant `NodeId` and
 `CollectionId` each cost a replication outage to learn.
 
+**And a third defect, older than both, found by checking a claim.** A pull
+request description said a client could resume past an invalidate and would
+replay to it again. Probing a real node showed that was not what happened —
+and what *did* happen was worse. Because ids are derived from
+`(database, name)`, a recreated collection reuses its id, so the oplog still
+held the dead incarnation's entries and streams still matched them:
+`from_start` on a healthy recreated collection replayed a dead collection's
+documents and then invalidated immediately, never showing the live data.
+
+A stream now never reads across a drop, and a resume token from before one is
+**refused** with `resume_token_expired` rather than moved forward silently —
+between that token and this collection's first event is a gap, and a silent gap
+is what the invalidate machinery exists to prevent.
+
+**The pattern across all three:** each was found by asking a running node what
+it did, not by reading what it was supposed to do. The third one came from
+verifying a sentence I had written in a PR description, which turned out to
+describe a system that does not exist.
+
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because
 `Members` holds *peers only*, and the authenticated-peers invariant (ADR-053)
