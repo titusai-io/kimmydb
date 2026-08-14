@@ -9,6 +9,7 @@ members = [
     "crates/kimmy-cluster",
     "crates/kimmy-mcp",
     "crates/kimmy-api",
+    "crates/kimmy-client",
     "crates/kimmyd",
     "crates/kimmy-cli",
 ]
@@ -30,6 +31,7 @@ kimmy-auth = { path = "crates/kimmy-auth" }
 kimmy-cluster = { path = "crates/kimmy-cluster" }
 kimmy-mcp = { path = "crates/kimmy-mcp" }
 kimmy-api = { path = "crates/kimmy-api" }
+kimmy-client = { path = "crates/kimmy-client" }
 
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros"] }

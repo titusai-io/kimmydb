@@ -7,6 +7,15 @@
 //! is the same command surface plus a terminal UI — so the commands come first
 //! and a REPL, if it is ever wanted, sits on top of them rather than beside.
 //!
+//! # It is a consumer of `kimmy-client`
+//!
+//! Every request here goes through the Rust client crate. That is deliberate
+//! and it is the point: a client library nobody uses is a library whose rough
+//! edges nobody finds. Converting this tool from 200 lines of hand-rolled
+//! `reqwest` is what proved the crate pleasant rather than merely present —
+//! and it is why this file no longer builds a URL, reads a status code, or
+//! decides what an error means.
+//!
 //! # It speaks HTTP, like every other client
 //!
 //! Nothing here opens the database file. redb allows one process to hold a
@@ -25,6 +34,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
+use kimmy_client::{Client, Method, Query, Safety};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -65,6 +75,12 @@ enum Command {
     Databases,
     /// List collections in a database.
     Collections { database: String },
+    /// Create a collection. `target` is `db.collection`.
+    ///
+    /// Added after driving the converted CLI: without it, a fresh database
+    /// could not be used from this tool at all — the first `insert` fails with
+    /// "collection not found" and offers nowhere to go but `curl`.
+    CreateCollection { target: String },
     /// Query a collection. `target` is `db.collection`.
     Find {
         target: String,
@@ -114,6 +130,18 @@ enum Command {
     },
     /// List a collection's indexes.
     Indexes { target: String },
+    /// Follow a collection's changes until interrupted.
+    Watch {
+        target: String,
+        /// Include the whole document on every event.
+        #[arg(long)]
+        full: bool,
+        /// Resume after a token from an earlier run.
+        #[arg(long)]
+        resume_after: Option<String>,
+    },
+    /// The nodes this cluster is made of, and which are live.
+    Topology,
     /// Download a backup of the whole node. Needs admin over everything.
     Backup {
         /// Where to write it. `-` for stdout.
@@ -129,6 +157,15 @@ fn main() -> ExitCode {
             // Diagnostics on stderr so a failed command does not put anything
             // on stdout that a pipeline might mistake for a result.
             eprintln!("kimmy: {e:#}");
+            // The one error worth a hint, because the fix is a flag rather
+            // than a change to the request. Recovered from the typed error
+            // rather than by matching on the message — which is what the
+            // client crate's `ErrorCode` is for, and what the string-matching
+            // version of this would have got wrong the first time a message
+            // was reworded.
+            if e.downcast_ref::<kimmy_client::Error>().is_some_and(|e| e.is_unauthorized()) {
+                eprintln!("  set --token, or KIMMY_TOKEN from `kimmy login`");
+            }
             ExitCode::FAILURE
         }
     }
@@ -137,106 +174,118 @@ fn main() -> ExitCode {
 #[tokio::main(flavor = "current_thread")]
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    let client = reqwest::Client::new();
+
+    // Login is the one command that runs without a token, because producing
+    // one is what it is for.
+    if let Command::Login { user } = &cli.command {
+        let password = read_password()?;
+        let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
+        // The token alone, with no decoration, so `$(kimmy login ...)` is
+        // usable directly. Deliberately not written to a file: a CLI that
+        // stores a bearer token on disk has to answer for its permissions, its
+        // lifetime and its cleanup, and an environment variable answers all
+        // three by not existing afterwards.
+        println!("{}", client.token().await.context("the server did not return a token")?);
+        return Ok(());
+    }
+
+    let mut builder = Client::builder(&cli.url);
+    if let Some(token) = &cli.token {
+        builder = builder.token(token);
+    }
+    let client = builder.connect().await?;
 
     match &cli.command {
-        Command::Login { user } => {
-            let password = read_password()?;
-            let body = json!({ "user": user, "password": password });
-            let response =
-                send(&client, &cli, reqwest::Method::POST, "/v1/auth/login", Some(body)).await?;
-            let token = response["token"]
-                .as_str()
-                .context("the server did not return a token")?
-                .to_string();
-            // The token alone, with no decoration, so `$(kimmy login ...)` is
-            // usable directly. Deliberately not written to a file: a CLI that
-            // stores a bearer token on disk has to answer for its permissions,
-            // its lifetime and its cleanup, and an environment variable answers
-            // all three by not existing afterwards.
-            println!("{token}");
-            return Ok(());
-        }
+        // Handled above, before a client was built.
+        Command::Login { .. } => unreachable!("login returns early"),
         Command::Ping => {
-            let health = send(&client, &cli, reqwest::Method::GET, "/healthz", None).await?;
-            let ready = send(&client, &cli, reqwest::Method::GET, "/readyz", None).await?;
-            emit(&cli, &json!({ "healthz": health, "readyz": ready }));
+            let health = client.request(Method::Get, "/healthz", None, Safety::Idempotent).await?;
+            let ready = client.request(Method::Get, "/readyz", None, Safety::Idempotent).await?;
+            let version = client.version().await?;
+            emit(&cli, &json!({ "healthz": health, "readyz": ready, "version": version }));
+        }
+        Command::Topology => emit(&cli, &client.topology().await?),
+        Command::CreateCollection { target } => {
+            let (db, coll) = split_target(target)?;
+            let created = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/db/{db}/collections"),
+                    Some(json!({ "name": coll })),
+                    // Creating a collection twice is creating it once: the
+                    // server treats it as idempotent, so a retry elsewhere is
+                    // safe.
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(&cli, &created);
         }
         Command::Databases => {
-            let out = send(&client, &cli, reqwest::Method::GET, "/v1/databases", None).await?;
-            emit(&cli, &out);
+            emit(
+                &cli,
+                &client.request(Method::Get, "/v1/databases", None, Safety::Idempotent).await?,
+            );
         }
         Command::Collections { database } => {
             let path = format!("/v1/db/{database}/collections");
-            let out = send(&client, &cli, reqwest::Method::GET, &path, None).await?;
-            emit(&cli, &out);
+            emit(&cli, &client.request(Method::Get, &path, None, Safety::Idempotent).await?);
         }
         Command::Find { target, filter, sort, projection, limit, skip, explain } => {
             let (db, coll) = split_target(target)?;
-            let mut body = json!({ "explain": explain });
-            insert_json(&mut body, "filter", filter.as_deref())?;
-            insert_json(&mut body, "sort", sort.as_deref())?;
-            insert_json(&mut body, "projection", projection.as_deref())?;
+            let mut query = Query::new().explain(*explain);
+            if let Some(filter) = filter {
+                query = query.filter(parse_json("filter", filter)?);
+            }
+            if let Some(sort) = sort {
+                query = query.sort(parse_json("sort", sort)?);
+            }
+            if let Some(projection) = projection {
+                query = query.projection(parse_json("projection", projection)?);
+            }
             if let Some(limit) = limit {
-                body["limit"] = json!(limit);
+                query = query.limit(*limit);
             }
             if let Some(skip) = skip {
-                body["skip"] = json!(skip);
+                query = query.skip(*skip);
             }
-            let path = format!("/v1/db/{db}/coll/{coll}/find");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            emit(&cli, &client.find(db, coll, &query).await?);
         }
         Command::Count { target, filter } => {
             let (db, coll) = split_target(target)?;
-            let mut body = json!({});
-            insert_json(&mut body, "filter", filter.as_deref())?;
-            let path = format!("/v1/db/{db}/coll/{coll}/count");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            let filter = match filter {
+                Some(text) => parse_json("filter", text)?,
+                None => json!({}),
+            };
+            emit(&cli, &json!({ "count": client.count(db, coll, &filter).await? }));
         }
         Command::Insert { target, document } => {
             let (db, coll) = split_target(target)?;
-            let body = parse_json_arg("document", document.as_deref())?;
-            let path = format!("/v1/db/{db}/coll/{coll}/docs");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            let document = parse_json_arg("document", document.as_deref())?;
+            emit(&cli, &client.insert(db, coll, &document).await?);
         }
         Command::BulkInsert { target, documents } => {
             let (db, coll) = split_target(target)?;
-            let body = parse_json_arg("documents", documents.as_deref())?;
-            if !body.is_array() {
+            let documents = parse_json_arg("documents", documents.as_deref())?;
+            let Some(documents) = documents.as_array() else {
                 bail!("documents must be a JSON array");
-            }
-            let path = format!("/v1/db/{db}/coll/{coll}/bulk");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            };
+            emit(&cli, &client.insert_many(db, coll, documents).await?);
         }
         Command::Update { target, filter, update, multi } => {
             let (db, coll) = split_target(target)?;
-            let body = json!({
-                "filter": parse_json("filter", filter)?,
-                "update": parse_json("update", update)?,
-                "multi": multi,
-            });
-            let path = format!("/v1/db/{db}/coll/{coll}/update");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            let filter = parse_json("filter", filter)?;
+            let update = parse_json("update", update)?;
+            emit(&cli, &client.update(db, coll, &filter, &update, *multi).await?);
         }
         Command::Delete { target, filter, multi } => {
             let (db, coll) = split_target(target)?;
-            let body = json!({ "filter": parse_json("filter", filter)?, "multi": multi });
-            let path = format!("/v1/db/{db}/coll/{coll}/delete");
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            let filter = parse_json("filter", filter)?;
+            emit(&cli, &client.delete(db, coll, &filter, *multi).await?);
         }
         Command::Aggregate { target, pipeline } => {
             let (db, coll) = split_target(target)?;
-            let stages = parse_json_arg("pipeline", pipeline.as_deref())?;
-            let path = format!("/v1/db/{db}/coll/{coll}/aggregate");
-            let body = json!({ "pipeline": stages });
-            let out = send(&client, &cli, reqwest::Method::POST, &path, Some(body)).await?;
-            emit(&cli, &out);
+            let pipeline = parse_json_arg("pipeline", pipeline.as_deref())?;
+            emit(&cli, &client.aggregate(db, coll, &pipeline).await?);
         }
         Command::Describe { target, sample } => {
             let (db, coll) = split_target(target)?;
@@ -244,17 +293,31 @@ async fn run() -> Result<()> {
             if let Some(sample) = sample {
                 path.push_str(&format!("?sample={sample}"));
             }
-            let out = send(&client, &cli, reqwest::Method::GET, &path, None).await?;
-            emit(&cli, &out);
+            emit(&cli, &client.request(Method::Get, &path, None, Safety::Idempotent).await?);
         }
         Command::Indexes { target } => {
             let (db, coll) = split_target(target)?;
             let path = format!("/v1/db/{db}/coll/{coll}/indexes");
-            let out = send(&client, &cli, reqwest::Method::GET, &path, None).await?;
-            emit(&cli, &out);
+            emit(&cli, &client.request(Method::Get, &path, None, Safety::Idempotent).await?);
+        }
+        Command::Watch { target, full, resume_after } => {
+            let (db, coll) = split_target(target)?;
+            let mut options = kimmy_client::WatchOptions::new().full_document(*full);
+            if let Some(token) = resume_after {
+                options = options.resume_after(token);
+            }
+            let mut stream = client.watch(db, coll, options).await?;
+            // One event per line, so `kimmy watch shop.orders | jq` works and
+            // a pipeline sees each event as it happens rather than at the end.
+            while let Some(event) = stream.next().await? {
+                emit(&cli, &event.raw);
+                if event.is_invalidate() {
+                    break;
+                }
+            }
         }
         Command::Backup { out } => {
-            let bytes = download(&client, &cli, "/v1/admin/backup").await?;
+            let bytes = client.download("/v1/admin/backup").await?;
             if out == "-" {
                 use std::io::Write;
                 std::io::stdout().write_all(&bytes)?;
@@ -304,13 +367,6 @@ fn parse_json_arg(label: &str, text: Option<&str>) -> Result<Value> {
     }
 }
 
-fn insert_json(body: &mut Value, key: &str, text: Option<&str>) -> Result<()> {
-    if let Some(text) = text {
-        body[key] = parse_json(key, text)?;
-    }
-    Ok(())
-}
-
 /// The password, from `KIMMY_PASSWORD` or stdin.
 ///
 /// There is deliberately no `--password` flag. It would be recorded in shell
@@ -338,70 +394,6 @@ fn emit(cli: &Cli, value: &Value) {
         Ok(text) => println!("{text}"),
         Err(e) => eprintln!("kimmy: could not render the response: {e}"),
     }
-}
-
-fn request(
-    client: &reqwest::Client,
-    cli: &Cli,
-    method: reqwest::Method,
-    path: &str,
-) -> reqwest::RequestBuilder {
-    let url = format!("{}{path}", cli.url.trim_end_matches('/'));
-    let mut builder = client.request(method, url);
-    if let Some(token) = &cli.token {
-        builder = builder.bearer_auth(token);
-    }
-    builder
-}
-
-/// Send a request and parse the JSON response, turning an error status into an
-/// error rather than printing a body that looks like a result.
-async fn send(
-    client: &reqwest::Client,
-    cli: &Cli,
-    method: reqwest::Method,
-    path: &str,
-    body: Option<Value>,
-) -> Result<Value> {
-    let mut builder = request(client, cli, method, path);
-    if let Some(body) = body {
-        builder = builder.json(&body);
-    }
-    let response = builder.send().await.with_context(|| format!("requesting {}{path}", cli.url))?;
-    let status = response.status();
-    let text = response.text().await.context("reading the response")?;
-
-    if !status.is_success() {
-        // The server's own message is the useful part; the status alone would
-        // send someone to the documentation for something already explained.
-        let detail = serde_json::from_str::<Value>(&text)
-            .ok()
-            .and_then(|v| v["message"].as_str().map(str::to_string))
-            .unwrap_or_else(|| text.clone());
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            bail!("{status}: {detail} (set --token, or KIMMY_TOKEN from `kimmy login`)");
-        }
-        bail!("{status}: {detail}");
-    }
-    if text.trim().is_empty() {
-        return Ok(Value::Null);
-    }
-    serde_json::from_str(&text).context("the server returned a body that is not JSON")
-}
-
-/// Fetch raw bytes, for the backup endpoint.
-async fn download(client: &reqwest::Client, cli: &Cli, path: &str) -> Result<Vec<u8>> {
-    let response = request(client, cli, reqwest::Method::GET, path)
-        .send()
-        .await
-        .with_context(|| format!("requesting {}{path}", cli.url))?;
-    let status = response.status();
-    let bytes = response.bytes().await.context("reading the response")?;
-    if !status.is_success() {
-        let detail = String::from_utf8_lossy(&bytes).to_string();
-        bail!("{status}: {detail}");
-    }
-    Ok(bytes.to_vec())
 }
 
 #[cfg(test)]

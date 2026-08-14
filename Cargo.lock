@@ -2321,11 +2321,31 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
- "kimmy-core",
- "reqwest",
+ "kimmy-client",
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "kimmy-client"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "futures",
+ "kimmy-api",
+ "kimmy-auth",
+ "kimmy-core",
+ "kimmy-storage",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tokio-rustls",
+ "tokio-tungstenite",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -1180,6 +1180,53 @@ throughput for every client that does not batch.
 
 ---
 
+## 🟢 There is a Rust client, and the CLI is its first consumer (M10 task 8)
+
+**Was.** KimmyDB had a specified protocol and nobody to speak it. `kimmy-cli`
+hand-rolled every HTTP call — building URLs, reading statuses, deciding what an
+error meant — which meant every one of those decisions existed once, in a tool,
+where no other client could benefit from it being right.
+
+**Now.** `kimmy-client`, and the CLI is a consumer of it: nothing in
+`kimmy-cli` builds a URL or reads a status code any more.
+
+**It depends on no `kimmy-*` crate, and a test keeps it that way.** That is the
+property that makes it useful as a check rather than only as a convenience: it
+sees exactly what the Python and Go clients will see, so it cannot quietly rely
+on something the specification never promised.
+
+**What it does, and each of them is a server promise from an earlier task:**
+holds a token and refreshes it before expiry using `expiresIn` (task 4); fails
+over between nodes discovered from `/v1/topology` (task 5); pages with cursors,
+ending the walk on an empty page rather than a missing token (task 6); returns
+typed errors carrying the retry class (task 2); and resumes change streams from
+the last token seen, which is safe only because tokens are portable (M4 and
+task 6).
+
+**Retries are conservative on purpose.** A read moves to another node on
+`elsewhere`; **a write does not**, because `elsewhere` means *this node* did not
+answer, not that the work did not happen — and no status distinguishes an
+insert that failed before the commit from one that failed after it. Callers who
+know their request is idempotent say so.
+
+**Three things the conversion found**, which is exactly why the roadmap made
+the CLI the first consumer:
+
+- **`Client::request` took a `reqwest::Method`**, so every consumer had to
+  depend on `reqwest` to name a verb — the HTTP stack in the public API, where
+  changing it would be a breaking change for everyone. The crate has its own
+  `Method` now.
+- **Login did not fail over.** It only tried the first endpoint, so a client
+  handed a list whose first address was dead could not authenticate at all —
+  the one failure that makes every other endpoint useless. Found by a test that
+  put a dead address in front of a live one.
+- **The CLI could not create a collection.** On a fresh database the first
+  `insert` fails with "collection not found" and the tool offered nowhere to go
+  but `curl`. It has `create-collection` now, and `watch` and `topology` while
+  there.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

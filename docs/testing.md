@@ -798,6 +798,35 @@ hanging.
 
 ---
 
+## The client is tested against a real server
+
+`crates/kimmy-client/tests/client.rs` runs a node in-process and talks to it
+over a socket. Nothing calls a handler directly: the client's whole job is to
+be correct about what comes back over a connection, so a test that skipped the
+connection would exercise the half that was never in doubt.
+
+| Property | Test |
+|---|---|
+| A client with credentials logs in and the token works | `a_client_built_with_credentials_holds_a_token` |
+| An expired token is replaced without the caller noticing | `an_expired_token_is_replaced_without_the_caller_noticing` |
+| A dead first endpoint does not stop the client — including at login | `an_unreachable_node_is_skipped_for_one_that_answers` |
+| A write is not moved to another node automatically | `a_write_is_not_retried_elsewhere_automatically` |
+| A walk sees every document exactly once, in order | `paging_walks_the_whole_collection` |
+| A walk ends on an empty page, not a missing token | `a_walk_ends_on_an_empty_page_not_a_missing_token` |
+| A refusal arrives with its code and retry class | `a_refusal_arrives_typed` |
+| A change stream resumes from where it stopped | `a_change_stream_resumes_from_where_it_stopped` |
+| The crate depends on no server crate | `the_shipped_crate_depends_on_no_kimmy_crate` |
+
+The last one is a manifest check rather than a behaviour, and it is the one
+that keeps the rest meaningful: a client sharing a type with the server could
+rely on something the specification never promised, and the tests would still
+pass.
+
+Two of these found real defects on their first run — a login that could not
+fail over, and a public API that forced consumers to depend on `reqwest`.
+
+---
+
 ## Benchmarks are not tests, and one of them drives the server
 
 `cargo bench -p kimmyd --bench http` is the odd one out: it spawns the shipped

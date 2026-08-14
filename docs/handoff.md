@@ -6,13 +6,13 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 task 7 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 task 8 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–7 are done: #65–#70 merged, task 7 is on
-`m10-http-bench` with a PR open and unmerged. **Every reserved decision in the
-milestone is settled** — the protocol half of M10 is finished, and tasks 8–12
-are the clients, built against a contract that is written down, checked, and
-now measured.
+**M0–M9 complete.** M10 tasks 1–8 are done: #65–#71 merged, task 8 is on
+`m10-rust-client` with a PR open and unmerged. The protocol half of the
+milestone is finished and **the first client exists**; tasks 9–12 are the other
+two languages, the conformance suite that keeps all three honest, and the
+closeout.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -35,17 +35,21 @@ rather than argued from the encoding.
 
 Task 7: the HTTP benchmark harness, and the numbers it produced.
 
-**Next is task 8**, the Rust client `kimmy-client`, off fresh `main` once task 7
-merges. No reserved decision beyond the HTTP/async stack, and that one is
-effectively settled by the tree: `reqwest` with `rustls-tls` is already a
-workspace dependency and adding a second HTTP stack would undo the native-deps
-discipline. **`kimmy-cli` is the ready-made consumer** — its 464 lines hand-roll
-every HTTP call, and converting it is what proves the client is pleasant rather
-than merely present. The client owes: auth with refresh (task 4), cursor
-iteration (task 6), change streams over WebSocket with reconnect and resume,
-typed errors carrying the retry class (task 2), and multi-node failover driven
-by `/v1/topology` (task 5). Every one of those is now a specified, tested
-server-side promise — which is what tasks 1–7 were for.
+Task 8: `kimmy-client`, and `kimmy-cli` converted into a consumer of it.
+
+**Next is task 9**, the Python client, off fresh `main` once task 8 merges. Its
+reserved decision is the HTTP stack, and the roadmap already frames the other
+half: **sync first; async is a second decision, not an assumption.** Two things
+carry over from the Rust client rather than needing rediscovery. First,
+[Clients](clients.md) now states what a client is *expected* to do — the same
+list the conformance suite in task 11 will hold all three to. Second, the
+`kimmy-client` tests are a ready-made scenario list: token renewal, failover
+past a dead endpoint, a walk that ends on an empty page, a write that is not
+retried, and a change stream that resumes. A Python client that passes the
+equivalents is one the conformance suite will not be the first to exercise.
+
+**Where Python lives is an open choice** — nothing in this repository is Python
+except `scripts/`, so task 9 also decides packaging, layout and how CI runs it.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -113,7 +117,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-token-refresh` | ✅ Merged as #68. M10 task 4: `POST /v1/auth/refresh`, `expiresIn`, ADR-059 |
 | `m10-topology` | ✅ Merged as #69. M10 task 5: `GET /v1/topology`, the node registry, `server.advertise`, ADR-060 |
 | `m10-protocol-cursors` | ✅ Merged as #70. M10 task 6: the paging contract, and cross-node paging in the harness |
-| `m10-http-bench` | **Open, PR raised, not merged.** M10 task 7: `cargo bench -p kimmyd --bench http`, and the numbers in [Benchmarks](benchmarks.md) |
+| `m10-http-bench` | ✅ Merged as #71. M10 task 7: the HTTP benchmark, and the numbers in [Benchmarks](benchmarks.md) |
+| `m10-rust-client` | **Open, PR raised, not merged.** M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -239,7 +244,7 @@ work.
 | 5 | ✅ **Client-visible topology / discovery** | Settled: replicated registry for addresses, SWIM for liveness (ADR-060) |
 | 6 | ✅ **Cursors at the protocol level** | — (M9 settled the shape; this settled the wire contract) |
 | 7 | ✅ **HTTP-level benchmark harness** | — |
-| 8 | **Rust client**, `kimmy-client`; the CLI becomes its consumer | HTTP/async stack |
+| 8 | ✅ **Rust client**, `kimmy-client`; the CLI is its consumer | Settled: `reqwest`, already in the tree |
 | 9 | **Python client** | HTTP/async stack |
 | 10 | **Go client** | HTTP stack |
 | 11 | **Conformance suite all three clients pass** | — |
@@ -498,6 +503,42 @@ consumers a daemon runs and a bare `Engine` does not, or a commit's fsync on a
 runtime worker thread. **Recorded as a 🟡 question**, because a cause that has
 not been measured is not a cause. Halving it would double single-write
 throughput for every client that does not batch.
+
+### What task 8 did — the first client, and what it found
+
+`kimmy-client` holds a token and refreshes it, fails over between nodes
+discovered from `/v1/topology`, pages with cursors, returns typed errors
+carrying the retry class, and resumes change streams. Each of those is a server
+promise from an earlier task, which is what tasks 1–7 were for.
+
+**It depends on no `kimmy-*` crate, and a test keeps it that way.** That is the
+property that makes it a *check* rather than only a convenience: it sees what
+the Python and Go clients will see. A shared type would make this the one
+client that works for a reason the others cannot have.
+
+**Retries are deliberately conservative.** A read moves to another node on
+`elsewhere`; a write does not, because `elsewhere` says *this node* did not
+answer, not that the work did not happen — and no status distinguishes an
+insert that failed before its commit from one that failed after. A caller who
+knows the request is idempotent says so, and an insert carrying its own `_id`
+qualifies while one without does not.
+
+**Converting the CLI found three defects**, which is exactly why the roadmap
+made it the first consumer:
+
+- **`Client::request` took a `reqwest::Method`**, putting the HTTP stack in the
+  public API — every consumer had to depend on `reqwest` to name a verb. The
+  crate has its own `Method` now.
+- **Login did not fail over.** It tried only the first endpoint, so a client
+  handed a list whose first address was dead could not authenticate at all —
+  the one failure that makes every other endpoint useless. Found by a test
+  putting a dead address in front of a live one.
+- **The CLI could not create a collection.** On a fresh database the first
+  `insert` failed with "collection not found" and offered nowhere to go but
+  `curl`. Found by driving the converted binary.
+
+`kimmy watch` and `kimmy topology` came along with the conversion, because the
+client made them a few lines each.
 
 **Task 5 carried the milestone's distributed-systems risk and is done.** Both
 traps were handled deliberately — the answering node is added explicitly because

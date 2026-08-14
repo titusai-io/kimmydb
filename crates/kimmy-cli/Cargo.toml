@@ -12,10 +12,13 @@ name = "kimmy"
 path = "src/main.rs"
 
 [dependencies]
-kimmy-core.workspace = true
+# The CLI is a consumer of the client crate, not a second implementation of
+# it. Nothing here builds a URL or reads a status code — if that ever becomes
+# awkward, the awkwardness belongs in `kimmy-client` where every other client
+# benefits from fixing it.
+kimmy-client.workspace = true
 clap.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
-reqwest.workspace = true

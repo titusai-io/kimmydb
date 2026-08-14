@@ -24,6 +24,18 @@ loops and CI. An interactive shell is nicer for exploring, but it is this same
 command surface *plus* a terminal UI — so the commands come first, and a REPL,
 if it is ever wanted, sits on top of them rather than beside them.
 
+## It is a consumer of `kimmy-client`
+
+Every request goes through the Rust client crate rather than through HTTP calls
+written here. That is the point rather than an implementation detail: a client
+library nobody uses is a library whose rough edges nobody finds, and converting
+this tool is what found three of them — a public API that forced every consumer
+to depend on `reqwest`, a login that could not fail over to a second node, and
+the missing `create-collection` that made a fresh database unusable from here.
+
+What the tool gets for free as a result: token refresh, failover between nodes,
+cursor paging, and change streams that reconnect and resume.
+
 ## Why it speaks HTTP
 
 Nothing here opens the database file. redb allows one process to hold a
@@ -39,9 +51,11 @@ grants any other client is.
 | | |
 |---|---|
 | `kimmy login <user>` | Prints a token. Password from stdin or `KIMMY_PASSWORD` |
-| `kimmy ping` | Health and readiness. Needs no token |
+| `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
+| `kimmy topology` | The nodes of the cluster, and which are live |
 | `kimmy databases` | Databases you can read |
 | `kimmy collections <db>` | Collections in a database |
+| `kimmy create-collection <db.coll>` | Creating one is idempotent |
 | `kimmy find <db.coll> [filter]` | `--sort --projection --limit --skip --explain` |
 | `kimmy count <db.coll> [filter]` | |
 | `kimmy insert <db.coll> [document]` | Reads stdin when the document is omitted |
@@ -51,6 +65,7 @@ grants any other client is.
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |
 | `kimmy describe <db.coll>` | Inferred schema. `--sample` |
 | `kimmy indexes <db.coll>` | |
+| `kimmy watch <db.coll>` | Follow changes until interrupted, one event per line. `--full --resume-after` |
 | `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout |
 
 Global: `--url` (`KIMMY_URL`), `--token` (`KIMMY_TOKEN`), `--pretty`.

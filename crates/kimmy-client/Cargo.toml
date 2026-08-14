@@ -1,0 +1,38 @@
+[package]
+name = "kimmy-client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Rust client for KimmyDB"
+
+# No `kimmy-*` dependency, deliberately, and a test asserts it stays that way.
+# This crate is a client of the *protocol*, not of the server's internals — the
+# same position the Python and Go clients are in. Sharing a type with the
+# server would let it depend on something the specification never promised, and
+# the first place that would show is a bug the other two clients also have and
+# this one does not.
+[dependencies]
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "rt", "macros"] }
+futures.workspace = true
+# WebSocket framing only. TLS is supplied by this crate rather than selected by
+# a feature, so the connector is the ring-backed one the workspace already
+# vets — a feature-chosen provider is how `aws-lc-rs` gets in (ADR-050).
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-rustls.workspace = true
+webpki-roots = "1"
+
+[dev-dependencies]
+# A server to talk to. Dev-only: the shipped crate depends on no kimmy crate.
+kimmy-api.workspace = true
+kimmy-auth.workspace = true
+kimmy-storage.workspace = true
+kimmy-core.workspace = true
+axum.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
