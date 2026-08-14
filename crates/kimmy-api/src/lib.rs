@@ -23,6 +23,7 @@ pub mod routes;
 pub mod schema;
 pub mod sessions;
 pub mod state;
+pub mod topology;
 pub mod users;
 pub mod vectors;
 pub mod version;
@@ -89,6 +90,7 @@ pub fn state_with_egress(
         metrics: Metrics::default(),
         egress,
         sessions,
+        members: std::sync::OnceLock::new(),
     }))
 }
 

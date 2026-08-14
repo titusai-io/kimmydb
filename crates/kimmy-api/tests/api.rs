@@ -17,6 +17,10 @@ const ROOT_PASSWORD: &str = "root-password";
 struct Server {
     base: String,
     client: Client,
+    /// The server's own state, for the few tests whose subject is something a
+    /// request cannot reach — the live member set, which only exists once a
+    /// cluster has started.
+    state: kimmy_api::SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -137,7 +141,9 @@ impl Server {
         }
 
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
-        let app = kimmy_api::build(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
+        let state =
+            kimmy_api::state(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
+        let app = kimmy_api::router(Arc::clone(&state));
 
         // Port 0: let the OS pick, so parallel tests never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,7 +157,7 @@ impl Server {
                 .await;
         });
 
-        Self { base: format!("http://{addr}"), client: Client, _dir: dir }
+        Self { base: format!("http://{addr}"), client: Client, state, _dir: dir }
     }
 
     async fn get(&self, path: &str, token: Option<&str>) -> Res {
@@ -179,6 +185,34 @@ impl Server {
 
     async fn root(&self) -> String {
         self.login("root", ROOT_PASSWORD).await
+    }
+
+    /// Write a peer's record into the node registry directly.
+    ///
+    /// Standing in for the replication that would carry it in a real cluster:
+    /// the registry is an ordinary collection, so a replicated record and a
+    /// locally written one are the same thing by the time topology reads it.
+    async fn register_peer(&self, node: &kimmy_core::NodeId, endpoint: &str) {
+        let meta = self
+            .state
+            .engine
+            .create_system_collection(
+                kimmy_api::topology::NODES_DB,
+                kimmy_api::topology::NODES_COLLECTION,
+            )
+            .unwrap();
+        self.state
+            .engine
+            .insert(
+                &meta,
+                bson::doc! {
+                    "_id": node.to_string(),
+                    "endpoint": endpoint,
+                    "version": "0.0.1-peer",
+                    "updatedMs": 0i64,
+                },
+            )
+            .unwrap();
     }
 }
 
@@ -645,6 +679,72 @@ async fn the_last_user_cannot_be_deleted() {
     let token = server.root().await;
     let res = server.delete("/v1/users/root", Some(&token)).await;
     assert_eq!(res.status, 409);
+}
+
+#[tokio::test]
+async fn topology_lists_this_node_even_though_the_member_set_never_contains_it() {
+    // The trap, stated as a test. `Members` holds **peers only**, so anything
+    // derived from it alone can never include this node — the omission that
+    // silently undelivered every clustered webhook (ADR-051). A topology that
+    // inherited it would tell a client the cluster does not include the node
+    // that just answered.
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    let res = server.get("/v1/topology", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+    let me = &res.body["nodes"][0];
+    assert_eq!(me["self"], true);
+    assert_eq!(me["status"], "live", "the node that answered is reachable by definition");
+    assert_eq!(me["endpoint"], Value::Null, "nothing was advertised, and none is guessed");
+}
+
+#[tokio::test]
+async fn a_registered_peer_is_reported_unknown_until_membership_sees_it() {
+    // Address and liveness come from different places on purpose: the registry
+    // says where a node is, SWIM says whether it is there. A registered node
+    // nobody can vouch for is reported, not hidden — its gossip may be
+    // partitioned while its HTTP is perfectly fine.
+    let server = Server::start().await;
+    let token = server.root().await;
+    let peer = kimmy_core::NodeId::generate();
+
+    server.register_peer(&peer, "http://10.0.0.9:7878").await;
+
+    let nodes = server.get("/v1/topology", Some(&token)).await.body;
+    assert_eq!(nodes["count"], 2);
+    let entry = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node"] == peer.to_string())
+        .expect("the registered peer is listed");
+    assert_eq!(entry["status"], "unknown");
+    assert_eq!(entry["endpoint"], "http://10.0.0.9:7878");
+    assert_eq!(entry["self"], false);
+
+    // Now let membership see it, and the same record reads as live.
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test("10.0.0.9:7900".parse().unwrap(), peer);
+    server.state.set_members(members);
+
+    let nodes = server.get("/v1/topology", Some(&token)).await.body;
+    let entry = nodes["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|n| n["node"] == peer.to_string())
+        .expect("still listed");
+    assert_eq!(entry["status"], "live", "membership is what makes it live: {nodes}");
+}
+
+#[tokio::test]
+async fn topology_needs_a_token() {
+    // Unlike /v1/version. A version is a fact about software; this is a map of
+    // where a deployment's data lives.
+    let server = Server::start().await;
+    assert_eq!(server.get("/v1/topology", None).await.status, 401);
 }
 
 #[tokio::test]

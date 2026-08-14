@@ -2639,6 +2639,83 @@ refresh verifies a signature and reads one cached record, so a limit there
 would defend nothing and would throttle the healthy case this route exists to
 serve.
 
+## ADR-060 — Client topology comes from a replicated registry, liveness from SWIM
+
+**Decision.** `GET /v1/topology` lists the cluster's nodes. **Addresses** come
+from a replicated registry — each node writes one record naming itself and the
+endpoint it advertises into `__kimmy.__nodes`. **Liveness** comes from SWIM
+membership. Entries nobody can vouch for are reported as `unknown` rather than
+hidden, the answering node is always listed and always first, and the route
+requires a token.
+
+M10 task 5 of [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud).
+
+**Reading addresses out of SWIM is not available, and that is the whole
+decision.** `Member` is `{addr, incarnation, node}` where `addr` is the
+*gossip* address — there is no client-facing address anywhere in membership.
+Putting one there means adding a field to an identity encoded with postcard,
+which is not self-describing: a new node rejects an old identity outright, so
+it is a stop-the-cluster upgrade and a note in
+[Operations](operations.md). That would be the fourth in three milestones
+([ADR-040](#adr-040--replication-tls-is-bound-to-cluster_secret-not-to-certificates), [ADR-051](#adr-051--webhook-ownership-hashes-node-ids-and-the-identity-carries-one),
+[ADR-053](#adr-053--swim-datagrams-are-authenticated-with-the-cluster-secret)), and it would put
+client-facing configuration inside the cluster's internal wire, where every
+future change to it costs an outage window.
+
+Inferring the client address from the gossip address — same host, different
+port — is the tempting shortcut and is a guess: the two listeners can be on
+different interfaces, one may terminate TLS, and in a container the address
+clients reach frequently belongs to a service or an ingress rather than to the
+process at all.
+
+**So the registry is an ordinary replicated collection**, for the same reasons
+the webhook registry is one ([ADR-045](#adr-045--webhook-delivery-is-owned-by-a-derived-node-over-replicated-progress)):
+it replicates with no second transport, it is in a backup, it comes back on a
+restore, and reading it is reading a collection. A node learns about peers it
+was never seeded with, because the record arrives the way every other write
+does.
+
+**It is an address book, not a heartbeat.** A node writes its record at startup
+and only when the content would differ. A periodic rewrite would append to the
+oplog every tick, on every node, forever, for a fact that changes at restart —
+the failure mode the webhook dispatcher's progress heartbeat exists to bound.
+Freshness belongs to liveness, and SWIM is a better source for it than a
+timestamp.
+
+**`status` is `live` or `unknown`, never `down`.** A node whose gossip is
+partitioned while its HTTP is perfectly reachable is a real state in a
+leaderless cluster, and hiding it would remove an option exactly when a client
+most wants one. `unknown` says what is true: this node has not heard from it.
+Trying it anyway costs one round trip, and `retry: elsewhere` already describes
+the outcome.
+
+**Two inherited traps, both named because both have cost an outage before.**
+`Members` holds **peers only** — it can never contain this node — so the
+answering node is added explicitly rather than looked for; a set derived from
+membership alone would tell a client the cluster does not include the node that
+just answered, which is the shape of the bug that silently undelivered every
+clustered webhook. And the member set must contain **only authenticated
+peers** (ADR-053): that invariant now protects more than ownership, because an
+unauthenticated peer in the set would be advertised to clients as a node to
+send credentials to.
+
+**Authenticated, unlike `/v1/version`.** A version is a fact about software; a
+topology is a map of where a deployment's data lives. A client that wants to
+fail over already holds a token, so nothing needs it earlier.
+
+**`server.advertise` is configuration and cannot be inferred.** A node bound to
+a wildcard has no single address, so one with nothing configured advertises
+nothing and says so at startup rather than publishing a guess to every client
+in the cluster. With a concrete bind it defaults to that address, with the
+scheme following whether the node terminates TLS.
+
+**What is not solved.** A record outlives the node that wrote it: a
+decommissioned node stays listed as `unknown` forever. Age-based collection
+would be wrong — records are not rewritten, so age measures uptime — so removal
+is a deliberate act, and the registry being an ordinary collection is what makes
+it possible without new API surface. Recorded as carried debt rather than left
+to be discovered.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

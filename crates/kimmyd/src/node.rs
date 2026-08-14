@@ -92,8 +92,30 @@ pub async fn run(config: Config) -> Result<()> {
         info!("serving MCP at /mcp");
     }
 
+    // Published so `/v1/topology` can tell a client where this node is. The
+    // record replicates like any other document, which is what lets one node
+    // answer for the whole cluster; liveness comes from SWIM separately.
+    if let Some(endpoint) = kimmy_api::topology::advertised_endpoint(
+        config.server.advertise.as_deref(),
+        config.server.bind,
+        config.server.tls.is_enabled(),
+    ) && let Err(e) = kimmy_api::topology::register(&state, &endpoint)
+    {
+        // Not fatal: a node that cannot publish its address still serves. The
+        // cost is that clients are not told about it, which is worth a loud
+        // line rather than a refusal to start.
+        warn!(error = %e.message, "could not register this node in the client topology");
+    }
+
     let gc_handle = spawn_collector(Arc::clone(&engine), &config);
     let cluster = spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config).await?;
+
+    // The routes see the live member set only once the cluster is up, which is
+    // after the router was built — hence a late hand-off rather than a
+    // constructor argument.
+    if let Some(members) = cluster.members.clone() {
+        state.set_members(members);
+    }
 
     // The webhook dispatcher is an ordinary oplog consumer, like the embedding
     // worker below. It derives which subscriptions it owns from the same live

@@ -693,6 +693,13 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     let root = refreshed["token"].as_str().expect("a token").to_string();
     c.check("GET", "/v1/auth/whoami", "/v1/auth/whoami", Some(&root), None, 200).await;
 
+    // Always at least this node, marked `self` — `Members` holds peers only,
+    // so a list derived from it alone would omit the node that just answered.
+    let topology = c.check("GET", "/v1/topology", "/v1/topology", Some(&root), None, 200).await;
+    assert_eq!(topology["count"], 1);
+    assert_eq!(topology["nodes"][0]["self"], true);
+    assert_eq!(topology["nodes"][0]["status"], "live");
+
     // -- users -------------------------------------------------------------
     let clerk_grants = json!([{ "db": "shop", "collection": "*", "actions": ["read"] }]);
     c.check(
