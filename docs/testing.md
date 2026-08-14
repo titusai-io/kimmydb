@@ -879,6 +879,68 @@ is the evidence the conformance suite is built on.
 
 ---
 
+## M10: a mutation pass over the client, and what it left
+
+`cargo mutants --in-diff` over the milestone's diff, split by test scope
+because the client's suite runs in seconds while the storage suite runs in
+minutes — running every client mutant against the storage tests was a
+nine-hour job and a twenty-minute one after the split.
+
+**The client: 190 mutants, 133 caught, 34 missed, 20 unviable, 3 timeouts** —
+after new tests. The first pass caught 101 and missed 66; what the difference
+bought is worth naming, because it was not subtle:
+
+- **Seven convenience methods had no test at all.** `find`, `update`,
+  `delete`, `aggregate`, `replace_document`, `delete_document` and `download`
+  could each be replaced with a stub returning a default and nothing failed —
+  the suite reached the server through `pages`, `insert`, `count` and
+  `request`. Wrappers are exactly where a wrong path or verb hides, because
+  each is one line and looks obviously right.
+- **Topology filtering was untested.** With one node and nothing advertised
+  there is nothing to filter, so inverting every comparison in
+  `refresh_topology` changed nothing observable. It has three nodes to choose
+  between now.
+- **Thirteen of the seventeen error codes were never produced**, so each could
+  have been renamed silently. They are public surface.
+- **The query builders and `collect_all` were unreachable** from any test.
+
+### The server-side pass was started and abandoned
+
+The M10 diff also touches `kimmy-api`, `kimmy-storage` and `kimmy-auth` — 90
+mutants. That pass was **not completed**, and the reason is worth recording so
+the next person does not repeat it.
+
+Run against all three crates' suites, each mutant costs a build plus a ~78s
+test run. At `-j 8` on a machine already busy, the wall time per mutant blew
+through the 300s cap: after 47 mutants the result was **3 caught, 0 missed and
+15 timeouts** — nearly no information, and every timeout was a mutant whose
+`cargo test` had not finished linking, not a hang in the code.
+
+**The lesson is the same one that made the client pass cheap: scope the tests
+to the mutant.** A `kimmy-api` mutant does not need `kimmy-storage`'s suite to
+run. `-- -p kimmy-api` alone, at `-j 4`, with a timeout set from a *contended*
+baseline rather than an idle one.
+
+These crates had full mutation passes in M7 and M8, and the M10 diff over them
+is small next to the client and specification work. Redoing it properly is
+worth an hour of someone's time, not an emergency.
+
+### What is left, and why it is left
+
+| Class | Count | |
+|---|---:|---|
+| Change-stream reconnect internals | 17 | Attempt counters and backoff arithmetic. Killing them needs a server that refuses a controlled number of times; the *observable* behaviour — reconnect resumes, an expired token is not retried — is tested |
+| The `retry: wait` path in `send` | 4 | The client suite has no rate-limited server, so the wait branch is never taken. A real gap, and a cheap one to close whenever a harness grows a limiter |
+| Genuinely equivalent | ~6 | `promote`'s early return when the endpoint is already first; the far-future expiry a supplied token gets, where `*`, `+` and `/` are all still far future |
+| Renewal arithmetic | 1 | The one-second-lifetime test clamps to the floor either way, so `-` and `+` agree there |
+
+The rule from M7 holds: **some escapes are equivalent mutants no test can kill
+— prove it, do not chase it.** The ones above that are *not* equivalent are
+named rather than absorbed, which is the difference between a residue and a
+blind spot.
+
+---
+
 ## Conformance: the only test that compares clients
 
 `clients/conformance/run.py` is the one place where the three clients are held

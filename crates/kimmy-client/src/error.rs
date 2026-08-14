@@ -256,6 +256,68 @@ mod tests {
     }
 
     #[test]
+    fn every_documented_code_round_trips() {
+        // The mutation pass found this table barely exercised: the suite
+        // produces three or four codes, so the other thirteen could each have
+        // been renamed without anything noticing. They are public surface — a
+        // caller matching on `ErrorCode::UniqueViolation` is matching on this
+        // — and the strings are the specification's rather than this crate's
+        // to choose.
+        //
+        // Written out rather than imported: this crate depends on no server
+        // crate, so the only way it can agree with `docs/openapi.yaml` is by
+        // repeating it and being checked.
+        const CODES: [&str; 17] = [
+            "bad_request",
+            "payload_too_large",
+            "unsupported_media_type",
+            "unauthorized",
+            "forbidden",
+            "not_found",
+            "conflict",
+            "duplicate_key",
+            "unique_violation",
+            "no_vectors",
+            "resume_token_expired",
+            "rate_limited",
+            "internal",
+            "misconfigured",
+            "snapshot",
+            "not_implemented",
+            "provider_error",
+        ];
+
+        for code in CODES {
+            let parsed = ErrorCode::parse(code);
+            assert!(
+                !matches!(parsed, ErrorCode::Unknown(_)),
+                "{code} is documented but this client does not recognize it"
+            );
+            assert_eq!(parsed.to_string(), code, "{code} does not render back to itself");
+        }
+
+        // And the codes are distinct: two variants rendering the same string
+        // would make one of them unmatchable.
+        let mut rendered: Vec<String> =
+            CODES.iter().map(|c| ErrorCode::parse(c).to_string()).collect();
+        rendered.sort();
+        rendered.dedup();
+        assert_eq!(rendered.len(), CODES.len());
+    }
+
+    #[test]
+    fn every_retry_class_round_trips() {
+        for (text, expected) in
+            [("no", Retry::No), ("wait", Retry::Wait), ("elsewhere", Retry::Elsewhere)]
+        {
+            assert_eq!(Retry::parse(text), expected);
+        }
+        // Anything else is `no`, which is the safe reading: a client that does
+        // not understand the advice does not act on it.
+        assert_eq!(Retry::parse("shed-load"), Retry::No);
+    }
+
+    #[test]
     fn a_body_that_is_not_the_envelope_still_makes_an_error() {
         // A proxy's HTML page, or a body that never reached the application.
         let e = from_response(502, None, &json!("<html>gateway</html>"));

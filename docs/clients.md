@@ -281,6 +281,33 @@ repository created a collection exactly once.
 
 ---
 
+## One application, written three times
+
+[`examples/`](../examples/README.md) holds `shelf`, a small library catalogue
+in all three languages. It uses the features KimmyDB exists for rather than the
+ones every database has: bulk insert in one commit, cursor paging, an
+aggregation, semantic search over client-supplied vectors, and a change stream
+watching the collection while it is written to.
+
+```bash
+./examples/run-all.sh     # all three, against a fresh node
+```
+
+The deferred decision that became M10 named *running KimmyDB on something real*
+as the trigger for judging whether this direction was right. A snippet that
+inserts one document does not test that; an application that has to find
+something, page through results and react to a change does.
+
+**The embedding is a toy and says so** — a deterministic bag-of-words hash, the
+same in all three languages, so the pipeline is real without an API key or a
+model download. All three produce identical scores, which is a pleasant way to
+notice that nothing language-specific leaks into the protocol.
+
+**They run in CI.** An example nobody runs rots into a document that used to be
+true.
+
+---
+
 ## The CLI is a consumer, not a second implementation
 
 `kimmy` speaks through `kimmy-client` — nothing in it builds a URL or reads a

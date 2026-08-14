@@ -22,7 +22,7 @@ graph LR
     M7["<b>M7</b> ✅<br/>query engine<br/>completion"]
     M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
     M9["<b>M9</b> ✅<br/>finish the<br/>query engine"]
-    M10["<b>M10</b> 📋<br/>client protocol<br/>and clients"]
+    M10["<b>M10</b> ✅<br/>client protocol<br/>and clients"]
 
     M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10
 
@@ -37,7 +37,7 @@ graph LR
     style M7 fill:#2f5d3a,color:#fff
     style M8 fill:#2f5d3a,color:#fff
     style M9 fill:#2f5d3a,color:#fff
-    style M10 fill:#2d3748,color:#fff
+    style M10 fill:#2f5d3a,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -52,7 +52,7 @@ graph LR
 | **M7** | Query engine completion — the planner's carried gaps, and the M6 review findings | ✅ Complete |
 | **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
 | **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | ✅ Complete |
-| **M10** | The client protocol, formalized — a specified and versioned HTTP/WebSocket contract, and first-party Rust, Python and Go clients ([ADR-055](decisions.md)) | 📋 Planned |
+| **M10** | The client protocol, formalized — a specified and versioned HTTP/WebSocket contract, and first-party Rust, Python and Go clients ([ADR-055](decisions.md)) | ✅ Complete |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -695,7 +695,7 @@ scheduled — vector search remains its own endpoint.
 
 ---
 
-## M10 — The client protocol, formalized 📋
+## M10 — The client protocol, formalized ✅
 
 **The theme: KimmyDB has a protocol and has never written it down.** HTTP
 framing, Extended JSON v2 encoding, bearer-token authentication, a typed error
@@ -706,8 +706,25 @@ every client would be hand-written and nothing fails when a route drifts. That
 is the same defect shape as ADR-016's native-dependency claim, which lived in
 prose that nothing checked and was false for two milestones.
 
-[ADR-055](decisions.md) settles the direction and rejects the MongoDB wire
-protocol, gRPC and GraphQL. This milestone is the work.
+[ADR-055](decisions.md) settled the direction and rejected the MongoDB wire
+protocol, gRPC and GraphQL. This milestone was the work, and it is done:
+twelve tasks, six ADRs (056–060 plus the corrections), three clients, and a
+conformance suite that holds them to one set of scenarios.
+
+**What it changed about the project, rather than about the code.** Every task
+found something the code claimed and did not do — and by the end, the finding
+mechanism had itself become the deliverable. The specification is checked
+against a running server; the error codes are closed by an enum; the
+capability list is answered per build; the clients are compared against one
+oracle; the examples are executed. Nine defects were found by driving a real
+node, and one — a replicated schema change that was never published — by the
+cluster harness alone.
+
+**The lesson that generalizes**, and the one worth carrying into whatever comes
+next: *a documented outcome that no test produces is where the next false
+sentence is hiding.* The specification claimed collection creation was
+idempotent for four tasks. Nothing caught it because nothing ever created a
+collection twice.
 
 **M10 follows M9, and not only by preference.** Task 6 needs M9's cursors, and
 a client is a poor thing to ship against an engine that cannot `findAndModify`

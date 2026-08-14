@@ -16,6 +16,10 @@ const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
     base: String,
+    /// The server's own state, for the few tests whose subject is something a
+    /// request cannot reach — the live member set, which exists only once a
+    /// cluster has started.
+    state: kimmy_api::SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -32,9 +36,10 @@ impl Server {
         users.bootstrap_root(&engine, "root", ROOT_PASSWORD).unwrap();
 
         let tokens = kimmy_auth::TokenIssuer::new(SECRET, ttl).unwrap();
-        let app =
-            kimmy_api::build(Arc::clone(&engine), tokens, false, kimmy_api::RateLimits::disabled())
+        let state =
+            kimmy_api::state(Arc::clone(&engine), tokens, false, kimmy_api::RateLimits::disabled())
                 .unwrap();
+        let app = kimmy_api::router(Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -43,7 +48,35 @@ impl Server {
                 .await;
         });
 
-        Self { base: format!("http://{addr}"), _dir: dir }
+        Self { base: format!("http://{addr}"), state, _dir: dir }
+    }
+
+    /// Write a peer's record into the node registry directly.
+    ///
+    /// Standing in for the replication that would carry it in a real cluster:
+    /// the registry is an ordinary collection, so a replicated record and a
+    /// locally written one are the same thing by the time topology reads it.
+    async fn register_peer(&self, node: &kimmy_core::NodeId, endpoint: &str) {
+        let meta = self
+            .state
+            .engine
+            .create_system_collection(
+                kimmy_api::topology::NODES_DB,
+                kimmy_api::topology::NODES_COLLECTION,
+            )
+            .unwrap();
+        self.state
+            .engine
+            .insert(
+                &meta,
+                bson::doc! {
+                    "_id": node.to_string(),
+                    "endpoint": endpoint,
+                    "version": "0.0.1-peer",
+                    "updatedMs": 0i64,
+                },
+            )
+            .unwrap();
     }
 }
 
@@ -368,4 +401,177 @@ async fn a_change_stream_resumes_from_where_it_stopped() {
         .unwrap()
         .unwrap();
     assert_eq!(missed.document_id().and_then(Value::as_i64), Some(201));
+}
+
+/// The convenience methods, which the mutation pass found untested.
+///
+/// `find`, `update`, `delete`, `aggregate`, `replace_document`,
+/// `delete_document` and `download` could each be replaced with a stub that
+/// returns a default, and nothing failed: the rest of the suite reaches the
+/// server through `pages`, `insert`, `count` and `request`. Convenience
+/// wrappers are exactly where a wrong path or a wrong verb hides, because they
+/// are one line each and look obviously right.
+#[tokio::test]
+async fn the_convenience_methods_reach_the_routes_they_name() {
+    let (_server, client) = connected().await;
+    seeded(&client, 5).await;
+
+    let page = client
+        .find("shop", "orders", &Query::new().filter(json!({ "qty": { "$gte": 3 } })))
+        .await
+        .expect("find");
+    assert_eq!(page["count"], 2, "find must apply the filter it was given: {page}");
+
+    let updated = client
+        .update(
+            "shop",
+            "orders",
+            &json!({ "_id": 1 }),
+            &json!({ "$set": { "sku": "changed" } }),
+            false,
+        )
+        .await
+        .expect("update");
+    assert_eq!(updated["modified"], 1);
+    assert_eq!(
+        client.get_document("shop", "orders", "1").await.unwrap().expect("a document")["sku"],
+        "changed",
+        "update must reach the document it named"
+    );
+
+    let replaced = client
+        .replace_document("shop", "orders", "1", &json!({ "sku": "replaced" }), false)
+        .await
+        .expect("replace");
+    assert_eq!(replaced["matched"], 1);
+    assert_eq!(
+        client.get_document("shop", "orders", "1").await.unwrap().expect("a document")["sku"],
+        "replaced"
+    );
+
+    let grouped = client
+        .aggregate(
+            "shop",
+            "orders",
+            &json!([{ "$group": { "_id": null, "total": { "$sum": "$qty" } } }]),
+        )
+        .await
+        .expect("aggregate");
+    // 0+2+3+4: document 1 lost its `qty` to the replace above, because a
+    // replace is not a merge — unnamed fields are dropped. Worth having a test
+    // notice that rather than a caller.
+    assert_eq!(grouped["documents"][0]["total"], 9, "{grouped}");
+
+    assert_eq!(
+        client.delete_document("shop", "orders", "0").await.expect("delete one")["deleted"],
+        1
+    );
+    let deleted = client
+        .delete("shop", "orders", &json!({ "qty": { "$gte": 3 } }), true)
+        .await
+        .expect("delete many");
+    assert_eq!(deleted["deleted"], 2);
+    assert_eq!(client.count("shop", "orders", &json!({})).await.unwrap(), 2);
+
+    // A backup is bytes rather than JSON, and an empty one would still be
+    // "successful" to a caller that only checked the status.
+    let backup = client.download("/v1/admin/backup").await.expect("backup");
+    assert!(backup.len() > 100, "a backup of a seeded node is not a token amount of bytes");
+}
+
+/// Topology filtering, which the mutation pass also found untested.
+///
+/// The single-node test could not exercise it: with one node and nothing
+/// advertised there is nothing to filter, so inverting every comparison in
+/// `refresh_topology` changed nothing observable. This gives it three nodes to
+/// choose between.
+#[tokio::test]
+async fn refresh_topology_keeps_the_live_advertised_nodes_and_stays_where_it_is() {
+    let (server, client) = connected().await;
+
+    let live = kimmy_core::NodeId::generate();
+    let unknown = kimmy_core::NodeId::generate();
+    let unadvertised = kimmy_core::NodeId::generate();
+    server.register_peer(&live, "http://10.0.0.7:7878").await;
+    server.register_peer(&unknown, "http://10.0.0.8:7878").await;
+    server.register_peer(&unadvertised, "").await;
+
+    let members = kimmy_cluster::Members::default();
+    members.insert_for_test("10.0.0.7:7900".parse().unwrap(), live);
+    server.state.set_members(members);
+
+    let endpoints = client.refresh_topology().await.expect("topology");
+
+    assert_eq!(
+        endpoints.first().map(String::as_str),
+        Some(server.base.as_str()),
+        "the node answering stays first: a client should not be moved off it"
+    );
+    assert!(endpoints.contains(&"http://10.0.0.7:7878".to_string()), "a live peer is usable");
+    assert!(
+        !endpoints.iter().any(|e| e.contains("10.0.0.8")),
+        "a peer this node cannot vouch for is not somewhere to send requests now"
+    );
+    assert_eq!(endpoints.len(), 2, "and a node with no advertised endpoint cannot be dialled");
+}
+
+/// A stream reports the token it would resume from.
+///
+/// The accessor was untested: every other test reads `event.resume_token`, so
+/// `ChangeStream::resume_token()` could have returned any string at all —
+/// which the mutation pass demonstrated by making it return `"xyzzy"`.
+#[tokio::test]
+async fn a_stream_reports_the_token_it_would_resume_from() {
+    let (_server, client) = connected().await;
+    seeded(&client, 1).await;
+
+    let mut stream = client.watch("shop", "orders", WatchOptions::new()).await.unwrap();
+    client.insert("shop", "orders", &json!({ "_id": 300 })).await.unwrap();
+
+    let event = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("an event");
+    assert_eq!(
+        stream.resume_token(),
+        event.resume_token.as_deref(),
+        "the stream's position is the last event it delivered"
+    );
+    assert!(stream.resume_token().is_some_and(|t| !t.is_empty()));
+}
+
+/// The query builders and `collect_all`, which nothing else used.
+///
+/// `projection` and `explain` could each be replaced with a default and no
+/// test noticed, because every other test builds a query with a filter and a
+/// limit. A builder method that silently discards what it was given is the
+/// kind of defect that looks like the server ignoring a field.
+#[tokio::test]
+async fn the_query_builders_send_what_they_were_given() {
+    let (_server, client) = connected().await;
+    seeded(&client, 3).await;
+
+    let page = client
+        .find(
+            "shop",
+            "orders",
+            &Query::new().projection(json!({ "_id": 1 })).explain(true).limit(2),
+        )
+        .await
+        .expect("find");
+
+    assert!(page["explain"].is_object(), "explain(true) must ask for it: {page}");
+    let first = &page["documents"][0];
+    assert!(first["_id"].is_i64(), "the projection keeps _id");
+    assert!(first.get("qty").is_none(), "and drops what it did not name: {first}");
+
+    // `collect_all` is the shape a caller reaches for when the result is known
+    // to be small, and it was reachable only through code nothing ran.
+    let all = client
+        .pages("shop", "orders", Query::new().limit(2))
+        .collect_all()
+        .await
+        .expect("collect_all");
+    assert_eq!(all.len(), 3, "every document, across pages of two");
 }
