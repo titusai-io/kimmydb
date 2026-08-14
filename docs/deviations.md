@@ -1349,6 +1349,56 @@ two earlier clients had already taken the surprises.
 
 ---
 
+## 🟢 Three clients are held to one set of scenarios (M10 task 11)
+
+**Was.** Three clients passed matching scenarios because they were *written* to
+match. Nothing enforced it. The drift would have been found by a user.
+
+**Now.** `clients/conformance`: one declared scenario list with the
+observations a correct client must produce, a small driver per client, and a
+runner that starts a fresh node per scenario and compares. Sixteen scenarios,
+three clients, forty-eight runs.
+
+**Two checks, not one.** Coverage — every driver must implement every declared
+scenario — and behaviour, which is the half a per-language suite cannot do:
+three suites can each have a `failover` test and disagree about what failover
+means.
+
+**A driver reports; it never judges.** Three clients that each decided whether
+they had passed would be three opinions rather than one oracle and three
+answers.
+
+**Verified by breaking a client on purpose.** The Python driver made to stop
+one page early produced `documents_seen: expected 250, observed 200` while the
+other two passed. A suite that has never gone red is a suite nobody has tested.
+
+---
+
+## 🟢 Collection creation is not idempotent, and the specification said it was
+
+**Found by the conformance suite's first full run**, indirectly: the runner
+reused its work directory, so a second run started a node on the first run's
+data and every client failed to create a collection that already existed. The
+runner bug was real and is fixed — but the error message was the finding.
+
+**`POST /v1/db/{db}/collections` returns `409 conflict` when the collection
+exists.** It always has: `create_collection_inner` returns `CollectionExists`.
+`docs/openapi.yaml` had said "Created, or already present — creation is
+idempotent" since M10 task 1, and both the Python and Go clients repeated the
+claim in a comment.
+
+**Nothing caught it because nothing ever created a collection twice.** Every
+test in the repository — the contract test, three client suites, every drive
+script — creates each collection exactly once. The specification's coverage
+assertion checks that every *operation* is exercised, not every documented
+*outcome*, so a false sentence about a second call sat unchallenged.
+
+**Now**: the specification says what happens, both clients say it correctly,
+the contract test creates a collection twice, and it is a conformance scenario.
+Four places, because the claim was in four places.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was

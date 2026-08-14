@@ -1,2 +1,4 @@
 # Nothing built here belongs in the repository; `go.sum` does.
 *.test
+# The conformance driver, built on demand by the runner.
+conformance-driver

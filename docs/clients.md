@@ -237,6 +237,50 @@ it is how a caller stops watching.
 
 ---
 
+## Conformance: one set of scenarios, three clients
+
+Three clients passed matching scenarios only because they were **written** to
+match. Nothing enforced it, and nothing would have noticed the day one started
+paging differently — except a user.
+
+`clients/conformance/scenarios.json` declares every scenario and the
+observations a correct client must produce. Each client ships a small driver
+that runs a named scenario and prints what it observed; the runner starts a
+fresh node per scenario, runs it against every driver, and compares.
+
+```bash
+./clients/conformance/run.py
+```
+
+```
+16 scenarios x 3 clients: go, python, rust
+
+paging_walks_everything                        go:ok  python:ok  rust:ok
+change_stream_resumes                          go:ok  python:ok  rust:ok
+...
+48 runs, three clients, one set of scenarios: no disagreements
+```
+
+Two different checks. **Coverage**: every declared scenario must be implemented
+by every driver, so a client that quietly stops covering one fails rather than
+falls silent. **Behaviour**: the observations must match what is declared —
+which is the part a per-language suite cannot do, because three suites can each
+have a `failover` test and disagree about what failover means.
+
+**A driver reports; it never judges.** Three clients that each decided whether
+they had passed would be three opinions. There is one oracle and three answers.
+
+It was verified by breaking a client on purpose: the Python driver made to stop
+one page early produced `documents_seen: expected 250, observed 200` while the
+other two passed. A suite that has never gone red is a suite nobody has tested.
+
+**And it found something on its first full run**: the specification had claimed
+since M10 task 1 that collection creation is idempotent, while the server has
+always answered `409`. Nothing had caught it because every test in the
+repository created a collection exactly once.
+
+---
+
 ## The CLI is a consumer, not a second implementation
 
 `kimmy` speaks through `kimmy-client` — nothing in it builds a URL or reads a

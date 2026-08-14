@@ -1047,6 +1047,30 @@ async fn documented_refusals_use_the_documented_envelope() {
     let clerk = c.login("clerk", "clerk-password").await;
     c.check("GET", "/v1/users", "/v1/users", Some(&clerk), None, 403).await;
 
+    // Creating a collection that exists is a conflict, not a second success.
+    // The specification claimed creation was idempotent for four tasks, and
+    // nothing exercised it: every test created a collection exactly once.
+    c.check(
+        "POST",
+        "/v1/db/{db}/collections",
+        "/v1/db/shop/collections",
+        Some(&root),
+        Some(json!({ "name": "twice" })),
+        200,
+    )
+    .await;
+    let conflict = c
+        .check(
+            "POST",
+            "/v1/db/{db}/collections",
+            "/v1/db/shop/collections",
+            Some(&root),
+            Some(json!({ "name": "twice" })),
+            409,
+        )
+        .await;
+    assert_eq!(conflict["error"], "conflict");
+
     // A collection that does not exist.
     c.check(
         "POST",

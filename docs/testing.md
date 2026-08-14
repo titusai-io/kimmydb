@@ -879,6 +879,43 @@ is the evidence the conformance suite is built on.
 
 ---
 
+## Conformance: the only test that compares clients
+
+`clients/conformance/run.py` is the one place where the three clients are held
+to the *same* claims rather than to three sets of their own.
+
+```bash
+cargo build --release --bin kimmyd
+cargo build --release --example conformance -p kimmy-client
+(cd clients/go && go build -o conformance-driver ./conformance)
+./clients/conformance/run.py
+```
+
+Sixteen scenarios, three clients, forty-eight runs, about two minutes. Each
+scenario gets a **fresh node**, so nothing inherits another's data — a lesson
+learned by not doing it, when a reused work directory made every client appear
+to fail at creating a collection.
+
+Two checks:
+
+| | |
+|---|---|
+| **Coverage** | Every declared scenario must be implemented by every driver. A client that quietly stops covering one fails rather than falls silent |
+| **Behaviour** | Observations must match what is declared. This is what a per-language suite cannot do: three suites can each have a `failover` test and disagree about what failover means |
+
+**It has been shown to go red.** Breaking the Python driver so its walk stopped
+one page early produced `documents_seen: expected 250, observed 200` while the
+other two passed. A suite that has never failed is a suite nobody has tested,
+which is the same reason the route scanner asserts it matched something.
+
+**And it found a defect on its first full run:** the specification had claimed
+collection creation was idempotent since M10 task 1, while the server has
+always returned `409`. Nothing had caught it because **nothing ever created a
+collection twice** — the contract test's coverage assertion checks that every
+operation is exercised, not that every documented outcome is.
+
+---
+
 ## Benchmarks are not tests, and one of them drives the server
 
 `cargo bench -p kimmyd --bench http` is the odd one out: it spawns the shipped

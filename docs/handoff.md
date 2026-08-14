@@ -6,16 +6,15 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 task 10 done, on a branch awaiting review**
+## As of 2026-08-14 — **M10 task 11 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1–9 are merged (#65–#74, including the
-change-stream fixes that came out of task 9), and task 10 is on
-`m10-go-client` with a PR open and unmerged.
+**M0–M9 complete.** M10 tasks 1–10 are merged (#65–#75), and task 11 is on
+`m10-conformance` with a PR open and unmerged.
 
-**Three clients now exist, share no code, and pass the same scenario list.**
-That is exactly the arrangement task 11 was waiting for: the conformance suite
-is a matter of running one set of scenarios three ways rather than inventing
-them. Tasks 11 and 12 are what remain.
+**Three clients are now held to one set of scenarios** rather than to three of
+their own — sixteen scenarios, forty-eight runs, one oracle. **Task 12 is all
+that remains**: an example application per language, a mutation pass over the
+milestone diff, and the closeout.
 
 Every reserved decision so far went to the maintainer first, as every M8 and M9
 one did. Task 1: hand-written specification, checked by a contract test that
@@ -45,18 +44,20 @@ Task 9: `clients/python`, package `kimmydb`, synchronous on `httpx` and
 
 Task 10: `clients/go`, package `kimmydb`, one dependency, with its own CI job.
 
-**Next is task 11**, the conformance suite, off fresh `main` once task 10
-merges. No reserved decision, but one worth settling early: **what the suite
-*is*.** Three languages already run the same scenarios in three test suites, so
-the honest question is whether task 11 writes a fourth thing that drives all
-three, or turns the existing three into one declared list they each execute.
-The first is a new harness; the second is a shared file of scenarios plus a
-thin runner per language, which is closer to what the milestone was after —
-"one set of scenarios, run three ways" — and much harder to let drift.
+Task 11: `clients/conformance` — a declared scenario list, a driver per client,
+and a runner that compares.
 
-**The scenario list already exists** in three places: `crates/kimmy-client/tests`,
-`clients/python/tests`, and `clients/go/kimmydb`. They match today because they
-were written to match. Nothing enforces that, which is the gap task 11 closes.
+**Next is task 12**, the last one: an example application per language, a
+mutation pass over the milestone diff, and the closeout. No reserved decision.
+
+Two notes for it. The examples are meant to be **something real end to end** —
+documents, a change stream, a vector search — not a snippet that inserts one
+record; the deferred decision named *running KimmyDB on something real* as the
+trigger for judging this whole direction, and these are that. And the mutation
+pass is `cargo mutants --in-diff` over the milestone's Rust diff, as M7 and M8
+both closed; the clients are not Rust, so what it covers is the server-side
+half — the specification's contract test, the error taxonomy, the topology
+registry and the change-stream fixes.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -128,7 +129,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-rust-client` | ✅ Merged as #72. M10 task 8: `kimmy-client`, the CLI converted, [Clients](clients.md) |
 | `m10-python-client` | ✅ Merged as #73. M10 task 9: `clients/python`, the `kimmydb` package, a CI job |
 | `drop-invalidates-change-streams` | ✅ Merged as #74. Three change-stream defects: the drop invalidate, the unpublished replicated DDL, and a recreated collection serving the dead one's history |
-| `m10-go-client` | **Open, PR raised, not merged.** M10 task 10: `clients/go`, package `kimmydb`, a CI job |
+| `m10-go-client` | ✅ Merged as #75. M10 task 10: `clients/go`, package `kimmydb`, a CI job |
+| `m10-conformance` | **Open, PR raised, not merged.** M10 task 11: `clients/conformance`, three drivers, a CI job |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -257,7 +259,7 @@ work.
 | 8 | ✅ **Rust client**, `kimmy-client`; the CLI is its consumer | Settled: `reqwest`, already in the tree |
 | 9 | ✅ **Python client** | Settled: `httpx` + `websockets`, sync first |
 | 10 | ✅ **Go client** | Settled: stdlib `net/http` + `coder/websocket` |
-| 11 | **Conformance suite all three clients pass** | — |
+| 11 | ✅ **Conformance suite all three clients pass** | — |
 | 12 | **One example app per language** + mutation pass and closeout | — |
 
 **M9 is done, so nothing blocks M10.** Task 6 inherits the cursor design
@@ -609,6 +611,38 @@ including the change stream, and cancelling it is how watching stops.
 because it was least likely to surface a gap the other two had missed. Two
 clients and a specification had already taken the surprises, and the third
 agreeing is the evidence task 11 rests on.
+
+### What task 11 did, and the defect it exposed
+
+`clients/conformance` holds all three clients to **one** set of scenarios. A
+declared list with the observations a correct client must produce, a small
+driver per client that runs a named scenario and prints what it saw, and a
+runner that starts a fresh node per scenario and compares. Sixteen scenarios,
+three clients, forty-eight runs.
+
+**A driver reports; it never judges.** Three clients that each decided whether
+they had passed would be three opinions rather than one oracle and three
+answers. Coverage is checked separately from behaviour, because a client that
+stops implementing a scenario must fail rather than fall silent.
+
+**Shown to go red.** The Python driver, made to stop one page early, produced
+`documents_seen: expected 250, observed 200` while the other two passed. A
+suite that has never failed is a suite nobody has tested.
+
+**And it found a real defect on its first full run.** The specification had
+said since M10 task 1 that collection creation is idempotent — "Created, or
+already present" — and the server has always returned `409 conflict`. Both
+clients repeated the claim in a comment.
+
+**Nothing caught it because nothing ever created a collection twice.** The
+contract test's coverage assertion checks that every *operation* is exercised,
+not that every documented *outcome* is, so a false sentence about the second
+call went unchallenged through four tasks. It is now corrected in the
+specification, in both clients, in the contract test, and as a conformance
+scenario — four places, because the claim was in four places.
+
+**Worth carrying forward:** a documented outcome that no test produces is the
+next place to look for this kind of error.
 
 ### The change-stream fix, and the second defect it exposed
 
