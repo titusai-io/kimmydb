@@ -2503,6 +2503,83 @@ since that is the mechanism rather than an overhead beside it.
 
 ---
 
+## ADR-058 — `/v1` does not break, and a node says what it can do
+
+**Decision.** The path carries the major version and **`/v1` never breaks**.
+Additive changes ship in it without ceremony; anything that would break a
+correct `/v1` client mints `/v2`, served alongside `/v1` for at least one minor
+release line and no less than six months. There is no version header, no
+per-request pinning, and no compatibility shim layer. `GET /v1/version` reports
+the protocol version, the build, the node that answered, and a **capability
+list**. [Compatibility](compatibility.md) is the policy in full; this records
+why it has that shape.
+
+M10 task 3 of [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud).
+
+**Rejected: date-versioned requests, Stripe style.** A client pins
+`Kimmy-Version: 2026-08-13` and the server keeps a transformation shim per
+released version. It is the strongest compatibility story available and it lets
+the wire evolve freely — and it costs a shim layer that grows without bound and
+has to be *exercised* for every version it claims to support, or it is a
+promise nothing checks, which is the failure mode this milestone exists to end.
+Stripe can afford that; a one-maintainer project taking it on before shipping a
+single client would be buying a permanent tax against a hypothetical.
+
+**Rejected: additive-only forever, with no `/v2` ever.** Simplest to state and
+easiest to keep honest, but it is a bet that no breaking change will ever be
+worth making. When one is, the escape hatch would be an unplanned emergency
+rather than a documented path. The current decision keeps the same discipline
+in practice — `/v2` is meant to be rare — while writing down what happens if it
+is not.
+
+**The capability list is the load-bearing half, and it is not a version
+number.** A client is handed one address and, once task 5 lands, will
+round-robin across a cluster whose nodes are upgraded one at a time. So the
+node answering the next request can be older than the one that answered the
+last, and the question a client actually has is "does *this* node have the
+feature I am about to use". A version number answers that only if the client
+also carries a table mapping versions to features — which is exactly the table
+`/v1/version` exists to replace, and exactly the table that goes stale in every
+client independently.
+
+`Capability` is an enum for the same reason `ErrorCode` is (ADR-057): the set
+is public surface, and a hand-kept list drifts from what it describes. Twelve
+of the thirteen are constant for a given build, which is not a reason to omit
+them — a client asking may be talking to a node from before the feature
+existed. The thirteenth, `local-embeddings`, varies *today*, between two builds
+of the same version, which is what keeps the list a question rather than a
+decoration.
+
+**Unauthenticated, deliberately.** A client must be able to negotiate before it
+holds a token — whether a refresh route exists is precisely what it wants to
+know while logging in. `/readyz` already discloses the node id without
+credentials and the build version is on every release artifact, so this adds no
+fact an observer could not have. The rule it must not break is the one in
+[Security](security.md): an unauthenticated endpoint must not leak the
+*schema*. This names no database, collection or user.
+
+**What is mechanism and what is prose.** The distinction is recorded because
+this project has been wrong before about claims nothing checked. The contract
+test enforces that every versioned route sits under `/v1/`, that the prefix
+agrees with both the server's reported protocol and the specification's
+`info.version`, that the served capability set is exactly the documented one
+and that each capability is explained, and that **no response schema forbids
+unknown properties** — which is what makes "a new response field is additive"
+true rather than intended, since a validating client would otherwise break on
+the next field added, silently, and only for them. The six-month window and
+"changing what a route means is breaking" are prose: one is a promise about
+calendar time, the other cannot be detected by anything that reads shapes.
+
+**The contrast with the cluster wire is the point.** SWIM identities are
+postcard-encoded and not self-describing, so a field change there breaks
+membership outright — three stop-the-cluster upgrades are already documented
+(ADR-040, ADR-051, ADR-053). Two wires, two opposite properties, each right for
+its side: the internal one is optimized for size and changed under an outage
+window that the operator schedules; the client one is optimized for never
+needing one.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

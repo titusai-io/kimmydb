@@ -6,24 +6,28 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-13 — **M10 task 2 done, on a branch awaiting review**
+## As of 2026-08-13 — **M10 task 3 done, on a branch awaiting review**
 
-**M0–M9 complete.** M10 tasks 1 and 2 are done: task 1 merged as #65, task 2 is
-on `m10-error-taxonomy` with a PR open and unmerged.
+**M0–M9 complete.** M10 tasks 1–3 are done: #65 and #66 merged, task 3 is on
+`m10-versioning` with a PR open and unmerged.
 
-Both reserved decisions went to the maintainer first, as every M8 and M9
-reserved decision did. Task 1: hand-written specification, checked by a contract
-test that validates **live responses** rather than only the route inventory
-([ADR-056](decisions.md)). Task 2: a typed `ErrorCode` enum, and retryability
-declared **three-valued** — `no` / `wait` / `elsewhere` — because leaderless
-replication makes "ask a different node" a real answer ([ADR-057](decisions.md)).
+Every reserved decision so far went to the maintainer first, as every M8 and M9
+one did. Task 1: hand-written specification, checked by a contract test that
+validates **live responses**, not only the route inventory ([ADR-056](decisions.md)).
+Task 2: a typed `ErrorCode` enum, retryability **three-valued** — `no` / `wait`
+/ `elsewhere` — because leaderless replication makes "ask a different node" a
+real answer ([ADR-057](decisions.md)). Task 3: `/v1` does not break, and a node
+advertises **capabilities** rather than expecting clients to map versions to
+features ([ADR-058](decisions.md)).
 
-**Next is task 3**, the versioning and compatibility policy, off fresh `main`
-once task 2 merges. Its reserved decision — the shape of the promise — comes
-first. Two pieces of it are already load-bearing and should be stated rather
-than rediscovered: the error envelope carries `retry`, which is what makes
-adding a code additive rather than breaking, and `docs/openapi.yaml` plus its
-contract test are what make any compatibility claim checkable at all.
+**Next is task 4**, token refresh, off fresh `main` once task 3 merges. Its
+reserved decision — a separate refresh token versus sliding re-issue of the
+access token — comes first, and **the security half is the real work**: refresh
+must re-read the user record and re-check `token_version` and `disabled`, or it
+launders a revoked session indefinitely, which is the exact failure ADR-052
+exists to prevent. Task 4 also owes a new `Capability` variant, because a
+client needs to discover refresh before it can use it — that is now the pattern
+for every client-visible feature.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -86,7 +90,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 |---|---|
 | `main` | PRs #16–#63 merged: all of M8 and all of M9, SWIM authentication (ADR-053), the witnessed vector (ADR-054), ADR-055 and the M10 board |
 | `m10-protocol-spec` | ✅ Merged as #65. M10 task 1: `docs/openapi.yaml`, its contract test, ADR-056 |
-| `m10-error-taxonomy` | **Open, PR raised, not merged.** M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
+| `m10-error-taxonomy` | ✅ Merged as #66. M10 task 2: `ErrorCode` as an enum, the three-valued retry class, `JsonBody`, ADR-057 |
+| `m10-versioning` | **Open, PR raised, not merged.** M10 task 3: `docs/compatibility.md`, `GET /v1/version`, the `Capability` enum, ADR-058 |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -207,7 +212,7 @@ work.
 |---|---|---|
 | 1 | ✅ **Protocol specification** (OpenAPI 3.1) + a contract test | Settled: hand-written, checked by inventory *and* live responses (ADR-056) |
 | 2 | ✅ **Error taxonomy as public surface** | Settled: three-valued `no`/`wait`/`elsewhere`, closed by an enum (ADR-057) |
-| 3 | **Versioning and compatibility policy** | The shape of the promise |
+| 3 | ✅ **Versioning and compatibility policy** | Settled: path-major, `/v1` never breaks, capabilities over version numbers (ADR-058) |
 | 4 | **Token refresh** | Refresh token vs. sliding re-issue |
 | 5 | **Client-visible topology / discovery** | Static config vs. live SWIM membership |
 | 6 | **Cursors at the protocol level** | — (M9 task 5 settled the shape) |
@@ -307,6 +312,45 @@ new envelope, and a second that parses the retry table out of the specification
 and checks it against the wire — seven codes observed, including `misconfigured`
 as `elsewhere`, provoked by pointing a collection at an API key environment
 variable the node does not have.
+
+### What task 3 did, and the shape it sets for tasks 4–12
+
+[Compatibility](compatibility.md) is the policy: the path carries the major,
+`/v1` does not break, additive changes ship in it without ceremony, and
+anything breaking mints `/v2` served alongside for at least one minor line and
+six months. Date-versioned requests were rejected — a shim layer per released
+version has to be *exercised* to mean anything, and that is a permanent tax
+taken on before the first client exists.
+
+**`GET /v1/version` is the load-bearing half, and it advertises capabilities
+rather than a number.** Nodes are upgraded one at a time, so a client that
+round-robins meets nodes of different ages; "does this node have the feature I
+am about to use" is not a question a version number answers unless the client
+also carries a version→feature table, which is the table that goes stale in
+every client independently. `Capability` is an enum checked against the
+specification, like `ErrorCode`.
+
+**Every client-visible feature from here on owes a capability**, and tasks 4
+and 5 are the first two — refresh and topology are exactly the things a client
+must detect rather than assume.
+
+**Four claims became mechanism**, which is the part worth keeping:
+
+- Every versioned route is under `/v1/`, and the prefix agrees with the
+  server's reported protocol *and* `info.version` in the specification.
+- The advertised capabilities are the documented ones, each with an
+  explanation rather than only a name.
+- **No response schema forbids unknown properties.** Without it, "a new
+  response field is additive" is false for any client that validates — it would
+  break on the next field added, silently, and only for them.
+- The default build must not advertise `local-embeddings`, which is what proves
+  the list is answered per build rather than asserted.
+
+**Two things stay prose and are marked as such** in the policy: the six-month
+window, which is a promise about calendar time, and "changing what a route
+means is breaking", which nothing reading shapes can detect. Naming them is the
+point — the failure this milestone keeps finding is a claim that reads like a
+mechanism and is not one.
 
 **Only task 5 carries distributed-systems risk**, and it carries two known
 traps at once: `Members` holds *peers only*, and the set must contain only

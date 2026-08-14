@@ -23,6 +23,9 @@ pub fn router(state: SharedState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/auth/login", post(login))
+        // Public for the same reason the health routes are: a client has to be
+        // able to ask what a node supports before it holds a token.
+        .route("/v1/version", get(crate::version::version))
         .route("/v1/admin/backup", get(backup))
         .route("/v1/auth/whoami", get(crate::users::whoami))
         .route("/v1/users", get(crate::users::list_users).post(crate::users::create_user))

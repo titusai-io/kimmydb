@@ -618,6 +618,9 @@ a *document*.
 | The server's error codes and the specification's are the same set, with the same retry class | `every_error_code_is_specified_with_the_retry_class_the_server_uses` |
 | A wrong-shaped body carries the envelope on a route that is not `/bulk` | inside `documented_refusals_use_the_documented_envelope` |
 | A non-upgrade request to `/watch` carries the envelope | same test |
+| Every versioned route is under `/v1/`, and the server, the routes and `info.version` agree | `every_versioned_route_carries_the_protocol_major` |
+| No response schema forbids unknown properties, so adding a field stays additive | `no_response_schema_forbids_the_fields_it_has_not_seen` |
+| The advertised capabilities are the documented ones, each with an explanation | `the_capability_set_is_the_documented_one` |
 
 The coverage assertion is the load-bearing part: it means a route cannot be
 added to the router and the specification without also being driven here. A

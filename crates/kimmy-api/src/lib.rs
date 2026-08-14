@@ -25,6 +25,7 @@ pub mod sessions;
 pub mod state;
 pub mod users;
 pub mod vectors;
+pub mod version;
 pub mod watch;
 pub mod webhooks;
 

@@ -942,6 +942,45 @@ the suite — which had passed the whole time:
 
 ---
 
+## 🟢 `/v1` has a written promise, and a node says what it can do (M10 task 3)
+
+**Was.** The path said `v1` and nothing said what that meant. No document
+stated what could change under a client, and **nothing exposed a version over
+HTTP at all** — the build version was in the startup log and in the MCP
+handshake, so a client could not ask what it was talking to.
+
+**Now.** [Compatibility](compatibility.md) is the policy: `/v1` does not break,
+additive changes ship in it, anything breaking mints `/v2` served alongside for
+a stated window. `GET /v1/version` reports the protocol, the build, the node
+that answered, and a **capability list**. [ADR-058](decisions.md) has the
+reasoning, including why date-versioned requests were rejected.
+
+**Capabilities rather than a version number**, because nodes are upgraded one
+at a time and a round-robin client can reach an older node right after a newer
+one. A number answers "can I use this feature" only if the client also carries
+a table mapping versions to features — the table this replaces, and the table
+that goes stale in every client independently. `Capability` is an enum, checked
+against the specification like the error codes.
+
+**Four claims became mechanism**, which is what separates this from the last
+time a compatibility property lived in prose:
+
+- Every versioned route is under `/v1/`, and the prefix agrees with the
+  server's reported protocol *and* the specification's `info.version`.
+- The advertised capability set is exactly the documented one, and every
+  capability has an explanation rather than only a name.
+- **No response schema forbids unknown properties.** Without this, "a new
+  response field is additive" is false for any client that validates — it would
+  break on the next field added, silently, and only for them.
+- The default build must *not* advertise `local-embeddings`, which is what
+  proves the list is answered per build rather than asserted.
+
+**Two things stay prose, and are marked as such**: the six-month `/v2` window,
+which is a promise about calendar time, and "changing what a route means is
+breaking", which nothing that reads shapes can detect.
+
+---
+
 ## 🟡 Sharding is deferred until there is experience
 
 **Raised and explicitly postponed on 2026-08-11**, after the surface was
