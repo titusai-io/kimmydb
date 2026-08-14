@@ -2580,6 +2580,65 @@ needing one.
 
 ---
 
+## ADR-059 — Refresh is sliding re-issue of the access token, not a second credential
+
+**Decision.** `POST /v1/auth/refresh` takes a valid token in the ordinary
+`Authorization` header and returns a fresh one. There is no refresh token, no
+stored session, and no grace for an expired token. Login and refresh both
+report `expiresIn`, so a client schedules its own renewal without decoding
+anything.
+
+M10 task 4 of [ADR-055](#adr-055--the-client-protocol-is-httpjson-and-websocket-said-out-loud).
+
+**The security half was the real work, and it is a property of the route's
+shape rather than of code inside it.** Refresh takes the `Auth` extractor, so
+the presented token goes through exactly the check every other route applies:
+signature, expiry, and the storage read that makes deletion, disabling and a
+token-version bump take effect immediately ([ADR-052](#adr-052--token-revocation-is-a-per-user-version-checked-against-a-cache-the-oplog-keeps-honest)).
+A token refused there never reaches the handler. **Refresh cannot launder a
+revoked session**, and it cannot do so by construction rather than by
+remembering to check — which matters, because the checking version of this is
+one forgotten line away from being an indefinite session-laundering endpoint.
+
+The new token is built from a **fresh read of the user record**, not from the
+old token's claims. Today that cannot differ — any change to grants bumps the
+version, so the extractor would already have refused — but a route that
+carries authority forward must read the authority, not copy it.
+
+**Rejected: a separate refresh token.** It buys the offline case: an
+application idle overnight resumes without stored credentials. It costs two
+credentials to store and two lifetimes to reason about, and its apparent
+advantage does not survive contact with this design — the only revocation
+available is bumping `token_version`, which invalidates *every* token that user
+holds, so a refresh token is not separately revocable and the granularity it
+seems to offer is not there.
+
+**Rejected: stored, rotating refresh tokens with reuse detection.** The
+strongest story on paper, and it fits this architecture badly. Rotation is a
+compare-and-set on a replicated record, which a leaderless store does not
+offer: a client that rotates against one node and then reaches another
+mid-replication can be told its live credential is unknown, and two concurrent
+rotations resolve by last-writer-wins — discarding a token a client is holding.
+Every failure mode is a client logged out for a reason it cannot see.
+
+**Rejected: a grace window for refreshing a recently expired token.** It would
+soften the idle case without a second credential, and it would make `exp` mean
+two different things depending on which route reads it. One of those two
+readers gets it wrong eventually, and the reader that matters is the security
+one.
+
+**What this deliberately does not fix.** The old token keeps working until it
+expires; a stateless token cannot be recalled. Ending a session early is what
+the version bump is for. And a client idle longer than `token_ttl_secs` logs in
+again — which is a thing a library may ask of an application, where re-sending
+credentials every hour is not. That distinction is the whole point of the task.
+
+**Not rate-limited.** The login limiter bounds Argon2 work
+([ADR-038](#adr-038--login-is-rate-limited-before-the-password-is-checked));
+refresh verifies a signature and reads one cached record, so a limit there
+would defend nothing and would throttle the healthy case this route exists to
+serve.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

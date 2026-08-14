@@ -29,7 +29,7 @@ tolerate additions. The rules below say exactly which ones.
 |---|---|
 | A **new route** | Nothing existing changes |
 | A **new optional request field** | Omitting it keeps the previous behaviour |
-| A **new response field** | A client that reads the fields it knows is unaffected |
+| A **new response field** | A client that reads the fields it knows is unaffected. `expiresIn` on the login response, added in task 4, is the first one spent |
 | A **new error code** | The envelope carries `retry`, so a client acts correctly on a code it has never seen ([ADR-057](decisions.md)) |
 | A **new value in a response enum** a client is told to tolerate | `capabilities` is the case that exists today |
 | A **new capability** in `GET /v1/version` | It is a fact about the node, not a change to any route |
