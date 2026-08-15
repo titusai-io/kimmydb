@@ -2308,16 +2308,30 @@ components:
       properties:
         strategy:
           type: string
-          enum: [collectionScan, index, indexUnion]
+          enum: [collectionScan, index, indexUnion, idLookup]
           description: |
             `indexUnion` is a union of equality probes — the shape `$in`
             planning produces — and is named rather than folded into `index`
             because it is a different amount of work.
+
+            `idLookup` means the filter pinned `_id` and the documents were
+            read through the primary key, consulting no index. It is reported
+            for an `_id` equality and for an `$in` over `_id`, and `index` is
+            null for it because none was used and none needs to exist. A
+            filter naming `_id` inside an `$or`, or with a range rather than an
+            equality, is not an `idLookup`.
+
+            A new strategy name is an additive change under the compatibility
+            policy: treat an unrecognized value as "some access path this
+            client does not know about" rather than as an error.
         index:
           oneOf:
             - type: string
             - type: "null"
-          description: The index used, or null for a collection scan.
+          description: |
+            The index used. Null for a collection scan, and null for
+            `idLookup`, where the primary key answered and no index was
+            consulted.
         indexFieldsUsed: { type: integer }
         documentsExamined: { type: integer }
         documentsMatched: { type: integer }

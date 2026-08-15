@@ -996,7 +996,7 @@ in [Deviations](deviations.md):
 
 | Debt | |
 |---|---|
-| `find {_id}` is a collection scan — the planner never consults the primary key. `GET /docs/{id}` is the point path | found during M8 task 2; still open |
+| ~~`find {_id}` is a collection scan~~ | **Closed 2026-08-14.** `plan::choose_primary_key`: 7.328 ms → 0.540 ms p50 over 10k documents, examined 10,000 → 1. `update`/`delete`/`count` inherit it. Ranges on `_id` are deliberately still out |
 | **Index scans return `_id` order, not index order** — so sorted paging still uses `skip`, and every sorted `find` materialises its whole match set | the largest known performance item; see "how to size the next thing" |
 | Rate limiting covers login only | waits on a capacity decision |
 | `update` and `delete` apply document by document and can stop partway — bulk *insert* is atomic, they are not. They *do* use the planner now (#60) | by design |

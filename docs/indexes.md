@@ -52,8 +52,33 @@ curl -XPOST .../orders/find -H "$A" -d '{"filter":{"qty":7},"explain":true}'
   } }
 ```
 
-`strategy` is `index` or `collectionScan`. Watching `documentsExamined` fall
-while `documentsMatched` stays the same is the whole point of an index.
+`strategy` is `index`, `collectionScan`, `indexUnion` or `idLookup`. Watching
+`documentsExamined` fall while `documentsMatched` stays the same is the whole
+point of an index.
+
+## `_id` needs no index
+
+**A filter that pins `_id` is answered through the primary key**, reported as
+`"strategy": "idLookup"` with `index: null` — no index was consulted and none
+needs to exist. It applies to an equality and to an `$in` over `_id`, and
+`update`, `delete` and `count` get it as well as `find`.
+
+```jsonc
+{ "_id": 4171 }                  // idLookup — one read
+{ "_id": {"$in": [1, 2, 3]} }    // idLookup — one read per value
+{ "_id": {"$gt": 100} }          // scan — a range, not a set of probes
+{ "$or": [{"_id": 1}, {"qty": 3}] }
+                                 // scan — a disjunction constrains nothing
+                                 //        that must hold of every match
+```
+
+Over 10,000 documents this is 7.3 ms → 0.5 ms; see [Benchmarks](benchmarks.md).
+`GET /v1/db/{db}/coll/{coll}/docs/{id}` is still slightly cheaper, because it
+does no filter parsing or planning, but it is no longer a difference worth
+restructuring an application around.
+
+**Creating an index on `_id` is not useful** and the fast path does not need
+one. If you have one, it is maintained on every write for nothing.
 
 **`update` and `delete` take `explain` too, and plan the same way.** They did
 not until M9 — both scanned the collection however selective the filter was,

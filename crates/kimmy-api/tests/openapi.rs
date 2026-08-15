@@ -810,6 +810,31 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     assert_eq!(page["count"], 2);
     assert!(page["nextCursor"].is_string(), "a full page offers a cursor: {page}");
 
+    // The `idLookup` strategy, driven rather than only declared. M10 task 11's
+    // lesson was that a documented *outcome* no test produces is where the
+    // next false sentence hides — the specification claimed idempotent
+    // collection creation for four tasks because nothing ever created one
+    // twice. A strategy name in the enum that no request returns is the same
+    // shape of claim.
+    // A real `_id` from the page just read, in whatever Extended JSON shape it
+    // has, rather than a guessed literal — the filter round-trips the value the
+    // server itself just sent.
+    let existing_id = page["documents"][0]["_id"].clone();
+    let by_id = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find",
+            "/v1/db/shop/coll/orders/find",
+            Some(&root),
+            Some(json!({ "filter": { "_id": existing_id }, "explain": true })),
+            200,
+        )
+        .await;
+    assert_eq!(by_id["explain"]["strategy"], "idLookup", "{by_id}");
+    assert_eq!(by_id["explain"]["index"], Value::Null, "the primary key is not an index");
+    assert_eq!(by_id["explain"]["documentsExamined"], 1, "one read, not a scan: {by_id}");
+    assert_eq!(by_id["count"], 1, "{by_id}");
+
     c.check(
         "POST",
         "/v1/db/{db}/coll/{coll}/count",

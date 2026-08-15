@@ -365,6 +365,11 @@ an index was used:
                "documentsExamined": 10, "documentsMatched": 10 } }
 ```
 
+`strategy` is `collectionScan`, `index`, `indexUnion` (a `$in` union of
+probes) or `idLookup` (the filter pinned `_id`, answered through the primary
+key with no index). Treat an unrecognized value as an access path this client
+does not know about — new names are additive.
+
 ---
 
 ## Change streams
