@@ -41,26 +41,74 @@ const MIN_EF_SEARCH: usize = 50;
 /// close to free; exhaustive checking would cost as much as the build itself.
 const REACHABILITY_SAMPLE: usize = 128;
 
-/// How many sampled misses mean the graph orphaned data, rather than merely
-/// approximated.
+/// What a sampled probe found, split by what the answer means.
 ///
-/// **Not zero, and the difference matters.** A healthy graph still fails to
-/// self-retrieve a couple of points in four hundred — a vector sitting among
-/// near-duplicates gets edged out by a neighbour, which is approximation
-/// working as designed. Measured over 400 builds the full-collection miss count
-/// runs median 2, p99 10. In a [`REACHABILITY_SAMPLE`] of 128 that is around
-/// 0.6 expected misses, so retrying on any miss at all would rebuild most
-/// collections two extra times for nothing.
+/// The split is the point. A missed probe is two different events added
+/// together — a search that ran out of budget, and a point the graph cannot
+/// reach at all — and only the second is data loss. An ordinary search explores
+/// a fixed amount, so the first grows as a collection does while the second
+/// does not, and adding them gave a threshold that could not hold at more than
+/// one collection size.
+#[derive(Default, Debug, Clone, Copy)]
+struct Reachability {
+    /// Points probed. Zero for a collection too small to sample.
+    sampled: usize,
+    /// Probes that did not return their own point at ordinary search effort.
+    missed: usize,
+    /// Of those, the ones still missing when effort stops being the limit.
+    unreachable: usize,
+}
+
+/// How hard a second look is, before a miss is called data loss.
 ///
-/// An orphaned build loses a tenth of the collection or more, which is ~13
-/// expected misses in the same sample. Three separates them.
+/// Sized from the plateau, which is also what proved the original diagnosis:
+/// re-probing the missed points at 200, 400, 800 and 1600 changes the answer
+/// between 200 and 800 and then stops. Past the plateau more exploration buys
+/// nothing, because no amount of exploring crosses into a part of the graph
+/// that has no edges leading to it.
+const REACHABILITY_CONFIRM_EF: usize = 800;
+
+/// How many neighbours the second look asks for.
 ///
-/// **The measured cost is one rebuild for 11.2% of builds** — about 1.11×
-/// the build work overall, against eliminating a defect that silently dropped
-/// a tenth of a collection out of every search result. Worth stating because
-/// the first estimate here was 3%, taken from an assumed miss rate rather than
-/// the observed one; the number above is from 1,500 builds.
-const REACHABILITY_MAX_MISSES: usize = 3;
+/// Not one. Identical vectors are all at distance zero, so a `k` of one can
+/// return a different point that is exactly as close and report a miss that is
+/// not one.
+const REACHABILITY_CONFIRM_K: usize = 32;
+
+/// How many unreachable points in a sample mean the graph lost data, rather
+/// than being the graph HNSW ordinarily produces.
+///
+/// **Not zero, and not for the reason this comment used to give.** An earlier
+/// revision said a healthy miss was a vector among near-duplicates getting
+/// edged out by a neighbour — approximation working as designed. That was
+/// assumed, and it is wrong: re-probed at [`REACHABILITY_CONFIRM_EF`] those
+/// points are still not found, so they are not edged out, they are genuinely
+/// unreachable. **Every graph this builds orphans a little.** Over 599 healthy
+/// builds at 400 vectors, checking every point rather than a sample, the true
+/// orphaned fraction ran **0.8% to 3.0%** — never zero.
+///
+/// So the threshold separates *routine* orphaning from *catastrophic*
+/// orphaning, and both sides are measured:
+///
+/// | | true orphaned | sampled score |
+/// |---|---|---|
+/// | 599 healthy builds | 0.8%–3.0% | 0–5, median 1 |
+/// | the 1 catastrophic build | 14.8% | **22** |
+///
+/// Across a further 126 builds spanning 16 and 384 dimensions and 500 to 8,000
+/// vectors, no healthy build scored above 7. **Eight sits above every healthy
+/// observation and far below the only bad one**, and a catastrophic build at
+/// the mildest fraction on record (10%) still expects ~13 of 128 — with
+/// [`MAX_BUILD_ATTEMPTS`] fresh draws behind it.
+///
+/// **This was 3, sized against a 400-vector, 16-dimensional fixture, and the
+/// shape depends on both.** At 384 dimensions — the realistic embedding width —
+/// misses grow steeply with collection size, so `3` fired on 7 builds in 10 at
+/// 4,000 vectors: every such build was discarded, rebuilt twice, and then
+/// reported as losing data. A 3× cost and a false alarm, on a healthy graph.
+/// [`REACHABILITY_CONFIRM_EF`] removes most of that growth and this threshold
+/// covers the rest.
+const REACHABILITY_MAX_UNREACHABLE: usize = 8;
 
 /// How many times a build that loses data is discarded and retried.
 ///
@@ -181,24 +229,26 @@ impl HnswIndex {
     ) -> Result<Self> {
         let mut built = Self::build_once(engine, shadow, metric, dim)?;
         for attempt in 1..=MAX_BUILD_ATTEMPTS {
-            if built.1 < REACHABILITY_MAX_MISSES {
+            if built.1.unreachable < REACHABILITY_MAX_UNREACHABLE {
                 return Ok(built.0);
             }
             debug!(
                 attempt,
-                misses = built.1,
+                unreachable = built.1.unreachable,
+                missed = built.1.missed,
                 vectors = built.0.keys.len(),
                 "HNSW build left data unreachable; rebuilding"
             );
             built = Self::build_once(engine, shadow, metric, dim)?;
         }
-        if built.1 >= REACHABILITY_MAX_MISSES {
+        if built.1.unreachable >= REACHABILITY_MAX_UNREACHABLE {
             // Never fail: a poor index still answers, and refusing to build one
             // would take vector search down entirely over a quality problem.
             // The caller gets a working index and the operator gets a warning.
             tracing::warn!(
                 vectors = built.0.keys.len(),
-                misses = built.1,
+                unreachable = built.1.unreachable,
+                sampled = built.1.sampled,
                 "HNSW index still loses data after {MAX_BUILD_ATTEMPTS} rebuilds; \
                  searches on this collection may be incomplete"
             );
@@ -224,7 +274,7 @@ impl HnswIndex {
         shadow: &CollectionMeta,
         metric: Metric,
         dim: usize,
-    ) -> Result<(Self, usize)> {
+    ) -> Result<(Self, Reachability)> {
         if !Self::supports(metric) {
             return Err(VectorError::MalformedResponse {
                 provider: "hnsw",
@@ -281,17 +331,42 @@ impl HnswIndex {
         // records are still in hand here, so this costs a few dozen searches
         // and no extra reads.
         let n = index.keys.len();
-        let mut misses = 0;
+        let mut reach = Reachability::default();
         if n >= REACHABILITY_SAMPLE {
             let stride = (n / REACHABILITY_SAMPLE).max(1);
             for i in (0..n).step_by(stride).take(REACHABILITY_SAMPLE) {
+                reach.sampled += 1;
                 let found = index.search_keys(&records[i].vector, 1, None)?;
-                if found.first() != index.keys.get(i) {
-                    misses += 1;
+                if found.first() == index.keys.get(i) {
+                    continue;
+                }
+                reach.missed += 1;
+                // Asked again with a much larger budget. An ordinary search is
+                // a fixed amount of exploration, so as a collection grows the
+                // same budget covers less of it and a reachable point starts
+                // being missed for want of looking — which is a fact about the
+                // query, not about the graph. Only a point that stays missing
+                // when the budget stops mattering is one the graph has lost.
+                if !index.finds_itself(&records[i].vector, i) {
+                    reach.unreachable += 1;
                 }
             }
         }
-        Ok((index, misses))
+        Ok((index, reach))
+    }
+
+    /// Whether `id` comes back for its own vector when effort stops being the
+    /// limit.
+    ///
+    /// `k` above one matters as much as the wide `ef`: two identical vectors
+    /// are both at distance zero, so a `k` of one can return the other and
+    /// report a miss that has nothing to do with reachability.
+    fn finds_itself(&self, query: &[f32], id: usize) -> bool {
+        let neighbours = match &self.graph {
+            Graph::Cosine(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
+            Graph::Euclidean(g) => g.search(query, REACHABILITY_CONFIRM_K, REACHABILITY_CONFIRM_EF),
+        };
+        neighbours.iter().any(|n| n.d_id == id)
     }
 
     /// Whether the collection has drifted far enough to justify a rebuild.
@@ -568,6 +643,179 @@ mod tests {
             index.search_keys(&[0.0; 4], 5, None).err(),
             Some(VectorError::DimensionMismatch { .. })
         ));
+    }
+
+    /// A healthy graph at a realistic embedding width is not treated as broken.
+    ///
+    /// This is the regression test for the defect that this change fixes, and
+    /// it is deliberately at 384 dimensions rather than the 16 the other tests
+    /// use. The threshold it guards was sized against a 400-vector,
+    /// 16-dimensional fixture, and both of those turned out to matter: at 384
+    /// dimensions a fixed search budget covers proportionally less of a growing
+    /// collection, so ordinary misses climbed with size until *every* build at
+    /// 4,000 vectors was discarded, rebuilt twice, and then reported as losing
+    /// data. Three times the build cost and a false alarm, on a good graph.
+    ///
+    /// The margin is wide on purpose: measured over 20 builds at this size and
+    /// width, `unreachable` had a median of 1 and never exceeded 4, against a
+    /// threshold of 8. If this starts failing, the thing to measure is
+    /// `reachability_distribution_by_collection_size` — not this number.
+    ///
+    /// **Ignored, and run by its own CI job in release.** A 384-dimensional
+    /// graph costs 146 seconds to build in a debug profile against 21 in
+    /// release, and doubling the default suite to hold one property is a good
+    /// way to have the property removed later. Same arrangement, and the same
+    /// reasoning, as the cluster harness.
+    #[test]
+    #[ignore = "384-dimensional builds are minutes in debug; CI runs this in release"]
+    fn a_healthy_graph_at_a_realistic_width_is_not_rebuilt() {
+        const COUNT: usize = 1_000;
+        const DIM: usize = 384;
+
+        let (engine, shadow, _dir) = setup(COUNT, DIM);
+        for build in 0..3 {
+            let (_, reach) = HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+            assert_eq!(reach.sampled, REACHABILITY_SAMPLE, "the sample must be full at this size");
+            assert!(
+                reach.unreachable <= reach.missed,
+                "a confirmed loss is a subset of the misses it was found among"
+            );
+            assert!(
+                reach.unreachable < REACHABILITY_MAX_UNREACHABLE,
+                "build {build}: a healthy {DIM}-dimensional graph of {COUNT} vectors scored \
+                 {} unreachable of {} sampled ({} missed at ordinary effort) and would be \
+                 discarded and rebuilt",
+                reach.unreachable,
+                reach.sampled,
+                reach.missed,
+            );
+        }
+    }
+
+    /// The distribution the reachability constants are sized from.
+    ///
+    /// Ignored because it builds hundreds of graphs and takes minutes. It
+    /// exists so the numbers in those constants can be re-derived rather than
+    /// trusted — this project has now set them wrongly twice, both times by
+    /// picking a value without knowing the shape of what it bounds, and the
+    /// second time the shape turned out to depend on collection size.
+    ///
+    /// ```bash
+    /// cargo test -p kimmy-vector --release -- --ignored --nocapture reachability
+    /// ```
+    #[test]
+    #[ignore = "builds hundreds of graphs; run it when changing a reachability constant"]
+    fn reachability_distribution_by_collection_size() {
+        // Both axes, because the first cut of this measurement swept only
+        // collection size at 16 dimensions and concluded the miss rate was
+        // flat. It is not. Width drives it far harder than count does, and 384
+        // is the realistic embedding width — the regime that matters is the one
+        // a 16-dimensional fixture does not show.
+        for &(dim, count, builds) in &[
+            (16, 500, 40),
+            (16, 4_000, 12),
+            (384, 500, 30),
+            (384, 1_000, 20),
+            (384, 2_000, 14),
+            (384, 4_000, 10),
+        ] {
+            let (engine, shadow, _dir) = setup(count, dim);
+            let mut missed = Vec::new();
+            let mut unreachable = Vec::new();
+            for _ in 0..builds {
+                let (_, reach) =
+                    HnswIndex::build_once(&engine, &shadow, Metric::Cosine, dim).unwrap();
+                missed.push(reach.missed);
+                unreachable.push(reach.unreachable);
+            }
+            missed.sort_unstable();
+            unreachable.sort_unstable();
+            let median = |v: &Vec<usize>| v[v.len() / 2];
+            let over = |v: &Vec<usize>, t: usize| v.iter().filter(|&&x| x >= t).count();
+            println!(
+                "dim={dim:<4} n={count:<6} builds={builds:<4} \
+                 missed: median={:<3} max={:<3} | unreachable: median={:<3} max={:<3} \
+                 >=3:{:<3} >=5:{:<3} >=8:{:<3} >=13:{}",
+                median(&missed),
+                missed.last().unwrap(),
+                median(&unreachable),
+                unreachable.last().unwrap(),
+                over(&unreachable, 3),
+                over(&unreachable, 5),
+                over(&unreachable, 8),
+                over(&unreachable, 13),
+            );
+        }
+    }
+
+    /// What the threshold actually has to separate.
+    ///
+    /// The distribution above says what a healthy build scores. It says
+    /// nothing about what a *bad* one scores, and a threshold is a statement
+    /// about the gap between the two — so assuming the bad side from a
+    /// binomial argument would be picking a number without knowing the shape
+    /// of what it bounds, one more time.
+    ///
+    /// So this builds many graphs at the size where the catastrophic failure
+    /// is known to occur (~1 in 250 at 400 vectors), checks **every** point
+    /// rather than a sample to get the true orphaned fraction, and prints the
+    /// sampled score beside it. The two columns are what the threshold sits
+    /// between.
+    ///
+    /// ```bash
+    /// cargo test -p kimmy-vector --release -- --ignored --nocapture separates
+    /// ```
+    #[test]
+    #[ignore = "builds ~600 graphs; run it when changing a reachability constant"]
+    fn the_threshold_separates_catastrophic_builds_from_healthy_ones() {
+        const COUNT: usize = 400;
+        const DIM: usize = 16;
+        const BUILDS: usize = 600;
+
+        let (engine, shadow, _dir) = setup(COUNT, DIM);
+        let mut records = Vec::new();
+        engine
+            .for_each_vector(&shadow, |r| {
+                records.push(r);
+                Ok(true)
+            })
+            .unwrap();
+
+        let mut healthy = Vec::new();
+        let mut bad = Vec::new();
+        for _ in 0..BUILDS {
+            let (index, reach) =
+                HnswIndex::build_once(&engine, &shadow, Metric::Cosine, DIM).unwrap();
+            // Every point, not a sample: this is the ground truth the sampled
+            // score is being judged against.
+            let truly = (0..index.keys.len())
+                .filter(|&i| !index.finds_itself(&records[i].vector, i))
+                .count();
+            let fraction = truly as f64 / index.keys.len() as f64;
+            if fraction >= 0.05 { &mut bad } else { &mut healthy }
+                .push((fraction, reach.unreachable));
+        }
+
+        let summarize = |label: &str, v: &mut Vec<(f64, usize)>| {
+            if v.is_empty() {
+                println!("{label:<12} none observed in {BUILDS} builds");
+                return;
+            }
+            v.sort_by_key(|a| a.1);
+            let scores: Vec<usize> = v.iter().map(|(_, s)| *s).collect();
+            println!(
+                "{label:<12} builds={:<4} true orphaned {:.1}%-{:.1}%  \
+                 sampled score: min={} median={} max={}",
+                v.len(),
+                v.first().unwrap().0 * 100.0,
+                v.iter().map(|(f, _)| *f).fold(0.0, f64::max) * 100.0,
+                scores.first().unwrap(),
+                scores[scores.len() / 2],
+                scores.last().unwrap(),
+            );
+        };
+        summarize("healthy", &mut healthy);
+        summarize("catastrophic", &mut bad);
     }
 
     /// The measurement that justifies using an approximate index at all.

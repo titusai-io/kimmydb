@@ -2716,6 +2716,77 @@ is a deliberate act, and the registry being an ordinary collection is what makes
 it possible without new API surface. Recorded as carried debt rather than left
 to be discovered.
 
+## ADR-061 — A reachability probe counts unreachable points, not missed searches
+
+**Decision.** The build-time check that a finished HNSW graph can find its own
+data splits a failed probe into two outcomes and only acts on one. A sampled
+point that does not return itself at ordinary search effort is re-probed with a
+much larger `ef` and a `k` above one. Points recovered by the second look are
+**search budget**, not data loss, and are ignored. Only points still missing
+when effort stops being the limit count toward the rebuild threshold.
+
+Supersedes the single miss counter added with the check itself.
+
+**The counter it replaces could not hold at more than one collection size.** It
+added the two outcomes together, and they scale differently. An ordinary search
+explores a fixed amount, so as a collection grows the same budget covers less of
+it and a perfectly reachable point starts being missed for want of looking —
+that count climbs with size and width. Genuine orphaning does not. Summed, the
+threshold had to be set for one fixture and was: 400 vectors at 16 dimensions.
+
+At 384 dimensions — the realistic embedding width, and the one the recall tests
+already single out — the sum climbs steeply with collection size:
+
+| vectors (at 384 dimensions) | missed at ordinary effort | still unreachable |
+|---:|---:|---:|
+| 500 | median 0 | median 0 |
+| 1,000 | median 1 | median 1 |
+| 2,000 | median 3 | median 2 |
+| 4,000 | **median 8** | median 3 |
+
+Against a threshold of three, **seven builds in ten at 4,000 vectors were
+discarded, rebuilt twice, and then reported to the operator as losing data** —
+three times the build cost and a false alarm, on a healthy graph. The
+re-probe removes the growth; the threshold covers what is left.
+
+**Both sides of the threshold are measured, which is the part that was missing
+before.** The distribution of healthy builds says nothing about the distance to
+a bad one, and a threshold is a claim about that distance. Over 600 builds at
+the size where the catastrophic failure is known to occur, checking every point
+rather than a sample for ground truth:
+
+| | true orphaned | sampled score |
+|---|---|---|
+| 599 healthy builds | 0.8%–3.0% | 0–5, median 1 |
+| the one catastrophic build | 14.8% | **22** |
+
+Eight sits above every healthy observation across 725 builds spanning two
+widths and five collection sizes, and far below the only bad one.
+
+**A correction worth keeping.** The replaced comment explained a healthy miss as
+a vector among near-duplicates being edged out by a neighbour — approximation
+working as designed. That was assumed and it is false. Re-probed with the budget
+removed, those points are still not found: they are unreachable, not edged out.
+**Every graph this builds orphans a little**, between 0.8% and 3.0% of the
+collection, and the check has always been separating routine orphaning from
+catastrophic orphaning rather than noise from signal. Naming that correctly is
+what makes the threshold a judgement about a measured gap instead of a guard
+against a mechanism that does not exist.
+
+**Alternatives.** Scaling the threshold with collection size keeps the summed
+counter and fits another constant to measurements — but the growth depends on
+width as well as count, so it is two fitted constants, and it needs the bad-side
+distribution measured at every point on the surface to prove the margin holds.
+A threshold as a fraction of the sample is scale-free in the right way but the
+margin was already under 2× at 4,000 vectors and shrinking. Neither addresses
+the actual defect, which is that two different events were being added together.
+
+**What is not solved.** Routine orphaning of up to 3% of a collection is
+accepted and not reported. It is a property of the graph parameters rather than
+of a build, so rebuilding cannot fix it, and the honest place to change it is
+`MAX_CONNECTIONS` or `EF_CONSTRUCTION` with recall measurements to hand.
+Recorded so that the number is known rather than discovered.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

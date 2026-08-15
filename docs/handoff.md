@@ -18,9 +18,13 @@ board is in [Roadmap](roadmap.md) rather than only in this file.
 | #79 | `kimmy-api` mutation pass — closes the M10 mutation debt entirely |
 | #80 | `find {_id}` uses the primary key — 7.328 ms → 0.540 ms |
 | #81 | An HNSW build could orphan a tenth of a collection. Merged 2026-08-15 |
-| **`m11-write-gap`** | **OPEN.** M11 task 1: the write gap is explained. Read the next section |
+| #82 | M11 task 1: the daemon commits twice per insert. Merged 2026-08-15 |
+| **`hnsw-reachability-does-not-depend-on-collection-size`** | **OPEN.** #81's threshold was sized on a toy fixture and fires on every healthy build at a realistic embedding width. Read the section below |
 
 ### M11 task 1 — the write gap, and what explaining it turned up
+
+*(Merged as #82. The branch open now came out of verifying it — see
+"The reachability threshold" below.)*
 
 **The daemon spends two durable commits on an insert where the engine spends
 one.** The second is the embedding worker's: `EmbeddingWorker::run` records its
@@ -74,6 +78,53 @@ trades a crash replaying a few idempotent entries for an fsync per write. It
 changes the oplog-consumer contract, and it is reserved — see the M11 board. It
 must not become "record only when there was work to do": a position that
 advances only on work gets killed by retention.
+
+### The reachability threshold — what verifying #82 turned up
+
+**Found by the baseline check, not by a test.** Running
+`scripts/bench-baseline.py check` as part of #82's verification reported
+`hnsw_build/4000` at **3.00×** and `hnsw_build/2000` at **2.03×**. Neither was
+reachable from that diff. 3.00× is exactly `MAX_BUILD_ATTEMPTS + 1` — the
+signature of a graph being discarded and rebuilt the maximum number of times,
+every single time.
+
+**#81's threshold counted two different things as one.** A probe that fails to
+retrieve its own point is either a search that ran out of budget or a point the
+graph cannot reach. An ordinary search explores a fixed amount, so the first
+grows with collection size and width and the second does not. `3` was sized
+against a **400-vector, 16-dimensional** fixture; at 384 dimensions — the
+realistic embedding width, the one `recall_holds_at_a_realistic_embedding_width`
+exists to cover — misses reach a median of 8 in a sample of 128 at 4,000
+vectors. Seven builds in ten were rebuilt twice and then reported to the
+operator as losing data. Healthy graphs.
+
+**The fix is the split, not a bigger number.** `Reachability { sampled, missed,
+unreachable }`: a miss is re-probed with the budget removed, and only what stays
+missing counts. Threshold 8, and `hnsw_build/4000` goes 15,955 ms → 5,354 ms,
+1.01× of the pre-#81 baseline.
+
+**Both sides of the gap are measured**, which is what was missing the first two
+times. 600 builds at the size where the catastrophic failure occurs, checking
+every point rather than sampling:
+
+| | true orphaned | sampled score |
+|---|---|---|
+| 599 healthy builds | 0.8%–3.0% | 0–5, median 1 |
+| the 1 catastrophic build | 14.8% | **22** |
+
+**And a false explanation was corrected.** #81's comment said a healthy miss was
+a near-duplicate being edged out — "approximation working as designed". It is
+not: with the budget removed those points are still not found. **Every graph
+this builds orphans 0.8%–3.0% of a collection**, which is now its own 🟡 in the
+register because it was previously believed to be zero. The check has always
+been separating routine orphaning from catastrophic orphaning.
+
+**Three constants in one file have now been sized against an assumption.** Both
+distributions ship as `#[ignore]`d tests so the next person re-derives them
+instead of trusting them, and the regression test runs at 384 dimensions in its
+own CI job in release — 21 s there against 146 s in debug, on the cluster
+harness's reasoning that a suite doubled to hold one property loses the
+property.
 
 ### #81, the branch before this one — still worth reading
 
@@ -135,8 +186,8 @@ git checkout main && git pull
 gh pr list --state open            # is the write-gap branch still open?
 ```
 
-**If `m11-write-gap` is still open**, that branch is the work and it is waiting
-on review. Read its description first.
+**If `hnsw-reachability-does-not-depend-on-collection-size` is still open**,
+that branch is the work and it is waiting on review.
 
 **If it is merged**, the next thing is **M11 task 2: give `IndexPlan` a notion
 of the order it yields**. The board is in [Roadmap](roadmap.md#m11--index-ordered-scans),
@@ -272,7 +323,7 @@ The rhythm:
   --test-threads=1`).
 - **Every deviation from plan gets a `docs/deviations.md` entry at the time
   it is made**, 🔴 (open drift) / 🟡 (agreed deferral) / 🟢 (superseded/closed).
-  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-061**).
+  Design decisions get an ADR in `docs/decisions.md` (next number: **ADR-062**).
   M8 task 7 found the register can silently lose an entry — this file's debt
   table pointed at a 🟡 for bulk insert that had never been written down.
   Check the register itself, not the summary of it.
@@ -325,7 +376,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `m10-api-mutation-pass` | ✅ Merged as #79. `kimmy-api`'s 76 mutants; closes the M10 mutation debt. Found `capabilities()` could return an empty list with every assertion still passing |
 | `find-by-id-uses-the-primary-key` | ✅ Merged as #80. `plan::choose_primary_key`: 7.328 ms → 0.540 ms over 10k documents, examined 10,000 → 1 |
 | `recall-test-does-not-depend-on-core-count` | ✅ Merged as #81. Badly named — it is the HNSW build fix. An index build could orphan 10–24% of a collection |
-| `m11-write-gap` | **Open.** M11 task 1: the daemon spends two commits per insert where the engine spends one. `kimmy_commits` on `/metrics`, and the tests that hold both numbers |
+| `m11-write-gap` | ✅ Merged as #82. M11 task 1: the daemon spends two commits per insert where the engine spends one. `kimmy_commits` on `/metrics`, and the tests that hold both numbers |
+| `hnsw-reachability-does-not-depend-on-collection-size` | **Open.** #81's threshold, re-sized. It counted budget-limited searches as lost data, so at a realistic embedding width every large build was rebuilt twice and reported as incomplete (ADR-061) |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -352,7 +404,7 @@ milestone was two behind. [Decisions](decisions.md) and
 its reasoning rather than an architectural choice with alternatives. **M10 in
 turn wrote five** — ADR-056 through ADR-060 — because each of its reserved
 decisions had real alternatives to weigh rather than being a feature choice
-with a reason. Next ADR number is **ADR-061**.
+with a reason. Next ADR number is **ADR-062**.
 
 ### What the M9 branches did, and what they found
 

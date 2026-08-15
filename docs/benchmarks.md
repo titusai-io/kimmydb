@@ -102,6 +102,35 @@ that grows faster than linearly, and a collection queried a handful of times
 between rebuilds never repays it. The break-even column above is the number to
 re-read if that judgement needs revisiting.
 
+### The build-cost regression this page caught
+
+Worth recording as a use of the baseline rather than as a number. Running
+`scripts/bench-baseline.py check` during unrelated work reported
+`hnsw_build/4000` at **3.00×** and `hnsw_build/2000` at **2.03×** against the
+M8 baseline — and 3.00× is exactly `MAX_BUILD_ATTEMPTS + 1`, the signature of a
+graph being discarded and rebuilt the maximum number of times, every time.
+
+The reachability check added with the vector data-loss fix was counting a
+search that ran out of budget as a point the graph had lost. Its threshold was
+sized on a 400-vector, 16-dimensional fixture; at 384 dimensions the count
+climbs with collection size, so at 4,000 vectors it fired on essentially every
+build. [ADR-061](decisions.md) has the split that fixed it.
+
+| | before | after | baseline |
+|---|---:|---:|---:|
+| `hnsw_build/2000` | 3,342 ms | **1,702 ms** | 1.03× |
+| `hnsw_build/4000` | 15,955 ms | **5,354 ms** | 1.01× |
+
+The residual 1.28× at 250 vectors and 1.14× at 500 are the check itself — 128
+probes against a build measured in tens of milliseconds — and are the cost the
+data-loss fix was always going to carry.
+
+**The point is that a tolerance nobody was gating on still caught it.** The
+±50% band is loose on purpose, to catch a change of *shape* rather than a
+wobble, and a 3× is a shape. Nothing else would have: every recall measurement
+was fine, because every rebuilt graph was fine, and only the wasted work
+differed.
+
 ---
 
 ## Not yet measured
@@ -459,7 +488,7 @@ which is why no latency figure showed it:
 
 A third of a second of ingest bought twelve seconds of saturated writer. The
 bulk API exists so that 100 documents cost one fsync rather than 100
-([Batching into one commit](#batching-into-one-commit)); behind it, the worker
+([Batching into one commit](#batching-into-one-commit--176)); behind it, the worker
 pays the 100 anyway. Sustained ingest is bounded by the worker's per-document
 commit rate, not by the batch path — and this holds on every node, whether or
 not any collection uses vectors.
