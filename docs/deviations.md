@@ -1704,6 +1704,79 @@ like one was working.
 
 ---
 
+## 🟢 An HNSW build could orphan a tenth of a collection (was a 🟡 "flaky test")
+
+**2026-08-15. The recall test was not flaky. It was correctly reporting silent
+data loss, and the first attempt at a fix would have hidden it.**
+
+`recall_against_exact_search_is_high` failed CI at **0.865** against a `>= 0.90`
+bar, on a pull request whose diff could not reach `kimmy-vector`. The obvious
+reading — a randomised structure makes a hard threshold unreliable — was wrong,
+and acting on it would have been the worst available outcome.
+
+**What was actually happening.** Over 1,500 builds the distribution is
+**bimodal**: median 0.995, and about **one build in 250** collapsing as low as
+**0.545**. In a collapsed build, 19 of 20 queries degrade together — a global
+property, not one hard query. Probing every stored vector with *its own exact
+value* found the cause: a healthy build fails to self-retrieve ~2 of 400 points,
+while a bad one fails **40 to 96 — 10% to 24% of the collection**. Those
+documents were unreachable from the graph's entry point, so **no search at any
+`k` could ever return them**, until something happened to rebuild the index.
+
+**Everything else was eliminated by measurement, not argument:**
+
+| Candidate | Verdict |
+|---|---|
+| SIMD divergence between machines | `anndists` builds without `simdeez_f`; scalar path everywhere |
+| Core count / rayon scheduling | rayon is only in `parallel_insert`/`parallel_search`; this code calls the sequential ones |
+| Misconfigured graph | `Hnsw::new` argument order checked against the crate source |
+| Unusually tall graph | failures occur at the **modal** top level, not rare ones |
+| Poor connectivity (`keep_pruned`) | improves the bulk (median 0.990 → 1.000), leaves failures untouched |
+| Too-narrow search (`ef`) | helps then **plateaus**: 5/800 at ef=50, 2/800 at ef=100, 2/800 at ef=200 |
+
+The `ef` plateau is the tell: more exploration recovers hard-to-reach points but
+cannot cross into a disconnected component.
+
+**The fix is at build time, where the defect is.** `HnswIndex::build` asks a
+sample of the stored vectors to retrieve themselves and rebuilds a graph that
+cannot. Draws are independent, so the failure rate falls off geometrically.
+Measured over 1,500 builds with the check in place: **minimum recall 0.9600,
+nothing below 0.95, zero failures**, against a floor of 0.5350 before. It never
+fails the build — a poor index still answers, with a warning, because taking
+vector search down over a quality problem would be worse than serving it.
+
+**Both constants are sized from measured distributions**, because two earlier
+attempts at this were wrong for exactly the reason this register keeps
+recording — a number chosen without knowing the shape of what it bounds:
+
+- The **sample** is 128, not 32. At 32 the catastrophic builds were caught but
+  *mild* orphaning of a few percent slipped through: detection is `1-0.97^n`,
+  62% at 32 and 98% at 128.
+- The **trigger** is 3 sampled misses, not "any miss". A healthy graph
+  legitimately misses ~2 of 400 (median 3, p99 9), so retrying on any miss at
+  all rebuilt most collections twice for nothing — **a 3× build-cost regression
+  that no recall measurement could see**, since every rebuild is fine and only
+  the wasted work differs. The measured cost at 3 is one rebuild for **11.2%**
+  of builds, ~1.11× overall.
+
+**The rejected fix is worth recording.** The first attempt averaged recall over
+three graphs. It would have smeared a data-loss bug into an acceptable-looking
+statistic — and, because a mean of three draws three chances at a bad graph, it
+would have failed CI *more* often, not less (~1 in 300 → ~1 in 100). Its
+supporting measurement was real but irrelevant: it sampled the bulk of the
+distribution and never observed the rare mode that actually breaks the test.
+
+**The test is restored unchanged.** Fixing the defect made the original
+assertion honest rather than lenient, which is the outcome to prefer whenever a
+test looks flaky: ask what it is reporting before making it quieter.
+
+**Operational note.** The fix prevents new bad builds; it does not repair one
+already cached in a running node or persisted as a snapshot. See
+[Operations](operations.md) — a collection whose vector search looks
+incomplete should have its index rebuilt.
+
+---
+
 ## 🟢 Closed
 
 **Reindexing is `POST /vector` again — and the old escape hatch never worked.**

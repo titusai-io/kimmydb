@@ -116,7 +116,7 @@ the three client suites, the conformance runner and the examples.
   open is a 🟡 that was agreed. Read the register itself, not a summary — M8
   found a debt that existed only there.
 
-#### 5. The two failure modes that keep catching people here
+#### 5. The three failure modes that keep catching people here
 
 **A claim with no mechanism behind it is usually false.** M8 found one in four
 branches, M9 in every task, M10 in four more — including a sentence in a PR
@@ -132,6 +132,18 @@ real nodes — most recently a replicated schema change that was appended to the
 oplog and never published, so a dropped collection ended its own node's
 watchers and left every other node's hanging. Use `cargo test -p kimmyd --test
 cluster -- --ignored --test-threads=1`.
+
+**A test that looks flaky may be reporting a real defect.** The HNSW recall test
+failed CI once at 0.865 against a 0.90 bar, on a branch that could not reach
+that crate, and the obvious reading was that a randomised structure makes a hard
+threshold unreliable. It was reporting **silent data loss**: about one index
+build in 250 orphaned 10–24% of a collection, so those documents were returned
+by no search at any `k`. The first fix averaged three graphs to quiet it — which
+would have hidden the bug *and* failed more often, since a mean of three draws
+three chances at a bad graph. **Before making a test quieter, find out what it
+is telling you**, and be sure any threshold is sized from a measured
+distribution rather than from one observation. Both mistakes here came from the
+latter.
 
 #### 6. Picking the next milestone
 

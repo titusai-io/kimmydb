@@ -138,7 +138,13 @@ construction the right answer to measure against.
   byte-identical score, because both paths score from the *stored* vector rather
   than from graph distances
 - `recall_against_exact_search_is_high` — ≥ 90% recall at k=10, **measured, not
-  assumed**
+  assumed**. **This test looked flaky and was not.** It failed CI once at 0.865
+  and was reporting real data loss: about one HNSW build in 250 orphaned 10–24%
+  of the collection, so those documents could not be returned by any search at
+  any `k`. `HnswIndex::build` now verifies a graph can retrieve its own data and
+  rebuilds one that cannot, and the assertion is back to a single graph with the
+  same bar — minimum 0.9600 over 1,500 builds, against 0.5350 before. The whole
+  investigation is in [Deviations](deviations.md).
 - `the_top_result_matches_exact_search` — approximation is acceptable in the
   tail, not at rank 1
 - `scores_match_the_exact_path_exactly` — the graph's own distances never reach
