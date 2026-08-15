@@ -563,6 +563,9 @@ impl Client {
 
         for endpoint in &endpoints {
             tried.push(endpoint.clone());
+            // Per endpoint, because the bound is on how long *this* node is
+            // given to recover; the next one has said nothing yet.
+            let mut waited = false;
             loop {
                 let token = self.token().await;
                 let result = self
@@ -592,13 +595,25 @@ impl Client {
                 }
 
                 match error.retry() {
-                    // The same node, after the delay it named. Bounded to one
-                    // wait: a client that sleeps repeatedly on a rate limit is
-                    // an application that has stopped responding.
-                    Retry::Wait if safety == Safety::Idempotent => {
+                    // The same node, after the delay it named — which is what
+                    // separates `wait` from `elsewhere`. `wait` says *this*
+                    // node will serve the request shortly, so failing over
+                    // abandons the one node that told you how long to wait,
+                    // and with a single endpoint there is nowhere to go at all.
+                    //
+                    // Bounded to one wait per endpoint: a client that sleeps
+                    // repeatedly on a rate limit is an application that has
+                    // stopped responding. A second refusal falls through to the
+                    // next node, since this one has now said no twice.
+                    Retry::Wait if safety == Safety::Idempotent && !waited => {
                         let Error::Api { retry_after, .. } = &error else { break };
                         let delay = Duration::from_secs(retry_after.unwrap_or(1).min(30));
                         tokio::time::sleep(delay).await;
+                        waited = true;
+                        last = Some(error);
+                        continue;
+                    }
+                    Retry::Wait if safety == Safety::Idempotent => {
                         last = Some(error);
                         break;
                     }

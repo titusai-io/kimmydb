@@ -6,7 +6,9 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
+use axum::response::IntoResponse;
 use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, WatchOptions};
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
@@ -78,6 +80,79 @@ impl Server {
             )
             .unwrap();
     }
+}
+
+/// A server that answers `429` a fixed number of times, then succeeds.
+///
+/// Not `kimmy_api::router`: a real node's rate limiter bounds *login*, so no
+/// arrangement of it makes an ordinary request answer `rate_limited` on
+/// demand. The `wait` arm of the retry taxonomy (ADR-057) is public surface a
+/// caller depends on, and it had no test that reached it at all — the M10
+/// mutation pass found four surviving mutants sitting in this one branch.
+///
+/// It counts the requests it received, which is the observation that separates
+/// `wait` from `elsewhere`: the question is not only whether the call
+/// eventually succeeds but *which node* it succeeded on.
+struct Stalling {
+    base: String,
+    hits: Arc<AtomicUsize>,
+}
+
+impl Stalling {
+    /// Refuse the first `refusals` requests with `429`, then answer them.
+    ///
+    /// `Retry-After: 0` because the client honours the header and a test that
+    /// slept for the default second per attempt would pay for nothing: the
+    /// subject is which endpoint the retry goes to, not the arithmetic.
+    async fn start(refusals: usize) -> Self {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&hits);
+
+        let app = axum::Router::new().fallback(axum::routing::any(move || {
+            let seen = Arc::clone(&seen);
+            async move {
+                let n = seen.fetch_add(1, Ordering::SeqCst);
+                if n < refusals {
+                    (
+                        axum::http::StatusCode::TOO_MANY_REQUESTS,
+                        [(axum::http::header::RETRY_AFTER, "0")],
+                        axum::Json(json!({
+                            "error": "rate_limited",
+                            "message": "slow down",
+                            "retry": "wait",
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    axum::Json(json!({ "documents": [], "served_by": "stalling" })).into_response()
+                }
+            }
+        }));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Self { base: format!("http://{addr}"), hits }
+    }
+
+    fn hits(&self) -> usize {
+        self.hits.load(Ordering::SeqCst)
+    }
+}
+
+/// A client holding a token, so no stub has to serve the auth routes.
+///
+/// A supplied token is never renewed on a schedule, so `authenticate` makes no
+/// request and every hit a stub counts is the request under test.
+async fn with_token(endpoints: &[&str]) -> Client {
+    let mut builder = Client::builder(endpoints[0]).token("opaque-to-this-client");
+    for extra in &endpoints[1..] {
+        builder = builder.endpoint(*extra);
+    }
+    builder.connect().await.expect("connecting")
 }
 
 async fn connected() -> (Server, Client) {
@@ -539,6 +614,97 @@ async fn a_stream_reports_the_token_it_would_resume_from() {
         "the stream's position is the last event it delivered"
     );
     assert!(stream.resume_token().is_some_and(|t| !t.is_empty()));
+}
+
+/// `retry: wait` waits, then asks the *same* node again.
+///
+/// The distinction from `elsewhere` is the whole reason the taxonomy has three
+/// values rather than a boolean (ADR-057): `wait` says this node will serve the
+/// request shortly, so moving to a peer abandons the node that just told you
+/// how long to wait. With one endpoint there is nowhere else to go, which makes
+/// this the sharpest statement of the rule — a client that fails over on `wait`
+/// has nothing to fail over to and reports an error the server never meant.
+#[tokio::test]
+async fn a_wait_retries_the_same_node() {
+    let stalling = Stalling::start(1).await;
+    let client = with_token(&[&stalling.base]).await;
+
+    let page = client
+        .find("shop", "orders", &Query::new())
+        .await
+        .expect("a rate limit that names a delay is recoverable, not an error the caller sees");
+
+    assert_eq!(page["served_by"], "stalling", "the eventual success is the server's own answer");
+    assert_eq!(stalling.hits(), 2, "the refusal, then the same node again after the delay");
+}
+
+/// And a `wait` that keeps refusing is bounded rather than infinite.
+///
+/// The bound is what keeps a rate limit from turning a client into an
+/// application that has stopped responding. It gives up and reports the
+/// server's own error, which is more useful than a client-invented one.
+#[tokio::test]
+async fn a_wait_that_keeps_refusing_gives_up() {
+    // More refusals than any bounded client could absorb.
+    let stalling = Stalling::start(100).await;
+    let client = with_token(&[&stalling.base]).await;
+
+    let error = client.find("shop", "orders", &Query::new()).await.expect_err("still refusing");
+
+    assert_eq!(error.retry(), Retry::Wait, "the class the server sent survives to the caller");
+    assert!(
+        stalling.hits() < 10,
+        "a bounded number of attempts, not a client that sleeps forever: {} hits",
+        stalling.hits()
+    );
+}
+
+/// A node that has said `wait` twice is one the client moves on from.
+///
+/// The bound and the fall-through are one decision seen from two sides, and
+/// with a single endpoint they are indistinguishable — giving up and moving to
+/// a node that does not exist produce the same error. It takes a second node to
+/// tell them apart, which is why the mutation pass could rewrite this guard
+/// either way without a test noticing.
+#[tokio::test]
+async fn a_node_that_keeps_saying_wait_is_left_for_one_that_answers() {
+    let stalling = Stalling::start(100).await;
+    let healthy = Stalling::start(0).await;
+    let client = with_token(&[&stalling.base, &healthy.base]).await;
+
+    let page = client.find("shop", "orders", &Query::new()).await.expect("the second node answers");
+
+    assert_eq!(page["served_by"], "stalling", "the answer came from a node, not from the client");
+    assert_eq!(stalling.hits(), 2, "the refusal and one wait, and then no more");
+    assert_eq!(healthy.hits(), 1, "then the next node, asked once");
+}
+
+/// A write is never repeated on `wait` — not to this node, and not to another.
+///
+/// `429` is answered before the work in every case this stub produces, but
+/// nothing in the response says so, and no status distinguishes a request that
+/// failed before its commit from one that failed after. So the write goes
+/// exactly once and the caller decides.
+///
+/// **The second endpoint is what makes this a test.** With one node, "reported
+/// the refusal" and "failed over and found nowhere to go" produce the same
+/// error, and the mutation pass showed the guard could be rewritten to fail
+/// over without anything noticing. A peer that receives a write the first node
+/// may already have committed is a duplicate, silently.
+#[tokio::test]
+async fn a_wait_does_not_repeat_a_write_anywhere() {
+    let stalling = Stalling::start(1).await;
+    let healthy = Stalling::start(0).await;
+    let client = with_token(&[&stalling.base, &healthy.base]).await;
+
+    let error = client
+        .request(Method::Post, "/v1/db/shop/coll/orders/insert", Some(json!({})), Safety::Unsafe)
+        .await
+        .expect_err("an unsafe request reports the refusal rather than repeating it");
+
+    assert_eq!(error.retry(), Retry::Wait, "the class is reported, not acted on");
+    assert_eq!(stalling.hits(), 1, "sent once");
+    assert_eq!(healthy.hits(), 0, "and never to a peer that might commit it a second time");
 }
 
 /// The query builders and `collect_all`, which nothing else used.

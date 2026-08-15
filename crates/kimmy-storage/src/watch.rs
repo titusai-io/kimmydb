@@ -541,6 +541,42 @@ mod tests {
         (engine, coll, dir)
     }
 
+    /// Every invalidate reason's wire name, pinned where the choice is made.
+    ///
+    /// `as_str` exists so a variant rename cannot silently rename a value
+    /// clients branch on — but the strings themselves were asserted only
+    /// downstream, in the three client suites and the conformance scenarios,
+    /// and only for `CollectionDropped`. The other two were held by prose in
+    /// `docs/openapi.yaml` and nothing else, which is the arrangement this
+    /// method was added to end.
+    ///
+    /// Exhaustive by construction: a new variant does not compile until its
+    /// wire name is decided here too.
+    #[test]
+    fn every_invalidate_reason_has_the_name_the_protocol_promises() {
+        use InvalidateReason::*;
+
+        // The literals `docs/openapi.yaml` documents and the clients branch on.
+        assert_eq!(ConsumerLagged.as_str(), "ConsumerLagged");
+        assert_eq!(ResumeTokenExpired.as_str(), "ResumeTokenExpired");
+        assert_eq!(CollectionDropped.as_str(), "CollectionDropped");
+
+        // Exhaustive by construction: a new variant does not compile until its
+        // wire name is decided, and the names must stay distinguishable —
+        // two reasons sharing a string is a client that cannot tell "nothing
+        // left to watch" from "events existed and you missed them".
+        let all = [ConsumerLagged, ResumeTokenExpired, CollectionDropped];
+        for reason in all {
+            match reason {
+                ConsumerLagged | ResumeTokenExpired | CollectionDropped => {}
+            }
+        }
+        let mut names: Vec<_> = all.iter().map(|r| r.as_str()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), all.len(), "each reason needs its own name");
+    }
+
     /// Collect the next `n` *document* changes, failing rather than hanging.
     ///
     /// Schema-change entries share the collection id and would otherwise be

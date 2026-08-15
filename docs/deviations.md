@@ -1424,49 +1424,82 @@ does not test that; something that has to find, page and react does.
 
 ---
 
-## 🟡 The M10 mutation pass covered the client, not the server crates
+## 🟡 The M10 server-side mutation pass — two crates of three done
 
-**M10 task 12 called for a mutation pass over the milestone diff. It covers
-`kimmy-client` only.** The client pass is complete and its findings are real —
-seven untested public methods, untested topology filtering, thirteen never-produced
-error codes — but the 90 mutants in `kimmy-api`, `kimmy-storage` and
-`kimmy-auth` are **unclassified**.
+**Narrowed on 2026-08-14.** M10 task 12 called for a mutation pass over the
+milestone diff and covered `kimmy-client` only, leaving 90 mutants in
+`kimmy-api`, `kimmy-storage` and `kimmy-auth` unclassified. The original run was
+misconfigured — every mutant re-ran all three crates' suites at a parallelism
+that pushed each past the timeout, producing 3 caught and 15 timeouts out of 47
+before being abandoned.
 
-**Why**: the run was misconfigured — every mutant re-ran all three crates'
-suites at a parallelism that pushed each past the timeout. It produced 3 caught
-and 15 timeouts out of 47 before being abandoned rather than left to burn hours
-for no data.
+The scope splits **76 / 12 / 2**, which sums to exactly the 90 recorded.
 
-**Not alarming**: those three crates had full passes in M7 and M8, and their
-share of the M10 diff is small. **Not nothing either**: the new code in them —
-the error taxonomy, `/v1/version`, `/v1/topology`, the node registry, the
-change-stream invalidate — is exactly the kind of branch-heavy logic mutation
-testing is good at.
+| Crate | | |
+|---|---|---|
+| `kimmy-auth` | ✅ 2 caught | Both first read as misses and **both were scoping artefacts** — see below |
+| `kimmy-storage` | ✅ 10 caught, 2 unviable | One real gap: `InvalidateReason::as_str` |
+| `kimmy-api` | ⏳ 76 outstanding | Started; stopped mid-run for contention, not for a finding |
 
-**To close**: one pass per crate, tests scoped to that crate (`-- -p kimmy-api`),
-`-j 4`, timeout set from a contended baseline. [Testing](testing.md) has the
-detail.
+**The `kimmy-storage` finding is the one that mattered.**
+`InvalidateReason::as_str` could return `""` or `"xyzzy"` with nothing failing.
+That method exists *precisely* so a variant rename cannot silently rename a
+value clients branch on — and the strings were pinned only downstream, in the
+three client suites, the cluster harness and the conformance scenarios, and
+only for `CollectionDropped`. `ConsumerLagged` and `ResumeTokenExpired` were
+held by prose in `docs/openapi.yaml` and by nothing that fails. They are pinned
+now in the crate that chooses them.
+
+**And a methodological finding worth more than either.** Both `kimmy-auth`
+misses were caught once `-p kimmy-api` joined the test scope: `ttl_secs` is
+asserted in the consumer's suite, not the owner's. **Per-crate scoping — M10's
+own documented lesson, and the thing that makes these runs twenty minutes
+instead of nine hours — systematically hides cross-crate killers.** A miss in a
+crate whose surface is consumed by another may only mean the test lives one
+crate up. Verify with a widened scope before believing a gap is real. A local
+test was still added, because a crate's public accessor should not depend on a
+consumer to pin it.
+
+**To close**: the `kimmy-api` pass, `--in-diff` against the M10 range,
+`-- -p kimmy-api`, `-j 4`, on an **idle machine** — running it beside an
+ordinary `cargo test --workspace` stretched that suite from ~2 minutes past 10,
+which is the same contention that ruined the original run.
 
 ---
 
-## 🟡 The client's `retry: wait` path has no test that reaches it
+## 🟢 The client's `retry: wait` path is tested — and was broken (was a 🟡)
 
-**Found by the M10 mutation pass, not by review.** `Client::send` branches on
-the retry class the server returns, and the `wait` arm — back off, then try the
-same node again — can have its guard replaced with `true` or `false` without a
-test failing. No harness in the client's suite ever answers `429`, so the
-branch is never taken.
+**Closed on 2026-08-14, and the untested branch turned out to be wrong.** The
+🟡 recorded a missing test. Writing it found that `Client::send` did not do
+what the comment directly above it said, which is the failure mode this project
+keeps meeting: a claim with nothing that fails when it stops being true.
 
-Four of the thirty-four surviving mutants are this one path. It is a **real
-gap**, not an equivalent mutant: a client that mishandles `wait` turns a
-recoverable overload into an error the caller sees, which is precisely the
-failure the three-valued taxonomy (ADR-057) exists to prevent.
+The comment read *"The same node, after the delay it named."* The code slept
+and then `break`, and that `break` left the inner `loop` — advancing the outer
+`for endpoint`. So `wait` moved to the **next node**, exactly like `elsewhere`
+and only slower; with a single endpoint it slept and then returned the error,
+so the wait bought a delayed failure and nothing else. That is precisely the
+outcome the three-valued taxonomy (ADR-057) exists to prevent: `wait` means
+*this* node will serve the request shortly, so failing over abandons the one
+node that said how long to wait.
 
-**To close**: a test server that returns `429` with `retry: wait` a fixed
-number of times and then succeeds, asserting the call returns the eventual
-success and that it went to the *same* endpoint — the distinction from
-`elsewhere` is the whole point. Cheap; deferred only because it wants a small
-harness change and the milestone was closing.
+`wait` now retries the same endpoint, **bounded to one wait per endpoint**, and
+a node that refuses twice is left for the next one.
+
+**Four tests, and the second endpoint is what makes three of them tests at
+all.** With one node, "gave up" and "failed over and found nowhere to go"
+produce the same error, so the mutation pass could rewrite the guards either
+way unnoticed. Adding a second stub separated them — including the sharpest
+case, an **unsafe write** that must not be repeated to a peer that might commit
+it a second time. All nine mutants in the changed region are now caught, from
+zero.
+
+The harness is `Stalling` in `crates/kimmy-client/tests/client.rs`: a stub that
+answers `429` a fixed number of times and counts its hits. It is not
+`kimmy_api::router` because a real node's rate limiter bounds *login*, so no
+arrangement of one makes an ordinary request answer `rate_limited` on demand —
+which is also why this path has no live drive, and the conformance suite's 48
+runs stand as the regression instead.
 
 The rest of the residue is classified in [Testing](testing.md): reconnect
 backoff arithmetic that needs fault injection to reach, and a handful of

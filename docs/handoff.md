@@ -822,8 +822,9 @@ viable mutants, and the misses were not marginal:
 Five new tests took it to **133 caught of 167 viable** (190 mutants: 34
 missed, 20 unviable, 3 timeouts). What is left is classified rather than
 absorbed, in [Testing](testing.md): reconnect-backoff internals that need
-fault injection, the `retry: wait` branch the client suite has no rate-limited
-server to reach, and a handful of provably equivalent mutants.
+fault injection, and a handful of provably equivalent mutants. **The `retry:
+wait` row was closed on 2026-08-14** — and closing it found the branch was not
+merely untested but wrong; see the section below.
 
 **The rule from M7 held again**: the value was not the score, it was that
 mutation testing asked "which of these lines could I delete?" and the answer
@@ -986,8 +987,8 @@ in [Deviations](deviations.md):
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
 | Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`), type conversion | outside M9 task 1's agreed list; variable binding needs an evaluation *scope*, not another operator |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
-| **The M10 mutation pass covered `kimmy-client` only** — 90 mutants in `kimmy-api`, `kimmy-storage` and `kimmy-auth` are unclassified | new in M10 task 12. Misconfigured run, not a finding; about an hour to redo properly. Those crates had full passes in M7 and M8 |
-| **The client's `retry: wait` path has no test that reaches it** — 4 surviving mutants are this one branch | new in M10 task 12. Wants a test server answering `429`, asserting the retry goes to the *same* endpoint |
+| **The M10 server-side mutation pass — `kimmy-api`'s 76 mutants are still unclassified** | narrowed 2026-08-14: `kimmy-auth` (2) and `kimmy-storage` (12) are done, and found `InvalidateReason::as_str` unpinned. Run `kimmy-api` on an **idle** machine — contention is what ruined it twice |
+| ~~The client's `retry: wait` path has no test that reaches it~~ | **Closed 2026-08-14.** The test found the branch was *wrong*: `wait` failed over instead of waiting, so it behaved as `elsewhere` with a delay. Fixed, 9/9 mutants caught |
 | A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **recorded as an open question rather than explained** |
 | Sharding | **deferred by decision** until there is operational experience |
 
