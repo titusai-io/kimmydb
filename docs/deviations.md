@@ -1424,28 +1424,46 @@ does not test that; something that has to find, page and react does.
 
 ---
 
-## 🟡 The M10 mutation pass covered the client, not the server crates
+## 🟡 The M10 server-side mutation pass — two crates of three done
 
-**M10 task 12 called for a mutation pass over the milestone diff. It covers
-`kimmy-client` only.** The client pass is complete and its findings are real —
-seven untested public methods, untested topology filtering, thirteen never-produced
-error codes — but the 90 mutants in `kimmy-api`, `kimmy-storage` and
-`kimmy-auth` are **unclassified**.
+**Narrowed on 2026-08-14.** M10 task 12 called for a mutation pass over the
+milestone diff and covered `kimmy-client` only, leaving 90 mutants in
+`kimmy-api`, `kimmy-storage` and `kimmy-auth` unclassified. The original run was
+misconfigured — every mutant re-ran all three crates' suites at a parallelism
+that pushed each past the timeout, producing 3 caught and 15 timeouts out of 47
+before being abandoned.
 
-**Why**: the run was misconfigured — every mutant re-ran all three crates'
-suites at a parallelism that pushed each past the timeout. It produced 3 caught
-and 15 timeouts out of 47 before being abandoned rather than left to burn hours
-for no data.
+The scope splits **76 / 12 / 2**, which sums to exactly the 90 recorded.
 
-**Not alarming**: those three crates had full passes in M7 and M8, and their
-share of the M10 diff is small. **Not nothing either**: the new code in them —
-the error taxonomy, `/v1/version`, `/v1/topology`, the node registry, the
-change-stream invalidate — is exactly the kind of branch-heavy logic mutation
-testing is good at.
+| Crate | | |
+|---|---|---|
+| `kimmy-auth` | ✅ 2 caught | Both first read as misses and **both were scoping artefacts** — see below |
+| `kimmy-storage` | ✅ 10 caught, 2 unviable | One real gap: `InvalidateReason::as_str` |
+| `kimmy-api` | ⏳ 76 outstanding | Started; stopped mid-run for contention, not for a finding |
 
-**To close**: one pass per crate, tests scoped to that crate (`-- -p kimmy-api`),
-`-j 4`, timeout set from a contended baseline. [Testing](testing.md) has the
-detail.
+**The `kimmy-storage` finding is the one that mattered.**
+`InvalidateReason::as_str` could return `""` or `"xyzzy"` with nothing failing.
+That method exists *precisely* so a variant rename cannot silently rename a
+value clients branch on — and the strings were pinned only downstream, in the
+three client suites, the cluster harness and the conformance scenarios, and
+only for `CollectionDropped`. `ConsumerLagged` and `ResumeTokenExpired` were
+held by prose in `docs/openapi.yaml` and by nothing that fails. They are pinned
+now in the crate that chooses them.
+
+**And a methodological finding worth more than either.** Both `kimmy-auth`
+misses were caught once `-p kimmy-api` joined the test scope: `ttl_secs` is
+asserted in the consumer's suite, not the owner's. **Per-crate scoping — M10's
+own documented lesson, and the thing that makes these runs twenty minutes
+instead of nine hours — systematically hides cross-crate killers.** A miss in a
+crate whose surface is consumed by another may only mean the test lives one
+crate up. Verify with a widened scope before believing a gap is real. A local
+test was still added, because a crate's public accessor should not depend on a
+consumer to pin it.
+
+**To close**: the `kimmy-api` pass, `--in-diff` against the M10 range,
+`-- -p kimmy-api`, `-j 4`, on an **idle machine** — running it beside an
+ordinary `cargo test --workspace` stretched that suite from ~2 minutes past 10,
+which is the same contention that ruined the original run.
 
 ---
 

@@ -925,6 +925,40 @@ These crates had full mutation passes in M7 and M8, and the M10 diff over them
 is small next to the client and specification work. Redoing it properly is
 worth an hour of someone's time, not an emergency.
 
+### Redone properly: two crates of three
+
+**2026-08-14.** The scope splits 76 `kimmy-api` / 12 `kimmy-storage` / 2
+`kimmy-auth` — exactly the 90 recorded. Two are done; `kimmy-api` is still
+outstanding.
+
+| Crate | Result |
+|---|---|
+| `kimmy-auth` | 2 caught. Both first read as misses; both were scoping artefacts |
+| `kimmy-storage` | 10 caught, 2 unviable, 0 missed. One real gap, now fixed |
+| `kimmy-api` | 76 outstanding |
+
+**The real gap was `InvalidateReason::as_str`**, which could return `""` or
+`"xyzzy"` unnoticed. The method exists so that renaming a variant cannot
+silently rename a value clients branch on — and yet the strings were asserted
+only downstream (three client suites, the cluster harness, the conformance
+scenarios) and only for `CollectionDropped`. The other two reasons were held by
+prose in `docs/openapi.yaml`. All three are pinned now in the crate that
+chooses them, exhaustively, so a new variant does not compile until its wire
+name is decided.
+
+**Scoping to the mutant's crate hides cross-crate killers, and that cuts both
+ways.** It is what makes these runs affordable, but both `kimmy-auth` "misses"
+were caught the moment `-p kimmy-api` joined the scope: `ttl_secs` is asserted
+by its consumer, not its owner. **A miss in a crate whose surface another crate
+consumes may only mean the test lives one crate up — widen the scope and re-run
+before believing it.** The local test was added anyway, on the principle that a
+crate's public accessor should not rely on a consumer to pin it.
+
+**And the contention lesson repeated itself, in the other direction.** Running
+the `kimmy-api` pass beside an ordinary `cargo test --workspace` stretched that
+suite from ~2 minutes to over 10. Contention does not only ruin the mutation
+run; it ruins whatever shares the machine with it. Run these alone.
+
 ### What is left, and why it is left
 
 | Class | Count | |

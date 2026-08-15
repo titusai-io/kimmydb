@@ -147,6 +147,30 @@ mod tests {
         assert!(!recovered.can(Action::Write, "sales", Some("orders")));
     }
 
+    /// The reported lifetime is the configured one, and it is the token's own.
+    ///
+    /// `expiresIn` is how a client decides when to refresh (ADR-059), so a
+    /// wrong answer here is a client that renews too late and gets a 401, or
+    /// renews constantly. It was asserted only in `kimmy-api`'s suite, which
+    /// left it unpinned for any mutation run scoped to this crate — and this
+    /// accessor is this crate's surface, so this crate should hold it.
+    #[test]
+    fn the_reported_lifetime_is_the_one_tokens_are_issued_with() {
+        let issuer = TokenIssuer::new(SECRET, 900).unwrap();
+        assert_eq!(issuer.ttl_secs(), 900);
+
+        // And it is not merely stored: it is the `exp` a verifier will enforce.
+        // Issued at a fixed past instant so the arithmetic is exact, which
+        // means expiry validation has to be off — the subject is the claim's
+        // value, not whether it is still live.
+        let token = issuer.issue_at(&analyst(), 1_000).unwrap();
+        let mut validation = jsonwebtoken::Validation::new(Algorithm::HS256);
+        validation.validate_exp = false;
+        let claims =
+            jsonwebtoken::decode::<Claims>(&token, &issuer.decoding, &validation).unwrap().claims;
+        assert_eq!(claims.exp - claims.iat, issuer.ttl_secs(), "told and issued must agree");
+    }
+
     #[test]
     fn a_token_signed_with_another_secret_is_rejected() {
         let token = issuer().issue(&analyst()).unwrap();
