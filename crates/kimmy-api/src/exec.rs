@@ -260,11 +260,19 @@ pub struct QueryStats {
     /// Index ranges scanned: 1 for a plain index plan, several for a `$in`
     /// union, 0 for a collection scan.
     pub probes: usize,
+    /// Whether the filter pinned `_id` and was answered by primary-key reads.
+    ///
+    /// Reported separately from `index` because the primary key is not one: no
+    /// index was consulted and none needs to exist. A client tuning a query
+    /// wants to see that it took the fast path, not to be told an index it
+    /// never created was used.
+    pub id_lookup: bool,
 }
 
 impl QueryStats {
     pub fn to_json(&self) -> Value {
         let strategy = match (&self.index, self.probes) {
+            _ if self.id_lookup => "idLookup",
             (None, _) => "collectionScan",
             // A union of equality probes is a different shape of work from
             // one range scan, and the difference is what `$in` planning
@@ -314,9 +322,45 @@ pub fn collect_matching_after(
     stop_after: Option<usize>,
     after: Option<&[u8]>,
 ) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
-    let mut plan = plan::choose(filter, &meta.indexes);
     let mut matched = Vec::new();
     let mut examined = 0usize;
+
+    // The primary key first: it is the tightest access path there is, needs no
+    // index to exist, and beats anything a secondary index could offer for the
+    // same predicate. The keys are already document keys, so this produces the
+    // same candidate shape an index scan does and the filter is re-applied to
+    // each exactly as it is there.
+    let primary = plan::choose_primary_key(filter);
+    if let Some(pk) = &primary {
+        for key in &pk.keys {
+            if after.is_some_and(|bound| key.as_slice() <= bound) {
+                continue;
+            }
+            // A key naming no document is an ordinary miss, not an error: the
+            // filter asked for an `_id` nothing was stored under.
+            let Some(doc) = state.engine.get_by_encoded_key(meta, key)? else {
+                continue;
+            };
+            examined += 1;
+            if filter::matches(filter, &doc) {
+                matched.push(doc);
+                if stop_after.is_some_and(|n| matched.len() >= n) {
+                    break;
+                }
+            }
+        }
+        let stats = QueryStats {
+            index: None,
+            fields_used: 0,
+            examined,
+            matched: matched.len(),
+            probes: pk.keys.len(),
+            id_lookup: true,
+        };
+        return Ok((matched, stats));
+    }
+
+    let mut plan = plan::choose(filter, &meta.indexes);
 
     // A plan that intersected both ends of a range is only sound while the
     // index is not multikey — and it was chosen from a metadata read that is
@@ -386,6 +430,7 @@ pub fn collect_matching_after(
         examined,
         matched: matched.len(),
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
+        id_lookup: false,
     };
     Ok((matched, stats))
 }
@@ -1092,6 +1137,7 @@ mod tests {
             examined: 0,
             matched: 0,
             probes,
+            id_lookup: false,
         }
     }
 
@@ -1102,6 +1148,22 @@ mod tests {
         assert_eq!(stats(None, 0).to_json()["strategy"], "collectionScan");
         assert_eq!(stats(Some("i"), 1).to_json()["strategy"], "index");
         assert_eq!(stats(Some("i"), 2).to_json()["strategy"], "indexUnion");
+    }
+
+    #[test]
+    fn a_primary_key_lookup_is_named_as_one_and_claims_no_index() {
+        // `idLookup` wins over every other strategy, including a probe count
+        // that would otherwise read as a union — the work is primary-key reads
+        // whether there is one key or ten.
+        let one = QueryStats { probes: 1, id_lookup: true, ..stats(None, 0) };
+        assert_eq!(one.to_json()["strategy"], "idLookup");
+        let many = QueryStats { probes: 5, id_lookup: true, ..stats(None, 0) };
+        assert_eq!(many.to_json()["strategy"], "idLookup");
+
+        // And it reports no index, because none was consulted and none needs
+        // to exist. Naming one would send a reader looking for it.
+        assert_eq!(one.to_json()["index"], Value::Null);
+        assert_eq!(one.to_json()["indexFieldsUsed"], 0);
     }
 
     #[test]

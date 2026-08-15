@@ -1589,22 +1589,63 @@ here so that the absence of a decision is visible as a decision.
 
 ---
 
-## 🟡 `find` by `_id` does not use the primary key
+## 🟢 `find` by `_id` uses the primary key (was a 🟡 since M8)
 
 Found while measuring latency-histogram buckets (ADR-046): `{_id: 500}`
-through `find` is a full collection scan — ~7 ms over 10k documents — because
+through `find` was a full collection scan — ~7 ms over 10k documents — because
 the planner consults *secondary* indexes only. The primary key is not in its
 candidate set. `GET /v1/db/{db}/coll/{coll}/docs/{id}` is the O(1) path and
 runs p50 ≈ 250 µs on the same data.
 
 **Consequence.** Correct but slow, the register's favourite shape. Any client
 that filters on `_id` through `find` — including via the MCP `find` tool,
-where an agent has no reason to know a second route is the fast one — pays a
+where an agent has no reason to know a second route is the fast one — paid a
 scan.
 
-**To close.** Teach the planner an `_id` equality (and `$in`) fast path that
-resolves through the primary key rather than an index. Self-contained; a
-natural M8 stretch or M9 item.
+**Closed on 2026-08-14.** `plan::choose_primary_key` resolves an `_id` equality
+or `$in` straight into document keys, which is the same candidate shape an
+index scan produces — so the executor's existing "re-apply the full filter to
+every candidate" rule carries over untouched. Measured on a release build, 10k
+documents, before and after on the same data:
+
+| | `find({_id})` p50 | examined | strategy | unindexed scan (control) |
+|---|---|---|---|---|
+| before | 7.328 ms | 10,000 | `collectionScan` | 7.242 ms |
+| after | **0.540 ms** | **1** | `idLookup` | 7.065 ms |
+
+**13.6× faster, and the control is unchanged** — which is what says the gain is
+this path rather than a warmer machine. The remaining 1.77× against
+`GET /docs/{id}` (0.306 ms) is real work `find` still does: parse a filter,
+plan, re-apply the filter, wrap the result.
+
+**`update`, `delete` and `count` inherit it**, because M9's #60 made all three
+go through `collect_matching`. A targeted write on `_id` stops costing a scan
+too, and a test asserts it rather than leaving it implied.
+
+**The trap, and why the conversion is not decoration.** A stored document key
+is `keyenc::encode(DocId::try_from_bson(id).to_bson())`, and that conversion
+**normalizes `Int32` into `Int64`**. Encoding the filter's raw `Bson` instead
+would build a different key for `{_id: 5}` depending on how the JSON parsed,
+match nothing, and report a stored document as absent — a candidate set that is
+*too narrow*, the one error the planner's safety rule forbids. Routing every
+value through the same function the write path uses makes probe and stored key
+agree by construction.
+
+**And why a value it refuses falls back rather than being dropped.**
+`try_from_bson` rejects `Double`, `Decimal128` and null. That is not merely
+unhelpful: filter equality is cross-type *within* the numeric group, so
+`{_id: 5.0}` genuinely matches a document stored under `Int64(5)`. Probing only
+the values that normalize would lose it silently, so a single unusable value
+abandons the fast path for the whole filter. There is a test that inserts under
+an integer key, queries with a double, and requires both `collectionScan` *and*
+the document.
+
+**Deliberately not included:** ranges on `_id` (`$gt`, `$lt`). The documents
+table is ordered by encoded key and `keyenc` is order-preserving, so a range
+scan is available and would be a real further win — but it is a different shape
+of work from a set of probes, and saying so is cheaper than a wrong answer. An
+`_id` inside an `$or` is not a lookup either, for the reason `extract` already
+encodes: a disjunction constrains nothing that must universally hold.
 
 **Built.** A token bucket per key, on `/v1/auth/login`, keyed on the client
 address. Closes the 🔴 that made a password guessable at network speed.

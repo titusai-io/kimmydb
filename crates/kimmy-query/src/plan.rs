@@ -101,6 +101,74 @@ pub fn choose(filter: &Filter, indexes: &[IndexMeta]) -> Option<IndexPlan> {
     best
 }
 
+/// A direct primary-key lookup.
+///
+/// `_id` is not in the secondary-index candidate set — the documents table
+/// *is* the primary key — so before this existed, `find({_id: 5})` scanned the
+/// whole collection while `GET /docs/{id}` answered the same question with one
+/// read. Any client filtering on `_id` through `find` paid it, including the
+/// MCP `find` tool, where an agent has no reason to know a second route is the
+/// fast one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PrimaryKeyPlan {
+    /// Encoded document keys to fetch, in key order and deduplicated.
+    ///
+    /// Key order because the executor skips a `after` prefix by comparison and
+    /// relies on candidates arriving sorted, exactly as the index path does.
+    pub keys: Vec<Vec<u8>>,
+}
+
+/// Resolve a filter that pins `_id` into document keys, or `None` to plan
+/// normally.
+///
+/// # Why every value goes through `DocId`
+///
+/// A stored document key is `keyenc::encode(DocId::try_from_bson(id).to_bson())`,
+/// and that conversion **normalizes**: `Int32(5)` and `Int64(5)` both become
+/// `Int64(5)`. Encoding a filter's raw `Bson` instead would build a different
+/// key for `{_id: 5}` depending on how the JSON happened to parse, find
+/// nothing, and report it as "no such document" — a candidate set that is *too
+/// narrow*, which is the one error this module's safety rule forbids. Routing
+/// through the same function the write path uses makes probe and stored key
+/// agree by construction rather than by argument.
+///
+/// # Why a rejected value falls back rather than being dropped
+///
+/// `try_from_bson` refuses types that cannot be a primary key — `Double`,
+/// `Decimal128`, null. Those are not merely unhelpful: filter equality is
+/// **cross-type within the numeric group**, so `{_id: 5.0}` really does match
+/// a document stored under `Int64(5)`. Dropping such a value would lose that
+/// document silently, so any value this cannot normalize abandons the fast
+/// path for the whole filter and lets the collection scan answer it.
+pub fn choose_primary_key(filter: &Filter) -> Option<PrimaryKeyPlan> {
+    let predicates = extract(filter);
+    let bounds = predicates.get(crate::shape::ID_FIELD)?;
+
+    // Equality first, as `plan_for` does: a single probe beats a union when
+    // both constrain the same field.
+    let values: Vec<&Bson> = match (&bounds.eq, &bounds.in_values) {
+        (Some(eq), _) => vec![eq],
+        (None, Some(values)) => values.iter().collect(),
+        (None, None) => return None,
+    };
+    // An empty `$in` matches nothing, and a plan with no keys would read as a
+    // lookup that found nothing rather than as one that was never made. Both
+    // answer "no documents", but only the scan says so for a reason a reader
+    // can check.
+    if values.is_empty() {
+        return None;
+    }
+
+    let mut keys = Vec::with_capacity(values.len());
+    for value in values {
+        let id = kimmy_core::DocId::try_from_bson(value).ok()?;
+        keys.push(keyenc::encode(&id.to_bson()).ok()?);
+    }
+    keys.sort();
+    keys.dedup();
+    Some(PrimaryKeyPlan { keys })
+}
+
 /// Whether a partial index may be used for a query proving `proven`.
 ///
 /// `true` for an ordinary index, always. A partial index whose stored filter
@@ -387,6 +455,113 @@ mod tests {
 
     fn plan(query: bson::Document, indexes: &[IndexMeta]) -> Option<IndexPlan> {
         choose(&crate::filter::parse(&query).unwrap(), indexes)
+    }
+
+    // -----------------------------------------------------------------------
+    // The primary-key fast path
+    // -----------------------------------------------------------------------
+
+    fn pk(query: bson::Document) -> Option<PrimaryKeyPlan> {
+        choose_primary_key(&crate::filter::parse(&query).unwrap())
+    }
+
+    /// The trap this whole conversion exists for.
+    ///
+    /// A stored key is encoded from a `DocId`, which folds `Int32` into
+    /// `Int64`. Encoding the filter's raw `Bson` instead would build a
+    /// different key depending on how the JSON happened to parse, match
+    /// nothing, and report a stored document as absent — a candidate set that
+    /// is *too narrow*, which is the one error this module forbids.
+    #[test]
+    fn an_int32_and_an_int64_id_probe_the_same_key() {
+        let as_i32 = pk(doc! { "_id": 5i32 }).expect("an equality on _id");
+        let as_i64 = pk(doc! { "_id": 5i64 }).expect("an equality on _id");
+        assert_eq!(as_i32.keys, as_i64.keys, "the width of the integer must not change the key");
+
+        // And the key really is the one the storage layer stores under, not
+        // merely self-consistent: same function, same normalization.
+        let expected =
+            keyenc::encode(&kimmy_core::DocId::Int64(5).to_bson()).expect("encoding a doc id");
+        assert_eq!(as_i32.keys, vec![expected]);
+    }
+
+    /// A value that cannot be a primary key abandons the fast path entirely.
+    ///
+    /// Not merely conservative: filter equality is cross-type *within* the
+    /// numeric group, so `{_id: 5.0}` really does match a document stored
+    /// under `Int64(5)`. Probing only what normalizes would lose it silently,
+    /// so the whole filter falls back to a scan that can still find it.
+    #[test]
+    fn a_value_that_cannot_be_an_id_falls_back_to_a_scan() {
+        assert_eq!(pk(doc! { "_id": 5.0 }), None, "a double may still equal a stored integer");
+        assert_eq!(pk(doc! { "_id": bson::Bson::Null }), None);
+        assert_eq!(pk(doc! { "_id": true }), None);
+    }
+
+    /// One unusable value in an `$in` abandons the path for all of them.
+    #[test]
+    fn a_mixed_in_list_falls_back_rather_than_dropping_the_awkward_value() {
+        assert!(pk(doc! { "_id": { "$in": [1i64, 2i64] } }).is_some(), "both are usable");
+        assert_eq!(
+            pk(doc! { "_id": { "$in": [1i64, 2.5] } }),
+            None,
+            "dropping 2.5 would silently narrow the answer"
+        );
+    }
+
+    #[test]
+    fn an_in_list_becomes_sorted_deduplicated_probes() {
+        let plan = pk(doc! { "_id": { "$in": [3i64, 1i64, 3i64, 2i64] } }).expect("a union");
+        assert_eq!(plan.keys.len(), 3, "the repeat is one probe, not two");
+        let mut sorted = plan.keys.clone();
+        sorted.sort();
+        assert_eq!(plan.keys, sorted, "the executor skips an `after` prefix by comparison");
+    }
+
+    /// A disjunction constrains nothing that must universally hold.
+    ///
+    /// Taking `_id` out of an `$or` would answer only one of its branches and
+    /// drop every document matching the others.
+    #[test]
+    fn an_id_inside_an_or_is_not_a_primary_key_lookup() {
+        assert_eq!(pk(doc! { "$or": [{ "_id": 1i64 }, { "status": "new" }] }), None);
+        assert_eq!(pk(doc! { "$nor": [{ "_id": 1i64 }] }), None);
+    }
+
+    #[test]
+    fn a_range_or_absence_on_id_is_not_a_lookup() {
+        // Ranges are a scan of the documents table, not a set of probes. Worth
+        // having one day; out of scope here, and saying so is cheaper than a
+        // wrong answer.
+        assert_eq!(pk(doc! { "_id": { "$gt": 1i64 } }), None);
+        assert_eq!(pk(doc! { "_id": { "$ne": 1i64 } }), None);
+        assert_eq!(pk(doc! { "status": "new" }), None);
+        assert_eq!(pk(doc! { "_id": { "$in": [] } }), None, "an empty $in matches nothing");
+    }
+
+    /// An `_id` equality alongside other predicates still takes the fast path.
+    ///
+    /// The filter is re-applied to every candidate, so extra conditions cost
+    /// nothing here — narrowing to one document first is the point.
+    #[test]
+    fn other_predicates_do_not_prevent_the_lookup() {
+        let plan = pk(doc! { "_id": 5i64, "status": "new" }).expect("still pinned to one _id");
+        assert_eq!(plan.keys.len(), 1);
+    }
+
+    /// Every id type that can be a primary key resolves.
+    #[test]
+    fn every_usable_id_type_probes() {
+        assert!(pk(doc! { "_id": "abc" }).is_some(), "string");
+        assert!(pk(doc! { "_id": bson::oid::ObjectId::new() }).is_some(), "object id");
+        assert!(
+            pk(doc! { "_id": bson::Binary {
+                subtype: bson::spec::BinarySubtype::Generic,
+                bytes: vec![1, 2, 3],
+            } })
+            .is_some(),
+            "binary"
+        );
     }
 
     #[test]

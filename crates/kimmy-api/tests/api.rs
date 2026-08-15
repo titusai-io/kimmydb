@@ -1137,6 +1137,236 @@ async fn an_index_never_changes_which_documents_a_query_returns() {
     }
 }
 
+/// `find` on `_id` reads the document rather than scanning for it.
+///
+/// The register carried this as "correct but slow": the planner consults
+/// *secondary* indexes only, so `{_id: 5}` scanned the whole collection while
+/// `GET /docs/5` answered the same question with one read. Any client filtering
+/// on `_id` through `find` paid it — including the MCP `find` tool, where an
+/// agent has no reason to know a second route is the fast one.
+#[tokio::test]
+async fn a_find_on_id_examines_one_document_not_the_collection() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "explain": true }),
+        )
+        .await;
+
+    assert_eq!(res.body["explain"]["strategy"], "idLookup", "{:?}", res.body);
+    assert_eq!(
+        res.body["explain"]["documentsExamined"], 1,
+        "one read, not a scan of sixty: {:?}",
+        res.body
+    );
+    assert_eq!(res.body["explain"]["index"], Value::Null, "no index was consulted");
+    assert_eq!(res.body["documents"].as_array().unwrap().len(), 1);
+    assert_eq!(res.body["documents"][0]["_id"], 5);
+
+    // And it is the same document the point route returns, which is the claim
+    // that matters: a faster path must not be a different answer.
+    let point = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    assert_eq!(res.body["documents"][0], point.body);
+}
+
+/// An `$in` on `_id` becomes one probe per value, still without a scan.
+#[tokio::test]
+async fn an_in_on_id_probes_each_value() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            // 5 twice, and one that was never stored: a repeat is one probe,
+            // and a miss is an ordinary absence rather than an error.
+            json!({ "filter": { "_id": { "$in": [5, 9, 5, 9999] } }, "explain": true }),
+        )
+        .await;
+
+    assert_eq!(res.body["explain"]["strategy"], "idLookup", "{:?}", res.body);
+    assert_eq!(res.body["explain"]["documentsExamined"], 2, "{:?}", res.body);
+    let ids: Vec<i64> = res.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![5, 9]);
+}
+
+/// The fast path narrows; the filter still decides.
+///
+/// A candidate is re-checked against the whole filter exactly as an index
+/// candidate is, so a second predicate that excludes the document must still
+/// exclude it.
+#[tokio::test]
+async fn an_id_lookup_still_applies_the_rest_of_the_filter() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let five = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    let qty = five.body["qty"].clone();
+
+    let matching = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            json!({ "filter": { "_id": 5, "qty": qty }, "explain": true }),
+        )
+        .await;
+    assert_eq!(matching.body["explain"]["strategy"], "idLookup");
+    assert_eq!(matching.body["documents"].as_array().unwrap().len(), 1);
+
+    let excluded = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            json!({ "filter": { "_id": 5, "qty": 100000 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(excluded.body["explain"]["strategy"], "idLookup", "the path is still chosen");
+    assert_eq!(
+        excluded.body["documents"].as_array().unwrap().len(),
+        0,
+        "narrowing is not deciding: the filter still excludes it"
+    );
+}
+
+/// `update`, `delete` and `count` inherit the fast path, because all three go
+/// through `collect_matching`.
+///
+/// That sharing is deliberate — M9 found `update` and `delete` scanning while
+/// `find` used the planner — and it means a targeted write on `_id` stops
+/// costing a scan too. Asserted rather than assumed, since "they share a
+/// function" is exactly the kind of claim that quietly stops being true.
+#[tokio::test]
+async fn a_targeted_write_on_id_also_takes_the_fast_path() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let counted = server
+        .post(
+            "/v1/db/shop/coll/control/count",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(counted.body["count"], 1);
+    assert_eq!(counted.body["explain"]["strategy"], "idLookup", "{:?}", counted.body);
+
+    let updated = server
+        .post(
+            "/v1/db/shop/coll/control/update",
+            Some(&token),
+            json!({
+                "filter": { "_id": 5 },
+                "update": { "$set": { "item": "changed" } },
+                "explain": true,
+            }),
+        )
+        .await;
+    assert_eq!(updated.body["matched"], 1, "{:?}", updated.body);
+    assert_eq!(updated.body["explain"]["strategy"], "idLookup", "{:?}", updated.body);
+    assert_eq!(updated.body["explain"]["documentsExamined"], 1, "{:?}", updated.body);
+
+    let after = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    assert_eq!(after.body["item"], "changed", "the write landed on the right document");
+
+    let deleted = server
+        .post(
+            "/v1/db/shop/coll/control/delete",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(deleted.body["deleted"], 1, "{:?}", deleted.body);
+    assert_eq!(deleted.body["explain"]["strategy"], "idLookup", "{:?}", deleted.body);
+
+    let gone = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    assert_eq!(gone.status, 404, "and only that document: {:?}", gone.body);
+    let remaining =
+        server.post("/v1/db/shop/coll/control/count", Some(&token), json!({ "filter": {} })).await;
+    assert_eq!(remaining.body["count"], 59);
+}
+
+/// A `_id` the fast path cannot encode still finds its document, by scanning.
+///
+/// This is the safety case, and it is not hypothetical. Filter equality is
+/// cross-type *within* the numeric group, so `{_id: 5.0}` really does match a
+/// document stored under `Int64(5)`. `DocId` refuses a `Double`, so probing
+/// only what normalizes would lose the document silently — the fast path has
+/// to stand aside instead.
+#[tokio::test]
+async fn a_double_id_filter_still_finds_the_integer_keyed_document() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            json!({ "filter": { "_id": 5.0 }, "explain": true }),
+        )
+        .await;
+
+    assert_eq!(
+        res.body["explain"]["strategy"], "collectionScan",
+        "a double is not a document id, so the fast path must stand aside: {:?}",
+        res.body
+    );
+    assert_eq!(
+        res.body["documents"].as_array().unwrap().len(),
+        1,
+        "and the document is still found: {:?}",
+        res.body
+    );
+    assert_eq!(res.body["documents"][0]["_id"], 5);
+}
+
+/// An `_id` inside an `$or` is not a lookup, and every branch still answers.
+#[tokio::test]
+async fn an_id_inside_an_or_returns_both_branches() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/control/find",
+            Some(&token),
+            json!({
+                "filter": { "$or": [ { "_id": 5 }, { "_id": 9 } ] },
+                "explain": true,
+                "limit": 500,
+            }),
+        )
+        .await;
+
+    assert_eq!(
+        res.body["explain"]["strategy"], "collectionScan",
+        "a disjunction constrains nothing that must universally hold: {:?}",
+        res.body
+    );
+    let ids: Vec<i64> = res.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![5, 9], "taking _id out of an $or would drop a branch");
+}
+
 #[tokio::test]
 async fn explain_reports_which_access_path_was_used() {
     let server = Server::start().await;

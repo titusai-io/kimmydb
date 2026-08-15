@@ -195,6 +195,33 @@ statistics, so it will use an index whenever one applies. On a filter matching
 most documents that is a modest loss (5,000 of 10,000 cost 8.3 ms instead of
 7.9 ms), which is why statistics have not been worth building.
 
+### `find` on `_id` is a primary-key read, not a scan
+
+Measured 2026-08-14, release build, 10,000 documents, over HTTP — the same
+question asked three ways on the same data, first sample discarded.
+
+| | `find({_id})` p50 | p99 | examined | strategy |
+|---|---:|---:|---:|---|
+| before | 7.328 ms | 20.188 ms | 10,000 | `collectionScan` |
+| after | **0.540 ms** | **1.212 ms** | **1** | `idLookup` |
+| `GET /docs/{id}` | 0.306 ms | 0.703 ms | 1 | — |
+| unindexed filter (control) | 7.065 ms | 19.733 ms | 10,000 | `collectionScan` |
+
+**13.6× faster, and the control is unchanged**, which is what makes this the
+fast path rather than a warmer machine. The planner consults *secondary*
+indexes, and the primary key is not among them, so `find({_id: n})` read the
+whole collection while `GET /docs/{id}` answered the same question with one
+read.
+
+The residual **1.77×** against the point route is honest overhead rather than a
+mystery: `find` parses a filter, plans, re-applies the filter to the candidate
+and wraps the result in a documents array. Worth knowing that the point route
+is still the cheaper way to ask, and no longer worth restructuring an
+application around.
+
+`update`, `delete` and `count` inherit it, because all three go through
+`collect_matching`.
+
 ### `MAX_LIMIT = 10_000` is defensible
 
 The cap on `find` was a guess. A full scan of exactly 10,000 documents is
