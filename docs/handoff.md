@@ -6,24 +6,85 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-15 — **M11 has started**; task 1 done, one PR open
+## As of 2026-08-15 — **nothing open, and the direction has changed**
 
-**M0–M10 are all merged.** PRs #65–#77 closed M10; #78–#81 worked the carried
-debt down afterwards. **M11 — index-ordered scans — is now open**, and its
-board is in [Roadmap](roadmap.md) rather than only in this file.
+**Everything is merged and `main` is clean. There is no open PR and no branch in
+flight.** M0–M10 are complete; #78–#83 worked the carried debt down afterwards.
+
+> ### ⚠️ Read this before the roadmap
+>
+> **The maintainer has redirected the work, on 2026-08-15.** The next thing is
+> **not** M11 task 2, and not anything on any board.
+>
+> > *"I'm not ready to set up a CI/CD pipeline yet for this project. Right now I
+> > want to focus on finishing implementation, testing the actual running
+> > behaviour of KimmyDB, and getting this running for local use."*
+>
+> Three instructions in one sentence, and they outrank
+> [Roadmap](roadmap.md):
+>
+> 1. **Do not add CI.** Not a job, not a workflow, not a step. A job was added
+>    on #83 and removed again at the maintainer's word — do not re-add it, and
+>    do not treat "this property needs guarding" as a reason to. An
+>    `#[ignore]`d test listed in [Testing](testing.md) is how an expensive
+>    check gets a home here now.
+> 2. **Finish implementation and test the real running behaviour** — the
+>    running node, not the suite.
+> 3. **Get KimmyDB running for local use.** This is the goal to work toward,
+>    and it is a different kind of work from the last six branches. See
+>    "What to do next" below — it has not been scoped yet, and scoping it is a
+>    conversation with the maintainer rather than a reading of the roadmap.
+>
+> **M11 is paused, not cancelled.** Its board stays in [Roadmap](roadmap.md).
+> Task 1 is done; tasks 2–5 are not started and are not the next work.
 
 | | |
 |---|---|
 | #78 | `retry: wait` fixed (it failed over instead of waiting), `kimmy-auth` + `kimmy-storage` mutation passes |
 | #79 | `kimmy-api` mutation pass — closes the M10 mutation debt entirely |
 | #80 | `find {_id}` uses the primary key — 7.328 ms → 0.540 ms |
-| #81 | An HNSW build could orphan a tenth of a collection. Merged 2026-08-15 |
-| #82 | M11 task 1: the daemon commits twice per insert. Merged 2026-08-15 |
-| **`hnsw-reachability-does-not-depend-on-collection-size`** | **OPEN.** #81's threshold was sized on a toy fixture and fires on every healthy build at a realistic embedding width. Read the section below |
+| #81 | An HNSW build could orphan a tenth of a collection |
+| #82 | M11 task 1: the daemon commits twice per insert |
+| #83 | #81's threshold, re-sized — it counted budget-limited searches as lost data |
+
+### What to do next
+
+**Not yet scoped.** The direction above is clear about the goal and silent
+about the shape, so scoping it is the open item:
+
+> What does "running for local use" mean concretely — a single node you keep
+> real data in, the Docker image, or the three-node compose setup?
+
+**What exists already, checked rather than assumed.** A first draft of this
+section guessed and got two of four wrong, so these are verified:
+
+- **`README.md:40` has a Quick start**, and it is a good one — from source *and*
+  Docker, then login, create a collection, insert, a Mongo-style
+  filter/sort/projection, configure embeddings, vector search, and a change
+  stream over `websocat`.
+- **[Operations](operations.md) does not assume building from source** —
+  `operations.md:114` is a `docker run -d`.
+- **`docker-compose.yml` is a three-node cluster** (`kimmy1`/`2`/`3`, named
+  volumes). There is no single-node compose.
+- **No image is published.** `ci.yml` builds one with `push: false`, and the
+  README's Docker path starts with `docker build -t kimmydb .`, so every route
+  to a running node compiles the tree first.
+
+**So the gap is probably not "there are no instructions" — it is that nobody
+has run them verbatim from a clean clone recently.** That is exactly what
+"testing the actual running behaviour" asks for, and it is the cheapest first
+task: follow `README.md:40` literally, on a scratch directory, and record what
+happens. Every branch in the last two milestones found something by driving a
+real node; none of them started from the documented first-run path.
+
+**Two things that are true and easy to forget** when the goal is "make it
+usable": the register in [Deviations](deviations.md) holds **zero 🔴**, and the
+verification gate below still applies to every branch. A usability branch is
+still a branch — fresh `main`, one task, a PR, and the maintainer merges.
 
 ### M11 task 1 — the write gap, and what explaining it turned up
 
-*(Merged as #82. The branch open now came out of verifying it — see
+*(Merged as #82, and the branch after it came out of verifying this one — see
 "The reachability threshold" below.)*
 
 **The daemon spends two durable commits on an insert where the engine spends
@@ -126,7 +187,7 @@ own CI job in release — 21 s there against 146 s in debug, on the cluster
 harness's reasoning that a suite doubled to hold one property loses the
 property.
 
-### #81, the branch before this one — still worth reading
+### #81, the branch these two came out of — still worth reading
 
 **A test that looked flaky was reporting silent data loss.** About **one HNSW
 index build in 250** left **10–24% of a collection unreachable** from the graph:
@@ -183,18 +244,17 @@ deferral was settled by [ADR-055](decisions.md) and is what M10 carries out.
 ```bash
 cd /path/to/kimmydb
 git checkout main && git pull
-gh pr list --state open            # is the write-gap branch still open?
+gh pr list --state open            # expected: nothing
+git log --oneline -1               # expected: the #83 merge, or later
 ```
 
-**If `hnsw-reachability-does-not-depend-on-collection-size` is still open**,
-that branch is the work and it is waiting on review.
+**As of this writing there is nothing open and nothing in flight.** If that is
+still true, the next work is **not on any board** — read the boxed note at the
+top of this file, then "What to do next". The short version: the maintainer
+wants local usability and real running behaviour, not the next milestone task,
+and **adding CI is specifically ruled out**.
 
-**If it is merged**, the next thing is **M11 task 2: give `IndexPlan` a notion
-of the order it yields**. The board is in [Roadmap](roadmap.md#m11--index-ordered-scans),
-which is where M11 lives now rather than only in this file. **One decision is
-reserved before task 5 and one is left over from task 1** — the sorted-cursor
-token shape, and whether to coalesce a consumer's position writes. Both are on
-the board; neither blocks tasks 2–4.
+**If something *is* open**, that branch is the work and it is waiting on review.
 
 **Either way, check the register first.** `docs/deviations.md` holds zero 🔴.
 If a 🟡 has become a 🔴 in your absence, that outranks the plan.
@@ -204,7 +264,7 @@ If a 🟡 has become a 🔴 in your absence, that outranks the plan.
 KimmyDB is a document and vector database in Rust — MongoDB-shaped query
 surface, leaderless replication, HNSW vector search with server-side embedding,
 change streams, webhooks, and a full HTTP/WebSocket protocol. Eleven crates in
-one workspace, three first-party clients (Rust, Python, Go), ~1,126 tests, and
+one workspace, three first-party clients (Rust, Python, Go), 1,131 tests, and
 a specification (`docs/openapi.yaml`) that a contract test holds to the running
 server. **[The oplog is the spine](#the-one-structural-idea-if-you-read-nothing-else)**
 — read that section, because nearly every subsystem is a consumer of one log
@@ -216,7 +276,7 @@ and the design only makes sense once that lands.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/check-native-deps.sh          # must report `cc` alone, nothing more
-cargo test --workspace                  # ~2 minutes, ~1,126 tests
+cargo test --workspace                  # ~2 minutes, 1,131 tests
 ```
 
 Then, if the change is anything but documentation, **drive a real node** — the
@@ -275,7 +335,12 @@ what work a request *causes* as well as what it *does*: `kimmy_commits` over
 `kimmy_requests_total` is the version of that question this project can now
 answer from a running node.
 
-#### 6. What M11 is, and where it is
+#### 6. What M11 is, and why it is not what you should start
+
+**M11 is paused.** The maintainer redirected the work on 2026-08-15 toward local
+usability and real running behaviour — see the boxed note at the top of this
+file. This section is here so the milestone is not lost, **not** as a to-do
+list.
 
 **M11 is index-ordered scans**, chosen by the maintainer on 2026-08-14. The
 board is in [Roadmap](roadmap.md#m11--index-ordered-scans) — five tasks, of
@@ -333,6 +398,12 @@ The rhythm:
   sat at the 10 GiB ceiling with 87% duplicates, and eviction was removing
   *main's* caches to make room for copies of them. `cache-cleanup.yml` deletes
   a PR's caches when it closes. Do not remove `save-if` to "make CI faster".
+- **Do not add to CI.** As of 2026-08-15 the maintainer is not investing in the
+  pipeline: *"I'm not ready to set up a CI/CD pipeline yet for this project."*
+  The six jobs that exist keep running; adding a seventh does not. A job was
+  added on #83 to run an expensive check and removed again in the next commit —
+  **an expensive check gets an `#[ignore]` and a line in [Testing](testing.md),
+  not a workflow.**
 
 ### The one structural idea, if you read nothing else
 
@@ -377,7 +448,7 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `find-by-id-uses-the-primary-key` | ✅ Merged as #80. `plan::choose_primary_key`: 7.328 ms → 0.540 ms over 10k documents, examined 10,000 → 1 |
 | `recall-test-does-not-depend-on-core-count` | ✅ Merged as #81. Badly named — it is the HNSW build fix. An index build could orphan 10–24% of a collection |
 | `m11-write-gap` | ✅ Merged as #82. M11 task 1: the daemon spends two commits per insert where the engine spends one. `kimmy_commits` on `/metrics`, and the tests that hold both numbers |
-| `hnsw-reachability-does-not-depend-on-collection-size` | **Open.** #81's threshold, re-sized. It counted budget-limited searches as lost data, so at a realistic embedding width every large build was rebuilt twice and reported as incomplete (ADR-061) |
+| `hnsw-reachability-does-not-depend-on-collection-size` | ✅ Merged as #83. #81's threshold, re-sized. It counted budget-limited searches as lost data, so at a realistic embedding width every large build was rebuilt twice and reported as incomplete (ADR-061). A CI job added here was removed again before merge — see the note at the top of this file |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -1025,11 +1096,12 @@ harness test that no mutation run ever sees, and a killer that lives in another
 crate and is hidden by the per-crate scoping that makes these runs affordable.
 [Testing](testing.md) has the table.
 
-### How to size the next thing after M10
+### How to size a milestone, when one is wanted again
 
-**M11 is already chosen — index-ordered scans, write-gap measurement first.**
-This section is the material that choice was made from, kept for whoever sizes
-the milestone *after* it, and for the case where M11 gets re-opened.
+**No milestone is running.** M11 was chosen on 2026-08-14 and paused on
+2026-08-15 in favour of local usability — see the boxed note at the top. This
+section is the material M11 was sized from, kept for whoever sizes the next one
+and for the case where M11 is re-opened. **It is not a queue.**
 
 The material, if a milestone is ever needed for its own sake:
 
@@ -1173,9 +1245,23 @@ on every page after it. Discard the first sample or say plainly that you did.
   here but **not** `jsonschema`, so a full validator has to be the Rust test —
   the shallow check is still worth having, because it is a second reader of the
   same document.
-- **The suite is ~1,126 Rust tests** across the workspace, plus 8 ignored
-  cluster tests, 19 Python and 18 Go client tests and 16 conformance scenarios.
-  A full `cargo test --workspace` is about two minutes.
+- **The suite is 1,131 Rust tests** across 28 targets, plus **11 ignored** —
+  8 cluster harness, 3 in `kimmy-vector` — and 19 Python, 18 Go and 16
+  conformance scenarios. A full `cargo test --workspace` is about two minutes.
+  Counted 2026-08-15 with
+  `cargo test --workspace 2>&1 | grep '^test result' | awk '{p+=$4} END {print p}'`.
+  **The earlier figure of ~1,126 was close by luck and 902 in two PR
+  descriptions was simply wrong** — that one came from piping the grep through
+  `tail -25` before summing it, so eight targets were dropped. Count without a
+  `tail` in the pipe.
+- **The three ignored `kimmy-vector` tests are run deliberately**, in release,
+  because a 384-dimensional graph is 146 s to build in debug against 21 s in
+  release. One is a regression guard and two are the measurements the
+  reachability constants are sized from — see [Testing](testing.md) invariant 6:
+
+  ```bash
+  cargo test -p kimmy-vector --release -- --ignored a_healthy_graph
+  ```
 
 ### Carried debt, none blocking
 
@@ -1194,7 +1280,8 @@ in [Deviations](deviations.md):
 | ~~The M10 mutation pass covered `kimmy-client` only~~ | **Closed 2026-08-14.** All 90 classified. Found three real gaps: `InvalidateReason::as_str` unpinned, `capabilities()` able to return an empty list with every assertion still passing, and `register`'s "silent when unchanged" claim tested by nothing |
 | ~~The client's `retry: wait` path has no test that reaches it~~ | **Closed 2026-08-14.** The test found the branch was *wrong*: `wait` failed over instead of waiting, so it behaved as `elsewhere` with a delay. Fixed, 9/9 mutants caught |
 | **The embedding worker commits once per oplog entry, so a write costs two fsyncs and a bulk of 100 costs 101** | **Explained 2026-08-15** by M11 task 1, and no longer the same debt: the *gap* is understood, the *cost* is still paid. The fix is a reserved decision — see the M11 board |
-| **Vector indexes built before 2026-08-15 may be missing 10–24% of a collection** | #81 fixes new builds; it cannot repair a graph already cached or persisted under `<data_dir>/hnsw`. [Operations](operations.md) has the rebuild. **Open until the maintainer confirms their nodes are rebuilt** |
+| **Vector indexes built before 2026-08-15 may be missing 10–24% of a collection** | #81 fixes new builds; it cannot repair a graph already cached or persisted under `<data_dir>/hnsw`. [Operations](operations.md) has the rebuild. **Open until the maintainer confirms their nodes are rebuilt** — worth raising directly, since it is the one carried debt that touches data an operator already has |
+| **Every HNSW build orphans 0.8%–3.0% of a collection**, and it is accepted | Raised 2026-08-15 by [ADR-061](decisions.md), which measured it while re-sizing #81's threshold. Those documents are returned by no *approximate* vector search at any `k`; exact search and small collections are unaffected. Not a build defect — a property of `MAX_CONNECTIONS` and `EF_CONSTRUCTION`, so rebuilding cannot fix it. **It was previously believed to be zero and described in a comment as approximation rather than loss** |
 | Sharding | **deferred by decision** until there is operational experience |
 
 Three rows left this table in M10 and are noted here so nobody re-opens them:
