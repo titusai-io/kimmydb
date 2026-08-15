@@ -925,17 +925,52 @@ These crates had full mutation passes in M7 and M8, and the M10 diff over them
 is small next to the client and specification work. Redoing it properly is
 worth an hour of someone's time, not an emergency.
 
-### Redone properly: two crates of three
+### Redone properly
 
 **2026-08-14.** The scope splits 76 `kimmy-api` / 12 `kimmy-storage` / 2
-`kimmy-auth` — exactly the 90 recorded. Two are done; `kimmy-api` is still
-outstanding.
+`kimmy-auth` — exactly the 90 recorded. All three are done.
 
 | Crate | Result |
 |---|---|
 | `kimmy-auth` | 2 caught. Both first read as misses; both were scoping artefacts |
 | `kimmy-storage` | 10 caught, 2 unviable, 0 missed. One real gap, now fixed |
-| `kimmy-api` | 76 outstanding |
+| `kimmy-api` | 36 caught, 32 unviable, 8 missed. Six were real and are fixed; two are artefacts |
+
+**"Missed" turned out to be three different things**, and telling them apart
+was most of the value:
+
+| | What it means | What to do |
+|---|---|---|
+| **A real gap** | No test anywhere produces the behaviour | Write the test |
+| **Covered only by an `#[ignore]`d test** | The cluster harness has it, but a mutation run — like `cargo test --workspace` — never sees it | Decide whether the property is local enough to test in process. Often part of it is |
+| **A cross-crate artefact** | The killer lives in a crate outside the test scope | Widen the scope, re-run, classify. Do not chase |
+
+**The `kimmy-api` gaps, in order of how much they mattered:**
+
+- **`capabilities()` could return `vec![]` and every check passed.** The
+  contract test compared the wire against the same function that produced it,
+  then asserted the list does *not* contain `local-embeddings` — vacuous when
+  the list is empty. ADR-058 makes capabilities the thing clients branch on
+  instead of a version number, so a node silently claiming to support nothing
+  is precisely the failure the mechanism exists to prevent. The
+  unconditionally-present capabilities are now named and required, and the
+  fixture is asserted non-empty so it cannot go vacuous again.
+- **`register` claimed to be silent when nothing changed, and nothing tested
+  it.** The docstring says a node restarting twice an hour must not append to a
+  replicated log — and the harness structurally cannot check it, because it
+  starts each node once and never restarts one on an unchanged address. Now
+  covered in process, along with the `me_seen` bookkeeping that was dead code
+  in the whole default suite because no in-process test had ever called
+  `register` at all.
+- **`render` stays uncovered in this crate, deliberately.** The contract test
+  checks the `101` handshake and never reads a frame; the Rust, Python and Go
+  client suites and the conformance runner all drive it. Confirmed by re-running
+  with `-p kimmy-client` in scope, where both mutants die.
+
+**Run the verification twice when the tree moved under you.** The first widened
+run here was confounded — the test files were edited while it was in flight, so
+it could not separate "the wider scope caught it" from "the new tests caught
+it". The clean re-run at the natural scope is what established the result.
 
 **The real gap was `InvalidateReason::as_str`**, which could return `""` or
 `"xyzzy"` unnoticed. The method exists so that renaming a variant cannot

@@ -1424,7 +1424,7 @@ does not test that; something that has to find, page and react does.
 
 ---
 
-## 🟡 The M10 server-side mutation pass — two crates of three done
+## 🟢 The M10 server-side mutation pass is done (was a 🟡)
 
 **Narrowed on 2026-08-14.** M10 task 12 called for a mutation pass over the
 milestone diff and covered `kimmy-client` only, leaving 90 mutants in
@@ -1439,7 +1439,49 @@ The scope splits **76 / 12 / 2**, which sums to exactly the 90 recorded.
 |---|---|---|
 | `kimmy-auth` | ✅ 2 caught | Both first read as misses and **both were scoping artefacts** — see below |
 | `kimmy-storage` | ✅ 10 caught, 2 unviable | One real gap: `InvalidateReason::as_str` |
-| `kimmy-api` | ⏳ 76 outstanding | Started; stopped mid-run for contention, not for a finding |
+| `kimmy-api` | ✅ 76 tested | 36 caught, 32 unviable, **8 missed** on the first clean run; 6 were real and are fixed, 2 are artefacts |
+
+**`kimmy-api`'s eight misses sorted into three different categories**, which is
+the result worth keeping — "missed" is not one thing.
+
+**Category 1, a genuine gap: `capabilities()` could return `vec![]`.** The
+contract test compared the wire against *the same function that produced it*,
+then asserted `!served.contains("local-embeddings")` — and both hold for an
+empty list. A node advertising **no capabilities at all** passed every check.
+Since [ADR-058](decisions.md) makes capabilities the thing clients branch on
+*instead of* a version number, a node that silently claims to support nothing
+is the exact failure the mechanism exists to prevent. The unconditionally
+present capabilities are now named and required, and the fixture is asserted
+non-empty so the test cannot go vacuous again.
+
+**Category 2, covered only by an `#[ignore]`d test: the four `topology.rs`
+mutants.** The cluster harness does catch them — three real nodes, `count == 3`,
+exactly one `self` — but harness tests are `#[ignore]`, so they are invisible
+to `cargo test --workspace` *and* to every mutation pass. **A mutation run sees
+only the tests that run by default**, which means anything whose only coverage
+is the harness reads as uncovered forever.
+
+**And a real gap was hiding inside that category.** `register`'s docstring
+claims it is *"idempotent, and silent when nothing changed — a node that
+restarts twice an hour should not append to a log every other node then
+replicates."* **Nothing tested it, and the harness structurally cannot**: it
+starts each node once and never restarts one on an unchanged address. The
+registry is replicated, so a spurious rewrite is an oplog entry every peer then
+carries. Two in-process tests now cover it — `register` is entirely local, and
+only the *replication* half ever needed real nodes.
+
+**Category 3, a cross-crate artefact: the two `render` mutants.** `render` is
+never called in `kimmy-api`'s own suite, because the contract test checks the
+`101` handshake and never reads a frame. It is driven by the Rust, Python and
+Go client suites and by the conformance runner. Confirmed by re-running with
+`-p kimmy-client` in scope, where both die. Classified, not chased.
+
+**The verification was run twice on purpose.** The first widened-scope run was
+confounded — the test files were edited while it was in flight, so it could not
+separate "the wider scope caught it" from "the new tests caught it". The clean
+re-run at the natural `-p kimmy-api` scope reports **25 caught, 5 unviable, 2
+missed**, which is what establishes that the six are closed where it matters
+rather than only under a scope nobody uses.
 
 **The `kimmy-storage` finding is the one that mattered.**
 `InvalidateReason::as_str` could return `""` or `"xyzzy"` with nothing failing.
@@ -1460,10 +1502,11 @@ crate up. Verify with a widened scope before believing a gap is real. A local
 test was still added, because a crate's public accessor should not depend on a
 consumer to pin it.
 
-**To close**: the `kimmy-api` pass, `--in-diff` against the M10 range,
-`-- -p kimmy-api`, `-j 4`, on an **idle machine** — running it beside an
-ordinary `cargo test --workspace` stretched that suite from ~2 minutes past 10,
-which is the same contention that ruined the original run.
+**Contention had to be learned twice.** Running the `kimmy-api` pass beside an
+ordinary `cargo test --workspace` stretched that suite from ~2 minutes past 10.
+It does not only ruin the mutation run — it ruins whatever shares the machine.
+On an idle box the same 76 mutants finished in 31 minutes with **zero
+timeouts**, against the original run's 15 timeouts out of 47. Run these alone.
 
 ---
 

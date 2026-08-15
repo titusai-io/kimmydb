@@ -677,6 +677,31 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         kimmy_api::version::capabilities(),
         "the wire and the server's own list disagree"
     );
+    // Both assertions around this one are satisfied by an *empty* list: the
+    // comparison above comes from the same function that produced the wire
+    // value, and "does not contain local-embeddings" is vacuous when nothing
+    // is advertised. A mutation pass showed exactly that — `capabilities()`
+    // could return `vec![]` and every check here still passed, which would
+    // tell every client this node supports nothing at all. Since ADR-058 makes
+    // capabilities the thing clients branch on instead of a version number,
+    // that is the failure the whole mechanism exists to prevent.
+    //
+    // So the unconditional ones are named. `Capability::present` answers
+    // `true` for everything except `LocalEmbeddings`, so every other
+    // capability must appear in any build.
+    let always: Vec<&str> = kimmy_api::version::Capability::ALL
+        .iter()
+        .filter(|c| !matches!(c, kimmy_api::version::Capability::LocalEmbeddings))
+        .map(|c| c.as_str())
+        .collect();
+    assert!(!always.is_empty(), "the fixture itself must not be vacuous");
+    for capability in &always {
+        assert!(
+            served.contains(capability),
+            "every build has {capability}, so a node that does not advertise it is broken; \
+             served {served:?}"
+        );
+    }
     assert!(
         !served.contains(&"local-embeddings"),
         "the default build has no in-process embedding, so it must not advertise it — \
