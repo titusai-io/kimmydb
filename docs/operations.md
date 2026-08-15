@@ -562,6 +562,39 @@ Both are idempotent and run before the node serves anything.
 > migration is transactional per step, but a rollback to the older build is not
 > possible once it has run — the older build will refuse the newer schema.
 
+### Rebuild vector indexes after upgrading past 2026-08-15
+
+**Builds before this date could produce an HNSW index that silently lost part
+of its collection.** About one index build in 250 left 10–24% of the vectors
+unreachable from the graph, so those documents were never returned by any
+vector search, at any `k`, for any query. Nothing failed and nothing was
+logged — the searches simply came back without them.
+
+Newer builds verify a finished graph can retrieve its own data and rebuild one
+that cannot, so **no new index has this problem**. But the check runs at build
+time, and it does not repair a graph that is already cached in a running
+process or persisted as a snapshot on disk.
+
+**What to do**, on each node, if a collection has vector search enabled and was
+indexed by an older build:
+
+```bash
+# Stop the node first: a running process serves the graph it has in memory,
+# so deleting the snapshots under it changes nothing until it restarts.
+rm -rf <data_dir>/hnsw/
+# Start it again; each collection's graph rebuilds on the next search.
+```
+
+Rebuilding costs O(n log n) per collection and happens on the next search that
+needs the index. There is no data to recover — the *vectors* were always
+stored correctly and the exact scan could always see them; only the approximate
+index was incomplete.
+
+**How to tell whether you were affected**: search for a document you know is
+present, by its own embedding. If exact search finds it and vector search does
+not, the index was one of the bad ones. `docs/deviations.md` has the full
+measurement.
+
 ---
 
 ## Troubleshooting

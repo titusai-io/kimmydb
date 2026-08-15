@@ -6,54 +6,75 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-14 — **M10 complete**; the closeout is on a branch awaiting review
+## As of 2026-08-15 — **M10 merged**; post-M10 register work, one PR open
 
-**M0–M10 complete — every milestone that was ever planned.** Tasks 1–11 are
-merged (#65–#76); task 12 — the examples, the mutation pass and this closeout —
-is on `m10-examples-closeout` as **PR #77**, open and unmerged.
+**M0–M10 are all merged — every milestone that was ever planned.** PRs #65–#77
+closed the milestone. Since then, four short branches have worked the carried
+debt down rather than starting a new milestone:
 
-**KimmyDB now has a written, versioned and tested client protocol, and three
-first-party clients held to one set of scenarios.** What to do next is an open
-question rather than a plan: see "How to size the next thing" below, which is
-now the most useful section of this file.
+| | |
+|---|---|
+| #78 | `retry: wait` fixed (it failed over instead of waiting), `kimmy-auth` + `kimmy-storage` mutation passes |
+| #79 | `kimmy-api` mutation pass — closes the M10 mutation debt entirely |
+| #80 | `find {_id}` uses the primary key — 7.328 ms → 0.540 ms |
+| **#81** | **OPEN.** An HNSW build could orphan a tenth of a collection. Read this one before anything else |
 
-Every reserved decision so far went to the maintainer first, as every M8 and M9
-one did. Task 1: hand-written specification, checked by a contract test that
-validates **live responses**, not only the route inventory ([ADR-056](decisions.md)).
-Task 2: a typed `ErrorCode` enum, retryability **three-valued** — `no` / `wait`
-/ `elsewhere` — because leaderless replication makes "ask a different node" a
-real answer ([ADR-057](decisions.md)). Task 3: `/v1` does not break, and a node
-advertises **capabilities** rather than expecting clients to map versions to
-features ([ADR-058](decisions.md)).
+### The agreed plan, and where it stopped
 
-Task 4: **sliding re-issue** of the access token rather than a second
-credential, with no grace for an expired one ([ADR-059](decisions.md)).
+The maintainer chose this on 2026-08-14, and it is still the plan:
 
-Task 5: **addresses from a replicated registry, liveness from SWIM**, because
-reading client addresses out of membership was not available at any acceptable
-price ([ADR-060](decisions.md)).
+1. **Close the cheap register debt first** — done, in #78/#79/#80.
+2. **Then M11: index-ordered scans**, opening with the daemon-versus-engine
+   write-gap measurement as its task 1, so the performance work starts from an
+   explained baseline.
 
-Task 6: the paging contract, and **node portability tested on three real nodes**
-rather than argued from the encoding.
+**M11 has not started.** #81 is an unplanned interruption: CI failed on #80 with
+what looked like a flaky vector test, and chasing it found a real defect. Once
+#81 merges, the next thing is M11 task 1 — and nothing else is queued.
 
-Task 7: the HTTP benchmark harness, and the numbers it produced.
+### #81 is the one to understand before continuing
 
-Task 8: `kimmy-client`, and `kimmy-cli` converted into a consumer of it.
+**A test that looked flaky was reporting silent data loss.** About **one HNSW
+index build in 250** left **10–24% of a collection unreachable** from the graph:
+those documents were returned by no vector search, at any `k`, for any query,
+with nothing failing and nothing logged.
 
-Task 9: `clients/python`, package `kimmydb`, synchronous on `httpx` and
-`websockets`, with its own CI job driving a real node.
+The evidence chain, because it is the model for this kind of work:
 
-Task 10: `clients/go`, package `kimmydb`, one dependency, with its own CI job.
+- 1,500 builds → **bimodal**: median 0.995, ~1 in 250 collapsing to **0.545**.
+- In a collapsed build **19 of 20 queries degrade together** — a global
+  property, not one hard query.
+- Asking every vector to retrieve **itself** found it: healthy builds miss 2 of
+  400, bad builds miss **40–96**.
+- Six candidates eliminated by measurement — SIMD (`simdeez_f` is off), core
+  count (rayon is not on this path), `Hnsw::new` argument order, graph height,
+  `keep_pruned`, and `ef`. **The `ef` plateau proved it**: 5/800 at ef=50,
+  2/800 at ef=100, **2/800 again at ef=200**. More exploration cannot cross into
+  a disconnected component.
 
-Task 12: `shelf`, one application written three times and run in CI, plus the
-mutation pass and this closeout.
+**The fix is at build time**: `HnswIndex::build` asks a sample of stored vectors
+to retrieve themselves and rebuilds a graph that cannot. Min recall **0.5350 →
+0.9600**, zero failures in 1,500 builds. The recall test is restored
+**unchanged** — fixing the defect made the original assertion honest rather than
+lenient.
 
-**There is no M11.** The milestone that has just finished was the last one
-planned, and choosing the next thing is a decision for the maintainer rather
-than something to infer. The material for that choice is in
-[Roadmap](roadmap.md) and in "How to size the next thing" below — the carried
-debt, the gaps in [Testing](testing.md), and the one performance item M10
-measured and did not chase.
+**Three of my own mistakes were caught during it**, and all three came from the
+same root — choosing a number without knowing the shape of what it bounds:
+
+- The first fix averaged three graphs. It would have **hidden the bug** and
+  failed CI *more* often (a mean draws three chances at a bad graph).
+- The retry trigger `misses > 0` was a **~3× build-cost regression**, invisible
+  to any recall measurement because every rebuild is fine and only wasted work
+  differs.
+- A test I nearly shipped was itself flaky — threshold set from one observation.
+
+Both surviving constants are now sized from measured distributions with the
+arithmetic in the code.
+
+**Operational consequence, still open:** the check runs at build time and does
+**not** repair a graph already cached in a running process or persisted under
+`<data_dir>/hnsw`. [Operations](operations.md) has rebuild instructions. Any
+node with real vector data written before 2026-08-15 should be rebuilt.
 
 **Sharding is the one thing still deliberately deferred — do not re-open it
 unasked.** Replicated-not-partitioned is the current position and is considered
@@ -68,23 +89,27 @@ deferral was settled by [ADR-055](decisions.md) and is what M10 carries out.
 ```bash
 cd /path/to/kimmydb
 git checkout main && git pull
-gh pr list --state open            # is #77 still open?
-gh pr view 77 --json state,title
+gh pr list --state open            # is #81 still open?
+gh pr view 81 --json state,title
 ```
 
-**If #77 is still open**, the tree you want is that branch and the work is
-waiting on review.
+**If #81 is still open**, that branch is the work and it is waiting on review.
+Read its description first: it is a vector-search data-loss fix, and the
+reasoning in it is the most useful thing in the repo right now.
 
-**If #77 is merged**, `main` holds all of M0–M10 and there is **no next task
-queued**. That is the real state: the project has finished everything that was
-ever planned, and what happens next is a decision the maintainer makes.
+**If #81 is merged**, `main` holds M0–M10 plus the post-M10 register work, and
+the next thing is **M11 task 1: explain the write gap** (see below). That is
+already agreed with the maintainer.
+
+**Either way, check the register first.** `docs/deviations.md` holds zero 🔴.
+If a 🟡 has become a 🔴 in your absence, that outranks the plan.
 
 #### 2. What this project is, in one paragraph
 
 KimmyDB is a document and vector database in Rust — MongoDB-shaped query
 surface, leaderless replication, HNSW vector search with server-side embedding,
 change streams, webhooks, and a full HTTP/WebSocket protocol. Eleven crates in
-one workspace, three first-party clients (Rust, Python, Go), ~1,100 tests, and
+one workspace, three first-party clients (Rust, Python, Go), ~1,126 tests, and
 a specification (`docs/openapi.yaml`) that a contract test holds to the running
 server. **[The oplog is the spine](#the-one-structural-idea-if-you-read-nothing-else)**
 — read that section, because nearly every subsystem is a consumer of one log
@@ -96,7 +121,7 @@ and the design only makes sense once that lands.
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 ./scripts/check-native-deps.sh          # must report `cc` alone, nothing more
-cargo test --workspace                  # ~2 minutes, ~1,103 tests
+cargo test --workspace                  # ~2 minutes, ~1,126 tests
 ```
 
 Then, if the change is anything but documentation, **drive a real node** — the
@@ -116,7 +141,7 @@ the three client suites, the conformance runner and the examples.
   open is a 🟡 that was agreed. Read the register itself, not a summary — M8
   found a debt that existed only there.
 
-#### 5. The two failure modes that keep catching people here
+#### 5. The three failure modes that keep catching people here
 
 **A claim with no mechanism behind it is usually false.** M8 found one in four
 branches, M9 in every task, M10 in four more — including a sentence in a PR
@@ -133,13 +158,53 @@ oplog and never published, so a dropped collection ended its own node's
 watchers and left every other node's hanging. Use `cargo test -p kimmyd --test
 cluster -- --ignored --test-threads=1`.
 
-#### 6. Picking the next milestone
+**A test that looks flaky may be reporting a real defect.** The HNSW recall test
+failed CI once at 0.865 against a 0.90 bar, on a branch that could not reach
+that crate, and the obvious reading was that a randomised structure makes a hard
+threshold unreliable. It was reporting **silent data loss**: about one index
+build in 250 orphaned 10–24% of a collection, so those documents were returned
+by no search at any `k`. The first fix averaged three graphs to quiet it — which
+would have hidden the bug *and* failed more often, since a mean of three draws
+three chances at a bad graph. **Before making a test quieter, find out what it
+is telling you**, and be sure any threshold is sized from a measured
+distribution rather than from one observation. Both mistakes here came from the
+latter.
 
-"How to size the next thing after M10" below is written for exactly that, and
-the strongest single candidate named in it is **index-ordered scans** —
-`scan_range_in` sorts by document key, so sorted paging still uses `skip` and
-every sorted `find` materialises its whole match set. It is the largest known
-performance item and it makes two things better at once.
+#### 6. What M11 is, and how to start it
+
+**M11 is already chosen: index-ordered scans**, with the write-gap measurement
+as task 1. The maintainer settled this on 2026-08-14.
+
+**Task 1 — explain the write gap, before changing anything.** A single insert
+costs ~7.0 ms through the daemon against ~3.4 ms at the engine. It is *not*
+protocol overhead (reads bound that at 0.1 ms) and not per-document encoding
+(the gap is fixed per request, not per document). Candidates named and never
+measured: the background oplog consumers a daemon runs and a bare `Engine` does
+not, and a commit's fsync landing on a runtime worker thread. This goes first so
+the performance work has an explained baseline rather than an unexplained one.
+
+**Then the scans themselves**, and the shape is known:
+
+- `kimmy-storage/src/index.rs` — both `scan_range_in` and `scan_range_in_write`
+  end `out.sort(); out.dedup();`. **The sort is not gratuitous**: `dedup` only
+  removes *adjacent* duplicates, and duplicates are real (a multikey index
+  stores one document under several keys; a `$in` union produces several
+  ranges). Removing it needs a seen-set that preserves first-occurrence order.
+- `kimmy-query/src/plan.rs` — `IndexPlan` has **no notion of which order it
+  yields**. That is the extension point.
+- `kimmy-api/src/exec.rs:166` — `stop_after` is only set when the sort is
+  empty, which is why every sorted `find` materialises its whole match set; and
+  `:152` refuses any cursor sort but `{"_id": 1}`.
+
+**Lifting that refusal is the prize, and it reaches the wire**: a sorted
+cursor's token must carry the index key *plus* the document key, which touches
+`kimmy-core/src/cursor.rs`, `docs/openapi.yaml`, all three clients and the
+conformance scenarios. Expect a reserved decision on the token shape before
+writing code — it is public surface and must stay additive under
+[ADR-058](decisions.md).
+
+The other material considered and not chosen is still in "How to size the next
+thing after M10" below.
 
 ### How work runs here — read this first
 
@@ -207,7 +272,11 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `drop-invalidates-change-streams` | ✅ Merged as #74. Three change-stream defects: the drop invalidate, the unpublished replicated DDL, and a recreated collection serving the dead one's history |
 | `m10-go-client` | ✅ Merged as #75. M10 task 10: `clients/go`, package `kimmydb`, a CI job |
 | `m10-conformance` | ✅ Merged as #76. M10 task 11: `clients/conformance`, three drivers, a CI job |
-| `m10-examples-closeout` | **Open as PR #77, not merged.** M10 task 12: `shelf` in three languages, the client mutation pass, the closeout. The server-side mutation pass is *not* in it — see the debt table |
+| `m10-examples-closeout` | ✅ Merged as #77. M10 task 12: `shelf` in three languages, the client mutation pass, the closeout |
+| `close-m10-test-debts` | ✅ Merged as #78. `retry: wait` **failed over instead of waiting** — the comment above it said otherwise and nothing tested it. Plus the `kimmy-auth` and `kimmy-storage` mutation passes |
+| `m10-api-mutation-pass` | ✅ Merged as #79. `kimmy-api`'s 76 mutants; closes the M10 mutation debt. Found `capabilities()` could return an empty list with every assertion still passing |
+| `find-by-id-uses-the-primary-key` | ✅ Merged as #80. `plan::choose_primary_key`: 7.328 ms → 0.540 ms over 10k documents, examined 10,000 → 1 |
+| `recall-test-does-not-depend-on-core-count` | **Open as PR #81.** Badly named now — it is the HNSW build fix. An index build could orphan 10–24% of a collection. Read its description |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -857,9 +926,18 @@ crate and is hidden by the per-crate scoping that makes these runs affordable.
 
 ### How to size the next thing after M10
 
+**M11 is already chosen — index-ordered scans, write-gap measurement first.**
+This section is the material that choice was made from, kept for whoever sizes
+the milestone *after* it, and for the case where M11 gets re-opened.
+
 The material, if a milestone is ever needed for its own sake:
 
 - **The carried debt below**, none of it blocking.
+- **The gap that scale testing would have caught.** The HNSW orphaning in #81
+  existed since M7 and was found only because a test failed once in CI and
+  someone asked what it was reporting. It took ~1,500 index builds to
+  characterise. Nothing in the suite runs anything 1,500 times, which is the
+  same blind spot the row below names.
 - **The gaps in [Testing](testing.md)** — nothing runs for long or at scale,
   nothing kills a node mid-write, multi-node tests are pairwise and
   short-lived. Every serious bug of the last two sessions lived in exactly
@@ -956,7 +1034,16 @@ on every page after it. Discard the first sample or say plainly that you did.
   timeouts and 3 caught out of 47, where every "timeout" was `cargo test` still
   linking. And note the binary is `cargo-mutants`: **`pkill -f "cargo mutants"`
   does not match it**, so an abandoned run survives and competes with its
-  replacement.
+  replacement. **Run these alone** — the #79 pass beside an ordinary
+  `cargo test --workspace` stretched that suite from ~2 minutes past 10;
+  contention ruins whatever shares the machine, not only the mutation run. On
+  an idle box the same 76 mutants finished in 31 minutes with zero timeouts.
+  And **"missed" means three different things**: a real gap, a property covered
+  only by an `#[ignore]`d harness test that no mutation run ever sees, or a
+  killer that lives in another crate and is hidden by the per-crate scoping. Widen
+  the scope and re-run before believing a gap is real — both `kimmy-auth`
+  "misses" died the moment `-p kimmy-api` joined. [Testing](testing.md) has the
+  table.
 - **The Python client:** `cd clients/python && uv run --extra dev pytest`.
   Needs a `kimmyd` binary; `conftest.py` starts one. Timeout is 60s per test,
   because a change-stream bug once hung a test for ten minutes.
@@ -985,7 +1072,7 @@ on every page after it. Discard the first sample or say plainly that you did.
   here but **not** `jsonschema`, so a full validator has to be the Rust test —
   the shallow check is still worth having, because it is a second reader of the
   same document.
-- **The suite is ~1,103 Rust tests** across the workspace, plus 8 ignored
+- **The suite is ~1,126 Rust tests** across the workspace, plus 8 ignored
   cluster tests, 19 Python and 18 Go client tests and 16 conformance scenarios.
   A full `cargo test --workspace` is about two minutes.
 
@@ -1005,7 +1092,8 @@ in [Deviations](deviations.md):
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
 | ~~The M10 mutation pass covered `kimmy-client` only~~ | **Closed 2026-08-14.** All 90 classified. Found three real gaps: `InvalidateReason::as_str` unpinned, `capabilities()` able to return an empty list with every assertion still passing, and `register`'s "silent when unchanged" claim tested by nothing |
 | ~~The client's `retry: wait` path has no test that reaches it~~ | **Closed 2026-08-14.** The test found the branch was *wrong*: `wait` failed over instead of waiting, so it behaved as `elsewhere` with a delay. Fixed, 9/9 mutants caught |
-| A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **recorded as an open question rather than explained** |
+| A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **still unexplained, and it is M11 task 1** |
+| **Vector indexes built before 2026-08-15 may be missing 10–24% of a collection** | #81 fixes new builds; it cannot repair a graph already cached or persisted under `<data_dir>/hnsw`. [Operations](operations.md) has the rebuild. **Open until the maintainer confirms their nodes are rebuilt** |
 | Sharding | **deferred by decision** until there is operational experience |
 
 Three rows left this table in M10 and are noted here so nobody re-opens them:
