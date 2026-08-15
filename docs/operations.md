@@ -337,6 +337,7 @@ port.
 | `kimmy_auth_failures_total` | Rejected credentials and tokens |
 | `kimmy_rate_limited_total` | Refused by a rate limit |
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
+| `kimmy_commits` | Durable write transactions committed. redb has a single writer and every commit is an fsync, so this over `kimmy_requests_total` is what a write *costs* — a client-visible write that takes two commits costs twice one that takes one, and no latency figure tells you which is happening. This is the number that explained the daemon-versus-engine write gap; see [Benchmarks](benchmarks.md) |
 | `kimmy_backups_total` | Backups served |
 | `kimmy_cluster_members` | Peers SWIM currently considers alive; 0 with clustering off. A formed three-node cluster reads 2 on every node |
 | `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet **seen** locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero. Measured against what this node has processed rather than what it could re-serve, or entries it correctly discarded would pin it non-zero forever ([ADR-054](decisions.md)) |

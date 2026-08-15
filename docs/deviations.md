@@ -1158,25 +1158,51 @@ and writes. Recorded rather than gated, like every benchmark here.
 
 ---
 
-## 🟡 A write costs twice as much through the daemon as at the engine
+## 🟡 A write costs twice as much through the daemon as at the engine — explained, not yet fixed
 
-**Raised 2026-08-14 by M10 task 7.** A single insert is **7.0 ms** over HTTP
-against **~3.4 ms** for the same insert at the engine on the same machine.
+**Raised 2026-08-14 by M10 task 7. Explained 2026-08-15 by M11 task 1.** A
+single insert was **7.0 ms** over HTTP against **~3.4 ms** for the same insert
+at the engine on the same machine, and the cause was recorded as unknown
+because a cause that has not been measured is not a cause.
 
-**What it is not.** Not protocol overhead — the read numbers bound that at
-~0.1 ms per request. Not per-document encoding — a batch of 100 costs 12.2 ms
-against 6.9 ms at the engine, so the gap is roughly fixed per *request* rather
-than growing with the documents in it.
+**The cause.** The daemon spends **two durable commits** on an insert where the
+engine spends one. The second is the embedding worker's: `EmbeddingWorker::run`
+records its oplog position after *every* entry, including entries it skips in
+collections with no vector configuration, and `put_consumer_position` is its own
+write transaction and its own fsync. redb has a single writer, so that commit is
+a queue position in front of the next write — which is why the penalty was fixed
+per request rather than per document: a request waits behind at most one
+in-flight commit however many documents it carried.
 
-**Candidates, none verified**: the background oplog consumers the daemon runs
-and a bare `Engine` does not — the embedding worker and the webhook dispatcher
-both wake on every write — or a commit's fsync landing on a runtime worker
-thread rather than a dedicated one.
+**Measured, on a node, through `kimmy_commits`** — added for this and now on
+`/metrics`: 200 inserts cost **2.00 commits each** as shipped and **1.00** with
+the worker not started, at 156/s against 226/s. The HTTP benchmark's `insert
+one` cell goes **54 → 236 req/s** (p50 11.00 → 4.05 ms). The webhook
+dispatcher, the other named candidate, is **not** implicated: it wakes on a
+two-second tick, and removing it changes nothing. The third candidate — fsync
+on a runtime worker thread — cannot explain a gap present at one client, where
+the runtime has nothing else to schedule; whether it costs anything under
+concurrency is unmeasured.
 
-**Left as a question on purpose.** A cause that has not been measured is not a
-cause, which is the rule the retracted figure produced. It is the first thing
-for whoever picks up performance work; halving it would double single-write
-throughput for every client that does not batch.
+**The larger finding is the amplification behind the batch API.** The client
+waits behind one commit, but the worker commits once per *document*: 4,000
+documents in 40 bulk requests took 0.39 s and left the node committing for
+another **12.3 s**, 4,041 commits in total. Bulk exists so that 100 documents
+cost one fsync instead of 100; the worker pays the 100 anyway, deferred. This
+holds on every node whether or not any collection uses vectors.
+
+**Still 🟡 because it is explained and not fixed.** The fix — coalescing a
+consumer's position writes — trades a crash replaying a few idempotent entries
+for an fsync per write, which changes the oplog-consumer contract and is
+**reserved for a decision**. What has changed is that the trade is now between
+two measured numbers. It must not become "record only when there was work to
+do": a position that advances only on work is killed by retention.
+
+**Pinned by tests rather than by this entry.**
+`kimmy-storage`'s `one_insert_is_one_commit` and `kimmy-vector`'s
+`a_write_the_worker_skips_still_costs_a_second_commit` fail if either number
+changes, and `commits_are_counted_at_one_chokepoint` fails if a new write path
+stops being counted.
 
 ---
 

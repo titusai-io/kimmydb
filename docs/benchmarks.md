@@ -372,23 +372,122 @@ costs a client nothing but a loop. At thirty-two clients it is 24,400/s.
 and it is the one read that barely scales. A client that polls a count is
 asking the server to read everything, every time.
 
-### One thing measured here and not explained
+### The write gap, explained
 
-A single insert takes **7.0 ms** through the API against **~3.4 ms** for the
-same insert at the engine ([The write path](#the-write-path), re-measured on
-this machine while writing this section) — the write costs about twice as much
-through the daemon as in a bare harness.
+The tables above were published with an open question: a single insert took
+**7.0 ms** through the API against **~3.4 ms** for the same insert at the
+engine, and neither protocol overhead nor per-document encoding accounted for
+it. M11 task 1 measured it.
 
-**It is not protocol overhead**: the read numbers bound that at ~0.1 ms. It is
-not per-document encoding either, since a batch of 100 costs 12.2 ms against
-6.9 ms at the engine, so the gap is roughly fixed per *request* rather than
-growing with the documents in it. Candidates, none of them verified: the background oplog consumers the
-daemon runs and a bare `Engine` does not — the embedding worker and the webhook
-dispatcher both wake on every write — or a commit's fsync landing on a runtime
-worker thread rather than a dedicated one.
+**The daemon spends two durable commits on an insert where the engine spends
+one.** The second is the embedding worker's. It records its oplog position
+after *every* entry — including entries it has nothing to do with, in
+collections with no vector configuration — and `put_consumer_position` is its
+own write transaction and therefore its own fsync. redb has a single writer, so
+that commit is not merely extra work on the same disk: it is a queue position
+in front of the *next* write.
 
-**Recorded as a question rather than an answer**, which is the rule this file
-was rewritten under: a cause that has not been measured is not a cause.
+That last part is why the gap looked fixed per request. A request waits behind
+at most one in-flight commit however many documents it carried, so a batch of
+100 paid the same penalty as an insert of one — which is exactly the shape
+recorded above, and which had made per-document encoding look like the wrong
+answer for the right reason.
+
+#### The evidence
+
+**A running node reports it.** `kimmy_commits` on `/metrics`, over 200 inserts
+into a collection with no vector configuration:
+
+| | inserts/s | ms each | commits per insert |
+|---|---:|---:|---:|
+| as shipped | 156 | 6.39 | **2.00** |
+| embedding worker not started | 226 | 4.42 | **1.00** |
+| webhook dispatcher not started | 156 | 6.40 | 2.00 |
+| neither started | 215 | 4.65 | 1.00 |
+
+**The HTTP benchmark agrees, and more strongly**, one client, plaintext,
+`insert one`: **54 req/s at p50 11.00 ms** as shipped against **236 req/s at
+p50 4.05 ms** with the worker not started — 4.4× the throughput. It is a larger
+effect here than in the table above because that cell runs after 10,000
+documents have been seeded, and the worker is still working through them: its
+backfill competes with foreground writes for the same single writer.
+
+The dispatcher was a named candidate and is **not** implicated: it wakes on a
+two-second tick rather than on a write, and removing it changes nothing.
+
+**And it reproduces at the engine, with no HTTP anywhere.** `cargo bench -p
+kimmy-storage --bench write_path -- insert_with_consumer` runs the same insert
+loop with and without a thread that records an oplog position after every
+entry:
+
+| `insert_with_consumer` | median |
+|---|---:|
+| `consumers/0` | 3.51 ms |
+| `consumers/1` | **6.58 ms** |
+
+An iteration there ends when the consumer has caught up, not when the insert
+returns — which is the only honest unit, and worth stating because the first
+version of this benchmark did not do it. Timing the insert alone reported
+**+0.2 ms** for a cost that is **+3.1 ms**: the consumer's commit simply fell
+outside the window. A consumer that lags has not made the write cheaper.
+
+**Scale, for what the commit costs.** On this machine a raw redb commit of one
+small row is **3.00 ms** p50 and an engine insert is **3.17 ms** — so an insert
+is very nearly all fsync, and a second commit is close to a second insert. The
+per-request work the daemon does and a bare `Engine` call does not is
+negligible beside it: `get_collection`'s read transaction is **0.001 ms**,
+Extended JSON → BSON is **0.001 ms**, and authentication is bounded by the
+0.07 ms point read that includes it.
+
+**The remaining candidate is not eliminated, only shown not to apply here.** A
+commit's fsync does land on a runtime worker thread rather than a dedicated
+one — there is no `spawn_blocking` on this path — but at one client the runtime
+has nothing else to schedule, so it has no victim, and the gap is present at one
+client. Whether it costs anything at concurrency is a different question and
+has not been measured.
+
+#### The part that is worse than the gap
+
+The penalty a client sees is one commit, because it only ever waits behind one.
+The work is not one commit. **The worker commits once per document, so a bulk
+request is amplified by its batch size** — and the amplification is deferred,
+which is why no latency figure showed it:
+
+> 4,000 documents in 40 bulk requests: **0.39 s**, 84 commits while the
+> requests were in flight. The node then went on committing for another
+> **12.3 s**, reaching **4,041** — one per document, plus one per request.
+
+A third of a second of ingest bought twelve seconds of saturated writer. The
+bulk API exists so that 100 documents cost one fsync rather than 100
+([Batching into one commit](#batching-into-one-commit)); behind it, the worker
+pays the 100 anyway. Sustained ingest is bounded by the worker's per-document
+commit rate, not by the batch path — and this holds on every node, whether or
+not any collection uses vectors.
+
+**No fix is included here.** Making a consumer's position writes cheaper trades
+a crash replaying a few idempotent entries for an fsync per write, which is a
+change to the oplog-consumer contract and is reserved for a decision. What
+this section changes is that the trade is now between two measured numbers.
+
+Worth knowing before that decision: **the replication path already made the
+other choice.** `Sync::apply_batch` in `kimmy-storage/src/sync.rs` witnesses a
+whole batch in one transaction — "one transaction for the batch rather than one
+per entry", with the reasoning in a comment beside it — and it keeps the
+after-the-work ordering that makes a replay safe. So the shape a fix would take
+already exists in this codebase, applied to the same problem, by an author who
+was thinking about batch size at the time.
+
+#### How to reproduce it
+
+```bash
+# The mechanism, at the engine, with no HTTP involved:
+cargo bench -p kimmy-storage --bench write_path -- insert_with_consumer
+# The cost, on a node: read kimmy_commits off /metrics either side of N inserts.
+```
+
+`kimmy_commits` is on `/metrics` for this reason — see
+[Operations](operations.md). Commits per client-visible write is the number
+that matters, and it is not derivable from a latency figure.
 
 ---
 

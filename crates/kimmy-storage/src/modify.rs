@@ -107,7 +107,7 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
     ) -> Result<ModifyOutcome> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
 
         let chosen = match self.choose(&txn, coll, candidates, spec) {
             Ok(chosen) => chosen,

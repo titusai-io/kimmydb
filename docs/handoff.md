@@ -6,33 +6,76 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-15 — **M10 merged**; post-M10 register work, one PR open
+## As of 2026-08-15 — **M11 has started**; task 1 done, one PR open
 
-**M0–M10 are all merged — every milestone that was ever planned.** PRs #65–#77
-closed the milestone. Since then, four short branches have worked the carried
-debt down rather than starting a new milestone:
+**M0–M10 are all merged.** PRs #65–#77 closed M10; #78–#81 worked the carried
+debt down afterwards. **M11 — index-ordered scans — is now open**, and its
+board is in [Roadmap](roadmap.md) rather than only in this file.
 
 | | |
 |---|---|
 | #78 | `retry: wait` fixed (it failed over instead of waiting), `kimmy-auth` + `kimmy-storage` mutation passes |
 | #79 | `kimmy-api` mutation pass — closes the M10 mutation debt entirely |
 | #80 | `find {_id}` uses the primary key — 7.328 ms → 0.540 ms |
-| **#81** | **OPEN.** An HNSW build could orphan a tenth of a collection. Read this one before anything else |
+| #81 | An HNSW build could orphan a tenth of a collection. Merged 2026-08-15 |
+| **`m11-write-gap`** | **OPEN.** M11 task 1: the write gap is explained. Read the next section |
 
-### The agreed plan, and where it stopped
+### M11 task 1 — the write gap, and what explaining it turned up
 
-The maintainer chose this on 2026-08-14, and it is still the plan:
+**The daemon spends two durable commits on an insert where the engine spends
+one.** The second is the embedding worker's: `EmbeddingWorker::run` records its
+oplog position after *every* entry — including entries it skips, in collections
+with no vector configuration — and `put_consumer_position` is its own write
+transaction and its own fsync. redb has a single writer, so that commit is not
+just extra work on the same disk, it is a queue position in front of the next
+write. That is why the penalty looked fixed per request: a request waits behind
+at most one in-flight commit however many documents it carried.
 
-1. **Close the cheap register debt first** — done, in #78/#79/#80.
-2. **Then M11: index-ordered scans**, opening with the daemon-versus-engine
-   write-gap measurement as its task 1, so the performance work starts from an
-   explained baseline.
+Measured rather than reasoned, on a node, through a new `kimmy_commits` metric:
 
-**M11 has not started.** #81 is an unplanned interruption: CI failed on #80 with
-what looked like a flaky vector test, and chasing it found a real defect. Once
-#81 merges, the next thing is M11 task 1 — and nothing else is queued.
+| | inserts/s | ms each | commits per insert |
+|---|---:|---:|---:|
+| as shipped | 156 | 6.39 | **2.00** |
+| embedding worker not started | 226 | 4.42 | **1.00** |
+| webhook dispatcher not started | 156 | 6.40 | 2.00 |
 
-### #81 is the one to understand before continuing
+The HTTP benchmark's `insert one` cell goes **54 → 236 req/s** with the worker
+off. The webhook dispatcher — the other candidate M10 named — is not implicated;
+it wakes on a two-second tick. The third candidate, fsync on a runtime worker
+thread, cannot explain a gap that is present at one client, where the runtime
+has nothing else to schedule.
+
+**The bigger finding is behind the batch API.** The client waits behind one
+commit; the worker commits once per *document*. 4,000 documents in 40 bulk
+requests took 0.39 s and left the node committing for another **12.3 s** —
+4,041 commits. Bulk exists so 100 documents cost one fsync instead of 100, and
+the worker pays the 100 anyway, deferred out of view. This happens on every
+node whether or not anything uses vectors.
+
+**Three things worth carrying:**
+
+- **`kimmy_commits` is the instrument, and it stays.** Every write transaction
+  an open engine takes goes through `Engine::begin_write`, and
+  `commits_are_counted_at_one_chokepoint` scans the source so a new write path
+  cannot quietly stop being counted. Commits per client-visible write is not
+  derivable from a latency figure, which is why this cost survived a whole
+  milestone of benchmarking.
+- **The first version of the engine benchmark reported +0.2 ms for a cost that
+  is +3.1 ms**, because it timed the insert and let the consumer's commit fall
+  outside the window. A consumer that lags has not made the write cheaper — it
+  has moved the commit somewhere nobody is looking, which is the same thing the
+  daemon was doing. The benchmark now ends an iteration when the consumer has
+  caught up: 3.51 ms against 6.58 ms, reproducing the gap with no HTTP in it.
+- **Nothing tested `run`.** Every other test in `worker.rs` drives `process`
+  directly, and the position write is in `run`, not `process`.
+
+**No fix is included, by decision.** Coalescing a consumer's position writes
+trades a crash replaying a few idempotent entries for an fsync per write. It
+changes the oplog-consumer contract, and it is reserved — see the M11 board. It
+must not become "record only when there was work to do": a position that
+advances only on work gets killed by retention.
+
+### #81, the branch before this one — still worth reading
 
 **A test that looked flaky was reporting silent data loss.** About **one HNSW
 index build in 250** left **10–24% of a collection unreachable** from the graph:
@@ -89,17 +132,18 @@ deferral was settled by [ADR-055](decisions.md) and is what M10 carries out.
 ```bash
 cd /path/to/kimmydb
 git checkout main && git pull
-gh pr list --state open            # is #81 still open?
-gh pr view 81 --json state,title
+gh pr list --state open            # is the write-gap branch still open?
 ```
 
-**If #81 is still open**, that branch is the work and it is waiting on review.
-Read its description first: it is a vector-search data-loss fix, and the
-reasoning in it is the most useful thing in the repo right now.
+**If `m11-write-gap` is still open**, that branch is the work and it is waiting
+on review. Read its description first.
 
-**If #81 is merged**, `main` holds M0–M10 plus the post-M10 register work, and
-the next thing is **M11 task 1: explain the write gap** (see below). That is
-already agreed with the maintainer.
+**If it is merged**, the next thing is **M11 task 2: give `IndexPlan` a notion
+of the order it yields**. The board is in [Roadmap](roadmap.md#m11--index-ordered-scans),
+which is where M11 lives now rather than only in this file. **One decision is
+reserved before task 5 and one is left over from task 1** — the sorted-cursor
+token shape, and whether to coalesce a consumer's position writes. Both are on
+the board; neither blocks tasks 2–4.
 
 **Either way, check the register first.** `docs/deviations.md` holds zero 🔴.
 If a 🟡 has become a 🔴 in your absence, that outranks the plan.
@@ -141,7 +185,7 @@ the three client suites, the conformance runner and the examples.
   open is a 🟡 that was agreed. Read the register itself, not a summary — M8
   found a debt that existed only there.
 
-#### 5. The three failure modes that keep catching people here
+#### 5. The four failure modes that keep catching people here
 
 **A claim with no mechanism behind it is usually false.** M8 found one in four
 branches, M9 in every task, M10 in four more — including a sentence in a PR
@@ -170,20 +214,24 @@ is telling you**, and be sure any threshold is sized from a measured
 distribution rather than from one observation. Both mistakes here came from the
 latter.
 
-#### 6. What M11 is, and how to start it
+**A cost outside the measurement window is a cost nobody sees.** The write gap
+survived a whole milestone of benchmarking because the second fsync per write
+belonged to a background consumer and landed *after* the response — so every
+latency figure was honest and every one of them missed it. The first benchmark
+written to catch it made the same mistake a second time, reporting +0.2 ms for
+a cost of +3.1 ms, because it stopped the clock when the insert returned. Ask
+what work a request *causes* as well as what it *does*: `kimmy_commits` over
+`kimmy_requests_total` is the version of that question this project can now
+answer from a running node.
 
-**M11 is already chosen: index-ordered scans**, with the write-gap measurement
-as task 1. The maintainer settled this on 2026-08-14.
+#### 6. What M11 is, and where it is
 
-**Task 1 — explain the write gap, before changing anything.** A single insert
-costs ~7.0 ms through the daemon against ~3.4 ms at the engine. It is *not*
-protocol overhead (reads bound that at 0.1 ms) and not per-document encoding
-(the gap is fixed per request, not per document). Candidates named and never
-measured: the background oplog consumers a daemon runs and a bare `Engine` does
-not, and a commit's fsync landing on a runtime worker thread. This goes first so
-the performance work has an explained baseline rather than an unexplained one.
+**M11 is index-ordered scans**, chosen by the maintainer on 2026-08-14. The
+board is in [Roadmap](roadmap.md#m11--index-ordered-scans) — five tasks, of
+which **task 1 is done** (the write gap, explained above). Tasks 2–4 are
+engine-side and unblocked; task 5 reaches the wire and has a reserved decision.
 
-**Then the scans themselves**, and the shape is known:
+**The remaining work, and the shape is known:**
 
 - `kimmy-storage/src/index.rs` — both `scan_range_in` and `scan_range_in_write`
   end `out.sort(); out.dedup();`. **The sort is not gratuitous**: `dedup` only
@@ -276,7 +324,8 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `close-m10-test-debts` | ✅ Merged as #78. `retry: wait` **failed over instead of waiting** — the comment above it said otherwise and nothing tested it. Plus the `kimmy-auth` and `kimmy-storage` mutation passes |
 | `m10-api-mutation-pass` | ✅ Merged as #79. `kimmy-api`'s 76 mutants; closes the M10 mutation debt. Found `capabilities()` could return an empty list with every assertion still passing |
 | `find-by-id-uses-the-primary-key` | ✅ Merged as #80. `plan::choose_primary_key`: 7.328 ms → 0.540 ms over 10k documents, examined 10,000 → 1 |
-| `recall-test-does-not-depend-on-core-count` | **Open as PR #81.** Badly named now — it is the HNSW build fix. An index build could orphan 10–24% of a collection. Read its description |
+| `recall-test-does-not-depend-on-core-count` | ✅ Merged as #81. Badly named — it is the HNSW build fix. An index build could orphan 10–24% of a collection |
+| `m11-write-gap` | **Open.** M11 task 1: the daemon spends two commits per insert where the engine spends one. `kimmy_commits` on `/metrics`, and the tests that hold both numbers |
 
 ### The M8 and M9 boards — all seventeen done
 
@@ -1092,7 +1141,7 @@ in [Deviations](deviations.md):
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
 | ~~The M10 mutation pass covered `kimmy-client` only~~ | **Closed 2026-08-14.** All 90 classified. Found three real gaps: `InvalidateReason::as_str` unpinned, `capabilities()` able to return an empty list with every assertion still passing, and `register`'s "silent when unchanged" claim tested by nothing |
 | ~~The client's `retry: wait` path has no test that reaches it~~ | **Closed 2026-08-14.** The test found the branch was *wrong*: `wait` failed over instead of waiting, so it behaved as `elsewhere` with a delay. Fixed, 9/9 mutants caught |
-| A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **still unexplained, and it is M11 task 1** |
+| **The embedding worker commits once per oplog entry, so a write costs two fsyncs and a bulk of 100 costs 101** | **Explained 2026-08-15** by M11 task 1, and no longer the same debt: the *gap* is understood, the *cost* is still paid. The fix is a reserved decision — see the M11 board |
 | **Vector indexes built before 2026-08-15 may be missing 10–24% of a collection** | #81 fixes new builds; it cannot repair a graph already cached or persisted under `<data_dir>/hnsw`. [Operations](operations.md) has the rebuild. **Open until the maintainer confirms their nodes are rebuilt** |
 | Sharding | **deferred by decision** until there is operational experience |
 

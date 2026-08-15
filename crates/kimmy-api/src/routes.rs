@@ -128,6 +128,9 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
          # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
          # TYPE kimmy_unique_violations counter\n\
          kimmy_unique_violations {violations}\n\
+         # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
+         # TYPE kimmy_commits counter\n\
+         kimmy_commits {commits}\n\
          # HELP kimmy_storage_bytes Size of the database file on disk.\n\
          # TYPE kimmy_storage_bytes gauge\n\
          kimmy_storage_bytes {storage}\n\
@@ -139,6 +142,11 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
         // Surfaced here, not only on a change stream, so the condition is
         // visible without anyone having been subscribed when it happened.
         violations = state.engine.unique_violations(),
+        // redb has a single writer and every commit is an fsync, so this over
+        // the request count is what a write actually costs. A client-visible
+        // write that costs two commits costs twice as much as one that costs
+        // one, and no latency figure says which of those is happening.
+        commits = state.engine.commits(),
         storage = state.engine.storage_bytes(),
         process = state.metrics.render(),
     ))

@@ -215,7 +215,7 @@ impl Engine {
 
         // Everything is decided. Now write.
         let mut outcome = RewindOutcome::default();
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         {
             // Index maintenance needs each collection's index definitions,
             // keyed by the id the oplog refers to.

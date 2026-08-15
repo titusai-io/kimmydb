@@ -168,7 +168,7 @@ impl Engine {
     /// Generates an ObjectId when `_id` is absent, and returns the id either
     /// way so the caller need not re-read.
     pub fn insert(&self, coll: &CollectionMeta, doc: Document) -> Result<DocId> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
             Ok(pair) => pair,
             Err(e) => {
@@ -207,7 +207,7 @@ impl Engine {
             return Ok(Vec::new());
         }
 
-        let txn = self.db().begin_write().map_err(BulkInsertError::transaction)?;
+        let txn = self.begin_write().map_err(BulkInsertError::transaction)?;
         let mut ids = Vec::with_capacity(docs.len());
         let mut entries = Vec::with_capacity(docs.len());
 
@@ -315,7 +315,7 @@ impl Engine {
         let body = bson::serialize_to_vec(&doc)?;
         let stamp = self.next_stamp();
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let (existed, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The previous image is needed to remove the index entries it
@@ -395,7 +395,7 @@ impl Engine {
         let key = doc_key(id)?;
         let stamp = self.next_stamp();
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let previous = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let previous = match docs.get((coll.id.0, key.as_slice()))? {
@@ -469,7 +469,7 @@ impl Engine {
             None => DocRecord::tombstone(entry.stamp),
         };
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let violations;
         let applied = {
             let mut docs = txn.open_table(tables::DOCS)?;
@@ -589,7 +589,7 @@ impl Engine {
             body: Some(bson::serialize_to_vec(&detail)?),
         };
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         append_oplog(&txn, &entry)?;
         txn.commit()?;
         Ok(entry)
@@ -650,6 +650,49 @@ mod tests {
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         let coll = engine.create_collection("app", "docs").unwrap();
         (engine, coll, dir)
+    }
+
+    /// The cost of a write is the number of times it reaches the disk, and
+    /// redb's single writer makes each of those a queue position for everybody
+    /// else. M11 task 1 found the daemon spending two commits on an insert
+    /// where the engine spent one — invisible to every latency measurement,
+    /// because the second commit was somebody else's and only showed up as the
+    /// *next* write waiting. These pin the engine's half of that.
+    #[test]
+    fn one_insert_is_one_commit() {
+        let (engine, coll, _dir) = engine();
+
+        let before = engine.commits();
+        engine.insert(&coll, doc! {"n": 1}).unwrap();
+        assert_eq!(engine.commits() - before, 1, "an insert must reach the disk exactly once");
+    }
+
+    #[test]
+    fn a_batch_is_one_commit_however_many_documents_it_holds() {
+        let (engine, coll, _dir) = engine();
+
+        let before = engine.commits();
+        let batch: Vec<_> = (0..100).map(|n| doc! {"n": n}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        assert_eq!(
+            engine.commits() - before,
+            1,
+            "batching exists so that 100 documents cost one fsync, not 100"
+        );
+    }
+
+    #[test]
+    fn a_refused_write_does_not_commit() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": "same", "n": 1}).unwrap();
+
+        let before = engine.commits();
+        engine.insert(&coll, doc! {"_id": "same", "n": 2}).unwrap_err();
+        assert_eq!(
+            engine.commits() - before,
+            0,
+            "an aborted transaction never reached the disk and must not be counted as if it had"
+        );
     }
 
     #[test]
