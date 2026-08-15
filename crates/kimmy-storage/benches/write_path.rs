@@ -19,6 +19,10 @@
 //!   cost of a document *and* its log record, which is the honest unit.
 //! - `insert` with one and two secondary indexes — index maintenance is on the
 //!   write path, and its cost is the argument against indexing everything.
+//! - `insert_with_consumer` — the same insert with a background oplog consumer
+//!   recording its position behind it, which is what a daemon runs and a bare
+//!   engine does not. This is the daemon-versus-engine write gap reproduced
+//!   with no HTTP in it; see [Benchmarks](../../../docs/benchmarks.md).
 //! - `bulk` — the same insert, batched into one commit. Reported per document,
 //!   so the distance from `insert/secondary_indexes/0` is the per-commit
 //!   overhead a batch removes, which is the entire case for the bulk API.
@@ -31,7 +35,7 @@ use bson::{Document, doc};
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use kimmy_core::index_meta::IndexField;
 use kimmy_core::vector_meta::{ChunkConfig, Metric, ProviderConfig, VectorConfig};
-use kimmy_core::{DocId, Hlc, VectorRecord};
+use kimmy_core::{DocId, Hlc, ResumeToken, VectorRecord};
 use kimmy_storage::{CollectionMeta, Engine};
 
 /// A document of a size a real application might store.
@@ -87,6 +91,86 @@ fn inserts(c: &mut Criterion) {
                     let id = engine.insert(&coll, document(next)).unwrap();
                     black_box(id)
                 });
+            },
+        );
+    }
+    group.finish();
+}
+
+/// What a background oplog consumer costs the writes it watches.
+///
+/// This is the daemon reproduced at the engine, and it is the whole of M11
+/// task 1. A daemon runs consumers of the oplog that a bare `Engine` does not
+/// — the embedding worker, the webhook dispatcher — and each records its
+/// position in its own write transaction. redb has a single writer, so the
+/// next insert does not merely share a disk with that commit, it queues behind
+/// it. No HTTP is involved here: if these two differ by about the cost of one
+/// commit, the gap [Benchmarks](../../../docs/benchmarks.md) recorded over a
+/// socket is explained without protocol overhead entering into it.
+///
+/// The consumer records a position for *every* entry, which is what the
+/// embedding worker does — including for collections it has nothing to do
+/// with.
+///
+/// An iteration ends when the consumer has caught up, not when the insert
+/// returns. That is deliberate and it is the only honest unit: a consumer that
+/// falls behind has not made the write cheaper, it has moved the commit out of
+/// the window being timed. Sustained throughput has to absorb both commits, and
+/// timing only the insert reports a 0.2 ms difference for work that halves what
+/// a node can do — which is how this cost stayed invisible through M10.
+fn background_consumer(c: &mut Criterion) {
+    let mut group = c.benchmark_group("insert_with_consumer");
+    group.sample_size(30);
+
+    for consumers in [0usize, 1] {
+        group.bench_with_input(
+            BenchmarkId::new("consumers", consumers),
+            &consumers,
+            |b, &consumers| {
+                let (engine, _dir) = open();
+                let engine = std::sync::Arc::new(engine);
+                engine.create_collection("bench", "docs").unwrap();
+                let coll = engine.get_collection("bench", "docs").unwrap();
+
+                let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let handled = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+                let consumer = (consumers == 1).then(|| {
+                    let engine = std::sync::Arc::clone(&engine);
+                    let stop = std::sync::Arc::clone(&stop);
+                    let handled = std::sync::Arc::clone(&handled);
+                    let mut events = engine.subscribe();
+                    std::thread::spawn(move || {
+                        while let Ok(entry) = events.blocking_recv() {
+                            if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+                            let token = ResumeToken::new(entry.stamp.hlc, entry.stamp.node);
+                            engine.put_consumer_position("bench", token).unwrap();
+                            handled.fetch_add(1, std::sync::atomic::Ordering::Release);
+                        }
+                    })
+                });
+
+                let mut next = 0i64;
+                b.iter(|| {
+                    next += 1;
+                    let id = engine.insert(&coll, document(next)).unwrap();
+                    if consumers == 1 {
+                        while handled.load(std::sync::atomic::Ordering::Acquire) < next as u64 {
+                            std::thread::yield_now();
+                        }
+                    }
+                    black_box(id)
+                });
+
+                if let Some(consumer) = consumer {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                    // One more entry to wake the thread out of its blocking
+                    // receive so the batch does not leak a thread per sample.
+                    next += 1;
+                    engine.insert(&coll, document(next)).unwrap();
+                    consumer.join().unwrap();
+                }
             },
         );
     }
@@ -216,5 +300,12 @@ fn vector_writes(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, inserts, bulk_inserts, other_mutations, vector_writes);
+criterion_group!(
+    benches,
+    inserts,
+    background_consumer,
+    bulk_inserts,
+    other_mutations,
+    vector_writes
+);
 criterion_main!(benches);

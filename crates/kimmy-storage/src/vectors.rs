@@ -81,7 +81,7 @@ impl crate::Engine {
         self.create_system_collection(db, &shadow)?;
 
         meta.vector = Some(config.clone());
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -130,7 +130,7 @@ impl crate::Engine {
         }
 
         meta.vector = None;
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
         let logged = if log {
@@ -204,7 +204,7 @@ impl crate::Engine {
     /// rather than recomputed, because rebuilding it would mean re-reading the
     /// whole log on every restart.
     pub fn put_consumer_position(&self, consumer: &str, token: ResumeToken) -> Result<()> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut meta = txn.open_table(crate::tables::META)?;
             meta.insert(consumer_key(consumer).as_str(), token.encode().as_bytes())?;
@@ -236,7 +236,7 @@ impl crate::Engine {
     /// HLC cannot see a configuration change, because configurations do not
     /// touch documents.
     pub fn put_vector_fingerprint(&self, collection: CollectionId, fingerprint: u64) -> Result<()> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut meta = txn.open_table(crate::tables::META)?;
             meta.insert(fingerprint_key(collection).as_str(), &fingerprint.to_be_bytes()[..])?;

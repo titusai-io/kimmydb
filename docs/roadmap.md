@@ -23,8 +23,9 @@ graph LR
     M8["<b>M8</b> ✅<br/>prove, persist,<br/>polish"]
     M9["<b>M9</b> ✅<br/>finish the<br/>query engine"]
     M10["<b>M10</b> ✅<br/>client protocol<br/>and clients"]
+    M11["<b>M11</b> 🚧<br/>index-ordered<br/>scans"]
 
-    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10
+    M0 --> M1 --> IDX --> M2 --> M3 --> M4 --> M5 --> M6 --> M7 --> M8 --> M9 --> M10 --> M11
 
     style M0 fill:#2f5d3a,color:#fff
     style M1 fill:#2f5d3a,color:#fff
@@ -38,6 +39,7 @@ graph LR
     style M8 fill:#2f5d3a,color:#fff
     style M9 fill:#2f5d3a,color:#fff
     style M10 fill:#2f5d3a,color:#fff
+    style M11 fill:#6b5b2f,color:#fff
 ```
 
 | Milestone | Scope | Status |
@@ -53,6 +55,7 @@ graph LR
 | **M8** | Prove, persist, polish — the cluster harness, vector durability, observability, and the API ergonomics backlog | ✅ Complete |
 | **M9** | Finish the query engine — computed expressions, TTL, `findAndModify`, partial indexes, cursors | ✅ Complete |
 | **M10** | The client protocol, formalized — a specified and versioned HTTP/WebSocket contract, and first-party Rust, Python and Go clients ([ADR-055](decisions.md)) | ✅ Complete |
+| **M11** | Index-ordered scans — sorted queries that stop early, and cursors that can sort by something other than `_id` | 🚧 Task 1 of 5 |
 
 Ordering note: vectors and MCP come **before** clustering, deliberately. The
 AI-facing features are the differentiator and are useful on a single node;
@@ -773,6 +776,54 @@ reserved decisions and as M9 is set up to do with five.
   clients honest.
 - **mTLS**, which stays in the not-planned table. It is client *authentication*,
   not client *protocol*, and nothing here changes the argument.
+
+---
+
+## M11 — Index-ordered scans
+
+**The theme: the query engine knows how to find rows and not how to hand them
+back in order.** `scan_range_in` and `scan_range_in_write` in
+`kimmy-storage/src/index.rs` both end `out.sort(); out.dedup();`, so index
+candidates arrive in `_id` order rather than index order. Everything downstream
+pays for it: every sorted `find` materialises its whole match set before
+sorting, `kimmy-api/src/exec.rs` only sets `stop_after` when the sort is empty,
+and a cursor refuses any sort but `{"_id": 1}`. It is the largest single
+performance item known to be outstanding, and M9 named it without building it.
+
+**The sort is not gratuitous** and cannot simply be deleted: `dedup` removes
+only *adjacent* duplicates, and duplicates are real — a multikey index stores
+one document under several keys, and a `$in` union produces several ranges.
+Preserving index order needs a seen-set that keeps first occurrence, not a
+cheaper sort.
+
+**Chosen on 2026-08-14**, with the write-gap measurement first so the
+performance work starts from an explained baseline rather than an unexplained
+one.
+
+### Tasks
+
+| # | Task | Notes |
+|---|---|---|
+| 1 | ✅ **Explain the daemon-versus-engine write gap** | Measured, not argued. The daemon spends **two durable commits** on an insert where the engine spends one: the embedding worker records its oplog position after every entry, including ones it skips, and redb's single writer puts that commit in front of the next write. `kimmy_commits` on `/metrics` is the instrument, and it found the larger problem behind the gap — the worker commits once per *document*, so 4,000 documents ingested in 0.39 s leave the node committing for 12.3 s. Numbers and method in [Benchmarks](benchmarks.md); the fix is reserved below |
+| 2 | **`IndexPlan` carries the order it yields** | `kimmy-query/src/plan.rs` has no notion of output order today, which is the extension point. A plan that knows its order lets the executor skip the sort when the index already satisfies it |
+| 3 | **Index-ordered scans in storage** | Replace `sort`/`dedup` with a first-occurrence seen-set, so a scan yields index order and stays correct for multikey indexes and `$in` unions |
+| 4 | **Sorted `find` stops early** | With order from the index, `stop_after` applies to sorted queries too, and a sorted `find` stops reading at the limit instead of materialising every match |
+| 5 | **Sorted cursors** | Lifting `exec.rs`'s refusal of any cursor sort but `{"_id": 1}`. This one **reaches the wire**: the token must carry the index key *plus* the document key, which touches `kimmy-core/src/cursor.rs`, `docs/openapi.yaml`, all three clients and the conformance scenarios |
+
+### Decisions reserved for the maintainer
+
+- **The write gap's fix** (from task 1). Coalescing a consumer's position writes
+  removes one fsync per write and costs a crash replaying a few idempotent
+  entries. It changes the oplog-consumer contract, which is where this project
+  has had three separate bugs, so it is a decision rather than a follow-up
+  commit. **Not** "record only when there was work to do" — a position that
+  advances only on work is killed by retention. Note that `Sync::apply_batch`
+  already coalesces witnessing across a batch for this exact reason, so the
+  shape has precedent here rather than being invented for the occasion.
+- **The sorted cursor token's shape** (task 5). Public surface, and it must stay
+  additive under [ADR-058](decisions.md). Settle it before task 5 starts.
+
+Next ADR number: **ADR-061**.
 
 ---
 

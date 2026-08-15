@@ -752,6 +752,92 @@ mod tests {
         assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
     }
 
+    /// Wait for the worker to have started and then gone quiet.
+    ///
+    /// Quiet is defined on the commit counter rather than on a number of
+    /// entries, so that a change to how many oplog entries the setup produces
+    /// makes this test *slower* rather than flaky.
+    async fn worker_is_idle(engine: &Engine) {
+        let mut last = engine.commits();
+        let mut stable = 0;
+        for _ in 0..1_000 {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            let now = engine.commits();
+            // Started, and then unchanged for 50ms.
+            if now == last && engine.consumer_position(CONSUMER).unwrap().is_some() {
+                stable += 1;
+                if stable == 10 {
+                    return;
+                }
+            } else {
+                stable = 0;
+                last = now;
+            }
+        }
+        panic!("the worker never started, or never stopped writing");
+    }
+
+    /// Wait for the worker's recorded position to move past `from`, or give up.
+    ///
+    /// Polled rather than signalled because the thing under test is precisely
+    /// that the worker writes without being asked to.
+    async fn position_advances_past(engine: &Engine, from: Option<kimmy_core::ResumeToken>) {
+        for _ in 0..1_000 {
+            if let Some(now) = engine.consumer_position(CONSUMER).unwrap()
+                && Some(now) != from
+            {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the worker never recorded a position past {from:?}");
+    }
+
+    /// The daemon-versus-engine write gap, as a test.
+    ///
+    /// A bare `Engine` spends one commit on an insert
+    /// (`kimmy_storage::docs::tests::one_insert_is_one_commit`). A daemon runs
+    /// this worker, which records its oplog position after **every** entry —
+    /// including the ones it has nothing to do with — and each of those is its
+    /// own write transaction and its own fsync. So an insert into a collection
+    /// with no vector configuration costs two commits on a daemon and one at
+    /// the engine, which is the write gap M10 task 7 measured and could not
+    /// explain.
+    ///
+    /// Nothing caught it because every other test in this file drives
+    /// `process` directly and never `run`, and `process` is not where the
+    /// position is recorded.
+    ///
+    /// **This test passing is not an endorsement.** It pins the current cost so
+    /// that a fix has to change it deliberately; if you are reading this
+    /// because you just made it fail, you are probably doing the right thing.
+    #[tokio::test]
+    async fn a_write_the_worker_skips_still_costs_a_second_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        // No vector configuration, so every entry here is an `Outcome::Skipped`.
+        let coll = engine.create_collection("app", "plain").unwrap();
+
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        tokio::spawn(async move { worker.run().await });
+
+        // Let it finish with whatever creating the collection produced, so the
+        // measurement below covers one insert and nothing else.
+        worker_is_idle(&engine).await;
+        let settled = engine.consumer_position(CONSUMER).unwrap();
+
+        let before = engine.commits();
+        engine.insert(&coll, doc! { "n": 1i64 }).unwrap();
+        position_advances_past(&engine, settled).await;
+
+        assert_eq!(
+            engine.commits() - before,
+            2,
+            "an insert the worker skips still costs the insert's commit plus the worker's \
+             position write — one write, two fsyncs"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Backfill: a ConfigureVectors entry is the reindex trigger
     // -----------------------------------------------------------------------

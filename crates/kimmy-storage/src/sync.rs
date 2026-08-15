@@ -273,7 +273,7 @@ impl Engine {
         // identity intact, and is what advances the version vector for its
         // origin node — while minting a local entry instead would send the
         // change back to the peer, which would apply it and mint another.
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         crate::engine::append_oplog(&txn, entry)?;
         txn.commit()?;
         self.witness(&entry.stamp);

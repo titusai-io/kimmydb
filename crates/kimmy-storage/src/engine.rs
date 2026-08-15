@@ -45,6 +45,46 @@ pub struct Engine {
     /// metrics endpoint without anyone having to be watching a stream when it
     /// happens — see [ADR-020](../../../docs/decisions.md).
     unique_violations: std::sync::atomic::AtomicU64,
+    /// Durable write transactions committed, since start.
+    ///
+    /// redb has a single writer and every commit is an fsync, so the number of
+    /// commits a piece of work costs is the thing that decides what a write is
+    /// worth — not how much of it is CPU. Counting them makes "an insert is one
+    /// commit" a property of a running node rather than a claim in a comment,
+    /// which is what M11 task 1 needed: the daemon was paying two commits per
+    /// insert where a bare engine paid one, and nothing said so.
+    commits: std::sync::atomic::AtomicU64,
+}
+
+/// A write transaction that counts itself when it commits.
+///
+/// Aborts are not counted, deliberately: an abort does not fsync, and the
+/// question this exists to answer is how many times a write path reaches the
+/// disk. Derefs to the redb transaction, so `open_table` and the rest are
+/// unchanged at the call sites.
+pub(crate) struct WriteTxn<'a> {
+    txn: redb::WriteTransaction,
+    commits: &'a std::sync::atomic::AtomicU64,
+}
+
+impl WriteTxn<'_> {
+    pub(crate) fn commit(self) -> std::result::Result<(), redb::CommitError> {
+        self.txn.commit()?;
+        self.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub(crate) fn abort(self) -> std::result::Result<(), redb::StorageError> {
+        self.txn.abort()
+    }
+}
+
+impl std::ops::Deref for WriteTxn<'_> {
+    type Target = redb::WriteTransaction;
+
+    fn deref(&self) -> &Self::Target {
+        &self.txn
+    }
 }
 
 impl Engine {
@@ -105,6 +145,7 @@ impl Engine {
             vector_generations: Mutex::new(Default::default()),
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
+            commits: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -136,6 +177,15 @@ impl Engine {
     /// How many merged writes have broken a unique constraint since start.
     pub fn unique_violations(&self) -> u64 {
         self.unique_violations.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many durable write transactions have committed since start.
+    ///
+    /// One per unit of work is the expectation. Anything that turns one
+    /// client-visible write into two commits doubles what that write costs,
+    /// and this is where that shows up.
+    pub fn commits(&self) -> u64 {
+        self.commits.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub(crate) fn count_unique_violation(&self) {
@@ -365,7 +415,7 @@ impl Engine {
 
     /// Record that a collection was dropped at `stamp`, if that is newer.
     pub(crate) fn record_collection_drop(&self, id: CollectionId, stamp: Stamp) -> Result<()> {
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let newer = match dropped.get(id.0)? {
@@ -395,7 +445,7 @@ impl Engine {
         let mut witnessed = Self::read_versions(&self.db, tables::OPLOG_WITNESSED)?;
         witnessed.merge(&current);
 
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut seen = txn.open_table(tables::OPLOG_WITNESSED)?;
             for (node, hlc) in witnessed.iter() {
@@ -463,7 +513,7 @@ impl Engine {
         if seen.is_empty() {
             return Ok(());
         }
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut table = txn.open_table(tables::OPLOG_WITNESSED)?;
             for (node, hlc) in seen.iter() {
@@ -488,7 +538,7 @@ impl Engine {
     /// with it.
     pub fn witness_processed(&self, stamp: &Stamp) -> Result<()> {
         self.witness(stamp);
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         raise_version(&txn, tables::OPLOG_WITNESSED, stamp)?;
         txn.commit()?;
         Ok(())
@@ -523,6 +573,20 @@ impl Engine {
         &self.db
     }
 
+    /// Begin a counted write transaction.
+    ///
+    /// Every write an open engine performs goes through here rather than
+    /// through [`Database::begin_write`] directly, so that [`Engine::commits`]
+    /// counts the engine's durable commits rather than the paths somebody
+    /// remembered to instrument — `commits_are_counted_at_one_chokepoint`
+    /// fails if a new one appears. The three commits that legitimately do not
+    /// pass through here all happen where there is no `Engine` yet to count
+    /// them: opening the database, migrating it, and restoring a backup into a
+    /// fresh file.
+    pub(crate) fn begin_write(&self) -> std::result::Result<WriteTxn<'_>, redb::TransactionError> {
+        Ok(WriteTxn { txn: self.db.begin_write()?, commits: &self.commits })
+    }
+
     /// Publish committed events to live subscribers.
     ///
     /// Called only *after* a successful commit. Publishing before the commit
@@ -543,7 +607,7 @@ impl Engine {
         let stamp = self.next_stamp();
         let meta = DatabaseMeta { name: name.to_string(), created: stamp.hlc };
 
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             if dbs.get(name)?.is_some() {
@@ -586,7 +650,7 @@ impl Engine {
             self.drop_collection(name, &collection.name)?;
         }
 
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         let existed = {
             let mut dbs = txn.open_table(tables::DATABASES)?;
             dbs.remove(name)?.is_some()
@@ -633,7 +697,7 @@ impl Engine {
         log: bool,
     ) -> Result<CollectionMeta> {
         let stamp = self.next_stamp();
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
 
         let meta = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
@@ -763,7 +827,7 @@ impl Engine {
 
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
-        let txn = self.db.begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
@@ -985,6 +1049,56 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
         (engine, dir)
+    }
+
+    /// A counter is only worth reading if nothing can write behind its back.
+    ///
+    /// `Engine::commits` is a claim about the whole engine, and the way that
+    /// claim goes quietly false is somebody reaching for `self.db()` in a new
+    /// write path — which compiles, works, and undercounts. So the invariant is
+    /// checked against the source rather than trusted: every `begin_write` in
+    /// this crate is either `Engine::begin_write` or one of the three places
+    /// that legitimately has no engine to count against.
+    #[test]
+    fn commits_are_counted_at_one_chokepoint() {
+        // Where a commit happens before or outside an open `Engine`, and so
+        // cannot be counted by one. Each is a whole-file exemption because each
+        // file's entire job is one of these.
+        const NO_ENGINE_YET: [&str; 3] = [
+            "migrate.rs", // runs on the raw database during `Engine::open`
+            "backup.rs",  // restores into a fresh file that no engine has opened
+            "engine.rs",  // `Engine::open` itself, plus the chokepoint
+        ];
+
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders = Vec::new();
+
+        for entry in std::fs::read_dir(&src).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            if path.extension().is_none_or(|e| e != "rs") || NO_ENGINE_YET.contains(&name.as_str())
+            {
+                continue;
+            }
+
+            let body = std::fs::read_to_string(&path).unwrap();
+            for (n, line) in body.lines().enumerate() {
+                // Tests reach for a raw database on purpose — to prove what an
+                // engine does when the file underneath it was written by
+                // something else.
+                let raw = line.contains(".begin_write()") && !line.contains("self.begin_write()");
+                if raw && !line.trim_start().starts_with("let txn = db.begin_write().unwrap()") {
+                    offenders.push(format!("{name}:{}: {}", n + 1, line.trim()));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these write transactions bypass `Engine::begin_write`, so `Engine::commits` \
+             undercounts them and every conclusion drawn from it is wrong:\n  {}",
+            offenders.join("\n  ")
+        );
     }
 
     #[test]

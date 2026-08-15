@@ -598,7 +598,7 @@ impl crate::Engine {
             partial_filter,
         };
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
 
         // Scoped in a closure so every table borrow ends before the abort or
         // commit below, which need to move the transaction. Returns whether the
@@ -689,7 +689,7 @@ impl crate::Engine {
             return Ok(false);
         };
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             entries.retain_in(index_id_range(meta.id, index.id), |_, _| false)?;

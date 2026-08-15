@@ -103,7 +103,7 @@ impl Engine {
             return Ok(0);
         };
 
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut oplog = txn.open_table(tables::OPLOG)?;
@@ -172,7 +172,7 @@ impl Engine {
     /// already removed when the delete was applied, so nothing else refers to
     /// the key being dropped.
     fn collect_tombstones(&self, cutoff: Hlc) -> Result<usize> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut docs = txn.open_table(tables::DOCS)?;
@@ -198,7 +198,7 @@ impl Engine {
     /// question over the same window: "was this deleted more recently than the
     /// thing a peer is trying to replay?"
     fn collect_dropped_collections(&self, cutoff: Hlc) -> Result<usize> {
-        let txn = self.db().begin_write()?;
+        let txn = self.begin_write()?;
         let mut removed = 0usize;
         {
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
