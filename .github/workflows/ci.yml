@@ -78,6 +78,33 @@ jobs:
       - name: Cluster harness
         run: cargo test -p kimmyd --test cluster -- --ignored --test-threads=1
 
+  vector-reachability:
+    name: vector reachability
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `check` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # A healthy graph at a realistic embedding width must not be mistaken for
+      # one that has lost data. Ignored in the default run and released here
+      # because a 384-dimensional build is minutes in a debug profile and
+      # seconds in release. This job exists because the threshold it guards was
+      # sized against a 16-dimensional fixture, held there, and was wrong at
+      # every width a real embedding uses — discarding and rebuilding every
+      # healthy graph, then reporting it as incomplete.
+      - name: Reachability at a realistic width
+        run: >
+          cargo test -p kimmy-vector --release --lib --
+          --ignored --exact
+          index::tests::a_healthy_graph_at_a_realistic_width_is_not_rebuilt
+
   python-client:
     name: python client
     runs-on: ubuntu-latest

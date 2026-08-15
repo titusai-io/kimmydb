@@ -17,6 +17,65 @@ Status meanings:
 
 ---
 
+## 🟢 The reachability check was sized on a fixture whose shape did not generalize
+
+**Was.** PR #81 added a build-time check that a finished HNSW graph can find
+its own data, which closed a real defect: about one build in 250 orphaned 10–24%
+of a collection, silently. Its threshold — three sampled misses — was sized
+against a **400-vector, 16-dimensional** fixture, and both of those turned out to
+matter.
+
+**The problem.** A missed probe is two events added together: a search that ran
+out of budget, and a point the graph cannot reach. An ordinary search explores a
+fixed amount, so the first grows with collection size and width while the second
+does not. At 384 dimensions — the realistic embedding width — misses ran to a
+median of 8 in a sample of 128 at 4,000 vectors, against a threshold of 3.
+
+**Seven builds in ten at that size were discarded, rebuilt twice, and then
+reported to the operator as losing data.** Three times the build cost, and a
+`searches on this collection may be incomplete` warning, on a healthy graph.
+It was found by `scripts/bench-baseline.py check` during unrelated work:
+`hnsw_build/4000` at 3.00×, `hnsw_build/2000` at 2.03×, exactly
+`MAX_BUILD_ATTEMPTS + 1`.
+
+**Now.** The probe counts *unreachable* points rather than missed searches — a
+miss is re-probed with the budget removed, and only a point still missing then
+counts. Threshold 8, sized from both sides of the gap rather than one:
+599 healthy builds scored 0–5 (median 1), and the one catastrophic build
+observed scored 22. [ADR-061](decisions.md) has the reasoning and the
+alternatives.
+
+**A false explanation was corrected with it.** The old comment said a healthy
+miss was a vector among near-duplicates being edged out — approximation working
+as designed. Measured, that is wrong: with the budget removed those points are
+still not found. **Every graph this builds orphans between 0.8% and 3.0% of the
+collection**, and the check has always been separating routine orphaning from
+catastrophic orphaning rather than noise from signal.
+
+**The lesson is the one #81 recorded twice and this makes three:** a constant
+sized without knowing the shape of what it bounds. The new one ships with the
+measurement that produced it — two `#[ignore]`d tests that re-derive both
+distributions — so the next person can check rather than trust.
+
+## 🟡 Routine HNSW orphaning of up to 3% is accepted and not reported
+
+**Raised 2026-08-15 by [ADR-061](decisions.md).** Measuring the reachability
+threshold established that a healthy graph at these parameters leaves 0.8%–3.0%
+of a collection unreachable from the entry point. Those documents are returned
+by no approximate vector search, at any `k`. Exact search is unaffected, and
+collections under the approximate-index threshold use it.
+
+**Not a build defect and not fixable by rebuilding** — it is a property of
+`MAX_CONNECTIONS` and `EF_CONSTRUCTION`, so every draw has it. Closing it means
+changing those with recall measurements to hand, which trades build time and
+memory for it.
+
+**Recorded because it was previously believed to be zero**, and described in a
+comment as approximation rather than loss. The number is now known rather than
+waiting to be discovered.
+
+---
+
 ## 🟢 HNSW implemented (was an open drift)
 
 **Requested.** During planning the choice was *"HNSW from the start"*. It was

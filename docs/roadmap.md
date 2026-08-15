@@ -823,7 +823,7 @@ one.
 - **The sorted cursor token's shape** (task 5). Public surface, and it must stay
   additive under [ADR-058](decisions.md). Settle it before task 5 starts.
 
-Next ADR number: **ADR-061**.
+Next ADR number: **ADR-062**.
 
 ---
 
