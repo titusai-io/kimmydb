@@ -700,6 +700,81 @@ async fn topology_lists_this_node_even_though_the_member_set_never_contains_it()
     assert_eq!(me["endpoint"], Value::Null, "nothing was advertised, and none is guessed");
 }
 
+/// `register` writes this node in, and `topology` still reports it exactly once.
+///
+/// Every in-process topology test wrote *peer* records directly and none ever
+/// called `register`, so the registry never held this node and the
+/// self-bookkeeping in `topology` was dead code in the whole default suite —
+/// `me_seen` could be pinned to `false` with nothing failing, which would list
+/// the answering node twice. The cluster harness does cover it, on three real
+/// nodes, but it is `#[ignore]`: invisible to `cargo test --workspace` and to
+/// any mutation pass.
+#[tokio::test]
+async fn a_node_registers_itself_and_is_listed_once() {
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    kimmy_api::topology::register(&server.state, "http://10.1.1.1:7878").expect("register");
+
+    let res = server.get("/v1/topology", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1, "one node, listed once: {:?}", res.body);
+
+    let nodes = res.body["nodes"].as_array().expect("a list");
+    assert_eq!(
+        nodes.iter().filter(|n| n["self"] == true).count(),
+        1,
+        "the answering node appears exactly once: {:?}",
+        res.body
+    );
+    let me = &nodes[0];
+    assert_eq!(me["self"], true);
+    assert_eq!(me["endpoint"], "http://10.1.1.1:7878", "the advertised address, not a guess");
+    assert_eq!(me["node"], server.state.engine.node_id().to_string());
+}
+
+/// Registering again writes nothing when nothing changed.
+///
+/// The docstring says so — "a node that restarts twice an hour should not
+/// append to a log every other node then replicates" — and **nothing tested
+/// it**. The registry is replicated, so a spurious rewrite is an oplog entry
+/// every peer then carries; the guard is the whole reason `register` reads
+/// before it writes. The cluster harness cannot catch this: it starts each
+/// node once and never restarts one on an unchanged address.
+#[tokio::test]
+async fn registering_an_unchanged_record_appends_nothing() {
+    let server = Server::start().await;
+    let endpoint = "http://10.1.1.1:7878";
+
+    kimmy_api::topology::register(&server.state, endpoint).expect("first register");
+    let after_first = oplog_len(&server.state);
+
+    kimmy_api::topology::register(&server.state, endpoint).expect("second register");
+    assert_eq!(
+        oplog_len(&server.state),
+        after_first,
+        "an unchanged record must be silent, or an idle cluster appends forever"
+    );
+
+    // But a real change still lands — silence must come from the comparison,
+    // not from `register` having quietly become a no-op.
+    kimmy_api::topology::register(&server.state, "http://10.1.1.2:7878").expect("moved");
+    assert!(
+        oplog_len(&server.state) > after_first,
+        "a node that moved must advertise the new address"
+    );
+
+    let res = server.get("/v1/topology", Some(&server.root().await)).await;
+    assert_eq!(res.body["nodes"][0]["endpoint"], "http://10.1.1.2:7878");
+    assert_eq!(res.body["count"], 1, "moving is an update, not a second node");
+}
+
+/// How many entries the oplog holds, for tests whose subject is whether a
+/// write happened at all.
+fn oplog_len(state: &kimmy_api::SharedState) -> usize {
+    state.engine.read_oplog_from(kimmy_core::Hlc::ZERO, 10_000).expect("reading the oplog").len()
+}
+
 #[tokio::test]
 async fn a_registered_peer_is_reported_unknown_until_membership_sees_it() {
     // Address and liveness come from different places on purpose: the registry

@@ -830,14 +830,30 @@ merely untested but wrong; see the section below.
 mutation testing asked "which of these lines could I delete?" and the answer
 included seven public methods.
 
-**The server-side half of the pass was abandoned, and that is a debt.** The 90
-mutants in `kimmy-api`, `kimmy-storage` and `kimmy-auth` are unclassified: the
-run re-ran all three suites for every mutant at a parallelism that pushed each
-past its timeout, and produced 3 caught and 15 timeouts out of 47 before it was
-stopped. Those crates had full passes in M7 and M8 and their share of this diff
-is small, so it is not alarming — but the new code in them is branch-heavy and
-deserves it. One pass per crate with tests scoped to that crate closes it in
-about an hour; it is in [Deviations](deviations.md) so it does not get lost.
+**The server-side half of the pass was abandoned at the time, and was finished
+on 2026-08-14.** The 90 mutants split 76 `kimmy-api` / 12 `kimmy-storage` / 2
+`kimmy-auth`. The original run re-ran all three suites for every mutant at a
+parallelism that pushed each past its timeout — 3 caught and 15 timeouts out of
+47 before it was stopped. One pass per crate, scoped to that crate, on an idle
+machine: 31 minutes for the largest, **zero timeouts**.
+
+**It found three claims with nothing behind them**, which is the same yield as
+every other pass this project has run:
+
+- `InvalidateReason::as_str` could return `""` — the method that exists *so
+  that* renaming a variant cannot silently rename a value clients branch on.
+- `capabilities()` could return an empty list with every assertion still
+  passing, because the test compared the wire to the function that produced it
+  and then made a check that is vacuous on an empty list.
+- `register` documents itself as "silent when nothing changed" and nothing
+  tested it — the cluster harness structurally cannot, since it starts each
+  node once.
+
+**And it produced a distinction worth carrying**: "missed" means three
+different things — a real gap, a property covered only by an `#[ignore]`d
+harness test that no mutation run ever sees, and a killer that lives in another
+crate and is hidden by the per-crate scoping that makes these runs affordable.
+[Testing](testing.md) has the table.
 
 ### How to size the next thing after M10
 
@@ -987,7 +1003,7 @@ in [Deviations](deviations.md):
 | Keyword search is term overlap, not BM25; chunking counts characters, not tokens; no minimum score threshold | simplifications inside working features |
 | Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`), type conversion | outside M9 task 1's agreed list; variable binding needs an evaluation *scope*, not another operator |
 | No `$vectorSearch` pipeline stage; no mTLS | not planned |
-| **The M10 server-side mutation pass — `kimmy-api`'s 76 mutants are still unclassified** | narrowed 2026-08-14: `kimmy-auth` (2) and `kimmy-storage` (12) are done, and found `InvalidateReason::as_str` unpinned. Run `kimmy-api` on an **idle** machine — contention is what ruined it twice |
+| ~~The M10 mutation pass covered `kimmy-client` only~~ | **Closed 2026-08-14.** All 90 classified. Found three real gaps: `InvalidateReason::as_str` unpinned, `capabilities()` able to return an empty list with every assertion still passing, and `register`'s "silent when unchanged" claim tested by nothing |
 | ~~The client's `retry: wait` path has no test that reaches it~~ | **Closed 2026-08-14.** The test found the branch was *wrong*: `wait` failed over instead of waiting, so it behaved as `elsewhere` with a delay. Fixed, 9/9 mutants caught |
 | A single write costs ~2× as much through the daemon as at the engine — not protocol overhead, not encoding | found by M10 task 7; **recorded as an open question rather than explained** |
 | Sharding | **deferred by decision** until there is operational experience |
