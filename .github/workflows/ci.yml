@@ -239,6 +239,10 @@ jobs:
         run: |
           # The config validator is the cheapest end-to-end proof that the
           # binary is present, runnable, and correctly wired in the image.
+          # Both secrets are supplied because an authenticated node refuses to
+          # start -- and `check-config` refuses to bless -- a configuration
+          # with no signing key, single node or cluster.
           docker run --rm \
             -e KIMMY_ROOT_PASSWORD=ci-smoke-test \
+            -e KIMMY_JWT_SECRET=ci-smoke-test-signing-secret \
             kimmydb:ci check-config

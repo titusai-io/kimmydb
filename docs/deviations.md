@@ -17,6 +17,55 @@ Status meanings:
 
 ---
 
+## 🟢 An authenticated node without a JWT secret signed tokens with a source-visible constant
+
+**Was.** `Config::validate` required `auth.jwt_secret` only under
+`cluster.enabled` (`crates/kimmyd/src/config.rs`). A **single** authenticated
+node started without one was accepted, and `node::run` then fell back to a
+literal signing key — `"insecure-no-auth-unused-signing-key"` — that ships in
+the source. The comment above the fallback claimed it was reached only with auth
+off; the validation did not hold that claim, and nothing tested the single-node
+case.
+
+**Why it mattered.** The fallback is a public constant, so anyone could forge a
+`root` token (HS256 over `{sub, iat, exp, grants, tv}`) and skip login
+entirely — and `docker run -p 7878:7878` binds `0.0.0.0`, so the node is
+reachable from the LAN. The documented run paths all set `KIMMY_JWT_SECRET`,
+which is the only reason this stayed hidden. **Confirmed on a real node before
+the fix**: a hand-forged token returned `200` from `/v1/auth/whoami` as `root`
+with `[{db:*, collection:*, actions:[admin]}]` and created a collection; both
+`whoami` and the write became `401` once a real secret was set.
+
+**Now.** The JWT-secret requirement moved out of the `cluster.enabled` block: an
+auth-on node with no configured secret is **refused at startup**, single node or
+not, with an error that names the hazard. The constant is reachable only through
+`node::signing_key`, which returns the throwaway key for the auth-off path and
+an **error** otherwise — a second enforcement point rather than an assertion,
+because `debug_assert!` is compiled out of the `--release` build the Dockerfile
+ships. The length rule moved to `Config::validate` too (sharing
+`kimmy_auth::MIN_SECRET_LEN`), so `check-config` refuses what the server refuses
+instead of blessing a configuration that dies after bootstrapping the superuser.
+Covered by `auth_requires_a_jwt_secret` and
+`auth_on_with_no_secret_refuses_rather_than_signing_with_the_constant`, and
+listed in [Operations](operations.md#refused-at-startup).
+
+**The first attempt at the second half was itself the register's recurring
+mistake**, caught in review before merge: it was a `debug_assert`, with a comment
+claiming it meant a future weakening of the validation "trips a test". It could
+not — assertions are compiled out of release, and no test drove that path at all.
+A claim about a mechanism, with no mechanism.
+
+**Alternative considered:** generating a random secret when one is unset.
+Rejected — it would invalidate every live token on restart and give each node of
+a cluster a different key, turning one silent failure into two. Requiring the
+operator to supply the key is the same shape as the existing root-password and
+`cluster_secret` refusals.
+
+**The lesson is the register's recurring one:** a claim in a comment that the
+code does not enforce. The question that finds these is "what fails if this stops
+being true?" — here, nothing did, which is why a forged-token drive was the check
+that mattered.
+
 ## 🟢 The reachability check was sized on a fixture whose shape did not generalize
 
 **Was.** PR #81 added a build-time check that a finished HNSW graph can find

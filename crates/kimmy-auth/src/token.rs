@@ -14,6 +14,14 @@ use serde::{Deserialize, Serialize};
 use crate::error::{AuthError, Result};
 use crate::rbac::{Grant, Principal};
 
+/// Shortest signing secret `TokenIssuer` will accept.
+///
+/// A short secret makes offline brute force cheap, and the whole cluster shares
+/// this one value. Public so a caller can refuse a bad secret *before* building
+/// an issuer — `kimmyd` checks it while validating configuration, so
+/// `check-config` answers the same question the server would.
+pub const MIN_SECRET_LEN: usize = 16;
+
 /// The claims KimmyDB puts in a token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claims {
@@ -50,9 +58,6 @@ pub struct TokenIssuer {
 
 impl TokenIssuer {
     pub fn new(secret: &str, ttl_secs: u64) -> Result<Self> {
-        // A short secret makes offline brute force cheap, and the whole cluster
-        // shares this one value.
-        const MIN_SECRET_LEN: usize = 16;
         if secret.len() < MIN_SECRET_LEN {
             return Err(AuthError::WeakSecret { min: MIN_SECRET_LEN });
         }

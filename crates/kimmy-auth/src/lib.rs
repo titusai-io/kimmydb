@@ -18,5 +18,5 @@ pub mod users;
 
 pub use error::{AuthError, Result};
 pub use rbac::{Action, Grant, Principal, Role};
-pub use token::{Claims, TokenIssuer};
+pub use token::{Claims, MIN_SECRET_LEN, TokenIssuer};
 pub use users::{SYSTEM_DB, USERS_COLLECTION, User, UserStore};
