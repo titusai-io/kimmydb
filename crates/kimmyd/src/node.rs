@@ -9,10 +9,41 @@ use kimmy_auth::{TokenIssuer, UserStore};
 use kimmy_storage::{Engine, RetentionPolicy};
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{AuthConfig, Config};
 
 /// Filename of the redb database inside the data directory.
 const DATABASE_FILE: &str = "kimmy.redb";
+
+/// Signing key used when authentication is disabled.
+///
+/// Named rather than inline so it is greppable: with auth off no token is ever
+/// verified, and this value must never sign one that is. See `run`.
+const THROWAWAY_SIGNING_KEY: &str = "insecure-no-auth-unused-signing-key";
+
+/// The key tokens are signed with, or a refusal.
+///
+/// Split out of `run` so the decision can be tested without starting a server:
+/// the case that matters is the one where the node must *not* start, and a test
+/// that reached it through `run` would otherwise have to be a test that waits
+/// for a server to fail to be born.
+///
+/// `Config::validate` already refuses auth-on-with-no-secret, so the error here
+/// is unreachable through the CLI. It is a refusal rather than a `debug_assert`
+/// because assertions are compiled out of the release build that ships, and
+/// this is the line where a constant from the source would become a signing
+/// key — anyone could then forge a token.
+fn signing_key(auth: &AuthConfig) -> Result<String> {
+    match &auth.jwt_secret {
+        Some(secret) => Ok(secret.clone()),
+        // With auth off no token is ever verified, so a throwaway key is
+        // correct rather than a placeholder that might be mistaken for a secret.
+        None if auth.insecure_no_auth => Ok(THROWAWAY_SIGNING_KEY.to_string()),
+        None => anyhow::bail!(
+            "authentication is enabled but no auth.jwt_secret is configured; refusing to sign \
+             tokens with a constant compiled into the binary. Set KIMMY_JWT_SECRET."
+        ),
+    }
+}
 
 /// How often the certificate files are checked for a change.
 ///
@@ -44,22 +75,7 @@ pub async fn run(config: Config) -> Result<()> {
         bootstrap_users(&engine, &config)?;
     }
 
-    // With auth off, no token is ever verified, so a throwaway signing key is
-    // correct rather than a placeholder that might be mistaken for a secret.
-    // With auth on the fallback must never be reached: it is a constant that
-    // ships in the source, so signing a real token with it would let anyone
-    // forge one. `Config::validate` guarantees a configured secret whenever
-    // auth is on; the assertion pins that guarantee to this line so a future
-    // change to the validation cannot silently re-open the hole.
-    debug_assert!(
-        config.auth.insecure_no_auth || config.auth.jwt_secret.is_some(),
-        "auth is enabled but no jwt_secret is set; Config::validate should have refused this"
-    );
-    let secret = config
-        .auth
-        .jwt_secret
-        .clone()
-        .unwrap_or_else(|| "insecure-no-auth-unused-signing-key".to_string());
+    let secret = signing_key(&config.auth)?;
     let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
 
@@ -728,6 +744,41 @@ mod tests {
         let first = Engine::open(&path).unwrap().node_id();
         let second = Engine::open(&path).unwrap().node_id();
         assert_eq!(first, second, "identity must survive a restart");
+    }
+
+    #[test]
+    fn auth_on_with_no_secret_refuses_rather_than_signing_with_the_constant() {
+        // The second half of the defence. `Config::validate` refuses this
+        // combination at the CLI; this is the line where the constant would
+        // otherwise become a signing key, and a forged token follows from that.
+        let mut auth = AuthConfig {
+            root_password: Some("hunter2".into()),
+            jwt_secret: None,
+            insecure_no_auth: false,
+            ..Default::default()
+        };
+
+        let err = signing_key(&auth).unwrap_err().to_string();
+        assert!(err.contains("jwt_secret"), "unhelpful error: {err}");
+
+        // With auth off the throwaway key is correct: nothing verifies a token.
+        auth.insecure_no_auth = true;
+        assert_eq!(signing_key(&auth).unwrap(), THROWAWAY_SIGNING_KEY);
+
+        // A configured secret always wins, so the throwaway can never displace
+        // an operator's key.
+        auth.jwt_secret = Some("a-signing-key-of-adequate-length".into());
+        assert_eq!(signing_key(&auth).unwrap(), "a-signing-key-of-adequate-length");
+        auth.insecure_no_auth = false;
+        assert_eq!(signing_key(&auth).unwrap(), "a-signing-key-of-adequate-length");
+    }
+
+    #[test]
+    fn the_throwaway_key_satisfies_the_token_issuer() {
+        // It is only ever used with auth off, but `TokenIssuer::new` rejects a
+        // short secret — so shortening this constant would stop an auth-off
+        // node from starting at all.
+        TokenIssuer::new(THROWAWAY_SIGNING_KEY, 3600).expect("throwaway key must be accepted");
     }
 
     /// A self-signed certificate for `localhost`, written to a temp directory.

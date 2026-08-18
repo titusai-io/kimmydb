@@ -450,13 +450,27 @@ impl Config {
         // must be set identically on every node, or a token issued by one is
         // rejected by the next; catching it here avoids an intermittent 401 that
         // only shows up when a request lands on the "wrong" node.
-        if !self.auth.insecure_no_auth && self.auth.jwt_secret.is_none() {
-            anyhow::bail!(
-                "authentication is enabled but no auth.jwt_secret is configured; the server \
-                 would sign tokens with a constant compiled into the binary, so anyone could \
-                 forge a token. Set KIMMY_JWT_SECRET (>=16 bytes), and set it identically on \
-                 every node of a cluster."
-            );
+        if !self.auth.insecure_no_auth {
+            let min = kimmy_auth::MIN_SECRET_LEN;
+            match &self.auth.jwt_secret {
+                None => anyhow::bail!(
+                    "authentication is enabled but no auth.jwt_secret is configured; the server \
+                     would sign tokens with a constant compiled into the binary, so anyone \
+                     could forge a token. Set KIMMY_JWT_SECRET ({min} bytes or more), and set \
+                     it identically on every node of a cluster."
+                ),
+                // Checked here as well as in `TokenIssuer::new` so that
+                // `check-config` gives the same answer the server would. An
+                // entrypoint check that blesses a configuration the node then
+                // refuses is worse than no check.
+                Some(secret) if secret.len() < min => anyhow::bail!(
+                    "auth.jwt_secret is {} bytes; {min} or more are required, because the whole \
+                     cluster shares this one value and a short one makes offline brute force \
+                     cheap.",
+                    secret.len()
+                ),
+                Some(_) => {}
+            }
         }
 
         if self.cluster.enabled {
@@ -741,6 +755,17 @@ mod tests {
         cfg.auth.jwt_secret = Some("a-signing-key-of-adequate-length".into());
         cfg.validate().unwrap();
 
+        // The length rule is enforced where it is advertised, so `check-config`
+        // refuses what the server would refuse rather than blessing a
+        // configuration that dies after bootstrapping the superuser.
+        cfg.auth.jwt_secret = Some("short".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("5 bytes"), "the error should name the length: {err}");
+        assert!(
+            kimmy_auth::TokenIssuer::new("short", 3600).is_err(),
+            "validate must agree with the issuer about what is too short"
+        );
+
         // With auth off there is no token to forge, so no secret is required —
         // this is what keeps loopback development a single flag.
         let mut off = Config::default();
@@ -809,7 +834,6 @@ mod tests {
         cfg.cluster.enabled = true;
         cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
         cfg.cluster.cluster_secret = Some("shared".into());
-        cfg.auth.jwt_secret = Some("signing-key".into());
         cfg.validate().unwrap();
 
         cfg.cluster.sync_interval_secs = 0;

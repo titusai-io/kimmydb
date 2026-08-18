@@ -38,11 +38,22 @@ with `[{db:*, collection:*, actions:[admin]}]` and created a collection; both
 
 **Now.** The JWT-secret requirement moved out of the `cluster.enabled` block: an
 auth-on node with no configured secret is **refused at startup**, single node or
-not, with an error that names the hazard. `node::run` keeps the fallback for the
-auth-off path only and carries a `debug_assert` that pins the invariant to the
-line, so a future weakening of the validation trips a test rather than silently
-re-opening the hole. Covered by `auth_requires_a_jwt_secret` in `config.rs`, and
+not, with an error that names the hazard. The constant is reachable only through
+`node::signing_key`, which returns the throwaway key for the auth-off path and
+an **error** otherwise — a second enforcement point rather than an assertion,
+because `debug_assert!` is compiled out of the `--release` build the Dockerfile
+ships. The length rule moved to `Config::validate` too (sharing
+`kimmy_auth::MIN_SECRET_LEN`), so `check-config` refuses what the server refuses
+instead of blessing a configuration that dies after bootstrapping the superuser.
+Covered by `auth_requires_a_jwt_secret` and
+`auth_on_with_no_secret_refuses_rather_than_signing_with_the_constant`, and
 listed in [Operations](operations.md#refused-at-startup).
+
+**The first attempt at the second half was itself the register's recurring
+mistake**, caught in review before merge: it was a `debug_assert`, with a comment
+claiming it meant a future weakening of the validation "trips a test". It could
+not — assertions are compiled out of release, and no test drove that path at all.
+A claim about a mechanism, with no mechanism.
 
 **Alternative considered:** generating a random secret when one is unset.
 Rejected — it would invalidate every live token on restart and give each node of

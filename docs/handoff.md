@@ -30,13 +30,34 @@ error naming the hazard; with a real secret the same forged token is `401` and a
 real login still works. The forge script is the kind of check this project keeps
 learning it needs — see the boxed note and failure-mode 1 below.
 
-**The fix, in three places.** `Config::validate` now refuses an auth-on node with
-no `jwt_secret` regardless of clustering (`crates/kimmyd/src/config.rs`);
-`node::run` keeps the fallback for the auth-off path only and carries a
-`debug_assert` pinning that invariant to the line; and the requirement is
-recorded in [Operations](operations.md#refused-at-startup) and as a 🟢 in
-[Deviations](deviations.md). Test: `auth_requires_a_jwt_secret`. **The register
-still holds zero 🔴.**
+**The fix.** `Config::validate` refuses an auth-on node with no `jwt_secret`
+regardless of clustering, and refuses one shorter than
+`kimmy_auth::MIN_SECRET_LEN` — so `check-config` now answers what the server
+would, instead of blessing a configuration that dies after bootstrapping the
+superuser. The constant is reachable only through `node::signing_key`, which
+errors on the auth-on path. Tests: `auth_requires_a_jwt_secret` and
+`auth_on_with_no_secret_refuses_rather_than_signing_with_the_constant`.
+**The register still holds zero 🔴.**
+
+**Two things the review of this branch caught, both worth carrying:**
+
+- **The first version of the second enforcement point was a `debug_assert`,**
+  with a comment claiming it would trip a test if the validation were later
+  weakened. It would not: `[profile.release]` does not set `debug-assertions`
+  and the Dockerfile builds `--release`, so it was compiled out of the only
+  artefact that ships — and no test drove that path in debug either. **A claim
+  about a mechanism, with no mechanism, inside the very fix for a claim about a
+  mechanism with no mechanism.** It is a real refusal now.
+- **A stricter validation breaks its callers, and they are not all in
+  `cargo test --workspace`.** The image smoke test in `ci.yml` ran
+  `check-config` with a root password and no signing key, so this branch would
+  have failed CI; it now passes both. Reproduced locally before fixing.
+  `kimmy.example.toml` keeps both secrets commented — symmetric with
+  `root_password`, and a fake key in an example is a key someone pastes into
+  production — so `check-config` on it needs both env vars, which
+  [Testing](testing.md) now says. The client, conformance, example and bench
+  harnesses were each checked: all five already write a `jwt_secret`, so none
+  broke.
 
 **One doc drift spotted in passing, not yet fixed** (out of this branch's scope,
 cheap for the next one): `README.md`'s status line still says *"Clustering is not

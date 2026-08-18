@@ -137,7 +137,7 @@ The settings worth knowing before you deploy:
 | Setting | Env var | Why it matters |
 |---|---|---|
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | Required unless `--insecure-no-auth`. Bootstrap superuser, created on first start only. |
-| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | **Must be identical on every node.** Otherwise a token issued by one node is rejected by the next. |
+| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | **Required whenever auth is on**, single node or cluster — the node refuses to start without one rather than sign tokens with a built-in constant. 16 bytes minimum, and **identical on every node**, or a token issued by one node is rejected by the next. |
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |
 | `storage.tombstone_retention_secs` | — | Must exceed your worst tolerable partition, or deleted documents resurrect. See below. |

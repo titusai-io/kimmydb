@@ -78,10 +78,10 @@ runtime confusion:
 |---|---|
 | `insecure_no_auth` + non-loopback bind | Would expose an unauthenticated database to the network |
 | No root password, no `insecure_no_auth` | Nothing could authenticate |
-| Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster |
+| Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster — and in a cluster the *same* value everywhere, or a token issued by one node is rejected by the next |
+| A `jwt_secret` shorter than 16 bytes | The whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
-| `cluster.enabled` with no `jwt_secret` | Tokens issued by one node would be rejected by the next |
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
 | `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |

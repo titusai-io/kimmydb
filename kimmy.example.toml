@@ -178,8 +178,14 @@ root_user = "root"
 # Prefer KIMMY_ROOT_PASSWORD over writing this down.
 # root_password = "change-me"
 
-# Signing key for JWTs. In a cluster every node must use the *same* value, or a
-# token issued by one node will be rejected by the next node a request reaches.
+# Signing key for JWTs. **Required whenever authentication is on** — a single
+# node too, not just a cluster: without one the server would sign tokens with a
+# constant compiled into the binary, so anyone could forge one. It refuses to
+# start instead. 16 bytes minimum. In a cluster every node must use the *same*
+# value, or a token issued by one node will be rejected by the next node a
+# request reaches. Prefer KIMMY_JWT_SECRET over writing this down, which is why
+# it stays commented here — `check-config` on this file needs both it and
+# KIMMY_ROOT_PASSWORD in the environment.
 # jwt_secret = "generate-me-with-openssl-rand-base64-32"
 
 token_ttl_secs = 3600

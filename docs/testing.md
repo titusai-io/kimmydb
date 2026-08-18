@@ -735,7 +735,7 @@ manually and are recorded so they can be repeated:
 | Per-username limiting spread across addresses | ✅ the third address trying the same name was refused; a different name from a fourth was not |
 | A correct password while the address is over budget | ✅ `429` — the check necessarily precedes authentication ([Deviations](deviations.md)) |
 | Rate-limit config errors | ✅ zero window, zero `max_tracked_keys`, empty `trusted_proxy_header`, and a typo'd key all refused at startup |
-| `kimmy.example.toml` still parses | ✅ `check-config` valid — `deny_unknown_fields` makes this a real check |
+| `kimmy.example.toml` still parses | ✅ `check-config` valid with `KIMMY_ROOT_PASSWORD` **and** `KIMMY_JWT_SECRET` set — both secrets stay commented in the file, and auth-on now requires the signing key. `deny_unknown_fields` makes this a real check |
 | `--insecure-no-auth` | ✅ limiter off; no login to protect |
 | HTTPS with a verified certificate | ✅ TLS 1.3, `ssl_verify_result=0`, ALPN `h2` |
 | A client that does not trust the certificate | ✅ refused (curl exit 60) |
