@@ -46,6 +46,15 @@ pub async fn run(config: Config) -> Result<()> {
 
     // With auth off, no token is ever verified, so a throwaway signing key is
     // correct rather than a placeholder that might be mistaken for a secret.
+    // With auth on the fallback must never be reached: it is a constant that
+    // ships in the source, so signing a real token with it would let anyone
+    // forge one. `Config::validate` guarantees a configured secret whenever
+    // auth is on; the assertion pins that guarantee to this line so a future
+    // change to the validation cannot silently re-open the hole.
+    debug_assert!(
+        config.auth.insecure_no_auth || config.auth.jwt_secret.is_some(),
+        "auth is enabled but no jwt_secret is set; Config::validate should have refused this"
+    );
     let secret = config
         .auth
         .jwt_secret

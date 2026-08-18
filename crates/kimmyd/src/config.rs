@@ -441,6 +441,24 @@ impl Config {
             );
         }
 
+        // A node that verifies tokens must be given the key it signs them with.
+        // Without one the server would otherwise fall back to a constant that
+        // ships in the source, so anyone could forge a root token and every
+        // deployment would share the same signing secret — a single-node hole,
+        // not just a cluster one, which is why this is checked whenever auth is
+        // on rather than only under `cluster.enabled`. In a cluster the same key
+        // must be set identically on every node, or a token issued by one is
+        // rejected by the next; catching it here avoids an intermittent 401 that
+        // only shows up when a request lands on the "wrong" node.
+        if !self.auth.insecure_no_auth && self.auth.jwt_secret.is_none() {
+            anyhow::bail!(
+                "authentication is enabled but no auth.jwt_secret is configured; the server \
+                 would sign tokens with a constant compiled into the binary, so anyone could \
+                 forge a token. Set KIMMY_JWT_SECRET (>=16 bytes), and set it identically on \
+                 every node of a cluster."
+            );
+        }
+
         if self.cluster.enabled {
             if self.cluster.seeds.is_empty() {
                 anyhow::bail!(
@@ -453,16 +471,6 @@ impl Config {
                 anyhow::bail!(
                     "cluster.enabled is set but no cluster_secret is configured; peers would \
                      accept replication traffic from anyone. Set KIMMY_CLUSTER_SECRET."
-                );
-            }
-            // Tokens must validate on every node, so the signing key cannot be
-            // per-node. Catching this here avoids a confusing intermittent 401
-            // that only shows up when a request lands on the "wrong" node.
-            if !self.auth.insecure_no_auth && self.auth.jwt_secret.is_none() {
-                anyhow::bail!(
-                    "cluster.enabled is set but no auth.jwt_secret is configured. Every node \
-                     must sign tokens with the same key or tokens issued by one node will be \
-                     rejected by the others. Set KIMMY_JWT_SECRET identically on all nodes."
                 );
             }
         }
@@ -653,7 +661,13 @@ mod tests {
 
     fn valid() -> Config {
         Config {
-            auth: AuthConfig { root_password: Some("hunter2".into()), ..Default::default() },
+            auth: AuthConfig {
+                root_password: Some("hunter2".into()),
+                // Auth is on by default, and an auth-on node must be given a
+                // signing key or it is refused — see `auth_requires_a_jwt_secret`.
+                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
+                ..Default::default()
+            },
             ..Default::default()
         }
     }
@@ -708,11 +722,32 @@ mod tests {
         assert!(err.contains("cluster_secret"), "unhelpful error: {err}");
 
         cfg.cluster.cluster_secret = Some("shared".into());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn auth_requires_a_jwt_secret() {
+        // Without a configured secret an auth-on node falls back to a constant
+        // compiled into the binary, so anyone could forge a root token. The
+        // requirement holds for a single node, not just a cluster — a fresh
+        // `docker run` on a routable address is exactly where it bites.
+        let mut cfg = valid();
+        cfg.cluster.enabled = false;
+        cfg.auth.jwt_secret = None;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("jwt_secret"), "unhelpful error: {err}");
+        assert!(err.contains("forge"), "the error should say what breaks: {err}");
 
-        cfg.auth.jwt_secret = Some("signing-key".into());
+        cfg.auth.jwt_secret = Some("a-signing-key-of-adequate-length".into());
         cfg.validate().unwrap();
+
+        // With auth off there is no token to forge, so no secret is required —
+        // this is what keeps loopback development a single flag.
+        let mut off = Config::default();
+        off.auth.insecure_no_auth = true;
+        off.auth.jwt_secret = None;
+        off.server.bind = "127.0.0.1:7878".parse().unwrap();
+        off.validate().unwrap();
     }
 
     #[test]

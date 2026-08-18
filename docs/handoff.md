@@ -6,10 +6,49 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-15 — **nothing open, and the direction has changed**
+## As of 2026-08-17 — **a JWT-secret hole is fixed; one PR is open**
 
-**Everything is merged and `main` is clean. There is no open PR and no branch in
-flight.** M0–M10 are complete; #78–#83 worked the carried debt down afterwards.
+**Branch `jwt-secret-required-when-auth-is-on` has a PR open and is waiting on
+review — do not start something new on top of it, and do not merge it.** It is
+the first branch of the local-usability direction, and it came out of the very
+first step that direction asks for: running the documented first-start path and
+asking a running node what it actually did.
+
+**What it fixes.** An authenticated node started **without** `KIMMY_JWT_SECRET`
+did not refuse to start. `Config::validate` required the secret only under
+`cluster.enabled`, so a single node fell through to a fallback signing key that
+**ships in the source** (`node.rs`, `"insecure-no-auth-unused-signing-key"`).
+The comment above that fallback said it was reached only with auth off; the
+validation did not hold the claim, and nothing tested the single-node case. A
+`docker run -p 7878:7878` binds `0.0.0.0`, so the node is on the LAN — and anyone
+could forge a `root` token from the public constant and skip login.
+
+**Proven on a real node, both directions.** Before the fix, a hand-forged HS256
+token (no login) returned `200` from `/v1/auth/whoami` as `root` with full admin
+grants and created a collection. After: with no secret the node exits `1` with an
+error naming the hazard; with a real secret the same forged token is `401` and a
+real login still works. The forge script is the kind of check this project keeps
+learning it needs — see the boxed note and failure-mode 1 below.
+
+**The fix, in three places.** `Config::validate` now refuses an auth-on node with
+no `jwt_secret` regardless of clustering (`crates/kimmyd/src/config.rs`);
+`node::run` keeps the fallback for the auth-off path only and carries a
+`debug_assert` pinning that invariant to the line; and the requirement is
+recorded in [Operations](operations.md#refused-at-startup) and as a 🟢 in
+[Deviations](deviations.md). Test: `auth_requires_a_jwt_secret`. **The register
+still holds zero 🔴.**
+
+**One doc drift spotted in passing, not yet fixed** (out of this branch's scope,
+cheap for the next one): `README.md`'s status line still says *"Clustering is not
+built yet"* — it has been built since M4, and `docker-compose.yml` is a
+three-node cluster.
+
+---
+
+## As of 2026-08-15 — **the direction has changed** (still current)
+
+**M0–M10 are complete; #78–#83 worked the carried debt down afterwards.** The one
+PR above is the only thing in flight; everything else is merged and on `main`.
 
 > ### ⚠️ Read this before the roadmap
 >
@@ -449,6 +488,7 @@ set. Here clustering is a *consumer* of the log, not its cause.
 | `recall-test-does-not-depend-on-core-count` | ✅ Merged as #81. Badly named — it is the HNSW build fix. An index build could orphan 10–24% of a collection |
 | `m11-write-gap` | ✅ Merged as #82. M11 task 1: the daemon spends two commits per insert where the engine spends one. `kimmy_commits` on `/metrics`, and the tests that hold both numbers |
 | `hnsw-reachability-does-not-depend-on-collection-size` | ✅ Merged as #83. #81's threshold, re-sized. It counted budget-limited searches as lost data, so at a realistic embedding width every large build was rebuilt twice and reported as incomplete (ADR-061). A CI job added here was removed again before merge — see the note at the top of this file |
+| `jwt-secret-required-when-auth-is-on` | 🔵 **PR open, awaiting review.** An auth-on node with no `KIMMY_JWT_SECRET` fell back to a signing key that ships in the source, so a `root` token could be forged with no login. Now refused at startup for a single node, not just a cluster. Confirmed by forging a token against a real node before and after the fix |
 
 ### The M8 and M9 boards — all seventeen done
 
