@@ -99,8 +99,8 @@ does not have.
 
 ## A cluster is not one version
 
-Nodes are upgraded one at a time, and a client that round-robins may reach an
-older node immediately after a newer one. Three consequences, all of which
+Nodes are upgraded one at a time, and a client that fails over between nodes may
+reach an older node immediately after a newer one. Three consequences, all of which
 follow from the rules above rather than adding to them:
 
 - **Ask each node.** `/v1/version` describes the node that answered it, and the

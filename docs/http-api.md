@@ -483,10 +483,16 @@ curl localhost:7878/v1/topology -H "$A"
   "count": 2 }
 ```
 
-**Every node accepts writes**, so client-side selection is round-robin plus
-retry elsewhere. There is no primary to find and none of the machinery a driver
-needs to find one — which is the one thing this is straightforwardly better at
-than a replica-set driver, rather than merely different.
+**Every node accepts writes**, so client-side selection is sticky plus retry
+elsewhere: a client keeps using the node that last answered and fails over only
+when one stops answering. There is no primary to find and none of the machinery
+a driver needs to find one — which is the one thing this is straightforwardly
+better at than a replica-set driver, rather than merely different.
+
+Sticky rather than round-robin is a deliberate choice, and it is worth knowing
+which one you have: it keeps a connection and a page cache warm, and it also
+means one node serves everything until it fails rather than the load being
+spread. This endpoint gives a client somewhere to *go*, not a rotation to follow.
 
 Two sources, deliberately ([ADR-060](decisions.md)):
 
@@ -534,8 +540,8 @@ curl localhost:7878/v1/version
 **Branch on `capabilities`, not on `version`.** A version number only answers
 "can I use this" if the client also carries a table mapping versions to
 features — the table this endpoint replaces. Nodes are upgraded one at a time,
-so a client round-robining across a cluster can reach an older node right after
-a newer one; the answer describes *the node that answered* and is worth caching
+so a client that fails over between nodes can reach an older node right after a
+newer one; the answer describes *the node that answered* and is worth caching
 per node.
 
 `local-embeddings` appears only on a build compiled with that feature, which is

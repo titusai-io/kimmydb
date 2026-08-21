@@ -2,9 +2,9 @@
 //!
 //! # Why a capability list rather than a version number
 //!
-//! A client is handed one address and will, once task 5 lands, round-robin
-//! across a cluster. During a rolling upgrade the node that answers the next
-//! request may be older than the one that answered the last, so the question a
+//! A client is handed one or more addresses and fails over between them.
+//! During a rolling upgrade the node that answers the next request may be
+//! older than the one that answered the last, so the question a
 //! client actually has is not "what version is this" but **"does this node
 //! have the thing I am about to use"**. A number answers that only if the
 //! client also carries a table mapping versions to features, which is the
@@ -126,8 +126,8 @@ pub async fn version(State(state): State<SharedState>) -> impl IntoResponse {
     Json(json!({
         "protocol": PROTOCOL,
         "version": env!("CARGO_PKG_VERSION"),
-        // The node that answered. During a rolling upgrade a client may be
-        // round-robining across builds, and this is what tells it which one
+        // The node that answered. During a rolling upgrade a client that fails
+        // over lands on different builds, and this is what tells it which one
         // this answer came from.
         "node": state.engine.node_id().to_string(),
         "capabilities": capabilities(),

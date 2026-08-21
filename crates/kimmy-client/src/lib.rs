@@ -36,9 +36,12 @@
 //!   refreshes before expiry using `expiresIn` rather than by decoding a token
 //!   it is told to treat as opaque. Built with a token instead, it uses it
 //!   until the server stops accepting it and then says so.
-//! - **Fails over between nodes.** Every node accepts writes, so selection is
-//!   round-robin plus retry — no primary to find. With `discover_nodes`, the
-//!   node list comes from `/v1/topology`.
+//! - **Fails over between nodes.** Every node accepts writes, so there is no
+//!   primary to find. Selection is *sticky*, not round-robin: the node that
+//!   answers is promoted to the front of the list and keeps serving until it
+//!   fails. Seed more than one address with `endpoint` so a client can still
+//!   start when the first is down, and with `discover_nodes` the rest of the
+//!   list comes from `/v1/topology`.
 //! - **Retries only what is safe to retry.** A read is repeated on another node
 //!   when the failure says `elsewhere`. **A write is not**, unless the caller
 //!   says it is idempotent: an insert that failed after the commit but before

@@ -23,8 +23,9 @@
 //! It carries no server state — no cursor id, no session, nothing a particular
 //! node holds. Two nodes that hold the same document agree on its key, because
 //! the encoding is a pure function of the `_id`. So a page fetched from one
-//! node continues correctly on another, which matters because clients
-//! round-robin across a leaderless cluster ([ADR-055](../../../docs/decisions.md)).
+//! node continues correctly on another, which matters because a client fails
+//! over between nodes and may finish a walk somewhere it did not start
+//! ([ADR-055](../../../docs/decisions.md)).
 //! Change-stream resume tokens already have this property and it has been
 //! verified on a real cluster; this inherits it by construction rather than by
 //! arrangement.

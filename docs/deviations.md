@@ -1064,8 +1064,8 @@ that answered, and a **capability list**. [ADR-058](decisions.md) has the
 reasoning, including why date-versioned requests were rejected.
 
 **Capabilities rather than a version number**, because nodes are upgraded one
-at a time and a round-robin client can reach an older node right after a newer
-one. A number answers "can I use this feature" only if the client also carries
+at a time and a client that fails over between nodes can reach an older node
+right after a newer one. A number answers "can I use this feature" only if the client also carries
 a table mapping versions to features — the table this replaces, and the table
 that goes stale in every client independently. `Capability` is an enum, checked
 against the specification like the error codes.
@@ -1205,9 +1205,9 @@ It was argued from the design — a token is a pure function of the `_id`, so an
 node computes the same bound — and inherited from change-stream resume tokens,
 which *had* been verified on a cluster. A cluster-harness test now walks a
 collection changing node on every page and requires the walk to see every
-document exactly once, in order. The protocol tells clients to round-robin
-([ADR-060](decisions.md)); paging that broke when they did would be a data bug
-reached by following the protocol's own advice.
+document exactly once, in order. The protocol tells clients to fail over between
+nodes ([ADR-060](decisions.md)); paging that broke when they did would be a data
+bug reached by following the protocol's own advice.
 
 **Two silent behaviours were specified nowhere**, and both are the kind a
 client author discovers in production:
