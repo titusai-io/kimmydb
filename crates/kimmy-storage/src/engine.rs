@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use kimmy_core::{
-    CollectionId, Error as CoreError, Hlc, HlcClock, NodeId, OpKind, OplogEntry, Stamp,
+    CollectionId, Error as CoreError, Hlc, HlcClock, NodeId, OpKind, OplogEntry, Stamp, vector_meta,
 };
 use parking_lot::Mutex;
 use redb::{Database, ReadableDatabase, ReadableTable};
@@ -825,33 +825,64 @@ impl Engine {
             Err(e) => return Err(e),
         };
 
+        // A vector-enabled collection keeps its vectors in a shadow collection,
+        // which is an ordinary collection with its own id and so is not carried
+        // away by removing this one. Left behind, its chunks outlive the
+        // documents they describe — and because the shadow's name is derived
+        // from this one's, a collection later created with the same name adopts
+        // them. They are searchable: a document from the dropped collection
+        // came back from `vector_search` scoring 1.0, above the new
+        // collection's own documents, with an `_id` that resolves to nothing.
+        //
+        // Removed in the same transaction rather than by a second call, so
+        // there is no instant in which the parent is gone and its vectors are
+        // still answering queries.
+        let shadow = (!vector_meta::is_shadow(name))
+            .then(|| self.get_collection(db, &vector_meta::shadow_name(name)).ok())
+            .flatten();
+
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
         let txn = self.begin_write()?;
         {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
+            if let Some(shadow) = &shadow {
+                collections.remove((db, shadow.name.as_str()))?;
+            }
         }
         {
             // Range-retain rather than collecting keys: a large collection
             // should not have to fit its key set in memory to be dropped.
             let mut docs = txn.open_table(tables::DOCS)?;
             docs.retain_in(doc_range(meta.id), |_, _| false)?;
+            if let Some(shadow) = &shadow {
+                docs.retain_in(doc_range(shadow.id), |_, _| false)?;
+            }
         }
         {
             let mut indexes = txn.open_table(tables::INDEX_ENTRIES)?;
             indexes.retain_in(index_range(meta.id), |_, _| false)?;
+            if let Some(shadow) = &shadow {
+                indexes.retain_in(index_range(shadow.id), |_, _| false)?;
+            }
         }
         {
             // Same transaction as the removal, so there is no instant in which
             // the collection is gone with no record that it was dropped.
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
-            let newer = match dropped.get(meta.id.0)? {
-                Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
-                None => true,
-            };
-            if newer {
-                dropped.insert(meta.id.0, codec::oplog_key(&stamp).as_slice())?;
+            // The shadow needs its own tombstone for the same reason the parent
+            // does: without one, a peer still replaying pre-drop vector writes
+            // would recreate it and repopulate the chunks this just removed.
+            let ids = [Some(meta.id), shadow.as_ref().map(|s| s.id)];
+            for id in ids.into_iter().flatten() {
+                let newer = match dropped.get(id.0)? {
+                    Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
+                    None => true,
+                };
+                if newer {
+                    dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
+                }
             }
         }
 
@@ -873,7 +904,11 @@ impl Engine {
             self.publish(vec![entry]);
         }
 
-        info!(db, collection = name, "dropped collection");
+        if let Some(shadow) = &shadow {
+            info!(db, collection = name, shadow = %shadow.name, "dropped collection and its vectors");
+        } else {
+            info!(db, collection = name, "dropped collection");
+        }
         Ok(true)
     }
 

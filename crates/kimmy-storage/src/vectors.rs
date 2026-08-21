@@ -737,4 +737,87 @@ mod tests {
         let meta = engine.get_collection("app", "docs").unwrap();
         assert_eq!(meta.vector.expect("config should persist").dim, 384);
     }
+
+    /// A vector-enabled collection holding one document with one chunk.
+    fn with_one_embedded_document(engine: &Engine) {
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+        let docs = engine.get_collection("app", "docs").unwrap();
+        engine
+            .insert(
+                &docs,
+                bson::doc! { "_id": "ghost", "body": "text that is about to be dropped" },
+            )
+            .unwrap();
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        engine
+            .put_vectors(
+                &shadow,
+                &DocId::String("ghost".into()),
+                &[VectorRecord {
+                    source: DocId::String("ghost".into()),
+                    chunk: 0,
+                    source_hlc: Hlc::ZERO,
+                    vector: vec![0.5; 8],
+                    text: "text that is about to be dropped".into(),
+                }],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn dropping_a_collection_takes_its_vectors_with_it() {
+        // The shadow is an ordinary collection with its own id, so removing the
+        // parent's rows never touched it. Its chunks outlived the documents they
+        // described.
+        let (engine, _dir) = engine();
+        with_one_embedded_document(&engine);
+        assert!(engine.get_collection("app", "docs.__vectors").is_ok());
+
+        engine.drop_collection("app", "docs").unwrap();
+
+        assert!(
+            engine.get_collection("app", "docs.__vectors").is_err(),
+            "the shadow collection must not outlive the collection it describes"
+        );
+    }
+
+    #[test]
+    fn a_collection_recreated_with_the_same_name_does_not_inherit_old_vectors() {
+        // Why the leak mattered rather than merely wasted space. The shadow's
+        // name is derived from the parent's, so a new collection with the same
+        // name adopted the orphaned chunks -- and they were searchable. On a
+        // live cluster a document from the dropped collection came back from
+        // `vector_search` scoring 1.0, above the new collection's own document,
+        // with an `_id` that resolved to nothing.
+        let (engine, _dir) = engine();
+        with_one_embedded_document(&engine);
+        engine.drop_collection("app", "docs").unwrap();
+
+        engine.create_collection("app", "docs").unwrap();
+        engine.configure_vectors("app", "docs", config(8)).unwrap();
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let inherited = engine.count(&shadow).unwrap();
+        assert_eq!(
+            inherited, 0,
+            "a new collection must not inherit the vectors of a dropped one with the same name"
+        );
+    }
+
+    #[test]
+    fn dropping_a_shadow_collection_directly_still_works() {
+        // The cascade must not recurse: a shadow has no shadow of its own, and
+        // `disable_vectors(drop_vectors: true)` drops one by name.
+        let (engine, _dir) = engine();
+        with_one_embedded_document(&engine);
+
+        engine.drop_collection("app", "docs.__vectors").unwrap();
+
+        assert!(engine.get_collection("app", "docs.__vectors").is_err());
+        assert!(
+            engine.get_collection("app", "docs").is_ok(),
+            "dropping the shadow must not drop the collection it belongs to"
+        );
+    }
 }
