@@ -28,6 +28,15 @@ use std::time::{Duration, Instant};
 /// while making the per-round cost independent of cluster size.
 pub const DEFAULT_FANOUT: usize = 3;
 
+/// How often a peer that keeps failing is reported at warning level.
+///
+/// Bounded in both directions on purpose. Reporting every round turns a log
+/// into noise nobody reads; reporting only the first failure — which is what
+/// this replaced — hides an outage that never ends. Five minutes is frequent
+/// enough that a wedged cluster is visible within one alerting window and rare
+/// enough that a peer down overnight costs a handful of lines.
+pub const WARN_INTERVAL: Duration = Duration::from_secs(300);
+
 /// The longest a failing peer is left alone.
 ///
 /// Capped so a peer that comes back is noticed within a bounded time, however
@@ -41,6 +50,14 @@ struct PeerState {
     failures: u32,
     /// Not worth contacting before this.
     next_attempt: Instant,
+    /// When this peer's failure was last reported at warning level.
+    ///
+    /// Only the first failure used to be reported, and every one after it went
+    /// to `debug`, which is below the default level. That is right for a peer
+    /// that is rebooting and wrong for one that never comes back: a permanently
+    /// failing peer said nothing at all, so a cluster could sit half-converged
+    /// indefinitely with a clean log.
+    last_warned: Instant,
 }
 
 /// Local health bookkeeping and round-robin peer selection.
@@ -96,10 +113,25 @@ impl PeerHealth {
     }
 
     /// Record a round that did not, and back off.
-    pub fn failed(&mut self, peer: SocketAddr, now: Instant) {
-        let entry = self.state.entry(peer).or_insert(PeerState { failures: 0, next_attempt: now });
+    ///
+    /// Returns whether this failure should be reported at warning level: the
+    /// first one, and then no more often than [`WARN_INTERVAL`] for as long as
+    /// the peer keeps failing.
+    pub fn failed(&mut self, peer: SocketAddr, now: Instant) -> bool {
+        let entry = self.state.entry(peer).or_insert(PeerState {
+            failures: 0,
+            next_attempt: now,
+            // So the first failure is always due to be reported.
+            last_warned: now - WARN_INTERVAL,
+        });
         entry.failures = entry.failures.saturating_add(1);
         entry.next_attempt = now + backoff(self.base, entry.failures);
+
+        let due = now.duration_since(entry.last_warned) >= WARN_INTERVAL;
+        if due {
+            entry.last_warned = now;
+        }
+        due
     }
 
     /// Consecutive failures recorded for a peer.

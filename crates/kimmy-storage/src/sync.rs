@@ -122,7 +122,8 @@ impl Engine {
             warn!(
                 entries = outcome.unknown_collection,
                 "skipped replicated entries for collections this node does not have; \
-                 their creation has probably aged out of the peer's oplog"
+                 either the collection was dropped here, or its creation has aged out \
+                 of the peer's oplog"
             );
         }
         debug!(
@@ -131,6 +132,35 @@ impl Engine {
             "merged a batch from a peer"
         );
         Ok(outcome)
+    }
+}
+
+/// Turn "that collection is not here" into `None` rather than an error.
+///
+/// A replicated schema change names its collection by *name*, so replaying one
+/// after the collection has been dropped locally raises `CollectionNotFound`.
+/// Before this existed that error travelled all the way out of `apply_batch`,
+/// which failed the whole round — and since the offending entry stays in the
+/// peer's oplog forever, the position never advanced and every later round
+/// died on the same entry. One dropped collection permanently stopped
+/// replication between two nodes.
+///
+/// Skipping is correct, not merely convenient: `apply_one` already treats a
+/// *document* for a missing collection this way, and a schema change for a
+/// collection that is gone is history for the same reason. It cannot lose a
+/// change that still matters, because the only ways to reach here are a drop
+/// that already happened on this node — which supersedes anything older — or a
+/// creation that aged out of the peer's oplog, which the caller already counts
+/// and warns about.
+///
+/// Deliberately narrow: only `CollectionNotFound` is swallowed. Any other
+/// storage error still fails the round, because a round that quietly skips
+/// what it cannot understand is how corruption becomes convergence.
+fn gone<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -158,8 +188,11 @@ impl Engine {
         // Schema changes come first in stamp order, so a collection exists
         // by the time documents for it arrive.
         if entry.kind.is_ddl() {
-            self.apply_ddl(entry)?;
-            outcome.ddl += 1;
+            if self.apply_ddl(entry)? {
+                outcome.ddl += 1;
+            } else {
+                outcome.unknown_collection += 1;
+            }
             return Ok(());
         }
 
@@ -192,10 +225,13 @@ impl Engine {
         Ok(())
     }
 
-    fn apply_ddl(&self, entry: &OplogEntry) -> Result<()> {
+    /// Returns whether the change was applied. `false` means it named a
+    /// collection this node no longer has, which is history rather than an
+    /// error — see [`gone`].
+    fn apply_ddl(&self, entry: &OplogEntry) -> Result<bool> {
         let Some(body) = &entry.body else {
             // A legacy `Collection` entry, which names nothing.
-            return Ok(());
+            return Ok(true);
         };
 
         match entry.kind {
@@ -213,7 +249,7 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop that removed it"
                     );
-                    return Ok(());
+                    return Ok(true);
                 }
 
                 match self.get_collection(&target.db, &target.name) {
@@ -240,29 +276,41 @@ impl Engine {
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
-                self.apply_remote_index(&target)?;
+                if gone(self.apply_remote_index(&target))?.is_none() {
+                    return Ok(false);
+                }
             }
             OpKind::DropIndex => {
                 let target: kimmy_core::IndexDrop = bson::deserialize_from_slice(body)?;
-                self.drop_index_inner(&target.db, &target.collection, &target.index, false)?;
+                let dropped =
+                    self.drop_index_inner(&target.db, &target.collection, &target.index, false);
+                if gone(dropped)?.is_none() {
+                    return Ok(false);
+                }
             }
             OpKind::ConfigureVectors => {
                 let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
-                match target.config {
-                    Some(config) => {
-                        self.configure_vectors_inner(
-                            &target.db,
-                            &target.collection,
-                            config,
-                            false,
-                        )?;
-                    }
-                    None => {
-                        // Never `drop_vectors`: discarding a peer's stored
-                        // vectors is not something a configuration change from
-                        // elsewhere should decide.
-                        self.disable_vectors_inner(&target.db, &target.collection, false, false)?;
-                    }
+                let applied = match target.config {
+                    Some(config) => gone(self.configure_vectors_inner(
+                        &target.db,
+                        &target.collection,
+                        config,
+                        false,
+                    ))?
+                    .is_some(),
+                    // Never `drop_vectors`: discarding a peer's stored
+                    // vectors is not something a configuration change from
+                    // elsewhere should decide.
+                    None => gone(self.disable_vectors_inner(
+                        &target.db,
+                        &target.collection,
+                        false,
+                        false,
+                    ))?
+                    .is_some(),
+                };
+                if !applied {
+                    return Ok(false);
                 }
             }
             _ => {}
@@ -288,7 +336,7 @@ impl Engine {
         // looked the same. Found by the cluster harness, which is the only
         // thing that could have: a single node applies its own drop directly.
         self.publish(vec![entry.clone()]);
-        Ok(())
+        Ok(true)
     }
 
     /// Create a replicated index, tolerating one that is already there.
