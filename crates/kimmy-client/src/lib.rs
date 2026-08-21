@@ -366,6 +366,52 @@ impl Client {
     }
 
     // -----------------------------------------------------------------------
+    // Vector search
+    // -----------------------------------------------------------------------
+
+    /// Search a collection by meaning.
+    ///
+    /// `body` is the request document: `query` for text the server embeds, or
+    /// `vector` for one embedded already, plus optional `k`, `filter` and
+    /// `per_document`. Passed through rather than modelled as a struct because
+    /// the shape is the query language's, and a typed mirror here would be a
+    /// second place to update every time that grows.
+    ///
+    /// `Idempotent`, so a failure retries on another node: a search reads, and
+    /// every node holds the same vectors.
+    ///
+    /// Two refusals are worth expecting rather than treating as bugs. A
+    /// collection configured `byo` has no provider to embed a query with and
+    /// says so instead of returning nothing; a collection with no vectors at
+    /// all answers `409 no_vectors` rather than an empty result, because "not
+    /// found" and "never ingested" are different problems.
+    pub async fn vector_search(&self, db: &str, collection: &str, body: &Value) -> Result<Value> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/v1/db/{db}/coll/{collection}/vector_search"),
+            Some(body.clone()),
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    /// Search by meaning and by keyword at once, fused by rank.
+    ///
+    /// Same body as [`Self::vector_search`]. The server runs a dense and a
+    /// lexical search and combines them with Reciprocal Rank Fusion, so the
+    /// scores are fusion scores and are not comparable with the similarity
+    /// scores `vector_search` returns.
+    pub async fn hybrid_search(&self, db: &str, collection: &str, body: &Value) -> Result<Value> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/v1/db/{db}/coll/{collection}/hybrid_search"),
+            Some(body.clone()),
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
     // Change streams
     // -----------------------------------------------------------------------
 

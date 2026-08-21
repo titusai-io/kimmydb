@@ -65,6 +65,8 @@ grants any other client is.
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |
 | `kimmy describe <db.coll>` | Inferred schema. `--sample` |
 | `kimmy indexes <db.coll>` | |
+| `kimmy vector-search <db.coll> [query]` | Search by meaning. `--vector --k --filter --per-document` |
+| `kimmy hybrid-search <db.coll> [query]` | Dense and lexical, fused by rank. Same flags |
 | `kimmy watch <db.coll>` | Follow changes until interrupted, one event per line. `--full --resume-after` |
 | `kimmy backup --out <file>` | Whole node. Needs `admin` over `*`. `-` for stdout |
 
@@ -72,6 +74,52 @@ Global: `--url` (`KIMMY_URL`), `--token` (`KIMMY_TOKEN`), `--pretty`.
 
 A target is `db.collection`, split at the **first** dot — a collection name may
 contain one (`orders.__vectors`), a database name may not.
+
+---
+
+## Searching by meaning
+
+```bash
+kimmy vector-search shelf.articles "how do I look after my bread starter" --k 3
+```
+
+```json
+{"results":[{"_id":"a3","score":0.6276},{"_id":"d2","score":0.5851}]}
+```
+
+The query is text by default and **the server embeds it**, using whatever
+provider the collection is configured with — so the same model that embedded the
+documents embeds the query, which is the only way the scores mean anything.
+
+`--vector` sends an embedding computed elsewhere instead. That is not merely an
+optimisation: a collection configured `byo` has no provider to embed text with
+and will refuse a text query rather than return an empty result that looks like
+"no matches". The array is checked for being numbers here, before the request,
+because the server's complaint would be about dimensions and the mistake is a
+type.
+
+`--filter` is an ordinary query-language document and runs *first*, restricting
+the search to what it matches. `--per-document` caps how many chunks of one
+document may fill result slots, so a single long document cannot take every one.
+
+`hybrid-search` takes the same flags and runs a dense and a lexical search,
+fusing them with Reciprocal Rank Fusion. **Its scores are fusion scores** — much
+smaller numbers, and not comparable with the similarity scores `vector-search`
+returns. Compare rankings between them, never scores.
+
+Two refusals are worth expecting rather than reading as bugs:
+
+```
+$ kimmy vector-search shelf.notes "anything"
+kimmy: 400 bad_request: collection "notes" has no vector configuration
+
+$ kimmy vector-search shelf.articles --vector '[0.1,0.2,0.3]'
+kimmy: 400 bad_request: query vector has 3 dimensions, but this collection stores 1024
+```
+
+A collection with no vectors stored at all answers `409 no_vectors` rather than
+an empty result, because "nothing matched" and "nothing was ever ingested" are
+different problems and only one of them is fixed by rewording the query.
 
 ---
 
