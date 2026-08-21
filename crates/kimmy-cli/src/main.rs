@@ -130,6 +130,30 @@ enum Command {
     },
     /// List a collection's indexes.
     Indexes { target: String },
+    /// Define an index.
+    ///
+    /// `fields` is a comma-separated list of paths, each optionally prefixed
+    /// with `-` for descending: `item,-qty`.
+    CreateIndex {
+        target: String,
+        /// Index name. Unique within the collection.
+        name: String,
+        /// Comma-separated paths, `-` prefix for descending.
+        fields: String,
+        /// Reject documents that repeat a key. Enforced per node, not
+        /// cluster-wide — see docs/indexes.md before relying on it.
+        #[arg(long)]
+        unique: bool,
+        /// Make it a TTL index: documents expire this long after the field's
+        /// timestamp. `0` is the absolute-deadline pattern.
+        #[arg(long)]
+        expire_after_seconds: Option<u64>,
+        /// Index only the documents matching this filter, as JSON.
+        #[arg(long)]
+        partial: Option<String>,
+    },
+    /// Remove an index by name.
+    DropIndex { target: String, name: String },
     /// Follow a collection's changes until interrupted.
     Watch {
         target: String,
@@ -297,6 +321,16 @@ async fn run() -> Result<()> {
             }
             emit(&cli, &client.request(Method::Get, &path, None, Safety::Idempotent).await?);
         }
+        Command::CreateIndex { target, name, fields, unique, expire_after_seconds, partial } => {
+            let (db, coll) = split_target(target)?;
+            let spec =
+                index_spec(name, fields, *unique, *expire_after_seconds, partial.as_deref())?;
+            emit(&cli, &client.create_index(db, coll, &spec).await?);
+        }
+        Command::DropIndex { target, name } => {
+            let (db, coll) = split_target(target)?;
+            emit(&cli, &client.drop_index(db, coll, name).await?);
+        }
         Command::Indexes { target } => {
             let (db, coll) = split_target(target)?;
             let path = format!("/v1/db/{db}/coll/{coll}/indexes");
@@ -369,6 +403,52 @@ fn parse_json_arg(label: &str, text: Option<&str>) -> Result<Value> {
     }
 }
 
+/// Build an index definition from the command line's shorthand.
+///
+/// `item,-qty` rather than
+/// `[{"path":"item"},{"path":"qty","descending":true}]`, because index fields
+/// are the most tedious JSON this tool would otherwise ask anyone to type, and
+/// a CLI that makes you hand-write the wire format is not saving you from
+/// `curl`.
+///
+/// A `-` prefix means descending. Paths are dotted, so neither a comma nor a
+/// leading `-` appears in a real one and the shorthand stays unambiguous.
+///
+/// Everything the route accepts is reachable — `unique`, `expireAfterSeconds`
+/// and `partialFilterExpression` — so nothing about indexes is left needing
+/// HTTP.
+fn index_spec(
+    name: &str,
+    fields: &str,
+    unique: bool,
+    expire_after_seconds: Option<u64>,
+    partial: Option<&str>,
+) -> Result<Value> {
+    let parsed: Vec<Value> = fields
+        .split(',')
+        .map(str::trim)
+        .filter(|f| !f.is_empty())
+        .map(|field| match field.strip_prefix('-') {
+            Some(path) if !path.is_empty() => Ok(json!({ "path": path, "descending": true })),
+            Some(_) => bail!("a field is just \"-\" with no path: {fields:?}"),
+            None => Ok(json!({ "path": field })),
+        })
+        .collect::<Result<_>>()?;
+
+    if parsed.is_empty() {
+        bail!("an index needs at least one field, for example \"item\" or \"item,-qty\"");
+    }
+
+    let mut spec = json!({ "name": name, "fields": parsed, "unique": unique });
+    if let Some(seconds) = expire_after_seconds {
+        spec["expireAfterSeconds"] = json!(seconds);
+    }
+    if let Some(partial) = partial {
+        spec["partialFilterExpression"] = parse_json("partial", partial)?;
+    }
+    Ok(spec)
+}
+
 /// The password, from `KIMMY_PASSWORD` or stdin.
 ///
 /// There is deliberately no `--password` flag. It would be recorded in shell
@@ -434,6 +514,72 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn a_single_field_index_is_ascending() {
+        let spec = index_spec("item_idx", "item", false, None, None).unwrap();
+        assert_eq!(spec["name"], "item_idx");
+        assert_eq!(spec["fields"], json!([{ "path": "item" }]));
+        assert_eq!(spec["unique"], false);
+    }
+
+    #[test]
+    fn a_dash_prefix_means_descending() {
+        // The whole reason the shorthand exists: this is the alternative to
+        // typing the wire format by hand.
+        let spec = index_spec("item_qty", "item,-qty", false, None, None).unwrap();
+        assert_eq!(
+            spec["fields"],
+            json!([{ "path": "item" }, { "path": "qty", "descending": true }])
+        );
+    }
+
+    #[test]
+    fn whitespace_around_fields_is_tolerated() {
+        let spec = index_spec("i", " item , -qty ", false, None, None).unwrap();
+        assert_eq!(
+            spec["fields"],
+            json!([{ "path": "item" }, { "path": "qty", "descending": true }])
+        );
+    }
+
+    #[test]
+    fn dotted_paths_survive_the_shorthand() {
+        // Paths are dotted, which is exactly why the separator is a comma.
+        let spec = index_spec("i", "customer.address.city", false, None, None).unwrap();
+        assert_eq!(spec["fields"], json!([{ "path": "customer.address.city" }]));
+    }
+
+    #[test]
+    fn an_index_with_no_fields_is_refused() {
+        for empty in ["", "   ", ",", " , "] {
+            let e = index_spec("i", empty, false, None, None).unwrap_err().to_string();
+            assert!(e.contains("at least one field"), "unhelpful message for {empty:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn a_dash_with_no_path_is_refused() {
+        assert!(index_spec("i", "-", false, None, None).is_err());
+        assert!(index_spec("i", "item,-", false, None, None).is_err());
+    }
+
+    #[test]
+    fn ttl_and_partial_are_only_sent_when_asked_for() {
+        let plain = index_spec("i", "item", false, None, None).unwrap();
+        assert!(plain.get("expireAfterSeconds").is_none(), "absent must not be sent as null");
+        assert!(plain.get("partialFilterExpression").is_none());
+
+        // Zero is the absolute-deadline pattern, so it must survive rather than
+        // being treated as "unset".
+        let ttl = index_spec("i", "seen", false, Some(0), None).unwrap();
+        assert_eq!(ttl["expireAfterSeconds"], 0);
+
+        let partial =
+            index_spec("i", "email", true, None, Some("{\"email\":{\"$exists\":true}}")).unwrap();
+        assert_eq!(partial["partialFilterExpression"]["email"]["$exists"], true);
+        assert_eq!(partial["unique"], true);
     }
 
     #[test]
