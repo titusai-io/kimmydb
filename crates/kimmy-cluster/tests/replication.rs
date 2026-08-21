@@ -468,3 +468,76 @@ async fn the_same_two_nodes_converge_when_nobody_is_in_the_middle() {
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
     assert!(b.engine.get(&cb, &DocId::String("confidential".into())).unwrap().is_some());
 }
+
+/// A peer that completes the TCP handshake and then says nothing at all.
+///
+/// Accepted connections are held rather than dropped, because dropping them
+/// would make the dial fail immediately and prove nothing.
+async fn silent_peer() -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((stream, _)) = listener.accept().await {
+            held.push(stream);
+        }
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_silent_peer_cannot_stall_a_sync_round() {
+    // The bug this pins: neither the TCP connect nor the TLS handshake that
+    // follows it was bounded, and a sync round awaits its peers one at a time.
+    // So a peer that accepts a connection and then never speaks did not merely
+    // fail to sync — it held the round open indefinitely, and every healthy
+    // peer scheduled behind it in that round waited too. Measured against a
+    // running three-node cluster, one unreachable node took convergence between
+    // the two healthy ones from about six seconds to about four minutes.
+    //
+    // The assertion is therefore about *time*, not about the error: any error
+    // is fine, taking forever is not.
+    let addr = silent_peer().await;
+    let b = node().await;
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(30), sync_once(&b.engine, addr, SECRET))
+        .await
+        .expect("the dial must give up on its own rather than hang");
+    let elapsed = started.elapsed();
+
+    result.expect_err("a peer that never speaks cannot produce a successful round");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the dial must be bounded by CONNECT_TIMEOUT, took {elapsed:?}"
+    );
+}
+
+/// Ignored: it spends the connect timeout waiting on a deliberately
+/// unroutable address, and its result depends on how the host treats
+/// TEST-NET-1 — a sandbox with no network at all fails instantly and proves
+/// nothing. Run it on a real network with
+/// `cargo test -p kimmy-cluster --test replication -- --ignored`.
+/// See docs/testing.md.
+#[tokio::test]
+#[ignore = "waits on a real connect timeout; needs a network that drops rather than refuses"]
+async fn an_unroutable_peer_cannot_stall_a_sync_round() {
+    // The other half of the same bug. `silent_peer` covers the TLS handshake;
+    // this covers the TCP connect, which is the one that actually bit — a
+    // stopped container's address drops packets instead of refusing them, so
+    // the kernel spent its full SYN retry budget before returning.
+    let addr: std::net::SocketAddr = "192.0.2.1:7900".parse().unwrap();
+    let b = node().await;
+
+    let started = std::time::Instant::now();
+    let result = tokio::time::timeout(Duration::from_secs(60), sync_once(&b.engine, addr, SECRET))
+        .await
+        .expect("the connect must give up on its own rather than hang");
+    let elapsed = started.elapsed();
+
+    result.expect_err("an unroutable address cannot produce a successful round");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "the connect must be bounded by CONNECT_TIMEOUT, took {elapsed:?}"
+    );
+}
