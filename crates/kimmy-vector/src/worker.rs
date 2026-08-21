@@ -17,8 +17,9 @@
 //! provider — which can be slow, rate-limited, or briefly down — is tolerable
 //! at all.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use kimmy_core::{Hlc, OpKind, VectorConfig, VectorRecord, path};
 use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
@@ -37,6 +38,40 @@ pub const CONSUMER: &str = "embedding-worker";
 /// delays embedding but never silently loses it.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long a node waits before embedding a document written somewhere else.
+///
+/// Every node runs a worker and every node sees every write, so before this
+/// existed all of them embedded the same document at once. The stored result
+/// was still correct — `vectors_are_stale` makes a losing write a no-op, which
+/// is why the shadow collection holds one chunk per document and not one per
+/// node — but the *provider calls* were not deduplicated. Measured against a
+/// live three-node cluster: 23 embedding requests for 10 documents. Against a
+/// metered API that is the bill; locally it is CPU and latency; either way it
+/// scales with the number of nodes.
+///
+/// The node that originated the write embeds immediately, so the common path
+/// costs nothing. Everyone else waits this long and then checks again: by then
+/// the originator's vectors have normally replicated, `vectors_are_stale` says
+/// no, and no provider call happens at all.
+///
+/// It has to exceed one anti-entropy round comfortably — the default sync
+/// interval is 5s — or the deferral expires before the originator's work could
+/// have arrived and the duplicate call happens anyway.
+const FOREIGN_GRACE: Duration = Duration::from_secs(30);
+
+/// How often the worker wakes to re-check deferred documents when no writes
+/// are arriving to wake it anyway.
+const DEFERRAL_TICK: Duration = Duration::from_secs(5);
+
+/// The most documents held for a later re-check.
+///
+/// Bounded because this is memory a burst of remote writes can grow. On
+/// overflow the *oldest* deferral is embedded immediately rather than dropped:
+/// spending a duplicate provider call is the right way to lose this race, and
+/// silently forgetting a document would leave it unembedded with nothing to
+/// notice.
+const MAX_DEFERRED: usize = 4096;
+
 /// Keeps a collection's vectors in step with its documents.
 pub struct EmbeddingWorker {
     engine: Arc<Engine>,
@@ -49,6 +84,21 @@ pub struct EmbeddingWorker {
     /// reconfiguration a live event. `None` marks a test-injected provider
     /// that no configuration should evict.
     providers: HashMap<u64, (Option<VectorConfig>, Arc<dyn EmbeddingProvider>)>,
+    /// Documents written by another node, waiting to see whether that node
+    /// embeds them. Ordered by deadline, which insertion order already gives.
+    deferred: VecDeque<Deferred>,
+}
+
+/// A document another node wrote, to be re-checked once its owner has had
+/// [`FOREIGN_GRACE`] to embed it.
+///
+/// Holds ids rather than the entry: by the time this is examined the document
+/// may have been replaced or deleted, and the re-check has to see whatever is
+/// current, not what this entry described.
+struct Deferred {
+    collection: kimmy_core::CollectionId,
+    source: kimmy_core::DocId,
+    due: Instant,
 }
 
 /// What one processed entry did, so tests and metrics can tell the cases apart.
@@ -63,11 +113,14 @@ pub enum Outcome {
     /// Nothing to do: not a vector-enabled collection, no embeddable text, or
     /// the vectors were already current.
     Skipped,
+    /// Written by another node, so its owner is given first refusal. Re-checked
+    /// after [`FOREIGN_GRACE`] and embedded then if nobody else did.
+    Deferred,
 }
 
 impl EmbeddingWorker {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine, providers: HashMap::new() }
+        Self { engine, providers: HashMap::new(), deferred: VecDeque::new() }
     }
 
     /// Run until the change stream ends.
@@ -86,7 +139,22 @@ impl EmbeddingWorker {
         let mut stream = self.engine.watch(WatchScope::Cluster, options)?;
         info!(resumed = resume.is_some(), "embedding worker started");
 
-        while let Some(event) = stream.next(&self.engine).await {
+        loop {
+            // Timed rather than a plain await, so deferred documents are still
+            // re-checked on a cluster that has gone quiet. `next` is safe to
+            // cancel here: its only await is the wake-up channel, and it
+            // records where to resume *before* waiting, so a dropped future
+            // costs a notification and not a position. The re-read from the
+            // arrival index on the next call is what recovers it.
+            let event = match tokio::time::timeout(DEFERRAL_TICK, stream.next(&self.engine)).await {
+                Ok(Some(event)) => event,
+                Ok(None) => break,
+                Err(_) => {
+                    self.drain_deferred(Instant::now()).await;
+                    continue;
+                }
+            };
+
             let ChangeEvent::Change { entry, token } = event else {
                 // An invalidated stream cannot be trusted to be gap-free, and
                 // silently continuing would leave documents unembedded.
@@ -116,8 +184,91 @@ impl EmbeddingWorker {
             // Only after the work is done, so a crash re-processes rather than
             // skips. Re-processing is safe because embedding is idempotent.
             self.engine.put_consumer_position(CONSUMER, token)?;
+
+            // Also here, not only on the idle tick: a busy cluster may never
+            // reach the timeout, and a deferral that is due should not have to
+            // wait for a lull.
+            self.drain_deferred(Instant::now()).await;
         }
         Ok(())
+    }
+
+    /// Hold a remotely-written document for a later re-check.
+    fn defer(&mut self, collection: kimmy_core::CollectionId, source: kimmy_core::DocId) {
+        // Replaced rather than duplicated: a document written twice in quick
+        // succession only needs one re-check, and it needs the later deadline.
+        self.deferred.retain(|d| !(d.collection == collection && d.source == source));
+        self.deferred.push_back(Deferred {
+            collection,
+            source,
+            due: Instant::now() + FOREIGN_GRACE,
+        });
+
+        while self.deferred.len() > MAX_DEFERRED {
+            // Made due immediately rather than dropped -- see MAX_DEFERRED.
+            if let Some(oldest) = self.deferred.front_mut() {
+                oldest.due = Instant::now();
+                break;
+            }
+        }
+    }
+
+    /// Embed any deferred document whose owner has had its chance and did not
+    /// take it.
+    ///
+    /// Nearly always a no-op beyond a storage read: by the time a deferral is
+    /// due the originator's vectors have replicated, `embed_one` finds them
+    /// current, and no provider is called.
+    /// `now` is a parameter so a test can reach the deadline without sleeping
+    /// through [`FOREIGN_GRACE`].
+    pub async fn drain_deferred(&mut self, now: Instant) -> usize {
+        let mut embedded = 0;
+
+        while self.deferred.front().is_some_and(|d| d.due <= now) {
+            let Some(item) = self.deferred.pop_front() else { break };
+            match self.embed_deferred(&item).await {
+                Ok(true) => {
+                    embedded += 1;
+                    debug!(
+                        collection = %item.collection,
+                        "embedded a document its own node did not"
+                    );
+                }
+                Ok(false) => {}
+                // Put back to try again rather than lost: a provider that is
+                // briefly down must not cost the document.
+                Err(e) if e.is_retryable() => {
+                    warn!(error = %e, "deferred embedding failed; will retry");
+                    self.deferred.push_back(Deferred { due: now + RETRY_DELAY, ..item });
+                    break;
+                }
+                Err(e) => {
+                    warn!(error = %e, "deferred embedding permanently failed; skipping");
+                }
+            }
+        }
+        embedded
+    }
+
+    async fn embed_deferred(&mut self, item: &Deferred) -> Result<bool> {
+        let Some(collection) = self.engine.collection_by_id(item.collection)? else {
+            // The collection was dropped while this waited. Nothing to embed,
+            // and the drop took the vectors with it.
+            return Ok(false);
+        };
+        let Some(config) = collection.vector.clone() else {
+            return Ok(false);
+        };
+        if !config.provider.embeds_server_side() {
+            return Ok(false);
+        }
+        let shadow = self.engine.get_collection(
+            &collection.db,
+            &kimmy_core::vector_meta::shadow_name(&collection.name),
+        )?;
+        // `force: false` is the whole point: this re-reads the document's
+        // current stamp and does nothing if the owner's vectors arrived.
+        self.embed_one(&collection, &shadow, &config, &item.source, false).await
     }
 
     /// Handle one oplog entry.
@@ -181,6 +332,16 @@ impl EmbeddingWorker {
         // its own entry coming, so redoing older work would be wasted.
         if !self.engine.vectors_are_stale(&shadow, &source, entry.stamp.hlc)? {
             return Ok(Outcome::Skipped);
+        }
+
+        // Written elsewhere: let the node that wrote it embed it, and look
+        // again later. Deciding by the entry's own stamp needs no membership
+        // view and no agreement — every node reaches the same conclusion from
+        // the entry alone, and the one that reaches "mine" is by definition
+        // the one that has the document already.
+        if entry.stamp.node != self.engine.node_id() {
+            self.defer(entry.collection, source);
+            return Ok(Outcome::Deferred);
         }
 
         let text = extract_text(&document, &config);
@@ -1071,5 +1232,127 @@ mod tests {
         let built_b = real.provider_for(coll.id.0, &b).unwrap();
         assert_eq!(built_a.dim(), 4);
         assert_eq!(built_b.dim(), 8, "a changed configuration must rebuild the provider");
+    }
+
+    /// The same entry as if a different node had written it.
+    ///
+    /// Only the stamp's node changes: that is the whole input to the decision,
+    /// which is what makes it need no membership view.
+    fn as_if_written_elsewhere(mut entry: kimmy_core::OplogEntry) -> kimmy_core::OplogEntry {
+        entry.stamp.node = kimmy_core::NodeId::from_bytes([0xAB; 16]);
+        entry
+    }
+
+    #[tokio::test]
+    async fn a_document_written_elsewhere_is_not_embedded_immediately() {
+        // Every node runs a worker and every node sees every write, so all of
+        // them used to embed the same document at once. The stored result was
+        // right -- the staleness check makes a losing write a no-op -- but the
+        // provider calls were not deduplicated. Measured on a live three-node
+        // cluster: 23 embedding requests for 10 documents.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+        assert_eq!(
+            fake.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the node that wrote the document embeds it; nobody else pays for it too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_document_this_node_wrote_is_embedded_without_waiting() {
+        // The other half. Deferring everything would trade duplicated work for
+        // embedding nothing until a timer fired, so the common path has to stay
+        // immediate.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+
+        assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_document_is_embedded_if_its_own_node_never_does() {
+        // What stops this being a way to lose embeddings. The originator may
+        // have crashed between the write and the embed, so the grace period
+        // ends in doing the work rather than in forgetting it.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+        worker.process(&entry).await.unwrap();
+
+        // Nothing replicated in the meantime: the owner never embedded it.
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+
+        assert_eq!(embedded, 1, "a document nobody embedded must not stay unembedded");
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_document_costs_nothing_once_its_vectors_arrive() {
+        // The case the deferral exists for: by the time the grace period is up
+        // the originator's vectors have replicated, so the re-check finds them
+        // current and no provider is called at all.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+        worker.process(&entry).await.unwrap();
+
+        // Stand in for replication: the owner's vectors land before the deadline.
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let stamp =
+            engine.document_stamp(&coll, &kimmy_core::DocId::String("a".into())).unwrap().unwrap();
+        engine
+            .put_vectors(
+                &shadow,
+                &kimmy_core::DocId::String("a".into()),
+                &[VectorRecord {
+                    source: kimmy_core::DocId::String("a".into()),
+                    chunk: 0,
+                    source_hlc: stamp.hlc,
+                    vector: vec![0.1; 4],
+                    text: "hello".into(),
+                }],
+            )
+            .unwrap();
+
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+
+        assert_eq!(embedded, 0);
+        assert_eq!(
+            fake.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the whole point: the duplicate provider call never happens"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_deferral_is_not_due_before_its_grace_has_passed() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+        worker.process(&entry).await.unwrap();
+
+        assert_eq!(worker.drain_deferred(Instant::now()).await, 0, "the owner still has time");
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
