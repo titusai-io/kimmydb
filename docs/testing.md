@@ -658,7 +658,7 @@ every document exactly once and in order. A third,
 drops on another — the only arrangement that could have shown that replicated
 schema changes were appended without being published. Cursor portability had been argued
 from the encoding and inherited from resume tokens; the protocol now tells
-clients to round-robin, so it needed to be a measurement.
+clients to fail over between nodes, so it needed to be a measurement.
 
 ---
 

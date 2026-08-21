@@ -890,8 +890,10 @@ async fn a_page_from_one_node_continues_on_another() {
     })
     .await;
 
-    // Walk the collection, changing node on every page — the round-robin
-    // client `/v1/topology` exists to enable.
+    // Walk the collection, changing node on every page. Deliberately harsher
+    // than a real client, which is sticky and only moves when a node stops
+    // answering: if a cursor survives changing node on *every* page it survives
+    // the failover `/v1/topology` exists to enable.
     let mut seen: Vec<i64> = Vec::new();
     let mut cursor: Option<String> = None;
     let mut visited: Vec<&'static str> = Vec::new();

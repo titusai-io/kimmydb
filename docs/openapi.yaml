@@ -102,7 +102,7 @@ info:
     - **The token is opaque.** Do not parse, compare or construct one. It
       encodes a document key, and that encoding may change.
     - **It is portable across nodes.** It carries no server state and no node
-      identity, so a round-robin client may send it to any node in the cluster.
+      identity, so a client may send it to any node in the cluster.
       Verified on a real cluster, not only argued from the design.
     - **Paging never repeats a document, and never misses one that was present
       and unchanged for the whole walk.** That is stronger than `skip`, where a
@@ -273,10 +273,9 @@ paths:
       operationId: version
       summary: What this node is, and what it can do.
       description: |
-        **Ask this before assuming a feature exists.** A client is handed one
-        address and may end up round-robining across a cluster; during a
-        rolling upgrade the node answering the next request can be older than
-        the one that answered the last. `capabilities` is what a client should
+        **Ask this before assuming a feature exists.** A client fails over
+        between nodes, so during a rolling upgrade the node answering the next
+        request can be older than the one that answered the last. `capabilities` is what a client should
         branch on — a version number only answers the question if the client
         also carries a table mapping versions to features, which is the table
         this endpoint replaces.
@@ -359,8 +358,10 @@ paths:
       summary: The nodes a client may use.
       description: |
         **Every node accepts writes**, so client-side node selection here is
-        round-robin plus retry elsewhere — there is no primary to funnel
-        through, and none of the machinery a driver needs to find one.
+        sticky plus retry elsewhere: a client keeps using the node that last
+        answered and moves only when one stops answering. There is no primary to
+        funnel through, and none of the machinery a driver needs to find one.
+        This endpoint gives a client somewhere to go, not a rotation to follow.
 
         Two sources, because neither answers alone. The **address** of a node
         comes from a replicated registry each node writes itself into;
@@ -1769,8 +1770,8 @@ paths:
         per change; the client sends nothing but may close.
 
         **Resume tokens are portable across nodes.** A token taken from one
-        node resumes correctly on any other, which is what makes a
-        round-robin client workable.
+        node resumes correctly on any other, which is what lets a client fail
+        over mid-stream.
 
         Authorization happens *before* the upgrade, and so does opening the
         stream — an expired resume token is a `410` rather than an

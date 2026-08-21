@@ -364,8 +364,8 @@ rather than quadratic in it.
   cluster-harness test walks a collection changing node on every page and
   requires the walk to see every document exactly once. It carries no server
   state, so a page fetched from one node continues correctly on another — which
-  matters because [`/v1/topology`](http-api.md#topology) exists to make clients
-  round-robin across a leaderless cluster.
+  matters because [`/v1/topology`](http-api.md#topology) exists to give a client
+  somewhere else to go when a node stops answering mid-walk.
 - **`_id` order, always.** `sort` other than `{"_id": 1}` is refused with a
   cursor, and a query carrying one gets **no `nextCursor`** rather than a token
   that would silently page in a different order from the one asked for. Sorting

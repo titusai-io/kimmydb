@@ -36,7 +36,11 @@ exactly full still carries a token — so a walk that stopped when the token
 stopped arriving would read one page too few.
 
 **Fail over between nodes, and be careful about writes.** Every node accepts
-writes, so selection is round-robin plus retry with no primary to find. But
+writes, so there is no primary to find. Selection is **sticky rather than
+round-robin**: a client keeps using whichever node last answered and moves only
+when one stops answering. That keeps a connection warm, and it means load is not
+spread across the cluster by default — one node serves everything until it
+fails. But
 `retry: elsewhere` means *this node* did not answer, **not** that the work did
 not happen: repeating an insert that failed after its commit would apply it
 twice, and no status distinguishes the two. Reads move freely; writes are the
