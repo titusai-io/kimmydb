@@ -183,6 +183,25 @@ document:
 { "_id": 999, "item": "widget" }
 ```
 
+### `modified` counts writes, not changes
+
+An update that sets a field to the value it already holds is still a write, and
+still counts:
+
+```javascript
+// Both documents already have g: "x"
+{ "matched": 2, "modified": 2 }
+```
+
+**This is where the register differs from MongoDB**, whose `nModified` excludes
+documents that were already in the requested state. The two disagree on exactly
+the question a caller tends to ask — "did anything actually change?" — so an
+update ported from MongoDB gets a number that looks right and is not.
+
+To ask that question here, compare `matched` with a `count` whose filter
+describes the state you want; that works in either database and does not depend
+on how a write is counted. Recorded in [Deviations](deviations.md).
+
 ---
 
 ## `find_and_modify` — atomic claim-and-return

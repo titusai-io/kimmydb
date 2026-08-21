@@ -260,6 +260,14 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
 
 `multi` defaults to `false` — without it, one document is affected.
 
+> **`modified` counts documents written, not documents changed.** A `$set` to
+> the value a field already holds is still a write, so it still counts —
+> `{"matched": 2, "modified": 2}` for an update that moved nothing. MongoDB's
+> `nModified` excludes those, so the two disagree on exactly the question
+> "did anything change?". To ask that, compare `matched` against a `count`
+> with a filter describing the state you want. Recorded in
+> [Deviations](deviations.md).
+
 > **Sharp edge.** A multi-document update or delete is **not atomic as a batch**.
 > Each write is individually atomic and logged, but a crash partway leaves a
 > partial result. See [Storage](storage.md).

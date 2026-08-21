@@ -16,11 +16,12 @@ awkward to get together:
 📚 **[Full documentation is in `docs/`](docs/README.md)** — architecture, internals,
 API reference, operations, and the decision record.
 
-> **Status: early development.** The server runs on a single node: multi-user
-> document CRUD, Mongo-style queries, secondary indexes, live change streams
-> over WebSocket, automatic embeddings with vector and hybrid search, and an
-> in-process MCP server at `/mcp` all work. Clustering is not built yet. See
-> [Roadmap](#roadmap).
+> **Status: early development.** Multi-user document CRUD, Mongo-style queries,
+> secondary indexes, live change streams over WebSocket, automatic embeddings
+> with vector and hybrid search, and an in-process MCP server at `/mcp` all
+> work. **Clustering works too** — every node accepts writes, membership is
+> SWIM and convergence is anti-entropy over the oplog; `docker-compose.yml`
+> brings up three nodes. See [Roadmap](#roadmap).
 
 ## Why it is built this way
 
