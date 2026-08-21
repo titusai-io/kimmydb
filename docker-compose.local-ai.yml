@@ -1,0 +1,90 @@
+# The three-node cluster plus a local embedding server.
+#
+# Layered on top of docker-compose.yml rather than repeating it:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.local-ai.yml up -d
+#
+# The base file already documents why each node pins an IP and why they share
+# one seed alias; duplicating those three services here would be two copies to
+# keep in step. This file adds the fourth container and the two things the
+# cluster needs in order to use it.
+#
+# What the fourth container is
+# ----------------------------
+# llama.cpp's server, serving Qwen3-Embedding-0.6B over an OpenAI-compatible
+# /v1/embeddings. That is the same dialect a hosted OpenAI or Voyage endpoint
+# speaks, so a collection configured against this is exercising the `open_ai`
+# provider for real — the dialects are otherwise only pinned by fixtures
+# (ADR-047), and nothing in the suite calls a live endpoint.
+#
+# 0.6B rather than the 4B or 8B Qwen3 embedding models because there is no GPU
+# in this picture. At 1024 dimensions it embeds fast enough on CPU that the
+# worker keeps up with a test's writes instead of becoming the thing under
+# observation.
+
+services:
+  # Downloads the GGUF on first start into the `llama-models` volume — roughly
+  # 640MB, so the first `up` is slow and every one after it is not.
+  llama-embed:
+    image: ghcr.io/ggml-org/llama.cpp:server
+    container_name: llama-embed
+    restart: unless-stopped
+    command: >
+      --hf-repo Qwen/Qwen3-Embedding-0.6B-GGUF:Q8_0
+      --embeddings
+      --pooling last
+      --host 0.0.0.0
+      --port 8080
+      --ctx-size 2048
+      --ubatch-size 2048
+    environment:
+      LLAMA_CACHE: /models
+    volumes:
+      - llama-models:/models
+    # Published so a test on the host can call the same endpoint the cluster
+    # calls, and tell "the model is wrong" apart from "the cluster cannot
+    # reach the model".
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      # Generous: the first start is downloading a model, not just booting.
+      retries: 60
+      start_period: 120s
+    networks:
+      - default
+
+  kimmy1: &kimmy-ai
+    environment:
+      # llama.cpp does not check the token, but the `open_ai` provider refuses
+      # to build without a key present in the environment, and the variable
+      # name — not the value — is what gets stored in collection metadata.
+      OPENAI_API_KEY: local-no-key-needed
+      KIMMY_CONFIG: /etc/kimmy/kimmy.toml
+    depends_on:
+      llama-embed:
+        # Not required for correctness. Embedding is an oplog consumer, so a
+        # node that starts before the model is up just retries and falls
+        # behind; waiting only keeps the startup logs free of failures that
+        # resolve themselves.
+        condition: service_healthy
+    volumes:
+      - kimmy1-data:/var/lib/kimmy
+      - ./docker/local-ai/kimmy1.toml:/etc/kimmy/kimmy.toml:ro
+
+  kimmy2:
+    <<: *kimmy-ai
+    volumes:
+      - kimmy2-data:/var/lib/kimmy
+      - ./docker/local-ai/kimmy2.toml:/etc/kimmy/kimmy.toml:ro
+
+  kimmy3:
+    <<: *kimmy-ai
+    volumes:
+      - kimmy3-data:/var/lib/kimmy
+      - ./docker/local-ai/kimmy3.toml:/etc/kimmy/kimmy.toml:ro
+
+volumes:
+  llama-models:
