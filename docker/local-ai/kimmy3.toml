@@ -1,0 +1,13 @@
+# Node 3 of the local three-node cluster.
+#
+# The only thing here is server.advertise. The compose file binds HTTP to the
+# wildcard 0.0.0.0:7878, and a wildcard is a listening instruction rather than
+# an identity, so the node refuses to guess what clients should dial and
+# publishes nothing into the topology registry. Without this, /v1/topology
+# comes back empty on every node and the cluster looks headless to a client
+# doing round-robin selection.
+#
+# The address is the same pinned container IP that cluster.bind uses, on the
+# HTTP port rather than the gossip port.
+[server]
+advertise = "http://172.28.0.13:7878"
