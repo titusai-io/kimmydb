@@ -55,7 +55,7 @@ grants any other client is.
 | `kimmy topology` | The nodes of the cluster, and which are live |
 | `kimmy databases` | Databases you can read |
 | `kimmy collections <db>` | Collections in a database |
-| `kimmy create-collection <db.coll>` | Creating one is idempotent |
+| `kimmy create-collection <db.coll>` | Idempotent: a collection that already exists reports `{"exists": ...}` and succeeds |
 | `kimmy find <db.coll> [filter]` | `--sort --projection --limit --skip --explain` |
 | `kimmy count <db.coll> [filter]` | |
 | `kimmy insert <db.coll> [document]` | Reads stdin when the document is omitted |
@@ -110,12 +110,16 @@ Errors carry the server's own message rather than the status alone:
 
 ```
 $ kimmy find shop.nosuch
-kimmy: 404 Not Found: collection "shop"."nosuch" not found
+kimmy: 404 not_found: collection "shop"."nosuch" not found
 
 $ kimmy databases        # with no token
-kimmy: 401 Unauthorized: expected an Authorization: Bearer token
-       (set --token, or KIMMY_TOKEN from `kimmy login`)
+kimmy: 401 unauthorized: missing Authorization header
+  set --token, or KIMMY_TOKEN from `kimmy login`
 ```
+
+The first line is the server's own code and message; the second is the one hint
+this tool adds, because that failure is fixed with a flag rather than by
+changing the request. Both go to stderr.
 
 ---
 

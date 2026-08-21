@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use kimmy_client::{Client, Method, Query, Safety};
+use kimmy_client::{Client, ErrorCode, Method, Query, Safety};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -212,13 +212,15 @@ async fn run() -> Result<()> {
                     Method::Post,
                     &format!("/v1/db/{db}/collections"),
                     Some(json!({ "name": coll })),
-                    // Creating a collection twice is creating it once: the
-                    // server treats it as idempotent, so a retry elsewhere is
-                    // safe.
+                    // Safe to retry on another node, which is all `Idempotent`
+                    // claims — the *server* answers a second create with a
+                    // conflict. Reconciling those two is what the match below
+                    // is for.
                     Safety::Idempotent,
                 )
-                .await?;
-            emit(&cli, &created);
+                .await;
+
+            emit(&cli, &collection_created(created, coll)?);
         }
         Command::Databases => {
             emit(
@@ -396,6 +398,33 @@ fn emit(cli: &Cli, value: &Value) {
     }
 }
 
+/// What `create-collection` reports, given what the server answered.
+///
+/// A collection that is already there is the state this command exists to
+/// reach, so reporting failure is wrong twice over.
+///
+/// It is wrong for a person, who asked for a collection and has one, and who
+/// otherwise has to wrap a command that succeeded in `|| true`. And it is wrong
+/// after a failover: [`Safety::Idempotent`] lets the request be retried on
+/// another node, so a create that landed and lost its answer comes back as a
+/// conflict raised by this client's *own* first attempt. Exiting non-zero there
+/// reports a failure that did not happen.
+///
+/// The two cases stay distinguishable in the output rather than being flattened
+/// into one, because "I made this" and "this was already here" are different
+/// answers to the same question — and a script that cares can tell them apart.
+///
+/// Only `conflict` is absorbed. A reserved name, a missing database or a denied
+/// grant are all still failures, because none of them leave the caller with the
+/// collection they asked for.
+fn collection_created(answer: kimmy_client::Result<Value>, collection: &str) -> Result<Value> {
+    match answer {
+        Ok(created) => Ok(created),
+        Err(e) if e.code() == Some(ErrorCode::Conflict) => Ok(json!({ "exists": collection })),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -452,5 +481,45 @@ mod tests {
         let mut command = Cli::command();
         command.build();
         assert!(!has_password(&command), "a --password flag has been added");
+    }
+
+    fn api_error(status: u16, code: ErrorCode) -> kimmy_client::Error {
+        kimmy_client::Error::Api {
+            status,
+            code,
+            message: "from the server".into(),
+            retry: kimmy_client::Retry::No,
+            retry_after: None,
+        }
+    }
+
+    #[test]
+    fn creating_a_collection_that_exists_succeeds() {
+        // The command exists to leave the caller with a collection. It did.
+        let out = collection_created(Err(api_error(409, ErrorCode::Conflict)), "orders")
+            .expect("an existing collection is not a failure");
+        assert_eq!(out, json!({ "exists": "orders" }));
+    }
+
+    #[test]
+    fn a_created_collection_reports_what_the_server_said() {
+        // And the two outcomes stay distinguishable: a script that cares which
+        // happened can still tell.
+        let answer = json!({ "created": "orders", "id": 7 });
+        let out = collection_created(Ok(answer.clone()), "orders").unwrap();
+        assert_eq!(out, answer);
+        assert!(out.get("exists").is_none(), "a fresh create must not look like an existing one");
+    }
+
+    #[test]
+    fn only_a_conflict_is_absorbed() {
+        // A reserved name, a missing database and a denied grant all leave the
+        // caller without the collection they asked for, so all of them fail.
+        for code in [ErrorCode::BadRequest, ErrorCode::NotFound, ErrorCode::Forbidden] {
+            assert!(
+                collection_created(Err(api_error(400, code)), "orders").is_err(),
+                "{code:?} must not be swallowed"
+            );
+        }
     }
 }
