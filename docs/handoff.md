@@ -6,70 +6,112 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
-## As of 2026-08-17 — **a JWT-secret hole is fixed; one PR is open**
+## As of 2026-08-21 — **the local cluster env exists, and driving it found four bugs**
 
-**Branch `jwt-secret-required-when-auth-is-on` has a PR open and is waiting on
-review — do not start something new on top of it, and do not merge it.** It is
-the first branch of the local-usability direction, and it came out of the very
-first step that direction asks for: running the documented first-start path and
-asking a running node what it actually did.
+**#85 through #95 are merged** and `main` is clean; the only thing in flight is
+the branch that wrote this section, which adds a deviations entry and this
+update. The register holds **zero 🔴** and one new 🟡.
 
-**What it fixes.** An authenticated node started **without** `KIMMY_JWT_SECRET`
-did not refuse to start. `Config::validate` required the secret only under
-`cluster.enabled`, so a single node fell through to a fallback signing key that
-**ships in the source** (`node.rs`, `"insecure-no-auth-unused-signing-key"`).
-The comment above that fallback said it was reached only with auth off; the
-validation did not hold the claim, and nothing tested the single-node case. A
-`docker run -p 7878:7878` binds `0.0.0.0`, so the node is on the LAN — and anyone
-could forge a `root` token from the public constant and skip login.
+The whole run came out of the local-usability direction below: stand the thing
+up the way someone would actually use it, then believe the running node over the
+documentation. Every bug here was found that way, and none of them by the test
+suite.
 
-**Proven on a real node, both directions.** Before the fix, a hand-forged HS256
-token (no login) returned `200` from `/v1/auth/whoami` as `root` with full admin
-grants and created a collection. After: with no secret the node exits `1` with an
-error naming the hazard; with a real secret the same forged token is `401` and a
-real login still works. The forge script is the kind of check this project keeps
-learning it needs — see the boxed note and failure-mode 1 below.
+### What now exists
 
-**The fix.** `Config::validate` refuses an auth-on node with no `jwt_secret`
-regardless of clustering, and refuses one shorter than
-`kimmy_auth::MIN_SECRET_LEN` — so `check-config` now answers what the server
-would, instead of blessing a configuration that dies after bootstrapping the
-superuser. The constant is reachable only through `node::signing_key`, which
-errors on the auth-on path. Tests: `auth_requires_a_jwt_secret` and
-`auth_on_with_no_secret_refuses_rather_than_signing_with_the_constant`.
-**The register still holds zero 🔴.**
+`docker-compose.local-ai.yml` (#86) layers a fourth container onto the existing
+three-node compose file: llama.cpp serving Qwen3-Embedding-0.6B over an
+OpenAI-compatible `/v1/embeddings`.
 
-**Two things the review of this branch caught, both worth carrying:**
+```bash
+docker compose -f docker-compose.yml -f docker-compose.local-ai.yml up -d
+```
 
-- **The first version of the second enforcement point was a `debug_assert`,**
-  with a comment claiming it would trip a test if the validation were later
-  weakened. It would not: `[profile.release]` does not set `debug-assertions`
-  and the Dockerfile builds `--release`, so it was compiled out of the only
-  artefact that ships — and no test drove that path in debug either. **A claim
-  about a mechanism, with no mechanism, inside the very fix for a claim about a
-  mechanism with no mechanism.** It is a real refusal now.
-- **A stricter validation breaks its callers, and they are not all in
-  `cargo test --workspace`.** The image smoke test in `ci.yml` ran
-  `check-config` with a root password and no signing key, so this branch would
-  have failed CI; it now passes both. Reproduced locally before fixing.
-  `kimmy.example.toml` keeps both secrets commented — symmetric with
-  `root_password`, and a fake key in an example is a key someone pastes into
-  production — so `check-config` on it needs both env vars, which
-  [Testing](testing.md) now says. The client, conformance, example and bench
-  harnesses were each checked: all five already write a `jwt_secret`, so none
-  broke.
+That makes a live embedding endpoint a `compose up` rather than an errand, which
+matters because [ADR-047](decisions.md) pins the provider dialects with fixtures
+and **nothing in the suite has ever called a real one**. It also carries
+`server.advertise` per node — without it the base compose produces a cluster
+whose `/v1/topology` is empty on all three, so it looks headless to a client.
 
-**One doc drift spotted in passing, not yet fixed** (out of this branch's scope,
-cheap for the next one): `README.md`'s status line still says *"Clustering is not
-built yet"* — it has been built since M4, and `docker-compose.yml` is a
-three-node cluster.
+### Four bugs, all found by running it
+
+- **An unbounded dial let one dead node stall replication between the live
+  ones** (#87). `sync_once` had no timeout on the TCP connect or the TLS
+  handshake, and a round walks its peers sequentially — so an unroutable peer
+  held the round for the kernel's connect timeout (~127s) and the healthy peer
+  behind it waited too. Convergence with one node down: **~240s before, ~6s
+  after.**
+- **Dropping a collection wedged replication permanently and silently** (#88).
+  Replaying a schema change that names a dropped collection raised
+  `CollectionNotFound` out of `apply_batch`, failing the whole round; the entry
+  never leaves the peer's oplog, so every later round died on it. A freshly
+  restarted node failed its *first* round. It was invisible because `peers.rs`
+  warned only on the first failure and used `debug!` after — now first, then
+  every `WARN_INTERVAL`.
+- **A dropped collection left its vectors behind** (#89), and because the shadow
+  name is derived from the parent's, a collection recreated with the same name
+  adopted them. A document from the dropped collection came back from
+  `vector_search` scoring 1.0000, above the new collection's own document, with
+  an `_id` resolving to nothing.
+- **Every node embedded every document** (#90). The stored result was always
+  right — the HLC check makes a losing write a no-op — but the *provider calls*
+  were never deduplicated: **23 embedding requests for 10 documents**. The
+  writing node now embeds immediately and the others defer `FOREIGN_GRACE` and
+  re-check, which is 1:1 with writes spread across all three nodes. The grace
+  period ends in doing the work, so a crashed originator cannot cost an
+  embedding.
+
+### The CLI is now complete against what a node advertises
+
+Sweeping every command against the cluster (#92–#95) turned up that
+`create-collection` was documented idempotent and was not — it returned `409`
+and exited 1, which is also wrong after a failover, since `Idempotent` lets the
+request be retried elsewhere and the conflict may be raised by the client's own
+first attempt. And two capabilities the node advertises had no command at all:
+`vector-search`/`hybrid-search` (#93) and index creation (#94), so proving a
+query used an index meant leaving the tool for `curl`.
+
+`kimmy` now covers every route a client needs. **Restore is deliberately not
+among them** — `kimmyd restore --from` is offline because redb allows one process
+to hold a database, and a network client should not pretend otherwise. The round
+trip is verified: 671 records restored into an empty data dir and served
+standalone, with every collection, index and document body intact.
+
+### Three things worth carrying
+
+- **Memory per node tracks logins, not data.** A node that looks heavy is the
+  one the client is pinned to. `Argon2::default()` is the OWASP profile at
+  **19 MiB per hash**, and freed memory stays in glibc's arenas, so RSS is a
+  high-water mark. Idle floor is 4–10 MB; embedding a dozen documents moves a
+  node 1–3 MB. Chasing that as a leak cost a round of false diagnosis.
+- **The client is sticky, not round-robin.** `Client::promote` moves whichever
+  node answered to the front and leaves it there, so one node serves everything
+  until it fails. The documentation claimed round-robin in eleven places (#91);
+  the behaviour is deliberate and stays. `docs/decisions.md` still carries the
+  original prediction that a client "will, once task 5 lands, round-robin" —
+  wrong prediction, unaffected conclusion, left alone because rewriting a
+  decision record is a decision.
+- **DDL and documents replicate, and a script can outrun them.** Creating a
+  collection on one node and writing to another immediately is a clean `404`
+  with `retry: no`; deleting a document on a node it has not reached yet is a
+  silent `{"deleted": 0}`. Both are correct. Both bit the test harness
+  repeatedly — wait for the state you are about to act on, and never discard a
+  write's response in a loop.
+
+### Where to look first
+
+`docker-compose.local-ai.yml` for the environment, `crates/kimmy-vector/src/worker.rs`
+for the deferral, `crates/kimmy-cluster/src/{transport,health,peers}.rs` for the
+two replication fixes. The register's one new 🟡 is `modified` counting writes
+rather than changes — see [Deviations](deviations.md).
 
 ---
 
 ## As of 2026-08-15 — **the direction has changed** (still current)
 
-**M0–M10 are complete; #78–#83 worked the carried debt down afterwards.** The one
-PR above is the only thing in flight; everything else is merged and on `main`.
+**M0–M10 are complete; #78–#83 worked the carried debt down afterwards**, and
+#85–#95 have followed the direction below. See the section above for what the
+most recent run found.
 
 > ### ⚠️ Read this before the roadmap
 >

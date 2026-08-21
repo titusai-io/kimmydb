@@ -17,6 +17,53 @@ Status meanings:
 
 ---
 
+## 🟡 `modified` counts documents written, not documents changed
+
+**Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
+`update` reports `modified` for every document the write path put back, whether
+or not the stored document ended up different. A `$set` to the value a field
+already holds counts:
+
+```
+$ kimmy update dev.mod '{"g":"x"}' '{"$set":{"g":"x"}}' --multi
+{"matched":2,"modified":2}
+```
+
+Not a miscount. `docs.rs` returns `WriteOutcome { matched: existed, modified:
+existed, .. }`, so the field means *a document was there and we wrote over it* —
+which is exactly what it reports. It is consistent across every path that
+returns it: `$unset` of a field that was never present counts, and a `PUT`
+replacing a document with a byte-identical body counts.
+
+**MongoDB's `nModified` means the other thing.** It excludes documents whose
+values were already what the update asked for, so the two answers diverge on
+precisely the case a caller is most likely to be testing for — "did this change
+anything?" A client ported from MongoDB gets a number that looks right, is
+wrong, and never says so. That is what makes this worth an entry rather than a
+footnote: silent disagreement on a field both systems spell the same way.
+
+Nothing on the retry path depends on it. `modified` is reported, not consumed:
+no retry class reads it, and the value cannot make a write happen twice.
+
+**Closing it means comparing documents, not counting differently.** The write
+path would have to hold the pre-image and compare it with the result to know
+whether anything moved — a serialize-and-compare per document, on the write
+path, to make a reported number more precise. Deferred rather than done because
+the cost lands on every update in order to improve an answer that no part of the
+system acts on.
+
+**The workaround is to ask the question directly.** `matched` already says how
+many documents the filter found, and a `count` with a filter describing the
+desired state says how many are already that way — which is the honest way to
+learn whether an update would change anything, in either database.
+
+Also noted in [the HTTP API](http-api.md#count-update-delete-by-filter) and
+[Query language](query-language.md), which are where someone writing an update
+will meet it — rather than in [Compatibility](compatibility.md), which is about
+this project's own `/v1` promise and not about MongoDB.
+
+---
+
 ## 🟢 An authenticated node without a JWT secret signed tokens with a source-visible constant
 
 **Was.** `Config::validate` required `auth.jwt_secret` only under
