@@ -15,6 +15,23 @@ pub enum Error {
     #[error("collection {db:?}.{collection:?} already exists")]
     CollectionExists { db: String, collection: String },
 
+    /// An index name is taken by a definition that is not the same one.
+    ///
+    /// Separate from [`Self::CollectionExists`], which this used to borrow.
+    /// That produced a sentence built for a collection wrapped around an index
+    /// — `collection "shop"."orders.item_qty (index already exists with
+    /// different fields)" already exists` — and it named the wrong cause, since
+    /// re-creating an index that differs only in its TTL also landed here.
+    ///
+    /// `differs` names what actually changed, because that is the whole
+    /// question the reader has: the fix for a different TTL is not the fix for
+    /// different fields.
+    #[error(
+        "index {index:?} on {db:?}.{collection:?} already exists with a different {differs}; \
+         drop it first, or create this one under another name"
+    )]
+    IndexExists { db: String, collection: String, index: String, differs: String },
+
     #[error("document with _id {0} not found")]
     DocumentNotFound(String),
 

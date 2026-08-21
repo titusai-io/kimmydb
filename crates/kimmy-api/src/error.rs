@@ -299,7 +299,9 @@ impl From<CoreError> for ApiError {
             CoreError::CollectionNotFound { .. }
             | CoreError::DatabaseNotFound(_)
             | CoreError::DocumentNotFound(_) => ApiError::not_found(e.to_string()),
-            CoreError::CollectionExists { .. } => ApiError::conflict(e.to_string()),
+            CoreError::CollectionExists { .. } | CoreError::IndexExists { .. } => {
+                ApiError::conflict(e.to_string())
+            }
             CoreError::DuplicateKey(_) => {
                 ApiError::new(StatusCode::CONFLICT, ErrorCode::DuplicateKey, e.to_string())
             }

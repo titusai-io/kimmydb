@@ -561,18 +561,32 @@ impl crate::Engine {
             // The TTL is part of the definition: re-creating the same index
             // with a different `expireAfterSeconds` must not quietly return the
             // old policy and leave documents living longer than asked.
-            if existing.fields == fields
-                && existing.unique == unique
-                && existing.expire_after_secs == expire_after_secs
-                && existing.partial_filter == partial_filter
-            {
+            // Each part of the definition, so the error can say which one
+            // moved. "Different fields" used to be reported for all of them,
+            // including a changed TTL — which sent the reader to look at the
+            // one thing that had not changed.
+            let mut differs = Vec::new();
+            if existing.fields != fields {
+                differs.push("field list");
+            }
+            if existing.unique != unique {
+                differs.push("unique flag");
+            }
+            if existing.expire_after_secs != expire_after_secs {
+                differs.push("expireAfterSeconds");
+            }
+            if existing.partial_filter != partial_filter {
+                differs.push("partialFilterExpression");
+            }
+
+            if differs.is_empty() {
                 return Ok(existing.clone());
             }
-            return Err(StorageError::Core(CoreError::CollectionExists {
+            return Err(StorageError::Core(CoreError::IndexExists {
                 db: db.to_string(),
-                collection: format!(
-                    "{collection}.{name} (index already exists with different fields)"
-                ),
+                collection: collection.to_string(),
+                index: name,
+                differs: differs.join(", "),
             }));
         }
 
@@ -1075,6 +1089,87 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn a_conflicting_index_says_it_is_an_index_and_names_what_moved() {
+        // The message used to borrow `CollectionExists`, which produced a
+        // sentence built for a collection wrapped around an index:
+        //
+        //   collection "app"."docs.i (index already exists with different
+        //   fields)" already exists
+        //
+        // Nothing in it is quite true. The thing that exists is an index, not
+        // a collection called that, and the caller is left to guess what to do.
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("a")], false, Some("i".into()))
+            .unwrap();
+
+        let err = engine
+            .create_index("app", "docs", vec![IndexField::ascending("b")], false, Some("i".into()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("index \"i\""), "must say an index is what exists: {err}");
+        assert!(err.contains("field list"), "must name what differs: {err}");
+        assert!(!err.contains("collection \"app\".\"docs.i"), "no collection-shaped name: {err}");
+        assert!(err.contains("another name"), "must offer a way out: {err}");
+    }
+
+    #[test]
+    fn a_conflict_over_the_ttl_does_not_blame_the_fields() {
+        // The inaccuracy that mattered most: every conflict reported
+        // "different fields", including one where the fields were identical
+        // and only the expiry had moved — sending the reader to check the one
+        // part of the definition that had not changed.
+        let (engine, _coll, _dir) = engine();
+        let fields = vec![IndexField::ascending("seen")];
+        engine
+            .create_index_with(
+                "app",
+                "docs",
+                fields.clone(),
+                false,
+                Enforcement::Local,
+                Some("ttl".into()),
+                Some(60),
+                None,
+            )
+            .unwrap();
+
+        let err = engine
+            .create_index_with(
+                "app",
+                "docs",
+                fields,
+                false,
+                Enforcement::Local,
+                Some("ttl".into()),
+                Some(120),
+                None,
+            )
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("expireAfterSeconds"), "must name the TTL: {err}");
+        assert!(!err.contains("field list"), "the fields did not change: {err}");
+    }
+
+    #[test]
+    fn a_conflict_over_several_parts_names_all_of_them() {
+        let (engine, _coll, _dir) = engine();
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("a")], false, Some("i".into()))
+            .unwrap();
+
+        let err = engine
+            .create_index("app", "docs", vec![IndexField::ascending("b")], true, Some("i".into()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("field list"), "{err}");
+        assert!(err.contains("unique flag"), "{err}");
     }
 
     #[test]
