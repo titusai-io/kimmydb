@@ -541,3 +541,103 @@ async fn an_unroutable_peer_cannot_stall_a_sync_round() {
         "the connect must be bounded by CONNECT_TIMEOUT, took {elapsed:?}"
     );
 }
+
+fn vector_config() -> kimmy_core::VectorConfig {
+    kimmy_core::VectorConfig {
+        fields: vec!["body".into()],
+        provider: kimmy_core::ProviderConfig::Byo,
+        dim: 8,
+        metric: kimmy_core::Metric::Cosine,
+        chunk: Default::default(),
+    }
+}
+
+/// Two nodes where the *receiver* has dropped a collection the sender still
+/// holds a schema change for.
+///
+/// The order is the whole point. Replaying a whole history in stamp order never
+/// hits this: the collection is created before the change that names it and
+/// dropped after. The failure needs the drop to be applied *first*, which is
+/// what happens when the drop originates on the receiving node while an earlier
+/// change is still only on the sender.
+async fn sender_and_a_receiver_that_dropped_it() -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+
+    a.engine.create_collection("shelf", "doomed").unwrap();
+    sync_once(&b.engine, a.addr, SECRET).await.expect("the create must replicate");
+
+    // Recorded on the sender only -- the receiver has not seen it yet.
+    a.engine.configure_vectors("shelf", "doomed", vector_config()).unwrap();
+
+    // ...and meanwhile the receiver drops the collection.
+    b.engine.drop_collection("shelf", "doomed").unwrap();
+
+    (a, b)
+}
+
+#[tokio::test]
+async fn a_dropped_collection_does_not_wedge_replication() {
+    // The bug this pins. A schema change names its collection by name, so
+    // replaying one the receiver has already dropped raised
+    // `CollectionNotFound` -- which failed the *whole* round, not just that
+    // entry. The entry never leaves the sender's oplog, so the position never
+    // advanced and every later round died on the same entry. Measured on a real
+    // three-node cluster: one dropped collection permanently stopped
+    // replication, a node sat at four documents while its peer held six, new
+    // writes never arrived, and nothing in the log said so.
+    let (a, b) = sender_and_a_receiver_that_dropped_it().await;
+
+    // Unrelated work recorded after all of that. This is what must still
+    // arrive: the round has to get past the poisoned entry to reach it.
+    let live = a.engine.create_collection("shelf", "survivor").unwrap();
+    a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
+
+    sync_once(&b.engine, a.addr, SECRET)
+        .await
+        .expect("the round must not fail on a schema change for a dropped collection");
+
+    let coll = b
+        .engine
+        .get_collection("shelf", "survivor")
+        .expect("work recorded after the drop must replicate");
+    assert!(
+        b.engine.get(&coll, &DocId::String("must-replicate".into())).unwrap().is_some(),
+        "a dropped collection must not block the entries behind it"
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_collection_does_not_come_back_through_replication() {
+    // The control. Skipping the entry must not turn into recreating the
+    // collection it names -- resurrecting a drop would be a worse bug than the
+    // one being fixed.
+    let (a, b) = sender_and_a_receiver_that_dropped_it().await;
+    sync_once(&b.engine, a.addr, SECRET).await.expect("the round must succeed");
+
+    assert!(
+        b.engine.get_collection("shelf", "doomed").is_err(),
+        "a collection dropped on the receiver must not be recreated by replication"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_keeps_failing_is_reported_more_than_once() {
+    // The wedge above was invisible as well as permanent: only the first
+    // failure was reported, and every one after it went to `debug`, below the
+    // default level. A peer that never recovers has to keep saying so.
+    use kimmy_cluster::{PeerHealth, WARN_INTERVAL};
+    let dead: std::net::SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let mut health = PeerHealth::new(3, Duration::from_secs(5));
+
+    let start = std::time::Instant::now();
+    assert!(health.failed(dead, start), "the first failure must be reported");
+    assert!(
+        !health.failed(dead, start + Duration::from_secs(1)),
+        "a failure moments later must not be reported again"
+    );
+    assert!(
+        health.failed(dead, start + WARN_INTERVAL),
+        "a peer still failing a full interval later must be reported again"
+    );
+}

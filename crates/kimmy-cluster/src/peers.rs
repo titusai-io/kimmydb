@@ -145,12 +145,14 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         // stops costing a connection every interval.
                         Err(e) => {
                             let now = Instant::now();
-                            health.failed(peer, now);
+                            // Reported on the first failure and then at a
+                            // bounded cadence, not once and never again: a peer
+                            // that never recovers has to stay visible, or a
+                            // half-converged cluster looks like a healthy one.
+                            let report = health.failed(peer, now);
                             let failures = health.failures(peer);
-                            // Noisy once, then quiet: repeating the same failure
-                            // every interval is how a log stops being read.
-                            if failures == 1 {
-                                warn!(%peer, error = %e, "sync round failed; backing off");
+                            if report {
+                                warn!(%peer, error = %e, failures, "sync round failed; backing off");
                             } else {
                                 debug!(%peer, error = %e, failures, "sync round failed");
                             }
