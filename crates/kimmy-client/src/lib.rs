@@ -428,6 +428,52 @@ impl Client {
     }
 
     // -----------------------------------------------------------------------
+    // Indexes
+    // -----------------------------------------------------------------------
+
+    /// The indexes defined on a collection.
+    pub async fn indexes(&self, db: &str, collection: &str) -> Result<Value> {
+        self.send(
+            reqwest::Method::GET,
+            &format!("/v1/db/{db}/coll/{collection}/indexes"),
+            None,
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    /// Define an index.
+    ///
+    /// `spec` is the definition: `fields`, `name`, and optionally `unique`,
+    /// `expireAfterSeconds` or `partialFilterExpression`. Passed through for
+    /// the same reason a search body is — the shape belongs to the server, and
+    /// mirroring it here would be a second place to update.
+    ///
+    /// `Idempotent`, and it means it: re-creating an index with the *same*
+    /// definition is accepted, while the same name with a different definition
+    /// is a conflict rather than a silent redefinition.
+    pub async fn create_index(&self, db: &str, collection: &str, spec: &Value) -> Result<Value> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/v1/db/{db}/coll/{collection}/indexes"),
+            Some(spec.clone()),
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    /// Remove an index by name.
+    pub async fn drop_index(&self, db: &str, collection: &str, name: &str) -> Result<Value> {
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("/v1/db/{db}/coll/{collection}/indexes/{name}"),
+            None,
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
     // The escape hatch
     // -----------------------------------------------------------------------
 

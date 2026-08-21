@@ -64,6 +64,8 @@ grants any other client is.
 | `kimmy delete <db.coll> <filter>` | `--multi` |
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |
 | `kimmy describe <db.coll>` | Inferred schema. `--sample` |
+| `kimmy create-index <db.coll> <name> <fields>` | `item,-qty`. `--unique --expire-after-seconds --partial` |
+| `kimmy drop-index <db.coll> <name>` | Dropping one that is not there succeeds |
 | `kimmy indexes <db.coll>` | |
 | `kimmy vector-search <db.coll> [query]` | Search by meaning. `--vector --k --filter --per-document` |
 | `kimmy hybrid-search <db.coll> [query]` | Dense and lexical, fused by rank. Same flags |
@@ -168,6 +170,53 @@ kimmy: 401 unauthorized: missing Authorization header
 The first line is the server's own code and message; the second is the one hint
 this tool adds, because that failure is fixed with a flag rather than by
 changing the request. Both go to stderr.
+
+---
+
+## Indexes
+
+```bash
+kimmy create-index shelf.orders item_qty 'item,-qty'
+```
+
+Fields are a comma-separated list of paths, `-` for descending — rather than
+`[{"path":"item"},{"path":"qty","descending":true}]`. Index fields are the most
+tedious JSON this tool would otherwise ask you to type, and a CLI that makes you
+hand-write the wire format is not saving you from `curl`. Paths are dotted, so
+neither a comma nor a leading `-` appears in a real one.
+
+Everything the route accepts is reachable, so nothing about indexes needs HTTP:
+
+```bash
+kimmy create-index shelf.users uniq_email 'email' --unique
+kimmy create-index shelf.sessions ttl_seen 'seen' --expire-after-seconds 3600
+kimmy create-index shelf.users has_email 'email' --partial '{"email":{"$exists":true}}'
+kimmy drop-index shelf.orders item_qty
+```
+
+Read [Indexes](indexes.md) before relying on `--unique`: it is enforced **per
+node**, not cluster-wide, and that document explains exactly what it does and
+does not promise.
+
+Re-creating an index with the **same** definition succeeds. The same name with a
+*different* definition is a conflict rather than a silent redefinition:
+
+```
+$ kimmy create-index shelf.idx item_idx 'qty'
+kimmy: 409 conflict: ... index already exists with different fields
+```
+
+Dropping an index that is not there reports `{"dropped": false}` and succeeds —
+the collection ends up without that index either way, which is what was asked.
+
+Use `kimmy find ... --explain` to confirm one is actually being used:
+
+```json
+{"documentsExamined":1,"documentsMatched":1,"index":"item_idx","strategy":"index"}
+```
+
+`"strategy":"collectionScan"` with `documentsExamined` equal to the collection
+size means it is not.
 
 ---
 
