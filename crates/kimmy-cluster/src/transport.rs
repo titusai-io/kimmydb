@@ -21,6 +21,7 @@
 //! other is what converges them, and that falls out of every node running the
 //! same loop rather than needing a push half.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,23 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long one request may take.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long dialling a peer may take, covering the TCP connect and the TLS
+/// handshake that follows it.
+///
+/// Both were previously unbounded, and the cost of that was not paid by the
+/// unreachable peer. A sync round walks its peers sequentially and awaits each
+/// one, so a peer whose host drops packets rather than refusing them blocks the
+/// round for the kernel's connect timeout — around two minutes at the usual six
+/// SYN retries — and the round's own tick cannot fire while it is blocked. One
+/// stopped node therefore slowed replication to every *healthy* node behind it
+/// in the round, turning a six-second convergence into a four-minute one.
+///
+/// Short, because this bounds a dial to a peer on the same network rather than
+/// a request against it: a peer that cannot complete both handshakes in this
+/// long is one the round is better off recording as failed and backing off
+/// from, which is exactly what [`crate::PeerHealth`] then does.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Serve peer requests until the listener fails.
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
@@ -213,17 +231,35 @@ pub async fn sync_once(
     peer: SocketAddr,
     secret: &str,
 ) -> Result<SyncOutcome, ProtocolError> {
-    let tcp = TcpStream::connect(peer).await?;
+    let tcp =
+        tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await.map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("connecting to {peer} timed out after {CONNECT_TIMEOUT:?}"),
+            )
+        })??;
 
     // Built per round rather than held: a sync round is seconds apart, and a
     // dialling node has no accept loop to amortise it against.
     let tls = crate::tls::ClusterTls::new()
         .map_err(|e| ProtocolError::Malformed(format!("cluster TLS: {e}")))?;
-    let mut stream = tls
-        .connector()
-        .connect(crate::tls::ClusterTls::server_name(), tcp)
-        .await
-        .map_err(|e| ProtocolError::Malformed(format!("TLS handshake with {peer}: {e}")))?;
+
+    // Bounded for the same reason as the connect above, and separately from it:
+    // a host that completes a TCP handshake and then says nothing leaves the
+    // TLS handshake waiting, which stalls the round just as effectively as an
+    // unroutable address does.
+    let mut stream = tokio::time::timeout(
+        CONNECT_TIMEOUT,
+        tls.connector().connect(crate::tls::ClusterTls::server_name(), tcp),
+    )
+    .await
+    .map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!("TLS handshake with {peer} timed out after {CONNECT_TIMEOUT:?}"),
+        )
+    })?
+    .map_err(|e| ProtocolError::Malformed(format!("TLS handshake with {peer}: {e}")))?;
 
     let binding = {
         let (_, conn) = stream.get_ref();

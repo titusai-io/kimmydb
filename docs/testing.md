@@ -805,6 +805,22 @@ assert_eq!(wrong_password.to_string(), no_such_user.to_string());
 Async tests use explicit timeouts and fail with progress information rather than
 hanging.
 
+**A test whose result depends on the host's network is `#[ignore]`d**, with the
+command to run it in the doc comment. `an_unroutable_peer_cannot_stall_a_sync_round`
+in `crates/kimmy-cluster/tests/replication.rs` is the current one: it dials
+TEST-NET-1 to prove the connect is bounded, which only means anything on a
+network that *drops* packets to it. A sandbox with no network refuses instantly
+and the test passes without proving anything, so it does not belong in a default
+run:
+
+```
+cargo test -p kimmy-cluster --test replication -- --ignored
+```
+
+Its in-process half, `a_silent_peer_cannot_stall_a_sync_round`, is not ignored —
+a listener that accepts and stays silent needs no network to be unreachable, and
+that is what a default run relies on.
+
 ---
 
 ## The client is tested against a real server
