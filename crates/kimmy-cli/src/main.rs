@@ -140,6 +140,44 @@ enum Command {
         #[arg(long)]
         resume_after: Option<String>,
     },
+    /// Search a collection by meaning.
+    ///
+    /// The query is text by default and the server embeds it. Pass `--vector`
+    /// when the collection is `byo`, or when the embedding was computed
+    /// elsewhere — a `byo` collection has no provider to embed text with.
+    VectorSearch {
+        target: String,
+        /// Query text for the server to embed. Omit when using --vector.
+        query: Option<String>,
+        /// A pre-computed embedding, as a JSON array of numbers.
+        #[arg(long, conflicts_with = "query")]
+        vector: Option<String>,
+        /// How many results to return.
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        /// Query-language filter, applied before the search.
+        #[arg(long)]
+        filter: Option<String>,
+        /// Cap how many chunks of one document may fill result slots.
+        #[arg(long)]
+        per_document: Option<usize>,
+    },
+    /// Search by meaning and by keyword at once, fused by rank.
+    ///
+    /// Scores are fusion scores and are not comparable with the similarity
+    /// scores `vector-search` returns.
+    HybridSearch {
+        target: String,
+        query: Option<String>,
+        #[arg(long, conflicts_with = "query")]
+        vector: Option<String>,
+        #[arg(long, default_value_t = 10)]
+        k: usize,
+        #[arg(long)]
+        filter: Option<String>,
+        #[arg(long)]
+        per_document: Option<usize>,
+    },
     /// The nodes this cluster is made of, and which are live.
     Topology,
     /// Download a backup of the whole node. Needs admin over everything.
@@ -203,6 +241,28 @@ async fn run() -> Result<()> {
             let ready = client.request(Method::Get, "/readyz", None, Safety::Idempotent).await?;
             let version = client.version().await?;
             emit(&cli, &json!({ "healthz": health, "readyz": ready, "version": version }));
+        }
+        Command::VectorSearch { target, query, vector, k, filter, per_document } => {
+            let (db, coll) = split_target(target)?;
+            let body = search_body(
+                query.as_deref(),
+                vector.as_deref(),
+                *k,
+                filter.as_deref(),
+                *per_document,
+            )?;
+            emit(&cli, &client.vector_search(db, coll, &body).await?);
+        }
+        Command::HybridSearch { target, query, vector, k, filter, per_document } => {
+            let (db, coll) = split_target(target)?;
+            let body = search_body(
+                query.as_deref(),
+                vector.as_deref(),
+                *k,
+                filter.as_deref(),
+                *per_document,
+            )?;
+            emit(&cli, &client.hybrid_search(db, coll, &body).await?);
         }
         Command::Topology => emit(&cli, &client.topology().await?),
         Command::CreateCollection { target } => {
@@ -331,6 +391,46 @@ async fn run() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Build the request body both search commands send.
+///
+/// Shared because the two routes take the same document — only the ranking
+/// behind them differs, and duplicating this would let the commands drift into
+/// accepting different flags for the same thing.
+///
+/// Exactly one of `query` and `vector` is required. The "neither" case is
+/// caught here rather than by clap because "one of these is required" is not
+/// something `conflicts_with` expresses, and the message should name both.
+fn search_body(
+    query: Option<&str>,
+    vector: Option<&str>,
+    k: usize,
+    filter: Option<&str>,
+    per_document: Option<usize>,
+) -> Result<Value> {
+    let mut body = json!({ "k": k });
+
+    match (query, vector) {
+        (Some(query), None) => body["query"] = json!(query),
+        (None, Some(vector)) => {
+            let parsed = parse_json("vector", vector)?;
+            if !parsed.as_array().is_some_and(|v| v.iter().all(Value::is_number)) {
+                bail!("--vector must be a JSON array of numbers");
+            }
+            body["vector"] = parsed;
+        }
+        // Clap rejects both at once, so this is the neither case.
+        _ => bail!("give query text, or --vector with a pre-computed embedding"),
+    }
+
+    if let Some(filter) = filter {
+        body["filter"] = parse_json("filter", filter)?;
+    }
+    if let Some(per_document) = per_document {
+        body["per_document"] = json!(per_document);
+    }
+    Ok(body)
 }
 
 /// `db.collection` → `("db", "collection")`.
@@ -521,5 +621,50 @@ mod tests {
                 "{code:?} must not be swallowed"
             );
         }
+    }
+
+    #[test]
+    fn a_search_defaults_to_embedding_the_query_text() {
+        let body = search_body(Some("wet sticky dough"), None, 10, None, None).unwrap();
+        assert_eq!(body["query"], "wet sticky dough");
+        assert_eq!(body["k"], 10);
+        assert!(body.get("vector").is_none(), "text and a vector must not both be sent");
+    }
+
+    #[test]
+    fn a_precomputed_vector_is_sent_instead_of_text() {
+        // What a `byo` collection needs: it has no provider to embed text with.
+        let body = search_body(None, Some("[0.1, 0.2]"), 5, None, None).unwrap();
+        assert_eq!(body["vector"], json!([0.1, 0.2]));
+        assert!(body.get("query").is_none());
+    }
+
+    #[test]
+    fn a_search_with_neither_text_nor_vector_is_refused() {
+        // Clap catches both-at-once; nothing but this catches neither.
+        let e = search_body(None, None, 10, None, None).unwrap_err().to_string();
+        assert!(e.contains("query text"), "the message must name both options: {e}");
+        assert!(e.contains("--vector"), "the message must name both options: {e}");
+    }
+
+    #[test]
+    fn a_vector_that_is_not_numbers_is_refused_before_the_request() {
+        // Caught here rather than as a 400, because the server's complaint
+        // would be about dimensions and the mistake is a type.
+        for bad in ["[\"a\"]", "{}", "\"nope\"", "[1, \"two\"]"] {
+            assert!(search_body(None, Some(bad), 10, None, None).is_err(), "accepted {bad}");
+        }
+    }
+
+    #[test]
+    fn filter_and_per_document_are_passed_through_when_given() {
+        let body =
+            search_body(Some("q"), None, 3, Some("{\"status\":\"published\"}"), Some(1)).unwrap();
+        assert_eq!(body["filter"]["status"], "published");
+        assert_eq!(body["per_document"], 1);
+
+        let bare = search_body(Some("q"), None, 3, None, None).unwrap();
+        assert!(bare.get("filter").is_none(), "an absent filter must not be sent as null");
+        assert!(bare.get("per_document").is_none());
     }
 }
