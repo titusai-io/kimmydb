@@ -178,12 +178,32 @@ fn a_request_with_no_traceparent_starts_a_new_trace() {
     );
 }
 
+/// Serialises the tests that depend on `include_names`.
+///
+/// The gate is process-global (it mirrors the audit mode, for the reasons
+/// `kimmy_api::audit` documents), but cargo runs the tests in one binary on
+/// parallel threads. So a test asserting a name is *absent* can sample the flag
+/// while the test that exercises both directions has it turned on — which is a
+/// privacy assertion failing for a reason that has nothing to do with privacy.
+///
+/// It reads as a flake and is not one: it is a lost race, and which side wins
+/// depends on the machine. It passed locally and failed in CI.
+///
+/// `parking_lot`, as elsewhere in this crate, so a panicking test poisons
+/// nothing and its neighbour reports its own failure rather than a poison error.
+static NAMES_GATE: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[test]
 fn the_span_name_is_the_route_template_and_never_the_document_id() {
     // Two properties at once, and both are ADR-068. A span name is a dashboard
     // dimension, so a name carrying an `_id` is one group per document; and the
     // template carries no database or collection name, which is what makes the
     // default private by construction rather than by redaction.
+    //
+    // Holds the gate because of the `url.path` assertion below, which is only
+    // true while `include_names` is off.
+    let _gate = NAMES_GATE.lock();
+    kimmy_api::telemetry::set_include_names(false);
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
     let (provider, exporter) = recorder();
 
@@ -242,9 +262,12 @@ fn health_and_metrics_are_not_traced() {
 }
 
 /// The privacy gate is process-global, so the two directions cannot run at the
-/// same time in one binary. One test, both directions, in order.
+/// same time in one binary. One test, both directions, in order — and under
+/// [`NAMES_GATE`], because turning names *on* here would otherwise break any
+/// other test asserting they are off.
 #[test]
 fn names_reach_a_span_only_when_the_operator_turned_them_on() {
+    let _gate = NAMES_GATE.lock();
     opentelemetry::global::set_text_map_propagator(TraceContextPropagator::new());
 
     // --- off: the default ------------------------------------------------
