@@ -43,6 +43,17 @@ pub const OIDC_LEEWAY_SECS: u64 = 60;
 /// key verified as though it were a shared secret.
 pub const OIDC_ALGORITHMS: [Algorithm; 2] = [Algorithm::RS256, Algorithm::ES256];
 
+/// The one scheme an audience can carry and still be a resource identifier.
+const HTTPS_SCHEME: &str = "https://";
+
+/// Where RFC 9728 §3 puts a protected resource's metadata.
+///
+/// Public because three places have to agree about it and only one of them can
+/// serve it: the route in `kimmy-api`, the URL named by `resource_metadata` in
+/// a `WWW-Authenticate` challenge, and the CLI fetching it off a node to learn
+/// where to authenticate.
+pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
 /// One value of the roles claim, and what holding it grants.
 ///
 /// Grants are written inline in the configuration file rather than looked up in
@@ -78,6 +89,26 @@ pub struct OidcSettings {
 }
 
 impl OidcSettings {
+    /// The audience read as an OAuth 2.0 resource identifier, when it is one.
+    ///
+    /// **There is deliberately no second config key for this.** A resource
+    /// identifier and an audience that had to be equal would be one value with
+    /// two names, and the startup refusal for disagreeing about it would be an
+    /// invented failure mode. So the audience decides: written as an absolute
+    /// URI it *is* the resource identifier, and this node publishes RFC 9728
+    /// metadata naming it. Written as a bare string — `"kimmydb"`, or whatever
+    /// a provider with no RFC 8707 support mints — everything works exactly as
+    /// it did before this existed, minus the metadata document (ADR-071).
+    ///
+    /// **`https` and nothing else.** Not every audience with a scheme is a
+    /// resource identifier: Entra ID's own default audience for a registered
+    /// application is `api://<guid>`, which is an absolute URI, is not
+    /// dereferenceable, and could never serve a metadata document. Treating
+    /// those as opaque is what keeps a canonical Entra deployment working.
+    pub fn resource_identifier(&self) -> Option<&str> {
+        self.audience.starts_with(HTTPS_SCHEME).then_some(self.audience.as_str())
+    }
+
     /// Refuse settings that cannot mean what they say.
     ///
     /// Called by `Config::validate` as well as by [`OidcVerifier::new`], for the
@@ -85,6 +116,35 @@ impl OidcSettings {
     /// exactly what the server would refuse, and an entrypoint check that
     /// blesses a configuration the node then rejects is worse than no check.
     pub fn validate(&self) -> Result<()> {
+        // Two refusals, and deliberately no more. An audience of `http://…` is
+        // somebody writing a resource identifier and getting the scheme wrong,
+        // which is worth stopping — the identifier is where a client fetches
+        // this node's metadata, and over plaintext anyone on the path could
+        // answer with a *different* authorization server, which is a way to
+        // have credentials sent somewhere else entirely. A fragment is refused
+        // because RFC 8707 §2 forbids one and `aud` is matched byte for byte,
+        // so it could only ever fail to match.
+        //
+        // Everything else with a scheme is left alone rather than policed:
+        // `api://<guid>` is Entra ID's own default audience, and `urn:` values
+        // are common elsewhere. Neither is dereferenceable, so neither can be a
+        // resource identifier — but both are perfectly good audiences, and
+        // refusing them would break the deployments this workstream exists to
+        // serve.
+        let reason = if self.audience.starts_with("http://") {
+            Some("it is not https")
+        } else if self.audience.starts_with(HTTPS_SCHEME) && self.audience.contains('#') {
+            Some("it carries a fragment")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            return Err(AuthError::InvalidResourceIdentifier {
+                audience: self.audience.clone(),
+                reason: reason.to_string(),
+            });
+        }
+
         for mapping in &self.role_mappings {
             // `admin` is reserved to local users as a break-glass boundary
             // (ADR-067). If the identity provider is misconfigured or taken
@@ -667,5 +727,100 @@ mod tests {
         assert!(principal.can(Action::Read, "sales", Some("orders")));
         assert!(principal.can(Action::Write, "hr", Some("people")));
         assert!(!principal.can(Action::Write, "sales", Some("orders")));
+    }
+
+    // -----------------------------------------------------------------------
+    // The audience as a resource identifier (ADR-071)
+    // -----------------------------------------------------------------------
+
+    fn with_audience(audience: &str) -> OidcSettings {
+        OidcSettings { audience: audience.into(), ..settings() }
+    }
+
+    #[test]
+    fn an_https_audience_is_the_resource_identifier() {
+        let settings = with_audience("https://kimmydb.example.com");
+        settings.validate().unwrap();
+        assert_eq!(settings.resource_identifier(), Some("https://kimmydb.example.com"));
+    }
+
+    #[test]
+    fn an_opaque_audience_is_not_a_resource_identifier_and_is_still_valid() {
+        // The configuration that shipped first, and the only one available from
+        // a provider that does not implement RFC 8707. It must keep working
+        // untouched -- it simply publishes no metadata.
+        let settings = with_audience("kimmydb");
+        settings.validate().unwrap();
+        assert_eq!(settings.resource_identifier(), None);
+    }
+
+    #[test]
+    fn an_entra_style_api_audience_is_opaque_rather_than_refused() {
+        // `api://<guid>` is Entra ID's own default audience for a registered
+        // application. It is an absolute URI and it is not dereferenceable, so
+        // it can never be a resource identifier -- but refusing it would break
+        // a canonical deployment of a provider this workstream names as a
+        // target. Same for the `urn:` values other providers mint.
+        for audience in ["api://11111111-2222-3333-4444-555555555555", "urn:kimmydb:cluster"] {
+            let settings = with_audience(audience);
+            settings.validate().unwrap_or_else(|e| panic!("{audience} must be accepted: {e}"));
+            assert_eq!(settings.resource_identifier(), None, "{audience}");
+        }
+    }
+
+    #[test]
+    fn a_plaintext_audience_is_refused() {
+        // Somebody writing a resource identifier and getting the scheme wrong.
+        // The identifier is where a client fetches this node's metadata, so
+        // over plaintext anyone on the path could name a different
+        // authorization server -- and have credentials sent there instead.
+        let err = with_audience("http://kimmydb.example.com").validate().unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidResourceIdentifier { .. }),
+            "expected a resource identifier refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn an_audience_with_a_fragment_is_refused() {
+        // RFC 8707 §2 forbids one, and `aud` is matched byte for byte, so a
+        // fragment could only ever fail to match.
+        let err = with_audience("https://kimmydb.example.com#node").validate().unwrap_err();
+        assert!(
+            matches!(err, AuthError::InvalidResourceIdentifier { .. }),
+            "expected a resource identifier refusal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn a_token_audienced_to_the_resource_identifier_is_accepted() {
+        // The point of the whole workstream: a token minted *for this node*
+        // rather than for whatever the provider defaults to.
+        const RESOURCE: &str = "https://kimmydb.example.com";
+        let verifier = OidcVerifier::new(with_audience(RESOURCE))
+            .unwrap()
+            .with_keys(jwks(Algorithm::RS256, KID));
+
+        let mut claims = claims(json!(["kimmydb-analyst"]));
+        claims["aud"] = json!(RESOURCE);
+        let principal = verifier.verify(&sign(Algorithm::RS256, Some(KID), claims)).unwrap();
+
+        assert!(principal.federated);
+        assert!(principal.can(Action::Read, "sales", Some("orders")));
+    }
+
+    #[test]
+    fn a_token_audienced_to_the_issuer_is_refused_once_a_resource_is_configured() {
+        // The failure an operator will actually hit while wiring this up: the
+        // provider still has no `protected_resources` entry, so it falls back to
+        // its default audience. Refusing it is correct -- it is a token for
+        // something else -- and this test is what says the refusal is by design.
+        let verifier = OidcVerifier::new(with_audience("https://kimmydb.example.com"))
+            .unwrap()
+            .with_keys(jwks(Algorithm::RS256, KID));
+
+        let mut claims = claims(json!(["kimmydb-analyst"]));
+        claims["aud"] = json!(ISSUER);
+        assert!(verifier.verify(&sign(Algorithm::RS256, Some(KID), claims)).is_err());
     }
 }

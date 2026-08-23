@@ -73,9 +73,9 @@ the local path is refused. Both have tests ([ADR-064](decisions.md)).
 
 ```toml
 [auth.oidc]
-issuer = "https://auth.example.com"   # https only; discovery starts here
-audience = "kimmydb"                  # required — see below
-roles_claim = "roles"                 # "groups" for Entra ID
+issuer = "https://auth.example.com"          # https only; discovery starts here
+audience = "https://kimmydb.example.com"     # required — and see "Naming this node" below
+roles_claim = "roles"                        # "groups" for Entra ID
 
 [[auth.oidc.role_mappings]]
 claim_value = "kimmydb-analyst"
@@ -93,9 +93,80 @@ Refused at startup, each because of what it would otherwise break:
 | An issuer with no audience | A provider signs for every application that trusts it; without an audience a token minted for the company wiki authenticates here |
 | An audience with no issuer | Nothing to match `iss` against and nowhere to fetch keys — every federated token would be refused |
 | A non-`https` issuer | Discovery and the JWKS are fetched from it; over plaintext anyone on the path substitutes their own signing keys |
+| An `http://` audience | An https resource identifier with the scheme mistyped; over plaintext a client could be pointed at a different authorization server and send its credentials there |
+| An audience with a fragment | RFC 8707 §2 forbids one, and `aud` is matched byte for byte, so it could only ever fail to match |
 | A mapping naming `admin` | See below |
 | A mapping naming an unknown action | Caught while the file is parsed — the error names the bad value and lists the valid ones |
 | `auth.oidc` together with `--insecure-no-auth` | Every request is already a superuser, so the mappings would enforce nothing while appearing to |
+
+### Naming this node: the audience is the resource identifier
+
+A provider signs tokens for everything that trusts it, so `audience` is what
+stops a token minted for the company wiki from working here. **But an audience
+only narrows anything if the provider can actually mint a token for *this*
+node** — and asking for one is RFC 8707, where a client sends a `resource`
+parameter naming the resource server it wants a token for.
+
+That parameter needs a name for this node, and this is it:
+
+```toml
+audience = "https://kimmydb.example.com"
+```
+
+**There is deliberately no separate `resource_identifier` setting.** Two values
+that must always be equal are one value, and the startup refusal for them
+disagreeing would be a failure mode invented by the design. So the audience
+decides. Written as an `https` URL it *is* the resource identifier, and the
+node then:
+
+- publishes [protected resource metadata](http-api.md#protected-resource-metadata)
+  at `/.well-known/oauth-protected-resource`, naming itself and its issuer;
+- points at that document from every 401, via `resource_metadata`;
+- lets `kimmy login --oidc --url https://kimmydb.example.com` work with nothing
+  else configured, because the CLI reads both values off the node.
+
+The identifier is **not a free choice**. RFC 9728 §3 puts the metadata at
+`<identifier>/.well-known/oauth-protected-resource`, so it has to be the public
+base URL clients reach this node at.
+
+It also has to agree with the provider, in three places that are compared byte
+for byte:
+
+| Where | What |
+|---|---|
+| The provider's list of resource servers | e.g. `oauth.protected_resources` |
+| The client registration asking for a token | e.g. `allowed_resources` |
+| This node | `auth.oidc.audience` |
+
+Get one of them wrong and the provider answers `invalid_target`, or issues a
+token whose `aud` this node then refuses. Both are the system working.
+
+#### When the audience is not a URL
+
+`audience = "kimmydb"` keeps working exactly as it always has. So does Entra
+ID's `api://<guid>`, and a `urn:` value — neither is dereferenceable, so
+neither can be a resource identifier, and refusing them would break canonical
+deployments of providers this supports. What you give up is only the metadata
+document and the `resource` parameter: tokens then carry whatever audience the
+provider defaults to, **shared with every other resource that trusts it**,
+which is the thing an audience restriction exists to prevent. The node says
+which mode it is in at startup, and `kimmyd check-config` says so too.
+
+Only `http://` is refused, because that is an https identifier with the scheme
+mistyped rather than a different kind of value ([ADR-071](decisions.md)).
+
+### Refusals say how to authenticate
+
+Every 401 and 403 carries `WWW-Authenticate`, as RFC 6750 §3 requires. A
+request that offered **no** credentials is told only how to authenticate and
+deliberately carries no `error` code — `invalid_token` means "refresh and
+retry", which is the wrong advice for a client that has not tried yet. A bad or
+expired token gets `invalid_token`; a 403 gets `insufficient_scope`.
+
+The 403 challenge is byte-identical whether the target exists or not, so it
+adds nothing to the uniform-403 property described under
+[RBAC](#rbac). `POST /v1/auth/login` carries no challenge at all: it is where a
+token comes from, not a bearer-protected resource.
 
 ### `admin` is not federatable
 
@@ -174,14 +245,32 @@ called `root`. `/v1/auth/whoami` reports the same flag.
 
 ### Getting a token
 
+When the node names itself as a resource, the client id is the only thing the
+CLI cannot work out for itself:
+
 ```bash
-export KIMMY_OIDC_ISSUER=https://auth.example.com
+export KIMMY_URL=https://kimmydb.example.com
 export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 
 export KIMMY_TOKEN=$(kimmy login --oidc)                # RFC 8628 device flow
 export KIMMY_TOKEN=$(kimmy login --client-credentials)  # a service; secret from
                                                         # KIMMY_OIDC_CLIENT_SECRET
 ```
+
+The issuer and the resource come from the node's own metadata document. Set
+`--issuer`/`KIMMY_OIDC_ISSUER` or `--resource`/`KIMMY_OIDC_RESOURCE` to override
+either, and set both when the node publishes nothing:
+
+```bash
+export KIMMY_OIDC_ISSUER=https://auth.example.com
+export KIMMY_OIDC_RESOURCE=https://kimmydb.example.com
+```
+
+Both flows send the resource as an RFC 8707 `resource` parameter — the device
+flow on the authorization request *and* the token request, since a token
+request may narrow a grant and never widen it. Omitted when there is no
+resource to name, which is the well-defined "your default audience" every
+provider predating RFC 8707 implements.
 
 The device flow rather than a redirect, for the reason `gh auth login` uses it:
 a redirect needs a browser and a loopback listener on the same machine, and a

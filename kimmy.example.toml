@@ -223,6 +223,33 @@ token_ttl_secs = 3600
 # A provider signs tokens for every application that trusts it. Without an
 # audience restriction, a token minted for the company wiki would authenticate
 # against this database.
+#
+# **Write it as the public https URL clients reach this node at, if you can.**
+# There is deliberately no second setting for the resource identifier: an
+# audience written as an https URL *is* one, and it turns on two things that
+# only work when this node has a name an authorization server knows —
+#
+#   - RFC 9728 metadata at /.well-known/oauth-protected-resource, which is what
+#     lets `kimmy login --oidc --url <this node>` work with nothing else set,
+#     and what a conformant MCP client reads to find where to authenticate;
+#   - a `resource_metadata` pointer on every 401, so a client that gets refused
+#     can find out where to go.
+#
+# It also has to be registered with the provider — as a resource server it will
+# issue tokens for, and on each client that may ask for one. On some providers
+# that is `oauth.protected_resources` plus `allowed_resources` on the
+# registration. All three values must match byte for byte: `aud` is compared
+# exactly.
+#
+# audience = "https://kimmydb.example.com"
+#
+# An opaque audience keeps working exactly as it always has — it simply
+# publishes no metadata, and every token this node accepts carries whatever
+# audience the provider defaults to, shared with every other resource that
+# trusts it. Use one when the provider does not implement RFC 8707, or when it
+# mints something that is not dereferenceable (Entra ID's `api://<guid>`, or a
+# `urn:` value). Both are accepted; only `http://` is refused, because that is
+# an https URL with the scheme mistyped.
 # audience = "kimmydb"
 
 # Which claim carries the caller's roles. "roles" for most providers,
@@ -264,10 +291,11 @@ token_ttl_secs = 3600
 # KIMMY_OIDC_REFRESH_INTERVAL_SECS. The mappings are file-only — a grant is a
 # structure, and a command line is where structures go to be mistyped.
 #
-# `kimmyd check-config` reaches the provider and reports what it found. The
-# server deliberately does not: a briefly unreachable identity provider must
-# not stop a database from restarting, so it retries in the background and
-# local users keep working meanwhile.
+# `kimmyd check-config` reaches the provider and reports what it found, and
+# says whether this node publishes protected resource metadata. The server
+# deliberately does not reach the provider: a briefly unreachable identity
+# provider must not stop a database from restarting, so it retries in the
+# background and local users keep working meanwhile.
 
 [cluster]
 # KimmyDB is leaderless: there is no primary, no election, and no quorum. Each

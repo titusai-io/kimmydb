@@ -6,6 +6,59 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **KimmyDB has a name of its own to an authorization server**
+
+The branch that wrote this section closes the gap that made WS1's federation
+correct and unusable: **the CLI could not send an RFC 8707 `resource` parameter
+at all**, so the only audience `kimmy login` could ever obtain was whatever the
+provider defaulted to — its issuer URL, for a conformant server. That made
+`audience = "<issuer>"` the one working configuration, which is a single
+audience shared by every resource the provider serves, which is exactly what an
+audience restriction exists to prevent.
+
+**Read [ADR-071](decisions.md) before touching any of it.** The short version:
+`auth.oidc.audience` *is* the resource identifier when it is an `https` URL.
+There is deliberately no second key. Two values that must always be equal are
+one value, and the startup refusal invented to police them was the tell.
+
+**Three things follow from the identifier, and they are one feature:** RFC 9728
+metadata at `/.well-known/oauth-protected-resource`; a `WWW-Authenticate`
+challenge on every 401/403 pointing at it (RFC 6750 §3); and `kimmy login`
+sending the identifier as a `resource` parameter on both flows. The payoff is
+`kimmy login --oidc --url <node>` with nothing else set — the CLI reads the
+issuer and the resource off the node — and it is the same path a conformant MCP
+client uses to discover where to authenticate, which matters because `/mcp` is
+on this listener.
+
+**Three things worth knowing before changing it:**
+
+1. **The `http://`-only refusal is deliberate and narrow.** The obvious reading
+   of RFC 8707 §2 is "validate every audience that has a scheme", and it would
+   refuse `api://<guid>` — Entra ID's own default audience for a registered
+   application, and Entra is a named target provider. A scheme does not make an
+   audience a resource identifier; `https` does. `api://` and `urn:` values stay
+   valid and simply publish nothing.
+2. **The challenge is a middleware, not part of `ApiError`.** The RFC 6750 §3
+   distinction between a request that offered no credentials and one that
+   offered a bad one depends on the *request*, which an error value has never
+   seen — and `From<AuthError>` has no state to find the metadata URL with
+   anyway. `count_request` already wraps every route and still holds the
+   request. `/v1/auth/login` is excluded on purpose.
+3. **The router registers the well-known path as a literal.** Building it from
+   `PROTECTED_RESOURCE_METADATA_PATH` made the route invisible to the route
+   scanner in `tests/openapi.rs`, which reads source literals — so the docs
+   contract stopped covering it while still passing. That scanner also now
+   normalises axum's `{*name}` catch-all to OpenAPI's `{name}`, because the two
+   spell the same parameter differently and nothing else in the file knew.
+
+**Not done, and next:** the end-to-end validation against the live IdP. It needs
+the resource registered at the provider — on some providers that is
+`oauth.protected_resources` plus `allowed_resources` on each client
+registration, all matching `auth.oidc.audience` byte for byte. Nothing in the
+code waits on it.
+
+---
+
 ## As of 2026-08-23 — **OpenTelemetry is in, and it exports spans only**
 
 The branch that wrote this section adds distributed tracing and OTLP metrics.

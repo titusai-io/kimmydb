@@ -58,6 +58,50 @@ impl Federation {
         self.verifier.read().issuer().to_string()
     }
 
+    /// What this node calls itself to an authorization server, when it can.
+    ///
+    /// `None` when the audience is an opaque string rather than an https URI —
+    /// a perfectly ordinary configuration, and the one that shipped first. It
+    /// means no RFC 9728 metadata and no `resource` parameter, not a fault.
+    pub fn resource_identifier(&self) -> Option<String> {
+        self.verifier.read().settings().resource_identifier().map(str::to_string)
+    }
+
+    /// Where this node's own RFC 9728 metadata lives, for the `resource_metadata`
+    /// parameter of a `WWW-Authenticate` challenge (RFC 9728 §5.1).
+    ///
+    /// Built from the identifier rather than from the request's `Host`, because
+    /// the identifier is the name the authorization server was told about; a
+    /// challenge pointing anywhere else would send a client to look up a
+    /// resource nobody issued a token for.
+    pub fn resource_metadata_url(&self) -> Option<String> {
+        self.resource_identifier().map(|resource| metadata_url_for(&resource))
+    }
+
+    /// The path that URL resolves to on this node, so the route can refuse a
+    /// request for a *different* resource's metadata rather than answering for
+    /// everything under the well-known prefix.
+    pub fn resource_metadata_path(&self) -> Option<String> {
+        self.resource_identifier().map(|resource| metadata_path_for(&resource))
+    }
+
+    /// The RFC 9728 protected resource metadata document.
+    ///
+    /// **No `scopes_supported`.** Authorization here is roles carried in the
+    /// token, not scopes, and advertising a scope vocabulary would describe an
+    /// access-control model this database does not implement — a client that
+    /// asked for those scopes would get them and still be told no.
+    pub fn protected_resource_metadata(&self) -> Option<serde_json::Value> {
+        let verifier = self.verifier.read();
+        let settings = verifier.settings();
+        let resource = settings.resource_identifier()?;
+        Some(serde_json::json!({
+            "resource": resource,
+            "authorization_servers": [settings.issuer],
+            "bearer_methods_supported": ["header"],
+        }))
+    }
+
     /// How many signing keys are currently trusted. Zero until the first fetch
     /// lands, which is a state the node serves in rather than refusing to start.
     pub fn key_count(&self) -> usize {
@@ -109,6 +153,35 @@ impl Federation {
         debug!(kid, "a token named an unknown signing key; asking for a fresh JWKS");
         self.refresh.notify_one();
     }
+}
+
+/// The path a resource identifier's metadata is served at (RFC 9728 §3).
+///
+/// **Inserted between the authority and the path, not appended.** For the
+/// ordinary identifier with no path this is just the well-known path, but for
+/// `https://host/kimmy` it is `/.well-known/oauth-protected-resource/kimmy` —
+/// which is what keeps two resources on one host distinguishable, and is the
+/// same construction OIDC Discovery gets wrong often enough to be worth
+/// spelling out.
+fn metadata_path_for(resource: &str) -> String {
+    let path = resource
+        .trim_end_matches('/')
+        .strip_prefix("https://")
+        .and_then(|authority_and_path| {
+            authority_and_path.find('/').map(|at| &authority_and_path[at..])
+        })
+        .unwrap_or("");
+    format!("{}{path}", kimmy_auth::PROTECTED_RESOURCE_METADATA_PATH)
+}
+
+/// The absolute URL of that document, as a challenge has to name it.
+fn metadata_url_for(resource: &str) -> String {
+    let trimmed = resource.trim_end_matches('/');
+    let authority_end = trimmed
+        .strip_prefix("https://")
+        .and_then(|authority_and_path| authority_and_path.find('/'))
+        .map_or(trimmed.len(), |at| "https://".len() + at);
+    format!("{}{}", &trimmed[..authority_end], metadata_path_for(resource))
 }
 
 #[cfg(test)]

@@ -98,6 +98,12 @@ fn registered_operations() -> BTreeSet<(String, String)> {
         // `routes.rs` did — silently skipped exactly those three.
         let quoted = after.find('"').expect("a route path literal");
         let path = after[quoted + 1..].split('"').next().expect("a closing quote");
+        // axum spells a catch-all segment `{*name}`; OpenAPI path templating
+        // has no wildcard form and spells the same parameter `{name}`. The two
+        // vocabularies cannot be compared without saying so somewhere, and
+        // here is the one place that reads both.
+        let path = path.replace("{*", "{");
+        let path = path.as_str();
 
         // The registration runs to the paren matching `.route(`. Route paths
         // hold no parens, so counting them is enough.
@@ -279,7 +285,18 @@ fn every_versioned_route_carries_the_protocol_major() {
     // The unversioned routes, and why each one is allowed to be: an
     // infrastructure probe is not part of the client protocol and must not
     // move when the protocol majors.
-    const UNVERSIONED: [&str; 3] = ["/healthz", "/readyz", "/metrics"];
+    //
+    // The two well-known paths are unversioned for a stronger reason than the
+    // probes: RFC 9728 §3 *fixes* where they live. A client looks for them at
+    // that exact location, so moving them under `/v1` would put them where no
+    // conformant client would look.
+    const UNVERSIONED: [&str; 5] = [
+        "/healthz",
+        "/readyz",
+        "/metrics",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource/{resource_path}",
+    ];
 
     let protocol = kimmy_api::version::PROTOCOL;
     let stray: Vec<_> = documented_operations()
@@ -661,6 +678,29 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     );
     assert!(String::from_utf8_lossy(&metrics.raw).contains("kimmy_up 1"));
     c.covered.insert(("GET".into(), "/metrics".into()));
+
+    // This node federates with nobody, so both well-known paths answer the
+    // documented 404 — which is the response worth driving here, because it is
+    // what every non-federated deployment serves. The 200 shape needs a node
+    // with an identity provider configured and is covered in `tests/api.rs`.
+    c.check(
+        "GET",
+        "/.well-known/oauth-protected-resource",
+        "/.well-known/oauth-protected-resource",
+        None,
+        None,
+        404,
+    )
+    .await;
+    c.check(
+        "GET",
+        "/.well-known/oauth-protected-resource/{resource_path}",
+        "/.well-known/oauth-protected-resource/nodes/one",
+        None,
+        None,
+        404,
+    )
+    .await;
 
     // Unauthenticated on purpose: a client negotiates before it holds a token.
     let advertised = c.check("GET", "/v1/version", "/v1/version", None, None, 200).await;

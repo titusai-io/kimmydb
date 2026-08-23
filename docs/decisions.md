@@ -3227,6 +3227,79 @@ use dots (`kimmy.requests`). Anyone correlating the two surfaces has to know
 that, and it is written down here because nothing about either name reveals it.
 
 
+## ADR-071 — The audience is the resource identifier, and there is no second key for it
+
+**Decision.** KimmyDB names itself as an OAuth 2.0 protected resource, and the
+name is `auth.oidc.audience`. Written as an `https` URL it is the RFC 8707
+resource identifier: the node publishes RFC 9728 metadata at
+`/.well-known/oauth-protected-resource`, every 401 and 403 carries an RFC 6750
+`WWW-Authenticate` challenge pointing at it, and `kimmy login` sends the
+identifier as a `resource` parameter on both OAuth flows. Written as anything
+else — `kimmydb`, Entra ID's `api://<guid>`, a `urn:` — the audience is opaque:
+no metadata, no `resource` parameter, and behaviour identical to what shipped in
+0.2.0.
+
+**Alternatives.** A separate `resource_identifier` key beside `audience`, with
+a startup refusal when the two disagreed. A `publish_metadata` boolean. Making
+the resource identifier mandatory whenever OIDC is configured.
+
+**Why.** The gap this closes is not cosmetic. The CLI could not send a
+`resource` parameter at all, so the only audience it could obtain was whatever
+the provider defaulted to — for a conformant server, its own issuer URL. That
+made `audience = "<issuer>"` the only configuration that worked, which is one
+audience shared by every resource the provider serves, which is precisely what
+an audience restriction exists to prevent. The correct configuration existed on
+paper and was unreachable from the tool.
+
+The rejected alternative is the instructive one. Two keys that must always be
+equal are one key, and the startup refusal invented to police them was the tell:
+it would have been enforcing a rule the design created. Deriving the identifier
+from the audience also makes the change **non-breaking** — every existing
+configuration keeps its exact behaviour without being edited.
+
+**Only `http://` is refused, and that is a deliberately narrow rule.** The
+obvious reading of RFC 8707 §2 — "an absolute URI, so validate every audience
+with a scheme" — would refuse `api://<guid>`, which is Entra ID's own default
+audience for a registered application, and Entra is a named target provider.
+Those values are absolute URIs, are not dereferenceable, and can never be
+resource identifiers; they are perfectly good audiences. So a scheme alone does
+not make an audience a resource identifier — `https` does — and the only refusals
+are `http://` (an https identifier with the scheme mistyped, where a client
+could be pointed at a substitute authorization server and send its credentials
+there) and a fragment (forbidden by §2, and `aud` is matched byte for byte, so
+it could only ever fail to match).
+
+**No `scopes_supported` in the metadata.** Authorization here is roles carried
+in the token. Advertising a scope vocabulary would describe an access-control
+model this database does not implement, and a client that asked for those
+scopes would receive them and still be refused.
+
+**The challenge is a middleware, not part of `ApiError`.** A 401 arrives from
+two unrelated places — the `Auth` extractor building one directly, and
+`From<AuthError>` converting a verifier's refusal — and the conversion has no
+access to state, so it cannot know the metadata URL. More importantly, the RFC
+6750 §3 distinction between a request that offered **no** credentials (a bare
+challenge, no `error` code) and one that offered a bad one (`invalid_token`)
+depends on the *request*, which an error value has never seen. One layer that
+already wraps every route answers both. `/v1/auth/login` is excluded: it is
+where a token comes from, not a bearer-protected resource, and challenging
+there would tell a client to come back with the thing it is asking for.
+
+**Cost.** The identifier is no longer a free string — RFC 9728 §3 puts the
+metadata at `<identifier>/.well-known/oauth-protected-resource`, so it has to be
+the public base URL clients reach the node at, and it has to match the
+provider's own registration byte for byte in two more places. An operator who
+gets it wrong sees `invalid_target` from the provider or a refused token here.
+Both are the system working, and neither is self-evident from the error alone,
+which is why `kimmyd check-config` and the startup log both say which mode the
+node is in.
+
+The router also registers the well-known path as a **literal** rather than
+building it from the shared constant, because the documentation contract in
+`tests/openapi.rs` scans the source for route literals and a computed path is a
+route that silently escapes it. A test holds the literal and the constant
+together.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
