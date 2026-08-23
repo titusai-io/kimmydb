@@ -10,6 +10,76 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **Enterprise OIDC federation.** A node can now accept tokens from one
+  external OpenID Connect provider alongside its own local users. Configure it
+  under `[auth.oidc]` (or `KIMMY_OIDC_ISSUER` / `KIMMY_OIDC_AUDIENCE` /
+  `KIMMY_OIDC_ROLES_CLAIM`), map claim values to grants with
+  `[[auth.oidc.role_mappings]]`, and every route, MCP tool and audit record
+  works for a federated caller exactly as it does for a local one.
+  RS256/ES256 against the provider's JWKS, with issuer, audience and expiry
+  validation and 60 seconds of clock-skew allowance. See
+  [docs/security.md](docs/security.md) and ADR-064.
+- `kimmy login --oidc` — RFC 8628 device authorization, the flow `gh auth
+  login` uses. The code and URL go to stderr and the bare token to stdout, so
+  `export KIMMY_TOKEN=$(kimmy login --oidc)` works as it always has. Nothing
+  is written to disk, and no refresh token is ever requested or kept.
+- `kimmy login --client-credentials` — for a service account. The client
+  secret comes from `KIMMY_OIDC_CLIENT_SECRET`; there is deliberately no flag
+  for it, for the same reason there is no `--password`.
+- `Builder::token_provider` on the Rust client: an async callback that supplies
+  a fresh token at connect time, before expiry, and once after a 401. This is
+  how a long-lived application plugs in its own OIDC refresh — the client
+  library deliberately does not implement OAuth2.
+- `kimmy_jwks_refresh_total{outcome}` on `/metrics`. Worth an alert: a node
+  that has stopped reaching its provider keeps verifying perfectly until the
+  provider rotates its keys, and then refuses every federated caller at once.
+- `kimmyd check-config` now performs a live discovery and JWKS fetch when
+  `[auth.oidc]` is configured, and fails if the provider cannot be reached.
+
+### Changed
+
+- `GET /v1/auth/whoami` gained a `federated` boolean. A name cannot answer the
+  question — an identity provider is free to assert a subject matching a local
+  account — and a federated principal has no local record, so it cannot change
+  a password or be revoked from here.
+- Audit records carry `federated` alongside `unauthenticated`, so the three
+  origins of a principal stay distinguishable in the log.
+- The `kimmy` CLI's 401 hint is now issuer-aware: with `KIMMY_OIDC_ISSUER` set
+  it points at `kimmy login --oidc` rather than at a local password login the
+  caller may not have.
+- `POST /v1/auth/refresh` refuses a federated principal with a 400 explaining
+  that the identity provider renews that token. Previously it would have
+  failed with a misleading "this token is no longer valid".
+- The container image is tagged `latest` only for a final release. Previously
+  a prerelease tag would have taken over `:latest` if prerelease publishing
+  were ever enabled.
+
+### Security
+
+- **`admin` cannot be granted through an IdP claim.** A role mapping naming the
+  `admin` action stops the node at startup. Administration stays reachable only
+  through a local account, so a misconfigured or compromised identity provider
+  cannot mint a superuser over the database (ADR-067).
+- Federation is refused in combination with `--insecure-no-auth`, where the
+  role mappings would enforce nothing while appearing to.
+- A non-`https` `auth.oidc.issuer` is refused: the signing keys are fetched
+  from that URL, and over plaintext they can be substituted.
+
+### Notes for operators
+
+- **Federated sessions cannot be revoked from KimmyDB.** There is no local
+  record to carry a token version, so the session ends when the provider's
+  token expires. Keep federated token lifetimes short (ADR-065).
+- Role mappings are configuration: changing one is an edit and a restart, and
+  in a cluster a rolling one (ADR-066).
+- Startup does **not** wait for the identity provider. A briefly unreachable
+  provider must not stop a database from restarting, so the key fetch retries
+  in the background and local users keep working meanwhile.
+
 ## 0.1.0 - 2026-08-23
 
 The first tagged release. Everything below already works and is exercised by

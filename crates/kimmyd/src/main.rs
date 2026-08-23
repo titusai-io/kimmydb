@@ -23,6 +23,34 @@ fn main() -> Result<()> {
         Command::CheckConfig => {
             println!("{}", toml::to_string_pretty(&config)?);
             eprintln!("configuration is valid");
+
+            // The one check that needs the network, and the only place it is
+            // ever fatal. The server retries instead of refusing, because a
+            // briefly unreachable identity provider must not stop a database
+            // from restarting — which means a misspelled issuer would
+            // otherwise show up as a warning in a log and federated tokens
+            // failing forever. Here, an operator is watching.
+            if config.auth.oidc.is_configured() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .context("building the tokio runtime")?;
+                let issuer = config.auth.oidc.issuer.as_deref().unwrap_or("");
+                match runtime.block_on(node::probe_oidc(&config.auth.oidc)) {
+                    Ok(keys) => eprintln!(
+                        "identity provider {issuer} answered discovery and published {keys} \
+                         signing key(s)"
+                    ),
+                    Err(e) => {
+                        eprintln!("identity provider {issuer} could not be reached: {e:#}");
+                        eprintln!(
+                            "note: the server does NOT refuse to start for this -- it retries in \
+                             the background, and local users keep working meanwhile."
+                        );
+                        return Err(e.context("checking the OIDC provider"));
+                    }
+                }
+            }
             Ok(())
         }
         Command::Restore { from, until } => {

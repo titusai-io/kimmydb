@@ -58,7 +58,7 @@ graph TB
 
 ## The load-bearing invariants
 
-These nine carry disproportionate weight. Anything that breaks one produces
+These ten carry disproportionate weight. Anything that breaks one produces
 wrong answers, or a silently weakened defence, rather than a crash.
 
 ### 1. Key encoding order
@@ -245,6 +245,45 @@ response would say so.
 
 Certificates are generated per run with `rcgen` rather than checked in: a
 private key in the repository trips secret scanners and eventually expires.
+
+### 10. A token is only ever accepted by the verifier it claims to belong to
+
+```
+verifier(token) = f(unverified iss)        and        |{verifiers offered token}| = 1
+```
+
+With two verifiers in the process — HS256 against the cluster secret, and
+RS256/ES256 against an identity provider's JWKS — the classic failure is one
+verifier reading the algorithm out of the header and choosing a key to match,
+because the provider's *public* key then becomes an HMAC secret anybody can
+sign with. The structural defence is that routing happens before either
+verifier runs and each pins its own algorithm list ([ADR-064](decisions.md)).
+The tests exist because that is an argument, not a proof:
+
+- `a_locally_signed_token_claiming_the_external_issuer_is_refused` — the
+  confusion attempt from the inside: a token this cluster signed, carrying the
+  external `iss`, routes to the OIDC verifier and is refused
+- `an_rs256_header_on_the_local_path_is_refused` — and from the other side
+- `an_hs256_token_is_refused_on_the_oidc_path` — the same property asserted in
+  `kimmy-auth`, where the verifier is reachable without a server
+- `a_token_from_a_third_issuer_is_refused_by_both_verifiers` — correctly signed
+  by the provider's key, but naming an issuer this node does not federate with
+- `a_token_with_no_audience_at_all_is_rejected` — the quiet one: `aud` is only
+  *compared* when present, so requiring it is what makes the audience
+  restriction mean anything
+- `a_role_mapping_that_grants_admin_is_refused_at_startup` — the break-glass
+  boundary ([ADR-067](decisions.md)), asserted in the config layer and in
+  `kimmy-auth` so `check-config` cannot bless what the node refuses
+- `a_federated_principal_skips_the_check_entirely` — and asserts a *local* user
+  of the same name stays independently revocable, which is the failure the skip
+  is really guarding against ([ADR-065](decisions.md))
+- `the_record_says_where_the_identity_came_from` — captures the audit
+  subscriber's output, because the record's fields are the contract a collector
+  reads
+
+All of it runs against a **stub identity provider**: a fixed key pair and a
+canned discovery document. A test that needs somebody's IdP reachable fails for
+reasons that have nothing to do with the code under test.
 
 ---
 

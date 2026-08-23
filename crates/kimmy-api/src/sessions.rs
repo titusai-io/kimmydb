@@ -81,6 +81,16 @@ impl Sessions {
             return Ok(());
         }
 
+        // The identity came from the external provider, so there is no user
+        // record to check against either — and looking one up would find
+        // nothing, which this treats as a revocation. Without this line every
+        // federated request is refused (ADR-065). What ends a federated
+        // session is the provider: a short token lifetime, and the provider
+        // declining to mint the next one.
+        if principal.federated {
+            return Ok(());
+        }
+
         match self.state(engine, &principal.user) {
             // Gone. No record means no version to bump — the absence *is* the
             // revocation, which is how deleting a user ends its sessions.
@@ -318,6 +328,35 @@ mod tests {
         // would refuse every request on a server that has no users at all.
         let (engine, sessions, _dir) = engine();
         assert!(sessions.check(&engine, &Principal::insecure_root()).is_ok());
+    }
+
+    #[test]
+    fn a_federated_principal_skips_the_check_entirely() {
+        // There is no `__users` record behind an identity the provider
+        // asserted, and the absence of a record is how this refuses a deleted
+        // account. Without the skip, every federated request would be refused
+        // as revoked — and the harder failure mode is the other way round: a
+        // *local* user of the same name would decide whether the federated one
+        // may connect.
+        let (engine, sessions, _dir) = engine();
+        let federated = Principal::federated("ada@example.com", vec![Grant::superuser()]);
+        assert!(sessions.check(&engine, &federated).is_ok());
+
+        // A local user with that exact name, disabled, must not change the
+        // answer — the two identities are not the same identity.
+        let store = UserStore::open(&engine).unwrap();
+        let mut u = store
+            .create(&engine, "ada@example.com", "password123", vec![Grant::superuser()])
+            .unwrap();
+        u.disabled = true;
+        store.replace_for_test(&engine, &u).unwrap();
+        sessions.evict("ada@example.com");
+
+        assert!(sessions.check(&engine, &federated).is_ok());
+        assert!(
+            sessions.check(&engine, &user("ada@example.com").at_version(0)).is_err(),
+            "the local account is still revoked, which is what makes the two distinguishable"
+        );
     }
 
     #[tokio::test]

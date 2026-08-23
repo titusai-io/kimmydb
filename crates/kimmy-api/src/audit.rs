@@ -137,13 +137,17 @@ pub fn record(
 
     let collection = collection.unwrap_or("*");
     // `unauthenticated` distinguishes "root did this" from "the server was
-    // started with authentication disabled", which an audit reader has to be
-    // able to tell apart — the same reason the flag exists on the principal.
+    // started with authentication disabled", and `federated` distinguishes
+    // both from "somebody the identity provider called root did this" — which
+    // an audit reader has to be able to tell apart, because a name alone
+    // cannot: nothing stops an IdP from asserting a subject that matches a
+    // local account. Same reason the flags exist on the principal.
     if allowed {
         info!(
             target: "kimmy::audit",
             user = %principal.user,
             unauthenticated = principal.unauthenticated,
+            federated = principal.federated,
             action = ?action,
             db = %db,
             collection = %collection,
@@ -155,6 +159,7 @@ pub fn record(
             target: "kimmy::audit",
             user = %principal.user,
             unauthenticated = principal.unauthenticated,
+            federated = principal.federated,
             action = ?action,
             db = %db,
             collection = %collection,
@@ -166,7 +171,79 @@ pub fn record(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use kimmy_auth::Grant;
+    use parking_lot::Mutex;
+
     use super::*;
+
+    /// A writer a test can read back, so an assertion can be made about the
+    /// record's fields rather than about the call that produced them.
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// The audit lines one decision produces, at `all`.
+    fn record_of(principal: &Principal) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        // Scoped to this thread, so a parallel test's mode does not leak in;
+        // the mode itself is process-global, hence set inside the scope.
+        tracing::subscriber::with_default(subscriber, || {
+            let previous = mode();
+            set_mode(AuditMode::All);
+            record(principal, Action::Read, "sales", Some("orders"), true);
+            set_mode(previous);
+        });
+        let out = sink.0.lock().clone();
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    #[test]
+    fn the_record_says_where_the_identity_came_from() {
+        // Three origins, and a name cannot separate them: nothing stops an
+        // identity provider from asserting a subject called "root". An audit
+        // reader has to be able to tell "root did this" from "somebody the IdP
+        // called root did this" from "the server was started with
+        // authentication off".
+        let local = record_of(&Principal::superuser("root"));
+        assert!(local.contains("user=root"), "{local}");
+        assert!(local.contains("unauthenticated=false"), "{local}");
+        assert!(local.contains("federated=false"), "{local}");
+
+        let federated = record_of(&Principal::federated(
+            "root",
+            vec![Grant::new("sales", "orders", vec![Action::Read])],
+        ));
+        assert!(federated.contains("user=root"), "{federated}");
+        assert!(federated.contains("federated=true"), "{federated}");
+        assert!(federated.contains("unauthenticated=false"), "{federated}");
+
+        let no_auth = record_of(&Principal::insecure_root());
+        assert!(no_auth.contains("unauthenticated=true"), "{no_auth}");
+        assert!(no_auth.contains("federated=false"), "{no_auth}");
+    }
 
     #[test]
     fn modes_parse_and_round_trip() {

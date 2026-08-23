@@ -124,6 +124,32 @@ token loops forever.
 covers a subset of an API and cannot reach the rest sends people back to `curl`
 for one call; every named method above is a convenience over it.
 
+### Federated tokens: a callback, not an OAuth2 client
+
+Against a node federated with an OIDC provider ([Security](security.md)),
+`credentials()` cannot produce a token — that endpoint is this database's own
+login and it stays local-only. `token_provider` takes an async callback the
+client calls at connect time, shortly before each token expires, and once more
+when a request comes back 401:
+
+```rust
+let client = Client::builder("https://kimmy.internal:7878")
+    .token_provider(|| async { my_oidc_library.access_token().await })
+    .connect()
+    .await?;
+```
+
+The callback is whatever the application already uses to talk to its provider.
+This crate deliberately does not implement OAuth2: an OAuth2 implementation
+inside a database client is a second one to keep correct, and an application
+that needs a token from a provider already has one. It is also why nothing
+here ever holds a refresh token.
+
+`/v1/auth/refresh` **refuses a federated principal** — a federated token is the
+provider's to renew, and minting a local one from it would launder the identity
+(ADR-065). So a `token_provider` is the whole renewal mechanism, and a
+`token()` handed in by hand is used until the server stops accepting it.
+
 ---
 
 ## Python — `kimmydb`
@@ -312,13 +338,40 @@ true.
 
 ---
 
+## Federation in the Python and Go clients: not yet
+
+Both accept a bearer token today, which is all a federated deployment strictly
+needs — obtain one from your provider, hand it over, and every route works. What
+they do **not** have is the Rust client's `token_provider`: a long-lived Python
+or Go application has to notice a 401 and rebuild its client rather than being
+renewed underneath.
+
+Deferred rather than forgotten, and deliberately: the callback's shape is the
+part worth getting right per language — an `async def` returning a string is not
+the same decision as a `func() (string, error)` versus a `TokenSource` in the
+shape `golang.org/x/oauth2` already established — and the conformance suite
+drives all three clients against a real server, so proving the behaviour needs a
+stub identity provider in the harness. That is a piece of work with its own
+design, not a translation of this one.
+
+Until then, both clients are usable against a federated node exactly as they are
+against a local one, with a token from `kimmy login --oidc` or from the
+application's own provider.
+
+---
+
 ## The CLI is a consumer, not a second implementation
 
-`kimmy` speaks through `kimmy-client` — nothing in it builds a URL or reads a
-status code. That is what proves the library is pleasant rather than merely
-present, and it worked: converting it found a public API that forced consumers
-to depend on `reqwest`, a login that could not fail over, and a missing
-`create-collection` that made a fresh database unusable from the tool.
+`kimmy` speaks through `kimmy-client` — nothing in it builds a URL to a *node*
+or reads a status code from one. That is what proves the library is pleasant
+rather than merely present, and it worked: converting it found a public API that
+forced consumers to depend on `reqwest`, a login that could not fail over, and a
+missing `create-collection` that made a fresh database unusable from the tool.
+
+The one exception is `kimmy login --oidc` and `--client-credentials`, which talk
+to the **identity provider** rather than to a node. That is a different service
+with a different protocol, and putting it behind `kimmy-client` would give every
+application linking the crate an OAuth2 implementation it did not ask for.
 
 [CLI](cli.md) has the commands.
 

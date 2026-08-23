@@ -29,6 +29,11 @@ tracing-subscriber.workspace = true
 tokio.workspace = true
 axum-server.workspace = true
 rustls.workspace = true
+# OIDC discovery and JWKS. The node fetches signing keys from the identity
+# provider, which is the one piece of federation that is I/O — `kimmy-auth`
+# does none, deliberately, so it lives here. Both were already in the tree.
+reqwest.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

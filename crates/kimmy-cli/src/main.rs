@@ -45,8 +45,15 @@ use serde_json::{Value, json};
     after_help = "Authentication:\n  \
         kimmy login root                  # reads the password from stdin or KIMMY_PASSWORD\n  \
         export KIMMY_TOKEN=$(echo hunter2 | kimmy login root)\n\n\
-    There is deliberately no --password flag: it would land in shell history\n\
-    and in `ps` output for every user on the machine."
+    Against a node federated with an OIDC provider:\n  \
+        export KIMMY_OIDC_ISSUER=https://auth.example.com\n  \
+        export KIMMY_OIDC_CLIENT_ID=kimmy-cli\n  \
+        export KIMMY_TOKEN=$(kimmy login --oidc)              # opens a browser code flow\n  \
+        export KIMMY_TOKEN=$(kimmy login --client-credentials) # for a service, secret from env\n\n\
+    There is deliberately no --password flag and no --client-secret flag: either\n\
+    would land in shell history and in `ps` output for every user on the machine.\n\
+    No token is written to disk either -- an environment variable answers for its\n\
+    permissions, its lifetime and its cleanup by not existing afterwards."
 )]
 struct Cli {
     /// Base URL of the node.
@@ -68,7 +75,45 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Exchange credentials for a token, printed to stdout.
-    Login { user: String },
+    ///
+    /// Three ways in, and the token comes out the same on all three: bare, on
+    /// stdout, so `$(kimmy login ...)` is directly usable. Nothing is written
+    /// to disk.
+    Login {
+        /// Local user name. Omit it when using --oidc or --client-credentials.
+        user: Option<String>,
+
+        /// Log in through the node's OIDC provider, in a browser.
+        ///
+        /// RFC 8628 device authorization: this prints a code and a URL to
+        /// stderr, you approve it in a browser, and the token lands on stdout.
+        /// The same flow `gh auth login` uses, and it is the one that works
+        /// over SSH and in a container, where a redirect back to localhost
+        /// does not.
+        #[arg(long, conflicts_with_all = ["user", "client_credentials"])]
+        oidc: bool,
+
+        /// Log in as a service, with OAuth2 client credentials.
+        ///
+        /// The client secret is read from `KIMMY_OIDC_CLIENT_SECRET` and from
+        /// nowhere else: a flag would put it in shell history and in `ps`
+        /// output, the same reason there is no --password.
+        #[arg(long, conflicts_with = "user")]
+        client_credentials: bool,
+
+        /// Issuer URL of the OIDC provider. Must match the node's.
+        #[arg(long, env = "KIMMY_OIDC_ISSUER")]
+        issuer: Option<String>,
+
+        /// OAuth2 client id registered with the provider for this CLI.
+        #[arg(long, env = "KIMMY_OIDC_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// Scopes to request. The node reads roles from the token, so the
+        /// provider has to be configured to put them there.
+        #[arg(long, env = "KIMMY_OIDC_SCOPE", default_value = "openid profile")]
+        scope: String,
+    },
     /// Health and readiness of the node.
     Ping,
     /// List databases you can read.
@@ -226,7 +271,7 @@ fn main() -> ExitCode {
             // version of this would have got wrong the first time a message
             // was reworded.
             if e.downcast_ref::<kimmy_client::Error>().is_some_and(|e| e.is_unauthorized()) {
-                eprintln!("  set --token, or KIMMY_TOKEN from `kimmy login`");
+                eprintln!("  {}", unauthorized_hint(std::env::var("KIMMY_OIDC_ISSUER").ok()));
             }
             ExitCode::FAILURE
         }
@@ -239,15 +284,29 @@ async fn run() -> Result<()> {
 
     // Login is the one command that runs without a token, because producing
     // one is what it is for.
-    if let Command::Login { user } = &cli.command {
-        let password = read_password()?;
-        let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
+    if let Command::Login { user, oidc, client_credentials, issuer, client_id, scope } =
+        &cli.command
+    {
         // The token alone, with no decoration, so `$(kimmy login ...)` is
         // usable directly. Deliberately not written to a file: a CLI that
         // stores a bearer token on disk has to answer for its permissions, its
         // lifetime and its cleanup, and an environment variable answers all
-        // three by not existing afterwards.
-        println!("{}", client.token().await.context("the server did not return a token")?);
+        // three by not existing afterwards. The same goes for the refresh
+        // token the flows below deliberately never ask for and never keep.
+        let token = if *oidc {
+            oidc::device_login(issuer.as_deref(), client_id.as_deref(), scope).await?
+        } else if *client_credentials {
+            oidc::client_credentials_login(issuer.as_deref(), client_id.as_deref(), scope).await?
+        } else {
+            let user = user.as_deref().context(
+                "name the user to log in as, or pass --oidc / --client-credentials to log in \
+                 through the node's identity provider",
+            )?;
+            let password = read_password()?;
+            let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
+            client.token().await.context("the server did not return a token")?
+        };
+        println!("{token}");
         return Ok(());
     }
 
@@ -569,6 +628,272 @@ fn read_password() -> Result<String> {
     Ok(password)
 }
 
+/// What to suggest after a 401.
+///
+/// Issuer-aware, because the two deployments need opposite advice and the wrong
+/// one sends someone to a login endpoint that does not exist for them: a
+/// federated caller has no local password, and `kimmy login <user>` would ask
+/// them for one all the same.
+fn unauthorized_hint(issuer: Option<String>) -> String {
+    match issuer {
+        Some(issuer) => format!(
+            "set --token, or KIMMY_TOKEN from `kimmy login --oidc` (issuer {issuer}); \
+             a local account still works with `kimmy login <user>`"
+        ),
+        None => "set --token, or KIMMY_TOKEN from `kimmy login`".to_string(),
+    }
+}
+
+/// Getting a token out of an OpenID Connect provider.
+///
+/// # Why this talks to the provider directly rather than through `kimmy-client`
+///
+/// Everything else in this file goes through the client crate, deliberately
+/// (see the module docs). This does not, because it is not a KimmyDB request:
+/// the provider is a different service with a different protocol, and teaching
+/// the database client OAuth2 would put an OAuth2 implementation in every
+/// application that links it — which is exactly what `Builder::token_provider`
+/// exists to avoid.
+///
+/// # Why the device flow rather than a redirect
+///
+/// A redirect flow needs a browser and a loopback listener on the same machine.
+/// A database CLI is run over SSH and inside containers, where neither holds.
+/// The device flow works everywhere a person can read a code off one screen and
+/// type it on another — the same reason `gh auth login` uses it.
+mod oidc {
+    use anyhow::{Context, Result, bail};
+    use serde_json::Value;
+
+    /// How long to keep polling before giving up on a person approving.
+    ///
+    /// A backstop only: the provider states its own expiry and that is what is
+    /// honoured. This bounds the case where it does not.
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// The interval to poll at when the provider does not name one (RFC 8628 §3.5).
+    const DEFAULT_POLL_SECS: u64 = 5;
+
+    fn http() -> Result<reqwest::Client> {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .context("building the HTTP client")
+    }
+
+    fn issuer_or_bail(issuer: Option<&str>) -> Result<&str> {
+        issuer.context(
+            "no OIDC issuer: set KIMMY_OIDC_ISSUER or pass --issuer, using the same value the \
+             node is configured with",
+        )
+    }
+
+    fn client_id_or_bail(client_id: Option<&str>) -> Result<&str> {
+        client_id.context(
+            "no OIDC client id: set KIMMY_OIDC_CLIENT_ID or pass --client-id, using an \
+             application registered with your provider",
+        )
+    }
+
+    /// Read the provider's discovery document.
+    ///
+    /// Appended to the issuer rather than URL-joined, which is what RFC 8414
+    /// specifies — and for an issuer with a path, as Keycloak realms and Entra
+    /// tenants have, joining would look at the host root instead.
+    async fn discover(http: &reqwest::Client, issuer: &str) -> Result<Value> {
+        let url = format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'));
+        let response = http.get(&url).send().await.with_context(|| format!("fetching {url}"))?;
+        if !response.status().is_success() {
+            bail!("the provider answered {} for {url}", response.status());
+        }
+        response.json().await.with_context(|| format!("parsing the discovery document at {url}"))
+    }
+
+    fn endpoint(document: &Value, name: &str) -> Result<String> {
+        document
+            .get(name)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .with_context(|| format!("the provider's discovery document names no {name}"))
+    }
+
+    /// The OAuth2 error code in a failed token response, if there is one.
+    fn oauth_error(body: &Value) -> &str {
+        body.get("error").and_then(Value::as_str).unwrap_or("")
+    }
+
+    /// Pull the access token out of a successful token response.
+    ///
+    /// The **access** token, never the id token: the node verifies an audience,
+    /// and an id token's audience is the client, not the API. Handing over an
+    /// id token is the mistake that produces a 401 nobody can explain.
+    fn access_token(body: &Value) -> Result<String> {
+        body.get("access_token")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .context("the provider returned no access_token")
+    }
+
+    /// RFC 8628 device authorization grant.
+    ///
+    /// Everything a person reads goes to **stderr** and only the token goes to
+    /// stdout, so `$(kimmy login --oidc)` captures the token and the
+    /// instructions still reach the terminal.
+    pub async fn device_login(
+        issuer: Option<&str>,
+        client_id: Option<&str>,
+        scope: &str,
+    ) -> Result<String> {
+        let issuer = issuer_or_bail(issuer)?;
+        let client_id = client_id_or_bail(client_id)?;
+        let http = http()?;
+        let document = discover(&http, issuer).await?;
+        let device_endpoint = endpoint(&document, "device_authorization_endpoint").context(
+            "this provider does not advertise the device authorization endpoint; \
+             --client-credentials works for a service account",
+        )?;
+        let token_endpoint = endpoint(&document, "token_endpoint")?;
+
+        let start: Value = http
+            .post(&device_endpoint)
+            .form(&[("client_id", client_id), ("scope", scope)])
+            .send()
+            .await
+            .with_context(|| format!("starting the device flow at {device_endpoint}"))?
+            .json()
+            .await
+            .context("parsing the device authorization response")?;
+
+        if !oauth_error(&start).is_empty() {
+            bail!("the provider refused the device request: {}", describe(&start));
+        }
+
+        let device_code = start
+            .get("device_code")
+            .and_then(Value::as_str)
+            .context("the provider returned no device_code")?;
+        let user_code = start
+            .get("user_code")
+            .and_then(Value::as_str)
+            .context("the provider returned no user_code")?;
+        let verification = start
+            .get("verification_uri_complete")
+            .or_else(|| start.get("verification_uri"))
+            .and_then(Value::as_str)
+            .context("the provider returned no verification_uri")?;
+
+        eprintln!("Open {verification} and enter the code: {user_code}");
+        eprintln!("Waiting for approval...");
+
+        // The provider's own pacing, honoured: polling faster than it asked for
+        // is what `slow_down` exists to punish, and being told to slow down
+        // twice is how a client gets throttled out of the flow entirely.
+        let mut interval = std::time::Duration::from_secs(
+            start.get("interval").and_then(Value::as_u64).unwrap_or(DEFAULT_POLL_SECS),
+        );
+        let deadline = std::time::Instant::now()
+            + start
+                .get("expires_in")
+                .and_then(Value::as_u64)
+                .map(std::time::Duration::from_secs)
+                .unwrap_or(MAX_WAIT);
+
+        loop {
+            tokio::time::sleep(interval).await;
+            if std::time::Instant::now() > deadline {
+                bail!("the device code expired before it was approved; run the command again");
+            }
+
+            let body: Value = http
+                .post(&token_endpoint)
+                .form(&[
+                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                    ("device_code", device_code),
+                    ("client_id", client_id),
+                ])
+                .send()
+                .await
+                .with_context(|| format!("polling {token_endpoint}"))?
+                .json()
+                .await
+                .context("parsing the token response")?;
+
+            match oauth_error(&body) {
+                // Nobody has approved it yet. Not an error — it is the normal
+                // answer for as long as the person is still typing.
+                "authorization_pending" => continue,
+                // Told to back off. Five seconds is what RFC 8628 §3.5 says to
+                // add, and it is cumulative across repeats.
+                "slow_down" => {
+                    interval += std::time::Duration::from_secs(5);
+                    continue;
+                }
+                "expired_token" => {
+                    bail!("the device code expired before it was approved; run it again")
+                }
+                "access_denied" => bail!("the request was denied at the provider"),
+                "" => return access_token(&body),
+                _ => bail!("the provider refused the token request: {}", describe(&body)),
+            }
+        }
+    }
+
+    /// OAuth2 client credentials, for a service rather than a person.
+    ///
+    /// The secret comes from the environment and from nowhere else, for the
+    /// same reason there is no `--password`: a flag lands in shell history and
+    /// in `ps` output for every user on the machine.
+    pub async fn client_credentials_login(
+        issuer: Option<&str>,
+        client_id: Option<&str>,
+        scope: &str,
+    ) -> Result<String> {
+        let issuer = issuer_or_bail(issuer)?;
+        let client_id = client_id_or_bail(client_id)?;
+        let secret =
+            std::env::var("KIMMY_OIDC_CLIENT_SECRET").ok().filter(|s| !s.is_empty()).context(
+                "no client secret: set KIMMY_OIDC_CLIENT_SECRET. There is deliberately no flag \
+                 for it — it would land in shell history and in `ps` output.",
+            )?;
+
+        let http = http()?;
+        let document = discover(&http, issuer).await?;
+        let token_endpoint = endpoint(&document, "token_endpoint")?;
+
+        let body: Value = http
+            .post(&token_endpoint)
+            .form(&[
+                ("grant_type", "client_credentials"),
+                ("client_id", client_id),
+                ("client_secret", secret.as_str()),
+                ("scope", scope),
+            ])
+            .send()
+            .await
+            .with_context(|| format!("requesting a token from {token_endpoint}"))?
+            .json()
+            .await
+            .context("parsing the token response")?;
+
+        if !oauth_error(&body).is_empty() {
+            bail!("the provider refused the token request: {}", describe(&body));
+        }
+        access_token(&body)
+    }
+
+    /// An OAuth2 error, as something a person can act on.
+    ///
+    /// `error_description` is the half that says what to fix; the code alone is
+    /// usually `invalid_client`, which is true of several different mistakes.
+    pub(super) fn describe(body: &Value) -> String {
+        let code = oauth_error(body);
+        match body.get("error_description").and_then(Value::as_str) {
+            Some(detail) => format!("{code}: {detail}"),
+            None => code.to_string(),
+        }
+    }
+}
+
 fn emit(cli: &Cli, value: &Value) {
     let rendered =
         if cli.pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) };
@@ -736,6 +1061,61 @@ mod tests {
         let mut command = Cli::command();
         command.build();
         assert!(!has_password(&command), "a --password flag has been added");
+    }
+
+    #[test]
+    fn there_is_no_client_secret_flag_either() {
+        // Same property as `--password`, same reason: a secret on a command
+        // line is in shell history and in `ps` for every user on the machine.
+        // It is read from KIMMY_OIDC_CLIENT_SECRET and from nowhere else.
+        fn has(cmd: &clap::Command, long: &str) -> bool {
+            cmd.get_arguments().any(|a| a.get_long() == Some(long))
+                || cmd.get_subcommands().any(|c| has(c, long))
+        }
+        let mut command = Cli::command();
+        command.build();
+        assert!(!has(&command, "client-secret"), "a --client-secret flag has been added");
+    }
+
+    #[test]
+    fn login_takes_a_user_or_a_federated_flag_but_not_both() {
+        // The user argument became optional so that `--oidc` can stand alone.
+        // Clap has to keep the combinations honest, or the wrong pair reaches
+        // the handler and fails somewhere less obvious.
+        assert!(Cli::try_parse_from(["kimmy", "login", "root"]).is_ok());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_ok());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials"]).is_ok());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc", "root"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc", "--client-credentials"]).is_err());
+    }
+
+    #[test]
+    fn the_unauthorized_hint_matches_the_deployment() {
+        // The wrong hint sends a federated user to a local login that will ask
+        // them for a password they do not have.
+        let local = unauthorized_hint(None);
+        assert!(local.contains("kimmy login"), "{local}");
+        assert!(!local.contains("--oidc"), "{local}");
+
+        let federated = unauthorized_hint(Some("https://auth.example.com".into()));
+        assert!(federated.contains("kimmy login --oidc"), "{federated}");
+        assert!(federated.contains("auth.example.com"), "the issuer names itself: {federated}");
+        // ...and it still says a local account works, because both do at once.
+        assert!(federated.contains("kimmy login <user>"), "{federated}");
+    }
+
+    #[test]
+    fn an_oauth_error_carries_the_half_that_says_what_to_fix() {
+        // `invalid_client` alone is true of several different mistakes; the
+        // description is what distinguishes them.
+        let described = oidc::describe(&json!({
+            "error": "invalid_client",
+            "error_description": "client kimmy-cli is not configured for the device flow",
+        }));
+        assert!(described.contains("invalid_client"), "{described}");
+        assert!(described.contains("device flow"), "{described}");
+
+        assert_eq!(oidc::describe(&json!({ "error": "access_denied" })), "access_denied");
     }
 
     fn api_error(status: u16, code: ErrorCode) -> kimmy_client::Error {

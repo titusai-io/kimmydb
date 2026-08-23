@@ -113,6 +113,7 @@ running server, not merely compiled.
 | Sort and projection | ✅ Working | Multi-key sort, inclusion/exclusion projection |
 | Change streams | ✅ Working | **Single node, no replica set.** Resumable by token |
 | Multiple users | ✅ Working | Argon2id, JWT, per-collection RBAC |
+| Enterprise SSO | ✅ Working | One external OIDC issuer beside local users; RS256/ES256 against the provider's JWKS, claim-to-grant mappings in the config file, `admin` deliberately not federatable |
 | HTTP + WebSocket API | ✅ Working | Also health and Prometheus metrics |
 | Docker container | ✅ Working | ~106 MB, graceful SIGTERM shutdown |
 | Secondary indexes | ✅ Working | Compound, descending, multikey, unique (single-node) |
@@ -191,7 +192,7 @@ kimmydb/
 │   ├── kimmy-core/      Hlc, Stamp, DocId, DocRecord, OplogEntry, keyenc, cmp
 │   ├── kimmy-storage/   redb engine, documents, oplog, change streams
 │   ├── kimmy-query/     filter / update / sort / projection evaluation
-│   ├── kimmy-auth/      Argon2id, JWT, RBAC, user store
+│   ├── kimmy-auth/      Argon2id, JWT, OIDC verification, RBAC, user store
 │   ├── kimmy-api/       axum router, WebSocket, JSON boundary
 │   ├── kimmy-cluster/   discovery, SWIM membership, replication transport
 │   ├── kimmy-vector/    embeddings, HNSW, index cache, search

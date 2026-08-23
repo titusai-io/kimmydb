@@ -35,7 +35,11 @@
 //! - **Keeps a token alive.** Built with credentials, it logs in, and it
 //!   refreshes before expiry using `expiresIn` rather than by decoding a token
 //!   it is told to treat as opaque. Built with a token instead, it uses it
-//!   until the server stops accepting it and then says so.
+//!   until the server stops accepting it and then says so. Built with a
+//!   **token provider**, it calls back for a fresh one — which is how a
+//!   federated deployment works, because a token from an external identity
+//!   provider is not this database's to renew and this crate deliberately does
+//!   not implement OAuth2.
 //! - **Fails over between nodes.** Every node accepts writes, so there is no
 //!   primary to find. Selection is *sticky*, not round-robin: the node that
 //!   answers is promoted to the front of the list and keeps serving until it
@@ -120,11 +124,23 @@ struct Session {
     renew_at: Instant,
 }
 
+/// A future producing a fresh bearer token. See [`Builder::token_provider`].
+type TokenFuture = std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send>>;
+
+/// Something that can produce a fresh token on demand.
+///
+/// Boxed rather than a generic parameter on [`Client`], because the type would
+/// otherwise infect every signature that holds a client — including the ones in
+/// applications that do not use this at all.
+type TokenProvider = Arc<dyn Fn() -> TokenFuture + Send + Sync>;
+
 struct Inner {
     http: reqwest::Client,
     /// Node endpoints, this client's own first. Rotated on failover.
     endpoints: RwLock<Vec<String>>,
     credentials: Option<(String, String)>,
+    /// Where a token comes from when this client cannot mint one itself.
+    provider: Option<TokenProvider>,
     session: RwLock<Option<Session>>,
 }
 
@@ -142,6 +158,7 @@ pub struct Builder {
     endpoints: Vec<String>,
     credentials: Option<(String, String)>,
     token: Option<String>,
+    provider: Option<TokenProvider>,
     discover: bool,
     timeout: Duration,
     accept_invalid_certs: bool,
@@ -157,6 +174,7 @@ impl Client {
             endpoints: vec![normalize(endpoint.into())],
             credentials: None,
             token: None,
+            provider: None,
             discover: false,
             timeout: Duration::from_secs(30),
             accept_invalid_certs: false,
@@ -573,12 +591,20 @@ impl Client {
         let needs = {
             let session = self.inner.session.read().await;
             match session.as_ref() {
-                None => self.inner.credentials.is_some(),
+                None => self.inner.credentials.is_some() || self.inner.provider.is_some(),
                 Some(s) => Instant::now() >= s.renew_at,
             }
         };
         if !needs {
             return Ok(());
+        }
+
+        // Asked before a refresh is attempted, because a provider's token is
+        // not this cluster's to renew: `/v1/auth/refresh` issues tokens for
+        // *local* users and refuses a federated principal, so trying it first
+        // would spend a round trip to be told no on every renewal.
+        if let Some(provider) = self.inner.provider.clone() {
+            return self.adopt_provided(provider).await;
         }
 
         let held = self.token().await;
@@ -609,6 +635,21 @@ impl Client {
             )
             .await?;
         self.adopt(body).await
+    }
+
+    /// Take a token from the application's provider.
+    ///
+    /// The lifetime is not knowable here — a token this client did not obtain
+    /// carries no `expiresIn`, and decoding it would mean depending on a shape
+    /// nothing promised. So the provider is asked again after an hour, and an
+    /// application whose provider issues shorter tokens should be treating a
+    /// 401 as its own signal anyway.
+    async fn adopt_provided(&self, provider: TokenProvider) -> Result<()> {
+        let token = provider().await?;
+        let renew_in = Duration::from_secs(3600).saturating_sub(RENEW_BEFORE);
+        *self.inner.session.write().await =
+            Some(Session { token, renew_at: Instant::now() + renew_in });
+        Ok(())
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -678,14 +719,28 @@ impl Client {
                     Err(e) => e,
                 };
 
-                // A token that the server has stopped accepting: log in again
-                // once, in case it merely expired or was revoked by a change
-                // this client can recover from. Once, because a loop here is
-                // how a client hammers a login endpoint forever.
-                if error.is_unauthorized() && !relogged && self.inner.credentials.is_some() {
-                    relogged = true;
-                    if self.login().await.is_ok() {
-                        continue;
+                // A token that the server has stopped accepting: get another
+                // one, in case it merely expired or was revoked by a change
+                // this client can recover from. **Once**, because a loop here
+                // is how a client hammers a login endpoint — or somebody
+                // else's identity provider — forever.
+                //
+                // The provider comes first for the same reason it does in
+                // `authenticate`: a federated deployment has no local
+                // credentials to fall back on, and this is the only signal a
+                // provider's token has stopped working, since a token this
+                // client did not mint states no lifetime.
+                if error.is_unauthorized() && !relogged {
+                    if let Some(provider) = self.inner.provider.clone() {
+                        relogged = true;
+                        if self.adopt_provided(provider).await.is_ok() {
+                            continue;
+                        }
+                    } else if self.inner.credentials.is_some() {
+                        relogged = true;
+                        if self.login().await.is_ok() {
+                            continue;
+                        }
                     }
                 }
 
@@ -835,6 +890,43 @@ impl Builder {
         self
     }
 
+    /// Get tokens from a callback, and call it again when one is due to expire.
+    ///
+    /// For a federated deployment: the token comes from an external identity
+    /// provider, so `credentials` cannot produce one — that endpoint is this
+    /// database's own login, and it stays local-only on purpose. The callback
+    /// is whatever the application already uses to talk to its provider (an
+    /// OAuth2 library, a sidecar, a mounted file a platform rotates), which is
+    /// why this crate takes a closure instead of learning OAuth2 itself: an
+    /// OAuth2 implementation inside a database client is a second one to keep
+    /// correct, and applications that need a token already have one.
+    ///
+    /// The provider is called at connect time and again shortly before each
+    /// token expires — this client cannot renew a federated token, because
+    /// `/v1/auth/refresh` mints tokens for *local* users and refuses a
+    /// federated principal outright. `expiresIn` is not reported for a token
+    /// the client did not obtain here, so renewal falls back to an hour, and a
+    /// provider handing out shorter tokens should be paired with an
+    /// application that treats a 401 as its own signal.
+    ///
+    /// ```no_run
+    /// # async fn example() -> kimmy_client::Result<()> {
+    /// # async fn my_oidc_token() -> kimmy_client::Result<String> { Ok(String::new()) }
+    /// let client = kimmy_client::Client::builder("https://kimmy.internal:7878")
+    ///     .token_provider(|| async { my_oidc_token().await })
+    ///     .connect()
+    ///     .await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn token_provider<F, Fut>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<String>> + Send + 'static,
+    {
+        self.provider = Some(Arc::new(move || Box::pin(provider()) as TokenFuture));
+        self
+    }
+
     /// Additional endpoints to try, before any are discovered.
     pub fn endpoint(mut self, endpoint: impl Into<String>) -> Self {
         self.endpoints.push(normalize(endpoint.into()));
@@ -881,6 +973,7 @@ impl Builder {
                 http,
                 endpoints: RwLock::new(self.endpoints),
                 credentials: self.credentials,
+                provider: self.provider,
                 session: RwLock::new(session),
             }),
         };

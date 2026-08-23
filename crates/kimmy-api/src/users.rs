@@ -140,5 +140,10 @@ pub async fn whoami(auth: Auth) -> Json<Value> {
         "user": auth.principal().user,
         "grants": auth.principal().grants,
         "authenticated": !auth.principal().unauthenticated,
+        // Reported because a name does not answer it: an identity provider is
+        // free to assert a subject that matches a local account, and a caller
+        // deciding whether it may change its own password needs to know which
+        // of the two it is holding a token for.
+        "federated": auth.principal().federated,
     }))
 }

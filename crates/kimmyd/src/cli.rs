@@ -90,6 +90,26 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
 
+    /// Issuer URL of an external OIDC provider to federate with. Must be https.
+    #[arg(long, env = "KIMMY_OIDC_ISSUER")]
+    pub oidc_issuer: Option<String>,
+
+    /// The `aud` a federated token must carry. Required with --oidc-issuer.
+    #[arg(long, env = "KIMMY_OIDC_AUDIENCE")]
+    pub oidc_audience: Option<String>,
+
+    /// Claim carrying the caller's roles. `groups` for Entra ID.
+    ///
+    /// There is deliberately no flag for the role mappings themselves: a grant
+    /// is a structure, and a command line is where structures go to be
+    /// mistyped. They live in the config file (ADR-066).
+    #[arg(long, env = "KIMMY_OIDC_ROLES_CLAIM")]
+    pub oidc_roles_claim: Option<String>,
+
+    /// How often to re-fetch the provider's signing keys, in seconds.
+    #[arg(long, env = "KIMMY_OIDC_REFRESH_INTERVAL_SECS")]
+    pub oidc_refresh_interval_secs: Option<u64>,
+
     /// PEM certificate chain, leaf first. Enables TLS together with --tls-key.
     #[arg(long, env = "KIMMY_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -178,6 +198,18 @@ impl Overrides {
         }
         if let Some(secret) = &self.jwt_secret {
             cfg.auth.jwt_secret = Some(secret.clone());
+        }
+        if let Some(issuer) = &self.oidc_issuer {
+            cfg.auth.oidc.issuer = Some(issuer.clone());
+        }
+        if let Some(audience) = &self.oidc_audience {
+            cfg.auth.oidc.audience = Some(audience.clone());
+        }
+        if let Some(claim) = &self.oidc_roles_claim {
+            cfg.auth.oidc.roles_claim = claim.clone();
+        }
+        if let Some(secs) = self.oidc_refresh_interval_secs {
+            cfg.auth.oidc.refresh_interval_secs = secs;
         }
         if let Some(cert) = &self.tls_cert {
             cfg.server.tls.cert_file = Some(cert.clone());

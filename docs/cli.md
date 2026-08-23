@@ -57,6 +57,8 @@ grants any other client is.
 | | |
 |---|---|
 | `kimmy login <user>` | Prints a token. Password from stdin or `KIMMY_PASSWORD` |
+| `kimmy login --oidc` | Prints a token from the node's OIDC provider, via the device flow |
+| `kimmy login --client-credentials` | Same, for a service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
 | `kimmy topology` | The nodes of the cluster, and which are live |
 | `kimmy databases` | Databases you can read |
@@ -143,12 +145,54 @@ export KIMMY_TOKEN=$(KIMMY_PASSWORD=hunter2 kimmy login root)
 ```
 
 A test asserts the flag does not exist, so it cannot be added back as a
-convenience without someone deciding to.
+convenience without someone deciding to. The same goes for `--client-secret`
+below, for the same reason and with its own test.
 
 **The token is not written to disk.** `login` prints it and nothing else, so it
 is usable directly in `$(...)`. A CLI that stored a bearer token in a file would
 have to answer for its permissions, its lifetime and its cleanup; an environment
-variable answers all three by not existing afterwards.
+variable answers all three by not existing afterwards. Nothing here keeps a
+refresh token either — it never asks for one.
+
+---
+
+## Logging in through an identity provider
+
+Against a node federated with an OIDC provider
+([Security](security.md#two-ways-in-one-decision)):
+
+```bash
+export KIMMY_OIDC_ISSUER=https://auth.example.com
+export KIMMY_OIDC_CLIENT_ID=kimmy-cli
+
+# A person, in a browser. RFC 8628 device authorization.
+export KIMMY_TOKEN=$(kimmy login --oidc)
+
+# A service. The secret comes from KIMMY_OIDC_CLIENT_SECRET and nowhere else.
+export KIMMY_TOKEN=$(kimmy login --client-credentials)
+```
+
+`--oidc` prints a code and a URL to **stderr**, waits while you approve it in a
+browser, and puts the bare token on **stdout** — so `$(...)` captures the token
+and the instructions still reach the terminal:
+
+```
+Open https://auth.example.com/device and enter the code: WDJB-MJHT
+Waiting for approval...
+```
+
+**The device flow rather than a redirect**, for the reason `gh auth login` uses
+it: a redirect needs a browser and a loopback listener on the same machine, and
+a database CLI is run over SSH and inside containers. It honours whatever
+polling interval the provider asks for, including a `slow_down`.
+
+These talk to the **identity provider**, not to a node — the one place this tool
+does not go through `kimmy-client`, because an OAuth2 implementation inside a
+database client library is one every application linking it would inherit.
+
+Local accounts still work on a federated node, and `kimmy login <user>` is how
+you reach the break-glass administrator: `admin` cannot be granted through an
+IdP claim ([ADR-067](decisions.md)).
 
 ---
 
@@ -176,6 +220,15 @@ kimmy: 401 unauthorized: missing Authorization header
 The first line is the server's own code and message; the second is the one hint
 this tool adds, because that failure is fixed with a flag rather than by
 changing the request. Both go to stderr.
+
+The hint follows the deployment. With `KIMMY_OIDC_ISSUER` set it names the
+federated route instead, because sending a federated user to `kimmy login
+<user>` asks them for a password they do not have:
+
+```
+  set --token, or KIMMY_TOKEN from `kimmy login --oidc` (issuer
+  https://auth.example.com); a local account still works with `kimmy login <user>`
+```
 
 ---
 

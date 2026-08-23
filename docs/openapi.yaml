@@ -421,7 +421,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [user, grants, authenticated]
+                required: [user, grants, authenticated, federated]
                 properties:
                   user:
                     type: string
@@ -433,6 +433,15 @@ paths:
                     description: |
                       False only on a node started with `--insecure-no-auth`,
                       where every caller is an unauthenticated superuser.
+                  federated:
+                    type: boolean
+                    description: |
+                      True when the identity came from the external OIDC
+                      provider rather than this cluster's user store. A name
+                      does not answer this — a provider may assert a subject
+                      matching a local account — and a federated principal has
+                      no local record, so it cannot change a password or be
+                      revoked from here.
         "401":
           $ref: "#/components/responses/Unauthorized"
 

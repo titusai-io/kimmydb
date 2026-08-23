@@ -2901,6 +2901,172 @@ so the first release is preceded by a prerelease shakeout. And dist skips
 publish jobs on prerelease tags by default, which is the safe default and
 means the shakeout proves the build half only.
 
+---
+
+## ADR-064 — Two verifiers, routed by the issuer a token claims
+
+**Decision.** A node may federate with **one** external OpenID Connect
+provider. `TokenIssuer` (HS256, cluster secret, local users) is untouched; a
+second verifier, `OidcVerifier`, checks RS256/ES256 signatures against the
+provider's JWKS with issuer, audience and expiry validation. The `Auth`
+extractor reads the **unverified** `iss` claim and sends the token to the
+verifier it names — external issuer to the OIDC path, anything else to the
+local one. Nothing downstream changes: `Principal::can`, RBAC, MCP, the audit
+log and the search-without-read grant all treat a federated principal as a
+principal. `kimmy-auth` still does no I/O; the JWKS is fetched by `kimmyd` and
+injected.
+
+**Why reading an unverified claim is safe.** It decides which verifier gets to
+say yes, never whether the answer is yes. Both verifiers pin their own
+algorithm list and their own key, so a forged `iss` routes a token to a
+verifier that refuses it, and an omitted `iss` routes it to the local one,
+which refuses it just as firmly. Critically, a token is offered to **exactly
+one** verifier, which is what leaves no algorithm-confusion surface between
+them — the classic attack needs one verifier willing to read the algorithm out
+of the header, and neither is.
+
+**Rejected: one verifier that tries both keys.** It is the shape that
+introduces the bug. A verifier holding a shared secret *and* a public key,
+choosing by `alg`, is one header edit away from verifying an RSA public key as
+an HMAC secret — and the provider's public key is, by construction, public.
+Two verifiers that never see each other's tokens cannot make that mistake.
+
+**Rejected: replacing local users entirely.** An identity provider is a
+dependency, and a database that cannot be administered while its IdP is down
+is a database that cannot be recovered during the incident that took the IdP
+down. Local accounts stay, and `admin` stays local-only (ADR-067).
+
+**One issuer, this round.** A second issuer is a second trust root, and the
+question it raises — which of them may assert that a subject is an analyst —
+has an answer that depends on a deployment rather than on a default. Adding a
+list later is additive; guessing now is not.
+
+**Sixty seconds of leeway, on this path only.** The local path allows none:
+nodes in one cluster are expected to agree about the time and are operated by
+whoever operates the database. An external provider is somebody else's clock,
+and a few seconds of NTP drift refusing freshly minted tokens looks exactly
+like an outage in the IdP.
+
+**Cost.** A second thing to configure, a second thing to be wrong about, and a
+background task that can fail quietly — a node that cannot reach its provider
+keeps verifying perfectly against the keys it already holds until the provider
+rotates, and then refuses every federated caller at once. That failure is why
+`kimmy_jwks_refresh_total{outcome="failed"}` exists and why `check-config`
+does a live fetch. Boot deliberately does **not**: a briefly unreachable
+provider must not stop a database from restarting.
+
+---
+
+## ADR-065 — Revocation is asymmetric, because a federated identity has no record here
+
+**Decision.** Token-version revocation (ADR-052) applies to local users only.
+`Sessions::check` early-returns for a federated principal, exactly as it does
+for the `--insecure-no-auth` one. A federated session ends when the provider
+says so: a short token lifetime, and the provider declining to mint the next
+one. `/v1/auth/refresh` refuses a federated principal outright, and
+`Principal::federated` is carried into the audit record beside
+`unauthenticated`.
+
+**Why the skip is required, not a shortcut.** The check reads the user's
+record from `__users`, and **the absence of a record is how it refuses a
+deleted account**. A federated subject has no record, so without the skip every
+federated request would be refused as revoked. The subtler failure is the
+other direction: if a local user happened to share the name the provider
+asserts, that local account's version and `disabled` flag would silently decide
+whether the federated caller may connect.
+
+**Why refresh refuses rather than reissuing.** Minting a local HS256 token from
+a federated principal would launder the identity — it would shed the origin
+flag, outlive the provider's say in it, and make the audit log claim a local
+user did the work. The client library's answer is `Builder::token_provider`:
+the application refreshes with its own provider, and this database never holds
+a refresh token.
+
+**Rejected: mirroring federated users into `__users`.** It would restore
+symmetry and a familiar revocation story, at the price of a second source of
+truth for identity, a synchronisation problem nobody asked for, and a
+provisioning question (what happens on first login?) with no good default. The
+provider is authoritative about who exists; this database is authoritative
+about what they may do.
+
+**Cost, stated plainly.** There is no way to end one federated session from
+here. Cutting someone off means doing it at the provider, and it takes effect
+when their current token expires — which is the argument for short token
+lifetimes, and is documented in [security.md](security.md) rather than left to
+be discovered.
+
+---
+
+## ADR-066 — Role mappings live in the config file, not in the database
+
+**Decision.** The mapping from an IdP claim value to a set of grants is written
+inline in `kimmy.example.toml` under `[[auth.oidc.role_mappings]]`, read at
+startup, and changed by editing the file and restarting. It is not a
+collection, there is no endpoint that edits it, and it does not replicate.
+
+**Why.** Verification stays a pure function of the token plus configuration —
+the same property that makes the local path free (ADR-013). A mapping stored in
+the database would put a lookup on the request path, would need a cache and an
+invalidation story, and would make "what may a federated caller do" a question
+whose answer can differ between two nodes mid-replication. It would also make
+the mapping editable by anyone holding `admin`, which is precisely the
+privilege ADR-067 keeps away from the IdP.
+
+**Rejected: mapping to named roles that live in the database.** Tempting,
+because it is how the local user store already works. It loses the property
+above and adds an ordering problem: a role a mapping names but the database
+does not hold yet is either an error at startup or a silent zero-grant
+identity, and neither is good.
+
+**A role that maps to nothing is a principal with no grants**, not a refusal.
+It authenticated; it is simply not authorized here. Refusing at the door turns
+"your administrator has not given you access to this database" into "your
+login is broken", and the existing model already answers `false` to every
+question a grant-less principal asks.
+
+**Cost.** Changing who may do what is a restart and a config deploy, and in a
+cluster it is a rolling one — during which two nodes can hold different
+mappings. That window is real, and it is the same window every other
+configuration change already has.
+
+---
+
+## ADR-067 — `admin` is not federatable
+
+**Decision.** A role mapping whose grants name the `admin` action is **refused
+at startup**, alongside the unknown-action refusal. Administration of KimmyDB —
+creating and dropping collections, managing indexes, managing users, taking a
+backup — is reachable only through a local account. The rule lives in
+`OidcSettings::validate`, which both `Config::validate` and
+`OidcVerifier::new` call, so `check-config` refuses exactly what the node
+refuses.
+
+**Why.** It is a break-glass boundary. Federation makes an external system a
+dependency of authentication, and every other privilege is worth that trade —
+a compromised or misconfigured provider that can mint a reader is bad, and a
+compromised provider that can mint a superuser over the database is
+unrecoverable from inside the database. Keeping `admin` local means the answer
+to "the IdP has been taken over" is still "log in as root and turn federation
+off", rather than "restore from backup".
+
+**It is also a smaller mistake to make.** A group in a directory is a thing
+somebody adds people to for reasons that have nothing to do with this database.
+`kimmydb-analyst` mapping to read on `sales.orders*` is a decision an operator
+made; the same directory group silently carrying `admin` because someone
+copied a grant is a decision nobody made.
+
+**Rejected: allowing it behind a flag.** A flag whose only purpose is to remove
+a security boundary is a flag that gets set during an outage and never unset.
+The narrower version — allowing `admin` scoped to one database — was rejected
+too: it is still create and drop over that database, and the boundary that can
+be explained in one sentence is the one that survives.
+
+**Cost.** An organisation that wants every privilege in its directory cannot
+have that, and administering a federated deployment means keeping at least one
+local account and its password. That is the intended cost: the break-glass
+account is the point, and one that exists only in the IdP is not break-glass.
+
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

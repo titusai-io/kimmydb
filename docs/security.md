@@ -36,6 +36,165 @@ a registration list.
 
 ---
 
+## Two ways in, one decision
+
+A node can accept **local** tokens it issued itself, **federated** tokens from
+an external OpenID Connect provider, or both at once. The difference stops at
+the extractor: everything after it — `Principal::can`, RBAC, MCP, the audit
+log, the search-without-read grant — treats the two identically.
+
+```mermaid
+graph LR
+    T["Authorization: Bearer"] --> I{"unverified<br/>iss claim"}
+    I -->|"matches auth.oidc.issuer"| O["OidcVerifier<br/>RS256/ES256 vs JWKS<br/>+ issuer + audience"]
+    I -->|"anything else"| L["TokenIssuer<br/>HS256 vs cluster secret"]
+    L --> S["session check<br/>(token version)"]
+    O --> P["Principal { user, grants, federated }"]
+    S --> P
+    P --> D{"Principal::can"}
+
+    style D fill:#2d3748,color:#fff
+    style I fill:#2d3748,color:#fff
+```
+
+**Routing on an unverified claim is safe because of what it decides:** which
+verifier gets to say yes, never whether the answer is yes. Each verifier pins
+its own algorithm list and its own key, so a forged `iss` sends a token to a
+verifier that refuses it, and an omitted one sends it to the local verifier,
+which refuses it just as firmly.
+
+**A token is offered to exactly one verifier.** That is what leaves no
+algorithm-confusion surface: the classic attack needs one verifier that reads
+the algorithm out of the header and picks a key to match, and neither of these
+does. An HS256 token claiming the external issuer is refused; an RS256 header on
+the local path is refused. Both have tests ([ADR-064](decisions.md)).
+
+### Configuring it
+
+```toml
+[auth.oidc]
+issuer = "https://auth.example.com"   # https only; discovery starts here
+audience = "kimmydb"                  # required — see below
+roles_claim = "roles"                 # "groups" for Entra ID
+
+[[auth.oidc.role_mappings]]
+claim_value = "kimmydb-analyst"
+grants = [{ db = "sales", collection = "orders*", actions = ["read", "search"] }]
+```
+
+Also settable as `KIMMY_OIDC_ISSUER`, `KIMMY_OIDC_AUDIENCE`,
+`KIMMY_OIDC_ROLES_CLAIM`. The mappings are file-only: a grant is a structure,
+and a command line is where structures go to be mistyped.
+
+Refused at startup, each because of what it would otherwise break:
+
+| Refusal | What it prevents |
+|---|---|
+| An issuer with no audience | A provider signs for every application that trusts it; without an audience a token minted for the company wiki authenticates here |
+| An audience with no issuer | Nothing to match `iss` against and nowhere to fetch keys — every federated token would be refused |
+| A non-`https` issuer | Discovery and the JWKS are fetched from it; over plaintext anyone on the path substitutes their own signing keys |
+| A mapping naming `admin` | See below |
+| A mapping naming an unknown action | Caught while the file is parsed — the error names the bad value and lists the valid ones |
+| `auth.oidc` together with `--insecure-no-auth` | Every request is already a superuser, so the mappings would enforce nothing while appearing to |
+
+### `admin` is not federatable
+
+**A role mapping that grants the `admin` action stops the node at startup.**
+Administration — creating and dropping collections, managing indexes, managing
+users, taking a backup — is reachable only through a local account.
+
+This is a break-glass boundary. Federation makes an external system a dependency
+of authentication; a compromised provider that can mint a reader is bad, and one
+that can mint a superuser over the database is unrecoverable from inside it.
+Keeping `admin` local means the answer to "the IdP has been taken over" is still
+"log in as root and turn federation off" ([ADR-067](decisions.md)).
+
+Every other action — `read`, `write`, `watch`, `search`, `webhook` — maps freely.
+
+### A role that maps to nothing
+
+...is a principal with **zero grants**, not a refusal. It authenticated; it is
+simply not authorized here, and `Principal::can` already answers `false` to
+every question such a principal asks. Refusing at the door would report "your
+login is broken" for what is really "your administrator has not given you
+access to this database" ([ADR-066](decisions.md)).
+
+### Signing keys, and what happens when they rotate
+
+The provider's JWKS is fetched through
+`{issuer}/.well-known/openid-configuration` every five minutes and swapped in
+whole. A token naming a `kid` the node has not seen triggers **one**
+rate-limited refetch — the recovery for a rotation between two ticks — and the
+rate limit is not politeness: a `kid` is attacker-controlled, so an unlimited
+one would be a way to make this node hammer its own identity provider.
+
+**Boot does not wait for it.** A briefly unreachable provider must not stop a
+database from restarting — during an incident, both are being restarted — so the
+fetch retries in the background and local users keep working throughout. Until
+it lands, federated tokens get a 401.
+
+That trade has a failure mode worth watching: a node that has *stopped* being
+able to reach its provider keeps verifying perfectly against the keys it already
+holds, until the provider rotates and every federated caller is refused at once.
+Nothing about a working request reveals it. Two things do:
+
+```bash
+kimmyd check-config          # does a live discovery + JWKS fetch, and fails if it cannot
+curl -s localhost:7878/metrics | grep jwks_refresh
+# kimmy_jwks_refresh_total{outcome="ok"} 288
+# kimmy_jwks_refresh_total{outcome="failed"} 0
+```
+
+### Revoking a federated session
+
+Token-version revocation is for local users. A federated identity has **no
+record in `__users`**, and the absence of a record is exactly how that check
+refuses a deleted account — so the check is skipped for federated principals
+outright. Without the skip every federated request would be refused; worse, a
+local user who happened to share the asserted name would silently decide whether
+the federated caller could connect.
+
+So the session ends where it began: at the provider, and at the moment the
+current token expires. **Keep federated token lifetimes short.**
+`/v1/auth/refresh` refuses a federated principal rather than issuing a
+replacement — minting a local token from a federated identity would shed the
+origin flag and outlive the provider's say in it ([ADR-065](decisions.md)).
+
+### Telling them apart
+
+The principal carries `federated: true`, and the audit record carries it beside
+`unauthenticated`:
+
+```
+user=ada@example.com unauthenticated=false federated=true action=Read db=sales collection=orders decision=allow
+```
+
+A name cannot do this job: nothing stops a provider from asserting a subject
+called `root`. `/v1/auth/whoami` reports the same flag.
+
+### Getting a token
+
+```bash
+export KIMMY_OIDC_ISSUER=https://auth.example.com
+export KIMMY_OIDC_CLIENT_ID=kimmy-cli
+
+export KIMMY_TOKEN=$(kimmy login --oidc)                # RFC 8628 device flow
+export KIMMY_TOKEN=$(kimmy login --client-credentials)  # a service; secret from
+                                                        # KIMMY_OIDC_CLIENT_SECRET
+```
+
+The device flow rather than a redirect, for the reason `gh auth login` uses it:
+a redirect needs a browser and a loopback listener on the same machine, and a
+database CLI is run over SSH and inside containers. The code and URL go to
+**stderr** so the bare token on stdout stays capturable.
+
+**Nothing is stored on disk** — not the token, not a refresh token. An
+environment variable answers for its permissions, its lifetime and its cleanup
+by not existing afterwards. Applications get a fresh token the same way, through
+the Rust client's `token_provider` callback ([Clients](clients.md)).
+
+---
+
 ## Passwords
 
 Argon2id via the `argon2` crate, with a fresh random salt per password, stored
@@ -62,7 +221,10 @@ work factors can be raised later without stranding existing hashes.
 
 ## Tokens
 
-HS256 JWTs signed with a **cluster-wide** secret.
+Local tokens: HS256 JWTs signed with a **cluster-wide** secret. (Federated
+tokens are the provider's, signed RS256/ES256 — see
+[Two ways in](#two-ways-in-one-decision). Everything in this section is about
+the local half.)
 
 ```rust
 struct Claims {
@@ -110,6 +272,10 @@ curl -XPOST localhost:7878/v1/users/ada/password -H "$A" -d '{"password":"..."}'
 user's tokens; there is no way to kill one session and leave another. That is
 deliberate — a deny-list of individual tokens fails open when an entry has not
 reached the node handling the request, whereas a version mismatch fails closed.
+
+**None of it applies to a federated identity**, which has no record here to
+carry a version. See [Revoking a federated
+session](#revoking-a-federated-session).
 
 **Cluster-wide, at replication speed.** The edit is an ordinary write, so it
 replicates like any other and each node drops its cached view when it arrives.
@@ -259,6 +425,9 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **Node↔node TLS** | ✅ Built | Bound to `cluster_secret` via channel binding — see below |
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
+| **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
+| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider and keep token lifetimes short |
+| **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No field-level security** | Not planned | Collection is the finest granularity |

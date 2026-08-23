@@ -115,6 +115,13 @@ jobs:
       # X.Y.Z, X.Y and latest from the release tag, plus the exact commit.
       # No bare X tag while the workspace is pre-1.0: every 0.MINOR may break
       # (ADR-062), so a floating `0` would promise a stability 0.x does not have.
+      #
+      # `latest` is guarded on the tag having no `-` in it, so a prerelease
+      # cannot become it. dist skips publish jobs on prereleases today, which
+      # means the guard is currently belt and braces — and it stops being that
+      # the moment prerelease publishing is turned on for a shakeout, at which
+      # point `v0.2.0-rc.1` would silently become what `docker pull kimmydb`
+      # gives everybody.
       - name: Compute tags
         id: meta
         uses: docker/metadata-action@v5
@@ -124,7 +131,7 @@ jobs:
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
-            type=raw,value=latest
+            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
 
       - name: Create multi-arch manifest
         working-directory: ${{ runner.temp }}/digests
