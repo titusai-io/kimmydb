@@ -42,9 +42,14 @@ impl Server {
         .unwrap();
 
         // Merged exactly as the daemon merges it, so the test exercises the
-        // real mounting rather than a convenient stand-in.
-        let app = kimmy_api::router(Arc::clone(&state))
-            .merge(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new()));
+        // real mounting rather than a convenient stand-in. That faithfulness
+        // used to reproduce a defect instead of catching it: both sides said
+        // `router(..).merge(..)`, which leaves `/mcp` outside the layer that
+        // counts, times, traces and challenges.
+        let app = kimmy_api::router_with(
+            Arc::clone(&state),
+            Some(kimmy_mcp::mcp_router(Arc::clone(&state), Vec::new())),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -109,6 +114,60 @@ impl Server {
             .unwrap_or(0);
 
         (status, parse_body(head, rest))
+    }
+
+    /// The `WWW-Authenticate` header `/mcp` answers a rejected request with.
+    ///
+    /// Read off the wire rather than through `rpc`, which keeps only the status
+    /// and the body — and the header is the whole point here.
+    async fn challenge(&self, token: Option<&str>) -> Option<String> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let host = self.base.strip_prefix("http://").unwrap();
+        let payload = json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}).to_string();
+        let mut request = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+             Content-Type: application/json\r\n\
+             Accept: application/json, text/event-stream\r\n\
+             Content-Length: {}\r\n",
+            payload.len()
+        );
+        if let Some(token) = token {
+            request.push_str(&format!("Authorization: Bearer {token}\r\n"));
+        }
+        request.push_str("\r\n");
+        request.push_str(&payload);
+
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+        let (head, _) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+
+        head.lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("www-authenticate:"))
+            .map(|line| line.split_once(':').unwrap().1.trim().to_string())
+    }
+
+    /// `kimmy_requests_total`, scraped off `/metrics`.
+    async fn request_count(&self) -> u64 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let host = self.base.strip_prefix("http://").unwrap();
+        let request = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        stream.write_all(request.as_bytes()).await.unwrap();
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw).into_owned();
+
+        text.lines()
+            .find(|line| line.starts_with("kimmy_requests_total"))
+            .and_then(|line| line.split_whitespace().last())
+            .and_then(|n| n.parse().ok())
+            .expect("kimmy_requests_total is missing from /metrics")
     }
 
     /// Call a tool, returning the JSON-RPC response.
@@ -183,6 +242,64 @@ async fn mcp_requires_a_token() {
         .rpc(Some("not-a-token"), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
         .await;
     assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn a_rejected_mcp_request_says_where_to_authenticate() {
+    // RFC 6750 §3, and the reason RFC 9728 exists at all: an MCP client holding
+    // no credentials has no other way to discover its authorization server, so
+    // a bare 401 leaves it needing to be configured by hand.
+    //
+    // This is a mounting test as much as a header test. `/mcp` is merged into
+    // the same router as the REST API, and a router merged *after* the
+    // challenge layer keeps its own empty middleware stack — which is exactly
+    // how this regressed, silently, while every REST route stayed correct.
+    let server = Server::start().await;
+
+    let missing = server.challenge(None).await;
+    let challenge = missing.expect("a 401 from /mcp must carry WWW-Authenticate");
+    assert!(challenge.starts_with("Bearer"), "not a bearer challenge: {challenge}");
+    // No `error` code when the request offered no credentials (RFC 6750 §3.1).
+    assert!(
+        !challenge.contains("error="),
+        "a request with no credentials is not an error: {challenge}"
+    );
+
+    let rejected = server.challenge(Some("not-a-token")).await;
+    let challenge = rejected.expect("a rejected token must also carry WWW-Authenticate");
+    assert!(
+        challenge.contains(r#"error="invalid_token""#),
+        "a bad token is invalid_token: {challenge}"
+    );
+}
+
+#[tokio::test]
+async fn mcp_requests_are_counted_like_every_other_route() {
+    // The counting layer is the single instrumentation site, so a route outside
+    // it is invisible to `/metrics` and to tracing both. `/mcp` was.
+    let server = Server::start().await;
+    let token = server.root();
+
+    // `kimmy_requests_total` is one unlabelled counter and a scrape counts
+    // itself, so "it went up" would pass whether or not `/mcp` is counted.
+    // Calibrate against a scrape-only interval instead, and require exactly one
+    // more than that.
+    let a = server.request_count().await;
+    let b = server.request_count().await;
+    let scrape_cost = b - a;
+
+    let (status, _) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    assert_eq!(status, 200);
+
+    let c = server.request_count().await;
+    assert_eq!(
+        c - b,
+        scrape_cost + 1,
+        "an MCP request was not counted: scrape alone costs {scrape_cost}, \
+         scrape plus one MCP call cost {}",
+        c - b
+    );
 }
 
 #[tokio::test]

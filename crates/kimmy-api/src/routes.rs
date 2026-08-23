@@ -20,6 +20,35 @@ use crate::state::{Auth, SharedState};
 use crate::watch;
 
 pub fn router(state: SharedState) -> Router {
+    router_with(state, None)
+}
+
+/// Build the router, optionally merging routes served on the same listener.
+///
+/// `extra` exists so that anything mounted beside the REST API — `/mcp` is the
+/// only caller — is merged **before** [`count_request`] wraps the table, and so
+/// ends up inside it. A router merged after the layer keeps its own (empty)
+/// middleware stack: `merge` combines route tables, and a layer already applied
+/// stays with the routes it was applied to.
+///
+/// That is not a subtlety worth rediscovering. `/mcp` was merged afterwards, so
+/// it answered 401 with no `WWW-Authenticate` — the one case RFC 9728 exists to
+/// serve, since an MCP client has no other way to discover its authorization
+/// server — and every MCP request was invisible to `/metrics` and to tracing.
+pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
+    let mut app = routes(state.clone());
+    if let Some(extra) = extra {
+        app = app.merge(extra);
+    }
+    // Counting happens in one layer rather than in each handler: a counter
+    // beside a handler is a counter the next route forgets. It wraps
+    // everything including `/metrics` itself, so a scrape is visible as
+    // traffic rather than being invisible to the thing it scrapes.
+    app.layer(axum::middleware::from_fn_with_state(state, count_request))
+}
+
+/// The route table, before instrumentation.
+fn routes(state: SharedState) -> Router {
     Router::new()
         // Health endpoints are unauthenticated on purpose: a load balancer
         // probing them should not need credentials.
@@ -92,11 +121,6 @@ pub fn router(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/vector_search", post(crate::vectors::vector_search))
         .route("/v1/db/{db}/coll/{coll}/hybrid_search", post(crate::vectors::hybrid_search))
         .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
-        // Counting happens in one layer rather than in each handler: a counter
-        // beside a handler is a counter the next route forgets. It wraps
-        // everything including `/metrics` itself, so a scrape is visible as
-        // traffic rather than being invisible to the thing it scrapes.
-        .layer(axum::middleware::from_fn_with_state(state.clone(), count_request))
         .with_state(state)
 }
 
