@@ -358,6 +358,104 @@ The two absences ADR-043 recorded — latency histograms and oplog lag — are
 filled by the last two rows, each on the terms that kept it out
 ([ADR-046](decisions.md)).
 
+### Tracing
+
+Off unless you point it at a collector. There is no `enabled` flag: setting
+`telemetry.endpoint` is what turns it on.
+
+```toml
+[telemetry]
+endpoint = "http://otel-collector:4318"
+```
+
+```bash
+KIMMY_OTLP_ENDPOINT=http://otel-collector:4318 kimmyd run
+```
+
+Or try it against a collector you throw away:
+
+```bash
+docker run --rm -p 4318:4318 otel/opentelemetry-collector:latest
+KIMMY_OTLP_ENDPOINT=http://127.0.0.1:4318 kimmyd run
+```
+
+The startup summary reports what was read, so a mistyped section is visible
+rather than silently inert:
+
+```
+… log=info/Pretty otel=http://otel-collector:4318 (http/protobuf, ratio=1, names=off)
+```
+
+| Setting | Env | Default | |
+|---|---|---|---|
+| `endpoint` | `KIMMY_OTLP_ENDPOINT` | unset | Collector **base** URL; `/v1/traces` and `/v1/metrics` are appended |
+| `protocol` | `KIMMY_OTLP_PROTOCOL` | `http/protobuf` | Or `http/json`. **No gRPC** ([ADR-069](decisions.md)) |
+| `sample_ratio` | `KIMMY_OTLP_SAMPLE_RATIO` | `1.0` | Parent-based; `0.0` is refused rather than treated as off |
+| `include_names` | `KIMMY_TELEMETRY_INCLUDE_NAMES` | `false` | See below and [Security](security.md) |
+| `service_name` | `KIMMY_OTLP_SERVICE_NAME` | `kimmydb` | One name for the deployment, not one per node |
+| `export_timeout_secs` | — | `10` | Bounds an exporter thread, never a request |
+
+**Plaintext only, and refused rather than silently broken.** The exporter is
+built without a TLS backend, so an `https://` endpoint fails at startup with a
+message saying so. A collector is normally a sidecar or an in-cluster service;
+if yours is across an untrusted network, run one beside this node and let that
+forward over TLS ([ADR-069](decisions.md)).
+
+**An unreachable collector never touches serving.** Spans go to a batch
+processor on its own threads, exports are bounded by `export_timeout_secs`, and
+nothing on the request path waits for either. A node configured against a dead
+port serves at unchanged latency and keeps serving — verified, not asserted;
+the numbers are in [Benchmarks](benchmarks.md).
+
+#### What you get
+
+| Span | Where |
+|---|---|
+| `/v1/db/{db}/coll/{coll}/docs` and the other route templates | One per request. Health probes and `/metrics` are excluded, for the same reason they are excluded from the latency histogram |
+| `find`, `insert`, `update`, `aggregate`, … | One per executor operation, so REST and MCP produce the same spans — they call the same functions |
+| `storage.commit` | The fsync. redb has a single writer and every commit is one, so this is what a write *cost* |
+| `cluster.sync` | One per peer per anti-entropy round, with `applied`, `ddl` and `lag_ms` |
+| `vector.process`, `vector.embed` | The embedding worker, with the chunk count — a remote provider is a round trip per chunk |
+| `webhook.deliver` | One per batch, and it **injects `traceparent`** so a receiver can continue the trace |
+| `oidc.jwks_refresh` | The signing-key fetch |
+
+Inbound `traceparent` and `tracestate` are honoured, so a request that arrives
+from another traced service continues that trace rather than starting its own.
+Sampling is parent-based for the same reason: a ratio applied independently per
+node produces traces with holes in them.
+
+#### Names are off by default
+
+With `include_names = false` — the default — a span carries no database name,
+no collection name and no request path. Span names come from the route
+*template* and the operation, so there is nothing in them to redact. Turning
+the flag on adds `db.namespace`, `db.collection.name` and `url.path`, which
+publishes your schema to whatever holds the traces
+([ADR-068](decisions.md), [Security](security.md)).
+
+**Only spans are exported, never log events.** `tracing-opentelemetry` would
+otherwise attach every log line inside a request to its span with that line's
+own fields — `db`, `collection`, `user`, webhook URLs — none of which was
+written with a collector in mind. The cost is that a trace does not carry the
+log lines from inside it; correlate on time and node instead
+([ADR-068](decisions.md)).
+
+Audit records never reach the collector at any setting: they carry principal
+names, and `RUST_LOG` routing of `kimmy::audit` is the surface for them.
+
+#### Metrics over OTLP
+
+The same counters `/metrics` renders are reported through the collector as
+observable instruments reading the same atomics — bridged, not duplicated, so
+the two surfaces cannot disagree ([ADR-070](decisions.md)). `/metrics` itself
+is unchanged and stays the recommended scrape target.
+
+The OTLP names are **not** the Prometheus ones. They drop the `_total` suffix
+and use dots — `kimmy.requests`, `kimmy.responses.4xx`,
+`kimmy.replication.lag` — because a counter named `kimmy_requests_total`
+re-emerges from a collector's Prometheus exporter as
+`kimmy_requests_total_total`.
+
 ---
 
 ## The audit log

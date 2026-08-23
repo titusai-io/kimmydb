@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kimmy_storage::Engine;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
@@ -123,11 +123,34 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // an unreachable cluster has unknown lag, not zero lag.
                 let mut round_lag: Option<u64> = None;
                 for peer in health.select(&peers, Instant::now()) {
+                    // One span per peer per round, not one per round: an
+                    // anti-entropy round against three peers is three
+                    // conversations with three different outcomes, and folding
+                    // them into one span would lose which peer was the slow
+                    // one — the only thing anybody opens this trace to find
+                    // out. `applied`, `ddl` and `lag_ms` are declared here and
+                    // filled from the outcome, so a failed round still leaves a
+                    // span with the peer on it rather than nothing at all.
+                    let span = tracing::info_span!(
+                        "cluster.sync",
+                        otel.kind = "client",
+                        peer = %peer,
+                        applied = tracing::field::Empty,
+                        ddl = tracing::field::Empty,
+                        lag_ms = tracing::field::Empty,
+                    );
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once(&engine, peer, &config.secret).await {
+                    match sync_once(&engine, peer, &config.secret).instrument(span.clone()).await {
                         Ok(outcome) => {
+                            // `i64` throughout: `tracing-opentelemetry` has
+                            // no `record_u64`, so an unsigned value is
+                            // formatted with `Debug` and reaches a collector
+                            // as a string nothing can graph.
+                            span.record("applied", outcome.applied as i64);
+                            span.record("ddl", outcome.ddl as i64);
+                            span.record("lag_ms", outcome.lag_ms as i64);
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             if outcome.total() > 0 {

@@ -34,6 +34,13 @@ rustls.workspace = true
 # does none, deliberately, so it lives here. Both were already in the tree.
 reqwest.workspace = true
 serde_json.workspace = true
+# OpenTelemetry. The binary is the only crate that gets the SDK: it is what
+# decides whether an exporter exists at all, and where it points (ADR-069).
+opentelemetry.workspace = true
+opentelemetry_sdk.workspace = true
+opentelemetry-otlp.workspace = true
+opentelemetry-semantic-conventions.workspace = true
+tracing-opentelemetry.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true

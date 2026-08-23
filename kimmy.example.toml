@@ -360,3 +360,78 @@ level = "info"
 
 # "pretty" for a terminal, "json" for a log shipper.
 format = "pretty"
+
+# ---------------------------------------------------------------------------
+# Distributed tracing and OTLP metrics
+# ---------------------------------------------------------------------------
+#
+# There is no `enabled` flag: telemetry is on when `endpoint` is set and off
+# when it is not. A separate toggle would add an `enabled = true` with no
+# endpoint, which can only ever be a startup failure.
+#
+# The whole section is commented out, which is the default: a database that
+# opens an outbound connection nobody configured is a surprise, and an
+# operator who wants traces knows they want them.
+#
+# [telemetry]
+
+# Base URL of an OpenTelemetry collector -- the *base*, not a signal path.
+# `/v1/traces` and `/v1/metrics` are appended, which is what
+# OTEL_EXPORTER_OTLP_ENDPOINT means everywhere else, so you can paste the
+# value your other services already use.
+#
+# **Plaintext only.** The exporter is built without a TLS backend, so an
+# https:// endpoint is refused at startup rather than failing silently at
+# every export (ADR-069). A collector is normally a sidecar or an in-cluster
+# service; if yours is across an untrusted network, run a collector beside
+# this node and let that one forward over TLS.
+#
+# endpoint = "http://otel-collector:4318"
+
+# "http/protobuf" (default) or "http/json". No gRPC: it would add tonic and
+# its build machinery for a wire format the collector already accepts over
+# :4318, and ADR-016's rule about not adding native build dependencies is
+# worth more than the encoding (ADR-069). Reach for "http/json" when a
+# receiver is rejecting exports and you want to read one off a capture.
+#
+# protocol = "http/protobuf"
+
+# Fraction of traces to record, 0.0 to 1.0. Sampling is *parent-based*: a
+# request that arrives already carrying a sampled `traceparent` is recorded
+# whatever this says, because a ratio applied independently per node produces
+# traces with holes in them -- which is worse than fewer whole ones.
+#
+# 0.0 is refused while an endpoint is set. It would build an exporter that can
+# never emit a span, and you would find that out from an empty dashboard weeks
+# later. To turn telemetry off, remove `endpoint`.
+#
+# sample_ratio = 1.0
+
+# Whether spans may carry database and collection names. **Off**, and this is
+# the setting to think about before turning on.
+#
+# With it off, a span is named for its route template
+# (`/v1/db/{db}/coll/{coll}/docs`) or its operation (`find`, `insert`), neither
+# of which says anything about what you store -- the default is private by
+# construction rather than by redaction. With it on, `db.namespace`,
+# `db.collection.name` and `url.path` are exported too, which publishes your
+# schema to whatever holds the traces and to everyone who can read it.
+#
+# Audit records are excluded from the exporter entirely either way: they carry
+# principal names, and a collector is a different destination from a log file
+# even when the same person runs both (ADR-068, docs/security.md).
+#
+# include_names = false
+
+# What `service.name` this node reports itself as. One name for the whole
+# deployment rather than one per node -- nodes are told apart by their
+# resource attributes, and a per-node service name makes a three-node cluster
+# look like three unrelated systems.
+#
+# service_name = "kimmydb"
+
+# How long one export may take before it is abandoned. Exports are off the
+# request path, so this bounds an exporter thread rather than a client: an
+# unreachable collector costs a timeout every batch and nothing else.
+#
+# export_timeout_secs = 10

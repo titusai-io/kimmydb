@@ -34,6 +34,50 @@ pub const MAX_LIMIT: usize = 10_000;
 pub const MAX_BULK_INSERT: usize = 1000;
 
 // ---------------------------------------------------------------------------
+// Tracing
+// ---------------------------------------------------------------------------
+
+/// Open the span for one executor operation.
+///
+/// Here rather than at the two edges, for the same reason [`authorize`] is
+/// here: the REST route and the MCP tool both call these functions, so a span
+/// opened in this file covers both, and one opened beside a handler is a span
+/// the next edge forgets. The two lines sit together at the top of each
+/// function on purpose — what was asked for, and whether it was allowed.
+///
+/// **The span name carries no data name.** It is `db.operation.name` — `find`,
+/// `insert`, `aggregate` — which is low-cardinality and says nothing about what
+/// a deployment stores. `db.namespace` and `db.collection.name` do, so they are
+/// recorded only when the operator turned `telemetry.include_names` on
+/// (ADR-068); declared `Empty` and filled afterwards, because a field never
+/// filled is not exported at all, whereas an empty string would be an attribute
+/// asserting the collection is called "".
+fn op_span(operation: &'static str, db: &str, coll: Option<&str>) -> tracing::Span {
+    use opentelemetry_semantic_conventions::attribute as semconv;
+
+    use crate::telemetry::{DB_SYSTEM, include_names};
+
+    let span = tracing::info_span!(
+        "db.operation",
+        // The span's real name, set at runtime. The macro bakes a literal into
+        // a static callsite, so the name has to arrive as this field instead —
+        // `otel.name` is what `tracing-opentelemetry` reads it from.
+        otel.name = operation,
+        { semconv::DB_SYSTEM_NAME } = DB_SYSTEM,
+        { semconv::DB_OPERATION_NAME } = operation,
+        { semconv::DB_NAMESPACE } = tracing::field::Empty,
+        { semconv::DB_COLLECTION_NAME } = tracing::field::Empty,
+    );
+    if include_names() {
+        span.record(semconv::DB_NAMESPACE, db);
+        if let Some(coll) = coll {
+            span.record(semconv::DB_COLLECTION_NAME, coll);
+        }
+    }
+    span
+}
+
+// ---------------------------------------------------------------------------
 // Authorization
 // ---------------------------------------------------------------------------
 
@@ -57,6 +101,7 @@ pub fn authorize(
 // ---------------------------------------------------------------------------
 
 pub fn list_databases(state: &SharedState, auth: &Auth) -> Result<Value, ApiError> {
+    let _span = op_span("list_databases", "*", None).entered();
     let names: Vec<String> = state
         .engine
         .list_databases()?
@@ -70,6 +115,7 @@ pub fn list_databases(state: &SharedState, auth: &Auth) -> Result<Value, ApiErro
 }
 
 pub fn list_collections(state: &SharedState, auth: &Auth, db: &str) -> Result<Value, ApiError> {
+    let _span = op_span("list_collections", db, None).entered();
     let all = state.engine.list_collections(db)?;
     let names: Vec<&str> =
         auth.principal().visible(Action::Read, db, all.iter().map(|c| c.name.as_str()));
@@ -82,6 +128,7 @@ pub fn create_collection(
     db: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("create_collection", db, Some(name)).entered();
     auth.require(Action::Admin, db, Some(name))?;
     let meta = state.engine.create_collection(db, name)?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
@@ -93,6 +140,7 @@ pub fn drop_collection(
     db: &str,
     coll: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("drop_collection", db, Some(coll)).entered();
     auth.require(Action::Admin, db, Some(coll))?;
     Ok(json!({ "dropped": state.engine.drop_collection(db, coll)? }))
 }
@@ -122,6 +170,7 @@ pub fn find(
     coll: &str,
     params: FindParams,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("find", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let filter = parse_filter(params.filter.as_ref())?;
@@ -223,6 +272,7 @@ pub fn count(
     coll: &str,
     params: FindParams,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("count", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
 
@@ -243,6 +293,7 @@ pub fn get_doc(
     coll: &str,
     id: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("get_doc", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let doc_id = parse_id(id)?;
     match state.engine.get(&meta, &doc_id)? {
@@ -446,6 +497,7 @@ pub fn insert(
     coll: &str,
     document: &Value,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("insert", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc = json_to_document(document)?;
     let id = state.engine.insert(&meta, doc)?;
@@ -463,6 +515,7 @@ pub fn insert_many(
     coll: &str,
     documents: &[Value],
 ) -> Result<Value, ApiError> {
+    let _span = op_span("insert_many", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
     if documents.len() > MAX_BULK_INSERT {
@@ -511,6 +564,7 @@ pub fn replace(
     document: &Value,
     upsert: bool,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("replace", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let doc = json_to_document(document)?;
@@ -537,6 +591,7 @@ pub fn delete_by_id(
     coll: &str,
     id: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("delete_by_id", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let deleted = state.engine.delete(&meta, &doc_id)?;
@@ -565,6 +620,7 @@ pub fn update(
     update_json: &Value,
     params: WriteParams,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("update", db, Some(coll)).entered();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
@@ -705,6 +761,7 @@ pub fn find_and_modify(
     coll: &str,
     spec: FindAndModifySpec,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("find_and_modify", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
 
     // Mutually exclusive rather than silently preferring one: a request that
@@ -798,6 +855,7 @@ pub fn delete(
     coll: &str,
     params: WriteParams,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("delete", db, Some(coll)).entered();
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
@@ -852,6 +910,7 @@ pub fn create_index(
     coll: &str,
     spec: IndexSpec,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("create_index", db, Some(coll)).entered();
     auth.require(Action::Admin, db, Some(coll))?;
 
     let fields: Vec<kimmy_storage::IndexField> = spec
@@ -894,6 +953,7 @@ pub fn list_indexes(
     db: &str,
     coll: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("list_indexes", db, Some(coll)).entered();
     authorize(state, auth, Action::Read, db, coll)?;
     let indexes: Vec<Value> =
         state.engine.list_indexes(db, coll)?.iter().map(index_to_json).collect();
@@ -907,6 +967,7 @@ pub fn drop_index(
     coll: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("drop_index", db, Some(coll)).entered();
     auth.require(Action::Admin, db, Some(coll))?;
     Ok(json!({ "dropped": state.engine.drop_index(db, coll, name)? }))
 }
@@ -1005,6 +1066,7 @@ pub fn aggregate(
     coll: &str,
     pipeline: &Value,
 ) -> Result<Value, ApiError> {
+    let _span = op_span("aggregate", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let stages = parse_pipeline(pipeline)?;

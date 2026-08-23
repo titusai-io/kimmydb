@@ -14,6 +14,40 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **Distributed tracing and OTLP metrics.** A node can now export spans and
+  counters to an OpenTelemetry collector. Configure it under `[telemetry]` (or
+  `KIMMY_OTLP_ENDPOINT`); there is no enable flag, because setting an endpoint
+  is what turns it on. Spans cover the HTTP request, the executor operation —
+  so REST and MCP produce the same ones — the storage commit that is the fsync,
+  anti-entropy rounds, the embedding worker, webhook deliveries and the OIDC
+  key refresh. Inbound `traceparent` is honoured and outbound webhook
+  deliveries carry one. See [docs/operations.md](docs/operations.md) and
+  ADR-068 through ADR-070.
+- `--otlp-endpoint`, `--otlp-protocol`, `--otlp-sample-ratio`,
+  `--otlp-service-name` and `--telemetry-include-names`, each with a `KIMMY_*`
+  environment variable.
+- The process counters behind `/metrics` are also reported over OTLP, as
+  observable instruments reading the same atomics — bridged, not duplicated, so
+  the two surfaces cannot disagree (ADR-070). **`/metrics` itself is
+  unchanged**, and is now pinned by a golden test over the whole render plus an
+  ordered series-name assertion over the route's body.
+
+### Security
+
+- **Telemetry omits names by default.** With `telemetry.include_names = false`
+  — the default — a span is named for its route template
+  (`/v1/db/{db}/coll/{coll}/docs`) or its operation (`find`, `insert`), neither
+  of which is built from anything you stored. Turning it on adds
+  `db.namespace`, `db.collection.name` and `url.path`, which publishes your
+  schema to whatever holds the traces. **Only spans are exported, never log
+  events**, and audit records never reach a collector at any setting. See
+  [docs/security.md](docs/security.md) and ADR-068.
+- **OTLP over HTTP only, never gRPC**, and `https://` collector endpoints are
+  refused at startup rather than failing silently at every export. This keeps
+  the build free of a second native dependency stack, so the musl and arm64
+  cross-compiles are unchanged (ADR-069). A collector reachable only over gRPC
+  or TLS needs an OpenTelemetry Collector in front of it.
+
 - **Enterprise OIDC federation.** A node can now accept tokens from one
   external OpenID Connect provider alongside its own local users. Configure it
   under `[auth.oidc]` (or `KIMMY_OIDC_ISSUER` / `KIMMY_OIDC_AUDIENCE` /

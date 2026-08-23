@@ -29,6 +29,17 @@ uuid.workspace = true
 reqwest.workspace = true
 hmac = "0.12"
 sha2 = "0.10"
+# The OTel **API** only, never the SDK. This crate extracts an inbound
+# `traceparent` and injects an outbound one; which exporter (if any) is behind
+# the global propagator is `kimmyd`'s decision, and a library that could make
+# it would be a library that starts a network client on someone else's behalf.
+opentelemetry.workspace = true
+tracing-opentelemetry.workspace = true
+# The attribute vocabulary, as constants rather than as strings spelled out
+# here. `tracing` takes a constant field name in braces — `{ DB_NAMESPACE } =
+# value` — so a specification rename is a compile error instead of an attribute
+# nothing queries. Constants only: this crate still gets no SDK and no exporter.
+opentelemetry-semantic-conventions.workspace = true
 tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
 
 [dev-dependencies]
@@ -37,6 +48,12 @@ parking_lot.workspace = true
 # reads, and the only way to assert on them is to capture what a subscriber
 # formats. Nothing here ships.
 tracing-subscriber.workspace = true
+# Dev-only, and the layering is deliberate: this crate ships with the OTel API
+# alone, but the *tests* need an SDK to install a propagator and an in-memory
+# exporter — a span that is exported nowhere cannot be asserted on, and the
+# claims here (a `traceparent` becomes a parent, names are gated, the audit
+# target never leaves) are exactly the ones that are worthless untested.
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 # For the stub identity provider the federation tests sign tokens with. A test
 # that needs a real IdP reachable fails for reasons unrelated to what it checks.
 jsonwebtoken.workspace = true

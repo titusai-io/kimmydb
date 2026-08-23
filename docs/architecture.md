@@ -139,6 +139,21 @@ the single place the wall clock is actually read.
 second enforcement path is precisely how an MCP tool ends up quietly more
 permissive than the REST route beside it.
 
+**Only `kimmyd` can start an exporter.** `kimmy-api` depends on `opentelemetry`
+(the API), `tracing-opentelemetry` and `opentelemetry-semantic-conventions` —
+enough to read an inbound `traceparent`, write an outbound one, and name
+attributes from the specification. The **SDK** — `opentelemetry_sdk` and
+`opentelemetry-otlp` — is `kimmyd`'s alone, so whether telemetry exists at all,
+and where it goes, is one decision made in one place. A library that could make
+it is a library that opens a network connection on its consumer's behalf.
+
+`kimmy-storage`, `kimmy-cluster` and `kimmy-vector` take **no OpenTelemetry
+dependency at all**. They are instrumented with the `tracing` they already had,
+and the binary's `tracing-opentelemetry` layer converts their spans; dotted
+field names such as `db.operation.name` are ordinary `tracing` syntax and
+become OTel attributes. See [ADR-068](decisions.md) and
+[ADR-069](decisions.md).
+
 ---
 
 ## Request lifecycle

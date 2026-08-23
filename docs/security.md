@@ -659,6 +659,58 @@ protect and every request is already a superuser.
 
 ---
 
+## What telemetry sends, and what it does not
+
+Tracing is off unless `telemetry.endpoint` is set. When it is on, **spans omit
+names by default** ([ADR-068](decisions.md)).
+
+A span is named for the axum route *template* —
+`/v1/db/{db}/coll/{coll}/docs` — or for the executor operation (`find`,
+`insert`, `aggregate`). Neither is built from anything you stored, so the
+default is private by construction rather than by redaction: there is nothing
+in a span name to leak even if the gate were wrong. Attributes are the method,
+the route, the status code and the client address.
+
+Setting `telemetry.include_names = true` adds three attributes, and each one
+publishes something:
+
+| Attribute | What it exposes |
+|---|---|
+| `db.namespace` | Your database names |
+| `db.collection.name` | Your collection names |
+| `url.path` | The raw request path — which carries both, **and the document `_id`** |
+
+That is your schema, sent to whatever holds the traces and readable by everyone
+who can read it. A collector is a fan-out: it forwards to a vendor, it is
+scraped by a platform team, and its retention is somebody else's policy. Turn
+it on when you are debugging a specific collection and you have decided that
+trade is fine; the reason it is a flag rather than a default is that names
+already shipped cannot be un-shipped.
+
+Three things are never sent, at any setting:
+
+- **Log events.** Only spans are exported. `tracing-opentelemetry` would
+  otherwise attach every log line inside a request to its span *with that
+  line's own fields*, and this server's log lines carry `db`, `collection`,
+  `user` and webhook `url`s — none of which was written with a collector in
+  mind. Logs stay logs ([ADR-068](decisions.md)).
+- **Audit records.** They carry principal names alongside collection names, and
+  `include_names` was never meant to gate identities. The `kimmy::audit` target
+  is refused by name as well as by the rule above, and stays reachable through
+  `RUST_LOG` routing exactly as before.
+- **Document contents, filters, and webhook URLs.** No span carries a document,
+  a query, a token, or a subscription's endpoint. A webhook URL routinely has a
+  secret in its path, which is why the delivery span names neither it nor the
+  subscription id.
+
+Outbound webhook deliveries carry a `traceparent` header so a receiver can
+continue the trace. It is **not** covered by `x-kimmy-signature` — that signs
+the body and the timestamp, which is what replay protection needs, and a header
+a tracing-aware proxy is entitled to rewrite must not be able to fail a
+delivery. Treat an inbound `traceparent` as a hint, never as evidence.
+
+---
+
 ## Deployment checklist
 
 ```mermaid

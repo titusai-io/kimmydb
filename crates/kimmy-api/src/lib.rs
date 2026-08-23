@@ -24,6 +24,7 @@ pub mod routes;
 pub mod schema;
 pub mod sessions;
 pub mod state;
+pub mod telemetry;
 pub mod topology;
 pub mod users;
 pub mod vectors;

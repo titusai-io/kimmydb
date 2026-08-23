@@ -12,7 +12,14 @@ use anyhow::{Context, Result};
 use kimmy_cluster::SeedSource;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `Eq` deliberately absent, and only from this type.
+///
+/// [`TelemetryConfig::sample_ratio`] is an `f64`, which is `PartialEq` and not
+/// `Eq` — a ratio is a fraction, and rounding it to something comparable would
+/// be inventing precision the operator did not ask for. Every other section
+/// keeps `Eq`; nothing in the workspace needs a `Config` as a map key or in a
+/// set, so the loss costs nothing.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -22,6 +29,7 @@ pub struct Config {
     pub webhooks: WebhookConfig,
     pub audit: AuditConfig,
     pub log: LogConfig,
+    pub telemetry: TelemetryConfig,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -483,6 +491,191 @@ pub struct LogConfig {
     pub format: LogFormat,
 }
 
+/// Where traces and metrics are exported, if anywhere.
+///
+/// There is no `enabled` flag, for the same reason [`TlsConfig`] and
+/// [`OidcConfig`] have none: a toggle would add a state where `enabled = true`
+/// with no endpoint, which can only ever be a startup failure. Telemetry is on
+/// when `endpoint` is set and off when it is not, and the settings beside it
+/// are inert until it is — so a half-filled section is a section nobody has
+/// finished rather than a mistake.
+///
+/// **HTTP only, never gRPC** (ADR-069). The exporter rides the `reqwest` and
+/// `rustls`/`ring` stack the build already carries, which is what keeps
+/// `scripts/check-native-deps.sh` unchanged and the musl and arm64
+/// cross-compiles exactly as hard as they were.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TelemetryConfig {
+    /// Base URL of an OpenTelemetry collector. `None` — the default — means no
+    /// exporter is built and no span leaves this process.
+    ///
+    /// The **base**, not a signal path: `/v1/traces` and `/v1/metrics` are
+    /// appended, matching what `OTEL_EXPORTER_OTLP_ENDPOINT` means everywhere
+    /// else, so an operator can paste the same value they gave their other
+    /// services.
+    pub endpoint: Option<String>,
+    /// `http/protobuf` (the default) or `http/json`.
+    ///
+    /// Protobuf because it is what a collector's :4318 receiver expects and is
+    /// the cheaper encoding; JSON exists because it is the one an operator can
+    /// read off a packet capture when a receiver is rejecting exports and
+    /// nothing says why.
+    pub protocol: String,
+    /// Fraction of traces to record, `0.0` to `1.0`.
+    ///
+    /// Applied as a parent-based sampler, so a request that arrives already
+    /// carrying a sampled `traceparent` is recorded whatever this says. That is
+    /// the property that makes a trace whole: a ratio applied independently per
+    /// node produces traces with holes in them, which is worse than fewer
+    /// complete ones.
+    pub sample_ratio: f64,
+    /// Whether spans may carry database and collection names.
+    ///
+    /// **Off by default**, and the reason [`kimmy_api::telemetry`] exists.
+    /// Span names come from `http.route` and `db.operation.name`, neither of
+    /// which names anything a deployment stores; `url.path`, `db.namespace`
+    /// and `db.collection.name` do, so they are exported only when this says
+    /// so. See ADR-068 and docs/security.md.
+    pub include_names: bool,
+    /// What `service.name` this node reports itself as.
+    ///
+    /// One name for the whole deployment, not one per node — the node is
+    /// distinguished by `service.instance.id`, and a per-node service name
+    /// makes a three-node cluster look like three unrelated systems.
+    pub service_name: String,
+    /// How long one export may take before it is abandoned.
+    pub export_timeout_secs: u64,
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            // Off. Everything below is inert until this is set.
+            endpoint: None,
+            protocol: "http/protobuf".to_string(),
+            // Everything. A database is not a service where a hundredth of the
+            // requests is a useful sample of an incident, and an operator who
+            // needs less can say so — whereas one who discovers after the fact
+            // that the trace was dropped has nothing to look at.
+            sample_ratio: 1.0,
+            include_names: false,
+            service_name: "kimmydb".to_string(),
+            // Longer than the collector should ever take, short enough that a
+            // black-holed endpoint does not park an exporter thread for a
+            // minute. Exports are off the request path either way.
+            export_timeout_secs: 10,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    /// Whether an exporter should be built at all.
+    pub fn is_configured(&self) -> bool {
+        self.endpoint.is_some()
+    }
+
+    fn validate(&self) -> Result<()> {
+        let Some(endpoint) = self.endpoint.as_deref() else {
+            return Ok(());
+        };
+
+        // An absolute URL, because it is a base the signal path is appended to
+        // — `localhost:4318` parses as a scheme-relative something and would be
+        // requested as a path on nothing.
+        if !(endpoint.starts_with("http://") || endpoint.starts_with("https://")) {
+            anyhow::bail!(
+                "telemetry.endpoint is {endpoint:?}, which is not an absolute http:// or \
+                 https:// URL. It is the base a signal path is appended to, so a bare host and \
+                 port has nowhere to send anything. Set it to e.g. \
+                 http://otel-collector:4318 (KIMMY_OTLP_ENDPOINT)."
+            );
+        }
+        // Refused rather than left to fail at the first export. The exporter is
+        // built without a TLS backend — ADR-069 keeps the second TLS stack that
+        // would need out of this build — so an https endpoint would produce a
+        // node that serves perfectly while every export fails into a log
+        // nobody reads, which looks exactly like a collector nobody configured.
+        if endpoint.starts_with("https://") {
+            anyhow::bail!(
+                "telemetry.endpoint is {endpoint:?}, and the OTLP exporter is built without a \
+                 TLS backend, so every export would fail while the node kept serving — a \
+                 collector that silently receives nothing. Point it at the collector's \
+                 plaintext receiver (:4318 by default), or run a collector alongside this node \
+                 and let that forward over TLS. See ADR-069."
+            );
+        }
+
+        if !matches!(self.protocol.as_str(), "http/protobuf" | "http/json") {
+            anyhow::bail!(
+                "telemetry.protocol is {:?}; expected \"http/protobuf\" or \"http/json\" \
+                 (KIMMY_OTLP_PROTOCOL). gRPC is deliberately not built in — ADR-069 — because \
+                 it would add tonic and its build machinery for a wire format the collector \
+                 already accepts over HTTP.",
+                self.protocol
+            );
+        }
+
+        if !self.sample_ratio.is_finite() || !(0.0..=1.0).contains(&self.sample_ratio) {
+            anyhow::bail!(
+                "telemetry.sample_ratio is {}; it is a fraction of traces to record and must be \
+                 between 0.0 and 1.0 (KIMMY_OTLP_SAMPLE_RATIO)",
+                self.sample_ratio
+            );
+        }
+        // Not a way to turn telemetry off. It configures an exporter, a batch
+        // processor and a connection to a collector that can never emit a
+        // single span — and the operator would find that out from an empty
+        // dashboard weeks later. The way to turn telemetry off is to leave
+        // `endpoint` unset, and the useful moment to say so is now, while
+        // somebody is watching the boot.
+        if self.sample_ratio == 0.0 {
+            anyhow::bail!(
+                "telemetry.endpoint is set but telemetry.sample_ratio is 0.0, which builds an \
+                 exporter that can never emit a span. To turn telemetry off, remove \
+                 telemetry.endpoint; to record a fraction of traces, set a ratio above zero."
+            );
+        }
+
+        if self.export_timeout_secs == 0 {
+            anyhow::bail!(
+                "telemetry.export_timeout_secs must be greater than zero; an export allowed no \
+                 time at all would time out before it was sent, so nothing would ever reach the \
+                 collector"
+            );
+        }
+
+        if self.service_name.trim().is_empty() {
+            anyhow::bail!(
+                "telemetry.service_name is empty; every span this node exports would arrive \
+                 under a blank service and be impossible to tell apart from anything else \
+                 reporting to the same collector (KIMMY_OTLP_SERVICE_NAME)"
+            );
+        }
+
+        Ok(())
+    }
+
+    /// One-line form for the startup summary.
+    ///
+    /// The endpoint and the two settings that change what is *sent*. Naming
+    /// `include_names` here is the point: it is the difference between a
+    /// collector holding operation names and one holding a deployment's
+    /// schema, and an operator should be able to see which they turned on
+    /// without reading the file back.
+    fn describe(&self) -> String {
+        match &self.endpoint {
+            None => "off".to_string(),
+            Some(endpoint) => format!(
+                "{endpoint} ({}, ratio={}, names={})",
+                self.protocol,
+                self.sample_ratio,
+                if self.include_names { "on" } else { "off" },
+            ),
+        }
+    }
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -691,6 +884,7 @@ impl Config {
 
         self.server.rate_limit.validate()?;
         self.server.tls.validate()?;
+        self.telemetry.validate()?;
         // Parsed at startup so a typo is a boot failure rather than an audit
         // log that silently records nothing.
         kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
@@ -739,7 +933,7 @@ impl Config {
         };
         format!(
             "bind={} scheme={} data_dir={} auth={} oidc={} mcp={} gc={} ratelimit=[{}] audit={} \
-             cluster={} seeds=[{}] log={}/{:?}",
+             cluster={} seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
@@ -753,6 +947,7 @@ impl Config {
             seeds,
             self.log.level,
             self.log.format,
+            self.telemetry.describe(),
         )
     }
 }
@@ -1260,6 +1455,173 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("roles_claim"), "unhelpful error: {err}");
         assert!(err.contains("groups"), "the error should name the Entra ID case: {err}");
+    }
+
+    fn telemetry() -> TelemetryConfig {
+        TelemetryConfig {
+            endpoint: Some("http://otel-collector:4318".into()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn telemetry_is_off_by_default_and_a_configured_endpoint_shows_in_the_summary() {
+        // Off is the default, and the startup line is how an operator confirms
+        // the section was read at all — a mistyped table name would otherwise
+        // be a silent no-op that looks exactly like a collector that is down.
+        let cfg = valid();
+        assert!(!cfg.telemetry.is_configured());
+        assert!(cfg.summary().contains("otel=off"), "{}", cfg.summary());
+
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+        cfg.validate().unwrap();
+
+        let summary = cfg.summary();
+        assert!(summary.contains("otel=http://otel-collector:4318"), "{summary}");
+        assert!(summary.contains("http/protobuf"), "{summary}");
+        // The one setting that changes what leaves the process, named where an
+        // operator can see which of the two they turned on (ADR-068).
+        assert!(summary.contains("names=off"), "{summary}");
+
+        cfg.telemetry.include_names = true;
+        assert!(cfg.summary().contains("names=on"), "{}", cfg.summary());
+    }
+
+    #[test]
+    fn a_relative_telemetry_endpoint_is_refused() {
+        // It is a base a signal path is appended to, so a bare host and port
+        // has nowhere to send anything.
+        let mut cfg = valid();
+        cfg.telemetry.endpoint = Some("otel-collector:4318".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("telemetry.endpoint"), "unhelpful error: {err}");
+        assert!(err.contains("KIMMY_OTLP_ENDPOINT"), "the error should name the env var: {err}");
+        assert!(err.contains("absolute"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn an_https_telemetry_endpoint_is_refused_rather_than_failing_at_the_first_export() {
+        // The exporter is built without a TLS backend (ADR-069), so an https
+        // endpoint is a node that serves perfectly while every export fails —
+        // indistinguishable from a collector nobody configured.
+        let mut cfg = valid();
+        cfg.telemetry.endpoint = Some("https://otel-collector:4318".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("telemetry.endpoint"), "unhelpful error: {err}");
+        assert!(err.contains("TLS backend"), "the error should say what breaks: {err}");
+        assert!(err.contains("ADR-069"), "the error should point at the decision: {err}");
+    }
+
+    #[test]
+    fn an_unknown_telemetry_protocol_lists_the_two_and_says_grpc_is_deliberate() {
+        // Otherwise "grpc" reads as a typo in this file rather than as a
+        // transport this build does not have.
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+        cfg.telemetry.protocol = "grpc".into();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("telemetry.protocol"), "unhelpful error: {err}");
+        assert!(err.contains("http/protobuf"), "the error should list the valid ones: {err}");
+        assert!(err.contains("http/json"), "the error should list the valid ones: {err}");
+        assert!(err.contains("ADR-069"), "the error should point at the decision: {err}");
+
+        for protocol in ["http/protobuf", "http/json"] {
+            cfg.telemetry.protocol = protocol.into();
+            cfg.validate().unwrap_or_else(|e| panic!("{protocol} should be valid: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_sample_ratio_outside_zero_to_one_is_refused() {
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+
+        for bad in [-0.5, 1.5, f64::NAN, f64::INFINITY] {
+            cfg.telemetry.sample_ratio = bad;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("telemetry.sample_ratio"), "unhelpful error for {bad}: {err}");
+            assert!(err.contains("KIMMY_OTLP_SAMPLE_RATIO"), "name the env var for {bad}: {err}");
+        }
+
+        cfg.telemetry.sample_ratio = 0.25;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn an_endpoint_with_a_zero_sample_ratio_is_refused_rather_than_being_a_silent_no_op() {
+        // It configures an exporter, a batch processor and a connection to a
+        // collector that can never emit a single span. The operator would find
+        // that out from an empty dashboard weeks later; the useful moment to
+        // say so is while one is watching the boot.
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+        cfg.telemetry.sample_ratio = 0.0;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("sample_ratio"), "unhelpful error: {err}");
+        assert!(err.contains("never emit"), "the error should say what breaks: {err}");
+        assert!(err.contains("remove telemetry.endpoint"), "the error should say the fix: {err}");
+
+        // And with no endpoint it is inert, not an error: nothing is exported
+        // either way, so a leftover zero must not stop a node from starting.
+        let mut off = valid();
+        off.telemetry.sample_ratio = 0.0;
+        off.validate().unwrap();
+    }
+
+    #[test]
+    fn a_zero_export_timeout_is_refused() {
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+        cfg.telemetry.export_timeout_secs = 0;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("export_timeout_secs"), "unhelpful error: {err}");
+        assert!(err.contains("time out"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn an_empty_service_name_is_refused() {
+        // Every span would arrive under a blank service, indistinguishable
+        // from anything else reporting to the same collector.
+        let mut cfg = valid();
+        cfg.telemetry = telemetry();
+        cfg.telemetry.service_name = "  ".into();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("telemetry.service_name"), "unhelpful error: {err}");
+        assert!(
+            err.contains("KIMMY_OTLP_SERVICE_NAME"),
+            "the error should name the env var: {err}"
+        );
+    }
+
+    #[test]
+    fn a_telemetry_section_reads_back_from_toml_as_written() {
+        // The documented shape, exactly as `kimmy.example.toml` shows it. A
+        // renamed field would otherwise be caught only by an operator whose
+        // node refuses to start.
+        let cfg: Config = toml::from_str(
+            "[telemetry]\n\
+             endpoint = \"http://otel-collector:4318\"\n\
+             protocol = \"http/json\"\n\
+             sample_ratio = 0.1\n\
+             include_names = true\n\
+             service_name = \"kimmydb-prod\"\n\
+             export_timeout_secs = 5\n",
+        )
+        .unwrap();
+
+        assert_eq!(cfg.telemetry.endpoint.as_deref(), Some("http://otel-collector:4318"));
+        assert_eq!(cfg.telemetry.protocol, "http/json");
+        assert_eq!(cfg.telemetry.sample_ratio, 0.1);
+        assert!(cfg.telemetry.include_names);
+        assert_eq!(cfg.telemetry.service_name, "kimmydb-prod");
+        assert_eq!(cfg.telemetry.export_timeout_secs, 5);
     }
 
     #[test]

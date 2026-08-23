@@ -272,7 +272,20 @@ impl EmbeddingWorker {
     }
 
     /// Handle one oplog entry.
+    #[tracing::instrument(
+        name = "vector.process",
+        skip_all,
+        fields(kind = ?entry.kind, collection_id = entry.collection.0 as i64)
+    )]
     pub async fn process(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
+        // The collection *id* rather than its name, and no document id: the
+        // span answers "which entry, and how long did embedding it take", and
+        // an id answers that without publishing what a deployment calls its
+        // data (ADR-068). Embedding is the slowest thing this node does off
+        // the write path — a remote provider is a network round trip per chunk
+        // — so this is the span that explains why a document's vectors are
+        // minutes behind its write.
+        //
         // Not every oplog entry describes a mutation. A unique-violation entry
         // reports something that happened *to* the data and has nothing to
         // embed. It would be filtered by the `doc_id` check below anyway, but
@@ -475,6 +488,11 @@ impl EmbeddingWorker {
     ///
     /// `force` re-embeds even current-looking vectors — the configuration
     /// changed, so "current" was measured against the wrong ruler.
+    #[tracing::instrument(
+        name = "vector.embed",
+        skip_all,
+        fields(force, provider = config.provider.name(), chunks = tracing::field::Empty)
+    )]
     async fn embed_one(
         &mut self,
         collection: &CollectionMeta,
@@ -499,6 +517,11 @@ impl EmbeddingWorker {
 
         let text = extract_text(&document, config);
         let chunks = config.chunk.split(&text);
+        // Recorded rather than declared up front, because the split is what
+        // decides it — and the chunk count is what makes a slow embed legible:
+        // a remote provider is charged a round trip per chunk, so thirty
+        // chunks and one are two different costs behind the same span name.
+        tracing::Span::current().record("chunks", chunks.len() as i64);
         if chunks.is_empty() {
             self.engine.delete_vectors(shadow, source)?;
             return Ok(false);

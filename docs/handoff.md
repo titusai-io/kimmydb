@@ -6,6 +6,115 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **OpenTelemetry is in, and it exports spans only**
+
+The branch that wrote this section adds distributed tracing and OTLP metrics.
+It is **off unless `telemetry.endpoint` is set** — no `enabled` flag, for the
+same reason `[server.tls]` and `[auth.oidc]` have none — and when it is on, the
+default exports no database name, collection name or request path.
+
+**Three ADRs hold the reasoning**, and the first is the one to read before
+changing anything here: ADR-068 (attribute privacy — `include_names` off by
+default, span names from route templates and operation names, **log events not
+exported at all**), ADR-069 (OTLP over HTTP, never gRPC), ADR-070 (counters
+bridged to OTLP rather than duplicated).
+
+**The layering is load-bearing.** `kimmy-api` takes the OTel *API* plus
+`tracing-opentelemetry` and the semantic-conventions constants — enough to
+extract an inbound `traceparent` and inject an outbound one, and nothing that
+can start an exporter. `kimmyd` takes the SDK and is the only crate that
+decides whether one exists. `kimmy-storage`, `kimmy-cluster` and `kimmy-vector`
+gained **no new dependency at all**: they were instrumented with the `tracing`
+they already had, and the binary's layer converts their spans. Dotted field
+names (`db.operation.name = "find"`) are valid `tracing` and become OTel
+attributes; `tracing` also takes a *constant* field name in braces, which is
+what lets the semconv constants be used directly rather than re-spelled.
+
+**Spans go where the invariants already are.** `exec.rs`'s `op_span` sits beside
+the `authorize` that was already the first line of every executor function, so
+REST and MCP produce identical spans for free — the same argument that put the
+authorization check there. `routes.rs` opens the request span inside
+`count_request`, reusing its `"/healthz" | "/readyz" | "/metrics"` predicate.
+`WriteTxn::commit` is the storage span, and `commits_are_counted_at_one_chokepoint`
+already proves it is the only fsync.
+
+**The two things that surprised me, both found by running it rather than by
+reading it:**
+
+1. **Log events leak.** `tracing-opentelemetry` turns every event inside a span
+   into a span event *carrying that event's own fields*. With the audit filter
+   alone in place, a live collector received `collection: "orders"` hanging off
+   a `create_collection` span while `include_names` was off and every span
+   attribute was correctly empty. The filter is now `metadata.is_span() &&
+   target != "kimmy::audit"` — spans only, logs stay logs. Gating field by
+   field would have meant auditing every `info!` in the workspace, forever.
+2. **Unsigned numbers arrive as strings.** `tracing-opentelemetry` has no
+   `record_u64`, so a `u16` status code falls through to `record_debug` and
+   reaches the collector as `Str("200")` — which the semantic conventions say
+   is an integer, and which a backend filtering on it would not match. Every
+   numeric span field is recorded as `i64` for that reason. Verified as
+   `Int(200)` on the wire.
+
+**Metrics are bridged, not duplicated.** `Metrics::snapshot` is the new read
+surface; observable instruments read it at export time. `/metrics` is
+byte-for-byte unchanged and pinned two ways — a golden test over the whole
+`render()` string, and an ordered series-name assertion over the HTTP body,
+because the route prepends engine gauges and `kimmy_storage_bytes` is a file
+size. Deployed clusters scrape that endpoint; treat a diff as a
+release note. Note the OTLP names deliberately differ: `kimmy.requests`, not
+`kimmy_requests_total`, because a collector's Prometheus exporter would
+otherwise emit `kimmy_requests_total_total`.
+
+**`Config` lost its `Eq`** (kept `PartialEq`) because `sample_ratio` is an
+`f64`. Nothing in the workspace needed it.
+
+**`main.rs` was restructured** so the command is known before `logging::init`:
+`check-config` and `restore` pass `None` for telemetry, so validating a file
+does not open a connection to production's collector. The `TelemetryGuard` is
+held across `node::run` and dropped after it returns, matching the shutdown
+discipline already written there.
+
+### Verified, not asserted
+
+- **An unreachable collector costs nothing.** Pointed at a closed port, 2,000
+  point reads gave p50 0.153 ms / p99 0.311 ms against 0.159 / 0.315 with
+  telemetry off, and the node kept serving.
+- **A live collector receives what it should.** A REST insert carrying an
+  inbound `traceparent` produced exactly three spans in *that* trace — the
+  route template, `insert`, `storage.commit`, correctly nested and rooted at
+  the caller's span — with no span events, no `db.namespace`, no
+  `db.collection.name`, no `url.path`, and the strings `sales` and `orders`
+  absent from the entire export.
+- **A webhook delivery carries a valid `traceparent`**, unsigned, and the
+  `x-kimmy-signature` a receiver verifies is unchanged.
+- **The cost of tracing** is in `docs/benchmarks.md`: about 6–17% of read
+  throughput at `sample_ratio = 1.0` with the collector on the same machine,
+  and −31% in the one-client cell where the server is otherwise idle. It is
+  span construction, not export.
+
+### Worth knowing before changing this
+
+- `internal-logs` is kept on for `opentelemetry_sdk` and `opentelemetry-otlp`
+  even though everything else is `default-features = false`. Without it a node
+  pointed at the wrong port exports nothing, forever, silently.
+- The exporter takes a programmatic endpoint **verbatim** — it does not append
+  the signal path — so `signal_url` does it. A base handed straight through
+  would POST to the collector's root and be answered 404 forever while the node
+  served perfectly.
+- **`https://` endpoints are refused at startup.** `opentelemetry-http` uses
+  `reqwest` 0.13 (a different major from this workspace's 0.12) pulled with no
+  TLS backend, and the only way to give it one drags in
+  `rustls-platform-verifier` → `security-framework-sys`, a new native crate.
+  That is a decision, not a line for the allowlist, so it was left undone and
+  the refusal names the alternative. **If TLS to a collector is wanted, that is
+  the next decision here**, and the native-deps question is the whole of it —
+  on Linux the same feature adds nothing.
+- The metrics bridge holds a `Weak<AppState>`, so the final export at shutdown
+  observes nothing (the state is already dropped). The periodic export is
+  60 s; a node that lives less than that reports no metrics at all.
+
+---
+
 ## As of 2026-08-23 — **enterprise OIDC federation is in; local auth is untouched**
 
 The branch that wrote this section adds federation with **one** external

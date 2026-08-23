@@ -17,9 +17,17 @@ fn main() -> Result<()> {
     // misconfiguration is a clean one-line error rather than a panic buried in
     // a worker thread.
     let config = cli.resolve()?;
-    logging::init(&config.log)?;
 
-    match cli.command.unwrap_or(Command::Run) {
+    // The command is decided *before* logging is installed, which it did not
+    // used to be. Telemetry is only handed to the subscriber for `run`:
+    // `check-config` and `restore` neither serve nor last more than a moment,
+    // and starting an exporter for them would mean validating a file opens a
+    // connection to production's collector.
+    let command = cli.command.unwrap_or(Command::Run);
+    let telemetry = matches!(command, Command::Run).then_some(&config.telemetry);
+    let telemetry_guard = logging::init(&config.log, telemetry)?;
+
+    match command {
         Command::CheckConfig => {
             println!("{}", toml::to_string_pretty(&config)?);
             eprintln!("configuration is valid");
@@ -104,7 +112,15 @@ fn main() -> Result<()> {
                 .enable_all()
                 .build()
                 .context("building the tokio runtime")?;
-            runtime.block_on(node::run(config))
+            let outcome = runtime.block_on(node::run(config));
+            // Dropped *after* `node::run` returns, which is after every
+            // background task has been aborted — the same shutdown discipline
+            // the end of `node::run` already follows, for the same reason: a
+            // batch processor buffers, so shutting the exporter down first
+            // would throw away the last few seconds of spans, which is exactly
+            // the part anybody debugging a shutdown wants to see.
+            drop(telemetry_guard);
+            outcome
         }
     }
 }

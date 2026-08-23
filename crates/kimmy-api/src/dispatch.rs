@@ -61,6 +61,7 @@ use bson::{Document, doc};
 use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
 use serde_json::{Value, json};
 use tracing::{debug, info, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::egress::EgressPolicy;
 use crate::state::SharedState;
@@ -765,6 +766,17 @@ async fn deliver(
     job: &Job,
     delivery: &Delivery,
 ) -> Result<(), String> {
+    // No URL and no subscription id on the span. A webhook URL is an operator's
+    // endpoint and its path routinely carries a token; the subscription id is
+    // already in the log line beside every outcome, where it is not being
+    // shipped to a third party (ADR-068).
+    let span = tracing::info_span!(
+        "webhook.deliver",
+        otel.kind = "client",
+        events = delivery.stamps.len() as i64,
+    );
+    let _entered = span.enter();
+
     // Re-checked here, not just at registration: a name that resolved publicly
     // then can resolve inward now.
     policy.check(&job.url).map_err(|e| e.to_string())?;
@@ -776,22 +788,52 @@ async fn deliver(
     let first =
         delivery.stamps.first().map(|s| format!("{}-{}", s.hlc, s.node)).unwrap_or_default();
 
-    let response = client
+    let mut request = client
         .post(&job.url)
         .header("content-type", "application/json")
         .header("x-kimmy-event-id", first)
         .header("x-kimmy-timestamp", timestamp.to_string())
         .header("x-kimmy-signature", signature)
         .timeout(DELIVERY_TIMEOUT)
-        .body(delivery.body.clone())
-        .send()
-        .await
-        .map_err(|e| e.to_string())?;
+        .body(delivery.body.clone());
+
+    // Carry the trace across the boundary, so a receiver that also speaks W3C
+    // trace context can show the delivery it handled as a continuation of the
+    // write that caused it. **Not signed**, deliberately: `sign` covers the
+    // body and the timestamp, which is what replay protection needs, and adding
+    // a header a proxy is allowed to rewrite to the signed set would turn any
+    // tracing-aware hop into a delivery failure.
+    //
+    // With no propagator installed the closure writes nothing, so a node with
+    // telemetry off sends exactly the headers it always did — which the
+    // `no_traceparent_when_nothing_is_installed` test pins.
+    let mut headers = std::collections::HashMap::new();
+    opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.inject_context(&span.context(), &mut MapInjector(&mut headers));
+    });
+    for (name, value) in headers {
+        request = request.header(name, value);
+    }
+
+    let response = request.send().await.map_err(|e| e.to_string())?;
 
     if response.status().is_success() {
         Ok(())
     } else {
         Err(format!("endpoint returned {}", response.status()))
+    }
+}
+
+/// Collect the propagated headers before they are attached to a request.
+///
+/// A map rather than injecting straight into `reqwest::RequestBuilder`, because
+/// `Injector::set` takes `&mut self` and a builder is consumed by `header`.
+/// Going through a map also makes the injected set testable without a socket.
+struct MapInjector<'a>(&'a mut std::collections::HashMap<String, String>);
+
+impl opentelemetry::propagation::Injector for MapInjector<'_> {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_string(), value);
     }
 }
 

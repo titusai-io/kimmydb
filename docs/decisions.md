@@ -3067,6 +3067,166 @@ local account and its password. That is the intended cost: the break-glass
 account is the point, and one that exists only in the IdP is not break-glass.
 
 
+---
+
+## ADR-068 — Telemetry attribute privacy: names are off by default
+
+**Decision.** `telemetry.include_names` defaults to **false**, and with it
+false a span carries no database name, no collection name and no request path.
+Span names come from `http.route` — the axum route *template*,
+`/v1/db/{db}/coll/{coll}/docs` — and from `db.operation.name` (`find`,
+`insert`, `aggregate`), neither of which can carry a name because neither is
+built from one. `url.path`, `db.namespace` and `db.collection.name` are the
+three attributes that can, and all three are behind the flag. The
+`kimmy::audit` target is excluded from the OTLP layer **entirely**, at any
+setting of the flag.
+
+**Why.** The endpoint an operator points at is not the boundary the data
+crosses. A collector is a fan-out: it forwards to a vendor, it is scraped by a
+platform team, its retention is somebody else's policy, and traces are read by
+people who were never granted anything in this database. `/metrics` has been
+counts-and-never-names since M2 for exactly that reason, and the argument does
+not weaken because the destination was configured rather than exposed.
+
+**Private by construction, not by redaction.** The point of naming spans from
+the route template is that there is nothing to redact: the template is a
+compile-time string, so a span name cannot leak a name even if the gate is
+wrong. Redaction has to be right every time; construction has to be right once.
+The template is also what keeps span names low-cardinality — a trace backend
+groups by name, and a name built from a URI is one group per document id.
+
+**Spans are exported; log events are not.** `tracing-opentelemetry` turns
+every event that happens inside a span into a **span event**, carrying that
+event's own fields with it — and nothing in this codebase writes log lines with
+telemetry in mind. `kimmy_storage` logs `db` and `collection` on every DDL
+line, the dispatcher logs a webhook `url`, `kimmy-auth` logs `user`. This was
+not reasoned out; it was found by reading what a live collector received, with
+an earlier version of this decision in place: a `create_collection` span
+arrived carrying `collection: "orders"` as an event field while every span
+attribute was correctly empty and `include_names` was off.
+
+Gating those field by field is not a fix — it is an audit of every `info!` in
+the workspace, redone whenever anyone adds one, and the failure mode is a leak
+nobody notices. Spans are the surface designed for this: bounded, reviewed,
+named from route templates. Events are the surface nobody designed for it. So
+the OTLP layer takes spans only, and logs stay logs.
+
+**The audit exclusion is separate and unconditional.** Audit records are
+events, so the span rule already covers them — but they are named in the filter
+anyway, because the promise is about *identities* rather than about how one
+layer happens to be filtered, and if auditing ever grew a span it must still be
+refused. An audit record carries the *principal's* name alongside the
+collection's, a second category of thing entirely, and `include_names` was
+never meant to gate identities. Attaching the filter to the OTLP layer alone
+also leaves an operator's `RUST_LOG=kimmy::audit=info` routing working exactly
+as it did.
+
+**Rejected: treating an operator-chosen collector as a different trust boundary
+and exporting names unconditionally.** It is a defensible sentence and a bad
+default. The person who sets `telemetry.endpoint` during an incident is not
+the person who decided what the trace backend's retention is or who can read
+it, and the mistake is unrecoverable: names already shipped cannot be
+un-shipped. A flag that has to be turned *on* is one decision made once by
+someone who thought about it; a flag that has to be turned *off* is a decision
+nobody makes until after it has mattered.
+
+**Cost.** With names off, a trace shows *that* a `find` was slow and not *what*
+it was over, so an operator debugging one collection has to turn the flag on
+and restart. That is the intended shape — the diagnosis that needs names is a
+deliberate act — but it is a real cost during an incident, and it is why the
+flag exists at all rather than the names being absent for good.
+
+**And a second cost, from the events rule.** A trace shows the shape of a
+request and not the log lines inside it, so correlating the two means matching
+on time and on the node rather than clicking through from a span. Trace-to-log
+correlation by trace id is the thing this gives up, and it is worth giving up:
+it would be bought by exporting every field of every log line, which is the
+leak above.
+
+---
+
+## ADR-069 — OTLP over HTTP, never gRPC
+
+**Decision.** The OpenTelemetry exporters speak OTLP over HTTP —
+`http/protobuf` or `http/json` — and the gRPC transport is not compiled in.
+`opentelemetry-otlp` is taken with `default-features = false` and no
+`grpc-tonic`, so `tonic` is not in the tree. `telemetry.protocol` accepts the
+two HTTP names and refuses everything else with a message that says gRPC is
+deliberate rather than missing.
+
+**Why.** ADR-016's surviving rule is that the build pays for one native crypto
+stack and must not acquire a second; the check that enforces it is
+`scripts/check-native-deps.sh`. The HTTP exporter rides `reqwest` and
+`rustls`/`ring`, both already in the tree for the remote embedding providers
+and for TLS termination, so the allowlist is unchanged and the musl and arm64
+cross-compiles are exactly as hard as they were. That was verified rather than
+assumed: the native-dependency set is byte-identical to the one on `main`.
+
+**And it costs nothing to reach.** The OpenTelemetry Collector's `:4318` HTTP
+receiver is on in its default configuration, so "HTTP only" is not a
+restriction an operator has to work around in the common case — it is the port
+the thing already listens on.
+
+**The client is the blocking one, and that is not an accident.**
+`logging::init` runs before the tokio runtime is built, because configuration
+is resolved and refused before a runtime exists so that a bad file is a
+one-line error rather than a panic in a worker thread. An async exporter built
+there would have no reactor. `reqwest-blocking-client` owns its own threads and
+does not care, and exports are off the request path either way.
+
+**Rejected: a TLS backend for the exporter.** `reqwest` 0.13 — which
+`opentelemetry-http` uses, a different major version from the one this
+workspace carries — offers TLS only together with `rustls-platform-verifier`,
+which brings `security-framework-sys` on macOS. That is a new native crate for
+a case a sidecar collector does not have, so `https://` endpoints are
+**refused at startup** with a message naming the alternative, rather than
+accepted and failing at every export into a log nobody reads.
+
+**Cost.** A deployment whose collector exposes only the gRPC receiver on
+`:4317`, or only TLS, needs a Collector in front of it — which is the component
+whose entire job is to be in front of things. A collector across an untrusted
+network needs one locally to forward over TLS.
+
+---
+
+## ADR-070 — Counters are bridged to OTLP, not duplicated
+
+**Decision.** The OTLP meter provider registers **observable** instruments
+whose callbacks read the same `AtomicU64`s that `/metrics` renders, through a
+new `Metrics::snapshot`. `Metrics::render` is untouched, and the `/metrics`
+body is byte-for-byte what it was — pinned by a golden test over the whole
+render string, and by a second test asserting the exact ordered list of series
+names in the HTTP response.
+
+**Why.** The alternative is two sets of counters incremented at the same call
+sites, which works right up until one of them is not. A `record_request` that
+bumps the atomic and forgets the instrument is a Prometheus dashboard and a
+trace backend disagreeing about how many requests a node served, with nothing
+in either to say which is right — and the divergence is silent, because both
+numbers look plausible. One source of truth per counter removes the question.
+
+**Observable rather than synchronous, because of when the state exists.** The
+counters live in the API state, which needs a database; the subscriber is
+installed before the runtime, let alone the engine. An observable instrument is
+registered later, from `node::run`, and reads at export time, so the ordering
+falls out rather than being arranged.
+
+**The golden test is the load-bearing half.** `/metrics` is scraped by a live
+cluster, and the failure mode of changing it is a panel that goes blank and an
+alert that stops firing — neither of which says anything when it happens.
+`render` is fully deterministic in a test (`uptime_secs` is 0 on a fresh
+instance), so there is no reason to check it loosely: the whole string is
+compared against an inline literal. The route's body prepends engine gauges and
+`kimmy_storage_bytes` is a file size, so that one is pinned structurally
+instead — the ordered series names, which is what a scrape config names.
+
+**Cost.** The OTLP instrument names are not the Prometheus ones. A counter
+exported as `kimmy_requests_total` comes back out of a collector's Prometheus
+exporter as `kimmy_requests_total_total`, so the OTLP names drop the suffix and
+use dots (`kimmy.requests`). Anyone correlating the two surfaces has to know
+that, and it is written down here because nothing about either name reveals it.
+
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

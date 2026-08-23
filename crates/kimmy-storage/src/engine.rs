@@ -69,6 +69,18 @@ pub(crate) struct WriteTxn<'a> {
 
 impl WriteTxn<'_> {
     pub(crate) fn commit(self) -> std::result::Result<(), redb::CommitError> {
+        // The one span in this crate, at the one place a write reaches the
+        // disk. `commits_are_counted_at_one_chokepoint` already proves this is
+        // the only such place, so the span inherits that proof: redb has a
+        // single writer and every commit is an fsync, which makes this the
+        // segment of a trace that shows what a write *cost* rather than how
+        // much of it was CPU.
+        //
+        // Plain `tracing`, with no OpenTelemetry dependency in this crate. The
+        // binary's `tracing-opentelemetry` layer converts it if an operator
+        // configured a collector, and if none is configured this is the same
+        // disabled-span check every other `tracing` call site already pays.
+        let _span = tracing::info_span!("storage.commit").entered();
         self.txn.commit()?;
         self.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
