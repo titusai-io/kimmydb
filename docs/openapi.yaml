@@ -290,7 +290,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [protocol, version, node, capabilities]
+                required: [protocol, version, commit, node, capabilities]
                 properties:
                   protocol:
                     type: string
@@ -303,6 +303,14 @@ paths:
                     description: |
                       The build version. For operators; a client should branch
                       on `capabilities` instead.
+                  commit:
+                    type: string
+                    description: |
+                      The short git commit the build was made from, or
+                      `unknown` for a build made without git — a source
+                      tarball builds too. For operators, like `version`:
+                      it names the exact build when two nodes in a
+                      half-upgraded cluster claim the same version.
                   node:
                     type: string
                     description: The node that answered.

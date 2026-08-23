@@ -66,7 +66,15 @@ pub async fn run(config: Config) -> Result<()> {
         Engine::open(&path).with_context(|| format!("opening database {}", path.display()))?,
     );
 
-    info!(node = %engine.node_id(), version = env!("CARGO_PKG_VERSION"), "starting kimmyd");
+    // Version and commit together, because during a rolling upgrade or an
+    // incident the question is "which build is this exactly", and a version
+    // number alone does not answer it between releases.
+    info!(
+        node = %engine.node_id(),
+        version = kimmy_core::build::VERSION,
+        commit = kimmy_core::build::COMMIT,
+        "starting kimmyd"
+    );
     info!("{}", config.summary());
 
     if config.auth.insecure_no_auth {

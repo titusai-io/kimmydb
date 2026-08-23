@@ -5,6 +5,7 @@
 //! clock that drives last-writer-wins conflict resolution, oplog ordering, and
 //! change-stream resume tokens alike.
 
+pub mod build;
 pub mod cmp;
 pub mod conflict;
 pub mod cursor;

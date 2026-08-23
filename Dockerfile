@@ -8,6 +8,12 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 
+# The build context has no .git, so the commit the binary reports would be
+# "unknown". The release workflow passes the real one; a local `docker build`
+# without the arg still works and honestly says so.
+ARG GIT_COMMIT=
+ENV KIMMY_BUILD_COMMIT=$GIT_COMMIT
+
 # Cache mounts keep the cargo registry and target directory across builds, so a
 # source-only change recompiles just the workspace crates. The binary is copied
 # out inside the same RUN because cache mounts do not persist into the layer.
@@ -18,6 +24,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 
 # ---- runtime --------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
+
+# In the image itself rather than only in workflow metadata, so an image from
+# a laptop `docker build` still says where its source lives — and GHCR uses
+# this label to link the package to the repository.
+LABEL org.opencontainers.image.source="https://github.com/titusai-io/kimmydb"
 
 # ca-certificates is needed by the remote embedding providers (OpenAI, Voyage,
 # Ollama over TLS). The local ONNX provider needs no network at all.

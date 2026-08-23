@@ -19,6 +19,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 repository = "https://github.com/titusai-io/kimmydb"
+homepage = "https://github.com/titusai-io/kimmydb"
 authors = ["Chris Gruber <chris@titusai.io>"]
 
 [workspace.dependencies]
@@ -131,3 +132,9 @@ strip = "debuginfo"
 [profile.bench]
 inherits = "release"
 debug = true
+
+# What `dist` builds release artifacts with. Nothing beyond `release` on
+# purpose: the binary an operator downloads should be built the way the one
+# CI tested was.
+[profile.dist]
+inherits = "release"

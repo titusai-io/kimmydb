@@ -6,6 +6,34 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-22 — **release engineering exists; the first tag is the remaining step**
+
+The branch that wrote this section adds the release machinery: pushing a
+`v*` tag now builds both binaries for macOS (arm64, x86_64) and Linux
+(static musl, arm64 and x86_64 — verified empirically on aarch64 Alpine),
+attaches tarballs and SHA256 checksums to a GitHub Release with notes lifted
+from the new `CHANGELOG.md`, publishes a Homebrew formula for `kimmy` to
+`titusai-io/homebrew-tap`, and pushes a multi-arch image to
+`ghcr.io/titusai-io/kimmydb`. `dist` (cargo-dist) generates
+`.github/workflows/release.yml` from `dist-workspace.toml` — edit the config,
+run `dist generate`, never the YAML; `.github/workflows/publish-ghcr.yml` is
+the one hand-written piece, called by dist as a custom publish job. ADR-062
+(pre-1.0 SemVer, one workspace version, tests pin the binaries to it) and
+ADR-063 (the pipeline) hold the reasoning. Every build now knows its commit:
+`kimmyd`'s startup log, `kimmy --version` and `GET /v1/version` all report
+version + commit + date, with `unknown` for a build without `.git`.
+
+**Before the first release, three things that cannot be done from this repo:**
+create the public `titusai-io/homebrew-tap` repository; add a
+`HOMEBREW_TAP_TOKEN` secret (a PAT that can push to the tap) to this repo;
+then shake the pipeline out with a prerelease tag (e.g. `v0.1.0-rc.1`) —
+dist skips the Homebrew and GHCR publish jobs on prereleases by default, so
+the shakeout proves the build half, and the first real tag proves publishing.
+Retitle the changelog's `Unreleased` section to the version as part of
+tagging.
+
+---
+
 ## As of 2026-08-21 — **the local cluster env exists, and driving it found four bugs**
 
 **#85 through #95 are merged** and `main` is clean; the only thing in flight is

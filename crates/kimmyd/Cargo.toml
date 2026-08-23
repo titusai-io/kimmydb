@@ -52,3 +52,8 @@ futures.workspace = true
 [[bench]]
 name = "http"
 harness = false
+
+# No Homebrew formula for the server: its distribution channel is the GHCR
+# container image (ADR-063). Release tarballs are still built and attached.
+[package.metadata.dist]
+installers = []

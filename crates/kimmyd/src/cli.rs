@@ -12,7 +12,7 @@ use crate::config::{Config, LogFormat};
 #[derive(Parser, Debug)]
 #[command(
     name = "kimmyd",
-    version,
+    version = kimmy_core::build::ident(),
     about = "KimmyDB — a leaderless JSON document database with change streams, \
              vector search, and a built-in MCP server"
 )]
@@ -230,6 +230,21 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// The workspace version is the single source of truth for both binaries
+    /// (ADR-062). This pins the whole chain: `[workspace.package] version`
+    /// is what this binary carries, and what it carries is the constant the
+    /// startup log, `kimmyd --version` and `GET /v1/version` all print.
+    #[test]
+    fn the_server_version_is_the_workspace_version() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml");
+        let manifest: toml::Value =
+            toml::from_str(&std::fs::read_to_string(root).unwrap()).unwrap();
+        let workspace = manifest["workspace"]["package"]["version"].as_str().unwrap();
+
+        assert_eq!(workspace, env!("CARGO_PKG_VERSION"));
+        assert_eq!(workspace, kimmy_core::build::VERSION);
     }
 
     fn parse(args: &[&str]) -> Cli {
