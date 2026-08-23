@@ -6,6 +6,38 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **check-config stops printing the signing key**
+
+Found by running `check-config` against the live identity provider for the WS1
+end-to-end validation, which is the first time anyone had run it with real
+secrets in the environment. It printed `auth.jwt_secret` and
+`auth.root_password` in full, because it serializes the entire `Config` and
+nothing redacted them.
+
+The signing key is the serious half: it is the HS256 secret behind every local
+token, so anyone reading it can forge `root`. And the leak is in the
+*documented* path — `kimmy.example.toml` keeps both fields commented out and
+tells the operator to use `KIMMY_JWT_SECRET` and `KIMMY_ROOT_PASSWORD` instead,
+so the secret is meant to exist only in the environment right up until
+`check-config` writes it to stdout.
+
+Both fields now serialize as `<redacted>` via one `serialize_with` on the two
+`Option<String>`s. `None` still serializes as absent, so "is it set?" survives
+— that is what `check-config` is for. The placeholder is deliberately shorter
+than the 16 bytes `validate` requires of a signing key, so `check-config` output
+pasted back into a config file refuses to start rather than running with a
+placeholder for a key; that refusal fires first whenever authentication is on,
+which is also what stops the bootstrap password being taken literally on a fresh
+database.
+
+Two tests pin it: one asserts no secret value reaches the serialized form while
+both field *names* still do, the other that the placeholder is refused by
+`validate`. 1299 → 1301.
+
+No ADR: nothing was decided here that was open. It was a defect.
+
+---
+
 ## As of 2026-08-23 — **the boundaries are written down**
 
 Documentation only; no code changed and no test count moved.

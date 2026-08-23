@@ -82,6 +82,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Security
 
+- **`kimmyd check-config` no longer prints `auth.jwt_secret` or
+  `auth.root_password`.** It dumped the whole configuration, and those two
+  fields with it, to a terminal — and to CI output, and to anything pasted into
+  a bug report. `jwt_secret` signs every local token the cluster issues, so
+  reading it is enough to mint any principal, `root` included. Both now
+  serialize as `<redacted>`, and the documented workflow was the one that leaked:
+  the config file keeps both commented out in favour of `KIMMY_JWT_SECRET` and
+  `KIMMY_ROOT_PASSWORD`, exactly so the secret lives only in the environment.
+  Whether each is *set* is still shown, which is the question `check-config`
+  exists to answer. **Rotate `auth.jwt_secret` if its value has been through a
+  shared log or a pasted report**; rotating it invalidates every local token in
+  issue, which is the intended effect.
 - **A federated token's `nbf` is now validated.** `jsonwebtoken` leaves that
   check off by default, so a token stamped as not valid until a future time was
   accepted before it was due (RFC 7519 §4.1.5). The same 60-second leeway `exp`
