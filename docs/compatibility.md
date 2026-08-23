@@ -81,6 +81,7 @@ GET /v1/version
 {
   "protocol": "v1",
   "version": "0.1.0",
+  "commit": "416672024e20",
   "node": "3e98120f-66df-4cf0-9fa0-690e3d57fcea",
   "capabilities": ["aggregation", "backup", "bulk-insert", "..."]
 }
@@ -89,7 +90,8 @@ GET /v1/version
 **Branch on `capabilities`, not on `version`.** A version number only answers
 "can I use this feature" if the client also carries a table mapping versions to
 features — the table this endpoint exists to replace. `version` is for
-operators, and `node` says which machine answered.
+operators, `commit` names the exact build when two nodes claim the same
+version, and `node` says which machine answered.
 
 The capability set is closed by an enum in the server, and the contract test
 holds it to the list in `openapi.yaml`, so a node cannot advertise something it
@@ -126,6 +128,40 @@ window; the client wire is optimized for not breaking anyone.
 
 ---
 
+## Release versioning — what the build number promises
+
+Settled by [ADR-062](decisions.md). The protocol promise above is about the
+*wire*; this section is about the *artifacts*, and the two are deliberately
+decoupled — `/v1` can outlive many build versions, and a build version says
+nothing about which protocol majors a node serves.
+
+**Pre-1.0 SemVer.** While the workspace is `0.x`:
+
+- **`0.MINOR` bumps** carry features — and are the only place a breaking
+  change of any kind may land: a config key renamed, a CLI flag retired, a
+  default changed, an internal wire format touched. Read the release notes
+  before crossing a minor.
+- **`0.x.PATCH` bumps** are fixes only. Upgrading across a patch must never
+  require reading anything.
+
+The `/v1` promise holds *through* every one of these: "breaking" here means
+things the protocol contract does not cover — operator surface, packaging,
+the cluster wire.
+
+**One version, two binaries.** `[workspace.package] version` in the root
+`Cargo.toml` is the single source of truth. `kimmyd` and `kimmy` are always
+released together, carry the same number, and a test pins that neither can
+drift from the workspace. There is no per-crate versioning and no promise
+about the library crates' APIs — the crates are not published to crates.io,
+and the released artifacts are the two binaries and the container image.
+
+**Releases are tag-driven.** Pushing `v{MAJOR.MINOR.PATCH}` builds and
+publishes everything; nothing is released by hand. `GET /v1/version` reports
+the build version and the exact commit, so a running node can always be
+matched to its release.
+
+---
+
 ## What is checked, and what is only written down
 
 Some of this is mechanism and some is prose. The difference matters, because
@@ -156,4 +192,4 @@ this project has been wrong before about claims nothing checked.
 
 - [HTTP API](http-api.md) — the reference
 - [`openapi.yaml`](openapi.yaml) — the specification
-- [Decisions](decisions.md) — ADR-055, ADR-056, ADR-057, ADR-058
+- [Decisions](decisions.md) — ADR-055, ADR-056, ADR-057, ADR-058, ADR-062

@@ -38,6 +38,30 @@ change streams work here. In MongoDB they are a byproduct of replication, so
 they require a replica set. Here the log exists whether or not the node has ever
 seen a peer.
 
+## Install
+
+Releases are cut by tag; every artifact below appears with the first `v*`
+release. The server ships as a container image, the CLI ships everywhere.
+
+```bash
+# The server — multi-arch (amd64 + arm64) image on GHCR
+docker run --rm -p 7878:7878 \
+  -e KIMMY_ROOT_PASSWORD=change-me \
+  -e KIMMY_JWT_SECRET=a-long-random-secret \
+  -v kimmy-data:/var/lib/kimmy \
+  ghcr.io/titusai-io/kimmydb:latest
+
+# The CLI — Homebrew (macOS, arm64 and x86_64)
+brew install titusai-io/tap/kimmy
+```
+
+Prebuilt tarballs with SHA256 checksums for both binaries — macOS (arm64,
+x86_64) and Linux (arm64, x86_64, statically linked against musl, so they run
+on any distribution) — are on the
+[releases page](https://github.com/titusai-io/kimmydb/releases). Versioning
+policy is in [Compatibility](docs/compatibility.md): pre-1.0, a minor may
+break things and the [changelog](CHANGELOG.md) says so; a patch never does.
+
 ## Quick start
 
 ```bash

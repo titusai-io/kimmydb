@@ -1,0 +1,49 @@
+[workspace]
+members = ["cargo:."]
+
+# Release engineering, generated and driven by `dist` (cargo-dist). See
+# ADR-063: pushing a `v*` tag builds both binaries for every target below,
+# checksums them, drafts the GitHub Release from CHANGELOG.md, publishes the
+# Homebrew formula, and calls the GHCR publish workflow.
+#
+# `.github/workflows/release.yml` is GENERATED from this file. Do not edit it
+# by hand — change this file and run `dist generate`. The `plan` job that runs
+# on every pull request fails if the two have drifted.
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.32.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app. Homebrew carries `kimmy` only —
+# the server distributes as the GHCR container image (ADR-063) — which is why
+# crates/kimmyd/Cargo.toml opts out with `installers = []`.
+installers = ["homebrew"]
+# A GitHub repo to push Homebrew formulas to
+tap = "titusai-io/homebrew-tap"
+# Publish jobs to run in CI. `./publish-ghcr` is ours:
+# .github/workflows/publish-ghcr.yml, the multi-arch container image.
+publish-jobs = ["homebrew", "./publish-ghcr"]
+# Target platforms to build apps for (Rust target-triple syntax).
+#
+# musl rather than gnu for Linux, deliberately: the result is a static binary
+# that runs on any distribution and in a scratch container, and redb and ring
+# both build cleanly against musl on both architectures — verified empirically
+# on aarch64 (ADR-063) before this was written down.
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+
+# Native runners for both Linux architectures. Without the arm mapping dist
+# would cross-compile from x86_64, and ring's C and assembly make a native
+# toolchain the path that cannot surprise anyone.
+[dist.github-custom-runners]
+aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
+x86_64-unknown-linux-musl = "ubuntu-24.04"
+
+# Pushing a multi-arch image needs more than the release workflow's
+# `contents: write`.
+[dist.github-custom-job-permissions]
+publish-ghcr = { packages = "write", contents = "read" }

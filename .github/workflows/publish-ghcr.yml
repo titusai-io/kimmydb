@@ -1,0 +1,138 @@
+# The multi-arch container image: ghcr.io/titusai-io/kimmydb.
+#
+# Not run on its own. The dist-generated release workflow calls this as its
+# `./publish-ghcr` publish job (see dist-workspace.toml), after the tag's
+# binaries have been built and the GitHub Release is being hosted — so an
+# image only ever exists for a tag whose artifacts built on every platform.
+#
+# Why two native runners and a manifest merge, rather than one buildx run
+# with QEMU: the Dockerfile compiles the workspace in release mode, and a
+# Rust release build under QEMU emulation takes the better part of an hour
+# against minutes natively. GitHub's arm64 runners are free for public
+# repositories, so each architecture builds on its own hardware and a final
+# job stitches the two digests into one multi-arch tag list.
+
+name: Publish to GHCR
+
+on:
+  workflow_call:
+    inputs:
+      # The dist plan manifest. Unused here — the image is defined by the tag
+      # that triggered the release — but a caller cannot pass an undeclared
+      # input, and dist always passes this one.
+      plan:
+        required: true
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/titusai-io/kimmydb
+
+jobs:
+  build:
+    name: build image (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Pushed by digest, not by tag: the tags belong to the merged manifest,
+      # and a per-arch tag would be one more thing to explain in `docker pull`.
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          # What `kimmyd` reports as its commit — the build context carries
+          # no .git, so without this the image would say "unknown".
+          build-args: |
+            GIT_COMMIT=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/titusai-io/kimmydb
+            org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # Read-only reuse of the cache CI writes from main (base images and
+          # the apt layer — see the note in ci.yml on why mode=min is enough).
+          cache-from: type=gha
+
+      - name: Export digest
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          digest="${{ steps.build.outputs.digest }}"
+          touch "$RUNNER_TEMP/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: ghcr-digest-${{ matrix.platform == 'linux/amd64' && 'amd64' || 'arm64' }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: merge manifest and tag
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      packages: write
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          pattern: ghcr-digest-*
+          path: ${{ runner.temp }}/digests
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # X.Y.Z, X.Y and latest from the release tag, plus the exact commit.
+      # No bare X tag while the workspace is pre-1.0: every 0.MINOR may break
+      # (ADR-062), so a floating `0` would promise a stability 0.x does not have.
+      - name: Compute tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest
+
+      - name: Create multi-arch manifest
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf -- "$IMAGE@sha256:%s " *)
+
+      - name: Inspect the result
+        run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"

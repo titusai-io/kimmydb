@@ -2787,6 +2787,120 @@ of a build, so rebuilding cannot fix it, and the honest place to change it is
 `MAX_CONNECTIONS` or `EF_CONSTRUCTION` with recall measurements to hand.
 Recorded so that the number is known rather than discovered.
 
+---
+
+## ADR-062 — Pre-1.0 SemVer: minors may break, patches never do, and there is one version
+
+**Decision.** While the workspace is `0.x`, a **`0.MINOR` bump** carries
+features and is the only release that may break anything — operator surface,
+configuration, CLI flags, defaults, the cluster wire — and a **`0.x.PATCH`
+bump** carries fixes only and must never require reading release notes. The
+workspace version in the root `Cargo.toml` is the **single source of truth**:
+`kimmyd` and `kimmy` are always released together at that number, releases are
+driven by pushing a `v{MAJOR.MINOR.PATCH}` tag, and a test pins that neither
+binary can drift from the workspace. The **protocol version stays independent**
+— `/v1` in the path is a promise about the wire (ADR-058) and says nothing
+about builds; nothing here weakens it.
+
+[Compatibility](compatibility.md) carries the policy where users read it; this
+records why it has this shape.
+
+**Rejected: per-crate versions.** Cargo supports them and eleven crates could
+each carry their own. But nothing here is published to crates.io (deferred past
+0.x, deliberately — a registry release is a compatibility promise about
+*library APIs*, and the only public surfaces today are the HTTP protocol and
+two binaries), so per-crate numbers would version things nobody consumes at a
+cost paid on every release: eleven bumps to reason about instead of one, and a
+release that has to explain which crates moved. One number, moved in lockstep,
+is the version story a two-binary project actually has.
+
+**Rejected: pretending 0.x is 1.x.** Strict SemVer under 1.0 makes every
+breaking change a *major* bump, which this project is not ready to spend —
+the cluster wire alone has needed three stop-the-cluster changes in eleven
+milestones (ADR-040, ADR-051, ADR-053). The `0.MINOR`-may-break convention is
+the one the Rust ecosystem already reads correctly, and writing it down is
+what turns a convention into a promise: a patch is always safe, a minor is a
+release-notes event.
+
+**Why the build version and the protocol version must not merge.** They answer
+different questions on different clocks. "Does this node have the feature I am
+about to use" is answered by capabilities, per node, during a rolling upgrade;
+"which exact build is behaving oddly" is answered by `version` plus the commit
+hash now baked into every build. Tying `/v1` to `1.0.0` would either freeze
+the build number or break the wire promise every time the build number moved.
+
+**Cost.** Two numbers to explain instead of one, and a pre-1.0 minor that
+*may* break obliges the release notes to say clearly when it *does*. That
+obligation is the point: the alternative was breakage nobody had promised to
+announce.
+
+---
+
+## ADR-063 — cargo-dist builds the release; the container image is the server's channel
+
+**Decision.** Releases are built by **`dist` (cargo-dist)**, configured in
+`dist-workspace.toml`, which generates `.github/workflows/release.yml` — a
+file nobody edits by hand. Pushing a `v*` tag builds `kimmyd` and `kimmy` for
+four targets — macOS arm64 and x86_64, and Linux arm64 and x86_64 as **static
+musl binaries on native runners** — attaches tarballs and SHA256 checksums to
+a GitHub Release whose notes come from `CHANGELOG.md`, and publishes a
+Homebrew formula for **`kimmy` only** to `titusai-io/homebrew-tap`. The
+server's distribution channel is the **multi-arch container image** at
+`ghcr.io/titusai-io/kimmydb`, built by `.github/workflows/publish-ghcr.yml`
+as a custom dist publish job. CI stays the merge gate; the release workflow
+trusts what merged.
+
+**The spike that settled it.** The worry was an 11-crate workspace fighting a
+tool built for single-binary projects. It did not: `dist init` found exactly
+the two shipped binaries and nothing else, `installers = []` on `kimmyd`
+scopes Homebrew to the CLI, `formula = "kimmy"` names the formula after the
+binary rather than the crate, and mapping `aarch64-unknown-linux-musl` to
+`ubuntu-24.04-arm` in `[dist.github-custom-runners]` gave native arm builds
+with `musl-tools` installed automatically. The one thing dist does not do —
+the container image — bolts on as a first-class `./publish-ghcr` publish job
+with its own escalated permissions. Hand-rolling the same matrix would mean
+owning tarball naming, checksum generation, release-note extraction and the
+formula template forever, to reproduce what a config file already says.
+
+**Rejected: a hand-rolled matrix workflow.** It was the fallback, and it
+remains the escape hatch if dist is ever abandoned upstream — the cost of
+leaving is one generated workflow and one config file, since the tarball
+layout and checksum format are conventional. The reason it lost is the
+Homebrew half: formula generation and tap publication are exactly the kind of
+templated, twice-a-year-touched code that rots in a repository and stays
+maintained in a tool.
+
+**musl, verified rather than assumed.** The claim that redb and ring build
+against musl on arm64 was tested empirically before being configured: the full
+workspace compiles in an aarch64 Alpine container and both binaries link
+statically and run. A static binary runs on any distribution and in a
+`scratch` container, and it sidesteps the glibc-version matrix that gnu
+builds inherit from whatever runner built them.
+
+**QEMU rejected for the image build.** The Dockerfile compiles the workspace
+in release mode; under QEMU emulation that is the better part of an hour per
+architecture, natively it is minutes. GitHub's arm64 runners are free for
+public repositories, so each architecture builds on its own hardware and a
+final job merges the two digests into one manifest with the `X.Y.Z`, `X.Y`,
+`latest` and commit tags. No bare `X` tag pre-1.0: a floating `0` would
+promise a stability `0.x` does not have (ADR-062).
+
+**Homebrew ships the CLI only.** A server under `brew services` is a second
+init system to support and a data directory in a surprising place; the
+container is the supported way to run `kimmyd`, and the release tarballs
+exist for everything else. `brew install titusai-io/tap/kimmy` installs the
+prebuilt macOS binaries with checksums the formula carries.
+
+**Cost, and what is not solved.** A generated workflow means trusting a
+generator: `release.yml` is 350 lines nobody here wrote, pinned to
+`cargo-dist-version = "0.32.0"` and changed only by `dist generate` (the plan
+job fails any PR where the two drift). The publish half cannot be proven
+without publishing — dist runs a plan on every PR and builds artifacts on a
+`pull_request` opt-in, but the tap push and the GHCR manifest need a real tag,
+so the first release is preceded by a prerelease shakeout. And dist skips
+publish jobs on prerelease tags by default, which is the safe default and
+means the shakeout proves the build half only.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

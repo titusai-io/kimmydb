@@ -5,6 +5,12 @@
 One-shot commands that speak the ordinary HTTP API, print JSON on stdout, and
 exit non-zero when they fail.
 
+Install with `brew install titusai-io/tap/kimmy` on macOS, or take a prebuilt
+tarball from the [releases page](https://github.com/titusai-io/kimmydb/releases)
+— the Linux binaries are static, so they run on any distribution. `kimmy
+--version` prints the version, commit and build date, which is what to include
+in a bug report.
+
 ```bash
 export KIMMY_URL=http://localhost:7878
 export KIMMY_TOKEN=$(echo hunter2 | kimmy login root)
