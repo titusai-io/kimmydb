@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.2.0 - 2026-08-23
 
 ### Added
 
@@ -31,23 +31,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the two surfaces cannot disagree (ADR-070). **`/metrics` itself is
   unchanged**, and is now pinned by a golden test over the whole render plus an
   ordered series-name assertion over the route's body.
-
-### Security
-
-- **Telemetry omits names by default.** With `telemetry.include_names = false`
-  — the default — a span is named for its route template
-  (`/v1/db/{db}/coll/{coll}/docs`) or its operation (`find`, `insert`), neither
-  of which is built from anything you stored. Turning it on adds
-  `db.namespace`, `db.collection.name` and `url.path`, which publishes your
-  schema to whatever holds the traces. **Only spans are exported, never log
-  events**, and audit records never reach a collector at any setting. See
-  [docs/security.md](docs/security.md) and ADR-068.
-- **OTLP over HTTP only, never gRPC**, and `https://` collector endpoints are
-  refused at startup rather than failing silently at every export. This keeps
-  the build free of a second native dependency stack, so the musl and arm64
-  cross-compiles are unchanged (ADR-069). A collector reachable only over gRPC
-  or TLS needs an OpenTelemetry Collector in front of it.
-
 - **Enterprise OIDC federation.** A node can now accept tokens from one
   external OpenID Connect provider alongside its own local users. Configure it
   under `[auth.oidc]` (or `KIMMY_OIDC_ISSUER` / `KIMMY_OIDC_AUDIENCE` /
@@ -74,6 +57,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - `kimmyd check-config` now performs a live discovery and JWKS fetch when
   `[auth.oidc]` is configured, and fails if the provider cannot be reached.
 
+### Security
+
+- **Telemetry omits names by default.** With `telemetry.include_names = false`
+  — the default — a span is named for its route template
+  (`/v1/db/{db}/coll/{coll}/docs`) or its operation (`find`, `insert`), neither
+  of which is built from anything you stored. Turning it on adds
+  `db.namespace`, `db.collection.name` and `url.path`, which publishes your
+  schema to whatever holds the traces. **Only spans are exported, never log
+  events**, and audit records never reach a collector at any setting. See
+  [docs/security.md](docs/security.md) and ADR-068.
+- **OTLP over HTTP only, never gRPC**, and `https://` collector endpoints are
+  refused at startup rather than failing silently at every export. This keeps
+  the build free of a second native dependency stack, so the musl and arm64
+  cross-compiles are unchanged (ADR-069). A collector reachable only over gRPC
+  or TLS needs an OpenTelemetry Collector in front of it.
+- **`admin` cannot be granted through an IdP claim.** A role mapping naming the
+  `admin` action stops the node at startup. Administration stays reachable only
+  through a local account, so a misconfigured or compromised identity provider
+  cannot mint a superuser over the database (ADR-067).
+- Federation is refused in combination with `--insecure-no-auth`, where the
+  role mappings would enforce nothing while appearing to.
+- A non-`https` `auth.oidc.issuer` is refused: the signing keys are fetched
+  from that URL, and over plaintext they can be substituted.
+
 ### Changed
 
 - `GET /v1/auth/whoami` gained a `federated` boolean. A name cannot answer the
@@ -91,17 +98,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 - The container image is tagged `latest` only for a final release. Previously
   a prerelease tag would have taken over `:latest` if prerelease publishing
   were ever enabled.
-
-### Security
-
-- **`admin` cannot be granted through an IdP claim.** A role mapping naming the
-  `admin` action stops the node at startup. Administration stays reachable only
-  through a local account, so a misconfigured or compromised identity provider
-  cannot mint a superuser over the database (ADR-067).
-- Federation is refused in combination with `--insecure-no-auth`, where the
-  role mappings would enforce nothing while appearing to.
-- A non-`https` `auth.oidc.issuer` is refused: the signing keys are fetched
-  from that URL, and over plaintext they can be substituted.
 
 ### Notes for operators
 
