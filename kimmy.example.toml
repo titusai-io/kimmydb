@@ -263,6 +263,20 @@ token_ttl_secs = 3600
 # than about how fast a rotation is survived.
 # refresh_interval_secs = 300
 
+# Refuse a token whose `typ` header is not `at+jwt` (RFC 9068 §4). The header
+# exists so an ID token cannot be presented as an access token.
+#
+# Off by default, because providers disagree about stamping it: Entra ID sends
+# `typ: JWT` on its v2 access tokens, so a strict default would refuse every
+# token from a supported provider. Turn it on when yours is known to emit
+# `at+jwt` — check a real token before you do.
+#
+# If `audience` above is an https URL you are already covered without this: an
+# ID token's audience is the client id, which can never be this node's resource
+# identifier, so the audience check refuses it first. This is then defence in
+# depth. With an opaque audience it is the only check of its kind.
+# require_at_jwt = false
+
 # What a claim value is worth here. Repeat the block per role.
 #
 # Written inline rather than stored in the database on purpose (ADR-066):

@@ -168,6 +168,7 @@ impl Server {
                     vec![kimmy_auth::Action::Read],
                 )],
             }],
+            require_at_jwt: false,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);

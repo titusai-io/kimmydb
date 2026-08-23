@@ -33,6 +33,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   bearer-protected resource.
 - `kimmyd check-config` and the startup log now say whether the node publishes
   protected resource metadata, and why not when it does not.
+- **`auth.oidc.require_at_jwt`** (`KIMMY_OIDC_REQUIRE_AT_JWT`), default `false`:
+  refuse a federated token whose `typ` header is not `at+jwt` (RFC 9068 §4).
+  Off by default because providers disagree about stamping it — Entra ID sends
+  `typ: JWT` on v2 access tokens — so a strict default would refuse every token
+  from a supported provider. Turn it on when yours is known to emit it. If
+  `auth.oidc.audience` is an `https` URL you are already covered without it: an
+  ID token's audience is a client id and can never be a resource identifier.
 
 ### Changed
 
@@ -42,6 +49,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   values — those simply publish no metadata. No existing configuration that
   used `https` or an opaque string needs editing. See
   [ADR-071](docs/decisions.md).
+
+### Security
+
+- **A federated token's `nbf` is now validated.** `jsonwebtoken` leaves that
+  check off by default, so a token stamped as not valid until a future time was
+  accepted before it was due (RFC 7519 §4.1.5). The same 60-second leeway `exp`
+  gets applies, and a token carrying no `nbf` is unaffected — the claim stays
+  optional.
+- **A provider's discovery document must now name the issuer it was fetched
+  for**, and the `jwks_uri` it names must be `https` (OpenID Connect Discovery
+  §4.3, RFC 8414 §3.3). Checked in both places that read one: the node's key
+  refresher and `kimmy login`. Without it, anything able to answer for the
+  well-known path chose which signing keys a node trusts — or, on the CLI,
+  where a client secret is sent. Plain `http` to a loopback address stays
+  allowed, so a locally-run provider still works. **An operator whose provider
+  publishes an issuer that differs from the configured one — a trailing slash
+  is the usual case — will now see a startup failure naming both values.** See
+  [ADR-072](docs/decisions.md).
 
 ## 0.2.0 - 2026-08-23
 

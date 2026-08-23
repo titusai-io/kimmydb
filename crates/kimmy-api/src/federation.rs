@@ -199,6 +199,7 @@ mod tests {
                 claim_value: "kimmydb-analyst".into(),
                 grants: vec![Grant::new("sales", "orders*", vec![Action::Read])],
             }],
+            require_at_jwt: false,
         }
     }
 

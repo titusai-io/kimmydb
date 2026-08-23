@@ -660,6 +660,99 @@ pub(crate) fn discovery_url(issuer: &str) -> String {
     format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))
 }
 
+/// The key-set URI a discovery document names, once the document is shown to
+/// belong to the issuer it was fetched for.
+///
+/// **Two checks, and neither is ceremony.**
+///
+/// The `issuer` member must equal the issuer that was asked for. OpenID
+/// Connect Discovery §4.3 and RFC 8414 §3.3 both make this a MUST, and it is
+/// the step that binds a document to the identity the node actually trusts:
+/// without it, anything that can answer for the well-known path — a redirect
+/// followed silently, a stale CDN entry, a hijacked DNS record — chooses the
+/// signing keys this node will accept tokens against, which is the whole trust
+/// root. The verifier still matches `iss` on every token, so a substituted
+/// document cannot by itself authorize anybody; what it can do is point the
+/// refresher at a key set an attacker holds the private half of, and then the
+/// `iss` match is satisfied too.
+///
+/// `jwks_uri` must be https, for the reason the issuer itself must be
+/// (`OidcConfig::validate`): the key set *is* the trust root, and one fetched
+/// over plaintext can be replaced in transit by anyone on the path.
+///
+/// Pure and separate from the fetch so both can be tested without a network:
+/// the failures worth pinning are all about the document's contents.
+fn jwks_uri_from<'a>(document: &'a serde_json::Value, issuer: &str, url: &str) -> Result<&'a str> {
+    let named = document
+        .get("issuer")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("the discovery document at {url} names no issuer"))?;
+    // Byte-for-byte, exactly as `iss` is matched on a token. RFC 8414 §3.3
+    // says the comparison is on the literal string, and a document naming a
+    // near-miss is the case this is here to catch.
+    if named != issuer {
+        anyhow::bail!(
+            "the discovery document at {url} says its issuer is {named:?}, not {issuer:?}. \
+             A provider's metadata must name the issuer it was fetched for (OpenID Connect \
+             Discovery §4.3, RFC 8414 §3.3); a document that does not is either the wrong \
+             provider or one substituted on the way here, and its jwks_uri decides which \
+             signing keys this node trusts. Check auth.oidc.issuer against what the provider \
+             publishes."
+        );
+    }
+
+    let jwks_uri = document
+        .get("jwks_uri")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("the discovery document at {url} names no jwks_uri"))?;
+    if !is_secure_url(jwks_uri) {
+        anyhow::bail!(
+            "the discovery document at {url} names a jwks_uri of {jwks_uri:?}, which is not \
+             https. The key set is what every federated token is verified against, so fetching \
+             it over plaintext would let anyone on the network path choose the keys this node \
+             trusts. Only a loopback address is exempt."
+        );
+    }
+    Ok(jwks_uri)
+}
+
+/// Whether a URL is one credentials or keys may safely travel over.
+///
+/// https, or plain http to **loopback**. The exemption is the same one
+/// RFC 8252 §7.3 makes for native applications and browsers make for secure
+/// contexts, and it rests on the same fact: there is no network path to be on
+/// between a process and itself, so the attack the https requirement exists to
+/// stop cannot happen. Without it a stub or a locally-run provider would be
+/// untestable and undevelopable against, which is a good way to have the check
+/// removed later by somebody who only sees it getting in the way.
+///
+/// The host is parsed rather than matched as a prefix, deliberately.
+/// `http://127.0.0.1.attacker.example` starts with a loopback address and is
+/// not one, and `http://127.0.0.1@attacker.example` is userinfo — the host is
+/// what follows the `@`. Both are refused.
+fn is_secure_url(url: &str) -> bool {
+    if url.starts_with("https://") {
+        return true;
+    }
+    let Some(rest) = url.strip_prefix("http://") else { return false };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Everything before an `@` is userinfo, so a host that appears there is
+    // not the host being reached.
+    let authority = authority.rsplit('@').next().unwrap_or("");
+    let host = match authority.strip_prefix('[') {
+        // An IPv6 literal is bracketed, and the port comes after the bracket.
+        Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => ip.is_loopback(),
+        // Not resolved: a name that resolves to loopback elsewhere is not
+        // treated as loopback, because this cannot know that and guessing
+        // would make the rule depend on DNS.
+        Err(_) => host.eq_ignore_ascii_case("localhost"),
+    }
+}
+
 /// Fetch the provider's current signing keys, through discovery.
 ///
 /// Discovery every time rather than the JWKS URI being remembered: a provider
@@ -690,10 +783,7 @@ pub(crate) async fn fetch_jwks(http: &reqwest::Client, issuer: &str) -> Result<J
         .await
         .with_context(|| format!("parsing the discovery document from {url}"))?;
 
-    let jwks_uri = document
-        .get("jwks_uri")
-        .and_then(|v| v.as_str())
-        .with_context(|| format!("the discovery document at {url} names no jwks_uri"))?;
+    let jwks_uri = jwks_uri_from(&document, issuer, &url)?;
 
     let keys: JwkSet = http
         .get(jwks_uri)
@@ -1338,6 +1428,91 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_discovery_document_must_name_the_issuer_it_was_fetched_for() {
+        // OpenID Connect Discovery §4.3 / RFC 8414 §3.3. This is what binds
+        // the document to the identity being trusted: its jwks_uri decides
+        // which signing keys this node accepts tokens against, so anything
+        // able to answer for the well-known path would otherwise choose the
+        // trust root outright.
+        let url = "https://auth.example.com/.well-known/openid-configuration";
+        let good = serde_json::json!({
+            "issuer": "https://auth.example.com",
+            "jwks_uri": "https://auth.example.com/keys",
+        });
+        assert_eq!(
+            jwks_uri_from(&good, "https://auth.example.com", url).unwrap(),
+            "https://auth.example.com/keys"
+        );
+
+        // A near miss is the case worth pinning: matched byte for byte,
+        // exactly as `iss` is matched on a token.
+        for named in ["https://auth.example.com/", "https://evil.example.com", "AUTH.EXAMPLE.COM"] {
+            let mut document = good.clone();
+            document["issuer"] = serde_json::json!(named);
+            let err = jwks_uri_from(&document, "https://auth.example.com", url)
+                .expect_err(&format!("{named:?} is not the issuer"))
+                .to_string();
+            assert!(err.contains(named), "the error must name what it found: {err}");
+        }
+
+        let mut anonymous = good.clone();
+        anonymous.as_object_mut().unwrap().remove("issuer");
+        let err = jwks_uri_from(&anonymous, "https://auth.example.com", url).unwrap_err();
+        assert!(err.to_string().contains("no issuer"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_plaintext_key_set_uri_is_refused_unless_it_is_loopback() {
+        // The key set is the trust root. Fetched over plaintext, anyone on the
+        // path replaces it and mints tokens this node accepts — and note the
+        // jwks_uri need not share a host with the issuer, so an https issuer
+        // does not imply an https key set.
+        let url = "https://auth.example.com/.well-known/openid-configuration";
+        let document = |jwks_uri: &str| serde_json::json!({ "issuer": "https://auth.example.com", "jwks_uri": jwks_uri });
+
+        let err = jwks_uri_from(
+            &document("http://auth.example.com/keys"),
+            "https://auth.example.com",
+            url,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not https"), "unhelpful error: {err}");
+
+        // Loopback is exempt, which is what keeps a locally-run provider
+        // usable — and what the stub in these tests relies on.
+        assert!(
+            jwks_uri_from(&document("http://127.0.0.1:8080/keys"), "https://auth.example.com", url)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_a_real_loopback_host_is_exempt_from_https() {
+        // Prefix-matching the host would accept all three of the first group:
+        // a subdomain that merely starts with the address, userinfo hiding the
+        // real host after an `@`, and a name nothing here can resolve.
+        for url in [
+            "http://127.0.0.1.attacker.example/keys",
+            "http://127.0.0.1@attacker.example/keys",
+            "http://auth.internal/keys",
+            "ftp://127.0.0.1/keys",
+        ] {
+            assert!(!is_secure_url(url), "{url} must not count as secure");
+        }
+        for url in [
+            "https://auth.example.com/keys",
+            "http://127.0.0.1/keys",
+            "http://127.0.0.53:8080/keys",
+            "http://localhost:9000/keys",
+            "http://LOCALHOST/keys",
+            "http://[::1]:8080/keys",
+        ] {
+            assert!(is_secure_url(url), "{url} must count as secure");
+        }
+    }
+
     /// A stub identity provider: discovery pointing at a key set, both served
     /// once over plain HTTP.
     ///
@@ -1405,19 +1580,52 @@ mod tests {
     async fn a_discovery_document_with_no_jwks_uri_is_reported_as_such() {
         // The mistake this catches is pointing `issuer` at something that
         // answers JSON but is not an identity provider.
+        //
+        // The document names the issuer, so this reaches the jwks_uri check
+        // rather than stopping at the issuer binding — the two failures are
+        // different mistakes and must not be reported as each other.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let issuer = format!("http://{}", listener.local_addr().unwrap());
+        let body = format!(r#"{{"issuer":"{issuer}"}}"#);
         tokio::spawn(async move {
             let Ok((mut socket, _)) = listener.accept().await else { return };
             let mut buf = [0u8; 1024];
             let _ = socket.read(&mut buf).await;
-            let _ = socket
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
-                .await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
         });
 
         let err = fetch_jwks(&jwks_client().unwrap(), &issuer).await.unwrap_err().to_string();
         assert!(err.contains("jwks_uri"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_substituted_discovery_document_is_refused_over_the_wire() {
+        // The unit test above pins the rule; this pins that `fetch_jwks`
+        // actually applies it, rather than the check living somewhere the
+        // fetch path never reaches.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        // Answers for the issuer that was asked for, but names another.
+        let body =
+            r#"{"issuer":"https://evil.example.com","jwks_uri":"https://evil.example.com/keys"}"#;
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        });
+
+        let err = fetch_jwks(&jwks_client().unwrap(), &issuer).await.unwrap_err().to_string();
+        assert!(err.contains("evil.example.com"), "unhelpful error: {err}");
+        assert!(err.contains(&issuer), "the error must name what was asked for: {err}");
     }
 
     #[tokio::test]
@@ -1429,6 +1637,7 @@ mod tests {
             audience: "kimmydb".into(),
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
+            require_at_jwt: false,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);

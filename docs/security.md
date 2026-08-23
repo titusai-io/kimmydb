@@ -155,6 +155,46 @@ which mode it is in at startup, and `kimmyd check-config` says so too.
 Only `http://` is refused, because that is an https identifier with the scheme
 mistyped rather than a different kind of value ([ADR-071](decisions.md)).
 
+### What a federated token has to satisfy
+
+| Check | Rule |
+|---|---|
+| `alg` | `RS256` or `ES256`. Asymmetric only — the provider signs with a key nobody here holds. |
+| Signature | Against the JWK the token's `kid` names. |
+| `iss` | Equals `auth.oidc.issuer`, exactly. **Required to be present.** |
+| `aud` | Equals `auth.oidc.audience`, exactly. **Required to be present.** |
+| `sub` | Required to be present; becomes the principal's name. |
+| `exp` | Not past, allowing 60 seconds. **Required to be present.** |
+| `nbf` | Not future, allowing 60 seconds. *Optional* — a token without one is fine. |
+| `typ` | `at+jwt`, only when `require_at_jwt = true`. Off by default. |
+
+`iss`, `aud`, `exp` and `sub` are required to be **present**, not merely
+checked when they happen to appear. A token that simply omits its audience
+would otherwise sail past the audience restriction, which is the whole reason
+the audience is configured.
+
+The 60 seconds of leeway covers `exp` and `nbf` alike. The local HS256 path
+allows none: cluster nodes are expected to agree about the time and are run by
+whoever runs the database, whereas an identity provider's clock is somebody
+else's, and a fleet whose NTP has drifted by seconds must not read as an
+outage.
+
+#### `require_at_jwt`, and why it ships off
+
+RFC 9068 §4 says an access token carries `typ: at+jwt`, and the check exists so
+an **ID token** from the same issuer cannot be presented as an access token. It
+still defaults to `false`, because **Entra ID stamps `typ: JWT` on its v2
+access tokens** — turning it on by default would refuse every token from a
+provider this federation exists to support.
+
+If your `audience` is an `https` URL, the confusion this guards against is
+**already closed**: an ID token's `aud` is the client id, which can never also
+be this node's resource identifier, so such a token is refused on the audience
+before `typ` is consulted. The setting is defence in depth for you. With an
+opaque audience it is the only check of its kind, so turn it on — after
+decoding a real token from your provider and confirming what it stamps
+([ADR-072](decisions.md)).
+
 ### Refusals say how to authenticate
 
 Every 401 and 403 carries `WWW-Authenticate`, as RFC 6750 §3 requires. A
@@ -198,6 +238,33 @@ whole. A token naming a `kid` the node has not seen triggers **one**
 rate-limited refetch — the recovery for a rotation between two ticks — and the
 rate limit is not politeness: a `kid` is attacker-controlled, so an unlimited
 one would be a way to make this node hammer its own identity provider.
+
+**The document must name the issuer it was fetched for**, and the `jwks_uri` it
+names must be `https` — a discovery document that fails either is refused and
+no keys are installed. OpenID Connect Discovery §4.3 and RFC 8414 §3.3 both
+require this, and it is what ties the metadata to the provider you configured:
+without it, anything able to answer for the well-known path chooses the
+`jwks_uri`, and therefore the signing keys every federated token is checked
+against. Matching `iss` on each token does not cover that — an attacker who
+supplies the key set is also minting the tokens, so the `iss` check passes too.
+
+The comparison is byte for byte, exactly as `iss` is matched. **A trailing
+slash is a mismatch**, and it is the usual way this fails in practice: set
+`issuer` to whatever the provider's own document says in its `issuer` member,
+not to what you typed into the provider's console. The refusal names both
+values, because a one-character difference is otherwise invisible:
+
+```
+the discovery document at https://auth.example.com/.well-known/openid-configuration
+says its issuer is "https://auth.example.com/", not "https://auth.example.com"
+```
+
+Plain `http` to a **loopback** address is exempt from the `https` requirement,
+the same exemption RFC 8252 §7.3 makes for native applications: there is no
+network path to be on between a process and itself. The host is parsed, not
+prefix-matched, so `http://127.0.0.1.attacker.example` is not loopback and
+neither is `http://127.0.0.1@attacker.example`, where the real host is what
+follows the `@`.
 
 **Boot does not wait for it.** A briefly unreachable provider must not stop a
 database from restarting — during an incident, both are being restarted — so the
@@ -271,6 +338,14 @@ flow on the authorization request *and* the token request, since a token
 request may narrow a grant and never widen it. Omitted when there is no
 resource to name, which is the well-defined "your default audience" every
 provider predating RFC 8707 implements.
+
+**The CLI checks the provider's metadata the same way the node does.** A
+discovery document that does not name the issuer it was fetched for is refused,
+and every endpoint the CLI reads out of it must be `https` — loopback excepted.
+The stake here is different from the node's: these endpoints are where a
+**client secret** is sent and where an access token is collected, so a document
+nominating somewhere else for either is the whole attack. Neither check
+substitutes for the other, which is why both exist ([ADR-072](decisions.md)).
 
 The device flow rather than a redirect, for the reason `gh auth login` uses it:
 a redirect needs a browser and a loopback listener on the same machine, and a

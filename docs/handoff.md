@@ -6,6 +6,52 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **the federated verifier checks three more things**
+
+Small, independently testable hardening of the OIDC path. Nothing here changes
+a shape; it closes gaps a review of the shipped WS1 code found against the
+RFCs. [ADR-072](decisions.md) carries the reasoning.
+
+**`nbf` is validated.** `jsonwebtoken` defaults `validate_nbf` to `false`, so
+setting `validate_exp` — which reads like "check the times" — left the front
+edge unchecked and a token stamped valid from next week was accepted today. The
+claim stays optional, because it is optional in RFC 7519; the same 60-second
+leeway as `exp` applies.
+
+**A discovery document must name the issuer it was fetched for**, and its
+`jwks_uri` must be `https`. **This is checked in two places, and they are not
+redundant:** `fetch_jwks` in `crates/kimmyd/src/node.rs` (the node picks
+signing keys from it) and `mod oidc`'s `discover` in
+`crates/kimmy-cli/src/main.rs` (the CLI sends a client secret to endpoints from
+it). The rule is written twice rather than shared because `kimmy-cli`
+deliberately links no kimmy crate that could carry it — the same reasoning
+already recorded on `PROTECTED_RESOURCE_METADATA_PATH`.
+
+**Loopback is exempt from the `https` requirement**, per RFC 8252 §7.3, and the
+host is *parsed* rather than prefix-matched — `is_secure_url` in both files.
+`http://127.0.0.1.attacker.example` and `http://127.0.0.1@attacker.example` are
+both refused, and there are tests for each. The exemption is load-bearing for
+the test suite too: `stub_idp` serves over plain HTTP on `127.0.0.1`, and
+without it the fetch-path tests would need TLS.
+
+**`typ: at+jwt` is opt-in**, `auth.oidc.require_at_jwt`, default `false`. It
+**cannot** default to strict: Entra ID stamps `typ: JWT` on v2 access tokens.
+This is the same shape as ADR-071's narrowing — an RFC applied literally would
+break a named target provider — and it is worth recognising the pattern before
+adding a third such check. Note that ADR-071 already closes the ID-token
+confusion for any operator whose audience is an `https` URL.
+
+**If you extend `OidcSettings`, five test constructors need the new field**:
+`kimmy-auth/src/oidc.rs`, `kimmy-api/src/federation.rs`,
+`kimmy-api/tests/api.rs`, `kimmy-client/tests/client.rs` and
+`kimmyd/src/node.rs`. `cargo build` will not tell you — it does not compile
+`#[cfg(test)]` code. Use `cargo clippy --all-targets`.
+
+Gates: fmt clean, clippy clean, **1289 passed / 0 failed / 12 ignored** (up 12
+from the 1277 baseline this branch started at).
+
+---
+
 ## As of 2026-08-23 — **KimmyDB has a name of its own to an authorization server**
 
 The branch that wrote this section closes the gap that made WS1's federation
