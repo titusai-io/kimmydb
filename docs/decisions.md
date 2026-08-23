@@ -3380,6 +3380,61 @@ startup-visible failure; that is the intent, but it will be met as a break by
 anyone who was relying on the mismatch. Both refusals name what was found and
 what was expected, because a byte-level difference is otherwise invisible.
 
+## ADR-075 — The CLI caches an access token only when asked, and never a refresh token
+
+**Decision.** `kimmy login --cache-token` (or `KIMMY_TOKEN_CACHE`) stores the
+access token it just obtained in a `0600` file under `$XDG_CACHE_HOME/kimmy`,
+keyed by issuer, client id and resource, and reuses it until it is within a
+minute of expiring. **Off by default.** A refresh token is never requested by
+either flow and never stored. A token whose lifetime the provider did not state
+is not cached at all.
+
+**Alternatives.** Caching by default, as `gh`, `aws`, `az` and `kubectl` all
+do. Keeping the absolute no-disk rule and closing the question. Caching the
+refresh token too, so a lapsed session renews silently.
+
+**Why.** The no-disk rule was a real design position — an environment variable
+answers for a token's permissions, its lifetime and its cleanup by not existing
+afterwards — and it was also stricter than every comparable tool, which made an
+interactive user re-run the whole device flow whenever their shell export
+lapsed. Opt-in keeps both: nobody who does not ask for it inherits a file to
+look after, and the default behaviour is byte-for-byte what shipped before.
+
+**The refresh token is the line, and it is not arbitrary.** An access token is
+short-lived and, since ADR-071, audience-restricted to one node; a refresh
+token outlives the session and mints more. Caching the first is a convenience
+whose worst case expires on its own. Caching the second would be storing the
+credential actually worth stealing, and it is why neither flow asks for one.
+
+**A token with no `expires_in` is not cached.** RFC 6749 §5.1 only RECOMMENDS
+the field. The cache exists to reuse a token *known* to still be valid, and
+without a lifetime there is nothing to know — a guessed one would serve a dead
+token as a 401 in some later, unrelated command.
+
+**The key is all three of issuer, client and resource**, because each changes
+what the token is: a different issuer is a different trust root, a different
+client a different identity, and a different resource a different audience. A
+token with the wrong audience is refused by the node, which would read as a
+broken cache rather than as the wrong key having been used.
+
+**Every read failure is a miss, not an error.** A corrupt file, an absent one
+and one from a future version all mean the same thing to the caller —
+authenticate again. A cache that can break a login is worse than no cache. The
+write path is the same shape: it warns and carries on, and it writes through a
+temporary file and a rename so an interrupted write cannot destroy tokens
+already stored.
+
+**Cost.** There is now a file holding a bearer token for anyone who opts in,
+and the tool owns its permissions. `0600` is applied explicitly after creation
+rather than relying on the umask, and the directory is `0700`; both are
+asserted by tests, because a permissive umask would otherwise leave the token
+group-readable and nothing would say so. Expired entries are swept on the next
+write, so an issuer that stops being used does not leave a token on disk
+indefinitely. Two functions take an explicit path so the tests never set
+`XDG_CACHE_HOME` — an environment variable is process-global and cargo runs
+tests in parallel, the same shape as the `include_names` race that cost a round
+to diagnose.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

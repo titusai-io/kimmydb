@@ -190,6 +190,48 @@ These talk to the **identity provider**, not to a node — the one place this to
 does not go through `kimmy-client`, because an OAuth2 implementation inside a
 database client library is one every application linking it would inherit.
 
+### Scopes differ between the two flows
+
+Left unset, `--oidc` asks for `openid profile` and `--client-credentials` asks
+for **nothing**. That is not an oversight: there is no end user in the
+client-credentials grant, so `openid` requests an ID token that cannot be
+issued — providers split between ignoring it and refusing the request. A
+service client gets whatever scopes it is registered for. `--scope` overrides
+either flow.
+
+### Client authentication
+
+`--client-credentials` sends the id and secret as **HTTP Basic** when the
+provider advertises `client_secret_basic`, and in the request body only when
+the provider advertises the body and not Basic. RFC 6749 §2.3.1 requires every
+authorization server to support Basic and leaves the body optional, so Basic is
+the one that is always there — and a provider advertising nothing gets it.
+
+### Reusing a token between commands
+
+Nothing is written to disk unless you ask:
+
+```bash
+export KIMMY_TOKEN=$(kimmy login --oidc --cache-token)
+```
+
+With `--cache-token` (or `KIMMY_TOKEN_CACHE=1`), the access token is kept in a
+`0600` file under `$XDG_CACHE_HOME/kimmy` — `~/.cache/kimmy/tokens.json` by
+default — keyed by issuer, client and resource, and reused until it is within a
+minute of expiring. A later `kimmy login --oidc --cache-token` then prints the
+cached token instead of making you approve the device flow again.
+
+**A refresh token is never requested and never stored**, flag or no flag. The
+access token is short-lived and audience-restricted; a refresh token outlives
+the session and can mint more, which makes caching it a different feature with
+a different risk ([ADR-075](decisions.md)).
+
+To forget everything cached:
+
+```bash
+rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/kimmy/tokens.json"
+```
+
 Local accounts still work on a federated node, and `kimmy login <user>` is how
 you reach the break-glass administrator: `admin` cannot be granted through an
 IdP claim ([ADR-067](decisions.md)).

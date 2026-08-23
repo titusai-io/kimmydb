@@ -6,6 +6,47 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **the CLI behaves like an OAuth 2.0 client**
+
+Three conformance fixes in `crates/kimmy-cli/src/main.rs`, none of them
+touching the server. [ADR-075](decisions.md) covers the third.
+
+**Client authentication prefers HTTP Basic**, read from the provider's
+`token_endpoint_auth_methods_supported`. RFC 6749 §2.3.1 makes Basic mandatory
+for a server and the request body optional, so the body is the fallback and a
+provider that advertises nothing gets Basic. **The id and secret are
+form-encoded before the Basic header is built** — §2.3.1 requires it, and
+skipping it is invisible until a secret contains a `:`, a `+`, a space or a
+non-ASCII character, at which point the failure reads as a wrong password.
+`form_urlencode` is written out rather than pulled from a crate, to keep this
+binary's short dependency list.
+
+**The two flows now default to different scopes.** `--scope` was one shared
+`default_value` of `openid profile`; client credentials has no end user, so
+`openid` there asks for an ID token that cannot exist. It now asks for nothing.
+**This is the one behaviour change a user could notice** — a service account
+relying on the old default must pass `--scope` explicitly.
+
+**`--cache-token` is opt-in and stores only the access token.** The no-disk
+promise was stated in three places — the `after_help`, the `Login` doc comment,
+and `docs/security.md` — and all three were amended in the same change rather
+than left contradicting the code. `cache::get_from` and `cache::put_into` take
+an explicit path so **no test ever sets `XDG_CACHE_HOME`**: environment
+variables are process-global and cargo runs tests in parallel, which is the
+`include_names` race in a different costume.
+
+**If you extend the cache**, note that a token with no `expires_in` is
+deliberately not stored, that every read failure is a miss rather than an
+error, and that `0600`/`0700` are applied explicitly after creation because
+`File::create` goes through the umask.
+
+Gates: fmt clean, clippy clean, 39 CLI tests (up from 28). Verified by running
+the binary: the bare `--cache-token` flag, `KIMMY_TOKEN_CACHE=1`, `=0` (does
+not enable, does not error) and `=maybe` (errors) all behave. **The full
+login → cache → reuse loop against a live provider is not exercised yet** —
+that needs the two client registrations the deferred end-to-end validation
+covers.
+
 ## As of 2026-08-23 — **the federated verifier checks three more things**
 
 Small, independently testable hardening of the OIDC path. Nothing here changes

@@ -352,10 +352,28 @@ a redirect needs a browser and a loopback listener on the same machine, and a
 database CLI is run over SSH and inside containers. The code and URL go to
 **stderr** so the bare token on stdout stays capturable.
 
-**Nothing is stored on disk** — not the token, not a refresh token. An
-environment variable answers for its permissions, its lifetime and its cleanup
-by not existing afterwards. Applications get a fresh token the same way, through
-the Rust client's `token_provider` callback ([Clients](clients.md)).
+**Nothing is stored on disk unless `--cache-token` asks for it**, and **a
+refresh token is never requested or stored at all**. Without the flag an
+environment variable answers for the token's permissions, its lifetime and its
+cleanup by not existing afterwards. With it, the access token is kept in a
+`0600` file under `$XDG_CACHE_HOME/kimmy`, keyed by issuer, client and
+resource, and reused until it is within a minute of expiring — the same thing
+`gh` and `aws` do, made a decision rather than a default because storing a
+bearer token is a responsibility ([ADR-075](decisions.md)). Applications get a
+fresh token the same way, through the Rust client's `token_provider` callback
+([Clients](clients.md)).
+
+The refresh token is where the line is drawn, and not arbitrarily: an access
+token is short-lived and audience-restricted to one node, while a refresh token
+outlives the session and mints more. Caching the first has a worst case that
+expires on its own.
+
+**Client authentication uses HTTP Basic** when the provider advertises
+`client_secret_basic`, falling back to the request body only when the provider
+takes the body and not Basic — RFC 6749 §2.3.1 makes Basic mandatory for a
+server and the body optional. The id and secret are form-encoded before the
+header is built, as §2.3.1 requires, which matters as soon as a secret contains
+a `:`, a `+`, a space or a non-ASCII character.
 
 ---
 
