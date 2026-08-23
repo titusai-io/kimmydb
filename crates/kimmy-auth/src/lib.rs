@@ -25,7 +25,9 @@ pub use error::{AuthError, Result};
 /// without either of them taking a direct dependency on the JWT library. What
 /// they hold is this crate's key material, not a third party's type.
 pub use jsonwebtoken::jwk::{Jwk, JwkSet};
-pub use oidc::{OIDC_LEEWAY_SECS, OidcSettings, OidcVerifier, RoleMapping};
+pub use oidc::{
+    OIDC_LEEWAY_SECS, OidcSettings, OidcVerifier, PROTECTED_RESOURCE_METADATA_PATH, RoleMapping,
+};
 pub use rbac::{Action, Grant, Principal, Role};
 pub use token::{Claims, MIN_SECRET_LEN, TokenIssuer};
 pub use users::{SYSTEM_DB, USERS_COLLECTION, User, UserStore};

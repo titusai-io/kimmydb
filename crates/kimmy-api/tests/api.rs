@@ -149,10 +149,16 @@ impl Server {
     /// how this node treats a token, and a test that needs somebody's identity
     /// provider reachable fails for reasons that have nothing to do with it.
     async fn start_federated() -> Self {
+        Self::start_federated_for(oidc::AUDIENCE).await
+    }
+
+    /// The same, with the audience chosen — which is what decides whether this
+    /// node names itself as an OAuth 2.0 protected resource (ADR-071).
+    async fn start_federated_for(audience: &str) -> Self {
         let server = Self::build(false, kimmy_api::RateLimits::disabled()).await;
         let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
             issuer: oidc::ISSUER.into(),
-            audience: oidc::AUDIENCE.into(),
+            audience: audience.into(),
             roles_claim: "roles".into(),
             role_mappings: vec![kimmy_auth::RoleMapping {
                 claim_value: "kimmydb-analyst".into(),
@@ -3718,4 +3724,193 @@ async fn a_node_without_federation_configured_treats_every_token_as_local() {
     let who = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
     assert_eq!(who.status, 200);
     assert_eq!(who.body["federated"], false);
+}
+
+// ---------------------------------------------------------------------------
+// Resource identity: RFC 9728 metadata and RFC 6750 challenges (ADR-071)
+// ---------------------------------------------------------------------------
+
+/// The audience a node uses when it names itself as a protected resource.
+const RESOURCE: &str = "https://kimmydb.example.com";
+
+#[tokio::test]
+async fn a_node_with_a_url_audience_publishes_protected_resource_metadata() {
+    // The document a client reads to find out where to authenticate. Its whole
+    // point is that `kimmy login --oidc --url ...` needs nothing else set.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let res = server.get("/.well-known/oauth-protected-resource", None).await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["resource"], RESOURCE);
+    assert_eq!(res.body["authorization_servers"][0], oidc::ISSUER);
+    assert_eq!(res.body["bearer_methods_supported"][0], "header");
+
+    // Authorization here is roles carried in the token, never scopes.
+    // Advertising a scope vocabulary would describe a model this database does
+    // not implement, and a client that asked for those scopes would get them
+    // and still be refused.
+    assert!(
+        res.body.get("scopes_supported").is_none(),
+        "scopes must not be advertised: {:?}",
+        res.body
+    );
+}
+
+#[test]
+fn the_well_known_route_matches_the_shared_constant() {
+    // The router registers this path as a literal so the documentation contract
+    // in tests/openapi.rs can see it, while the challenge header and the startup
+    // log build their URLs from the constant. This is what keeps the two from
+    // drifting into a node that advertises a document it does not serve.
+    assert_eq!(
+        kimmy_auth::PROTECTED_RESOURCE_METADATA_PATH,
+        "/.well-known/oauth-protected-resource"
+    );
+}
+
+#[tokio::test]
+async fn the_metadata_is_unauthenticated() {
+    // A client that has no token is exactly who needs this document, so
+    // requiring one would make it useless.
+    let server = Server::start_federated_for(RESOURCE).await;
+    assert_eq!(server.get("/.well-known/oauth-protected-resource", None).await.status, 200);
+}
+
+#[tokio::test]
+async fn an_opaque_audience_publishes_no_metadata() {
+    // `audience = "kimmydb"` is a supported configuration, not a broken one --
+    // it is what shipped first and what a provider with no RFC 8707 support
+    // needs. There is simply nothing truthful to publish for it, and publishing
+    // an identifier no token will ever carry would send every client to ask its
+    // provider for a resource the provider refuses.
+    let server = Server::start_federated_for("kimmydb").await;
+    assert_eq!(server.get("/.well-known/oauth-protected-resource", None).await.status, 404);
+}
+
+#[tokio::test]
+async fn a_node_without_federation_publishes_no_metadata() {
+    let server = Server::start().await;
+    assert_eq!(server.get("/.well-known/oauth-protected-resource", None).await.status, 404);
+}
+
+#[tokio::test]
+async fn metadata_is_served_only_for_this_nodes_own_resource() {
+    // RFC 9728 §3 puts the well-known segment between the authority and the
+    // path, so the route has to accept a suffix -- and then answering for a
+    // suffix that is not this node's resource would be a lie a client acts on.
+    let server = Server::start_federated_for(RESOURCE).await;
+    assert_eq!(
+        server.get("/.well-known/oauth-protected-resource/somebody-else", None).await.status,
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_resource_identifier_with_a_path_is_served_one_level_down() {
+    let server = Server::start_federated_for("https://kimmydb.example.com/nodes/one").await;
+
+    // Not at the bare well-known path: that would be a different resource.
+    assert_eq!(server.get("/.well-known/oauth-protected-resource", None).await.status, 404);
+
+    let res = server.get("/.well-known/oauth-protected-resource/nodes/one", None).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["resource"], "https://kimmydb.example.com/nodes/one");
+}
+
+#[tokio::test]
+async fn a_request_with_no_credentials_is_challenged_without_an_error_code() {
+    // RFC 6750 §3: a client that has not yet tried must not be told it failed.
+    // The distinction is not cosmetic -- `invalid_token` tells a client to
+    // refresh and retry, which is wrong advice for one that has no token.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let res = server.get("/v1/auth/whoami", None).await;
+
+    assert_eq!(res.status, 401);
+    let challenge = res.header("www-authenticate").expect("RFC 6750 §3 makes this a MUST");
+    assert!(challenge.starts_with("Bearer "), "{challenge}");
+    assert!(!challenge.contains("error="), "an untried client has not failed: {challenge}");
+    assert!(
+        challenge.contains(&format!(
+            r#"resource_metadata="{RESOURCE}/.well-known/oauth-protected-resource""#
+        )),
+        "the challenge must point at the metadata document: {challenge}"
+    );
+}
+
+#[tokio::test]
+async fn a_request_with_a_bad_token_is_challenged_with_invalid_token() {
+    let server = Server::start_federated_for(RESOURCE).await;
+    let res = server.get("/v1/auth/whoami", Some("not-a-token")).await;
+
+    assert_eq!(res.status, 401);
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
+}
+
+#[tokio::test]
+async fn a_denied_request_is_challenged_with_insufficient_scope() {
+    // RFC 6750 §3.1 pairs this code with 403. It says nothing the body does not
+    // already say -- see the next test, which is the one that matters.
+    let server = Server::start_federated().await;
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    let res = server.post("/v1/db/payroll/collections", Some(&token), json!({"name": "salaries"}));
+
+    let res = res.await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="insufficient_scope""#), "{challenge}");
+}
+
+#[tokio::test]
+async fn the_challenge_does_not_distinguish_a_missing_target_from_a_forbidden_one() {
+    // The uniform-403 property, re-checked now that 403 carries a header. A
+    // caller who cannot read `sales` must not be able to learn from the
+    // challenge whether `sales.orders` exists -- otherwise the header has
+    // quietly become the probe the body was written to prevent.
+    let server = Server::start_federated().await;
+    let root = server.root().await;
+    // Real, and outside the analyst's `orders*` grant -- so the only difference
+    // between the two requests below is that one target exists.
+    let made =
+        server.post("/v1/db/sales/collections", Some(&root), json!({ "name": "secrets" })).await;
+    assert_eq!(made.status, 200, "{:?}", made.body);
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    let missing = server.post("/v1/db/sales/coll/nonexistent/find", Some(&token), json!({})).await;
+    let existing = server.post("/v1/db/sales/coll/secrets/find", Some(&token), json!({})).await;
+
+    assert_eq!(missing.status, 403);
+    assert_eq!(existing.status, 403);
+    assert_eq!(
+        missing.header("www-authenticate"),
+        existing.header("www-authenticate"),
+        "the challenge must not reveal which target exists"
+    );
+    assert_eq!(missing.body["error"], existing.body["error"]);
+}
+
+#[tokio::test]
+async fn a_failed_password_login_is_not_challenged_for_a_bearer_token() {
+    // `/v1/auth/login` is where a token comes from, not a bearer-protected
+    // resource. Telling a client to come back with a token would be advice it
+    // cannot act on and the opposite of what it should do.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let res =
+        server.post("/v1/auth/login", None, json!({"user": "root", "password": "wrong"})).await;
+
+    assert_eq!(res.status, 401);
+    assert_eq!(res.header("www-authenticate"), None, "a login failure is not a bearer challenge");
+}
+
+#[tokio::test]
+async fn an_opaque_audience_still_challenges_but_names_no_metadata() {
+    // The header is required regardless (RFC 6750 §3). Only the RFC 9728
+    // pointer depends on this node having a name an authorization server knows.
+    let server = Server::start_federated_for("kimmydb").await;
+    let res = server.get("/v1/auth/whoami", None).await;
+
+    assert_eq!(res.status, 401);
+    let challenge = res.header("www-authenticate").expect("still a MUST");
+    assert!(challenge.starts_with("Bearer "), "{challenge}");
+    assert!(!challenge.contains("resource_metadata="), "there is no document to name: {challenge}");
 }

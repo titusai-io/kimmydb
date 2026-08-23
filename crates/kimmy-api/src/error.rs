@@ -365,9 +365,9 @@ impl From<AuthError> for ApiError {
             // serves, so neither can reach a request. Mapped rather than
             // matched loosely so that adding a variant stays a compile error
             // here instead of silently becoming a 400.
-            AuthError::WeakSecret { .. } | AuthError::AdminNotFederatable { .. } => {
-                ApiError::bad_request(e.to_string())
-            }
+            AuthError::WeakSecret { .. }
+            | AuthError::AdminNotFederatable { .. }
+            | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");
                 ApiError::internal("authentication failure")

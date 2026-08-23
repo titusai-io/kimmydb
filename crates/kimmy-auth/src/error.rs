@@ -50,6 +50,24 @@ pub enum AuthError {
     )]
     AdminNotFederatable { claim_value: String },
 
+    /// The audience carries a URI scheme, so it names this node as an OAuth 2.0
+    /// protected resource — but not as one a client could actually use.
+    ///
+    /// Refused at startup rather than silently ignored: an audience that looks
+    /// like a resource identifier and is not a valid one would leave the node
+    /// publishing metadata nothing can act on, which is worse than publishing
+    /// none at all (ADR-071).
+    #[error(
+        "auth.oidc.audience is {audience:?}, which carries a URI scheme and so names this node \
+         as an OAuth 2.0 protected resource — but {reason}. RFC 8707 §2 requires a resource \
+         identifier to be an absolute URI without a fragment. It is what a client sends as its \
+         `resource` parameter and what this node publishes at \
+         /.well-known/oauth-protected-resource, so it has to be the public base URL clients \
+         reach this node at. Use a bare string such as \"kimmydb\" instead if your provider \
+         does not implement resource indicators."
+    )]
+    InvalidResourceIdentifier { audience: String, reason: String },
+
     #[error("password hashing failed: {0}")]
     Hashing(String),
 

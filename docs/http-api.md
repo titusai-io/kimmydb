@@ -34,6 +34,8 @@ has been incomplete before.
 | `GET` | `/healthz` | — public |
 | `GET` | `/readyz` | — public |
 | `GET` | `/metrics` | — public |
+| `GET` | `/.well-known/oauth-protected-resource` | — public — see [Protected resource metadata](#protected-resource-metadata) |
+| `GET` | `/.well-known/oauth-protected-resource/{resource_path}` | — public — the same document, for a resource identifier that has a path |
 | `POST` | `/v1/auth/login` | — public |
 | `POST` | `/v1/auth/refresh` | authenticated — see [Tokens](#tokens) |
 | `GET` | `/v1/topology` | authenticated — see [Topology](#topology) |
@@ -407,6 +409,71 @@ actually responds, so a node with a wedged database is taken out of rotation.
 
 Metrics deliberately expose **counts only** — naming collections there would
 leak your schema to anything that can reach the port.
+
+---
+
+## Protected resource metadata
+
+When the node federates with an identity provider **and** `auth.oidc.audience`
+is written as an `https` URL, the node publishes what RFC 9728 calls protected
+resource metadata — its own name as an OAuth 2.0 resource, and the
+authorization server that speaks for it:
+
+```bash
+curl localhost:7878/.well-known/oauth-protected-resource
+```
+
+```json
+{
+  "resource": "https://kimmydb.example.com",
+  "authorization_servers": ["https://auth.example.com"],
+  "bearer_methods_supported": ["header"]
+}
+```
+
+Unauthenticated, necessarily: a client that has no token is exactly who needs
+it. It is what lets `kimmy login --oidc --url https://kimmydb.example.com` work
+with nothing else configured, and it is how a conformant MCP client discovers
+where to authenticate — see [mcp.md](mcp.md).
+
+`scopes_supported` is deliberately **absent**. Authorization here is roles
+carried in the token, not scopes; advertising a scope vocabulary would describe
+an access-control model this database does not implement.
+
+**404 when the node has no such name.** An `auth.oidc.audience` that is an
+opaque string (`kimmydb`, or Entra ID's `api://<guid>`) is a supported
+configuration, not a broken one — there is simply nothing truthful to publish,
+and an identifier no token will ever carry would send every client to ask its
+provider for a resource the provider refuses.
+
+RFC 9728 §3 inserts the well-known segment between the host and the path, so a
+resource identifier of `https://kimmydb.example.com/nodes/one` publishes at
+`/.well-known/oauth-protected-resource/nodes/one`. A request for any other
+suffix is a 404 rather than this node's document.
+
+### Refusals carry a challenge
+
+Every 401 and 403 answers with `WWW-Authenticate`, as RFC 6750 §3 requires:
+
+```
+401, no credentials offered:  Bearer realm="kimmydb", resource_metadata="…"
+401, bad or expired token:    Bearer realm="kimmydb", error="invalid_token", …
+403, authenticated but denied: Bearer realm="kimmydb", error="insufficient_scope", …
+```
+
+The first two differ on purpose. `invalid_token` tells a client to refresh and
+retry, which is the wrong advice for one that has not tried yet — so a request
+that offered no credentials is told only *how* to authenticate, never that it
+failed.
+
+`resource_metadata` appears only when there is a document to point at. The 403
+challenge reveals nothing the body does not: it is byte-identical whether the
+target exists or not, which is the same property the uniform 403 has always
+had.
+
+`POST /v1/auth/login` is exempt. It is where a token comes from, not a
+bearer-protected resource, and challenging there would tell a client to come
+back with the thing it is asking for.
 
 ---
 

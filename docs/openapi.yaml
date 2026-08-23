@@ -224,6 +224,108 @@ paths:
               schema:
                 type: string
 
+  /.well-known/oauth-protected-resource:
+    get:
+      tags: [auth]
+      operationId: protectedResourceMetadata
+      summary: This node, as an OAuth 2.0 protected resource (RFC 9728).
+      description: |
+        Published when the node federates with an identity provider **and**
+        `auth.oidc.audience` is written as an `https` URL — which is what gives
+        the node a name an authorization server knows it by.
+
+        Unauthenticated by necessity: a client holding no token is exactly who
+        needs it. It names both the resource identifier to request a token for
+        (the RFC 8707 `resource` parameter) and the authorization server to
+        request it from, so `kimmy login --oidc` needs nothing but the node URL.
+        It is also how a conformant MCP client discovers where to authenticate.
+
+        `scopes_supported` is deliberately absent: authorization here is roles
+        carried in the token, not scopes.
+
+        404 when the audience is an opaque string rather than an https URL — a
+        supported configuration with nothing truthful to publish.
+      security: []
+      responses:
+        "200":
+          description: The node's protected resource metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resource, authorization_servers]
+                properties:
+                  resource:
+                    type: string
+                    format: uri
+                    description: This node's resource identifier.
+                  authorization_servers:
+                    type: array
+                    items:
+                      type: string
+                      format: uri
+                    description: >-
+                      The issuer this node trusts. Exactly one entry: a second
+                      issuer is a second trust root (ADR-064).
+                  bearer_methods_supported:
+                    type: array
+                    items:
+                      type: string
+                    description: Always `["header"]`.
+        "404":
+          description: This node publishes no protected resource metadata.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /.well-known/oauth-protected-resource/{resource_path}:
+    get:
+      tags: [auth]
+      operationId: protectedResourceMetadataAtPath
+      summary: The same document, for a resource identifier that has a path.
+      description: |
+        RFC 9728 §3 inserts the well-known segment between the host and the
+        path, so a resource identifier of `https://host/nodes/one` publishes at
+        `/.well-known/oauth-protected-resource/nodes/one`. Any other suffix is
+        a 404 rather than this node's document — answering for a resource that
+        is not this one would be a lie a client acts on.
+      security: []
+      parameters:
+        - name: resource_path
+          in: path
+          required: true
+          schema:
+            type: string
+          description: The path component of this node's resource identifier.
+      responses:
+        "200":
+          description: The node's protected resource metadata.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [resource, authorization_servers]
+                properties:
+                  resource:
+                    type: string
+                    format: uri
+                  authorization_servers:
+                    type: array
+                    items:
+                      type: string
+                      format: uri
+                  bearer_methods_supported:
+                    type: array
+                    items:
+                      type: string
+        "404":
+          description: Not this node's resource.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
   /v1/auth/login:
     post:
       tags: [auth]

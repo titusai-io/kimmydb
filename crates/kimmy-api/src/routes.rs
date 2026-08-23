@@ -26,6 +26,23 @@ pub fn router(state: SharedState) -> Router {
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
+        // Unauthenticated by specification, not by oversight: RFC 9728 §3 is
+        // how a client that holds no credentials yet finds out where to get
+        // some. Both shapes are registered because §3 inserts the well-known
+        // segment *between* the authority and the path, so a resource
+        // identifier with a path is served one level down; the handler refuses
+        // anything that is not this node's own resource.
+        //
+        // Written out rather than built from `PROTECTED_RESOURCE_METADATA_PATH`
+        // because the documentation contract in `tests/openapi.rs` scans this
+        // file for route *literals* — a computed path is a route that silently
+        // escapes it. `the_well_known_route_matches_the_shared_constant` holds
+        // the two together instead.
+        .route("/.well-known/oauth-protected-resource", get(protected_resource_metadata))
+        .route(
+            "/.well-known/oauth-protected-resource/{*resource_path}",
+            get(protected_resource_metadata),
+        )
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/refresh", post(refresh))
         // Public for the same reason the health routes are: a client has to be
@@ -101,11 +118,25 @@ async fn count_request(
     let timed = !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
     let started = std::time::Instant::now();
 
+    // Read before the request is consumed, for the challenge below. RFC 6750 §3
+    // makes the two cases different, and *whether credentials were offered* is
+    // the only thing that tells them apart — which is knowable here and nowhere
+    // downstream.
+    let offered_credentials = request.headers().contains_key(axum::http::header::AUTHORIZATION);
+    // `/v1/auth/login` answers 401 for a bad password, and it is not a
+    // bearer-protected resource. Challenging there would tell a client to come
+    // back with a token, which is the opposite of what it should do.
+    let challengeable = request.uri().path() != "/v1/auth/login";
+
     let span = timed.then(|| request_span(&request));
-    let response = match &span {
+    let mut response = match &span {
         Some(span) => next.run(request).instrument(span.clone()).await,
         None => next.run(request).await,
     };
+
+    if challengeable {
+        add_challenge(&state, offered_credentials, &mut response);
+    }
 
     if let Some(span) = &span {
         // `i64`, not `u16`: `tracing-opentelemetry` has no `record_u64`, so an
@@ -120,6 +151,77 @@ async fn count_request(
     }
     state.metrics.record_request(response.status().as_u16());
     response
+}
+
+/// Answer a refusal with the challenge RFC 6750 §3 requires.
+///
+/// # Why this is a layer and not part of `ApiError`
+///
+/// A 401 arrives here from two unrelated places: the `Auth` extractor building
+/// one directly, and `From<AuthError>` converting whatever a verifier returned.
+/// The conversion has no access to state, so it cannot know the resource
+/// metadata URL, and threading state into it would mean touching every call
+/// site to carry something only this header wants. One layer that already wraps
+/// every route, and already holds the request, answers all of it — including
+/// the part `ApiError` fundamentally cannot see, which is whether the caller
+/// offered credentials at all.
+///
+/// # The two 401s are deliberately different
+///
+/// A request with **no** credentials gets a bare challenge and **no** `error`
+/// code: RFC 6750 §3 says a client that has not yet tried should not be told it
+/// failed. A request with a **bad** one gets `invalid_token`, because that is
+/// actionable — it means refresh and retry rather than "you are not welcome".
+/// 403 takes `insufficient_scope` (§3.1), which says nothing the body does not
+/// already say: it still does not distinguish a collection that is missing from
+/// one the caller may not have, and a test holds that.
+fn add_challenge(
+    state: &SharedState,
+    offered_credentials: bool,
+    response: &mut axum::response::Response,
+) {
+    use axum::http::header::WWW_AUTHENTICATE;
+
+    let error = match response.status() {
+        axum::http::StatusCode::UNAUTHORIZED if offered_credentials => {
+            Some((r#"error="invalid_token""#, "the access token is expired, revoked or malformed"))
+        }
+        axum::http::StatusCode::UNAUTHORIZED => None,
+        axum::http::StatusCode::FORBIDDEN => Some((
+            r#"error="insufficient_scope""#,
+            "the authenticated principal holds no grant covering this operation",
+        )),
+        _ => return,
+    };
+    // Never clobber one a handler set for itself. Nothing does today, and a
+    // silent overwrite is the kind of thing that stays invisible until it is
+    // the bug.
+    if response.headers().contains_key(WWW_AUTHENTICATE) {
+        return;
+    }
+
+    let mut challenge = String::from(r#"Bearer realm="kimmydb""#);
+    if let Some((code, description)) = error {
+        challenge.push_str(", ");
+        challenge.push_str(code);
+        challenge.push_str(&format!(r#", error_description="{description}""#));
+    }
+    // RFC 9728 §5.1. Absent when the audience is an opaque string, which is a
+    // configuration this node supports rather than a gap: there is simply no
+    // document to point at.
+    if let Some(url) = state.federation().and_then(|f| f.resource_metadata_url()) {
+        challenge.push_str(&format!(r#", resource_metadata="{url}""#));
+    }
+
+    match axum::http::HeaderValue::from_str(&challenge) {
+        Ok(value) => {
+            response.headers_mut().insert(WWW_AUTHENTICATE, value);
+        }
+        // Only reachable through a configured resource identifier containing a
+        // character no header may carry. Dropping the header beats panicking on
+        // the error path, and the refusal itself is unaffected.
+        Err(e) => warn!(error = %e, "could not encode the WWW-Authenticate challenge"),
+    }
 }
 
 /// The span for one HTTP request, parented to whatever sent the request.
@@ -241,6 +343,39 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
         storage = state.engine.storage_bytes(),
         process = state.metrics.render(),
     ))
+}
+
+/// This node, described as an OAuth 2.0 protected resource (RFC 9728).
+///
+/// Served only when federation is configured *and* the audience is an https
+/// URI, because only then does this node have a name an authorization server
+/// knows it by. A bare-string audience gets a 404 — there is nothing truthful
+/// to publish, and publishing an identifier no token will ever carry would send
+/// every client to ask for a `resource` the provider refuses.
+///
+/// The payoff is `kimmy login --oidc` with nothing but `--url`: the client
+/// reads this document off the node it is about to use and learns both who to
+/// authenticate with and what to ask the token to be for. It is also exactly
+/// how the MCP authorization specification says an MCP client discovers where
+/// to authenticate, which matters here because `/mcp` is on this same listener.
+async fn protected_resource_metadata(
+    State(state): State<SharedState>,
+    uri: axum::http::Uri,
+) -> Result<Json<Value>, ApiError> {
+    let federation = state.federation().ok_or_else(not_a_protected_resource)?;
+    let served_at = federation.resource_metadata_path().ok_or_else(not_a_protected_resource)?;
+    // The wildcard route means this handler also sees requests for *another*
+    // resource's metadata on the same host. Answering those with this node's
+    // document would be a lie, and one a client would act on.
+    if uri.path().trim_end_matches('/') != served_at.trim_end_matches('/') {
+        return Err(not_a_protected_resource());
+    }
+    let metadata = federation.protected_resource_metadata().ok_or_else(not_a_protected_resource)?;
+    Ok(Json(metadata))
+}
+
+fn not_a_protected_resource() -> ApiError {
+    ApiError::not_found("this node publishes no protected resource metadata")
 }
 
 /// Readiness differs from liveness: it proves the storage engine responds, so

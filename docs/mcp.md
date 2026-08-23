@@ -73,6 +73,39 @@ An unauthenticated request is rejected with `401` by middleware, before the MCP
 transport runs — so a missing token fails at the door rather than inside twelve
 separate tools.
 
+### Discovering where to authenticate
+
+The `401` above carries a `WWW-Authenticate` challenge, and when the node
+federates with an identity provider under an https `audience`, that challenge
+names its metadata document:
+
+```
+WWW-Authenticate: Bearer realm="kimmydb",
+  resource_metadata="https://kimmydb.example.com/.well-known/oauth-protected-resource"
+```
+
+This is what the MCP authorization specification asks of a server acting as an
+OAuth 2.0 resource server, and it is the whole discovery path: a client with no
+configuration reads that document, learns the resource identifier and the
+authorization server, and runs its own OAuth flow against them. Without it an
+MCP client has to be told the issuer by hand.
+
+```bash
+curl http://localhost:7878/.well-known/oauth-protected-resource
+# {"resource":"https://kimmydb.example.com",
+#  "authorization_servers":["https://auth.example.com"],
+#  "bearer_methods_supported":["header"]}
+```
+
+`kimmy login --oidc --url <node>` uses exactly the same path, so what an MCP
+client does automatically is what the CLI does for a person. Full detail:
+[http-api.md](http-api.md#protected-resource-metadata) and
+[security.md](security.md#naming-this-node-the-audience-is-the-resource-identifier).
+
+A node with no federation, or with an opaque audience, answers `404` there and
+sends a challenge without the pointer — the token then has to come from
+somewhere the client already knows about.
+
 ### In a client config
 
 ```json

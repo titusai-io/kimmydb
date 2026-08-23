@@ -44,6 +44,23 @@ fn main() -> Result<()> {
                     .build()
                     .context("building the tokio runtime")?;
                 let issuer = config.auth.oidc.issuer.as_deref().unwrap_or("");
+                // Said here as well as at startup, because this is where an
+                // operator comes to find out why a client cannot discover them.
+                match config.auth.oidc.settings().and_then(|s| {
+                    s.resource_identifier().map(|r| (r.to_string(), s.audience.clone()))
+                }) {
+                    Some((resource, _)) => eprintln!(
+                        "this node publishes protected resource metadata for {resource} at \
+                         {path}, so `kimmy login --oidc --url ...` needs no other configuration",
+                        path = kimmy_auth::PROTECTED_RESOURCE_METADATA_PATH
+                    ),
+                    None => eprintln!(
+                        "note: auth.oidc.audience is not an https URI, so no protected resource \
+                         metadata is published and a client cannot ask for a token scoped to \
+                         this node. Tokens will carry whatever audience the provider defaults \
+                         to, shared with every other resource that trusts it."
+                    ),
+                }
                 match runtime.block_on(node::probe_oidc(&config.auth.oidc)) {
                     Ok(keys) => eprintln!(
                         "identity provider {issuer} answered discovery and published {keys} \

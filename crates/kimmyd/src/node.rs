@@ -175,6 +175,25 @@ pub async fn run(config: Config) -> Result<()> {
                 mappings = verifier.settings().role_mappings.len(),
                 "federating with an external identity provider"
             );
+            // Whether this node can name itself to an authorization server, said
+            // once at startup rather than left to be inferred from a 404. An
+            // operator who set an opaque audience and expected RFC 9728 to
+            // appear has no other way to find out why it did not, and the two
+            // configurations are otherwise indistinguishable from the outside.
+            match verifier.settings().resource_identifier() {
+                Some(resource) => info!(
+                    resource,
+                    path = kimmy_auth::PROTECTED_RESOURCE_METADATA_PATH,
+                    "publishing protected resource metadata"
+                ),
+                None => info!(
+                    audience = verifier.settings().audience,
+                    "the audience is not an https URI, so no protected resource metadata is \
+                     published and clients cannot ask this node's provider for a token scoped \
+                     to it; set auth.oidc.audience to the public URL clients reach this node at \
+                     to enable it"
+                ),
+            }
             let federation = kimmy_api::Federation::new(verifier);
             state.set_federation(Arc::clone(&federation));
             Some(spawn_jwks_refresher(

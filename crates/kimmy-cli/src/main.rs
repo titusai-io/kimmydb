@@ -109,6 +109,16 @@ enum Command {
         #[arg(long, env = "KIMMY_OIDC_CLIENT_ID")]
         client_id: Option<String>,
 
+        /// The resource the token should be *for* (RFC 8707).
+        ///
+        /// Without one, a provider mints its default audience — usually its own
+        /// issuer URL — and every resource that trusts it shares a single
+        /// audience, which is the thing an audience restriction exists to
+        /// prevent. Left unset this is read off the node named by --url, so it
+        /// normally needs no setting at all.
+        #[arg(long, env = "KIMMY_OIDC_RESOURCE")]
+        resource: Option<String>,
+
         /// Scopes to request. The node reads roles from the token, so the
         /// provider has to be configured to put them there.
         #[arg(long, env = "KIMMY_OIDC_SCOPE", default_value = "openid profile")]
@@ -284,7 +294,7 @@ async fn run() -> Result<()> {
 
     // Login is the one command that runs without a token, because producing
     // one is what it is for.
-    if let Command::Login { user, oidc, client_credentials, issuer, client_id, scope } =
+    if let Command::Login { user, oidc, client_credentials, issuer, client_id, scope, resource } =
         &cli.command
     {
         // The token alone, with no decoration, so `$(kimmy login ...)` is
@@ -293,10 +303,21 @@ async fn run() -> Result<()> {
         // lifetime and its cleanup, and an environment variable answers all
         // three by not existing afterwards. The same goes for the refresh
         // token the flows below deliberately never ask for and never keep.
-        let token = if *oidc {
-            oidc::device_login(issuer.as_deref(), client_id.as_deref(), scope).await?
-        } else if *client_credentials {
-            oidc::client_credentials_login(issuer.as_deref(), client_id.as_deref(), scope).await?
+        let token = if *oidc || *client_credentials {
+            // Ask the node itself where to authenticate and what to ask the
+            // token to be for, so the usual invocation is `kimmy login --oidc`
+            // with nothing else set. A flag still wins, and a node that
+            // publishes nothing leaves both as they were.
+            let (issuer, resource) =
+                oidc::defaults_from_node(&cli.url, issuer.clone(), resource.clone()).await;
+            let issuer = issuer.as_deref();
+            let resource = resource.as_deref();
+            let client_id = client_id.as_deref();
+            if *oidc {
+                oidc::device_login(issuer, client_id, scope, resource).await?
+            } else {
+                oidc::client_credentials_login(issuer, client_id, scope, resource).await?
+            }
         } else {
             let user = user.as_deref().context(
                 "name the user to log in as, or pass --oidc / --client-credentials to log in \
@@ -674,6 +695,16 @@ mod oidc {
     /// The interval to poll at when the provider does not name one (RFC 8628 §3.5).
     const DEFAULT_POLL_SECS: u64 = 5;
 
+    /// Where a node publishes what it is, as an OAuth 2.0 protected resource.
+    ///
+    /// Written out here rather than shared with the server's constant in
+    /// `kimmy-auth`. That crate carries password hashing and a storage engine,
+    /// and `kimmy-client` — the one dependency that could have re-exported it —
+    /// deliberately links no kimmy crate at all, which is a property worth more
+    /// than deduplicating a string. It is fixed by RFC 9728 §3 in any case, so
+    /// the two cannot drift without the specification changing under both.
+    const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected-resource";
+
     fn http() -> Result<reqwest::Client> {
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -686,6 +717,69 @@ mod oidc {
             "no OIDC issuer: set KIMMY_OIDC_ISSUER or pass --issuer, using the same value the \
              node is configured with",
         )
+    }
+
+    /// Fill in the issuer and the resource from the node about to be used.
+    ///
+    /// This is the whole ergonomic point of publishing RFC 9728 metadata: the
+    /// node already knows which authorization server it trusts and what name it
+    /// was registered under, and making an operator restate both in environment
+    /// variables is asking them to keep three places in agreement by hand.
+    ///
+    /// **Never fatal.** A node built before this existed, one whose audience is
+    /// an opaque string, or one that is simply unreachable all publish nothing —
+    /// and in every one of those cases the flags are still the answer, so a
+    /// lookup failure returns what it was given rather than stopping a login.
+    /// Nothing is fetched at all when both values are already known.
+    pub async fn defaults_from_node(
+        url: &str,
+        issuer: Option<String>,
+        resource: Option<String>,
+    ) -> (Option<String>, Option<String>) {
+        if issuer.is_some() && resource.is_some() {
+            return (issuer, resource);
+        }
+        let Some(document) = protected_resource_metadata(url).await else {
+            return (issuer, resource);
+        };
+        // `authorization_servers` is a list because a resource may trust
+        // several; this node trusts exactly one (ADR-064), so the first entry
+        // is the only entry.
+        let discovered_issuer = document
+            .get("authorization_servers")
+            .and_then(Value::as_array)
+            .and_then(|servers| servers.first())
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let discovered_resource =
+            document.get("resource").and_then(Value::as_str).map(str::to_string);
+        (issuer.or(discovered_issuer), resource.or(discovered_resource))
+    }
+
+    /// The node's own RFC 9728 document, if it publishes one.
+    async fn protected_resource_metadata(url: &str) -> Option<Value> {
+        let url = format!("{}{PROTECTED_RESOURCE_METADATA_PATH}", url.trim_end_matches('/'));
+        let response = http().ok()?.get(&url).send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        response.json().await.ok()
+    }
+
+    /// Name the resource a token is being asked for, when one is known.
+    ///
+    /// Omitted rather than sent empty when it is not: a `resource` parameter
+    /// with no value is a malformed request, whereas its absence is the
+    /// well-defined "give me your default audience" that every provider
+    /// predating RFC 8707 already implements.
+    pub(super) fn with_resource<'a>(
+        mut form: Vec<(&'a str, &'a str)>,
+        resource: Option<&'a str>,
+    ) -> Vec<(&'a str, &'a str)> {
+        if let Some(resource) = resource {
+            form.push(("resource", resource));
+        }
+        form
     }
 
     fn client_id_or_bail(client_id: Option<&str>) -> Result<&str> {
@@ -743,6 +837,7 @@ mod oidc {
         issuer: Option<&str>,
         client_id: Option<&str>,
         scope: &str,
+        resource: Option<&str>,
     ) -> Result<String> {
         let issuer = issuer_or_bail(issuer)?;
         let client_id = client_id_or_bail(client_id)?;
@@ -756,7 +851,11 @@ mod oidc {
 
         let start: Value = http
             .post(&device_endpoint)
-            .form(&[("client_id", client_id), ("scope", scope)])
+            // The resource goes on the *authorization* request as well as the
+            // token request below (RFC 8707 §2.1 and §2.2). Sending it only at
+            // the token endpoint would ask a provider to widen a grant that was
+            // recorded without it, which is the one direction it may not go.
+            .form(&with_resource(vec![("client_id", client_id), ("scope", scope)], resource))
             .send()
             .await
             .with_context(|| format!("starting the device flow at {device_endpoint}"))?
@@ -806,11 +905,14 @@ mod oidc {
 
             let body: Value = http
                 .post(&token_endpoint)
-                .form(&[
-                    ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
-                    ("device_code", device_code),
-                    ("client_id", client_id),
-                ])
+                .form(&with_resource(
+                    vec![
+                        ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
+                        ("device_code", device_code),
+                        ("client_id", client_id),
+                    ],
+                    resource,
+                ))
                 .send()
                 .await
                 .with_context(|| format!("polling {token_endpoint}"))?
@@ -847,6 +949,7 @@ mod oidc {
         issuer: Option<&str>,
         client_id: Option<&str>,
         scope: &str,
+        resource: Option<&str>,
     ) -> Result<String> {
         let issuer = issuer_or_bail(issuer)?;
         let client_id = client_id_or_bail(client_id)?;
@@ -862,12 +965,15 @@ mod oidc {
 
         let body: Value = http
             .post(&token_endpoint)
-            .form(&[
-                ("grant_type", "client_credentials"),
-                ("client_id", client_id),
-                ("client_secret", secret.as_str()),
-                ("scope", scope),
-            ])
+            .form(&with_resource(
+                vec![
+                    ("grant_type", "client_credentials"),
+                    ("client_id", client_id),
+                    ("client_secret", secret.as_str()),
+                    ("scope", scope),
+                ],
+                resource,
+            ))
             .send()
             .await
             .with_context(|| format!("requesting a token from {token_endpoint}"))?
@@ -948,6 +1054,77 @@ mod tests {
     fn the_cli_version_is_the_workspace_version() {
         assert_eq!(env!("CARGO_PKG_VERSION"), kimmy_core::build::VERSION);
         assert!(kimmy_core::build::ident().starts_with(kimmy_core::build::VERSION));
+    }
+
+    // -----------------------------------------------------------------------
+    // The RFC 8707 resource parameter (ADR-071)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn the_resource_rides_on_both_oauth_flows() {
+        // The gap this workstream exists to close: without it the only audience
+        // `kimmy login` could ever obtain was the provider's default, so the
+        // correct configuration was unreachable from this tool.
+        let device = oidc::with_resource(
+            vec![("client_id", "kimmy-cli"), ("scope", "openid profile")],
+            Some("https://kimmydb.example.com"),
+        );
+        assert!(device.contains(&("resource", "https://kimmydb.example.com")));
+
+        let service = oidc::with_resource(
+            vec![("grant_type", "client_credentials")],
+            Some("https://kimmydb.example.com"),
+        );
+        assert!(service.contains(&("resource", "https://kimmydb.example.com")));
+    }
+
+    #[test]
+    fn no_resource_means_the_parameter_is_absent_rather_than_empty() {
+        // An empty `resource` is a malformed request; its absence is the
+        // well-defined "your default audience" that every provider predating
+        // RFC 8707 already implements.
+        let form = oidc::with_resource(vec![("client_id", "kimmy-cli")], None);
+        assert!(form.iter().all(|(key, _)| *key != "resource"), "{form:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_node_does_not_stop_a_login() {
+        // Discovery off the node is an ergonomic shortcut, never a dependency:
+        // a node built before this existed, one with an opaque audience, and
+        // one that is simply down all publish nothing, and in every case the
+        // flags are still the answer.
+        let (issuer, resource) = oidc::defaults_from_node(
+            // Refused rather than blackholed, so the test costs a syscall
+            // instead of the client's 30-second timeout.
+            "http://127.0.0.1:1",
+            Some("https://auth.example.com".into()),
+            None,
+        )
+        .await;
+        assert_eq!(issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(resource, None);
+    }
+
+    #[tokio::test]
+    async fn nothing_is_fetched_when_both_values_are_already_known() {
+        // 192.0.2.0/24 is reserved for documentation (RFC 5737) and blackholes,
+        // so a request to it hangs until the client's own timeout. Returning
+        // inside the deadline below is therefore the assertion: it says the
+        // network was never touched, and a regression fails in two seconds
+        // rather than thirty.
+        let resolved = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            oidc::defaults_from_node(
+                "http://192.0.2.1:7878",
+                Some("https://auth.example.com".into()),
+                Some("https://kimmydb.example.com".into()),
+            ),
+        )
+        .await
+        .expect("nothing should be fetched when both values are already known");
+
+        assert_eq!(resolved.0.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(resolved.1.as_deref(), Some("https://kimmydb.example.com"));
     }
 
     #[test]

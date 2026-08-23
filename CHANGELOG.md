@@ -10,6 +10,39 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **KimmyDB names itself as an OAuth 2.0 protected resource.** When
+  `auth.oidc.audience` is written as an `https` URL, a node publishes RFC 9728
+  metadata at `/.well-known/oauth-protected-resource` naming that identifier
+  and its authorization server. `kimmy login --oidc --url <node>` now needs
+  nothing else configured — it reads both values off the node — and a
+  conformant MCP client can discover where to authenticate the same way.
+- **`kimmy login` sends an RFC 8707 `resource` parameter**, on the device flow
+  and the client-credentials flow, via `--resource` / `KIMMY_OIDC_RESOURCE` or
+  the node's own metadata. Without it the only audience the CLI could obtain
+  was whatever the provider defaulted to, so an audience naming this node
+  specifically was unreachable from the tool.
+- **`WWW-Authenticate` on every 401 and 403** (RFC 6750 §3), pointing at the
+  metadata document when there is one. A request that offered no credentials is
+  told how to authenticate and deliberately carries no `error` code; a bad
+  token gets `invalid_token`, and a denied request `insufficient_scope`.
+  `POST /v1/auth/login` is exempt — it is where a token comes from, not a
+  bearer-protected resource.
+- `kimmyd check-config` and the startup log now say whether the node publishes
+  protected resource metadata, and why not when it does not.
+
+### Changed
+
+- **`auth.oidc.audience` written as `http://` is now refused at startup**, as
+  is one carrying a fragment. Every other audience is accepted exactly as
+  before, including opaque strings, Entra ID's `api://<guid>` and `urn:`
+  values — those simply publish no metadata. No existing configuration that
+  used `https` or an opaque string needs editing. See
+  [ADR-071](docs/decisions.md).
+
 ## 0.2.0 - 2026-08-23
 
 ### Added
