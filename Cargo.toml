@@ -108,6 +108,39 @@ argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 rand = "0.9"
 
+# OpenTelemetry. The API crate is separated from the SDK on purpose: the
+# library crates take `opentelemetry` (context and propagation types only, no
+# exporter, no runtime) and the binary takes the SDK, so nothing but `kimmyd`
+# can decide where a span goes.
+#
+# **HTTP transport, never gRPC** (ADR-069). `default-features = false` drops
+# the `grpc-tonic` default, which would pull `tonic`, `prost` and their build
+# machinery for a wire format the OpenTelemetry Collector already accepts over
+# :4318. Doing it this way rides the `reqwest` + `rustls`/`ring` stack the tree
+# already carries, so `scripts/check-native-deps.sh` needs no new entry —
+# the same reasoning that picked `ring` over `aws-lc-rs` in ADR-016 and 039.
+#
+# `reqwest-blocking-client` rather than `reqwest-client`: `logging::init` runs
+# **before** the tokio runtime is built (see `kimmyd/src/main.rs`), so an async
+# exporter would be constructed with no reactor to drive it. The blocking
+# client owns its own threads and does not care.
+#
+# `internal-logs` is kept out of the `default-features = false` sweep on
+# purpose. It is what makes the exporter's own failures visible: without it a
+# node pointed at the wrong port serves perfectly and exports nothing, forever,
+# with no line anywhere saying so — the same quiet failure the TLS reload and
+# JWKS refresh counters exist for. The events go to the `opentelemetry` target
+# and are raised from the exporter's own threads, where no span is open, so
+# they reach the log and cannot feed back into the exporter.
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "metrics", "internal-logs"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "http-proto", "http-json", "reqwest-blocking-client", "internal-logs"] }
+opentelemetry-semantic-conventions = "0.32"
+# The bridge: converts `tracing` spans into OTel spans, which is what lets
+# `kimmy-storage`, `kimmy-cluster` and `kimmy-vector` be instrumented with the
+# `tracing` they already have and no new dependency at all.
+tracing-opentelemetry = { version = "0.33", default-features = false, features = ["tracing-log"] }
+
 # Dev / test
 proptest = "1"
 tempfile = "3"

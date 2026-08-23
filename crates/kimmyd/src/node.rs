@@ -103,6 +103,14 @@ pub async fn run(config: Config) -> Result<()> {
     kimmy_api::audit::set_mode(audit);
     info!(mode = audit.name(), "audit logging");
 
+    // Beside the audit mode, and process-global for the same reason: it is a
+    // property of the deployment rather than of a request, and threading it
+    // through every extractor would put a configuration parameter in the
+    // signature of code that has no other reason to know about configuration.
+    // Set before anything can be served, so no span escapes carrying a name
+    // the operator did not ask to publish (ADR-068).
+    kimmy_api::telemetry::set_include_names(config.telemetry.include_names);
+
     let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
     let state = kimmy_api::state_with_egress(
         Arc::clone(&engine),
@@ -112,6 +120,13 @@ pub async fn run(config: Config) -> Result<()> {
         egress,
     )
     .context("building the API state")?;
+
+    // The OTLP counters, reading the same atomics `/metrics` renders. Here
+    // rather than in `logging::init` because the counters live in this state
+    // and this state needs a database, which does not exist when the
+    // subscriber is installed. With no collector configured the global meter
+    // is a no-op and this registers nothing (ADR-070).
+    crate::logging::TelemetryGuard::bridge_metrics(&state);
 
     // MCP shares the state rather than being handed its own, so an agent tool
     // and the REST route beside it reach the same engine through the same
@@ -631,7 +646,19 @@ pub(crate) fn discovery_url(issuer: &str) -> String {
 /// Discovery every time rather than the JWKS URI being remembered: a provider
 /// is allowed to move it, and one extra request every few minutes is not worth
 /// a cache that can go stale in a way nothing would report.
+#[tracing::instrument(name = "oidc.jwks_refresh", skip_all, fields(
+    issuer = %issuer,
+    otel.kind = "client",
+    keys = tracing::field::Empty,
+))]
 pub(crate) async fn fetch_jwks(http: &reqwest::Client, issuer: &str) -> Result<JwkSet> {
+    // The issuer is on the span deliberately, unlike a database name: it is an
+    // operator's own identity provider, it is already in every log line this
+    // task writes, and without it a refresh failure in a trace says only that
+    // *something* could not be reached. The failure this span exists for is
+    // the quiet one — a node that keeps verifying perfectly against the keys
+    // it holds until the provider rotates, and then refuses every federated
+    // caller at once (ADR-064).
     let url = discovery_url(issuer);
     let document: serde_json::Value = http
         .get(&url)
@@ -667,6 +694,7 @@ pub(crate) async fn fetch_jwks(http: &reqwest::Client, issuer: &str) -> Result<J
     if keys.keys.is_empty() {
         anyhow::bail!("the key set at {jwks_uri} is empty");
     }
+    tracing::Span::current().record("keys", keys.keys.len() as i64);
     Ok(keys)
 }
 

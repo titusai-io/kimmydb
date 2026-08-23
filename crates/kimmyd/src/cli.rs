@@ -143,6 +143,31 @@ pub struct Overrides {
     /// Log output format.
     #[arg(long, env = "KIMMY_LOG_FORMAT", value_enum)]
     pub log_format: Option<LogFormatArg>,
+
+    /// Base URL of an OpenTelemetry collector, e.g. http://otel-collector:4318.
+    ///
+    /// Setting it is what turns telemetry on; there is no separate enable flag.
+    #[arg(long, env = "KIMMY_OTLP_ENDPOINT")]
+    pub otlp_endpoint: Option<String>,
+
+    /// OTLP encoding: `http/protobuf` (default) or `http/json`. No gRPC.
+    #[arg(long, env = "KIMMY_OTLP_PROTOCOL")]
+    pub otlp_protocol: Option<String>,
+
+    /// Fraction of traces to record, 0.0 to 1.0.
+    #[arg(long, env = "KIMMY_OTLP_SAMPLE_RATIO")]
+    pub otlp_sample_ratio: Option<f64>,
+
+    /// What `service.name` this node reports itself as.
+    #[arg(long, env = "KIMMY_OTLP_SERVICE_NAME")]
+    pub otlp_service_name: Option<String>,
+
+    /// Let spans carry database and collection names.
+    ///
+    /// Off by default. Turning it on publishes a deployment's schema to
+    /// whatever holds the traces — see ADR-068 and docs/security.md.
+    #[arg(long, env = "KIMMY_TELEMETRY_INCLUDE_NAMES")]
+    pub telemetry_include_names: bool,
 }
 
 #[derive(clap::ValueEnum, Clone, Copy, Debug)]
@@ -250,6 +275,26 @@ impl Overrides {
         if let Some(format) = self.log_format {
             cfg.log.format = format.into();
         }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            cfg.telemetry.endpoint = Some(endpoint.clone());
+        }
+        if let Some(protocol) = &self.otlp_protocol {
+            cfg.telemetry.protocol = protocol.clone();
+        }
+        if let Some(ratio) = self.otlp_sample_ratio {
+            cfg.telemetry.sample_ratio = ratio;
+        }
+        if let Some(name) = &self.otlp_service_name {
+            cfg.telemetry.service_name = name.clone();
+        }
+        // One-way, like `--insecure-no-auth` above: the flag can only turn
+        // names on, so omitting it cannot silently switch off what the config
+        // file asked for. The direction matters more here than elsewhere — the
+        // absent-flag default is the private one, so a bug in this branch
+        // fails closed.
+        if self.telemetry_include_names {
+            cfg.telemetry.include_names = true;
+        }
     }
 }
 
@@ -312,6 +357,42 @@ mod tests {
         cfg.auth.insecure_no_auth = true;
         cli.overrides.apply(&mut cfg);
         assert!(cfg.auth.insecure_no_auth, "an absent flag must not override the file");
+    }
+
+    #[test]
+    fn telemetry_flags_override_the_file_and_an_absent_one_does_not() {
+        let cli = parse(&[
+            "--otlp-endpoint",
+            "http://collector:4318",
+            "--otlp-protocol",
+            "http/json",
+            "--otlp-sample-ratio",
+            "0.25",
+            "--otlp-service-name",
+            "kimmydb-prod",
+        ]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg);
+
+        assert_eq!(cfg.telemetry.endpoint.as_deref(), Some("http://collector:4318"));
+        assert_eq!(cfg.telemetry.protocol, "http/json");
+        assert_eq!(cfg.telemetry.sample_ratio, 0.25);
+        assert_eq!(cfg.telemetry.service_name, "kimmydb-prod");
+        // Not passed, so untouched — and the untouched value is the private one.
+        assert!(!cfg.telemetry.include_names);
+
+        // The boolean is one-way. A file that asked for names must keep them
+        // when the flag is absent, exactly as `--insecure-no-auth` behaves.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.telemetry.include_names = true;
+        cli.overrides.apply(&mut cfg);
+        assert!(cfg.telemetry.include_names, "an absent flag must not override the file");
+
+        let cli = parse(&["--telemetry-include-names"]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg);
+        assert!(cfg.telemetry.include_names);
     }
 
     #[test]

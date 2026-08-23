@@ -31,6 +31,42 @@ use std::time::Instant;
 const LATENCY_BUCKETS_US: [u64; 12] =
     [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 25_000, 50_000, 100_000, 1_000_000, 10_000_000];
 
+/// Every counter as a plain value, for a reader that is not the renderer.
+///
+/// A value struct rather than an accessor per counter: the OTLP bridge wants
+/// all of them, once, and twenty-five getters would be twenty-five things to
+/// forget when a counter is added. See [`Metrics::snapshot`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MetricsSnapshot {
+    pub uptime_secs: u64,
+    pub requests: u64,
+    pub responses_2xx: u64,
+    pub responses_4xx: u64,
+    pub responses_5xx: u64,
+    pub authz_denied: u64,
+    pub auth_failures: u64,
+    pub rate_limited: u64,
+    pub backups: u64,
+    pub ttl_expired: u64,
+    pub ttl_skipped: u64,
+    pub webhook_delivered: u64,
+    pub webhook_failed: u64,
+    pub webhook_events: u64,
+    pub webhook_active: u64,
+    pub webhook_invalidated: u64,
+    pub webhook_backlog_secs: u64,
+    pub cluster_members: u64,
+    pub replication_lag_secs: u64,
+    pub tls_reloads_ok: u64,
+    pub tls_reloads_failed: u64,
+    pub jwks_refresh_ok: u64,
+    pub jwks_refresh_failed: u64,
+    /// Requests observed by the latency histogram — health and metrics routes
+    /// excluded, so this is smaller than `requests` on any real node.
+    pub latency_count: u64,
+    pub latency_sum_us: u64,
+}
+
 /// Counters for one running server.
 pub struct Metrics {
     started: Instant,
@@ -242,6 +278,49 @@ impl Metrics {
         counter.load(Ordering::Relaxed)
     }
 
+    /// Every counter, read once, as plain numbers.
+    ///
+    /// The read surface the OTLP bridge uses (ADR-070). Counters are
+    /// **bridged, not duplicated**: an observable instrument's callback reads
+    /// this and reports it, so `/metrics` and a collector are two renderings of
+    /// one set of atomics rather than two sets that can drift. A second set is
+    /// the failure this avoids — a Prometheus dashboard and a trace backend
+    /// disagreeing about how many requests a node served, with nothing to say
+    /// which is right.
+    ///
+    /// Not a consistent snapshot, and it does not need to be: each field is a
+    /// relaxed load, so a value may be one increment behind a sibling. That is
+    /// already true of `render`, and of any counter read without a lock.
+    pub fn snapshot(&self) -> MetricsSnapshot {
+        MetricsSnapshot {
+            uptime_secs: self.uptime_secs(),
+            requests: self.get(&self.requests),
+            responses_2xx: self.get(&self.responses_2xx),
+            responses_4xx: self.get(&self.responses_4xx),
+            responses_5xx: self.get(&self.responses_5xx),
+            authz_denied: self.get(&self.authz_denied),
+            auth_failures: self.get(&self.auth_failures),
+            rate_limited: self.get(&self.rate_limited),
+            backups: self.get(&self.backups),
+            ttl_expired: self.get(&self.ttl_expired),
+            ttl_skipped: self.get(&self.ttl_skipped),
+            webhook_delivered: self.get(&self.webhook_delivered),
+            webhook_failed: self.get(&self.webhook_failed),
+            webhook_events: self.get(&self.webhook_events),
+            webhook_active: self.get(&self.webhook_active),
+            webhook_invalidated: self.get(&self.webhook_invalidated),
+            webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
+            cluster_members: self.get(&self.cluster_members),
+            replication_lag_secs: self.get(&self.replication_lag_secs),
+            tls_reloads_ok: self.get(&self.tls_reloads_ok),
+            tls_reloads_failed: self.get(&self.tls_reloads_failed),
+            jwks_refresh_ok: self.get(&self.jwks_refresh_ok),
+            jwks_refresh_failed: self.get(&self.jwks_refresh_failed),
+            latency_count: self.get(&self.latency_count),
+            latency_sum_us: self.get(&self.latency_sum_us),
+        }
+    }
+
     /// Render the process counters in Prometheus text format.
     ///
     /// The storage gauges are rendered by the caller, which has the engine;
@@ -367,6 +446,207 @@ impl Metrics {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One instance with every counter at a value nothing else has.
+    ///
+    /// Distinct on purpose: with several counters sharing a value, a render
+    /// that printed the wrong one would still match.
+    fn every_counter_distinct() -> Metrics {
+        use std::time::Duration;
+
+        let m = Metrics::default();
+        // 2 × 2xx, 3 × 4xx (one each of 401/403/429), 4 × 5xx, and one 304
+        // that lands in the total alone: ten requests, no two classes equal.
+        for _ in 0..2 {
+            m.record_request(200);
+        }
+        m.record_request(401);
+        m.record_request(403);
+        m.record_request(429);
+        for _ in 0..4 {
+            m.record_request(500);
+        }
+        m.record_request(304);
+
+        m.record_backup();
+        m.record_expiry(11, 12);
+        m.record_webhook_delivery(true, 13);
+        m.record_webhook_delivery(true, 14);
+        m.record_webhook_delivery(false, 0);
+        m.set_webhook_gauges(15, 16, 17);
+        m.set_cluster_members(18);
+        m.set_replication_lag_secs(19);
+        for _ in 0..20 {
+            m.record_tls_reload(true);
+        }
+        m.record_tls_reload(false);
+        for _ in 0..22 {
+            m.record_jwks_refresh(true);
+        }
+        m.record_jwks_refresh(false);
+
+        // One observation in three different buckets, so the cumulative sum is
+        // visible in the golden text rather than being three copies of 1.
+        m.record_latency(Duration::from_micros(90));
+        m.record_latency(Duration::from_micros(400));
+        m.record_latency(Duration::from_millis(30));
+        m
+    }
+
+    /// **Deployed clusters scrape this endpoint. Any diff is a
+    /// regression** — a renamed series is a dashboard that goes blank and an
+    /// alert that stops firing, and neither announces itself.
+    ///
+    /// A whole-string comparison rather than a set of `contains` assertions,
+    /// because the failure this guards against is the one `contains` cannot
+    /// see: a series *added*, a HELP line reworded, a blank line appearing
+    /// between two samples. `render` is fully deterministic in a test —
+    /// `uptime_secs` is 0 on a fresh instance and nothing else reads a clock —
+    /// so there is no reason to check it loosely.
+    ///
+    /// If this fails because you meant to change the output, read the diff as
+    /// the release note it is: every line here is something a scrape config or
+    /// a dashboard may name.
+    #[test]
+    fn the_render_is_byte_for_byte_what_a_scrape_receives() {
+        let expected = "\
+# HELP kimmy_uptime_seconds Seconds since this process started serving.
+# TYPE kimmy_uptime_seconds gauge
+kimmy_uptime_seconds 0
+# HELP kimmy_requests_total HTTP requests handled.
+# TYPE kimmy_requests_total counter
+kimmy_requests_total 10
+# HELP kimmy_responses_total HTTP responses by status class.
+# TYPE kimmy_responses_total counter
+kimmy_responses_total{class=\"2xx\"} 2
+kimmy_responses_total{class=\"4xx\"} 3
+kimmy_responses_total{class=\"5xx\"} 4
+# HELP kimmy_authz_denied_total Operations refused by RBAC.
+# TYPE kimmy_authz_denied_total counter
+kimmy_authz_denied_total 1
+# HELP kimmy_auth_failures_total Rejected credentials and tokens.
+# TYPE kimmy_auth_failures_total counter
+kimmy_auth_failures_total 1
+# HELP kimmy_rate_limited_total Requests refused by a rate limit.
+# TYPE kimmy_rate_limited_total counter
+kimmy_rate_limited_total 1
+# HELP kimmy_backups_total Backups served.
+# TYPE kimmy_backups_total counter
+kimmy_backups_total 1
+# HELP kimmy_ttl_expired_total Documents deleted by a TTL index.
+# TYPE kimmy_ttl_expired_total counter
+kimmy_ttl_expired_total 11
+# HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.
+# TYPE kimmy_ttl_skipped_total counter
+kimmy_ttl_skipped_total 12
+# HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
+# TYPE kimmy_webhook_deliveries_total counter
+kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2
+kimmy_webhook_deliveries_total{outcome=\"failed\"} 1
+# HELP kimmy_webhook_events_total Change events pushed to endpoints.
+# TYPE kimmy_webhook_events_total counter
+kimmy_webhook_events_total 27
+# HELP kimmy_webhook_subscriptions Registered subscriptions, as this node sees the registry.
+# TYPE kimmy_webhook_subscriptions gauge
+kimmy_webhook_subscriptions{state=\"active\"} 15
+kimmy_webhook_subscriptions{state=\"invalidated\"} 16
+# HELP kimmy_webhook_backlog_seconds Age of the oldest undelivered event, across subscriptions this node owns.
+# TYPE kimmy_webhook_backlog_seconds gauge
+kimmy_webhook_backlog_seconds 17
+# HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.
+# TYPE kimmy_cluster_members gauge
+kimmy_cluster_members 18
+# HELP kimmy_replication_lag_seconds Seconds of peer oplog history not yet applied locally, max over peers in the last sync round. 0 when caught up or clustering is off.
+# TYPE kimmy_replication_lag_seconds gauge
+kimmy_replication_lag_seconds 19
+# HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
+# TYPE kimmy_tls_reloads_total counter
+kimmy_tls_reloads_total{outcome=\"ok\"} 20
+kimmy_tls_reloads_total{outcome=\"failed\"} 1
+# HELP kimmy_jwks_refresh_total Attempts to refresh the OIDC provider's signing keys, by outcome. A failed refresh leaves the key set already in use verifying.
+# TYPE kimmy_jwks_refresh_total counter
+kimmy_jwks_refresh_total{outcome=\"ok\"} 22
+kimmy_jwks_refresh_total{outcome=\"failed\"} 1
+# HELP kimmy_request_duration_seconds End-to-end request latency. Health and metrics routes are excluded, so scrapes do not crowd the buckets the real traffic lands in.
+# TYPE kimmy_request_duration_seconds histogram
+kimmy_request_duration_seconds_bucket{le=\"0.0001\"} 1
+kimmy_request_duration_seconds_bucket{le=\"0.00025\"} 1
+kimmy_request_duration_seconds_bucket{le=\"0.0005\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.001\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.0025\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.005\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.01\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.025\"} 2
+kimmy_request_duration_seconds_bucket{le=\"0.05\"} 3
+kimmy_request_duration_seconds_bucket{le=\"0.1\"} 3
+kimmy_request_duration_seconds_bucket{le=\"1\"} 3
+kimmy_request_duration_seconds_bucket{le=\"10\"} 3
+kimmy_request_duration_seconds_bucket{le=\"+Inf\"} 3
+kimmy_request_duration_seconds_sum 0.03049
+kimmy_request_duration_seconds_count 3
+";
+
+        assert_eq!(every_counter_distinct().render(), expected);
+    }
+
+    #[test]
+    fn the_snapshot_reads_the_same_atomics_the_render_does() {
+        // The bridge's whole claim (ADR-070) is that there is one source of
+        // truth per counter. A snapshot that drifted from the render would be
+        // the duplication this was written to avoid, arrived at by accident —
+        // so every field is checked against the text a scrape would see.
+        let m = every_counter_distinct();
+        let s = m.snapshot();
+        let out = m.render();
+
+        let expect = |line: &str| {
+            assert!(out.contains(line), "the render disagrees with the snapshot: {line}\n{out}")
+        };
+        expect(&format!("kimmy_uptime_seconds {}\n", s.uptime_secs));
+        expect(&format!("kimmy_requests_total {}\n", s.requests));
+        expect(&format!("kimmy_responses_total{{class=\"2xx\"}} {}\n", s.responses_2xx));
+        expect(&format!("kimmy_responses_total{{class=\"4xx\"}} {}\n", s.responses_4xx));
+        expect(&format!("kimmy_responses_total{{class=\"5xx\"}} {}\n", s.responses_5xx));
+        expect(&format!("kimmy_authz_denied_total {}\n", s.authz_denied));
+        expect(&format!("kimmy_auth_failures_total {}\n", s.auth_failures));
+        expect(&format!("kimmy_rate_limited_total {}\n", s.rate_limited));
+        expect(&format!("kimmy_backups_total {}\n", s.backups));
+        expect(&format!("kimmy_ttl_expired_total {}\n", s.ttl_expired));
+        expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
+        expect(&format!(
+            "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
+            s.webhook_delivered
+        ));
+        expect(&format!(
+            "kimmy_webhook_deliveries_total{{outcome=\"failed\"}} {}\n",
+            s.webhook_failed
+        ));
+        expect(&format!("kimmy_webhook_events_total {}\n", s.webhook_events));
+        expect(&format!("kimmy_webhook_subscriptions{{state=\"active\"}} {}\n", s.webhook_active));
+        expect(&format!(
+            "kimmy_webhook_subscriptions{{state=\"invalidated\"}} {}\n",
+            s.webhook_invalidated
+        ));
+        expect(&format!("kimmy_webhook_backlog_seconds {}\n", s.webhook_backlog_secs));
+        expect(&format!("kimmy_cluster_members {}\n", s.cluster_members));
+        expect(&format!("kimmy_replication_lag_seconds {}\n", s.replication_lag_secs));
+        expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
+        expect(&format!(
+            "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
+            s.tls_reloads_failed
+        ));
+        expect(&format!("kimmy_jwks_refresh_total{{outcome=\"ok\"}} {}\n", s.jwks_refresh_ok));
+        expect(&format!(
+            "kimmy_jwks_refresh_total{{outcome=\"failed\"}} {}\n",
+            s.jwks_refresh_failed
+        ));
+        expect(&format!("kimmy_request_duration_seconds_count {}\n", s.latency_count));
+
+        // Not a rendered series of its own — the histogram prints it in seconds
+        // — but the bridge reports microseconds, so the conversion is the thing
+        // that can silently be wrong.
+        assert_eq!(s.latency_sum_us, 90 + 400 + 30_000);
+    }
 
     #[test]
     fn statuses_land_in_the_right_class() {

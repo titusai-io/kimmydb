@@ -1,12 +1,16 @@
 //! HTTP routes.
 
-use axum::extract::{Path, Query, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use opentelemetry_semantic_conventions::attribute as semconv;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tracing::warn;
+use tracing::{Instrument, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::ApiError;
 use crate::exec;
@@ -80,6 +84,9 @@ pub fn router(state: SharedState) -> Router {
 }
 
 /// Count every response by status, and time the ones that are real traffic.
+///
+/// Also where a request's trace span is opened, for the same reason the
+/// counting is here: a span beside a handler is a span the next route forgets.
 async fn count_request(
     State(state): State<SharedState>,
     request: axum::extract::Request,
@@ -88,14 +95,98 @@ async fn count_request(
     // Health probes and scrapes are excluded from the *histogram* — every few
     // seconds forever, they would crowd the buckets the real traffic lands in
     // — but still counted as requests, so a scrape stays visible as traffic.
+    // The same predicate excludes them from tracing, and the argument is the
+    // same one: a trace every few seconds forever, of a request nobody is
+    // debugging, is cost and noise in equal measure.
     let timed = !matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
     let started = std::time::Instant::now();
-    let response = next.run(request).await;
+
+    let span = timed.then(|| request_span(&request));
+    let response = match &span {
+        Some(span) => next.run(request).instrument(span.clone()).await,
+        None => next.run(request).await,
+    };
+
+    if let Some(span) = &span {
+        // `i64`, not `u16`: `tracing-opentelemetry` has no `record_u64`, so an
+        // unsigned value falls through to `record_debug` and arrives at the
+        // collector as the *string* "200". The semantic conventions say this
+        // attribute is an integer, and a backend filtering on it would match
+        // nothing.
+        span.record(semconv::HTTP_RESPONSE_STATUS_CODE, i64::from(response.status().as_u16()));
+    }
     if timed {
         state.metrics.record_latency(started.elapsed());
     }
     state.metrics.record_request(response.status().as_u16());
     response
+}
+
+/// The span for one HTTP request, parented to whatever sent the request.
+///
+/// **Named from axum's `MatchedPath`, not the URI.** The matched path is the
+/// route *template* — `/v1/db/{db}/coll/{coll}/docs` — which is low-cardinality
+/// (a trace backend groups by span name, and a name carrying an `_id` produces
+/// one group per document) *and* carries no database or collection name, so the
+/// default span name is private by construction rather than by redaction. The
+/// raw path has the names in it, which is why `url.path` is behind
+/// `telemetry.include_names` (ADR-068).
+fn request_span(request: &axum::extract::Request) -> tracing::Span {
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|m| m.as_str().to_string())
+        // A request that matched no route still gets a span, under a constant
+        // rather than under its URI: the 404 path is exactly where an attacker
+        // chooses the string, and a span name is a dashboard dimension.
+        .unwrap_or_else(|| "unmatched".to_string());
+
+    let span = tracing::info_span!(
+        "http.request",
+        otel.name = %route,
+        otel.kind = "server",
+        { semconv::HTTP_REQUEST_METHOD } = %request.method(),
+        { semconv::HTTP_ROUTE } = %route,
+        { semconv::HTTP_RESPONSE_STATUS_CODE } = tracing::field::Empty,
+        { semconv::CLIENT_ADDRESS } = tracing::field::Empty,
+        { semconv::URL_PATH } = tracing::field::Empty,
+    );
+
+    if let Some(ConnectInfo(peer)) = request.extensions().get::<ConnectInfo<SocketAddr>>() {
+        span.record(semconv::CLIENT_ADDRESS, peer.ip().to_string());
+    }
+    if crate::telemetry::include_names() {
+        span.record(semconv::URL_PATH, request.uri().path());
+    }
+
+    // Continue the caller's trace rather than starting a new one. Without a
+    // propagator installed — which is every build that has not configured a
+    // collector — `extract` returns an empty context, and with no OTel layer in
+    // the subscriber `set_parent` answers `LayerNotFound`. Both are the ordinary
+    // telemetry-off path rather than a failure, which is why the result is
+    // dropped: there is nothing to report and nobody to report it to.
+    let parent = opentelemetry::global::get_text_map_propagator(|propagator| {
+        propagator.extract(&HeaderExtractor(request.headers()))
+    });
+    let _ = span.set_parent(parent);
+    span
+}
+
+/// Read `traceparent` and `tracestate` out of a request's headers.
+///
+/// Hand-written rather than taken from `opentelemetry-http`: that crate exists
+/// to carry an HTTP *client*, and pulling it in would put a second `reqwest`
+/// major version into this crate's tree for two accessor methods.
+struct HeaderExtractor<'a>(&'a axum::http::HeaderMap);
+
+impl opentelemetry::propagation::Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|name| name.as_str()).collect()
+    }
 }
 
 // ---------------------------------------------------------------------------

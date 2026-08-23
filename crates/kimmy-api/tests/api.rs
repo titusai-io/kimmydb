@@ -78,7 +78,19 @@ impl Client {
 
         stream.write_all(request.as_bytes()).await.expect("write");
         let mut raw = Vec::new();
-        stream.read_to_end(&mut raw).await.expect("read");
+        // A reset after the response is end-of-stream, not a failure. The
+        // server answers an over-sized body with 413 and closes *without*
+        // draining the rest of the request, so the bytes still in flight are
+        // answered with an RST — and on macOS that surfaces here as
+        // `ConnectionReset` rather than a clean EOF. A real client reads what
+        // arrived and moves on; reading anything at all is what says the
+        // response was received. An empty read really is a failure, so it is
+        // still one.
+        if let Err(e) = stream.read_to_end(&mut raw).await
+            && (raw.is_empty() || e.kind() != std::io::ErrorKind::ConnectionReset)
+        {
+            panic!("read: {e:?}");
+        }
         let text = String::from_utf8_lossy(&raw).into_owned();
 
         let (head, body_text) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
@@ -3158,6 +3170,94 @@ async fn the_metrics_endpoint_exposes_the_process_counters() {
     assert!(
         !raw.contains("orders"),
         "metrics is unauthenticated and must not name collections:\n{raw}"
+    );
+}
+
+#[tokio::test]
+async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
+    // The route's body is `Metrics::render` with the engine gauges prepended,
+    // and `kimmy_storage_bytes` is a file size — not something a golden text
+    // can hold. So this pins the *shape*: the exact ordered list of series
+    // names, which is what a scrape config, a recording rule and a dashboard
+    // panel each name. A series renamed or dropped is a panel that goes blank
+    // and an alert that stops firing, and neither says anything when it
+    // happens. The values themselves are pinned by the unit-level golden test
+    // in `metrics.rs`.
+    //
+    // **Deployed clusters scrape this endpoint.** If this fails
+    // because you meant to change the output, treat the diff as a release
+    // note (ADR-070).
+    let server = Server::start().await;
+
+    let raw = {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let host = server.base.strip_prefix("http://").unwrap();
+        let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+        let req = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    };
+    let body = raw.split("\r\n\r\n").nth(1).expect("a response body");
+
+    // Sample lines only, with labels and values stripped: what is left is the
+    // series each line belongs to, in the order a scraper reads them.
+    let series: Vec<&str> = body
+        .lines()
+        .filter(|l| !l.starts_with('#') && !l.trim().is_empty())
+        .map(|l| l.split(['{', ' ']).next().unwrap_or_default())
+        .collect();
+
+    assert_eq!(
+        series,
+        [
+            "kimmy_databases",
+            "kimmy_collections",
+            "kimmy_unique_violations",
+            "kimmy_commits",
+            "kimmy_storage_bytes",
+            "kimmy_up",
+            "kimmy_uptime_seconds",
+            "kimmy_requests_total",
+            "kimmy_responses_total",
+            "kimmy_responses_total",
+            "kimmy_responses_total",
+            "kimmy_authz_denied_total",
+            "kimmy_auth_failures_total",
+            "kimmy_rate_limited_total",
+            "kimmy_backups_total",
+            "kimmy_ttl_expired_total",
+            "kimmy_ttl_skipped_total",
+            "kimmy_webhook_deliveries_total",
+            "kimmy_webhook_deliveries_total",
+            "kimmy_webhook_events_total",
+            "kimmy_webhook_subscriptions",
+            "kimmy_webhook_subscriptions",
+            "kimmy_webhook_backlog_seconds",
+            "kimmy_cluster_members",
+            "kimmy_replication_lag_seconds",
+            "kimmy_tls_reloads_total",
+            "kimmy_tls_reloads_total",
+            "kimmy_jwks_refresh_total",
+            "kimmy_jwks_refresh_total",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_bucket",
+            "kimmy_request_duration_seconds_sum",
+            "kimmy_request_duration_seconds_count",
+        ],
+        "the /metrics series set or its order changed:\n{body}"
     );
 }
 

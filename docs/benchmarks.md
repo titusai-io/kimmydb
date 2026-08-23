@@ -520,6 +520,76 @@ that matters, and it is not derivable from a latency figure.
 
 ---
 
+## What tracing costs
+
+Telemetry is off unless `telemetry.endpoint` is set, so the tables above are
+what a node without it does. This one is the same benchmark run twice on the
+same machine, minutes apart: once with no endpoint, once pointed at an
+OpenTelemetry Collector on loopback with `sample_ratio = 1.0` — **every span
+exported, which is the worst case**.
+
+| | |
+|---|---|
+| Machine | Darwin 25.6.0, Apple silicon, 10 cores |
+| Date | 2026-08-23 |
+| Build | `cargo bench` profile — the shipped `kimmyd` binary, spawned as a child process |
+| Fixture | 10,000 documents of six fields |
+| Method | 2 s per cell after 200 discarded warm-up requests |
+| Collector | `docker run --rm -p 4318:4318 otel/opentelemetry-collector:latest`, default config, **on the same machine** |
+
+```bash
+cargo bench -p kimmyd --bench http                                      # off
+KIMMY_OTLP_ENDPOINT=http://127.0.0.1:4318 cargo bench -p kimmyd --bench http
+```
+
+### Reads, plaintext
+
+| Scenario | Clients | Off req/s | On req/s | Change | p99 off → on |
+|---|---:|---:|---:|---:|---|
+| point read by `_id` | 1 | 23,723 | 16,373 | −31% | 0.08 → 0.21 ms |
+| point read by `_id` | 8 | 64,048 | 54,784 | −14% | 0.32 → 0.30 ms |
+| point read by `_id` | 32 | 93,297 | 77,343 | −17% | 1.15 → 1.39 ms |
+| `find`, page of 100 | 1 | 2,505 | 2,367 | −6% | 0.50 → 0.60 ms |
+| `find`, page of 100 | 32 | 13,993 | 12,506 | −11% | 4.63 → 5.87 ms |
+| `count`, whole collection | 32 | 360 | 302 | −16% | 149.60 → 217.90 ms |
+
+### Writes, plaintext
+
+| Scenario | Clients | Off req/s | On req/s | Change |
+|---|---:|---:|---:|---:|
+| insert one | 1 | 90 | 74 | −18% |
+| insert one | 32 | 369 | 328 | −11% |
+| bulk of 100 | 1 | 72 | 64 | −11% |
+| bulk of 100 | 32 | 290 | 334 | +15% |
+
+### What it says
+
+**The cost is real and it is span construction, not export.** Nothing on the
+request path waits for the collector — spans go to a batch processor on its own
+threads — so what these numbers measure is building three to five spans per
+request and handing them to a queue. A point read is ~0.04 ms of work, so
+attaching spans to it is a large *fraction* of a very small number; the same
+absolute cost is 6% of a `find` and invisible against a `count`.
+
+**Read the −31% at one client as the ceiling, not the expectation.** The
+collector shares ten cores with both the server and the load generator, and the
+single-client cell is the one where the server is otherwise idle enough to be
+dominated by that. The write rows move by roughly the run-to-run jitter this
+benchmark already has — the `bulk of 100` row went *up* by 15%, which is not a
+finding about tracing.
+
+**`sample_ratio` is the dial, and 1.0 is not the recommended setting for a node
+serving 90,000 reads a second.** Sampling is parent-based, so lowering it still
+records whole traces rather than fragments of them
+([ADR-069](decisions.md)) — you get fewer traces, not worse ones.
+
+**An unreachable collector costs nothing measurable.** Pointed at a closed port,
+2,000 point reads measured p50 0.153 ms / p99 0.311 ms against 0.159 / 0.315 with
+telemetry off, and the node kept serving throughout. Export failures are logged
+from the exporter's own threads and never reach the request path.
+
+---
+
 ## The baseline
 
 `scripts/bench-baseline.py` records every Criterion median to
