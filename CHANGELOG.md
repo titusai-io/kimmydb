@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.1.0 - 2026-08-23
 
 The first tagged release. Everything below already works and is exercised by
 tests and by driving real nodes — see the status table in
