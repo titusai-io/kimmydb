@@ -17,6 +17,7 @@ pub mod error;
 pub mod oidc;
 pub mod password;
 pub mod rbac;
+pub mod roles;
 pub mod token;
 pub mod users;
 
@@ -29,5 +30,6 @@ pub use oidc::{
     OIDC_LEEWAY_SECS, OidcSettings, OidcVerifier, PROTECTED_RESOURCE_METADATA_PATH, RoleMapping,
 };
 pub use rbac::{Action, Grant, Principal, Role};
+pub use roles::{ROLES_COLLECTION, RoleStore};
 pub use token::{Claims, MIN_SECRET_LEN, TokenIssuer};
 pub use users::{SYSTEM_DB, USERS_COLLECTION, User, UserStore};

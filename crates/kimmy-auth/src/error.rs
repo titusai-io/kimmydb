@@ -24,6 +24,12 @@ pub enum AuthError {
     #[error("user {0:?} already exists")]
     UserExists(String),
 
+    #[error("role {0:?} not found")]
+    RoleNotFound(String),
+
+    #[error("role {0:?} already exists")]
+    RoleExists(String),
+
     #[error("the JWT secret must be at least {min} bytes")]
     WeakSecret { min: usize },
 

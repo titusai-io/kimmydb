@@ -13,6 +13,7 @@ use tracing::{info, warn};
 use crate::error::{AuthError, Result};
 use crate::password;
 use crate::rbac::{Grant, Principal};
+use crate::roles::RoleStore;
 
 /// Reserved database holding server metadata.
 pub const SYSTEM_DB: &str = "__kimmy";
@@ -28,6 +29,14 @@ pub struct User {
     pub password_hash: String,
     #[serde(default)]
     pub grants: Vec<Grant>,
+    /// Named roles this user holds, resolved through the role store.
+    ///
+    /// Additive with `grants`, never a replacement: effective permission is the
+    /// union of the two (ADR-073). `default` is what lets every user record
+    /// written before roles existed decode as holding none, which is why this
+    /// needed no migration.
+    #[serde(default)]
+    pub roles: Vec<String>,
     #[serde(default)]
     pub disabled: bool,
     /// Bumped to invalidate every token this user currently holds.
@@ -40,14 +49,26 @@ pub struct User {
 }
 
 impl User {
-    fn to_principal(&self) -> Principal {
-        Principal::new(self.name.clone(), self.grants.clone()).at_version(self.token_version)
+    /// The principal this user authorizes, given the grants its roles resolve to.
+    ///
+    /// Role grants and direct grants are a **union**, always (ADR-073).
+    /// Kubernetes RBAC is purely additive and Postgres unions privileges across
+    /// role membership; more to the point, a union is the only rule that needs
+    /// no rewrite of an existing user record, since a user holding no roles
+    /// gets exactly what it got before.
+    fn to_principal(&self, role_grants: Vec<Grant>) -> Principal {
+        let mut grants = self.grants.clone();
+        grants.extend(role_grants);
+        Principal::new(self.name.clone(), grants).at_version(self.token_version)
     }
 }
 
 /// Reads and writes users against the storage engine.
 pub struct UserStore {
     collection: CollectionMeta,
+    /// Held so that a user's effective grants can be resolved without every
+    /// call site having to know that roles exist.
+    roles: RoleStore,
 }
 
 impl UserStore {
@@ -56,7 +77,66 @@ impl UserStore {
         let collection = engine
             .create_system_collection(SYSTEM_DB, USERS_COLLECTION)
             .map_err(|e| AuthError::Hashing(format!("opening the user store: {e}")))?;
-        Ok(Self { collection })
+        Ok(Self { collection, roles: RoleStore::open(engine)? })
+    }
+
+    /// The role store this user store resolves names against.
+    pub fn roles(&self) -> &RoleStore {
+        &self.roles
+    }
+
+    /// Everything a user is permitted, direct grants and role grants together.
+    pub fn effective_grants(&self, engine: &Engine, user: &User) -> Result<Vec<Grant>> {
+        let mut grants = user.grants.clone();
+        grants.extend(self.roles.grants_for(engine, &user.roles)?);
+        Ok(grants)
+    }
+
+    /// Replace the roles a user holds, taking effect immediately.
+    ///
+    /// Bumps `token_version` for the same reason [`Self::set_grants`] does: the
+    /// grants a role resolves to are embedded in the token at login, so without
+    /// the bump a *narrowing* edit would do nothing until the token expired.
+    pub fn set_roles(&self, engine: &Engine, name: &str, roles: Vec<String>) -> Result<()> {
+        let mut user =
+            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
+        user.roles = roles;
+        user.token_version = user.token_version.wrapping_add(1);
+        self.put(engine, &user)
+    }
+
+    /// Invalidate every token held by a user carrying `role`, returning how many.
+    ///
+    /// **This is what keeps a role edit honest, and it is the easiest thing in
+    /// the feature to leave out.** A local user's grants are resolved at login
+    /// and embedded in its token, so narrowing a role changes nothing for
+    /// anyone already holding one until it expires — silently contradicting the
+    /// promise [`Self::set_grants`] has made since ADR-052.
+    ///
+    /// A scan, because users are documents in a collection and there is no
+    /// index from role to holder. That is the honest cost of the storage shape;
+    /// a role edit is an administrative action, not a request-path one.
+    ///
+    /// Federated principals need nothing here and get nothing: they have no
+    /// user record and no token version (ADR-065), and their grants are
+    /// resolved from the mapping on every request, so a role edit already
+    /// applies to them immediately.
+    pub fn invalidate_holders_of_role(&self, engine: &Engine, role: &str) -> Result<u64> {
+        let mut holders = Vec::new();
+        for name in self.list(engine)? {
+            if let Some(user) = self.get(engine, &name)?
+                && user.roles.iter().any(|held| held == role)
+            {
+                holders.push(user);
+            }
+        }
+
+        let count = holders.len() as u64;
+        for mut user in holders {
+            user.token_version = user.token_version.wrapping_add(1);
+            self.put(engine, &user)?;
+        }
+        Ok(count)
     }
 
     /// Create the bootstrap superuser if the store is empty.
@@ -91,6 +171,7 @@ impl UserStore {
             name: name.to_string(),
             password_hash: password::hash(password)?,
             grants,
+            roles: Vec::new(),
             disabled: false,
             token_version: 0,
         };
@@ -190,7 +271,8 @@ impl UserStore {
             return Err(AuthError::InvalidCredentials);
         }
 
-        Ok(user.to_principal())
+        let role_grants = self.roles.grants_for(engine, &user.roles)?;
+        Ok(user.to_principal(role_grants))
     }
 }
 
@@ -338,5 +420,114 @@ mod tests {
         // The `__` prefix is reserved so nothing can shadow the user store.
         let (engine, _store, _dir) = setup();
         assert!(engine.create_collection(SYSTEM_DB, USERS_COLLECTION).is_err());
+    }
+
+    // Roles (ADR-073)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn role_grants_and_direct_grants_are_a_union() {
+        let (engine, store, _dir) = setup();
+        store
+            .roles()
+            .create(&engine, "reader", vec![Grant::new("sales", "*", vec![Action::Read])])
+            .unwrap();
+        store
+            .create(&engine, "ada", "hunter2", vec![Grant::new("hr", "*", vec![Action::Write])])
+            .unwrap();
+        store.set_roles(&engine, "ada", vec!["reader".into()]).unwrap();
+
+        let principal = store.authenticate(&engine, "ada", "hunter2").unwrap();
+
+        assert!(
+            principal.can(Action::Read, "sales", Some("orders")),
+            "the role's grant is missing"
+        );
+        assert!(principal.can(Action::Write, "hr", Some("people")), "the direct grant was lost");
+    }
+
+    #[test]
+    fn a_user_holding_no_roles_is_unchanged() {
+        // The whole reason this needed no migration: `roles` defaults to empty
+        // and an empty role list contributes nothing.
+        let (engine, store, _dir) = setup();
+        store
+            .create(&engine, "ada", "hunter2", vec![Grant::new("hr", "*", vec![Action::Write])])
+            .unwrap();
+
+        let principal = store.authenticate(&engine, "ada", "hunter2").unwrap();
+
+        assert_eq!(principal.grants, vec![Grant::new("hr", "*", vec![Action::Write])]);
+    }
+
+    #[test]
+    fn narrowing_a_role_invalidates_the_tokens_of_everyone_holding_it() {
+        // The one that matters. Grants are embedded in a token at login, so
+        // without the bump a narrowed role would keep working until the token
+        // expired — which is exactly the promise ADR-052 makes for set_grants.
+        let (engine, store, _dir) = setup();
+        store
+            .roles()
+            .create(
+                &engine,
+                "wide",
+                vec![Grant::new("sales", "*", vec![Action::Read, Action::Write])],
+            )
+            .unwrap();
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.create(&engine, "grace", "hunter2", Vec::new()).unwrap();
+        store.set_roles(&engine, "ada", vec!["wide".into()]).unwrap();
+
+        let issued_at = store.authenticate(&engine, "ada", "hunter2").unwrap().token_version;
+        let bystander = store.authenticate(&engine, "grace", "hunter2").unwrap().token_version;
+
+        store
+            .roles()
+            .set_grants(&engine, "wide", vec![Grant::new("sales", "*", vec![Action::Read])])
+            .unwrap();
+        let invalidated = store.invalidate_holders_of_role(&engine, "wide").unwrap();
+
+        assert_eq!(invalidated, 1, "only the holder should be invalidated");
+        let after = store.authenticate(&engine, "ada", "hunter2").unwrap();
+        assert_ne!(after.token_version, issued_at, "the holder's outstanding tokens still verify");
+        assert!(!after.can(Action::Write, "sales", Some("orders")), "the narrowing did not apply");
+        assert_eq!(
+            store.authenticate(&engine, "grace", "hunter2").unwrap().token_version,
+            bystander,
+            "a user who does not hold the role was logged out for nothing"
+        );
+    }
+
+    #[test]
+    fn a_deleted_role_grants_nothing_and_is_not_an_error() {
+        // A dangling name is the safe direction to fail in, and it is why a
+        // delete does not have to rewrite every user record that names it.
+        let (engine, store, _dir) = setup();
+        store.roles().create(&engine, "temp", vec![Grant::superuser()]).unwrap();
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+        store.set_roles(&engine, "ada", vec!["temp".into()]).unwrap();
+
+        assert!(store.roles().delete(&engine, "temp").unwrap());
+
+        let principal = store.authenticate(&engine, "ada", "hunter2").unwrap();
+        assert!(principal.grants.is_empty(), "a deleted role still granted something");
+    }
+
+    #[test]
+    fn assigning_a_role_invalidates_the_users_own_tokens() {
+        // Widening needs the bump as much as narrowing does, so that the new
+        // grants are actually reachable without waiting for expiry.
+        let (engine, store, _dir) = setup();
+        store
+            .roles()
+            .create(&engine, "reader", vec![Grant::new("sales", "*", vec![Action::Read])])
+            .unwrap();
+        store.create(&engine, "ada", "hunter2", Vec::new()).unwrap();
+
+        let before = store.authenticate(&engine, "ada", "hunter2").unwrap().token_version;
+        store.set_roles(&engine, "ada", vec!["reader".into()]).unwrap();
+        let after = store.authenticate(&engine, "ada", "hunter2").unwrap().token_version;
+
+        assert_ne!(before, after);
     }
 }
