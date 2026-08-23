@@ -267,6 +267,20 @@ pub struct OidcConfig {
     /// unknown key id triggers one rate-limited refetch — so this interval is
     /// about staying current, not about how fast a rotation is survived.
     pub refresh_interval_secs: u64,
+    /// Require `typ: at+jwt` on a federated token (RFC 9068 §4).
+    ///
+    /// **Off by default, deliberately.** The header exists so an access token
+    /// cannot be mistaken for an ID token, but providers disagree about
+    /// stamping it — Entra ID sends `typ: JWT` on v2 access tokens — so a
+    /// strict default would refuse every token from a provider this
+    /// federation is meant to support.
+    ///
+    /// Turn it on when your provider is known to emit it. If the audience is
+    /// an https URL then ADR-071 has already closed the confusion this
+    /// guards against, because an ID token's audience is a client id and can
+    /// never be this node's resource identifier; the setting is then defence
+    /// in depth. With an opaque audience it is the real check.
+    pub require_at_jwt: bool,
 }
 
 impl Default for OidcConfig {
@@ -280,6 +294,10 @@ impl Default for OidcConfig {
             // Five minutes: far inside the hours a provider leaves a retiring
             // key published, and rare enough to be invisible as load.
             refresh_interval_secs: 300,
+            // Off, so that a provider which does not stamp the header keeps
+            // working. See the field's own documentation for why that is the
+            // safe default rather than the lax one.
+            require_at_jwt: false,
         }
     }
 }
@@ -302,6 +320,7 @@ impl OidcConfig {
             audience: self.audience.clone()?,
             roles_claim: self.roles_claim.clone(),
             role_mappings: self.role_mappings.clone(),
+            require_at_jwt: self.require_at_jwt,
         })
     }
 

@@ -800,15 +800,96 @@ mod oidc {
         if !response.status().is_success() {
             bail!("the provider answered {} for {url}", response.status());
         }
-        response.json().await.with_context(|| format!("parsing the discovery document at {url}"))
+        let document: Value = response
+            .json()
+            .await
+            .with_context(|| format!("parsing the discovery document at {url}"))?;
+        check_issuer(&document, issuer)?;
+        Ok(document)
     }
 
-    fn endpoint(document: &Value, name: &str) -> Result<String> {
-        document
+    /// Refuse a discovery document that does not name the issuer it was
+    /// fetched for.
+    ///
+    /// OpenID Connect Discovery §4.3 and RFC 8414 §3.3 make this a MUST, and
+    /// on this side it protects something specific: the endpoints in this
+    /// document are where the CLI sends a **client secret** and where it polls
+    /// for an **access token**. A document that is not bound to the issuer the
+    /// user named is a document that can nominate somewhere else to send both.
+    /// The node performs the same check independently before trusting a
+    /// `jwks_uri`; neither substitutes for the other, because they read the
+    /// document for different reasons.
+    pub(super) fn check_issuer(document: &Value, issuer: &str) -> Result<()> {
+        let named = document
+            .get("issuer")
+            .and_then(Value::as_str)
+            .context("the provider's discovery document names no issuer")?;
+        if named != issuer {
+            bail!(
+                "the discovery document says its issuer is {named:?}, not {issuer:?}. A \
+                 provider's metadata must name the issuer it was fetched for (OpenID Connect \
+                 Discovery §4.3, RFC 8414 §3.3). Check --issuer, or KIMMY_OIDC_ISSUER, against \
+                 what your provider publishes."
+            );
+        }
+        Ok(())
+    }
+
+    /// An endpoint named by the discovery document, required to be https.
+    ///
+    /// Every caller of this sends either client credentials or a device code
+    /// to the URL it returns, and receives an access token back. RFC 8414 §2
+    /// requires these to be https for exactly that reason, and the node
+    /// refuses a non-https issuer outright (`OidcConfig::validate`), so a
+    /// plaintext endpoint here could only ever come from a document that had
+    /// been tampered with or a provider that is misconfigured.
+    pub(super) fn endpoint(document: &Value, name: &str) -> Result<String> {
+        let url = document
             .get(name)
             .and_then(Value::as_str)
-            .map(str::to_string)
-            .with_context(|| format!("the provider's discovery document names no {name}"))
+            .with_context(|| format!("the provider's discovery document names no {name}"))?;
+        if !is_secure_url(url) {
+            bail!(
+                "the provider's discovery document gives a {name} of {url:?}, which is not \
+                 https. Credentials and access tokens travel over it, so it is not usable. \
+                 Only a loopback address is exempt."
+            );
+        }
+        Ok(url.to_string())
+    }
+
+    /// Whether a URL is one credentials may safely travel over.
+    ///
+    /// https, or plain http to **loopback** — the exemption RFC 8252 §7.3
+    /// makes for native applications, on the ground that there is no network
+    /// path to be on between a process and itself. It is what lets someone
+    /// develop against a provider running on their own machine, and a check
+    /// that made that impossible would be a check somebody eventually deletes.
+    ///
+    /// The host is parsed, not prefix-matched: `http://127.0.0.1.example.com`
+    /// merely begins with a loopback address, and in
+    /// `http://127.0.0.1@example.com` the loopback part is userinfo and the
+    /// host is what follows the `@`.
+    ///
+    /// The node applies the same rule to the `jwks_uri` it fetches. Kept
+    /// separate rather than shared for the reason given on
+    /// `PROTECTED_RESOURCE_METADATA_PATH`: this binary links no kimmy crate
+    /// that could carry it.
+    pub(super) fn is_secure_url(url: &str) -> bool {
+        if url.starts_with("https://") {
+            return true;
+        }
+        let Some(rest) = url.strip_prefix("http://") else { return false };
+        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+        let authority = authority.rsplit('@').next().unwrap_or("");
+        let host = match authority.strip_prefix('[') {
+            Some(bracketed) => bracketed.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        };
+        match host.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.is_loopback(),
+            Err(_) => host.eq_ignore_ascii_case("localhost"),
+        }
     }
 
     /// The OAuth2 error code in a failed token response, if there is one.
@@ -1085,6 +1166,71 @@ mod tests {
         // RFC 8707 already implements.
         let form = oidc::with_resource(vec![("client_id", "kimmy-cli")], None);
         assert!(form.iter().all(|(key, _)| *key != "resource"), "{form:?}");
+    }
+
+    #[test]
+    fn a_discovery_document_must_name_the_issuer_it_was_fetched_for() {
+        // OpenID Connect Discovery §4.3 / RFC 8414 §3.3. On this side the
+        // stake is where a client secret gets sent and where an access token
+        // is collected from: a document not bound to the issuer the user named
+        // can nominate somewhere else for both.
+        let good = json!({ "issuer": "https://auth.example.com" });
+        assert!(oidc::check_issuer(&good, "https://auth.example.com").is_ok());
+
+        for named in ["https://auth.example.com/", "https://evil.example.com"] {
+            let err = oidc::check_issuer(&json!({ "issuer": named }), "https://auth.example.com")
+                .expect_err(&format!("{named:?} is not the issuer"))
+                .to_string();
+            assert!(err.contains(named), "the error must name what it found: {err}");
+        }
+
+        let err = oidc::check_issuer(&json!({}), "https://auth.example.com").unwrap_err();
+        assert!(err.to_string().contains("no issuer"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_plaintext_endpoint_is_refused_unless_it_is_loopback() {
+        // The CLI POSTs a client secret to the token endpoint. Over plaintext
+        // that is the secret handed to anyone on the path.
+        let document = |url: &str| json!({ "token_endpoint": url });
+
+        assert_eq!(
+            oidc::endpoint(&document("https://auth.example.com/token"), "token_endpoint").unwrap(),
+            "https://auth.example.com/token"
+        );
+
+        let err = oidc::endpoint(&document("http://auth.example.com/token"), "token_endpoint")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not https"), "unhelpful error: {err}");
+
+        // A provider running on the developer's own machine stays usable.
+        assert!(oidc::endpoint(&document("http://localhost:8080/token"), "token_endpoint").is_ok());
+    }
+
+    #[test]
+    fn only_a_real_loopback_host_is_exempt_from_https() {
+        // Prefix-matching the host would wave through a subdomain that merely
+        // begins with a loopback address, and userinfo hiding the real host
+        // after an `@`.
+        for url in [
+            "http://127.0.0.1.attacker.example/token",
+            "http://127.0.0.1@attacker.example/token",
+            "http://auth.internal/token",
+            "ftp://127.0.0.1/token",
+        ] {
+            assert!(!oidc::is_secure_url(url), "{url} must not count as secure");
+        }
+        for url in [
+            "https://auth.example.com/token",
+            "http://127.0.0.1/token",
+            "http://127.0.0.53:8080/token",
+            "http://localhost:9000/token",
+            "http://LOCALHOST/token",
+            "http://[::1]:8080/token",
+        ] {
+            assert!(oidc::is_secure_url(url), "{url} must count as secure");
+        }
     }
 
     #[tokio::test]

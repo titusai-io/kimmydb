@@ -3300,6 +3300,86 @@ building it from the shared constant, because the documentation contract in
 route that silently escapes it. A test holds the literal and the constant
 together.
 
+## ADR-072 — The verifier binds the metadata to the issuer, and `typ` is opt-in
+
+**Decision.** Three hardening changes to the federated path, and one of them
+deliberately ships turned off.
+
+1. **`nbf` is validated.** A federated token whose "not before" is in the
+   future is refused, under the same 60-second leeway `exp` already gets.
+2. **A discovery document must name the issuer it was fetched for**, and the
+   `jwks_uri` it names must be `https` — checked at *both* places that read a
+   discovery document, the node's JWKS refresher and the CLI's login flows.
+   Plain `http` to a loopback address is exempt.
+3. **`typ: at+jwt` is checked only when `auth.oidc.require_at_jwt` is set**,
+   which defaults to `false`.
+
+**Alternatives.** Validating `nbf` without leeway. Requiring `at+jwt` by
+default, as RFC 9068 §4 reads on its face. Checking the discovery issuer only
+on the server, on the grounds that only the server picks signing keys.
+Requiring `https` with no loopback exemption.
+
+**Why.**
+
+*`nbf`.* jsonwebtoken 11 defaults `validate_nbf` to `false`, so setting
+`validate_exp` — which reads like "check the times" — left the front edge
+unchecked, and a token stamped as valid from next week was accepted today. RFC
+7519 §4.1.5 makes rejecting it a MUST. The claim stays optional, because it is
+optional in the RFC and most providers omit it; making it required would have
+refused ordinary tokens. The leeway is shared with `exp` for the reason
+ADR-064 gives for having any leeway at all: the provider's clock is somebody
+else's, and a fleet whose NTP drifts by seconds must not read as an outage.
+
+*Binding the metadata.* OpenID Connect Discovery §4.3 and RFC 8414 §3.3 both
+require the check, and it is the step that ties a document to the identity the
+operator meant. Without it, anything that can answer for the well-known path —
+a followed redirect, a stale cache, a hijacked record — chooses the `jwks_uri`,
+and therefore the signing keys every federated token is verified against. The
+per-token `iss` match does not cover this: an attacker who supplies the key set
+satisfies that check too, because they are minting the tokens.
+
+**Both call sites, not just the server.** The CLI reads a discovery document
+for different reasons than the node does — it learns where to POST a **client
+secret** and where to collect an **access token** — and a substituted document
+nominates somewhere else for both. Neither check substitutes for the other. The
+rule is implemented twice rather than shared, because `kimmy-cli` deliberately
+links no kimmy crate that could carry it, for the reason recorded on
+`PROTECTED_RESOURCE_METADATA_PATH`.
+
+**Loopback is exempt from the `https` requirement.** The same exemption
+RFC 8252 §7.3 makes for native applications and browsers make for secure
+contexts, resting on the same fact: there is no network path to be on between a
+process and itself. Without it a locally-run provider would be undevelopable
+against and a stub untestable — which is a reliable way to have a security check
+deleted later by somebody who only ever sees it in the way. The host is parsed
+rather than prefix-matched, so `http://127.0.0.1.attacker.example` and
+`http://127.0.0.1@attacker.example` are both refused.
+
+*`typ` is opt-in, and this is the uncomfortable one.* RFC 9068 §4 requires an
+access token to carry `typ: at+jwt`, and the check exists so an **ID token**
+from the same issuer cannot be presented as an access token. It cannot default
+to strict: **Entra ID stamps `typ: JWT` on its v2 access tokens**, and Entra is
+a named target provider throughout this design, so a strict default would
+refuse every token from a canonical deployment. This is the same shape as
+ADR-071's narrowing — a specification applied literally would break a provider
+the feature exists to support.
+
+Shipping it off is defensible because **ADR-071 already closed the confusion it
+guards against** for anyone who took that route: an ID token's `aud` is the
+client id, which cannot also be the node's `https://…` resource identifier, so
+an audience written as a URL refuses an ID token on the audience alone. The
+switch is therefore defence in depth for those operators and the real check for
+anyone whose provider mints an opaque audience.
+
+**Cost.** `require_at_jwt` is a setting whose correct value depends on the
+provider, which is a question an operator should not have to hold — the
+alternative was refusing Entra outright, and the field documents which case is
+which. The discovery binding turns a class of provider misconfiguration
+(metadata naming an issuer that differs by a trailing slash) from silent into a
+startup-visible failure; that is the intent, but it will be met as a break by
+anyone who was relying on the mismatch. Both refusals name what was found and
+what was expected, because a byte-level difference is otherwise invisible.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

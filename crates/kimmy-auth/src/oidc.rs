@@ -86,6 +86,22 @@ pub struct OidcSettings {
     pub roles_claim: String,
     /// Claim values, and the grants they carry.
     pub role_mappings: Vec<RoleMapping>,
+    /// Refuse a token whose `typ` header is not `at+jwt` (RFC 9068 §4).
+    ///
+    /// **Off by default, and that is not an oversight.** RFC 9068 defines the
+    /// header so an access token cannot be mistaken for an ID token, but not
+    /// every provider stamps it: Entra ID emits `typ: JWT` on its v2 access
+    /// tokens, and Entra is one of the providers this federation exists to
+    /// work with. Defaulting to strict would refuse every token from it.
+    ///
+    /// It is also no longer the primary defence against the confusion it
+    /// names. Since ADR-071 the audience is the resource identifier, and an ID
+    /// token's `aud` is the *client id* — a value that cannot also be this
+    /// node's `https://…` identifier. So an operator who has set a URL
+    /// audience is already protected, and this switch is defence in depth for
+    /// them and the real check for anyone whose provider mints an opaque
+    /// audience.
+    pub require_at_jwt: bool,
 }
 
 impl OidcSettings {
@@ -213,12 +229,16 @@ impl OidcVerifier {
 
     /// Verify a token and recover the principal it authorizes.
     ///
-    /// Signature, issuer, audience and expiry. No storage is consulted and none
-    /// exists to consult: a federated subject has no local user record, which
-    /// is also why token-version revocation does not apply to it (ADR-065).
+    /// Signature, issuer, audience, expiry and not-before. No storage is
+    /// consulted and none exists to consult: a federated subject has no local
+    /// user record, which is also why token-version revocation does not apply
+    /// to it (ADR-065).
     pub fn verify(&self, token: &str) -> Result<Principal> {
         let header = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
         if !OIDC_ALGORITHMS.contains(&header.alg) {
+            return Err(AuthError::InvalidToken);
+        }
+        if self.settings.require_at_jwt && !is_access_token_type(header.typ.as_deref()) {
             return Err(AuthError::InvalidToken);
         }
 
@@ -234,6 +254,16 @@ impl OidcVerifier {
         // is the whole reason the audience is configured.
         validation.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         validation.validate_exp = true;
+        // Not defaulted on, unlike expiry: jsonwebtoken leaves `validate_nbf`
+        // false, so without this line a token stamped as not valid until next
+        // week is accepted today. RFC 7519 §4.1.5 says a token MUST NOT be
+        // accepted before its `nbf`. Unlike `exp` this is not a required claim
+        // — a token without one is unconstrained at the front and stays valid,
+        // which is the correct reading and what every other consumer does.
+        validation.validate_nbf = true;
+        // Covers `nbf` as well as `exp`, and for the same reason: the provider
+        // stamping a token a few seconds into the future is somebody else's
+        // clock, not a forgery.
         validation.leeway = OIDC_LEEWAY_SECS;
 
         let claims = decode::<Value>(token, &key, &validation)
@@ -294,6 +324,25 @@ impl OidcVerifier {
 pub fn claimed_issuer(token: &str) -> Option<String> {
     let data = jsonwebtoken::dangerous::insecure_decode::<Value>(token).ok()?;
     data.claims.get("iss")?.as_str().map(str::to_string)
+}
+
+/// Whether a `typ` header names an OAuth 2.0 access token (RFC 9068 §4).
+///
+/// Both spellings are accepted. RFC 9068 writes the value as `at+jwt`, and
+/// RFC 7519 §5.1 says the `application/` prefix "MAY be omitted" and that a
+/// recipient encountering it should strip it — so `application/at+jwt` is the
+/// same media type and refusing it would be refusing the long form of the
+/// value being asked for. The comparison is case-insensitive because media
+/// types are (RFC 2045 §5.1).
+///
+/// An absent `typ` is **not** an access token here. RFC 9068 §4 makes the
+/// header a MUST, so when an operator has asked for the check the missing case
+/// is the one it exists to catch.
+fn is_access_token_type(typ: Option<&str>) -> bool {
+    typ.is_some_and(|typ| {
+        let typ = typ.trim();
+        typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
+    })
 }
 
 /// The role values a token carries, from the configured claim.
@@ -412,6 +461,10 @@ mod tests {
                 claim_value: "kimmydb-analyst".into(),
                 grants: vec![Grant::new("sales", "orders*", vec![Action::Read, Action::Search])],
             }],
+            // The shipped default. Every test above this line therefore
+            // exercises the configuration an operator gets without asking for
+            // anything, which is the one that has to keep working.
+            require_at_jwt: false,
         }
     }
 
@@ -549,6 +602,88 @@ mod tests {
 
         assert!(verifier(Algorithm::RS256).verify(&token).is_ok());
         assert_eq!(OIDC_LEEWAY_SECS, 60, "the local HS256 path allows none; this one allows this");
+    }
+
+    #[test]
+    fn a_token_that_is_not_valid_yet_is_refused() {
+        // jsonwebtoken leaves `validate_nbf` off, so this passed before the
+        // verifier turned it on: a provider stamping a token as usable next
+        // week would have had it accepted today. RFC 7519 §4.1.5.
+        let mut early = claims(json!(["kimmydb-analyst"]));
+        early["nbf"] = json!(now() + 600);
+        let token = sign(Algorithm::RS256, Some(KID), early);
+
+        assert!(matches!(verifier(Algorithm::RS256).verify(&token), Err(AuthError::InvalidToken)));
+    }
+
+    #[test]
+    fn a_not_before_inside_the_leeway_is_still_accepted() {
+        // The same allowance `exp` gets, and for the same reason: a token
+        // minted a few seconds ahead of this node's clock is somebody else's
+        // NTP, not a forgery. Without this a provider running marginally fast
+        // would have every fresh token refused.
+        let mut soon = claims(json!(["kimmydb-analyst"]));
+        soon["nbf"] = json!(now() + 5);
+        let token = sign(Algorithm::RS256, Some(KID), soon);
+
+        assert!(verifier(Algorithm::RS256).verify(&token).is_ok());
+    }
+
+    #[test]
+    fn a_token_with_no_not_before_is_unaffected() {
+        // `nbf` is optional (RFC 7519 §4.1.5) and every claims() token omits
+        // it. Validating it must not have made it required — that would refuse
+        // most providers' tokens outright.
+        let token = sign(Algorithm::RS256, Some(KID), claims(json!(["kimmydb-analyst"])));
+        assert!(claims(json!([])).get("nbf").is_none(), "the fixture must have no nbf");
+
+        assert!(verifier(Algorithm::RS256).verify(&token).is_ok());
+    }
+
+    /// Sign with an explicit `typ` header, which `sign` leaves at
+    /// jsonwebtoken's default of `JWT`.
+    fn sign_with_typ(typ: Option<&str>, claims: Value) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(KID.to_string());
+        header.typ = typ.map(str::to_string);
+        jsonwebtoken::encode(&header, &claims, &signing_key(Algorithm::RS256)).expect("signed")
+    }
+
+    fn strict_verifier() -> OidcVerifier {
+        OidcVerifier::new(OidcSettings { require_at_jwt: true, ..settings() })
+            .unwrap()
+            .with_keys(jwks(Algorithm::RS256, KID))
+    }
+
+    #[test]
+    fn the_token_type_is_only_checked_when_it_is_asked_for() {
+        // The default has to accept `typ: JWT`, because that is what Entra ID
+        // stamps on a v2 access token and Entra is a provider this federation
+        // exists to work with. Turning the check on is what refuses it.
+        let lax = verifier(Algorithm::RS256);
+        let strict = strict_verifier();
+
+        for typ in [Some("JWT"), None, Some("id_token+jwt")] {
+            let token = sign_with_typ(typ, claims(json!(["kimmydb-analyst"])));
+            assert!(lax.verify(&token).is_ok(), "default must accept typ {typ:?}");
+            assert!(
+                matches!(strict.verify(&token), Err(AuthError::InvalidToken)),
+                "require_at_jwt must refuse typ {typ:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_spellings_of_the_access_token_type_are_accepted() {
+        // RFC 9068 §4 writes it `at+jwt`; RFC 7519 §5.1 says the
+        // `application/` prefix may be omitted, so the long form is the same
+        // media type. Media types are case-insensitive (RFC 2045 §5.1).
+        let strict = strict_verifier();
+
+        for typ in ["at+jwt", "AT+JWT", "application/at+jwt", "application/AT+JWT"] {
+            let token = sign_with_typ(Some(typ), claims(json!(["kimmydb-analyst"])));
+            assert!(strict.verify(&token).is_ok(), "typ {typ:?} names an access token");
+        }
     }
 
     #[test]
