@@ -6,6 +6,37 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **v0.3.0: the OAuth 2.0 round, and the first release validated against a real provider**
+
+Release prep only — no behaviour changed on this branch. Workspace version
+`0.2.0` → `0.3.0`, and `## Unreleased` retitled to `## 0.3.0`, which is the
+step that has twice nearly shipped empty release notes. Verified rather than
+eyeballed: `dist plan --tag=v0.3.0 --output-format=json` reports a 7201-character
+`announcement_changelog`, `dist generate --check` is clean, and both binaries
+report `0.3.0` with the commit.
+
+A `0.MINOR` under ADR-062 because the round carries a user-visible behaviour
+change: `kimmy login --client-credentials` no longer requests `openid profile`.
+
+**What it ships:** WS5a resource identity (ADR-071), WS5b verifier hardening
+(ADR-072), WS5c the CLI as an OAuth client (ADR-075), WS5e the stated
+boundaries (ADR-076), plus two defects found by actually running the thing —
+`check-config` printing the signing key, and `/mcp` sitting outside the layer
+that counts and challenges.
+
+**This is the first release whose federation was validated end to end against a
+live provider** rather than a stub JWKS. What that run established, beyond the
+happy path: a token's `aud` is the resource identifier and not the issuer; a
+node configured with a *different* audience refuses the same valid token; the
+provider stamps `typ: at+jwt`, so `require_at_jwt = true` is safe here; a local
+HS256 token still works on the same node as a federated one; `/v1/auth/refresh`
+refuses a federated principal while a local one still refreshes; and — the one
+worth keeping — **an identity the provider asserts is `admin` gets no admin
+here**, because nothing maps it. ADR-067's break-glass boundary was tested
+against a provider actively claiming superuser, not merely reasoned about.
+
+---
+
 ## As of 2026-08-23 — **`/mcp` was outside the instrumentation layer**
 
 Found during the WS1 end-to-end validation, by sending an unauthenticated
