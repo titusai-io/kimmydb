@@ -52,8 +52,9 @@ use serde_json::{Value, json};
         export KIMMY_TOKEN=$(kimmy login --client-credentials) # for a service, secret from env\n\n\
     There is deliberately no --password flag and no --client-secret flag: either\n\
     would land in shell history and in `ps` output for every user on the machine.\n\
-    No token is written to disk either -- an environment variable answers for its\n\
-    permissions, its lifetime and its cleanup by not existing afterwards."
+    No token is written to disk unless you pass --cache-token, and a refresh token\n\
+    is never requested or stored at all -- an environment variable answers for a\n\
+    token's permissions, its lifetime and its cleanup by not existing afterwards."
 )]
 struct Cli {
     /// Base URL of the node.
@@ -78,7 +79,7 @@ enum Command {
     ///
     /// Three ways in, and the token comes out the same on all three: bare, on
     /// stdout, so `$(kimmy login ...)` is directly usable. Nothing is written
-    /// to disk.
+    /// to disk unless `--cache-token` asks for it.
     Login {
         /// Local user name. Omit it when using --oidc or --client-credentials.
         user: Option<String>,
@@ -121,8 +122,35 @@ enum Command {
 
         /// Scopes to request. The node reads roles from the token, so the
         /// provider has to be configured to put them there.
-        #[arg(long, env = "KIMMY_OIDC_SCOPE", default_value = "openid profile")]
-        scope: String,
+        ///
+        /// Left unset the two flows differ, because they have to: the device
+        /// flow asks for `openid profile`, and client credentials asks for
+        /// nothing at all. There is no end user behind a service account, so
+        /// `openid` there requests an ID token that cannot exist — some
+        /// providers ignore it and some refuse the request outright.
+        #[arg(long, env = "KIMMY_OIDC_SCOPE")]
+        scope: Option<String>,
+
+        /// Reuse a cached token instead of authenticating again.
+        ///
+        /// Off unless asked for. When on, the access token is kept in a
+        /// `0600` file under `$XDG_CACHE_HOME/kimmy` (or `~/.cache/kimmy`),
+        /// keyed by issuer, client and resource, and reused until it is within
+        /// a minute of expiring. A refresh token is never requested and never
+        /// stored.
+        ///
+        /// As an environment variable this takes any of the usual spellings —
+        /// `1`, `true`, `yes`, `on` — rather than only `true`. Nothing else
+        /// enables it: an unrecognised value is an error, never a quiet yes,
+        /// because the setting decides whether a bearer token is written to
+        /// disk.
+        #[arg(
+            long,
+            env = "KIMMY_TOKEN_CACHE",
+            action = clap::ArgAction::SetTrue,
+            value_parser = clap::builder::BoolishValueParser::new(),
+        )]
+        cache_token: bool,
     },
     /// Health and readiness of the node.
     Ping,
@@ -294,15 +322,25 @@ async fn run() -> Result<()> {
 
     // Login is the one command that runs without a token, because producing
     // one is what it is for.
-    if let Command::Login { user, oidc, client_credentials, issuer, client_id, scope, resource } =
-        &cli.command
+    if let Command::Login {
+        user,
+        oidc,
+        client_credentials,
+        issuer,
+        client_id,
+        scope,
+        resource,
+        cache_token,
+    } = &cli.command
     {
         // The token alone, with no decoration, so `$(kimmy login ...)` is
-        // usable directly. Deliberately not written to a file: a CLI that
-        // stores a bearer token on disk has to answer for its permissions, its
+        // usable directly. **Nothing is written to disk unless --cache-token
+        // asks for it**, and even then only the access token: a CLI that
+        // stores a bearer token has to answer for its permissions, its
         // lifetime and its cleanup, and an environment variable answers all
-        // three by not existing afterwards. The same goes for the refresh
-        // token the flows below deliberately never ask for and never keep.
+        // three by not existing afterwards. A refresh token is never requested
+        // and never kept, cache or no cache — it is the credential that
+        // outlives the session, and the one worth stealing.
         let token = if *oidc || *client_credentials {
             // Ask the node itself where to authenticate and what to ask the
             // token to be for, so the usual invocation is `kimmy login --oidc`
@@ -313,11 +351,33 @@ async fn run() -> Result<()> {
             let issuer = issuer.as_deref();
             let resource = resource.as_deref();
             let client_id = client_id.as_deref();
-            if *oidc {
+            // Scopes differ per flow when unset, because a service account has
+            // no end user to describe. Explicit `--scope` overrides both.
+            let scope = scope.as_deref().unwrap_or(if *oidc {
+                oidc::DEVICE_SCOPE
+            } else {
+                oidc::CLIENT_CREDENTIALS_SCOPE
+            });
+
+            let cache_key = cache::Key::new(issuer, client_id, resource);
+            if let Some(cached) = cache_key.as_ref().filter(|_| *cache_token).and_then(cache::get) {
+                println!("{cached}");
+                return Ok(());
+            }
+
+            let (token, expires_in) = if *oidc {
                 oidc::device_login(issuer, client_id, scope, resource).await?
             } else {
                 oidc::client_credentials_login(issuer, client_id, scope, resource).await?
+            };
+            if *cache_token && let Some(key) = cache_key {
+                // A cache that cannot be written is a slower login, not a
+                // failed one, so this reports and carries on.
+                if let Err(e) = cache::put(&key, &token, expires_in) {
+                    eprintln!("warning: could not cache the token: {e:#}");
+                }
             }
+            token
         } else {
             let user = user.as_deref().context(
                 "name the user to log in as, or pass --oidc / --client-credentials to log in \
@@ -695,6 +755,24 @@ mod oidc {
     /// The interval to poll at when the provider does not name one (RFC 8628 §3.5).
     const DEFAULT_POLL_SECS: u64 = 5;
 
+    /// Scopes the device flow asks for when nothing was specified.
+    ///
+    /// There is a person behind this flow, so `openid` is meaningful: it is
+    /// what makes the exchange an OpenID Connect one rather than bare OAuth 2.
+    pub(super) const DEVICE_SCOPE: &str = "openid profile";
+
+    /// Scopes the client-credentials flow asks for when nothing was specified:
+    /// **none**.
+    ///
+    /// `openid` requests an ID token, and an ID token describes an end user
+    /// authenticating. There is no end user in this grant — RFC 6749 §4.4 is
+    /// the client acting for itself — so the request is asking for something
+    /// that cannot be issued. Providers split on what to do about it: some
+    /// ignore the scope, some refuse the whole request. Asking for nothing is
+    /// the interoperable answer, and a client's own registered scopes are what
+    /// it gets.
+    pub(super) const CLIENT_CREDENTIALS_SCOPE: &str = "";
+
     /// Where a node publishes what it is, as an OAuth 2.0 protected resource.
     ///
     /// Written out here rather than shared with the server's constant in
@@ -780,6 +858,59 @@ mod oidc {
             form.push(("resource", resource));
         }
         form
+    }
+
+    /// Whether the provider accepts HTTP Basic for client authentication.
+    ///
+    /// RFC 6749 §2.3.1 says an authorization server **MUST** support Basic and
+    /// **MAY** support credentials in the request body, so Basic is the method
+    /// that is always there and the body is the optional one. This reads the
+    /// provider's own `token_endpoint_auth_methods_supported` rather than
+    /// assuming either.
+    ///
+    /// A provider that advertises nothing gets Basic, because that is what
+    /// §2.3.1 makes mandatory and what OpenID Connect Discovery names as the
+    /// default when the member is absent.
+    pub(super) fn prefers_basic_auth(document: &Value) -> bool {
+        let Some(methods) = document.get("token_endpoint_auth_methods_supported") else {
+            return true;
+        };
+        let Some(methods) = methods.as_array() else { return true };
+        let named = |want: &str| methods.iter().filter_map(Value::as_str).any(|m| m == want);
+        // Only fall back to the body when the provider says it takes that and
+        // says it does not take Basic. Both advertised means Basic.
+        if named("client_secret_basic") {
+            return true;
+        }
+        !named("client_secret_post")
+    }
+
+    /// One credential, encoded the way RFC 6749 §2.3.1 requires before it goes
+    /// into an `Authorization: Basic` header.
+    ///
+    /// **Not the same as base64ing `id:secret` directly.** §2.3.1 says the
+    /// client id and password are each encoded with the
+    /// `application/x-www-form-urlencoded` algorithm *first*, and only then
+    /// used as the username and password. It matters whenever a secret
+    /// contains a `:`, a `+`, a space or any non-ASCII character — a provider
+    /// that decodes to the letter then sees a different secret than the one
+    /// that was set, and the failure reads as a wrong password.
+    ///
+    /// Written out rather than pulled from a crate: it is a dozen lines, and
+    /// this binary's short dependency list is deliberate.
+    pub(super) fn form_urlencode(value: &str) -> String {
+        let mut out = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                // The set the HTML form serializer leaves alone.
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
+                    out.push(byte as char)
+                }
+                b' ' => out.push('+'),
+                _ => out.push_str(&format!("%{byte:02X}")),
+            }
+        }
+        out
     }
 
     fn client_id_or_bail(client_id: Option<&str>) -> Result<&str> {
@@ -909,6 +1040,16 @@ mod oidc {
             .context("the provider returned no access_token")
     }
 
+    /// How many seconds the provider says the token is good for.
+    ///
+    /// `expires_in` is only RECOMMENDED by RFC 6749 §5.1, so its absence is
+    /// ordinary rather than an error. A token with no stated lifetime is not
+    /// cached: the cache exists to reuse a token that is known to still be
+    /// valid, and without a lifetime there is nothing to know.
+    pub(super) fn expires_in(body: &Value) -> Option<u64> {
+        body.get("expires_in").and_then(Value::as_u64)
+    }
+
     /// RFC 8628 device authorization grant.
     ///
     /// Everything a person reads goes to **stderr** and only the token goes to
@@ -919,7 +1060,7 @@ mod oidc {
         client_id: Option<&str>,
         scope: &str,
         resource: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let issuer = issuer_or_bail(issuer)?;
         let client_id = client_id_or_bail(client_id)?;
         let http = http()?;
@@ -1015,7 +1156,7 @@ mod oidc {
                     bail!("the device code expired before it was approved; run it again")
                 }
                 "access_denied" => bail!("the request was denied at the provider"),
-                "" => return access_token(&body),
+                "" => return Ok((access_token(&body)?, expires_in(&body))),
                 _ => bail!("the provider refused the token request: {}", describe(&body)),
             }
         }
@@ -1031,7 +1172,7 @@ mod oidc {
         client_id: Option<&str>,
         scope: &str,
         resource: Option<&str>,
-    ) -> Result<String> {
+    ) -> Result<(String, Option<u64>)> {
         let issuer = issuer_or_bail(issuer)?;
         let client_id = client_id_or_bail(client_id)?;
         let secret =
@@ -1044,17 +1185,28 @@ mod oidc {
         let document = discover(&http, issuer).await?;
         let token_endpoint = endpoint(&document, "token_endpoint")?;
 
-        let body: Value = http
-            .post(&token_endpoint)
-            .form(&with_resource(
-                vec![
-                    ("grant_type", "client_credentials"),
-                    ("client_id", client_id),
-                    ("client_secret", secret.as_str()),
-                    ("scope", scope),
-                ],
-                resource,
-            ))
+        let mut form = vec![("grant_type", "client_credentials")];
+        // An empty scope is omitted rather than sent blank: `scope=` is a
+        // parameter with no value, which is not the same request as one that
+        // named no scope at all, and providers are entitled to refuse it.
+        if !scope.is_empty() {
+            form.push(("scope", scope));
+        }
+
+        let basic = prefers_basic_auth(&document);
+        if !basic {
+            form.push(("client_id", client_id));
+            form.push(("client_secret", secret.as_str()));
+        }
+
+        let mut request = http.post(&token_endpoint);
+        if basic {
+            request = request
+                .basic_auth(form_urlencode(client_id), Some(form_urlencode(secret.as_str())));
+        }
+
+        let body: Value = request
+            .form(&with_resource(form, resource))
             .send()
             .await
             .with_context(|| format!("requesting a token from {token_endpoint}"))?
@@ -1065,7 +1217,7 @@ mod oidc {
         if !oauth_error(&body).is_empty() {
             bail!("the provider refused the token request: {}", describe(&body));
         }
-        access_token(&body)
+        Ok((access_token(&body)?, expires_in(&body)))
     }
 
     /// An OAuth2 error, as something a person can act on.
@@ -1078,6 +1230,193 @@ mod oidc {
             Some(detail) => format!("{code}: {detail}"),
             None => code.to_string(),
         }
+    }
+}
+
+/// An opt-in cache for the access token `kimmy login` just obtained.
+///
+/// # It is off unless asked for, and that is the decision
+///
+/// `gh`, `aws`, `az` and `kubectl` all cache credentials at `0600`, so doing
+/// so is unremarkable. It is still opt-in here, because storing a bearer token
+/// changes what this tool is responsible for: file permissions, a lifetime,
+/// and cleanup. Nobody who does not ask for it inherits any of that, and the
+/// default behaviour is byte-for-byte what shipped before this existed.
+///
+/// # A refresh token is never stored, and never even requested
+///
+/// The access token is short-lived and audience-restricted; a refresh token is
+/// the credential that outlives the session and can mint more. Caching one
+/// would be a different feature with a different risk, and neither flow asks
+/// for one.
+mod cache {
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    use anyhow::{Context, Result};
+    use serde_json::{Value, json};
+
+    /// Treat a token as spent this long before it actually expires.
+    ///
+    /// A token that passes the freshness test has to survive the command that
+    /// is about to use it, not merely exist at the moment it is read.
+    const EXPIRY_MARGIN_SECS: u64 = 60;
+
+    /// What a cached token is filed under.
+    ///
+    /// All three parts, because all three change what the token *is*: a
+    /// different issuer is a different trust root, a different client is a
+    /// different identity, and a different resource is a different audience —
+    /// and a token for the wrong audience is refused by the node, which would
+    /// look like a broken cache rather than a wrong key.
+    ///
+    /// Constructing one requires an issuer and a client id. Without them there
+    /// was no OAuth flow to cache the result of.
+    pub struct Key(String);
+
+    impl Key {
+        pub fn new(
+            issuer: Option<&str>,
+            client_id: Option<&str>,
+            resource: Option<&str>,
+        ) -> Option<Self> {
+            // A tab cannot appear in a URL or a client id, so it separates
+            // without any escaping and without two different triples ever
+            // colliding on one key.
+            Some(Self(format!("{}\t{}\t{}", issuer?, client_id?, resource.unwrap_or(""))))
+        }
+    }
+
+    /// `$XDG_CACHE_HOME/kimmy/tokens.json`, or `~/.cache/kimmy/tokens.json`.
+    ///
+    /// One file rather than one per key: it is what makes `0600` a single
+    /// thing to get right, and it keeps the issuer out of a filename.
+    fn path() -> Result<PathBuf> {
+        let base = match std::env::var_os("XDG_CACHE_HOME").filter(|v| !v.is_empty()) {
+            Some(dir) => PathBuf::from(dir),
+            None => PathBuf::from(
+                std::env::var_os("HOME").context("neither XDG_CACHE_HOME nor HOME is set")?,
+            )
+            .join(".cache"),
+        };
+        Ok(base.join("kimmy").join("tokens.json"))
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// A still-valid token for this key, if one was stored.
+    ///
+    /// **Every failure is a cache miss, not an error.** A corrupt file, a
+    /// missing one, or one written by a future version all mean the same thing
+    /// to the caller: authenticate again. Reporting them would turn a cache
+    /// into something that can break a login.
+    pub fn get(key: &Key) -> Option<String> {
+        get_from(&path().ok()?, key)
+    }
+
+    /// [`get`], against a named file.
+    ///
+    /// Split out so the tests never touch `XDG_CACHE_HOME`. Environment
+    /// variables are process-global and cargo runs tests on parallel threads,
+    /// so a test that set one would be racing every other test that reads it —
+    /// the same shape as the `include_names` race that took a round to
+    /// diagnose.
+    pub fn get_from(path: &std::path::Path, key: &Key) -> Option<String> {
+        let document: Value = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let entry = document.get("entries")?.get(&key.0)?;
+        let expires_at = entry.get("expires_at")?.as_u64()?;
+        if expires_at.saturating_sub(EXPIRY_MARGIN_SECS) <= now() {
+            return None;
+        }
+        entry.get("access_token")?.as_str().map(str::to_string)
+    }
+
+    /// Store a token against this key.
+    ///
+    /// A token whose lifetime the provider did not state is **not** stored:
+    /// the cache exists to reuse a token known to still be valid, and without
+    /// `expires_in` there is nothing to know. Guessing a lifetime would mean
+    /// serving a dead token, which fails as a 401 somewhere unrelated.
+    pub fn put(key: &Key, token: &str, expires_in: Option<u64>) -> Result<()> {
+        put_into(&path()?, key, token, expires_in)
+    }
+
+    /// [`put`], into a named file. Split out for the reason [`get_from`] is.
+    pub fn put_into(
+        path: &std::path::Path,
+        key: &Key,
+        token: &str,
+        expires_in: Option<u64>,
+    ) -> Result<()> {
+        let Some(expires_in) = expires_in else { return Ok(()) };
+
+        let dir = path.parent().context("the cache path has no parent")?;
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        restrict(dir, 0o700)?;
+
+        // Read-modify-write, so caching a token for one node does not discard
+        // the token cached for another.
+        let mut document = std::fs::read(path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<Value>(&raw).ok())
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
+        document["version"] = json!(1);
+        // Drop entries that have already expired while we are here, so an
+        // abandoned issuer does not leave a token on disk indefinitely.
+        let entries = document["entries"].as_object().cloned().unwrap_or_default();
+        let mut kept = serde_json::Map::new();
+        for (name, entry) in entries {
+            if entry.get("expires_at").and_then(Value::as_u64).is_some_and(|at| at > now()) {
+                kept.insert(name, entry);
+            }
+        }
+        kept.insert(
+            key.0.clone(),
+            json!({ "access_token": token, "expires_at": now().saturating_add(expires_in) }),
+        );
+        document["entries"] = Value::Object(kept);
+
+        // Written to a temporary file in the same directory and renamed, so a
+        // reader never sees a half-written cache and an interrupted write
+        // cannot destroy the tokens already stored.
+        let temporary = path.with_extension("tmp");
+        let mut file = std::fs::File::create(&temporary)
+            .with_context(|| format!("creating {}", temporary.display()))?;
+        restrict(&temporary, 0o600)?;
+        file.write_all(serde_json::to_string(&document)?.as_bytes())
+            .with_context(|| format!("writing {}", temporary.display()))?;
+        file.sync_all().ok();
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("replacing {}", path.display()))?;
+        Ok(())
+    }
+
+    /// Narrow a path's permissions to its owner.
+    ///
+    /// Applied after creation rather than at it, because `create_dir_all` and
+    /// `File::create` both go through the process umask and a permissive one
+    /// would otherwise leave a token group- or world-readable.
+    #[cfg(unix)]
+    fn restrict(path: &std::path::Path, mode: u32) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("restricting permissions on {}", path.display()))
+    }
+
+    /// No equivalent on other platforms, and nothing is shipped for one — the
+    /// release targets are macOS and Linux. A stub rather than a silent
+    /// success, so this is found rather than assumed if that changes.
+    #[cfg(not(unix))]
+    fn restrict(_path: &std::path::Path, _mode: u32) -> Result<()> {
+        anyhow::bail!(
+            "the token cache is only implemented for platforms with POSIX file permissions"
+        )
     }
 }
 
@@ -1231,6 +1570,223 @@ mod tests {
         ] {
             assert!(oidc::is_secure_url(url), "{url} must count as secure");
         }
+    }
+
+    #[test]
+    fn basic_is_preferred_and_is_what_an_unhelpful_provider_gets() {
+        // RFC 6749 §2.3.1: a server MUST support Basic and MAY support the
+        // body, so Basic is the one that is always available. The body is used
+        // only when the provider says it takes that and does not take Basic.
+        let advertising =
+            |methods: Value| json!({ "token_endpoint_auth_methods_supported": methods });
+
+        assert!(oidc::prefers_basic_auth(&advertising(json!(["client_secret_basic"]))));
+        assert!(oidc::prefers_basic_auth(&advertising(json!([
+            "client_secret_post",
+            "client_secret_basic"
+        ]))));
+        assert!(
+            !oidc::prefers_basic_auth(&advertising(json!(["client_secret_post"]))),
+            "a provider that takes only the body must get the body"
+        );
+
+        // Absent, empty, or the wrong JSON type: RFC 6749 makes Basic
+        // mandatory, so it is the answer whenever the provider has not said
+        // otherwise.
+        assert!(oidc::prefers_basic_auth(&json!({})));
+        assert!(oidc::prefers_basic_auth(&advertising(json!([]))));
+        assert!(oidc::prefers_basic_auth(&advertising(json!("client_secret_post"))));
+    }
+
+    #[test]
+    fn credentials_are_form_encoded_before_they_are_sent_as_basic() {
+        // RFC 6749 §2.3.1 encodes the id and the secret with the form
+        // algorithm *before* they become the username and password. Skipping
+        // it means a provider decoding to the letter sees a different secret
+        // than the one that was set, and the failure reads as a wrong
+        // password rather than as an encoding bug.
+        assert_eq!(oidc::form_urlencode("kimmy-cli"), "kimmy-cli");
+        assert_eq!(oidc::form_urlencode("s3cr3t.va_lue-*"), "s3cr3t.va_lue-*");
+        // The characters that actually bite: a colon separates the two halves
+        // of a Basic credential, and `+` and space are each other's encoding.
+        assert_eq!(oidc::form_urlencode("a:b"), "a%3Ab");
+        assert_eq!(oidc::form_urlencode("a b"), "a+b");
+        assert_eq!(oidc::form_urlencode("a+b"), "a%2Bb");
+        assert_eq!(oidc::form_urlencode("a%b"), "a%25b");
+        // Non-ASCII goes out as UTF-8 bytes, percent-encoded one at a time.
+        assert_eq!(oidc::form_urlencode("é"), "%C3%A9");
+    }
+
+    #[test]
+    fn the_two_flows_ask_for_different_scopes_by_default() {
+        // A service account has no end user, so `openid` would request an ID
+        // token that cannot be issued — ignored by some providers, refused by
+        // others. The device flow does have a person behind it.
+        assert_eq!(oidc::DEVICE_SCOPE, "openid profile");
+        assert_eq!(oidc::CLIENT_CREDENTIALS_SCOPE, "", "a service account asks for no scope");
+    }
+
+    #[test]
+    fn a_token_with_no_stated_lifetime_is_not_cached() {
+        // `expires_in` is only RECOMMENDED by RFC 6749 §5.1. Without it there
+        // is nothing to base freshness on, and guessing would mean serving a
+        // dead token as a 401 somewhere unrelated.
+        assert_eq!(
+            oidc::expires_in(&json!({ "access_token": "t", "expires_in": 3600 })),
+            Some(3600)
+        );
+        assert_eq!(oidc::expires_in(&json!({ "access_token": "t" })), None);
+        // Some providers send it as a string. Not accepted rather than
+        // guessed at: not caching is the safe reading.
+        assert_eq!(oidc::expires_in(&json!({ "expires_in": "3600" })), None);
+    }
+
+    /// A scratch path under the OS temp directory, unique per test.
+    ///
+    /// No `XDG_CACHE_HOME`, no environment variable of any kind: the tests
+    /// name the file directly, so nothing here is process-global and nothing
+    /// races the rest of the suite.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kimmy-cache-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("tokens.json")
+    }
+
+    fn key(resource: Option<&str>) -> cache::Key {
+        cache::Key::new(Some("https://auth.example.com"), Some("kimmy-cli"), resource)
+            .expect("issuer and client id are both present")
+    }
+
+    #[test]
+    fn a_cached_token_comes_back_and_the_file_is_owner_only() {
+        let path = scratch("roundtrip");
+        let key = key(Some("https://kimmydb.example.com"));
+
+        assert_eq!(cache::get_from(&path, &key), None, "nothing is cached before anything is put");
+
+        cache::put_into(&path, &key, "the-token", Some(3600)).unwrap();
+        assert_eq!(cache::get_from(&path, &key).as_deref(), Some("the-token"));
+
+        // The whole reason a token on disk is a decision rather than a
+        // convenience: it has to be unreadable by anyone else on the machine.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "the cache file must be owner-only, got {mode:o}");
+            let dir_mode =
+                std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700, "the cache directory must be owner-only, got {dir_mode:o}");
+        }
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn the_key_separates_issuer_client_and_resource() {
+        // A token for the wrong audience is refused by the node, which would
+        // read as a broken cache rather than as the wrong key being used.
+        let path = scratch("keys");
+        cache::put_into(&path, &key(Some("https://a.example.com")), "token-a", Some(3600)).unwrap();
+        cache::put_into(&path, &key(Some("https://b.example.com")), "token-b", Some(3600)).unwrap();
+
+        assert_eq!(
+            cache::get_from(&path, &key(Some("https://a.example.com"))).as_deref(),
+            Some("token-a")
+        );
+        assert_eq!(
+            cache::get_from(&path, &key(Some("https://b.example.com"))).as_deref(),
+            Some("token-b"),
+            "caching the second must not have discarded the first"
+        );
+        assert_eq!(cache::get_from(&path, &key(Some("https://c.example.com"))), None);
+        assert_eq!(cache::get_from(&path, &key(None)), None, "no resource is its own key");
+
+        let other_client = cache::Key::new(
+            Some("https://auth.example.com"),
+            Some("some-other-client"),
+            Some("https://a.example.com"),
+        )
+        .unwrap();
+        assert_eq!(cache::get_from(&path, &other_client), None);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_token_close_to_expiry_is_not_served() {
+        // It has to survive the command about to use it, not merely exist at
+        // the moment it is read.
+        let path = scratch("expiry");
+        let key = key(None);
+
+        cache::put_into(&path, &key, "nearly-dead", Some(30)).unwrap();
+        assert_eq!(
+            cache::get_from(&path, &key),
+            None,
+            "inside the margin, so it must be treated as spent"
+        );
+
+        cache::put_into(&path, &key, "alive", Some(3600)).unwrap();
+        assert_eq!(cache::get_from(&path, &key).as_deref(), Some("alive"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_corrupt_or_missing_cache_is_a_miss_rather_than_a_failure() {
+        // Anything that goes wrong reading it means the same thing to the
+        // caller — authenticate again — and a cache that can break a login is
+        // worse than no cache.
+        let path = scratch("corrupt");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"this is not json").unwrap();
+        assert_eq!(cache::get_from(&path, &key(None)), None);
+
+        std::fs::write(&path, br#"{"entries":{"x":{"access_token":"t"}}}"#).unwrap();
+        assert_eq!(cache::get_from(&path, &key(None)), None, "an entry with no expiry is unusable");
+
+        assert_eq!(
+            cache::get_from(std::path::Path::new("/nonexistent/kimmy/x.json"), &key(None)),
+            None
+        );
+
+        // ...and a corrupt file must not stop a new token being stored.
+        std::fs::write(&path, b"this is not json").unwrap();
+        cache::put_into(&path, &key(None), "fresh", Some(3600)).unwrap();
+        assert_eq!(cache::get_from(&path, &key(None)).as_deref(), Some("fresh"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn an_expired_entry_is_dropped_when_the_cache_is_next_written() {
+        // Otherwise an issuer nobody uses any more leaves a token on disk
+        // indefinitely.
+        let path = scratch("sweep");
+        let stale = key(Some("https://stale.example.com"));
+        cache::put_into(&path, &stale, "stale-token", Some(1)).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+
+        cache::put_into(&path, &key(Some("https://fresh.example.com")), "fresh", Some(3600))
+            .unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("stale-token"), "the expired entry must be gone from disk: {raw}");
+        assert!(raw.contains("fresh"));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_cache_key_needs_an_issuer_and_a_client() {
+        // Without both there was no OAuth flow whose result could be cached.
+        assert!(cache::Key::new(None, Some("kimmy-cli"), None).is_none());
+        assert!(cache::Key::new(Some("https://auth.example.com"), None, None).is_none());
+        assert!(
+            cache::Key::new(Some("https://auth.example.com"), Some("kimmy-cli"), None).is_some()
+        );
     }
 
     #[tokio::test]

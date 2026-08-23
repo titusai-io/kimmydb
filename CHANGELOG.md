@@ -40,6 +40,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   from a supported provider. Turn it on when yours is known to emit it. If
   `auth.oidc.audience` is an `https` URL you are already covered without it: an
   ID token's audience is a client id and can never be a resource identifier.
+- **`kimmy login --cache-token`** (or `KIMMY_TOKEN_CACHE`) reuses the access
+  token from a previous login instead of authenticating again. **Off unless
+  asked for**, so nothing changes for anyone who does not pass it. The token
+  goes in a `0600` file under `$XDG_CACHE_HOME/kimmy` (or `~/.cache/kimmy`),
+  keyed by issuer, client and resource, and is reused until it is within a
+  minute of expiring. **A refresh token is never requested and never stored**,
+  with or without the flag. See [ADR-075](docs/decisions.md).
 
 ### Changed
 
@@ -49,6 +56,20 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   values — those simply publish no metadata. No existing configuration that
   used `https` or an opaque string needs editing. See
   [ADR-071](docs/decisions.md).
+- **`kimmy login --client-credentials` now authenticates with HTTP Basic** when
+  the provider advertises `client_secret_basic`, falling back to the request
+  body only when it advertises the body and not Basic. RFC 6749 §2.3.1 makes
+  Basic mandatory for an authorization server and the body optional, so this is
+  the method that is always available. The id and secret are form-encoded
+  before the header is built, as §2.3.1 requires — which matters whenever a
+  secret contains a `:`, a `+`, a space or a non-ASCII character.
+- **`kimmy login --client-credentials` no longer requests any scope by
+  default.** `--scope` previously defaulted to `openid profile` for both flows,
+  but there is no end user in the client-credentials grant, so `openid` asks
+  for an ID token that cannot be issued — some providers ignore it, others
+  refuse the request. The device flow still defaults to `openid profile`, and
+  an explicit `--scope` still wins for either. **If you relied on the old
+  default for a service account, pass `--scope` explicitly.**
 
 ### Security
 
