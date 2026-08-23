@@ -2322,6 +2322,7 @@ dependencies = [
  "anyhow",
  "clap",
  "kimmy-client",
+ "kimmy-core",
  "serde",
  "serde_json",
  "tokio",

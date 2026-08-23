@@ -125,11 +125,28 @@ pub fn capabilities() -> Vec<&'static str> {
 pub async fn version(State(state): State<SharedState>) -> impl IntoResponse {
     Json(json!({
         "protocol": PROTOCOL,
-        "version": env!("CARGO_PKG_VERSION"),
+        // From the crate at the root of the graph rather than this crate's
+        // own `CARGO_PKG_VERSION`, so this answer, the startup log and
+        // `kimmy --version` are one fact, not three that happen to agree.
+        "version": kimmy_core::build::VERSION,
+        // The exact build, for the operator staring at a half-upgraded
+        // cluster where two nodes claim the same version. `unknown` on a
+        // build made without git — a tarball build is a supported build.
+        "commit": kimmy_core::build::COMMIT,
         // The node that answered. During a rolling upgrade a client that fails
         // over lands on different builds, and this is what tells it which one
         // this answer came from.
         "node": state.engine.node_id().to_string(),
         "capabilities": capabilities(),
     })) as Json<Value>
+}
+
+#[cfg(test)]
+mod tests {
+    /// One workspace version, one binary story (ADR-062): the version this
+    /// endpoint reports is the workspace's, not privately this crate's.
+    #[test]
+    fn the_reported_version_is_the_workspace_version() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), kimmy_core::build::VERSION);
+    }
 }

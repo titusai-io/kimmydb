@@ -40,7 +40,7 @@ use serde_json::{Value, json};
 #[derive(Parser)]
 #[command(
     name = "kimmy",
-    version,
+    version = kimmy_core::build::ident(),
     about = "Terminal client for KimmyDB",
     after_help = "Authentication:\n  \
         kimmy login root                  # reads the password from stdin or KIMMY_PASSWORD\n  \
@@ -614,6 +614,15 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    /// One workspace version, one binary story (ADR-062): what
+    /// `kimmy --version` prints is the workspace version the server also
+    /// reports, and the identity line leads with it.
+    #[test]
+    fn the_cli_version_is_the_workspace_version() {
+        assert_eq!(env!("CARGO_PKG_VERSION"), kimmy_core::build::VERSION);
+        assert!(kimmy_core::build::ident().starts_with(kimmy_core::build::VERSION));
     }
 
     #[test]
