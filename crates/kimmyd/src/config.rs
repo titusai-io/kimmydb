@@ -214,13 +214,43 @@ pub struct AuthConfig {
     pub root_user: String,
     /// Bootstrap password. Prefer the `KIMMY_ROOT_PASSWORD` env var over
     /// writing this into a file.
+    #[serde(serialize_with = "redact")]
     pub root_password: Option<String>,
     /// Shared secret for signing JWTs. Every node in a cluster must agree, or
     /// tokens issued by one node will be rejected by another.
+    #[serde(serialize_with = "redact")]
     pub jwt_secret: Option<String>,
     pub token_ttl_secs: u64,
     /// Federation with an external OpenID Connect provider.
     pub oidc: OidcConfig,
+}
+
+/// What a secret serializes as, in place of itself.
+///
+/// Below the 16 bytes [`Config::validate`] requires of a signing key, on
+/// purpose: `check-config` output pasted back into a config file has to fail at
+/// startup rather than run with a placeholder for a key. That refusal comes
+/// first whenever authentication is on, which is also what stops the bootstrap
+/// password below from being taken literally on a fresh database.
+const REDACTED: &str = "<redacted>";
+
+/// Serialize a secret as [`REDACTED`], keeping only whether it is set.
+///
+/// The only thing that serializes a [`Config`] is `check-config`, whose whole
+/// job is to be read by a person — in a terminal, in CI output, pasted into a
+/// bug report. The value of `jwt_secret` in particular signs every local token
+/// this cluster issues, so anyone who reads it can mint a principal, `root`
+/// included; and the config file deliberately keeps both of these commented out
+/// in favour of `KIMMY_JWT_SECRET` and `KIMMY_ROOT_PASSWORD`, so the documented
+/// workflow is precisely the one that used to print them.
+///
+/// `None` still serializes as absent. "Is it set?" is the question
+/// `check-config` exists to answer and is not itself a secret.
+fn redact<S: serde::Serializer>(value: &Option<String>, serializer: S) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(_) => serializer.serialize_some(REDACTED),
+        None => serializer.serialize_none(),
+    }
 }
 
 /// Trust in one external identity provider.
@@ -1074,6 +1104,40 @@ mod tests {
         let text = toml::to_string(&Config::default()).unwrap();
         let parsed: Config = toml::from_str(&text).unwrap();
         assert_eq!(parsed, Config::default());
+    }
+
+    #[test]
+    fn serializing_a_config_never_emits_a_secret() {
+        // `check-config` prints this, and an operator reads it in a terminal, in
+        // CI output, or pasted into a bug report. `jwt_secret` signs every local
+        // token the cluster issues, so printing it hands over the ability to
+        // mint any principal, `root` included.
+        let cfg = valid();
+        let secrets = [
+            cfg.auth.root_password.clone().expect("the fixture sets a root password"),
+            cfg.auth.jwt_secret.clone().expect("the fixture sets a signing key"),
+        ];
+
+        let text = toml::to_string(&cfg).unwrap();
+
+        for secret in secrets {
+            assert!(!text.contains(&secret), "a secret reached check-config output:\n{text}");
+        }
+        // Set-ness survives, because that is the question check-config answers.
+        assert!(text.contains("root_password"), "the field vanished entirely:\n{text}");
+        assert!(text.contains("jwt_secret"), "the field vanished entirely:\n{text}");
+    }
+
+    #[test]
+    fn a_redacted_signing_key_is_refused_rather_than_used() {
+        // check-config output pasted back into a config file must not start a
+        // node whose tokens are signed with the placeholder.
+        let mut cfg = valid();
+        cfg.auth.jwt_secret = Some(REDACTED.into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+
+        assert!(err.contains("jwt_secret"), "unhelpful error: {err}");
     }
 
     #[test]
