@@ -103,6 +103,16 @@ pub fn router(state: SharedState) -> Router {
     routes::router(state)
 }
 
+/// Build the HTTP router, merging routes served on the same listener.
+///
+/// Use this rather than `router(..).merge(..)` for anything sharing the
+/// listener: merging afterwards leaves those routes outside the layer that
+/// counts, times, traces and adds the `WWW-Authenticate` challenge. See
+/// [`routes::router_with`].
+pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
+    routes::router_with(state, extra)
+}
+
 /// Build the application router.
 pub fn build(
     engine: Arc<Engine>,

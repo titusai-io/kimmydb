@@ -131,12 +131,17 @@ pub async fn run(config: Config) -> Result<()> {
     // MCP shares the state rather than being handed its own, so an agent tool
     // and the REST route beside it reach the same engine through the same
     // authorization check. See kimmy-mcp's crate documentation.
-    let mut app = kimmy_api::router(Arc::clone(&state));
-    if config.server.mcp {
-        app = app.merge(kimmy_mcp::mcp_router(
-            Arc::clone(&state),
-            config.server.mcp_allowed_hosts.clone(),
-        ));
+    //
+    // Merged through `router_with` rather than onto the finished router: a
+    // router merged afterwards sits outside the layer that counts, times,
+    // traces and challenges, which is how `/mcp` came to answer 401 with no
+    // `WWW-Authenticate` and to be missing from `/metrics` entirely.
+    let mcp = config.server.mcp.then(|| {
+        kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
+    });
+    let serving_mcp = mcp.is_some();
+    let app = kimmy_api::router_with(Arc::clone(&state), mcp);
+    if serving_mcp {
         info!("serving MCP at /mcp");
     }
 

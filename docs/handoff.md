@@ -6,6 +6,49 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **`/mcp` was outside the instrumentation layer**
+
+Found during the WS1 end-to-end validation, by sending an unauthenticated
+request to `/mcp` against a live provider and noticing the 401 carried no
+`WWW-Authenticate` while the identical REST 401 did.
+
+One cause, four symptoms. `kimmy_api::router()` applied the `count_request`
+layer to its own routes and `node.rs` then did `app.merge(mcp_router(..))`.
+**A router merged after a layer keeps its own empty middleware stack** — `merge`
+combines route tables, and a layer already applied stays with the routes it was
+applied to. So `/mcp` had no request counter, no latency timing, no trace span,
+and no challenge header.
+
+The header is the half that matters. WS5a's §5.1 singled out `/mcp` as the
+reason RFC 9728 mattered *more* than usual: an MCP client holding no credentials
+has no other way to find its authorization server. The metadata document was
+published correctly the whole time — the 401 just never pointed at it, so the
+discovery chain was broken at its last link.
+
+The counting half was measurable and is the one that proves it: three MCP calls
+moved `kimmy_requests_total` by zero.
+
+Fixed by adding `kimmy_api::router_with(state, extra)`, which merges before
+layering; `router()` delegates to it with `None`, so every existing caller is
+unchanged. `node.rs` passes the MCP router through it.
+
+Two regression tests, both verified to **fail against the old mounting** and
+pass against the new one. The counting test is deliberately self-calibrating:
+`kimmy_requests_total` is a single unlabelled counter and a `/metrics` scrape
+counts itself, so "the number went up" passes whether or not `/mcp` is counted.
+It measures a scrape-only interval first and requires exactly one more than
+that.
+
+**Worth noting for its own sake:** the MCP test harness said *"Merged exactly as
+the daemon merges it, so the test exercises the real mounting rather than a
+convenient stand-in"* — and that faithfulness is precisely why it reproduced the
+defect instead of catching it. Mirroring production exactly makes a test share
+production's blind spots. 1301 → 1303.
+
+No ADR: a defect, not a decision.
+
+---
+
 ## As of 2026-08-23 — **check-config stops printing the signing key**
 
 Found by running `check-config` against the live identity provider for the WS1

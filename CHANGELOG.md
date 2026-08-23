@@ -80,6 +80,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the main listener rather than gaining a second port. See
   [ADR-076](docs/decisions.md).
 
+### Fixed
+
+- **`/mcp` now answers a rejected request with `WWW-Authenticate`, and its
+  traffic reaches `/metrics` and tracing.** It was merged onto the router
+  *after* the layer that counts, times, traces and adds the challenge, and a
+  router merged after a layer keeps its own empty middleware stack — so every
+  MCP request skipped all four. The header is the half that matters: an MCP
+  client holding no credentials has no other way to discover its authorization
+  server, which is the case RFC 9728 exists to serve, so a bare 401 left it
+  needing to be configured by hand. Nothing about MCP authorization itself
+  changed — a request without a valid token was refused before and is refused
+  now — and REST routes were never affected.
+
 ### Security
 
 - **`kimmyd check-config` no longer prints `auth.jwt_secret` or
