@@ -2275,6 +2275,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "jsonschema",
+ "jsonwebtoken",
  "kimmy-auth",
  "kimmy-cluster",
  "kimmy-core",
@@ -2293,6 +2294,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 
@@ -2323,6 +2325,7 @@ dependencies = [
  "clap",
  "kimmy-client",
  "kimmy-core",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

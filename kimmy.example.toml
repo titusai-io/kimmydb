@@ -190,6 +190,85 @@ root_user = "root"
 
 token_ttl_secs = 3600
 
+# ---------------------------------------------------------------------------
+# Federating with an external OpenID Connect provider.
+#
+# Entirely optional, and additive: local users keep working exactly as they do
+# without this. The node grows a *second* token verifier and picks between them
+# by the issuer a token claims — a token is only ever offered to the verifier it
+# says it belongs to, which is what leaves no algorithm-confusion surface
+# between the two. See docs/security.md and ADR-064.
+#
+# The whole section is commented out because there is no sensible default for
+# "which identity provider". Uncomment it and the node federates; leave it and
+# nothing changes. A *half*-filled section is refused at startup rather than
+# quietly ignored — a node that started with federation silently off would
+# refuse every token the provider issued.
+# ---------------------------------------------------------------------------
+# [auth.oidc]
+
+# The provider's issuer URL, matched against a token's `iss` exactly, and where
+# discovery starts: {issuer}/.well-known/openid-configuration names the JWKS
+# this node fetches signing keys from.
+#
+# Must be https. The signing keys come down this URL, so over plaintext anyone
+# on the network path could substitute their own and mint any identity they
+# liked — the node refuses to start rather than allow that.
+#
+# One issuer, not a list. A second one is a second trust root.
+# issuer = "https://auth.example.com"
+
+# The `aud` a token must carry to be accepted here. **Required.**
+#
+# A provider signs tokens for every application that trusts it. Without an
+# audience restriction, a token minted for the company wiki would authenticate
+# against this database.
+# audience = "kimmydb"
+
+# Which claim carries the caller's roles. "roles" for most providers,
+# "groups" for Entra ID. Getting this wrong is quiet: every federated caller
+# arrives with no grants at all, which looks exactly like a permissions problem.
+# roles_claim = "roles"
+
+# How often to re-fetch the provider's signing keys, in seconds. A rotation
+# between two ticks is covered separately — a token naming an unknown key id
+# triggers one rate-limited refetch — so this is about staying current rather
+# than about how fast a rotation is survived.
+# refresh_interval_secs = 300
+
+# What a claim value is worth here. Repeat the block per role.
+#
+# Written inline rather than stored in the database on purpose (ADR-066):
+# verification stays a pure function of the token plus this file, so there is no
+# lookup on the request path and no way for two nodes to disagree about what a
+# role means. Changing a mapping is an edit and a restart.
+#
+# A role nobody maps is not an error — it produces a principal with zero grants.
+# The caller authenticated; they are simply not authorized here.
+#
+# `admin` is NOT mappable and a mapping that names it stops the node at
+# startup. Administration is reserved to local accounts as a break-glass
+# boundary: if this provider is misconfigured or taken over, nobody gets
+# superuser over the database through it (ADR-067). read, write, watch, search
+# and webhook all map freely.
+# [[auth.oidc.role_mappings]]
+# claim_value = "kimmydb-analyst"
+# grants = [{ db = "sales", collection = "orders*", actions = ["read", "search"] }]
+
+# [[auth.oidc.role_mappings]]
+# claim_value = "kimmydb-writer"
+# grants = [{ db = "sales", collection = "*", actions = ["write", "watch"] }]
+
+# Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
+# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM,
+# KIMMY_OIDC_REFRESH_INTERVAL_SECS. The mappings are file-only — a grant is a
+# structure, and a command line is where structures go to be mistyped.
+#
+# `kimmyd check-config` reaches the provider and reports what it found. The
+# server deliberately does not: a briefly unreachable identity provider must
+# not stop a database from restarting, so it retries in the background and
+# local users keep working meanwhile.
+
 [cluster]
 # KimmyDB is leaderless: there is no primary, no election, and no quorum. Each
 # node pulls the oplog entries it is missing from a few peers each round. Writes

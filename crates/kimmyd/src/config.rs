@@ -211,6 +211,160 @@ pub struct AuthConfig {
     /// tokens issued by one node will be rejected by another.
     pub jwt_secret: Option<String>,
     pub token_ttl_secs: u64,
+    /// Federation with an external OpenID Connect provider.
+    pub oidc: OidcConfig,
+}
+
+/// Trust in one external identity provider.
+///
+/// There is no `enabled` flag, for the same reason [`TlsConfig`] has none:
+/// a toggle would add a state where `enabled = true` with nothing configured,
+/// which can only ever be a startup failure. Federation is on when the section
+/// says anything at all, and a half-filled section is refused — naming an
+/// issuer without an audience is unambiguously a mistake, and the useful
+/// moment to say so is at startup rather than the first time a token arrives.
+///
+/// Local users keep working alongside it. This adds a second verifier; it does
+/// not replace the first (ADR-064).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct OidcConfig {
+    /// The provider's issuer URL, matched against a token's `iss` exactly.
+    ///
+    /// Also where discovery starts: `{issuer}/.well-known/openid-configuration`
+    /// names the JWKS this node fetches signing keys from.
+    ///
+    /// One issuer, not a list. A second one is a second trust root, and
+    /// "which of these may say a subject is an analyst" is a question this
+    /// round does not answer (ADR-064).
+    pub issuer: Option<String>,
+    /// The `aud` a token must carry to be accepted here.
+    ///
+    /// Required, because a provider signs tokens for every application that
+    /// trusts it. Without an audience restriction, a token minted for the
+    /// company wiki would authenticate against this database.
+    pub audience: Option<String>,
+    /// Claim carrying the caller's roles. `groups` for Entra ID.
+    pub roles_claim: String,
+    /// Claim values, and the grants each is worth here.
+    ///
+    /// Written inline rather than stored in a table this database owns
+    /// (ADR-066): the mapping is configuration an operator reviews and diffs,
+    /// so changing it is a restart, and a node cannot disagree with its file
+    /// about who may do what.
+    pub role_mappings: Vec<kimmy_auth::RoleMapping>,
+    /// How often to re-fetch the provider's signing keys.
+    ///
+    /// A rotation between two ticks is covered separately — a token naming an
+    /// unknown key id triggers one rate-limited refetch — so this interval is
+    /// about staying current, not about how fast a rotation is survived.
+    pub refresh_interval_secs: u64,
+}
+
+impl Default for OidcConfig {
+    fn default() -> Self {
+        Self {
+            issuer: None,
+            audience: None,
+            // What most providers use. Entra ID is the notable exception.
+            roles_claim: "roles".to_string(),
+            role_mappings: Vec::new(),
+            // Five minutes: far inside the hours a provider leaves a retiring
+            // key published, and rare enough to be invisible as load.
+            refresh_interval_secs: 300,
+        }
+    }
+}
+
+impl OidcConfig {
+    /// Whether the operator asked for federation at all.
+    ///
+    /// Any setting in the section counts, including a half-filled one, so that
+    /// an incomplete section is refused rather than silently ignored — the
+    /// failure mode being avoided is a node that starts with federation
+    /// quietly off and refuses every token the IdP issues.
+    pub fn is_configured(&self) -> bool {
+        self.issuer.is_some() || self.audience.is_some() || !self.role_mappings.is_empty()
+    }
+
+    /// The settings the verifier is built from, once validated.
+    pub fn settings(&self) -> Option<kimmy_auth::OidcSettings> {
+        Some(kimmy_auth::OidcSettings {
+            issuer: self.issuer.clone()?,
+            audience: self.audience.clone()?,
+            roles_claim: self.roles_claim.clone(),
+            role_mappings: self.role_mappings.clone(),
+        })
+    }
+
+    fn validate(&self) -> Result<()> {
+        if !self.is_configured() {
+            return Ok(());
+        }
+
+        let Some(issuer) = self.issuer.as_deref() else {
+            anyhow::bail!(
+                "auth.oidc is configured but no issuer is set; there is nothing to match a \
+                 token's `iss` against and nowhere to fetch signing keys from, so every \
+                 federated token would be refused. Set auth.oidc.issuer (KIMMY_OIDC_ISSUER)."
+            );
+        };
+        if self.audience.is_none() {
+            anyhow::bail!(
+                "auth.oidc.issuer is set but auth.oidc.audience is not; a provider signs tokens \
+                 for every application that trusts it, so without an audience a token minted \
+                 for an unrelated application would authenticate against this database. Set \
+                 auth.oidc.audience (KIMMY_OIDC_AUDIENCE)."
+            );
+        }
+        // Not tidiness: the discovery document and the JWKS are fetched from
+        // this URL, and over plaintext anyone on the path can substitute their
+        // own signing keys — which is a way to mint any principal they like.
+        if !issuer.starts_with("https://") {
+            anyhow::bail!(
+                "auth.oidc.issuer is {issuer:?}, which is not https. The discovery document and \
+                 the signing keys are fetched from it, so over plaintext anyone on the network \
+                 path could substitute their own keys and mint any identity they liked."
+            );
+        }
+        if self.roles_claim.trim().is_empty() {
+            anyhow::bail!(
+                "auth.oidc.roles_claim is empty; no claim would be read, so every federated \
+                 caller would arrive with no grants at all. Set it to `roles`, or to `groups` \
+                 for Entra ID."
+            );
+        }
+        if self.refresh_interval_secs == 0 {
+            anyhow::bail!(
+                "auth.oidc.refresh_interval_secs must be greater than zero; a node that never \
+                 re-fetches the provider's signing keys would refuse every token once the \
+                 provider rotated them"
+            );
+        }
+
+        // The `admin` refusal, and anything else the verifier itself would
+        // reject. Checked here as well as in `OidcVerifier::new` so that
+        // `check-config` refuses exactly what the server refuses — an
+        // entrypoint check that blesses a configuration the node then rejects
+        // is worse than no check.
+        //
+        // An *unknown* action never reaches this: `Grant::actions` is a typed
+        // enum, so `actions = ["delet"]` fails while the file is being parsed,
+        // with an error naming the bad value and listing the valid ones.
+        if let Some(settings) = self.settings() {
+            settings.validate()?;
+        }
+        Ok(())
+    }
+
+    /// One-line form for the startup summary. Never the mappings themselves —
+    /// they are long, and the count is what tells an operator the file was read.
+    fn describe(&self) -> String {
+        match &self.issuer {
+            None => "off".to_string(),
+            Some(issuer) => format!("{issuer} ({} role mappings)", self.role_mappings.len()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +542,7 @@ impl Default for AuthConfig {
             root_password: None,
             jwt_secret: None,
             token_ttl_secs: 60 * 60,
+            oidc: OidcConfig::default(),
         }
     }
 }
@@ -472,6 +627,19 @@ impl Config {
                 Some(_) => {}
             }
         }
+
+        // Federation is refused outright with authentication off rather than
+        // quietly ignored: `--insecure-no-auth` makes every request a
+        // superuser, so a node holding both would be handing out more than the
+        // role mappings say while looking like it enforced them.
+        if self.auth.insecure_no_auth && self.auth.oidc.is_configured() {
+            anyhow::bail!(
+                "auth.oidc is configured together with auth.insecure_no_auth; with \
+                 authentication disabled every request already runs as a superuser, so the \
+                 role mappings would be enforcing nothing. Remove one of the two."
+            );
+        }
+        self.auth.oidc.validate()?;
 
         if self.cluster.enabled {
             if self.cluster.seeds.is_empty() {
@@ -570,12 +738,13 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} scheme={} data_dir={} auth={} mcp={} gc={} ratelimit=[{}] audit={} \
+            "bind={} scheme={} data_dir={} auth={} oidc={} mcp={} gc={} ratelimit=[{}] audit={} \
              cluster={} seeds=[{}] log={}/{:?}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
+            self.auth.oidc.describe(),
             if self.server.mcp { "enabled" } else { "off" },
             gc,
             self.server.rate_limit.describe(),
@@ -914,6 +1083,183 @@ mod tests {
             cfg.audit.mode = mode.into();
             cfg.validate().unwrap_or_else(|e| panic!("{mode} should be valid: {e}"));
         }
+    }
+
+    fn oidc() -> OidcConfig {
+        OidcConfig {
+            issuer: Some("https://auth.example.com".into()),
+            audience: Some("kimmydb".into()),
+            role_mappings: vec![kimmy_auth::RoleMapping {
+                claim_value: "kimmydb-analyst".into(),
+                grants: vec![kimmy_auth::Grant::new(
+                    "sales",
+                    "orders*",
+                    vec![kimmy_auth::Action::Read, kimmy_auth::Action::Search],
+                )],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_complete_oidc_section_validates_and_shows_in_the_summary() {
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.validate().unwrap();
+
+        // The startup line is how an operator confirms the file was read at
+        // all — a mistyped section name would otherwise be a silent no-op.
+        let summary = cfg.summary();
+        assert!(summary.contains("oidc=https://auth.example.com"), "{summary}");
+        assert!(summary.contains("1 role mappings"), "{summary}");
+        assert!(Config::default().summary().contains("oidc=off"));
+    }
+
+    #[test]
+    fn oidc_needs_both_an_issuer_and_an_audience() {
+        // Half a section is unambiguously a mistake, and the useful moment to
+        // say so is at startup: the alternative is a node that starts, ignores
+        // the section, and refuses every token the provider issues.
+        let mut cfg = valid();
+        cfg.auth.oidc.audience = Some("kimmydb".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("no issuer"), "unhelpful error: {err}");
+        assert!(err.contains("refused"), "the error should say what breaks: {err}");
+
+        let mut cfg = valid();
+        cfg.auth.oidc.issuer = Some("https://auth.example.com".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("audience"), "unhelpful error: {err}");
+        assert!(err.contains("unrelated application"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn a_plaintext_issuer_is_refused() {
+        // The discovery document and the signing keys are fetched from this
+        // URL, so over plaintext anyone on the path can substitute their own
+        // keys — which is a way to mint any identity they like.
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.auth.oidc.issuer = Some("http://auth.example.com".into());
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("not https"), "unhelpful error: {err}");
+        assert!(err.contains("substitute their own keys"), "{err}");
+    }
+
+    #[test]
+    fn a_role_mapping_that_grants_admin_is_refused_at_startup() {
+        // `admin` is reserved to local users as a break-glass boundary: if the
+        // identity provider is misconfigured or taken over, nobody gets
+        // superuser over KimmyDB through it (ADR-067).
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.auth.oidc.role_mappings.push(kimmy_auth::RoleMapping {
+            claim_value: "kimmydb-admin".into(),
+            grants: vec![kimmy_auth::Grant::superuser()],
+        });
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("kimmydb-admin"), "the error should name the mapping: {err}");
+        assert!(err.contains("reserved"), "the error should say what breaks: {err}");
+
+        // Every other action stays mappable — the boundary is `admin` alone.
+        cfg.auth.oidc.role_mappings.pop();
+        cfg.auth.oidc.role_mappings.push(kimmy_auth::RoleMapping {
+            claim_value: "kimmydb-writer".into(),
+            grants: vec![kimmy_auth::Grant::new(
+                "sales",
+                "*",
+                vec![
+                    kimmy_auth::Action::Write,
+                    kimmy_auth::Action::Watch,
+                    kimmy_auth::Action::Webhook,
+                ],
+            )],
+        });
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_role_mapping_naming_an_unknown_action_is_refused_while_the_file_is_read() {
+        // Earlier than `validate`, because an action is a typed enum: the value
+        // cannot even be represented, so the refusal is a parse error. Asserted
+        // anyway, because "is it caught at all" is the question, and the answer
+        // has to include the valid values or the operator is left guessing.
+        let err = toml::from_str::<Config>(
+            "[auth.oidc]\nissuer = \"https://auth.example.com\"\n\
+             [[auth.oidc.role_mappings]]\nclaim_value = \"analyst\"\n\
+             grants = [{ db = \"sales\", collection = \"*\", actions = [\"delet\"] }]\n",
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("delet"), "the error should name the bad value: {err}");
+        assert!(err.contains("read"), "the error should list the valid ones: {err}");
+    }
+
+    #[test]
+    fn an_oidc_section_reads_back_from_toml_as_written() {
+        // The documented shape, exactly as `kimmy.example.toml` shows it. A
+        // renamed field would otherwise be caught only by an operator whose
+        // node refuses to start.
+        let cfg: Config = toml::from_str(
+            "[auth.oidc]\n\
+             issuer = \"https://auth.example.com\"\n\
+             audience = \"kimmydb\"\n\
+             roles_claim = \"roles\"\n\
+             [[auth.oidc.role_mappings]]\n\
+             claim_value = \"kimmydb-analyst\"\n\
+             grants = [{ db = \"sales\", collection = \"orders*\", actions = [\"read\", \"search\"] }]\n",
+        )
+        .unwrap();
+
+        let settings = cfg.auth.oidc.settings().expect("issuer and audience are both set");
+        assert_eq!(settings.issuer, "https://auth.example.com");
+        assert_eq!(settings.audience, "kimmydb");
+        assert_eq!(settings.roles_claim, "roles");
+        assert_eq!(settings.role_mappings.len(), 1);
+        assert_eq!(settings.role_mappings[0].claim_value, "kimmydb-analyst");
+        assert_eq!(settings.role_mappings[0].grants[0].collection, "orders*");
+    }
+
+    #[test]
+    fn federation_is_refused_with_authentication_disabled() {
+        // Every request is already a superuser, so the role mappings would be
+        // enforcing nothing while looking as though they were.
+        let mut cfg = Config::default();
+        cfg.auth.insecure_no_auth = true;
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+
+        cfg.auth.oidc = oidc();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("insecure_no_auth"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_zero_key_refresh_interval_is_refused() {
+        // A node that never re-fetches would refuse every token the moment the
+        // provider rotated its keys.
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.auth.oidc.refresh_interval_secs = 0;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("refresh_interval_secs"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_empty_roles_claim_is_refused() {
+        // It would read no claim, so every federated caller would arrive with
+        // no grants — which looks exactly like a permissions problem.
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.auth.oidc.roles_claim = "  ".into();
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("roles_claim"), "unhelpful error: {err}");
+        assert!(err.contains("groups"), "the error should name the Entra ID case: {err}");
     }
 
     #[test]

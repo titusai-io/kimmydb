@@ -55,7 +55,12 @@ fails fast on a bad volume mount.
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
 | `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
-| `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only |
+| `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only. Refused together with `auth.oidc` |
+| `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | — | Federate with one external OIDC provider. `https` only — the signing keys come down this URL. Setting it obliges `audience` |
+| `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
+| `auth.oidc.roles_claim` | `KIMMY_OIDC_ROLES_CLAIM` | `roles` | `groups` for Entra ID. Getting it wrong is quiet — every federated caller arrives with no grants |
+| `auth.oidc.refresh_interval_secs` | `KIMMY_OIDC_REFRESH_INTERVAL_SECS` | `300` | How often the provider's JWKS is re-fetched. An unknown `kid` triggers one rate-limited refetch besides |
+| `auth.oidc.role_mappings` | — | `[]` | File-only. A claim value and the grants it is worth. **`admin` is refused** — see [Security](security.md) |
 | `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
 | `cluster.seeds` | `KIMMY_SEEDS` | `[]` | Naming seeds implies `enabled` |
@@ -344,6 +349,7 @@ port.
 | `kimmy_replication_lag_seconds` | Seconds of peer oplog history not yet **seen** locally, worst peer in the last sync round. **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero. Measured against what this node has processed rather than what it could re-serve, or entries it correctly discarded would pin it non-zero forever ([ADR-054](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
+| `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
 
 Counters render at zero before their first event, so a dashboard shows "nothing
 has gone wrong yet" rather than "no data".

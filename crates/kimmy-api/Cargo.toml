@@ -33,6 +33,14 @@ tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
+# For the audit tests only: the record's *fields* are the contract a collector
+# reads, and the only way to assert on them is to capture what a subscriber
+# formats. Nothing here ships.
+tracing-subscriber.workspace = true
+# For the stub identity provider the federation tests sign tokens with. A test
+# that needs a real IdP reachable fails for reasons unrelated to what it checks.
+jsonwebtoken.workspace = true
+base64.workspace = true
 kimmy-core.workspace = true
 uuid.workspace = true
 reqwest.workspace = true

@@ -741,3 +741,83 @@ async fn the_query_builders_send_what_they_were_given() {
         .expect("collect_all");
     assert_eq!(all.len(), 3, "every document, across pages of two");
 }
+
+#[tokio::test]
+async fn a_token_provider_supplies_the_token_and_is_asked_again_when_it_stops_working() {
+    // The federated shape. The token comes from outside this client — in a real
+    // deployment from an OIDC provider — so `credentials` cannot produce one and
+    // `/v1/auth/refresh` cannot renew one. The provider is the whole mechanism.
+    let server = Server::start().await;
+
+    // Two tokens: a stale one first, then a live one. Standing in for a
+    // provider whose earlier token has aged out.
+    let stale = "not-a-token".to_string();
+    let live = {
+        let bootstrap = Client::builder(&server.base)
+            .credentials("root", ROOT_PASSWORD)
+            .connect()
+            .await
+            .unwrap();
+        bootstrap.token().await.expect("a token")
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+
+    let client = {
+        let calls = Arc::clone(&calls);
+        Client::builder(&server.base)
+            .token_provider(move || {
+                let calls = Arc::clone(&calls);
+                let (stale, live) = (stale.clone(), live.clone());
+                async move {
+                    let n = calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(if n == 0 { stale } else { live })
+                }
+            })
+            .connect()
+            .await
+            .unwrap()
+    };
+
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "asked once at connect time");
+    assert_eq!(client.token().await.as_deref(), Some("not-a-token"));
+
+    // The stale one is refused, and the client re-asks rather than giving up —
+    // which is the difference between this and a token handed in with `token()`.
+    let databases = client
+        .request(Method::Get, "/v1/databases", None, Safety::Idempotent)
+        .await
+        .expect("the provider's second answer works");
+    assert!(databases["databases"].is_array());
+    assert!(calls.load(Ordering::SeqCst) >= 2, "the provider must be asked again");
+}
+
+#[tokio::test]
+async fn a_federated_token_cannot_be_refreshed_by_the_node_that_accepted_it() {
+    // Refusing here is what keeps the origin flag meaningful: minting a local
+    // token from a federated principal would launder the identity and outlive
+    // the provider's say in it (ADR-065). It is also why `token_provider`
+    // exists rather than the client renewing on its own.
+    let server = Server::start().await;
+    let federation = kimmy_api::Federation::new(
+        kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
+            issuer: "https://auth.example.com".into(),
+            audience: "kimmydb".into(),
+            roles_claim: "roles".into(),
+            role_mappings: Vec::new(),
+        })
+        .unwrap(),
+    );
+    server.state.set_federation(federation);
+
+    // No key set is installed, so no federated token verifies — but the local
+    // path is unchanged, and that is what this asserts about: refresh works for
+    // a local user, and the federated refusal is covered where a signed token
+    // exists (kimmy-api's suite).
+    let client =
+        Client::builder(&server.base).credentials("root", ROOT_PASSWORD).connect().await.unwrap();
+    let refreshed = client
+        .request(Method::Post, "/v1/auth/refresh", None, Safety::Idempotent)
+        .await
+        .expect("a local user still refreshes");
+    assert!(refreshed["token"].is_string());
+}

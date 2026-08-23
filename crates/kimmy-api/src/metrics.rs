@@ -55,6 +55,8 @@ pub struct Metrics {
     cluster_members: AtomicU64,
     tls_reloads_ok: AtomicU64,
     tls_reloads_failed: AtomicU64,
+    jwks_refresh_ok: AtomicU64,
+    jwks_refresh_failed: AtomicU64,
     ttl_expired: AtomicU64,
     ttl_skipped: AtomicU64,
 }
@@ -86,6 +88,8 @@ impl Default for Metrics {
             cluster_members: AtomicU64::new(0),
             tls_reloads_ok: AtomicU64::new(0),
             tls_reloads_failed: AtomicU64::new(0),
+            jwks_refresh_ok: AtomicU64::new(0),
+            jwks_refresh_failed: AtomicU64::new(0),
         }
     }
 }
@@ -218,6 +222,18 @@ impl Metrics {
         counter.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one attempt to refresh the identity provider's signing keys.
+    ///
+    /// The same quiet failure as a certificate reload, one step worse: a node
+    /// that cannot reach its provider keeps verifying tokens perfectly against
+    /// the keys it already has, until the provider rotates and every federated
+    /// caller is refused at once. Nothing about a working request reveals that
+    /// the refresh has been failing for a day (ADR-064).
+    pub fn record_jwks_refresh(&self, succeeded: bool) {
+        let counter = if succeeded { &self.jwks_refresh_ok } else { &self.jwks_refresh_failed };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub fn uptime_secs(&self) -> u64 {
         self.started.elapsed().as_secs()
     }
@@ -285,7 +301,11 @@ impl Metrics {
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
-             kimmy_tls_reloads_total{{outcome=\"failed\"}} {tls_fail}\n",
+             kimmy_tls_reloads_total{{outcome=\"failed\"}} {tls_fail}\n\
+             # HELP kimmy_jwks_refresh_total Attempts to refresh the OIDC provider's signing keys, by outcome. A failed refresh leaves the key set already in use verifying.\n\
+             # TYPE kimmy_jwks_refresh_total counter\n\
+             kimmy_jwks_refresh_total{{outcome=\"ok\"}} {jwks_ok}\n\
+             kimmy_jwks_refresh_total{{outcome=\"failed\"}} {jwks_fail}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -307,6 +327,8 @@ impl Metrics {
             lag = self.get(&self.replication_lag_secs),
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
+            jwks_ok = self.get(&self.jwks_refresh_ok),
+            jwks_fail = self.get(&self.jwks_refresh_failed),
         );
         self.render_latency(&mut out);
         out
@@ -388,8 +410,8 @@ mod tests {
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 21 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 36, "expected one sample per series: {out}");
+        // 23 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 38, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -460,11 +482,19 @@ mod tests {
         m.record_tls_reload(true);
         m.record_tls_reload(false);
         m.record_tls_reload(false);
+        m.record_jwks_refresh(true);
+        m.record_jwks_refresh(true);
+        m.record_jwks_refresh(false);
 
         let out = m.render();
         assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
         assert!(out.contains("kimmy_cluster_members 2"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"failed\"} 2"), "{out}");
+        // A node that stops being able to reach its identity provider keeps
+        // serving until the provider rotates, so the failed count is the only
+        // warning there is (ADR-064).
+        assert!(out.contains("kimmy_jwks_refresh_total{outcome=\"ok\"} 2"), "{out}");
+        assert!(out.contains("kimmy_jwks_refresh_total{outcome=\"failed\"} 1"), "{out}");
     }
 }

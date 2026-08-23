@@ -245,6 +245,19 @@ async fn refresh(State(state): State<SharedState>, auth: Auth) -> Result<Json<Va
             "this node runs with authentication disabled, so there is no token to refresh",
         ));
     }
+    // A federated token is the identity provider's to renew, not this node's.
+    // Refused explicitly rather than left to fail on the user lookup below,
+    // which would report "this token is no longer valid" — true of nothing
+    // here, and it would send the caller to log in again by the wrong route.
+    // Minting a local token from a federated principal is also the one way an
+    // IdP identity could shed its origin flag and outlive the provider's say
+    // in it (ADR-065).
+    if auth.principal().federated {
+        return Err(ApiError::bad_request(
+            "this token came from the external identity provider, which is what renews it; \
+             this node cannot issue a replacement",
+        ));
+    }
 
     let name = &auth.principal().user;
     let user = state

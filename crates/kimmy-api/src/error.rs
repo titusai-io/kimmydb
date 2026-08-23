@@ -350,10 +350,24 @@ impl From<AuthError> for ApiError {
             AuthError::InvalidToken | AuthError::TokenExpired => {
                 ApiError::unauthorized(e.to_string())
             }
+            // Reported to the caller as an ordinary invalid token, with the
+            // key id kept out of the message. Which signing keys this node
+            // has fetched is not something an unauthenticated caller should
+            // learn by guessing, and the caller has nothing to do with the
+            // answer anyway — the refetch it triggers is this node's job.
+            AuthError::UnknownSigningKey(_) => {
+                ApiError::unauthorized("authentication token is invalid")
+            }
             AuthError::Forbidden { .. } => ApiError::forbidden(),
             AuthError::UserNotFound(_) => ApiError::not_found(e.to_string()),
             AuthError::UserExists(_) => ApiError::conflict(e.to_string()),
-            AuthError::WeakSecret { .. } => ApiError::bad_request(e.to_string()),
+            // Both are configuration refusals raised before the server ever
+            // serves, so neither can reach a request. Mapped rather than
+            // matched loosely so that adding a variant stays a compile error
+            // here instead of silently becoming a 400.
+            AuthError::WeakSecret { .. } | AuthError::AdminNotFederatable { .. } => {
+                ApiError::bad_request(e.to_string())
+            }
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");
                 ApiError::internal("authentication failure")

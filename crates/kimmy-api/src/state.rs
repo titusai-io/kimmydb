@@ -47,6 +47,13 @@ pub struct AppState {
     /// add `me` explicitly — the omission that silently undelivered every
     /// clustered webhook (ADR-051).
     pub(crate) members: std::sync::OnceLock<kimmy_cluster::Members>,
+    /// The external identity provider, when one is configured.
+    ///
+    /// Set late for the same reason `members` is: the router is built before
+    /// the task that keeps the key set fresh exists. A `OnceLock` because
+    /// there is one issuer for the life of the process (ADR-064) — federation
+    /// is not something a running node starts or stops doing.
+    pub(crate) federation: std::sync::OnceLock<Arc<crate::federation::Federation>>,
 }
 
 impl AppState {
@@ -65,6 +72,17 @@ impl AppState {
     /// advertised to clients as a node to send credentials to.
     pub fn members(&self) -> Option<&kimmy_cluster::Members> {
         self.members.get()
+    }
+
+    /// Hand the state the external identity provider. Called once, at startup;
+    /// a second call is ignored.
+    pub fn set_federation(&self, federation: Arc<crate::federation::Federation>) {
+        let _ = self.federation.set(federation);
+    }
+
+    /// The external identity provider, if this node federates with one.
+    pub fn federation(&self) -> Option<&Arc<crate::federation::Federation>> {
+        self.federation.get()
     }
 }
 
@@ -97,10 +115,25 @@ impl FromRequestParts<SharedState> for Auth {
             .strip_prefix("Bearer ")
             .ok_or_else(|| ApiError::unauthorized("expected an Authorization: Bearer token"))?;
 
-        let principal = state.tokens.verify(token.trim())?;
+        let token = token.trim();
+
+        // Two verifiers, chosen by the issuer the token *claims* (ADR-064).
+        //
+        // Reading an unverified claim is safe because of what it decides:
+        // which verifier gets to say yes, never whether the answer is yes.
+        // Both verifiers pin their own algorithm and their own key, so a
+        // forged `iss` only sends a token to a verifier that refuses it — and
+        // a token is never offered to both, which is what leaves no
+        // algorithm-confusion surface between them.
+        let principal = match state.federation() {
+            Some(federation) if federation.claims_this_issuer(token) => federation.verify(token)?,
+            _ => state.tokens.verify(token)?,
+        };
+
         // The signature proves the token was issued here and has not expired.
         // It cannot prove the account still exists, is still enabled, or has
-        // not been logged out since — which is this (ADR-052).
+        // not been logged out since — which is this (ADR-052). A federated
+        // principal has no local record to check, and the check knows that.
         state.sessions.check(&state.engine, &principal)?;
         Ok(Auth(principal))
     }

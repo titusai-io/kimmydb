@@ -5,11 +5,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum_server::tls_rustls::RustlsConfig;
-use kimmy_auth::{TokenIssuer, UserStore};
+use kimmy_auth::{JwkSet, OidcVerifier, TokenIssuer, UserStore};
 use kimmy_storage::{Engine, RetentionPolicy};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::config::{AuthConfig, Config};
+use crate::config::{AuthConfig, Config, OidcConfig};
 
 /// Filename of the redb database inside the data directory.
 const DATABASE_FILE: &str = "kimmy.redb";
@@ -140,6 +140,36 @@ pub async fn run(config: Config) -> Result<()> {
         warn!(error = %e.message, "could not register this node in the client topology");
     }
 
+    // Federation, if an external provider is configured. The verifier is
+    // installed *before* anything is served, with no keys in it yet; the keys
+    // arrive from the provider behind the node.
+    //
+    // Deliberately not awaited. A briefly unreachable identity provider must
+    // not stop a database from restarting — during an incident that is exactly
+    // when both are being restarted — so the fetch retries in the background
+    // and local users keep working the whole time. `kimmyd check-config` is
+    // where an operator gets the live answer.
+    let jwks_handle = match config.auth.oidc.settings() {
+        None => None,
+        Some(settings) => {
+            let verifier = OidcVerifier::new(settings).context("configuring the OIDC verifier")?;
+            info!(
+                issuer = verifier.issuer(),
+                audience = verifier.settings().audience,
+                roles_claim = verifier.settings().roles_claim,
+                mappings = verifier.settings().role_mappings.len(),
+                "federating with an external identity provider"
+            );
+            let federation = kimmy_api::Federation::new(verifier);
+            state.set_federation(Arc::clone(&federation));
+            Some(spawn_jwks_refresher(
+                federation,
+                Duration::from_secs(config.auth.oidc.refresh_interval_secs),
+                Arc::clone(&state),
+            ))
+        }
+    };
+
     let gc_handle = spawn_collector(Arc::clone(&engine), &config);
     let cluster = spawn_cluster(Arc::clone(&engine), Arc::clone(&state), &config).await?;
 
@@ -269,6 +299,11 @@ pub async fn run(config: Config) -> Result<()> {
     // Nothing to drain: it holds no state beyond the mtimes it last saw, and
     // the certificate in use is already in the acceptor.
     if let Some(handle) = cert_reloader {
+        handle.abort();
+    }
+    // Likewise the key refresher: an aborted fetch installs nothing, and the
+    // key set already in the verifier is the one that was serving.
+    if let Some(handle) = jwks_handle {
         handle.abort();
     }
     // Holds only a cache, which the next start rebuilds by reading.
@@ -487,6 +522,164 @@ async fn reload(
             );
         }
     }
+}
+
+/// How long a discovery or JWKS request may take before it is a failure.
+///
+/// Short on purpose. The task retries, so a slow provider costs a retry rather
+/// than a task parked on a socket — and an unbounded fetch here would be a
+/// background task that silently stops refreshing keys forever.
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How soon to try again after a failed fetch.
+///
+/// Faster than the configured interval, because the state being recovered from
+/// is different: the interval keeps a working key set current, this is a node
+/// that has not reached its provider at all — possibly since it started, with
+/// every federated caller refused until it does.
+const JWKS_RETRY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Keep the identity provider's signing keys current, forever.
+///
+/// The same shape as the certificate reloader (ADR-049) and for the same
+/// reason: key material rotates *by* something rather than by someone, so there
+/// is nobody to signal. Two triggers, one refetch — the interval, and a nudge
+/// raised when a token names a key id this node has never seen, which is what
+/// makes a rotation between two ticks cost one request rather than a whole
+/// interval of refusals. The nudge is rate-limited inside `Federation`, because
+/// a key id is attacker-controlled.
+///
+/// The swap costs nothing to a request in flight: the verifier it is already
+/// holding keeps working against the key set it was cloned with.
+fn spawn_jwks_refresher(
+    federation: Arc<kimmy_api::Federation>,
+    interval: Duration,
+    state: kimmy_api::SharedState,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let http = match jwks_client() {
+            Ok(http) => http,
+            Err(e) => {
+                // Nothing to retry: this is a builder failure, not a network
+                // one. Federated tokens are refused for the life of the
+                // process, which is worth one loud line rather than a task
+                // that spins.
+                warn!(error = %e, "could not build the HTTP client for OIDC key refresh");
+                return;
+            }
+        };
+        let issuer = federation.issuer();
+
+        loop {
+            let wait = match fetch_jwks(&http, &issuer).await {
+                Ok(keys) => {
+                    let count = keys.keys.len();
+                    federation.install_keys(keys);
+                    state.metrics.record_jwks_refresh(true);
+                    debug!(issuer, keys = count, "refreshed the identity provider's signing keys");
+                    interval
+                }
+                Err(e) => {
+                    state.metrics.record_jwks_refresh(false);
+                    // Loud, because nothing about a working request reveals
+                    // it: the node keeps verifying against the keys it already
+                    // holds until the provider rotates, and then refuses every
+                    // federated caller at once.
+                    warn!(
+                        issuer,
+                        error = %e,
+                        keys = federation.key_count(),
+                        "could not refresh the identity provider's signing keys; keeping the \
+                         key set already in use"
+                    );
+                    JWKS_RETRY_INTERVAL.min(interval)
+                }
+            };
+
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {}
+                _ = federation.refresh_requested() => {
+                    debug!(issuer, "a token named an unknown signing key; re-fetching early");
+                }
+            }
+        }
+    })
+}
+
+/// The HTTP client used for discovery and JWKS.
+///
+/// Its own, not the one webhooks use: the timeouts differ, and an identity
+/// provider is not an endpoint a caller registered.
+pub(crate) fn jwks_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(JWKS_FETCH_TIMEOUT)
+        .build()
+        .context("building the HTTP client for OIDC discovery")
+}
+
+/// Where a provider publishes its discovery document.
+///
+/// Built by concatenation rather than by URL joining, because that is what
+/// RFC 8414 says the location is: the well-known path appended to the issuer,
+/// which for an issuer with a path component is *not* what joining produces.
+pub(crate) fn discovery_url(issuer: &str) -> String {
+    format!("{}/.well-known/openid-configuration", issuer.trim_end_matches('/'))
+}
+
+/// Fetch the provider's current signing keys, through discovery.
+///
+/// Discovery every time rather than the JWKS URI being remembered: a provider
+/// is allowed to move it, and one extra request every few minutes is not worth
+/// a cache that can go stale in a way nothing would report.
+pub(crate) async fn fetch_jwks(http: &reqwest::Client, issuer: &str) -> Result<JwkSet> {
+    let url = discovery_url(issuer);
+    let document: serde_json::Value = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("fetching the discovery document from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching the discovery document from {url}"))?
+        .json()
+        .await
+        .with_context(|| format!("parsing the discovery document from {url}"))?;
+
+    let jwks_uri = document
+        .get("jwks_uri")
+        .and_then(|v| v.as_str())
+        .with_context(|| format!("the discovery document at {url} names no jwks_uri"))?;
+
+    let keys: JwkSet = http
+        .get(jwks_uri)
+        .send()
+        .await
+        .with_context(|| format!("fetching the key set from {jwks_uri}"))?
+        .error_for_status()
+        .with_context(|| format!("fetching the key set from {jwks_uri}"))?
+        .json()
+        .await
+        .with_context(|| format!("parsing the key set from {jwks_uri}"))?;
+
+    // An empty set is treated as a failed fetch, not as a successful one that
+    // happens to trust nothing. Installing it would replace a working key set
+    // with one that refuses every token — a provider mid-deploy must not be
+    // able to lock this node out.
+    if keys.keys.is_empty() {
+        anyhow::bail!("the key set at {jwks_uri} is empty");
+    }
+    Ok(keys)
+}
+
+/// Reach the identity provider once and report what happened.
+///
+/// What `check-config` runs. The server deliberately does *not* do this at
+/// startup — it retries in the background instead — so this is the only place
+/// an operator gets a straight answer about whether the provider is reachable
+/// and its keys are usable, at a moment when they are watching.
+pub async fn probe_oidc(oidc: &OidcConfig) -> Result<usize> {
+    let issuer = oidc.issuer.as_deref().context("no issuer configured")?;
+    let keys = fetch_jwks(&jwks_client()?, issuer).await?;
+    Ok(keys.keys.len())
 }
 
 /// Serve the router, with or without TLS.
@@ -1075,5 +1268,126 @@ mod tests {
         assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {response}");
         let body = response.rsplit("\r\n\r\n").next().unwrap_or_default();
         assert!(body.starts_with("127.0.0.1:"), "handler saw {body:?}");
+    }
+
+    #[test]
+    fn discovery_is_the_well_known_path_appended_to_the_issuer() {
+        // Appended, not URL-joined. RFC 8414 says the path goes on the end of
+        // the issuer, and for an issuer that already has a path — which is how
+        // Keycloak and Entra ID name realms and tenants — joining would drop
+        // it and look for the document at the host root instead.
+        assert_eq!(
+            discovery_url("https://auth.example.com"),
+            "https://auth.example.com/.well-known/openid-configuration"
+        );
+        assert_eq!(
+            discovery_url("https://auth.example.com/realms/kimmy"),
+            "https://auth.example.com/realms/kimmy/.well-known/openid-configuration"
+        );
+        // A trailing slash must not double one, or the provider answers 404.
+        assert_eq!(
+            discovery_url("https://auth.example.com/"),
+            "https://auth.example.com/.well-known/openid-configuration"
+        );
+    }
+
+    /// A stub identity provider: discovery pointing at a key set, both served
+    /// once over plain HTTP.
+    ///
+    /// A stub rather than a live provider on purpose — a test that needs an IdP
+    /// reachable is a test that fails for reasons that have nothing to do with
+    /// this code.
+    async fn stub_idp(jwks_body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let issuer = format!("http://{addr}");
+        let discovery = format!(r#"{{"issuer":"{issuer}","jwks_uri":"{issuer}/keys"}}"#);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = [0u8; 2048];
+                let Ok(read) = socket.read(&mut buf).await else { continue };
+                let request = String::from_utf8_lossy(&buf[..read]).into_owned();
+                let body = if request.contains("/keys") { jwks_body } else { discovery.as_str() };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        issuer
+    }
+
+    /// One RSA public key, in the shape a provider publishes it.
+    const STUB_JWKS: &str = concat!(
+        r#"{"keys":[{"kty":"RSA","alg":"RS256","use":"sig","kid":"stub-key-1","#,
+        r#""n":"skSt8G8fV8ZteU7D70PGq2y5Q_dtHnxjsnGfr054ja_rNuLyQxmniWViaLYLNujpZeHR32dx"#,
+        r#"Fivh_7sZO9RbsgW_umwV1HCO5EEDMIITwoERFyGxMOeWR8m8ow6KDHI4O0J1Y6maNqU6oBCtyhgy"#,
+        r#"-6G91O6q8c2ZzPD7iwSgy1s9uaA88H4w4_sUJ0KIJXO6Kpgo_Qdtm-RHeKG4V_LYWevCfSP9hOUL"#,
+        r#"rEI2X9jIi_P1S4OcGj4ieTtF56TA_lYPVw5lBHtNORyliGq6s0knhOzx5DMlsrWBhv7cD8XgHpK0"#,
+        r#"pU0TVkrUDf_KcCLd3H5uyw7k3RzaK670bmwF1bpskQ","e":"AQAB"}]}"#,
+    );
+
+    #[tokio::test]
+    async fn the_key_set_is_fetched_through_the_discovery_document() {
+        // The whole path an operator depends on: issuer to discovery to
+        // jwks_uri to keys. A provider is free to move the key set, which is
+        // why the jwks_uri is read every time rather than remembered.
+        let issuer = stub_idp(STUB_JWKS).await;
+        let keys = fetch_jwks(&jwks_client().unwrap(), &issuer).await.unwrap();
+
+        assert_eq!(keys.keys.len(), 1);
+        assert_eq!(keys.keys[0].common.key_id.as_deref(), Some("stub-key-1"));
+        assert!(keys.find("stub-key-1").is_some(), "the key must be findable by its id");
+    }
+
+    #[tokio::test]
+    async fn an_empty_key_set_is_a_failed_fetch_rather_than_a_successful_one() {
+        // Installing it would replace a working key set with one that refuses
+        // every token, so a provider mid-deploy could lock this node out.
+        let issuer = stub_idp(r#"{"keys":[]}"#).await;
+        let err = fetch_jwks(&jwks_client().unwrap(), &issuer).await.unwrap_err().to_string();
+
+        assert!(err.contains("empty"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_with_no_jwks_uri_is_reported_as_such() {
+        // The mistake this catches is pointing `issuer` at something that
+        // answers JSON but is not an identity provider.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let issuer = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await;
+        });
+
+        let err = fetch_jwks(&jwks_client().unwrap(), &issuer).await.unwrap_err().to_string();
+        assert!(err.contains("jwks_uri"), "unhelpful error: {err}");
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_provider_leaves_the_key_set_already_in_use() {
+        // The property that lets a node restart while its identity provider is
+        // down: the fetch fails, nothing is installed, and the node serves.
+        let verifier = OidcVerifier::new(kimmy_auth::OidcSettings {
+            issuer: "http://127.0.0.1:1".into(),
+            audience: "kimmydb".into(),
+            roles_claim: "roles".into(),
+            role_mappings: Vec::new(),
+        })
+        .unwrap();
+        let federation = kimmy_api::Federation::new(verifier);
+        federation.install_keys(serde_json::from_str(STUB_JWKS).unwrap());
+
+        assert!(fetch_jwks(&jwks_client().unwrap(), "http://127.0.0.1:1").await.is_err());
+        assert_eq!(federation.key_count(), 1, "a failed fetch must install nothing");
     }
 }

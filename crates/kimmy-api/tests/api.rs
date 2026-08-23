@@ -131,6 +131,33 @@ impl Server {
         Self::build(false, limits).await
     }
 
+    /// A server that also federates with the stub identity provider below.
+    ///
+    /// The provider is a fixed key pair rather than a live IdP: the subject is
+    /// how this node treats a token, and a test that needs somebody's identity
+    /// provider reachable fails for reasons that have nothing to do with it.
+    async fn start_federated() -> Self {
+        let server = Self::build(false, kimmy_api::RateLimits::disabled()).await;
+        let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
+            issuer: oidc::ISSUER.into(),
+            audience: oidc::AUDIENCE.into(),
+            roles_claim: "roles".into(),
+            role_mappings: vec![kimmy_auth::RoleMapping {
+                claim_value: "kimmydb-analyst".into(),
+                grants: vec![kimmy_auth::Grant::new(
+                    "sales",
+                    "orders*",
+                    vec![kimmy_auth::Action::Read],
+                )],
+            }],
+        })
+        .unwrap();
+        let federation = kimmy_api::Federation::new(verifier);
+        federation.install_keys(oidc::jwks());
+        server.state.set_federation(federation);
+        server
+    }
+
     async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
@@ -3354,4 +3381,241 @@ async fn registering_against_a_missing_collection_fails_now_rather_than_silently
         )
         .await;
     assert_eq!(refused.status, 404, "{:?}", refused.body);
+}
+
+// ---------------------------------------------------------------------------
+// Federated identities
+// ---------------------------------------------------------------------------
+
+/// A stand-in identity provider: one fixed key pair, and tokens minted the way
+/// a real provider would mint them.
+mod oidc {
+    use jsonwebtoken::{Algorithm, EncodingKey, Header};
+    use kimmy_auth::{Jwk, JwkSet};
+    use serde_json::{Value, json};
+
+    pub const ISSUER: &str = "https://auth.example.com";
+    pub const AUDIENCE: &str = "kimmydb";
+    pub const KID: &str = "stub-key-1";
+
+    /// A PKCS#8 P-256 private key. Fixed so the tests are deterministic and
+    /// cost no key generation; it signs nothing outside this file.
+    const EC_DER_B64: &str = concat!(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdYt6Sm2yyfFR8Bic5yJIzy6A",
+        "Ra59sojVUjw/3t5rwyOhRANCAASTbia99nDdIMlZG1ND4yE0aYr4lybfQbD2whxMikG8lbsH",
+        "O6OtfLKUpjzwvieZriD+AhtalEtnc1pXO6GvNSrL",
+    );
+
+    fn key() -> EncodingKey {
+        use base64::Engine as _;
+        let der = base64::engine::general_purpose::STANDARD.decode(EC_DER_B64).unwrap();
+        EncodingKey::from_ec_der(&der)
+    }
+
+    /// The public half, as the provider would publish it.
+    pub fn jwks() -> JwkSet {
+        let mut jwk = Jwk::from_encoding_key(&key(), Algorithm::ES256).unwrap();
+        jwk.common.key_id = Some(KID.to_string());
+        JwkSet { keys: vec![jwk] }
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    pub fn claims(subject: &str, roles: Value) -> Value {
+        json!({
+            "sub": subject,
+            "iss": ISSUER,
+            "aud": AUDIENCE,
+            "exp": now() + 3600,
+            "iat": now(),
+            "roles": roles,
+        })
+    }
+
+    /// A token the provider signed.
+    pub fn token(claims: Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_string());
+        jsonwebtoken::encode(&header, &claims, &key()).unwrap()
+    }
+
+    /// A token with a chosen header, signed with a secret rather than the
+    /// provider's key. For the algorithm-confusion cases.
+    pub fn hmac_token(alg: Algorithm, claims: Value, secret: &str) -> String {
+        let mut header = Header::new(alg);
+        header.kid = Some(KID.to_string());
+        jsonwebtoken::encode(&header, &claims, &EncodingKey::from_secret(secret.as_bytes()))
+            .unwrap()
+    }
+
+    /// A syntactically valid token with an RS256 header and a signature that
+    /// verifies against nothing. Enough to reach a verifier's algorithm check,
+    /// which is the subject.
+    pub fn unsigned_with_header(header_json: &str, claims: Value) -> String {
+        use base64::Engine as _;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        format!(
+            "{}.{}.{}",
+            b64.encode(header_json),
+            b64.encode(serde_json::to_vec(&claims).unwrap()),
+            b64.encode(b"not-a-signature"),
+        )
+    }
+}
+
+#[tokio::test]
+async fn a_federated_token_authorizes_exactly_the_grants_its_roles_map_to() {
+    // The end-to-end shape: a token this cluster never issued, verified against
+    // the provider's published key, becomes an ordinary principal that the same
+    // RBAC check answers for.
+    let server = Server::start_federated().await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"salaries"})).await;
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+
+    let allowed = server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await;
+    assert_eq!(allowed.status, 200, "{:?}", allowed.body);
+
+    let denied = server.get("/v1/db/sales/coll/salaries/docs", Some(&token)).await;
+    assert_eq!(denied.status, 403, "the mapping named orders*, not everything");
+
+    let write =
+        server.post("/v1/db/sales/coll/orders/docs", Some(&token), json!({"sku":"widget"})).await;
+    assert_eq!(write.status, 403, "read must not imply write for a federated caller either");
+}
+
+#[tokio::test]
+async fn a_federated_principal_needs_no_local_user_record() {
+    // Revocation asymmetry (ADR-065): there is no `__users` row behind this
+    // identity, and the absence of one is how the session check refuses a
+    // deleted account. Without the skip, every federated request would be
+    // refused as revoked.
+    let server = Server::start_federated().await;
+    let token = oidc::token(oidc::claims("nobody-here@example.com", json!(["kimmydb-analyst"])));
+
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["user"], "nobody-here@example.com");
+    // Flagged, so a client can tell this token apart from a local one — the
+    // provider is free to assert a subject matching a local account.
+    assert_eq!(who.body["federated"], true);
+    assert_eq!(who.body["authenticated"], true);
+
+    // ...and a local token is still the other thing.
+    let local = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
+    assert_eq!(local.body["federated"], false);
+}
+
+#[tokio::test]
+async fn a_federated_identity_with_no_mapped_role_is_authenticated_and_powerless() {
+    // Authenticated but not authorized. The alternative — refusing the token —
+    // reports "your login is broken" for what is really "your administrator has
+    // not given you access to this database".
+    let server = Server::start_federated().await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["some-other-app-role"])));
+
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "the token is good; the grants are empty");
+    assert_eq!(who.body["grants"], json!([]));
+    assert_eq!(server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status, 403);
+}
+
+#[tokio::test]
+async fn a_locally_signed_token_claiming_the_external_issuer_is_refused() {
+    // The routing decision, attacked from the inside. Anyone holding a token
+    // this cluster issued could add `iss` to it — except that changing the
+    // payload breaks the HS256 signature, and a token that *does* carry the
+    // external issuer is sent to the OIDC verifier, which will not accept HS256
+    // and does not hold the cluster secret anyway.
+    let server = Server::start_federated().await;
+    let forged = oidc::hmac_token(
+        jsonwebtoken::Algorithm::HS256,
+        oidc::claims("root", json!(["kimmydb-analyst"])),
+        SECRET,
+    );
+
+    let res = server.get("/v1/auth/whoami", Some(&forged)).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn an_rs256_header_on_the_local_path_is_refused() {
+    // Algorithm confusion, the other direction: a token naming no external
+    // issuer routes to the HS256 verifier, which pins its own algorithm rather
+    // than reading one out of the header.
+    let server = Server::start_federated().await;
+    let mut claims = oidc::claims("root", json!([]));
+    claims.as_object_mut().unwrap().remove("iss");
+    let forged =
+        oidc::unsigned_with_header(r#"{"alg":"RS256","typ":"JWT","kid":"stub-key-1"}"#, claims);
+
+    let res = server.get("/v1/auth/whoami", Some(&forged)).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_token_from_a_third_issuer_is_refused_by_both_verifiers() {
+    // Correctly signed by the provider's key, but naming an issuer this node
+    // does not federate with. It routes to the local path — which does not hold
+    // that key — and is refused there. The point is that "signed by somebody"
+    // is never enough on either path.
+    let server = Server::start_federated().await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims["iss"] = json!("https://some-other-idp.example.com");
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_token_for_another_audience_is_refused() {
+    // The provider signs for every application that trusts it, so only the
+    // audience separates a token minted for the company wiki from one minted
+    // for this database.
+    let server = Server::start_federated().await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims["aud"] = json!("the-company-wiki");
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_token_signed_by_a_key_the_node_has_not_fetched_is_refused_without_naming_it() {
+    // Key rotation reaches the request path as a plain 401: which key ids this
+    // node holds is not something an unauthenticated caller should be able to
+    // learn by guessing. The recovery happens behind the response.
+    let server = Server::start_federated().await;
+    let claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    let token =
+        oidc::unsigned_with_header(r#"{"alg":"ES256","typ":"JWT","kid":"rotated-key-2"}"#, claims);
+
+    let res = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    let message = res.body["error"]["message"].as_str().unwrap_or_default();
+    assert!(!message.contains("rotated-key-2"), "the message must not echo the key id: {message}");
+}
+
+#[tokio::test]
+async fn a_node_without_federation_configured_treats_every_token_as_local() {
+    // The default deployment. Nothing about adding the feature may change what
+    // a node that does not use it does with a token.
+    let server = Server::start().await;
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    assert_eq!(server.get("/v1/auth/whoami", Some(&token)).await.status, 401);
+
+    // ...and a local login still works exactly as it did.
+    let who = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
+    assert_eq!(who.status, 200);
+    assert_eq!(who.body["federated"], false);
 }

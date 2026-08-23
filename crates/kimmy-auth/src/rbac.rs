@@ -124,6 +124,16 @@ pub struct Principal {
     pub grants: Vec<Grant>,
     /// Set when the server runs with `--insecure-no-auth`.
     pub unauthenticated: bool,
+    /// Set when the identity came from the external OIDC provider rather than
+    /// from this cluster's own user store.
+    ///
+    /// Flagged for the same reason `unauthenticated` is: audit output must be
+    /// able to tell these apart. "ada did this" and "somebody the identity
+    /// provider called ada did this" are different claims, and only one of them
+    /// rests on a password this cluster stores. It also decides revocation —
+    /// there is no local record to carry a token version, so the session check
+    /// has nothing to check (ADR-065).
+    pub federated: bool,
     /// The user's token version when this principal was issued a token.
     ///
     /// Carried so a request can be checked against the version the user
@@ -133,7 +143,28 @@ pub struct Principal {
 
 impl Principal {
     pub fn new(user: impl Into<String>, grants: Vec<Grant>) -> Self {
-        Self { user: user.into(), grants, unauthenticated: false, token_version: 0 }
+        Self {
+            user: user.into(),
+            grants,
+            unauthenticated: false,
+            federated: false,
+            token_version: 0,
+        }
+    }
+
+    /// The principal an external identity provider's token authorizes.
+    ///
+    /// No token version, because there is no local record to hold one. What
+    /// ends a federated session is the provider: a short token lifetime, and
+    /// the provider refusing to mint the next one (ADR-065).
+    pub fn federated(user: impl Into<String>, grants: Vec<Grant>) -> Self {
+        Self {
+            user: user.into(),
+            grants,
+            unauthenticated: false,
+            federated: true,
+            token_version: 0,
+        }
     }
 
     /// The same principal, at a stated token version.
@@ -155,6 +186,7 @@ impl Principal {
             user: "insecure-no-auth".into(),
             grants: vec![Grant::superuser()],
             unauthenticated: true,
+            federated: false,
             token_version: 0,
         }
     }
@@ -305,6 +337,23 @@ mod tests {
         assert!(p.can(Action::Admin, "any", Some("thing")));
         assert!(p.unauthenticated, "audit output must be able to tell these apart");
         assert!(!Principal::superuser("root").unauthenticated);
+    }
+
+    #[test]
+    fn a_federated_principal_is_distinguishable_from_a_local_one_of_the_same_name() {
+        // The three origins are three different claims, and an audit reader has
+        // to be able to tell which one it is looking at. A name is not enough:
+        // the identity provider is free to call somebody "root".
+        let federated =
+            Principal::federated("root", vec![Grant::new("db", "*", vec![Action::Read])]);
+        assert!(federated.federated);
+        assert!(!federated.unauthenticated);
+
+        let local = Principal::superuser("root");
+        assert!(!local.federated);
+        assert!(!local.unauthenticated);
+
+        assert!(!Principal::insecure_root().federated);
     }
 
     #[test]

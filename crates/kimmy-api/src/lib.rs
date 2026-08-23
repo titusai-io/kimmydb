@@ -15,6 +15,7 @@ pub mod egress;
 pub mod error;
 pub mod exec;
 pub mod expiry;
+pub mod federation;
 pub mod json;
 pub mod metrics;
 pub mod ownership;
@@ -39,6 +40,7 @@ use kimmy_vector::IndexCache;
 
 pub use audit::AuditMode;
 pub use error::ApiError;
+pub use federation::Federation;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use sessions::Sessions;
@@ -91,6 +93,7 @@ pub fn state_with_egress(
         egress,
         sessions,
         members: std::sync::OnceLock::new(),
+        federation: std::sync::OnceLock::new(),
     }))
 }
 
