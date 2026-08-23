@@ -3435,6 +3435,69 @@ indefinitely. Two functions take an explicit path so the tests never set
 tests in parallel, the same shape as the `include_names` race that cost a round
 to diagnose.
 
+## ADR-076 — Authorization stops at RBAC, and `/metrics` keeps its listener
+
+**Decision.** Two boundaries, stated so they are not re-argued every round.
+
+1. **Authorization stops at role-based access control.** The collection is the
+   finest unit of protection: no document-level filtering, no field masking, no
+   attribute-based rules, and no embedded policy engine — not OPA, not Cedar,
+   not an expression language. First-class named roles, when they arrive, do
+   **not** move this ceiling.
+2. **`/metrics` stays unauthenticated on the main listener.** A separate
+   metrics port was evaluated and is not built.
+
+**Alternatives.** Document- or field-level security, as Elastic sells it. An
+embedded policy engine evaluated at the authorization point. A second bind
+address for `/metrics`, with its own TLS and bind-refusal rules. A startup
+warning for any grant whose `db` pattern ends in `*`.
+
+**Why RBAC is the stopping point.** Roles are the vocabulary every compliance
+framework is already written in — access review, joiner-mover-leaver,
+segregation of duties are all phrased in them — so roles are the thing an
+enterprise buyer is actually asking about, and ABAC is the unusual request. A
+policy engine inside the database would also create a *second* place where
+access is decided, which is precisely what the single authorization decision
+point exists to prevent, and it would put a language nobody can audit at a
+glance in front of every read. A deployment that genuinely needs ABAC is better
+served by it living in an application in front of this one, where the request
+context it needs actually exists.
+
+**Saying "roles do not close this" is the load-bearing half.** The arrival of
+named roles is easy to read as having solved multi-tenancy, and it does not:
+roles govern who holds a permission and how it is administered, not how finely
+the permission cuts. The known-limits table says so in the same words, so the
+two cannot drift.
+
+**Why `/metrics` keeps its listener.** The usual argument for a second port is
+that the metrics surface leaks operational detail. **This one does not carry
+that detail** — it exposes counts and never names, with a golden test over the
+whole render, so no database, collection, user or query text appears. The
+benefit is therefore mostly notional, while the cost is concrete: a second bind
+address, a second TLS decision, its own non-loopback refusal rules, and a fresh
+way to misconfigure a node so that Prometheus silently scrapes nothing.
+Restricting who may reach a port is a question a firewall, a network policy or
+an existing reverse proxy already answers.
+
+**With a stated trigger for revisiting it**, so this is a decision rather than a
+refusal: if `/metrics` ever gains a label carrying a name, the trade inverts and
+the second listener stops being ceremony. Adding such a label and adding the
+listener are one piece of work.
+
+**No warning for a `db` pattern ending in `*`.** The trailing `*` applies to
+database names and matches a prefix, so `sales*` also covers `salesforce` — a
+wider blast radius than most people picture. It is still a legitimate grant,
+`{ "db": "*" }` for an administrator is the commonest one in existence, and a
+warning emitted on every start for something correct is a warning nobody reads
+by the second week. Documented with the habit that avoids the surprise — use a
+separator you control, `sales_*` — and left to the audit log, which names the
+database each decision was made against.
+
+**Cost.** These are commitments, and a prospect who needs field-level security
+is told plainly that this is not the database for that job. That is the cheaper
+answer: the expensive one is implying it might arrive and being asked about it
+every quarter.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

@@ -6,6 +6,35 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-23 — **the boundaries are written down**
+
+Documentation only; no code changed and no test count moved.
+[ADR-076](decisions.md) records the two decisions.
+
+**Authorization stops at RBAC, and the collection is the ceiling.** No
+document- or field-level security, no ABAC, no policy engine. The load-bearing
+sentence is that **named roles will not move that ceiling** — WS5d's arrival is
+otherwise easy to read as having solved multi-tenancy, and it does not. The
+same words appear in the known-limits table and in ADR-076 so the two cannot
+drift apart.
+
+**`/metrics` keeps its unauthenticated place on the main listener.** Evaluated,
+not built, with a stated trigger: **if `/metrics` ever gains a label carrying a
+name, the trade inverts** and the second listener stops being ceremony. Adding
+such a label and adding the listener are one piece of work — do not do the
+first without the second.
+
+**A trailing `*` on a grant's `db` matches a prefix**, so `sales*` covers
+`salesforce` and anything created later with that prefix. Documented, with the
+habit that avoids it (`sales_*`). **Deliberately no startup warning**: it is a
+legitimate grant, `{ "db": "*" }` is the commonest one in existence, and a
+warning on every start for something correct is one nobody reads by the second
+week.
+
+**ADR numbering.** WS5e took **076**, so the numbers now run 071 (WS5a), 072
+(WS5b), 075 (WS5c), 076 (WS5e), with **073 and 074 still reserved for WS5d**.
+An earlier note said WS4's ADRs start at 076 — **they start at 077.**
+
 ## As of 2026-08-23 — **the CLI behaves like an OAuth 2.0 client**
 
 Three conformance fixes in `crates/kimmy-cli/src/main.rs`, none of them
