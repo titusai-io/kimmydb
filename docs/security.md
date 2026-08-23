@@ -479,6 +479,11 @@ escalate grants, wrong-secret signatures, expired tokens, and malformed input.
 
 ## RBAC
 
+Role-based, and that is where authorization stops — the collection is the
+finest unit of protection, and there is no attribute-based layer or policy
+engine beneath it. See [How far authorization goes](#how-far-authorization-goes)
+for what that rules out and why ([ADR-076](decisions.md)).
+
 A grant is a set of actions over a set of collections:
 
 ```json
@@ -533,6 +538,36 @@ graph BT
 
 Deliberately not a full glob. `orders*` and `*` cover the real cases, and richer
 syntax invites patterns whose blast radius is hard to eyeball during an audit.
+
+#### A trailing `*` on `db` is wider than it reads
+
+The same prefix rule applies to the **database** name, and it matches a prefix
+rather than a path segment. So:
+
+```json
+{ "db": "sales*", "collection": "*", "actions": ["read"] }
+```
+
+covers `sales`, and also `sales_archive`, `salesforce`, `sales_2019_backup` —
+**including databases that do not exist yet**. A grant written on Monday keeps
+covering whatever is created on Friday with a name that happens to start the
+same way. That is not a bug, and it is the same rule as `orders*` on a
+collection; it is simply easy to read `sales*` as "the sales databases" when it
+means "every database whose name starts with `sales`".
+
+Two habits make it safe:
+
+- **Name the database exactly** unless you specifically want a family of them.
+  `{ "db": "sales" }` is almost always what was meant.
+- **When you do want a family, give it a separator you control** — `sales_*`
+  rather than `sales*` — so a future `salesforce` does not join it by accident.
+
+There is deliberately **no startup warning** for a `db` pattern ending in `*`.
+It is a legitimate and useful grant, `{ "db": "*" }` for an administrator is
+the commonest one in existence, and a warning on every start for something
+correct is a warning nobody reads by the second week. The audit log names the
+database each decision was made against, which is the thing that actually
+answers "what did this grant end up covering".
 
 ### Database-wide operations
 
@@ -612,10 +647,81 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
-| **No field-level security** | Not planned | Collection is the finest granularity |
+| **No document- or field-level security** | Not planned | Collection is the finest granularity — see [How far authorization goes](#how-far-authorization-goes) |
+| **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
 | **No encryption at rest** | Not planned | Use an encrypted volume |
+| **`/metrics` is unauthenticated on the main listener** | By design | Counts only, never names. Restrict it at the network or a proxy — see [The metrics endpoint](#the-metrics-endpoint) |
 | **No inter-node auth yet** | 📋 M4 | `cluster_secret` is validated at config time but nothing transports data yet |
 | **Grants are not validated against reality** | By design | A grant may name a database that does not exist |
+
+### How far authorization goes
+
+The ceiling is the **collection**. A principal that can read a collection can
+read every document in it, and every field of every document. There is no
+document-level filter, no field masking, no redaction, and no row-level
+security.
+
+**Named roles will not change this.** Roles are about who holds a permission
+and how you administer that; they are not a finer unit of protection. If a
+later release adds first-class roles, the ceiling is still the collection, and
+this entry stays exactly as it reads now. It is written down here because the
+arrival of roles is otherwise easy to mistake for having solved it.
+
+Model around the boundary rather than under it: put data that different people
+may see in **different collections**. That is the unit the system actually
+enforces, and it is enforceable at one decision point instead of on every read
+path.
+
+**Authorization stops at RBAC**, deliberately:
+
+- No attribute-based access control — no rules over document contents, request
+  time, client address or caller attributes.
+- No embedded policy engine, and no plan for one. Not OPA, not Cedar, not an
+  expression language.
+
+That boundary is a choice, not a gap waiting to be filled. Roles are the
+vocabulary every compliance framework is already written in — access reviews,
+joiner-mover-leaver, segregation of duties are all phrased in them — so roles
+are what an enterprise buyer is actually asking about. A policy engine inside
+the database would add a second place where access is decided, which is the
+precise thing [one authorization decision point](#model) exists to prevent, and
+it would put a language nobody can audit at a glance in front of every read.
+Systems that need ABAC are better served by it living in an application in
+front of this one, where it can see the request context this never will.
+
+If you need document- or field-level security, this is not the database for
+that job, and pretending otherwise in the docs would be the more expensive
+answer.
+
+### The metrics endpoint
+
+`/metrics` is served **unauthenticated on the main listener**. It is
+conventional for Prometheus, and it is safe here for a specific reason rather
+than by assumption: the endpoint exposes **counts, never names**. No database,
+collection, user or query text appears in it — a property with a golden test
+over the whole render, so it cannot be lost quietly.
+
+Binding it to a **separate listener** — a second port, typically on an internal
+interface — is a recurring enterprise request, and it is **evaluated and not
+built**. What it buys here is small: the usual argument for a second port is
+that the metrics surface leaks operational detail, and this one does not carry
+the detail that argument is about. What it costs is real: a second bind
+address, its own TLS decision, its own refusal rules for a non-loopback bind,
+and a new way to misconfigure a node such that Prometheus silently scrapes
+nothing.
+
+Restrict it where restrictions already live:
+
+- a firewall or network policy, which is where "who may reach this port" is
+  normally answered;
+- a reverse proxy that serves `/metrics` only to your scrape range, if one is
+  already in front of the node;
+- the container network, if the scraper is a sidecar.
+
+**This will be revisited if `/metrics` ever gains a label carrying a name.** At
+that point the trade changes completely, and the second listener stops being
+ceremony. Adding such a label and adding the listener are the same piece of
+work.
 
 ### Denial of service
 

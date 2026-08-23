@@ -70,6 +70,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   refuse the request. The device flow still defaults to `openid profile`, and
   an explicit `--scope` still wins for either. **If you relied on the old
   default for a service account, pass `--scope` explicitly.**
+- **Documentation only, no behaviour change:** [Security](docs/security.md) now
+  states where authorization stops and why. The collection is the finest unit
+  of protection — no document- or field-level security, no ABAC, no embedded
+  policy engine — and **named roles will not change that ceiling** when they
+  arrive. It also explains that a trailing `*` on a grant's `db` matches a
+  prefix, so `sales*` covers `salesforce` and any database created later with
+  that prefix, and records why `/metrics` keeps its unauthenticated place on
+  the main listener rather than gaining a second port. See
+  [ADR-076](docs/decisions.md).
 
 ### Security
 
