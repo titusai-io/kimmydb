@@ -6,6 +6,38 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-24 — **v0.4.0: roles become objects**
+
+Release prep only — no behaviour changed on this branch. Workspace version
+`0.3.0` → `0.4.0`, and `## Unreleased` retitled to `## 0.4.0`, which is the step
+that has twice nearly shipped empty release notes. Verified rather than
+eyeballed: `dist plan --tag=v0.4.0 --output-format=json` reports a
+2434-character `announcement_changelog` naming both features, and
+`dist generate --check` is clean.
+
+A `0.MINOR` under ADR-062: the round adds features and changes behaviour — a
+role mapping naming neither `role` nor `grants` now stops the node at startup,
+where it was previously accepted and silently granted nothing.
+
+**What it ships:** WS5d, roles as first-class stored objects (ADR-073) and
+`auth.oidc.allow_federated_admin` (ADR-074). This closes the architectural
+asymmetry the WS5 review found — local users carried grants directly on their
+record while federated users got them from an IdP claim, so "analyst" meant one
+thing in a config file and a hand-assembled copy of it on every user record.
+
+**Nothing about the default posture changed.** `allow_federated_admin` is off,
+so a federated principal still cannot hold `admin`, and the test that pins it
+asserts the same answer the live provider ran into when it presented a token
+claiming `roles: ["user", "admin"]`.
+
+**Upgrade notes:** none. No storage migration, no schema bump, and a user
+holding no roles gets exactly what it got before. The one thing an operator
+should check before upgrading is that no existing `[[auth.oidc.role_mappings]]`
+entry is empty — one that names neither `role` nor `grants` is now a startup
+refusal rather than a silent no-op.
+
+---
+
 ## As of 2026-08-24 — **WS5d: roles become objects, and `admin` becomes federatable on request**
 
 Closes the architectural asymmetry the WS5 review found: the system had two
