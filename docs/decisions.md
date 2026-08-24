@@ -3380,6 +3380,142 @@ startup-visible failure; that is the intent, but it will be met as a break by
 anyone who was relying on the mismatch. Both refusals name what was found and
 what was expected, because a byte-level difference is otherwise invisible.
 
+## ADR-073 — A role is one stored object, and role grants union with direct ones
+
+**Decision.** Roles become first-class stored objects, in a `__kimmy.__roles`
+system collection beside `__users`. A user record carries role *names*; a
+`[[auth.oidc.role_mappings]]` entry may name a role instead of, or as well as,
+carrying grants inline. Effective permission is always the **union** of a
+principal's direct grants and its roles' grants.
+
+Editing or deleting a role bumps `token_version` for every local user holding
+it. `Role`, declared since the first RBAC pass and never constructed outside a
+round-trip test, is now the thing this stores.
+
+**Alternatives.** Leave grants copied onto every user record (the state before
+this). Store roles but make them *replace* direct grants rather than add to
+them. Resolve a named role once, when the verifier is built, instead of per
+request.
+
+**Why.** The system had ended up with two authorization models: local users
+carried grants directly, an ACL, while federated users got them from an IdP
+claim, RBAC. "analyst" meant one thing in a config file and a hand-assembled
+copy of that thing on each user record, with nothing keeping the two in
+agreement. That is survivable for a small org and fails an enterprise in three
+specific ways — access review ("who can write to `sales`?" is a full scan of
+every user instead of one lookup), joiner-mover-leaver (edit N records instead
+of one object), and convergence with an IdP that already speaks roles.
+
+**A union, not a replacement.** Kubernetes RBAC is purely additive and Postgres
+unions privileges across role membership, so it is the unsurprising rule — but
+the decisive argument is that it is the only one needing no migration: a user
+holding no roles gets exactly what it got before, so every existing record
+means what it always meant.
+
+**No schema bump, and this is worth stating because the obvious reading is
+wrong.** `UserStore` is not a redb table; it is BSON documents in an ordinary
+system collection, created on demand. A `__roles` collection therefore needs no
+migration, `User.roles` behind `serde(default)` decodes every pre-existing
+record as holding none, and `SCHEMA_VERSION` stays where it was.
+
+**Four consequences that are easy to miss.**
+
+1. **The bump is not optional.** A local user's grants are resolved at login and
+   embedded in its token, so without invalidating holders a *narrowing* edit
+   would take effect only as each token expired — silently contradicting the
+   revocation promise `set_grants` has made since ADR-052.
+2. **The two paths need opposite treatment.** A federated principal has no user
+   record and no token version (ADR-065), and its grants re-resolve from the
+   store on every request, so a role edit already applies to it immediately and
+   it needs no bump. It is easy to read the bump as universal; it is not.
+3. **But federated role *membership* is still stale until the token expires.**
+   This database makes no introspection call, so the `roles` claim is frozen in
+   the access token. If the provider revokes someone's membership, this node
+   honours the old claim for the rest of that token's life. Role *grants*
+   re-resolve per request; role *membership* does not. These two facts are
+   stated next to each other deliberately, because they are easy to conflate —
+   and the auth service made the opposite trade for its own admin surface,
+   re-reading the database on every request. Short token lifetimes are the
+   mitigation.
+4. **A deleted role leaves a dangling name on holders' records**, resolving to
+   nothing. The alternative is rewriting every user record on a delete, and a
+   name that grants nothing is the safe direction to fail in.
+
+**Resolution is per request, not cached at construction.** Pre-resolving the
+mapping table when the verifier is built is the obvious optimisation and it
+silently freezes every federated principal's permissions at startup, so editing
+a role would change nothing until a restart — the opposite of what naming a
+stored role is for. Resolution therefore cannot live in `OidcVerifier`, which
+does no I/O by design; it happens in the `Auth` extractor, the first place that
+holds both the names and the engine.
+
+**The audit record carries the roles *held*, not the role that decided.** Grants
+are a union and more than one role can supply the same permission, so "the
+deciding role" is not well defined — which grant `can` happened to match first
+is an implementation detail, not a fact worth putting in an audit record. The
+names matter most for a federated caller, where there is no user record to read
+the association back from later.
+
+**A note on vocabulary.** A provider typically enforces a small fixed set of
+role names at client registration — the one this deployment federates with
+allows exactly `admin`, `developer` and `user` — so a KimmyDB-specific
+`claim_value` may simply be unregistrable. Named roles are a **mapping target**,
+not a mirror of the provider's vocabulary, and all the interesting granularity
+lives here. That is an argument for this decision rather than against it.
+
+**Cost.** Invalidating holders is a scan of every user record, because there is
+no index from role to holder. That is the honest cost of the storage shape, and
+a role edit is an administrative action rather than a request-path one. Roles
+also do not move the ceiling ADR-076 set: the collection is still the finest
+unit of protection, and this changes who holds a permission and how it is
+administered, not how finely it cuts.
+
+## ADR-074 — `admin` is federatable, but only when asked for
+
+**Decision.** `auth.oidc.allow_federated_admin`, default `false`. With it off —
+the behaviour that shipped — a federated principal can never hold `admin`,
+enforced in two places because there are two ways to ask for it: an inline
+mapping naming `admin` is refused at startup, and a stored role that resolves to
+`admin` has that action dropped where the role is resolved. With it on, both are
+permitted and the node says so in its startup summary.
+
+**Alternatives.** Keep ADR-067's absolute refusal. Allow it unconditionally.
+Refuse the whole request when a federated principal's role carries `admin`,
+rather than dropping the action.
+
+**Why not keep the absolute refusal.** ADR-067 is well reasoned for a small org
+and it makes the enterprise deployment *impossible*, not merely awkward: large
+organisations run joiner-mover-leaver, and auditors specifically flag privileged
+local accounts living outside the IdP — which the rule requires. MinIO, Vault,
+Grafana and Elasticsearch all allow mapping a group to admin; the canonical
+break-glass pattern is to allow the mapping and separately keep an emergency
+local account, not to forbid it.
+
+**Why the default does not change.** The boundary was tested rather than
+reasoned about: a device-flow token from the live provider came back asserting
+`roles: ["user", "admin"]`, and this node granted only what the `user` mapping
+said — `GET /v1/users` 403, an out-of-scope write 403. That is the answer the
+default must keep giving, and this flag is the only thing that changes it.
+
+**Why the check moved to resolution time.** A startup check is sufficient for an
+inline mapping, which cannot change while the process runs. It is *not*
+sufficient for a stored role, which can be edited to include `admin` at any
+time — a startup-only check would enforce a rule that stops being true minutes
+later. So the named-role half is enforced where the role is resolved, on every
+request.
+
+**Why drop the action rather than refuse the request.** A role is shared with
+the local users who hold it, and some of them legitimately have `admin`.
+Failing the whole request would take away a federated caller's unrelated,
+legitimate grants in order to withhold a permission it was never going to be
+given anyway. The action is dropped, a grant left empty by that is discarded,
+and the node warns once per process rather than once per request.
+
+**Cost.** An operator who turns this on has moved a real security boundary, and
+a compromised or misconfigured provider can then produce a superuser over this
+database. The mitigation is that it cannot happen quietly: it is a config file
+change, and the node names it at every start.
+
 ## ADR-075 — The CLI caches an access token only when asked, and never a refresh token
 
 **Decision.** `kimmy login --cache-token` (or `KIMMY_TOKEN_CACHE`) stores the

@@ -222,6 +222,24 @@ Keeping `admin` local means the answer to "the IdP has been taken over" is still
 
 Every other action — `read`, `write`, `watch`, `search`, `webhook` — maps freely.
 
+**`auth.oidc.allow_federated_admin` is what changes this**, and it defaults to
+`false`, which is exactly the behaviour above. It exists because the absolute
+refusal makes a large deployment impossible rather than merely awkward: an
+organisation running joiner-mover-leaver has auditors who specifically flag
+privileged local accounts living outside the IdP — which the rule requires.
+MinIO, Vault, Grafana and Elasticsearch all allow mapping a group to admin; the
+canonical pattern is to allow it and *separately* keep an emergency local
+account, not to forbid it ([ADR-074](decisions.md)).
+
+With the flag off the boundary is enforced in two places, because there are two
+ways to ask for it: an inline mapping naming `admin` stops the node at startup,
+and a **stored role** that resolves to `admin` has that action dropped when the
+role is resolved. The second check cannot live at startup — a role is editable
+while the node runs — and it drops the action rather than failing the request,
+because the same role is shared with local users who legitimately hold `admin`.
+
+Turning it on is not quiet: the node names it in the startup summary every time.
+
 ### A role that maps to nothing
 
 ...is a principal with **zero grants**, not a refusal. It authenticated; it is
@@ -499,6 +517,61 @@ A grant is a set of actions over a set of collections:
 | `webhook` | Register an endpoint the node pushes change events to |
 | `admin` | Create/drop collections, manage users |
 
+### Named roles
+
+A grant can be written straight onto a user record, and it can also live in a
+**role** — one named set of grants that several principals point at:
+
+```bash
+curl -XPOST localhost:7878/v1/roles -H "$A" -d '{
+  "name": "analyst",
+  "grants": [{"db":"sales","collection":"orders*","actions":["read","search"]}]
+}'
+curl -XPOST localhost:7878/v1/users/ada/roles -H "$A" -d '{"roles":["analyst"]}'
+```
+
+A federated principal reaches the same role by naming it in a mapping rather
+than repeating its grants:
+
+```toml
+[[auth.oidc.role_mappings]]
+claim_value = "developer"
+role = "analyst"
+```
+
+**Role grants and direct grants are a union, always.** Effective permission is
+everything a principal holds directly plus everything its roles carry; a role
+never replaces or narrows a direct grant. A user holding no roles gets exactly
+what it got before roles existed ([ADR-073](decisions.md)).
+
+**Editing or deleting a role revokes the live tokens of every local user
+holding it**, and the response says how many accounts that was. Without it a
+*narrowing* edit would take effect only as each token expired, which would
+quietly break the revocation promise that setting a user's grants has always
+made. Creating a role cannot narrow anything, so it revokes nothing.
+
+**Federated principals are the opposite case, and both halves matter:**
+
+- Their grants are resolved from the role store on **every request**, so an edit
+  to a role applies on their next call with no restart and no revocation needed.
+- Their *membership* is not. The `roles` claim is frozen in the provider's
+  access token and this database makes no introspection call, so if the provider
+  revokes someone's membership, this node honours the old claim until that token
+  expires. Short access-token lifetimes are the mitigation.
+
+**Deleting a role leaves its name on holders' records**, where it resolves to
+nothing — as does a mapping naming a role that was never created. The
+alternative is rewriting every user record on a delete, and a name that grants
+nothing is the safe direction to fail in.
+
+Managing roles requires `admin` over `*`, the same bar as managing users:
+whoever may edit a role may hand out everything it names.
+
+**What roles do not change.** They govern *who holds* a permission and how it is
+administered. They do not move the ceiling above — the collection is still the
+finest unit of protection, and named roles do not add document- or field-level
+security. See [How far authorization goes](#how-far-authorization-goes).
+
 ### Implication
 
 ```mermaid
@@ -661,11 +734,12 @@ read every document in it, and every field of every document. There is no
 document-level filter, no field masking, no redaction, and no row-level
 security.
 
-**Named roles will not change this.** Roles are about who holds a permission
-and how you administer that; they are not a finer unit of protection. If a
-later release adds first-class roles, the ceiling is still the collection, and
-this entry stays exactly as it reads now. It is written down here because the
-arrival of roles is otherwise easy to mistake for having solved it.
+**Named roles did not change this.** Roles are about who holds a permission and
+how you administer that; they are not a finer unit of protection. They have
+since arrived — see [Named roles](#named-roles) — and this entry reads exactly
+as it did when they had not, which is the point of having written it in advance.
+The ceiling is still the collection. It is written down here because the arrival
+of roles is otherwise easy to mistake for having solved it.
 
 Model around the boundary rather than under it: put data that different people
 may see in **different collections**. That is the unit the system actually

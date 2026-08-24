@@ -136,6 +136,15 @@ pub fn record(
     }
 
     let collection = collection.unwrap_or("*");
+    // The roles held, not "the role that decided". Grants are a union and more
+    // than one role can supply the same permission, so a single deciding role
+    // is not well defined — which one `can` happened to match first is an
+    // implementation detail, not a fact worth putting in an audit record.
+    //
+    // It matters most for a federated caller: there is no user record here to
+    // read the answer back from later, so this line is the only place that
+    // association is ever recoverable.
+    let roles = principal.roles.join(",");
     // `unauthenticated` distinguishes "root did this" from "the server was
     // started with authentication disabled", and `federated` distinguishes
     // both from "somebody the identity provider called root did this" — which
@@ -148,6 +157,7 @@ pub fn record(
             user = %principal.user,
             unauthenticated = principal.unauthenticated,
             federated = principal.federated,
+            roles = %roles,
             action = ?action,
             db = %db,
             collection = %collection,
@@ -160,6 +170,7 @@ pub fn record(
             user = %principal.user,
             unauthenticated = principal.unauthenticated,
             federated = principal.federated,
+            roles = %roles,
             action = ?action,
             db = %db,
             collection = %collection,

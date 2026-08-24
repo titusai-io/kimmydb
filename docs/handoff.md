@@ -6,6 +6,60 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-24 — **WS5d: roles become objects, and `admin` becomes federatable on request**
+
+Closes the architectural asymmetry the WS5 review found: the system had two
+authorization models in it. Local users carried grants directly on their record
+— an ACL, copied onto every principal — while federated users got them from an
+IdP claim through `[[auth.oidc.role_mappings]]`, which is RBAC. "analyst" meant
+one thing in a config file and a hand-assembled copy of that thing on each user
+record, with nothing keeping the two in agreement.
+
+A role is now one stored object both paths point at. `Role`, declared since the
+first RBAC pass and never constructed outside a round-trip test, is finally the
+thing this stores. ADR-073 and ADR-074.
+
+**No storage migration, and the obvious reading is wrong.** `UserStore` is not a
+redb table — users are BSON documents in an ordinary system collection created
+on demand — so `__roles` needs no migration, `User.roles` behind
+`serde(default)` decodes every existing record as holding none, and
+`SCHEMA_VERSION` stays at 3. An earlier plan for this branch specified a 3 → 4
+bump; following it would have added a migration for nothing.
+
+**Three things worth carrying forward:**
+
+- **Resolution is per request, and that is the whole feature.** Pre-resolving
+  the mapping table when the verifier is built is the obvious cache, and it
+  silently freezes every federated principal's permissions at startup so a role
+  edit changes nothing until a restart. `OidcVerifier` does no I/O by design, so
+  resolution lives in the `Auth` extractor — the first place holding both the
+  role names and the engine. There is a test that fails if you cache it.
+- **`allow_federated_admin`'s check had to move to resolution time too.** A
+  startup refusal is enough for an inline mapping, which cannot change while the
+  process runs. It is not enough for a stored role, which can be edited to
+  include `admin` minutes after the node booted. Off by default, so nothing
+  about the shipped posture changed — the boundary a live provider asserting
+  `roles: ["user", "admin"]` ran into still holds.
+- **The documentation contract earns its keep.** Registering four routes failed
+  three separate tests: absent from `docs/http-api.md`, absent from
+  `docs/openapi.yaml`, and — the one worth having — documented in the spec with
+  nothing driving them. The last forced real coverage rather than a spec entry.
+
+**Every new test was checked against its own removal**, not merely observed to
+pass: disabling the admin filter makes the federated-admin test return 200 where
+it expects 403, and making role resolution a no-op fails both resolution tests.
+
+`invalidate_holders_of_role` now returns the holder *names* rather than a count.
+Bumping the stored token version is only half a revocation — the session check
+reads a cache in front of it — and a caller cannot evict from that cache with a
+number.
+
+**Still open:** WS4, which the maintainer rescoped on 2026-08-24 to a documented
+client-library pattern rather than engine features, and the resource identifier's
+public hostname not resolving while the 401 challenge points at it.
+
+---
+
 ## As of 2026-08-23 — **v0.3.0: the OAuth 2.0 round, and the first release validated against a real provider**
 
 Release prep only — no behaviour changed on this branch. Workspace version

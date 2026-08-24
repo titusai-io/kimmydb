@@ -20,6 +20,7 @@ pub mod json;
 pub mod metrics;
 pub mod ownership;
 pub mod ratelimit;
+pub mod roles;
 pub mod routes;
 pub mod schema;
 pub mod sessions;

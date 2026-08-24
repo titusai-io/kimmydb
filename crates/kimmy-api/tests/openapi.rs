@@ -797,6 +797,44 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     )
     .await;
 
+    // -- roles -------------------------------------------------------------
+    c.check(
+        "POST",
+        "/v1/roles",
+        "/v1/roles",
+        Some(&root),
+        Some(json!({
+            "name": "reader",
+            "grants": [{ "db": "shop", "collection": "orders*", "actions": ["read"] }],
+        })),
+        201,
+    )
+    .await;
+    c.check("GET", "/v1/roles", "/v1/roles", Some(&root), None, 200).await;
+    c.check("GET", "/v1/roles/{name}", "/v1/roles/reader", Some(&root), None, 200).await;
+    c.check(
+        "POST",
+        "/v1/users/{name}/roles",
+        "/v1/users/clerk/roles",
+        Some(&root),
+        Some(json!({ "roles": ["reader"] })),
+        200,
+    )
+    .await;
+    // The holder is reported, which is what makes the revocation observable to
+    // the caller rather than only to whoever reads the log.
+    let narrowed = c
+        .check(
+            "POST",
+            "/v1/roles/{name}/grants",
+            "/v1/roles/reader/grants",
+            Some(&root),
+            Some(json!({ "grants": [] })),
+            200,
+        )
+        .await;
+    assert_eq!(narrowed["invalidated"], 1, "the holder's tokens are revoked: {narrowed}");
+
     // -- databases and collections ----------------------------------------
     c.check(
         "POST",
@@ -1076,6 +1114,11 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     )
     .await;
     c.check("DELETE", by_id_t, "/v1/db/shop/coll/orders/docs/b", Some(&root), None, 200).await;
+    // Deleted while `clerk` still holds it, so the revocation is exercised
+    // rather than trivially zero — and `clerk` keeps the dangling name.
+    let dropped =
+        c.check("DELETE", "/v1/roles/{name}", "/v1/roles/reader", Some(&root), None, 200).await;
+    assert_eq!(dropped["invalidated"], 1, "the holder's tokens are revoked: {dropped}");
     c.check("DELETE", "/v1/users/{name}", "/v1/users/clerk", Some(&root), None, 200).await;
     c.check("DELETE", "/v1/db/{db}/coll/{coll}", "/v1/db/shop/coll/orders", Some(&root), None, 200)
         .await;

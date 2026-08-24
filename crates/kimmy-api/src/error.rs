@@ -359,14 +359,19 @@ impl From<AuthError> for ApiError {
                 ApiError::unauthorized("authentication token is invalid")
             }
             AuthError::Forbidden { .. } => ApiError::forbidden(),
-            AuthError::UserNotFound(_) => ApiError::not_found(e.to_string()),
-            AuthError::UserExists(_) => ApiError::conflict(e.to_string()),
+            AuthError::UserNotFound(_) | AuthError::RoleNotFound(_) => {
+                ApiError::not_found(e.to_string())
+            }
+            AuthError::UserExists(_) | AuthError::RoleExists(_) => {
+                ApiError::conflict(e.to_string())
+            }
             // Both are configuration refusals raised before the server ever
             // serves, so neither can reach a request. Mapped rather than
             // matched loosely so that adding a variant stays a compile error
             // here instead of silently becoming a 400.
             AuthError::WeakSecret { .. }
             | AuthError::AdminNotFederatable { .. }
+            | AuthError::EmptyRoleMapping { .. }
             | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");

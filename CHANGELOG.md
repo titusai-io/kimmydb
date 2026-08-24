@@ -10,6 +10,52 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **Roles are first-class stored objects.** A role is one named set of grants
+  that several principals point at, managed at `/v1/roles` and assigned with
+  `POST /v1/users/{name}/roles`. Both halves of the system can now reach the
+  same definition: a local user names a role on its record, and an
+  `[[auth.oidc.role_mappings]]` entry can name one with `role = "analyst"`
+  instead of repeating its grants inline. Requires `admin` over `*`, the same
+  bar as managing users.
+
+  **Role grants are added to a principal's direct grants, never a replacement** —
+  effective permission is the union of the two, so a user holding no roles is
+  completely unaffected. No storage migration and no on-disk schema bump: roles
+  live in an ordinary system collection created on demand, and user records
+  written before this decode as holding no roles. See ADR-073.
+
+- **`auth.oidc.allow_federated_admin`**, default `false`. With it off — the
+  behaviour that shipped in 0.2.0 — a federated principal can never hold
+  `admin`. It exists because that absolute refusal makes a large deployment
+  impossible rather than awkward: auditors flag the privileged local accounts
+  outside the IdP that the rule requires. Turning it on is announced in the
+  startup summary every time. See ADR-074.
+
+### Changed
+
+- **Editing or deleting a role revokes the live tokens of every local user
+  holding it**, and the response reports how many accounts that was. Without it
+  a *narrowing* edit would take effect only as each token expired. Federated
+  principals need no such revocation and are not counted: their grants resolve
+  from the role store on every request, so an edit reaches them on their next
+  call. Their role *membership* is a different matter — it is frozen in the
+  provider's access token until that token expires.
+
+- **The audit record carries the roles a principal held.** The roles held, not
+  "the role that decided": grants are a union and more than one role can supply
+  the same permission. It matters most for a federated caller, where there is no
+  local record to recover the association from afterwards.
+
+- **A role mapping naming neither `role` nor `grants` now stops the node at
+  startup.** It could never have granted anything, so it was a typo — and the
+  failure it produced instead was a caller who authenticated and was then
+  authorized for nothing, with no indication that the configuration was at
+  fault.
+
 ## 0.3.0 - 2026-08-23
 
 ### Added

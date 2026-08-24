@@ -126,7 +126,18 @@ impl FromRequestParts<SharedState> for Auth {
         // a token is never offered to both, which is what leaves no
         // algorithm-confusion surface between them.
         let principal = match state.federation() {
-            Some(federation) if federation.claims_this_issuer(token) => federation.verify(token)?,
+            Some(federation) if federation.claims_this_issuer(token) => {
+                let mut principal = federation.verify(token)?;
+                // The one asymmetry between the two paths. A local token was
+                // issued from a user record, so its grants were resolved once
+                // at login and are already complete. A federated principal has
+                // no record here, so the roles its claims named are still just
+                // names — and they are resolved *here*, on every request,
+                // because this is the first place that holds both the names and
+                // the engine (ADR-073).
+                resolve_roles(state, federation, &mut principal)?;
+                principal
+            }
             _ => state.tokens.verify(token)?,
         };
 
@@ -137,6 +148,67 @@ impl FromRequestParts<SharedState> for Auth {
         state.sessions.check(&state.engine, &principal)?;
         Ok(Auth(principal))
     }
+}
+
+/// Resolve a federated principal's named roles into grants.
+///
+/// Per request, and that is the whole point: the alternative — resolving the
+/// mapping table once when the verifier is built — looks like an obvious cache
+/// and silently freezes every federated principal's permissions at startup, so
+/// editing a role would change nothing until the node was restarted. That is
+/// the opposite of what naming a stored role is for.
+///
+/// A name that resolves to nothing contributes nothing, which is how a deleted
+/// role behaves for the users still naming it.
+fn resolve_roles(
+    state: &SharedState,
+    federation: &crate::federation::Federation,
+    principal: &mut Principal,
+) -> Result<(), ApiError> {
+    if principal.roles.is_empty() {
+        return Ok(());
+    }
+    let mut grants = state.users.roles().grants_for(&state.engine, &principal.roles)?;
+
+    // The named-role half of ADR-067's break-glass boundary. The inline half is
+    // a startup refusal, but a *stored* role can be edited to include `admin`
+    // at any time, so the only place this can be enforced honestly is here.
+    //
+    // Filtered rather than refused: a role is shared with the local users who
+    // hold it, and some of them legitimately have `admin`. Failing the whole
+    // request would take away a federated caller's unrelated, legitimate grants
+    // to punish a permission it was never going to be given anyway.
+    if !federation.allow_federated_admin() {
+        for grant in &mut grants {
+            if grant.actions.contains(&Action::Admin) {
+                warn_federated_admin_dropped(&principal.user);
+                grant.actions.retain(|a| *a != Action::Admin);
+            }
+        }
+        // A grant stripped down to nothing is dropped rather than kept as an
+        // empty rule, so `can` has nothing to iterate that could never match.
+        grants.retain(|g| !g.actions.is_empty());
+    }
+
+    principal.extend_grants(grants);
+    Ok(())
+}
+
+/// Warn once per process, not per request.
+///
+/// This fires on a request path, and an operator who has mapped a claim to a
+/// role that carries `admin` would otherwise get one line per call for as long
+/// as the node runs. Once is enough to explain why a caller is being told no.
+fn warn_federated_admin_dropped(user: &str) {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        warn!(
+            user = %user,
+            "a role held by a federated principal grants the `admin` action, which was dropped: \
+             `admin` is reserved to local users (ADR-067). Set auth.oidc.allow_federated_admin = \
+             true to permit it."
+        );
+    });
 }
 
 /// The address a request appears to come from, as a rate-limiting key.

@@ -102,6 +102,14 @@ impl Federation {
         }))
     }
 
+    /// Whether a federated principal may hold `admin` (ADR-074).
+    ///
+    /// Read per request rather than captured once, because it decides what a
+    /// *stored* role is worth and stored roles change while the node runs.
+    pub fn allow_federated_admin(&self) -> bool {
+        self.verifier.read().settings().allow_federated_admin
+    }
+
     /// How many signing keys are currently trusted. Zero until the first fetch
     /// lands, which is a state the node serves in rather than refusing to start.
     pub fn key_count(&self) -> usize {
@@ -197,9 +205,11 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: vec![RoleMapping {
                 claim_value: "kimmydb-analyst".into(),
+                role: None,
                 grants: vec![Grant::new("sales", "orders*", vec![Action::Read])],
             }],
             require_at_jwt: false,
+            allow_federated_admin: false,
         }
     }
 

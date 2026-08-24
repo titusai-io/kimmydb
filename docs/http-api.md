@@ -45,6 +45,10 @@ has been incomplete before.
 | `GET` `DELETE` | `/v1/users/{name}` | server admin |
 | `POST` | `/v1/users/{name}/password` | own account, or server admin |
 | `POST` | `/v1/users/{name}/grants` | server admin |
+| `POST` | `/v1/users/{name}/roles` | server admin |
+| `GET` `POST` | `/v1/roles` | server admin |
+| `GET` `DELETE` | `/v1/roles/{name}` | server admin |
+| `POST` | `/v1/roles/{name}/grants` | server admin |
 | `GET` | `/v1/databases` | `read` (filtered) |
 | `GET` `POST` | `/v1/db/{db}/collections` | `read` (filtered) / `admin` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}` | `admin` |
@@ -335,6 +339,36 @@ curl localhost:7878/v1/users/analyst -H "$A"               # inspect
 curl -XDELETE localhost:7878/v1/users/analyst -H "$A"
 curl -XPOST localhost:7878/v1/users/analyst/password -H "$A" -d '{"password":"new-password"}'
 curl -XPOST localhost:7878/v1/users/analyst/grants   -H "$A" -d '{"grants":[…]}'
+curl -XPOST localhost:7878/v1/users/analyst/roles    -H "$A" -d '{"roles":["reader"]}'
+```
+
+### Roles
+
+A role is one named set of grants that both local users and federated
+principals can point at, instead of the same permissions being copied onto
+every user record. Role grants are **added to** a user's direct grants — the
+effective permission is the union of the two, never a replacement.
+
+Editing or deleting a role revokes the live tokens of every local user holding
+it, and the response says how many accounts that was. Without it a *narrowing*
+edit would take effect only as each token expired. Federated principals need no
+such revocation: their grants are resolved from the role store on every
+request, so an edit applies to them on the next call. What stays stale for them
+is role *membership*, which is frozen in the provider's token until it expires.
+
+Deleting a role leaves its name on holders' records, where it resolves to
+nothing.
+
+```bash
+curl -XPOST localhost:7878/v1/roles -H "$A" -d '{
+  "name": "reader",
+  "grants": [{"db":"sales","collection":"orders*","actions":["read","search"]}]
+}'
+
+curl localhost:7878/v1/roles -H "$A"                 # list
+curl localhost:7878/v1/roles/reader -H "$A"          # inspect
+curl -XPOST localhost:7878/v1/roles/reader/grants -H "$A" -d '{"grants":[…]}'
+curl -XDELETE localhost:7878/v1/roles/reader -H "$A"
 ```
 
 Passwords must be at least 8 characters. Password hashes are never returned. A
