@@ -371,6 +371,7 @@ impl From<AuthError> for ApiError {
             // here instead of silently becoming a 400.
             AuthError::WeakSecret { .. }
             | AuthError::AdminNotFederatable { .. }
+            | AuthError::EmptyRoleMapping { .. }
             | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");

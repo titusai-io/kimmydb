@@ -56,16 +56,46 @@ pub const PROTECTED_RESOURCE_METADATA_PATH: &str = "/.well-known/oauth-protected
 
 /// One value of the roles claim, and what holding it grants.
 ///
-/// Grants are written inline in the configuration file rather than looked up in
-/// a table this database owns (ADR-066), so the whole mapping is one thing an
-/// operator can read and diff.
+/// Two ways to say it, and a mapping may use either or both (ADR-073). Inline
+/// [`grants`](Self::grants) are the original form (ADR-066): the whole mapping
+/// is one thing an operator can read and diff, and changing it is a restart.
+/// A [`role`](Self::role) names a role stored in this database, which is
+/// editable at runtime and shared with local users, so one definition serves
+/// both paths.
+///
+/// Inline grants keep working unchanged because configurations written against
+/// ADR-066 are already deployed. This is an addition, not a replacement.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RoleMapping {
     /// The value that must appear in the roles claim, verbatim.
+    ///
+    /// Note this is the *provider's* vocabulary, not this database's. A
+    /// provider typically enforces a small fixed set of role names at client
+    /// registration, so a KimmyDB-specific value here may simply be
+    /// unregistrable — which is the argument for naming a stored role and
+    /// keeping the granularity on this side.
     pub claim_value: String,
-    /// What that value is worth here.
+    /// A role stored in this database, whose grants this value earns.
+    ///
+    /// Resolved on **every request**, not once when the verifier is built, so
+    /// an edit to the role takes effect on the next call rather than at the
+    /// next restart. That resolution cannot happen here — see
+    /// [`OidcVerifier::grants_for`], which has no I/O and must not gain any.
+    pub role: Option<String>,
+    /// What that value is worth here, written inline.
     pub grants: Vec<Grant>,
+}
+
+impl RoleMapping {
+    /// Whether this mapping could ever grant anything.
+    ///
+    /// A mapping with neither form is a typo, not a policy — nobody writes a
+    /// deliberate no-op into a config file — so it is refused at startup rather
+    /// than becoming a rule that silently does nothing.
+    fn is_empty(&self) -> bool {
+        self.role.is_none() && self.grants.is_empty()
+    }
 }
 
 /// What this node trusts about one external issuer.
@@ -102,6 +132,24 @@ pub struct OidcSettings {
     /// them and the real check for anyone whose provider mints an opaque
     /// audience.
     pub require_at_jwt: bool,
+    /// Let a federated principal hold the `admin` action (ADR-074).
+    ///
+    /// **Off by default, which is exactly today's behaviour.** ADR-067 reserved
+    /// `admin` to local users so that a misconfigured or compromised identity
+    /// provider could not mint a superuser over this database, and that remains
+    /// the right default. The flag exists because it also made the enterprise
+    /// deployment impossible: large organisations run joiner-mover-leaver, and
+    /// auditors flag privileged local accounts that live outside the IdP. The
+    /// canonical pattern elsewhere — MinIO, Vault, Grafana, Elasticsearch — is
+    /// to allow the mapping and *separately* keep an emergency local account,
+    /// not to forbid it.
+    ///
+    /// When off, this is enforced twice, because there are two ways to say it:
+    /// an inline mapping naming `admin` is refused at startup, and a *stored*
+    /// role that resolves to `admin` has that action dropped at resolution
+    /// time. The second check cannot be moved to startup — a role is editable
+    /// while the process runs.
+    pub allow_federated_admin: bool,
 }
 
 impl OidcSettings {
@@ -162,12 +210,26 @@ impl OidcSettings {
         }
 
         for mapping in &self.role_mappings {
+            if mapping.is_empty() {
+                return Err(AuthError::EmptyRoleMapping {
+                    claim_value: mapping.claim_value.clone(),
+                });
+            }
             // `admin` is reserved to local users as a break-glass boundary
             // (ADR-067). If the identity provider is misconfigured or taken
             // over, nobody gets superuser over KimmyDB through it — so a
             // mapping that would hand it out stops the node at startup rather
             // than becoming a privilege the operator discovers afterwards.
-            if mapping.grants.iter().any(|g| g.actions.contains(&Action::Admin)) {
+            //
+            // Only the inline grants are checked here, and that is not an
+            // oversight: a *stored* role can be edited to include `admin` long
+            // after the node booted, so a startup check over it would enforce a
+            // rule that stops being true while the process runs. The named-role
+            // half of this boundary is enforced where the role is resolved —
+            // see `allow_federated_admin` and ADR-074.
+            if !self.allow_federated_admin
+                && mapping.grants.iter().any(|g| g.actions.contains(&Action::Admin))
+            {
                 return Err(AuthError::AdminNotFederatable {
                     claim_value: mapping.claim_value.clone(),
                 });
@@ -274,7 +336,12 @@ impl OidcVerifier {
             .claims;
 
         let subject = claims.get("sub").and_then(Value::as_str).ok_or(AuthError::InvalidToken)?;
-        Ok(Principal::federated(subject, self.grants_for(&claims)))
+        // The inline grants are final; the role *names* are not resolved here,
+        // because resolving them needs the storage engine and this function has
+        // no I/O. They ride on the principal so that whoever holds the engine
+        // can finish the job — see `Principal::with_roles`.
+        Ok(Principal::federated(subject, self.grants_for(&claims))
+            .with_roles(self.roles_for(&claims)))
     }
 
     /// The key a token's `kid` names.
@@ -307,13 +374,26 @@ impl OidcVerifier {
     /// principal. Refusing at the door instead would turn "your administrator
     /// has not given you access to this database" into "your login is broken".
     fn grants_for(&self, claims: &Value) -> Vec<Grant> {
+        self.matching(claims).flat_map(|m| m.grants.iter().cloned()).collect()
+    }
+
+    /// The stored roles the claims name, which may be none at all.
+    ///
+    /// Names, not grants: what they resolve to lives in the database, and
+    /// [`OidcVerifier`] deliberately touches no storage. Returning the names
+    /// keeps that invariant while letting the caller resolve them *per
+    /// request*, which is what makes an edit to a role take effect on the next
+    /// call. Pre-resolving them into this verifier would be the obvious
+    /// shortcut and would silently freeze every federated principal's grants at
+    /// the moment the verifier was built.
+    fn roles_for(&self, claims: &Value) -> Vec<String> {
+        self.matching(claims).filter_map(|m| m.role.clone()).collect()
+    }
+
+    /// The mappings whose claim value the caller holds.
+    fn matching<'a>(&'a self, claims: &'a Value) -> impl Iterator<Item = &'a RoleMapping> + 'a {
         let held = roles(claims, &self.settings.roles_claim);
-        self.settings
-            .role_mappings
-            .iter()
-            .filter(|m| held.iter().any(|r| r == &m.claim_value))
-            .flat_map(|m| m.grants.iter().cloned())
-            .collect()
+        self.settings.role_mappings.iter().filter(move |m| held.iter().any(|r| r == &m.claim_value))
     }
 }
 
@@ -454,10 +534,12 @@ mod tests {
 
     fn settings() -> OidcSettings {
         OidcSettings {
+            allow_federated_admin: false,
             issuer: ISSUER.into(),
             audience: AUDIENCE.into(),
             roles_claim: "roles".into(),
             role_mappings: vec![RoleMapping {
+                role: None,
                 claim_value: "kimmydb-analyst".into(),
                 grants: vec![Grant::new("sales", "orders*", vec![Action::Read, Action::Search])],
             }],
@@ -753,6 +835,7 @@ mod tests {
         // superuser over KimmyDB through it (ADR-067).
         let mut settings = settings();
         settings.role_mappings.push(RoleMapping {
+            role: None,
             claim_value: "kimmydb-admin".into(),
             grants: vec![Grant::superuser()],
         });
@@ -769,12 +852,88 @@ mod tests {
     }
 
     #[test]
+    fn allow_federated_admin_is_what_lifts_that_refusal() {
+        // The flag exists so the enterprise deployment stops being impossible,
+        // not to change the default posture — so the refusal above must be
+        // exactly what it lifts, and nothing else about the settings changes.
+        let mut settings = settings();
+        settings.role_mappings.push(RoleMapping {
+            role: None,
+            claim_value: "kimmydb-admin".into(),
+            grants: vec![Grant::superuser()],
+        });
+        assert!(settings.validate().is_err(), "off by default");
+
+        settings.allow_federated_admin = true;
+        assert!(settings.validate().is_ok(), "and permitted only when asked for");
+    }
+
+    #[test]
+    fn a_mapping_naming_neither_a_role_nor_grants_is_refused() {
+        // A rule that can never grant anything is a typo, not a policy. Left
+        // alone it produces a caller who authenticates and is then authorized
+        // for nothing, with nothing to say the config is at fault.
+        let mut settings = settings();
+        settings.role_mappings = vec![RoleMapping {
+            role: None,
+            claim_value: "kimmydb-analyst".into(),
+            grants: Vec::new(),
+        }];
+        match settings.validate() {
+            Err(AuthError::EmptyRoleMapping { claim_value }) => {
+                assert_eq!(claim_value, "kimmydb-analyst");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stored_role_is_named_rather_than_resolved_and_inline_grants_still_work() {
+        // ADR-066 configurations are already deployed, so inline grants have to
+        // keep meaning exactly what they meant. A mapping may also use both.
+        //
+        // The two halves come back separately because only one of them can be
+        // answered here: resolving a role name needs the storage engine, and
+        // this verifier deliberately has none.
+        let mut settings = settings();
+        settings.role_mappings = vec![
+            RoleMapping {
+                role: None,
+                claim_value: "inline-only".into(),
+                grants: vec![Grant::new("sales", "orders", vec![Action::Read])],
+            },
+            RoleMapping {
+                role: Some("analyst".into()),
+                claim_value: "role-only".into(),
+                grants: Vec::new(),
+            },
+            RoleMapping {
+                role: Some("extra".into()),
+                claim_value: "both".into(),
+                grants: vec![Grant::new("sales", "leads", vec![Action::Read])],
+            },
+        ];
+        let verifier = OidcVerifier::new(settings).unwrap();
+        let claims = json!({ "roles": ["inline-only", "both"] });
+
+        let grants = verifier.grants_for(&claims);
+        assert_eq!(grants.len(), 2, "both inline grant lists, and nothing from the role");
+        assert_eq!(verifier.roles_for(&claims), vec!["extra".to_string()]);
+
+        // A claim value nobody mapped contributes neither.
+        let unmapped = json!({ "roles": ["role-only-not-held"] });
+        assert!(verifier.grants_for(&unmapped).is_empty());
+        assert!(verifier.roles_for(&unmapped).is_empty());
+    }
+
+    #[test]
     fn admin_is_refused_however_it_is_spelled_in_a_grant() {
         // Not only as a bare superuser grant: `admin` scoped to one collection
         // is still administration of that collection, including creating and
         // dropping it.
         let mut settings = settings();
         settings.role_mappings = vec![RoleMapping {
+            role: None,
             claim_value: "sales-admin".into(),
             grants: vec![Grant::new("sales", "orders", vec![Action::Read, Action::Admin])],
         }];
@@ -787,6 +946,7 @@ mod tests {
         // write-and-watch role is the point of the feature.
         let mut settings = settings();
         settings.role_mappings = vec![RoleMapping {
+            role: None,
             claim_value: "editor".into(),
             grants: vec![Grant::new(
                 "sales",
@@ -847,6 +1007,7 @@ mod tests {
     fn several_mapped_roles_combine_their_grants() {
         let mut settings = settings();
         settings.role_mappings.push(RoleMapping {
+            role: None,
             claim_value: "kimmydb-writer".into(),
             grants: vec![Grant::new("hr", "*", vec![Action::Write])],
         });

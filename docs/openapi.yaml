@@ -147,6 +147,11 @@ tags:
     description: Obtaining a token and inspecting the principal behind it.
   - name: users
     description: Server-wide user administration. Requires `admin` over `*`.
+  - name: roles
+    description: |
+      Named sets of grants, shared by local users and by federated principals
+      whose claim maps to one. Requires `admin` over `*`, because whoever may
+      edit a role may hand out everything it names.
   - name: collections
     description: Databases, collections and their metadata.
   - name: documents
@@ -719,6 +724,212 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Updated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/users/{name}/roles:
+    parameters:
+      - $ref: "#/components/parameters/UserName"
+    post:
+      tags: [roles]
+      operationId: setUserRoles
+      summary: Replace the roles a user holds.
+      description: |
+        The whole set, not a delta. Role grants are **added to** the user's
+        direct grants rather than replacing them: effective permission is the
+        union of the two. The account's existing tokens stop working, because a
+        user's grants are resolved at login and embedded in its token.
+
+        A name that matches no role is accepted, not refused — it simply grants
+        nothing. Roles and users are administered independently, so refusing
+        would make the order of two unrelated operations load-bearing.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [roles]
+              properties:
+                roles:
+                  type: array
+                  items: { type: string }
+      responses:
+        "200":
+          description: Replaced.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Updated" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /v1/roles:
+    get:
+      tags: [roles]
+      operationId: listRoles
+      summary: List roles.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: |
+            The name of every role on the node. Names only — grants come from
+            `GET /v1/roles/{name}`.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [roles]
+                properties:
+                  roles:
+                    type: array
+                    items: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+    post:
+      tags: [roles]
+      operationId: createRole
+      summary: Create a role.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name:
+                  type: string
+                grants:
+                  type: array
+                  items: { $ref: "#/components/schemas/Grant" }
+      responses:
+        "201":
+          description: Created.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [role, grants]
+                properties:
+                  role:
+                    type: string
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Grant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "422": { $ref: "#/components/responses/WrongShape" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409":
+          description: A role of that name already exists.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+
+  /v1/roles/{name}:
+    parameters:
+      - $ref: "#/components/parameters/RoleName"
+    get:
+      tags: [roles]
+      operationId: getRole
+      summary: One role.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: The role and its grants.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [role, grants]
+                properties:
+                  role:
+                    type: string
+                  grants:
+                    type: array
+                    items: { $ref: "#/components/schemas/Grant" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [roles]
+      operationId: deleteRole
+      summary: Delete a role.
+      description: |
+        Holders keep the role's *name* on their record, where it resolves to
+        nothing. That is deliberate: the alternative is rewriting every user
+        record on a delete, and a name that grants nothing is the safe direction
+        to fail in.
+
+        Every holder's live tokens are revoked, and `invalidated` reports how
+        many accounts that was.
+      x-kimmy-action: admin over `*`
+      responses:
+        "200":
+          description: Deleted, or no such role.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [deleted, invalidated]
+                properties:
+                  deleted:
+                    type: boolean
+                  invalidated:
+                    type: integer
+                    description: How many accounts had their tokens revoked.
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
+  /v1/roles/{name}/grants:
+    parameters:
+      - $ref: "#/components/parameters/RoleName"
+    post:
+      tags: [roles]
+      operationId: setRoleGrants
+      summary: Replace a role's grants.
+      description: |
+        The whole set, not a delta.
+
+        Every holder's live tokens are revoked, and `invalidated` reports how
+        many accounts that was. Without it a *narrowing* edit would take effect
+        only as each holder's token expired. Federated principals need no such
+        revocation and are not counted: their grants are resolved from this
+        store on every request, so the edit already applies to them.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [grants]
+              properties:
+                grants:
+                  type: array
+                  items: { $ref: "#/components/schemas/Grant" }
+      responses:
+        "200":
+          description: Replaced.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated, invalidated]
+                properties:
+                  updated:
+                    type: string
+                  invalidated:
+                    type: integer
+                    description: How many accounts had their tokens revoked.
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -2030,6 +2241,12 @@ components:
       required: true
       schema: { type: string }
       description: Username.
+    RoleName:
+      name: name
+      in: path
+      required: true
+      schema: { type: string }
+      description: Role name.
     IndexName:
       name: name
       in: path

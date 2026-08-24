@@ -287,11 +287,11 @@ token_ttl_secs = 3600
 # A role nobody maps is not an error — it produces a principal with zero grants.
 # The caller authenticated; they are simply not authorized here.
 #
-# `admin` is NOT mappable and a mapping that names it stops the node at
-# startup. Administration is reserved to local accounts as a break-glass
+# `admin` is NOT mappable by default and a mapping that names it stops the node
+# at startup. Administration is reserved to local accounts as a break-glass
 # boundary: if this provider is misconfigured or taken over, nobody gets
 # superuser over the database through it (ADR-067). read, write, watch, search
-# and webhook all map freely.
+# and webhook all map freely. See allow_federated_admin below.
 # [[auth.oidc.role_mappings]]
 # claim_value = "kimmydb-analyst"
 # grants = [{ db = "sales", collection = "orders*", actions = ["read", "search"] }]
@@ -300,10 +300,43 @@ token_ttl_secs = 3600
 # claim_value = "kimmydb-writer"
 # grants = [{ db = "sales", collection = "*", actions = ["write", "watch"] }]
 
+# A mapping may instead name a ROLE stored in this database (ADR-073), so one
+# definition serves both federated principals and local users rather than the
+# same grants being copied into two places. Manage them at /v1/roles.
+#
+# Unlike inline grants, a named role is resolved on every request, so editing it
+# applies to the next call rather than at the next restart. A name that matches
+# no role grants nothing, which is also what a deleted role leaves behind.
+#
+# Note claim_value is the PROVIDER's vocabulary, not this database's: a provider
+# typically enforces a small fixed set of role names at client registration, so
+# a KimmyDB-specific value here may simply be unregistrable. That is the case
+# for naming a role — all the granularity lives on this side.
+#
+# A mapping must name a role or carry grants (both is fine). One that does
+# neither could never grant anything, so it is refused at startup as a typo.
+# [[auth.oidc.role_mappings]]
+# claim_value = "developer"
+# role = "analyst"
+
+# Let a federated principal hold `admin`, lifting the refusal described above.
+#
+# Off by default, which is exactly the behaviour that shipped. It exists because
+# an absolute refusal makes a large deployment impossible rather than merely
+# awkward: auditors flag privileged local accounts living outside the IdP, which
+# that rule requires. The canonical pattern is to allow the mapping and
+# SEPARATELY keep an emergency local account, not to forbid it (ADR-074).
+#
+# Turning it on moves a real security boundary, so the node says so in its
+# startup summary every time.
+# allow_federated_admin = false
+
 # Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
 # KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM,
 # KIMMY_OIDC_REFRESH_INTERVAL_SECS. The mappings are file-only — a grant is a
-# structure, and a command line is where structures go to be mistyped.
+# structure, and a command line is where structures go to be mistyped. So is
+# allow_federated_admin, which is a boundary an operator should have to write
+# down and review in a diff rather than set from a shell.
 #
 # `kimmyd check-config` reaches the provider and reports what it found, and
 # says whether this node publishes protected resource metadata. The server

@@ -1638,6 +1638,7 @@ mod tests {
         // The property that lets a node restart while its identity provider is
         // down: the fetch fails, nothing is installed, and the node serves.
         let verifier = OidcVerifier::new(kimmy_auth::OidcSettings {
+            allow_federated_admin: false,
             issuer: "http://127.0.0.1:1".into(),
             audience: "kimmydb".into(),
             roles_claim: "roles".into(),

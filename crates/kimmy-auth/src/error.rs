@@ -56,6 +56,19 @@ pub enum AuthError {
     )]
     AdminNotFederatable { claim_value: String },
 
+    /// A role mapping names neither a stored role nor any inline grants.
+    ///
+    /// Refused at startup for the same reason a half-filled `[auth.oidc]`
+    /// section is: a rule that can never grant anything is a typo, and the
+    /// failure it produces otherwise is a caller who authenticates and is then
+    /// authorized for nothing, with no indication that the config is at fault.
+    #[error(
+        "the OIDC role mapping for {claim_value:?} names neither `role` nor `grants`, so holding \
+         that claim value would earn nothing. Set `role = \"<a role in this database>\"`, or \
+         write the grants inline, or remove the mapping."
+    )]
+    EmptyRoleMapping { claim_value: String },
+
     /// The audience carries a URI scheme, so it names this node as an OAuth 2.0
     /// protected resource — but not as one a client could actually use.
     ///

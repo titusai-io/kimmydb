@@ -86,6 +86,14 @@ fn routes(state: SharedState) -> Router {
         .route("/v1/users/{name}", get(crate::users::get_user).delete(crate::users::delete_user))
         .route("/v1/users/{name}/password", post(crate::users::set_password))
         .route("/v1/users/{name}/grants", post(crate::users::set_grants))
+        .route("/v1/users/{name}/roles", post(crate::roles::set_user_roles))
+        // Written out as literals, like every route above, because the
+        // documentation contract in `tests/openapi.rs` scans this file for
+        // route *literals* — a path built from a constant is a route that
+        // silently escapes it while the test still passes.
+        .route("/v1/roles", get(crate::roles::list_roles).post(crate::roles::create_role))
+        .route("/v1/roles/{name}", get(crate::roles::get_role).delete(crate::roles::delete_role))
+        .route("/v1/roles/{name}/grants", post(crate::roles::set_role_grants))
         .route("/v1/databases", get(list_databases))
         .route("/v1/db/{db}/collections", get(list_collections).post(create_collection))
         .route("/v1/db/{db}/coll/{coll}", delete(drop_collection))

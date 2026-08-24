@@ -139,6 +139,19 @@ pub struct Principal {
     /// Carried so a request can be checked against the version the user
     /// currently has: a mismatch means the token was invalidated (ADR-052).
     pub token_version: u64,
+    /// Stored roles this principal holds whose grants are **not yet resolved**.
+    ///
+    /// Only ever populated on the federated path, and only between the verifier
+    /// and the extractor. A local user's roles are resolved when it
+    /// authenticates, because its grants are embedded in the token it is
+    /// issued; a federated principal has no such moment, so the names travel
+    /// this far and are resolved against the store on every request (ADR-073).
+    ///
+    /// Empty by the time any authorization decision is made — the extractor
+    /// resolves them into `grants` — so `can` deliberately does not consult it.
+    /// It is kept afterwards for the audit record, which reports the roles
+    /// *held*.
+    pub roles: Vec<String>,
 }
 
 impl Principal {
@@ -149,6 +162,7 @@ impl Principal {
             unauthenticated: false,
             federated: false,
             token_version: 0,
+            roles: Vec::new(),
         }
     }
 
@@ -164,6 +178,7 @@ impl Principal {
             unauthenticated: false,
             federated: true,
             token_version: 0,
+            roles: Vec::new(),
         }
     }
 
@@ -171,6 +186,28 @@ impl Principal {
     pub fn at_version(mut self, token_version: u64) -> Self {
         self.token_version = token_version;
         self
+    }
+
+    /// The same principal, holding stored roles that are not yet resolved.
+    ///
+    /// A builder rather than a parameter on [`Self::federated`] so that every
+    /// existing construction keeps compiling unchanged — `verify` has a great
+    /// many call sites, and widening its result would be churn in return for
+    /// nothing.
+    pub fn with_roles(mut self, roles: Vec<String>) -> Self {
+        self.roles = roles;
+        self
+    }
+
+    /// Add resolved grants, and forget nothing about where they came from.
+    ///
+    /// The union is additive, always (ADR-073): Kubernetes RBAC is purely
+    /// additive and Postgres unions privileges across role membership, and more
+    /// to the point it is the only rule that needs no rewrite of an existing
+    /// record, since a principal holding no roles gets exactly what it got
+    /// before.
+    pub fn extend_grants(&mut self, grants: impl IntoIterator<Item = Grant>) {
+        self.grants.extend(grants);
     }
 
     pub fn superuser(user: impl Into<String>) -> Self {
@@ -188,6 +225,7 @@ impl Principal {
             unauthenticated: true,
             federated: false,
             token_version: 0,
+            roles: Vec::new(),
         }
     }
 

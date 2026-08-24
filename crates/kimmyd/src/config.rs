@@ -311,6 +311,24 @@ pub struct OidcConfig {
     /// never be this node's resource identifier; the setting is then defence
     /// in depth. With an opaque audience it is the real check.
     pub require_at_jwt: bool,
+    /// Let a federated principal hold the `admin` action (ADR-074).
+    ///
+    /// **Off by default, which is exactly the behaviour that shipped.**
+    /// ADR-067 reserved `admin` to local users so a misconfigured or
+    /// compromised identity provider could not mint a superuser over this
+    /// database. That is still the right default, and it was tested rather than
+    /// merely reasoned about: a provider asserting `roles: ["user", "admin"]`
+    /// got exactly what the `user` mapping said and nothing more.
+    ///
+    /// The flag exists because the same rule made the enterprise deployment
+    /// impossible. Large organisations run joiner-mover-leaver, and auditors
+    /// specifically flag privileged local accounts living outside the IdP —
+    /// which this rule *requires*. MinIO, Vault, Grafana and Elasticsearch all
+    /// allow the mapping; the canonical break-glass pattern is to allow it and
+    /// separately keep an emergency local account, not to forbid it.
+    ///
+    /// Turning it on is loud: the node says so at startup, every time.
+    pub allow_federated_admin: bool,
 }
 
 impl Default for OidcConfig {
@@ -328,6 +346,9 @@ impl Default for OidcConfig {
             // working. See the field's own documentation for why that is the
             // safe default rather than the lax one.
             require_at_jwt: false,
+            // Off, so that enabling federation changes nothing about who may
+            // administer this database. See the field's documentation.
+            allow_federated_admin: false,
         }
     }
 }
@@ -351,6 +372,7 @@ impl OidcConfig {
             roles_claim: self.roles_claim.clone(),
             role_mappings: self.role_mappings.clone(),
             require_at_jwt: self.require_at_jwt,
+            allow_federated_admin: self.allow_federated_admin,
         })
     }
 
@@ -416,10 +438,18 @@ impl OidcConfig {
 
     /// One-line form for the startup summary. Never the mappings themselves —
     /// they are long, and the count is what tells an operator the file was read.
+    ///
+    /// `allow_federated_admin` is named only when it is on. A default that is
+    /// printed every time is a default nobody reads; a line that appears only
+    /// when a security boundary has been lowered is one somebody notices.
     fn describe(&self) -> String {
         match &self.issuer {
             None => "off".to_string(),
-            Some(issuer) => format!("{issuer} ({} role mappings)", self.role_mappings.len()),
+            Some(issuer) => {
+                let admin =
+                    if self.allow_federated_admin { ", FEDERATED ADMIN ALLOWED" } else { "" };
+                format!("{issuer} ({} role mappings{admin})", self.role_mappings.len())
+            }
         }
     }
 }
@@ -1368,6 +1398,7 @@ mod tests {
             issuer: Some("https://auth.example.com".into()),
             audience: Some("kimmydb".into()),
             role_mappings: vec![kimmy_auth::RoleMapping {
+                role: None,
                 claim_value: "kimmydb-analyst".into(),
                 grants: vec![kimmy_auth::Grant::new(
                     "sales",
@@ -1433,6 +1464,7 @@ mod tests {
         let mut cfg = valid();
         cfg.auth.oidc = oidc();
         cfg.auth.oidc.role_mappings.push(kimmy_auth::RoleMapping {
+            role: None,
             claim_value: "kimmydb-admin".into(),
             grants: vec![kimmy_auth::Grant::superuser()],
         });
@@ -1444,6 +1476,7 @@ mod tests {
         // Every other action stays mappable — the boundary is `admin` alone.
         cfg.auth.oidc.role_mappings.pop();
         cfg.auth.oidc.role_mappings.push(kimmy_auth::RoleMapping {
+            role: None,
             claim_value: "kimmydb-writer".into(),
             grants: vec![kimmy_auth::Grant::new(
                 "sales",

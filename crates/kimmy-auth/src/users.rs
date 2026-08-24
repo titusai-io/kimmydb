@@ -121,7 +121,7 @@ impl UserStore {
     /// user record and no token version (ADR-065), and their grants are
     /// resolved from the mapping on every request, so a role edit already
     /// applies to them immediately.
-    pub fn invalidate_holders_of_role(&self, engine: &Engine, role: &str) -> Result<u64> {
+    pub fn invalidate_holders_of_role(&self, engine: &Engine, role: &str) -> Result<Vec<String>> {
         let mut holders = Vec::new();
         for name in self.list(engine)? {
             if let Some(user) = self.get(engine, &name)?
@@ -131,12 +131,17 @@ impl UserStore {
             }
         }
 
-        let count = holders.len() as u64;
+        // The names, not a count: bumping the stored version is only half of a
+        // revocation, because the session check reads a cache in front of it
+        // (ADR-052). The caller has to evict each holder from that cache, and
+        // it cannot do that from a number.
+        let mut names = Vec::with_capacity(holders.len());
         for mut user in holders {
             user.token_version = user.token_version.wrapping_add(1);
             self.put(engine, &user)?;
+            names.push(user.name);
         }
-        Ok(count)
+        Ok(names)
     }
 
     /// Create the bootstrap superuser if the store is empty.
@@ -487,7 +492,7 @@ mod tests {
             .unwrap();
         let invalidated = store.invalidate_holders_of_role(&engine, "wide").unwrap();
 
-        assert_eq!(invalidated, 1, "only the holder should be invalidated");
+        assert_eq!(invalidated, vec!["ada".to_string()], "only the holder should be invalidated");
         let after = store.authenticate(&engine, "ada", "hunter2").unwrap();
         assert_ne!(after.token_version, issued_at, "the holder's outstanding tokens still verify");
         assert!(!after.can(Action::Write, "sales", Some("orders")), "the narrowing did not apply");

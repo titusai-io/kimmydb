@@ -46,6 +46,19 @@ pub struct Claims {
     /// 0, matching a user record that has never been bumped.
     #[serde(default)]
     pub tv: u64,
+    /// The named roles the user held when this token was issued.
+    ///
+    /// Carried for the audit record, not for authorization: the grants those
+    /// roles resolved to are already in `grants` above, unioned with the user's
+    /// direct ones (ADR-073). Embedding the names too is what lets an audit
+    /// reader answer "which roles were in play" without a lookup, and it costs
+    /// one storage read at login instead of one per request.
+    ///
+    /// A stale list, deliberately, in exactly the way `grants` is: an edit to
+    /// the user's roles bumps `tv` and invalidates the token, so the two can
+    /// never drift apart within one token's life.
+    #[serde(default)]
+    pub roles: Vec<String>,
 }
 
 /// Signs and verifies tokens.
@@ -92,6 +105,7 @@ impl TokenIssuer {
             exp: now + self.ttl_secs,
             grants: principal.grants.clone(),
             tv: principal.token_version,
+            roles: principal.roles.clone(),
         };
         jsonwebtoken::encode(&Header::new(Algorithm::HS256), &claims, &self.encoding)
             .map_err(|e| AuthError::TokenIssue(e.to_string()))
@@ -118,7 +132,9 @@ impl TokenIssuer {
             },
         )?;
 
-        Ok(Principal::new(data.claims.sub, data.claims.grants).at_version(data.claims.tv))
+        Ok(Principal::new(data.claims.sub, data.claims.grants)
+            .at_version(data.claims.tv)
+            .with_roles(data.claims.roles))
     }
 }
 
@@ -218,6 +234,7 @@ mod tests {
         let forged_payload = {
             use base64::Engine as _;
             let claims = Claims {
+                roles: Vec::new(),
                 sub: "analyst".into(),
                 iat: now_secs(),
                 exp: now_secs() + 3600,
@@ -259,6 +276,7 @@ mod tests {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
         let header = b64.encode(br#"{"alg":"none","typ":"JWT"}"#);
         let claims = Claims {
+            roles: Vec::new(),
             sub: "root".into(),
             iat: now_secs(),
             exp: now_secs() + 3600,

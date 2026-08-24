@@ -162,6 +162,7 @@ impl Server {
             roles_claim: "roles".into(),
             role_mappings: vec![kimmy_auth::RoleMapping {
                 claim_value: "kimmydb-analyst".into(),
+                role: None,
                 grants: vec![kimmy_auth::Grant::new(
                     "sales",
                     "orders*",
@@ -169,6 +170,34 @@ impl Server {
                 )],
             }],
             require_at_jwt: false,
+            allow_federated_admin: false,
+        })
+        .unwrap();
+        let federation = kimmy_api::Federation::new(verifier);
+        federation.install_keys(oidc::jwks());
+        server.state.set_federation(federation);
+        server
+    }
+
+    /// A federated server whose one mapping names a **stored** role rather than
+    /// carrying grants inline (ADR-073).
+    ///
+    /// `allow_federated_admin` is a parameter because it is the whole subject of
+    /// ADR-074, and because it must be read where the role is *resolved* rather
+    /// than captured at startup — a stored role can gain `admin` at any time.
+    async fn start_federated_with_role(role: &str, allow_federated_admin: bool) -> Self {
+        let server = Self::build(false, kimmy_api::RateLimits::disabled()).await;
+        let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
+            issuer: oidc::ISSUER.into(),
+            audience: oidc::AUDIENCE.into(),
+            roles_claim: "roles".into(),
+            role_mappings: vec![kimmy_auth::RoleMapping {
+                claim_value: "kimmydb-analyst".into(),
+                role: Some(role.into()),
+                grants: Vec::new(),
+            }],
+            require_at_jwt: false,
+            allow_federated_admin,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -3573,6 +3602,215 @@ mod oidc {
             b64.encode(b"not-a-signature"),
         )
     }
+}
+
+#[tokio::test]
+async fn a_mapping_naming_a_stored_role_resolves_that_role_s_grants() {
+    // The point of ADR-073: one role object both a local user and a federated
+    // principal can point at, instead of the same permissions copied onto every
+    // user record.
+    let server = Server::start_federated_with_role("analyst", false).await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"salaries"})).await;
+    server
+        .post(
+            "/v1/roles",
+            Some(&root),
+            json!({
+                "name": "analyst",
+                "grants": [{"db":"sales","collection":"orders*","actions":["read"]}],
+            }),
+        )
+        .await;
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    assert_eq!(
+        server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status,
+        200,
+        "the stored role's grants should apply"
+    );
+    assert_eq!(
+        server.get("/v1/db/sales/coll/salaries/docs", Some(&token)).await.status,
+        403,
+        "and only those grants"
+    );
+}
+
+#[tokio::test]
+async fn editing_a_role_changes_the_next_federated_request_without_a_restart() {
+    // The trap this feature exists to avoid. Resolving the mapping table once,
+    // when the verifier is built, is the obvious cache and it silently freezes
+    // every federated principal's permissions at startup — so a role edit would
+    // do nothing until the node was restarted, which is the opposite of what
+    // naming a stored role is for.
+    //
+    // Nothing here restarts anything: the same server, the same token.
+    let server = Server::start_federated_with_role("analyst", false).await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+    server.post("/v1/roles", Some(&root), json!({ "name": "analyst", "grants": [] })).await;
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    assert_eq!(
+        server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status,
+        403,
+        "an empty role grants nothing to begin with"
+    );
+
+    server
+        .post(
+            "/v1/roles/analyst/grants",
+            Some(&root),
+            json!({ "grants": [{"db":"sales","collection":"orders*","actions":["read"]}] }),
+        )
+        .await;
+
+    assert_eq!(
+        server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status,
+        200,
+        "the widened role must apply to the very next request"
+    );
+
+    // And narrowing is honoured just as immediately, which is the direction
+    // that actually matters for revocation.
+    server.post("/v1/roles/analyst/grants", Some(&root), json!({ "grants": [] })).await;
+    assert_eq!(
+        server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status,
+        403,
+        "the narrowed role must apply to the very next request too"
+    );
+}
+
+#[tokio::test]
+async fn a_mapping_naming_an_unknown_role_grants_nothing_and_is_not_an_error() {
+    // A role can be deleted while a mapping still names it, and roles and users
+    // are administered independently. Authenticating and being authorized for
+    // nothing is the safe reading of that; refusing at the door would turn "your
+    // administrator has not set this up yet" into "your login is broken".
+    let server = Server::start_federated_with_role("never-created", false).await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    let response = server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await;
+    assert_eq!(response.status, 403, "authenticated, authorized for nothing: {:?}", response.body);
+}
+
+#[tokio::test]
+async fn a_federated_principal_does_not_get_admin_from_a_role_unless_it_is_allowed() {
+    // ADR-067's break-glass boundary, in the one place a startup check cannot
+    // reach it: a *stored* role can be edited to include `admin` long after the
+    // node booted, so the check has to live where the role is resolved.
+    //
+    // Both halves are asserted against the same role, because the claim being
+    // made is that the boundary is about the *principal*, not the role — the
+    // local user holding it keeps its admin.
+    let server = Server::start_federated_with_role("ops", false).await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/roles",
+            Some(&root),
+            json!({
+                "name": "ops",
+                "grants": [{"db":"*","collection":"*","actions":["admin"]}],
+            }),
+        )
+        .await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({ "user": "ada", "password": "a-good-password", "grants": [] }),
+        )
+        .await;
+    server.post("/v1/users/ada/roles", Some(&root), json!({ "roles": ["ops"] })).await;
+
+    let federated = oidc::token(oidc::claims("ada", json!(["kimmydb-analyst"])));
+    assert_eq!(
+        server.get("/v1/users", Some(&federated)).await.status,
+        403,
+        "`admin` is not federatable while allow_federated_admin is off"
+    );
+
+    let local = server.login("ada", "a-good-password").await;
+    assert_eq!(
+        server.get("/v1/users", Some(&local)).await.status,
+        200,
+        "the same role still gives a local user admin — the boundary is the principal"
+    );
+}
+
+#[tokio::test]
+async fn allow_federated_admin_is_what_changes_that_answer() {
+    // The flag exists so the enterprise deployment stops being impossible, not
+    // to change the default posture — so this is the only configuration in
+    // which the previous test's answer flips.
+    let server = Server::start_federated_with_role("ops", true).await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/roles",
+            Some(&root),
+            json!({
+                "name": "ops",
+                "grants": [{"db":"*","collection":"*","actions":["admin"]}],
+            }),
+        )
+        .await;
+
+    let federated = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    assert_eq!(
+        server.get("/v1/users", Some(&federated)).await.status,
+        200,
+        "with the flag on, a role may carry admin to a federated principal"
+    );
+}
+
+#[tokio::test]
+async fn a_role_and_a_user_s_own_grants_are_a_union() {
+    // Additive, always (ADR-073). Kubernetes RBAC is purely additive and
+    // Postgres unions privileges across role membership; more to the point it
+    // is the only rule that needs no rewrite of an existing user record.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"leads"})).await;
+    server
+        .post(
+            "/v1/roles",
+            Some(&root),
+            json!({
+                "name": "reader",
+                "grants": [{"db":"sales","collection":"orders*","actions":["read"]}],
+            }),
+        )
+        .await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({
+                "user": "ada",
+                "password": "a-good-password",
+                "grants": [{"db":"sales","collection":"leads","actions":["read"]}],
+            }),
+        )
+        .await;
+    server.post("/v1/users/ada/roles", Some(&root), json!({ "roles": ["reader"] })).await;
+
+    let token = server.login("ada", "a-good-password").await;
+    assert_eq!(
+        server.get("/v1/db/sales/coll/orders/docs", Some(&token)).await.status,
+        200,
+        "the role's grant"
+    );
+    assert_eq!(
+        server.get("/v1/db/sales/coll/leads/docs", Some(&token)).await.status,
+        200,
+        "and the user's own, both at once"
+    );
 }
 
 #[tokio::test]
