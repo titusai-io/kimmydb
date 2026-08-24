@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-api"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
@@ -2316,7 +2316,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-auth"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2335,7 +2335,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2349,7 +2349,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bson",
@@ -2372,7 +2372,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-cluster"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bson",
  "foca",
@@ -2398,7 +2398,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-core"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "base64 0.23.1",
  "bson",
@@ -2411,7 +2411,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-mcp"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "axum",
  "bson",
@@ -2435,7 +2435,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-query"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bson",
  "kimmy-core",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-storage"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "bson",
  "criterion",
@@ -2468,7 +2468,7 @@ dependencies = [
 
 [[package]]
 name = "kimmy-vector"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "async-trait",
  "bson",
@@ -2489,7 +2489,7 @@ dependencies = [
 
 [[package]]
 name = "kimmyd"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "axum",
