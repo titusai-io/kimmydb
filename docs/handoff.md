@@ -6,6 +6,22 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-25 — **wildcards no longer reach the system database**
+
+Branch `feat/system-db-wildcard` (ADR-079). `{db:"*"}` stopped matching
+`__kimmy`: the cluster owner's own `*/*` federated role listed it in
+`kimmy databases`, and reading `__users` meant reading password hashes. Two
+doors remain — `admin` anywhere (root untouched, proven by the suite passing
+unmodified before the new tests landed) or an exact `{db:"__kimmy"}` grant,
+honored down to its collection pattern; patterns like `__k*` are wildcards and
+do not match. Choke point is `Principal::can`, so listings inherit the rule.
+Collection listings inside `__kimmy` keep hidden-not-forbidden: empty list,
+never a name. Tests cover wildcard denial (listing + find/count 403s), exact
+grant honored to the pattern, admin-anywhere, and the pattern-is-not-exact
+trap at both rbac and api level.
+
+---
+
 ## As of 2026-08-25 — **the admin surface reaches the CLI**
 
 Branch `feat/admin-cli`. Implements [[kimmydb-admin-cli-roles-and-users-management]]:

@@ -232,8 +232,41 @@ impl Principal {
     /// May this principal perform `action` on `db.collection`?
     ///
     /// Pass `None` for the collection to ask about a database-wide operation.
+    ///
+    /// **The system database never matches a wildcard** (ADR-079). A grant
+    /// written as `{db:"*"}` — the shape of nearly every data-plane role —
+    /// would otherwise carry the caller straight into `__kimmy`, whose
+    /// `__users` holds password hashes and token versions. See
+    /// [`Self::system_access`] for the two doors that do open it.
     pub fn can(&self, action: Action, db: &str, collection: Option<&str>) -> bool {
+        if db == crate::users::SYSTEM_DB {
+            return self.system_access(action, collection);
+        }
         self.grants.iter().any(|g| g.covers(db, collection, action))
+    }
+
+    /// Authorization for the system database.
+    ///
+    /// Two doors, and wildcards are deliberately neither of them:
+    ///
+    /// - holding the **`admin` action anywhere** — administration has always
+    ///   reached through every boundary (`admin` implies every other action),
+    ///   and managing users and roles is what admin is *for*. This is why the
+    ///   bootstrap superuser, whose only grant is admin over the wildcard,
+    ///   keeps working unchanged;
+    /// - a grant **naming `__kimmy` exactly**, honored as written down to its
+    ///   collection pattern and actions. Exact means exact: a pattern like
+    ///   `__k*` is a wildcard and does not match, because a rule that lets
+    ///   wildcards reach the system database is precisely the one this exists
+    ///   to close.
+    ///
+    /// Everything else is refused before any pattern matching runs.
+    fn system_access(&self, action: Action, collection: Option<&str>) -> bool {
+        const SYSTEM_DB: &str = crate::users::SYSTEM_DB;
+        if self.grants.iter().any(|g| g.actions.contains(&Action::Admin)) {
+            return true;
+        }
+        self.grants.iter().any(|g| g.db == SYSTEM_DB && g.covers(SYSTEM_DB, collection, action))
     }
 
     /// Collections in `db` this principal may act on, filtered from a list.
@@ -259,6 +292,55 @@ mod tests {
             "analyst",
             vec![Grant::new("sales", "orders*", vec![Action::Read, Action::Watch])],
         )
+    }
+
+    // -- The system database never matches a wildcard (ADR-079) --------------
+
+    fn wildcard_reader() -> Principal {
+        Principal::new("ada", vec![Grant::new("*", "*", vec![Action::Read, Action::Write])])
+    }
+
+    #[test]
+    fn a_wildcard_grant_does_not_reach_the_system_database() {
+        assert!(wildcard_reader().can(Action::Read, "sales", None));
+        assert!(!wildcard_reader().can(Action::Read, crate::users::SYSTEM_DB, Some("__users")));
+        assert!(!wildcard_reader().can(Action::Write, crate::users::SYSTEM_DB, None));
+    }
+
+    #[test]
+    fn admin_anywhere_still_opens_the_system_database() {
+        let mut root = wildcard_reader();
+        root.extend_grants(vec![Grant::superuser()]);
+        assert!(root.can(Action::Read, crate::users::SYSTEM_DB, Some("__users")));
+
+        // Admin on a *narrow* grant counts too — holding the action is what
+        // the boundary keys on, not the pattern it arrived with.
+        let mut narrow_admin =
+            Principal::new("ops", vec![Grant::new("tools", "*", vec![Action::Admin])]);
+        narrow_admin.token_version = 0;
+        assert!(narrow_admin.can(Action::Admin, crate::users::SYSTEM_DB, Some("__roles")));
+    }
+
+    #[test]
+    fn an_exact_system_grant_is_honored_down_to_its_collection_pattern() {
+        let mut sys = Principal::new(
+            "sys",
+            vec![Grant::new(crate::users::SYSTEM_DB, "__users", vec![Action::Read])],
+        );
+        sys.token_version = 0;
+        assert!(sys.can(Action::Read, crate::users::SYSTEM_DB, Some("__users")));
+        assert!(!sys.can(Action::Read, crate::users::SYSTEM_DB, Some("__roles")));
+        assert!(!sys.can(Action::Write, crate::users::SYSTEM_DB, Some("__users")));
+
+        // A pattern like __k* is still a wildcard: exact means exact.
+        let mut sneaky =
+            Principal::new("sneaky", vec![Grant::new("__k*", "*", vec![Action::Read])]);
+        sneaky.token_version = 0;
+        assert!(!sneaky.can(Action::Read, crate::users::SYSTEM_DB, Some("__users")));
+        assert!(
+            sneaky.can(Action::Read, "__keep", Some("x")),
+            "the pattern still matches ordinary databases"
+        );
     }
 
     #[test]

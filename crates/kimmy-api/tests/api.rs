@@ -1103,6 +1103,71 @@ async fn disabling_is_guarded_like_deletion() {
 }
 
 #[tokio::test]
+async fn the_system_database_never_matches_a_wildcard() {
+    // ADR-079. Before this, {"db":"*"} carried any caller into __kimmy —
+    // whose __users holds password hashes — because wildcards matched it like
+    // any other database. The cluster owner's own federated role surfaced it
+    // in `kimmy databases`, which is what got the question asked.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"ada","password":"ada-password",
+                   "grants":[{"db":"*","collection":"*","actions":["read","write"]}]}),
+        )
+        .await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"sys","password":"sys-password",
+                   "grants":[{"db":"__kimmy","collection":"__users","actions":["read"]}]}),
+        )
+        .await;
+    let ada = server.login("ada", "ada-password").await;
+    let sys = server.login("sys", "sys-password").await;
+
+    // The wildcard holder: system database invisible everywhere.
+    let dbs = server.get("/v1/databases", Some(&ada)).await;
+    assert_eq!(dbs.status, 200);
+    let names = dbs.body["databases"].as_array().unwrap();
+    assert!(
+        !names.iter().any(|n| n == "__kimmy"),
+        "listings filter through the same check as access: {names:?}"
+    );
+
+    // Collection listings filter rather than forbid (the same hidden-not-
+    // forbidden rule as everywhere else): 200, and nothing in it.
+    let res = server.get("/v1/db/__kimmy/collections", Some(&ada)).await;
+    assert_eq!(res.status, 200);
+    let listed = res.body["collections"].as_array().map(|c| c.len()).unwrap_or(0);
+    assert_eq!(listed, 0, "no system collection may surface: {:?}", res.body);
+
+    // Direct reads are refused outright: find and count on __users.
+    let res = server.post("/v1/db/__kimmy/coll/__users/find", Some(&ada), json!({})).await;
+    assert_eq!(res.status, 403);
+    let res = server.post("/v1/db/__kimmy/coll/__users/count", Some(&ada), json!({})).await;
+    assert_eq!(res.status, 403);
+
+    // An exact grant naming the system database is honored as written —
+    // including its collection pattern: __users yes, __roles no.
+    let res = server.post("/v1/db/__kimmy/coll/__users/find", Some(&sys), json!({})).await;
+    assert_eq!(res.status, 200);
+    let res = server.post("/v1/db/__kimmy/coll/__roles/find", Some(&sys), json!({})).await;
+    assert_eq!(res.status, 403, "the collection pattern still applies");
+
+    // Administration reaches through every boundary, unchanged: root's only
+    // grant is admin over the wildcard.
+    let root_dbs = server.get("/v1/databases", Some(&root)).await;
+    assert!(
+        root_dbs.body["databases"].as_array().unwrap().iter().any(|n| n == "__kimmy"),
+        "admin keeps its reach"
+    );
+}
+
+#[tokio::test]
 async fn narrowing_a_grant_takes_effect_without_waiting_for_the_token_to_expire() {
     // Grants ride inside the token, so before ADR-052 a *revoked* permission
     // kept working for the rest of the token's hour. This is the property that

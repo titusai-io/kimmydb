@@ -559,6 +559,18 @@ holding it**, and the response says how many accounts that was. Without it a
 quietly break the revocation promise that setting a user's grants has always
 made. Creating a role cannot narrow anything, so it revokes nothing.
 
+### The system database never matches a wildcard
+
+`__kimmy` holds the machinery — `__users` (password hashes, token versions),
+`__roles`, `__nodes`, the webhook registry. **A wildcard database grant does
+not reach it**, however generous: `{db:"*"}` buys the data plane, not this.
+Two things do open it: holding `admin` anywhere (administration reaches
+through every boundary, and user management is what admin is *for*), or a
+grant naming `__kimmy` exactly, honored down to its collection pattern —
+exact means exact, so `__k*` is still just a wildcard ([ADR-079](decisions.md)).
+Collection listings answer an empty list to callers with no door; nothing
+surfaces either way.
+
 **Federated principals are the opposite case, and both halves matter:**
 
 - Their grants are resolved from the role store on **every request**, so an edit

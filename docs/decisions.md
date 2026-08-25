@@ -3712,6 +3712,46 @@ The JSON form also moves a syntax error from TOML-parse time (where the file's
 line number is reported) to a message naming the variable and showing the
 expected shape, which the parser does deliberately.
 
+## ADR-079 — The system database never matches a wildcard
+
+**Decision.** `Principal::can` special-cases `__kimmy`. Wildcard database
+patterns (`*`, trailing-`*` forms) no longer reach it at all. Two doors open
+it instead: holding the **`admin` action on any grant** — administration
+reaches through every boundary, and managing users and roles is what admin is
+for — or a grant **naming `__kimmy` exactly**, honored down to its collection
+pattern and actions. Exact means exact: `__k*` is still a wildcard and does
+not match. Collection listings inside the system database keep the house
+hidden-not-forbidden behavior: a caller with no door answers an empty list,
+never a name.
+
+**Alternatives.** Documenting wildcard access as intended — rejected because
+it makes every `*/*` data-plane role a password-hash reader by default, which
+is the kind of grant most deployments write first. Redacting sensitive fields
+from `__users` reads instead of restricting them — rejected because the
+collection also carries token versions and role names, because field-level
+redaction multiplies surfaces to audit, and because "you may read this but not
+these columns" inverts the grain RBAC runs at. Requiring a dedicated
+`system` action for any system-database access — deferred; if a deployment
+needs to hand out system visibility without full admin, an explicit
+`{db:"__kimmy"}` grant already expresses it, and a new action can be added
+without breaking anything if that proves too blunt.
+
+**Why.** Found live, as the best ones are: the cluster owner's own federated
+role — plain read/write over `*/*`, exactly what nearly every deployment writes
+first — listed `__kimmy` in `kimmy databases`, and reading `__users` meant
+reading argon2id password hashes and token versions. Nothing about federation
+made it worse; *every* wildcard-granted principal had this reach since roles
+shipped. The system database holds no user documents, only the machinery —
+there is no legitimate data-plane reason for it to follow the data plane's
+wildcards, and there always was an administrative path that bypasses them.
+
+**Cost.** Anyone who was deliberately reading `__kimmy` through a wildcard
+must now either hold admin somewhere or write the exact grant — a visible
+behavior change, called out in the changelog's Changed section, and the safer
+direction to err in: the change hides information from people who were never
+meant to have it rather than revealing more. Root and every admin-flavored
+deployment are untouched, proven by the existing suite passing unmodified.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
