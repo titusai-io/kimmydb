@@ -510,3 +510,12 @@ format = "pretty"
 # unreachable collector costs a timeout every batch and nothing else.
 #
 # export_timeout_secs = 10
+
+# Automatic embedding. The worker is the oplog consumer that turns collection
+# changes into provider calls on this node; per-collection providers are
+# configured through the API, not here. Disable the worker to make this node a
+# consumer of embeddings rather than a producer of provider calls -- vectors
+# still replicate in, and vector search keeps working. Same effect as the
+# one-way flag --disable-vector-worker (KIMMY_DISABLE_VECTOR_WORKER).
+[vector]
+worker_enabled = true

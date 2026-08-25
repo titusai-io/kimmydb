@@ -19,6 +19,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kimmy_core::{Hlc, OpKind, VectorConfig, VectorRecord, path};
@@ -72,6 +73,9 @@ const DEFERRAL_TICK: Duration = Duration::from_secs(5);
 /// notice.
 const MAX_DEFERRED: usize = 4096;
 
+/// The injected ownership test. See [`EmbeddingWorker::set_owner_check`].
+pub type OwnerCheck = Box<dyn Fn(&str) -> bool + Send>;
+
 /// Keeps a collection's vectors in step with its documents.
 pub struct EmbeddingWorker {
     engine: Arc<Engine>,
@@ -87,6 +91,57 @@ pub struct EmbeddingWorker {
     /// Documents written by another node, waiting to see whether that node
     /// embeds them. Ordered by deadline, which insertion order already gives.
     deferred: VecDeque<Deferred>,
+    /// Whether *this* node owns embedding work for a collection, injected by
+    /// the caller because [`crate`] sits below the cluster crates that know
+    /// the member set. The closure receives a stable `"{db}/{collection}"`
+    /// key and answers with the same rendezvous hash the webhook dispatcher
+    /// and the expiry sweeper use, so all three subsystems land their work on
+    /// the same nodes for the same membership.
+    ///
+    /// `None` — the default, and what every single-node deployment runs —
+    /// owns everything, which is exactly right: with no peers there is
+    /// nobody to defer to.
+    am_owner: Option<OwnerCheck>,
+    /// Counters behind `/metrics`. Plain atomics for the same reason
+    /// `kimmy_api::metrics` is plain atomics: a fixed small set of series
+    /// does not want a registry dependency. Shared by handle so the
+    /// renderer can read them after the worker has been spawned.
+    counters: Arc<WorkerCounters>,
+}
+
+/// Worker-side counts for `/metrics`, shared between the worker task and the
+/// renderer by handle. See `kimmy_api::metrics`, which renders these as the
+/// `kimmy_embed_*` series.
+///
+/// Deliberately counts *documents* and *chunks* separately: a chunk count
+/// without a document count cannot distinguish "one huge document" from
+/// "many small ones", and the provider bill scales with chunks while the
+/// operational question ("is it keeping up?") scales with documents.
+#[derive(Debug, Default)]
+pub struct WorkerCounters {
+    /// Documents whose vectors were written by this node, streaming or
+    /// backfill.
+    pub documents_embedded: AtomicU64,
+    /// Chunks written — the number of provider inputs, and so the closest
+    /// proxy there is for provider spend.
+    pub chunks_embedded: AtomicU64,
+    /// Documents held for a later re-check because another node wrote them.
+    pub deferred: AtomicU64,
+    /// Documents dropped un-embedded because this node does not own the
+    /// collection. The signature of ownership working: without the gate this
+    /// counter's work would have been duplicate provider calls.
+    pub skipped_not_owned: AtomicU64,
+    /// Provider calls that failed, retryable and permanent together. A
+    /// number climbing while `documents_embedded` does not move is the
+    /// "provider is down" signature.
+    pub failures: AtomicU64,
+}
+
+impl WorkerCounters {
+    fn embedded(&self, chunks: usize) {
+        self.documents_embedded.fetch_add(1, Ordering::Relaxed);
+        self.chunks_embedded.fetch_add(chunks as u64, Ordering::Relaxed);
+    }
 }
 
 /// A document another node wrote, to be re-checked once its owner has had
@@ -120,7 +175,46 @@ pub enum Outcome {
 
 impl EmbeddingWorker {
     pub fn new(engine: Arc<Engine>) -> Self {
-        Self { engine, providers: HashMap::new(), deferred: VecDeque::new() }
+        Self {
+            engine,
+            providers: HashMap::new(),
+            deferred: VecDeque::new(),
+            am_owner: None,
+            counters: Arc::new(WorkerCounters::default()),
+        }
+    }
+
+    /// Install the cluster-ownership check. See the `am_owner` field for why
+    /// it is injected rather than computed here.
+    ///
+    /// The key format is `{db}/{collection}` — names, not ids, because names
+    /// are what every node agrees on across a restore, and because the key is
+    /// hashed, not parsed.
+    pub fn set_owner_check(&mut self, f: OwnerCheck) {
+        self.am_owner = Some(f);
+    }
+
+    /// The counters to hand the `/metrics` renderer. Call once, before
+    /// [`Self::run`]: the renderer keeps the handle, so replacing it later
+    /// would fork the counts.
+    pub fn counters(&self) -> Arc<WorkerCounters> {
+        Arc::clone(&self.counters)
+    }
+
+    /// Replace the built-in counters with a caller-supplied set — how
+    /// `kimmyd` shares one handle between the worker task and `/metrics`.
+    pub fn set_counters(&mut self, counters: Arc<WorkerCounters>) {
+        self.counters = counters;
+    }
+
+    /// Whether this node owns embedding for a collection. With no check
+    /// installed — single node, or a caller that has not wired clustering —
+    /// everything is owned, which is the correct default.
+    fn is_owner_of(&self, db: &str, collection: &str) -> bool {
+        match &self.am_owner {
+            None => true,
+            Some(f) => f(&format!("{db}/{collection}")),
+        }
     }
 
     /// Run until the change stream ends.
@@ -203,6 +297,7 @@ impl EmbeddingWorker {
             source,
             due: Instant::now() + FOREIGN_GRACE,
         });
+        self.counters.deferred.fetch_add(1, Ordering::Relaxed);
 
         while self.deferred.len() > MAX_DEFERRED {
             // Made due immediately rather than dropped -- see MAX_DEFERRED.
@@ -254,6 +349,23 @@ impl EmbeddingWorker {
         let Some(collection) = self.engine.collection_by_id(item.collection)? else {
             // The collection was dropped while this waited. Nothing to embed,
             // and the drop took the vectors with it.
+            return Ok(false);
+        };
+        // Not the owner: drop rather than re-check. Every node defers the
+        // same foreign writes, so the owner holds this document in its own
+        // queue — embedding it here too would be exactly the duplicate
+        // provider call the deferral mechanism exists to prevent. The one
+        // scenario dropping could lose coverage is the owner dying *and*
+        // this node being its only survivor, and there the rendezvous owner
+        // among the survivors has the same deferral and takes the work.
+        //
+        // Measured cost of leaving this gate out, from the 2026-08-24 load
+        // test on a three-node cluster whose replication had fallen hours
+        // behind: every node's [`FOREIGN_GRACE`] expiry found vectors that
+        // were still stale, so all three embedded the same backlog against
+        // one provider — the "3× amplification" that motivated this gate.
+        if !self.is_owner_of(&collection.db, &collection.name) {
+            self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
             return Ok(false);
         };
         let Some(config) = collection.vector.clone() else {
@@ -426,6 +538,28 @@ impl EmbeddingWorker {
             .engine
             .get_collection(&set.db, &kimmy_core::vector_meta::shadow_name(&set.collection))?;
 
+        // One node scans. A `ConfigureVectors` entry replicates to every
+        // member, and before this gate each of them ran the same full-
+        // collection scan — N× the provider calls for exactly one corpus,
+        // which on a fresh backfill is the single most expensive thing the
+        // worker ever does. The rendezvous owner (same function as webhooks
+        // and expiry) scans; the others skip and let replication bring them
+        // the vectors, which costs storage I/O instead of model inference.
+        //
+        // The fingerprint is deliberately *not* written here: it attests a
+        // completed scan by whoever ran it, and only the owner completes
+        // scans. If ownership moves later, vectors already replicate; a new
+        // owner re-scans only when someone changes the configuration again.
+        if !self.is_owner_of(&set.db, &set.collection) {
+            debug!(
+                db = %set.db,
+                collection = %set.collection,
+                "backfill owned elsewhere; relying on replication"
+            );
+            self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
+            return Ok(Outcome::Skipped);
+        }
+
         // Whether this scan must re-embed regardless of per-document
         // staleness. The HLC check cannot see a configuration change —
         // configurations do not touch documents — so the decision comes from
@@ -528,7 +662,13 @@ impl EmbeddingWorker {
         }
 
         let provider = self.provider_for(collection.id.0, config)?;
-        let vectors = provider.embed(&chunks).await?;
+        // Counted at the only line a provider outage can produce — including
+        // the retries, so a sustained outage reads as a climbing counter
+        // rather than one flat increment.
+        let vectors = provider.embed(&chunks).await.inspect_err(|_| {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        })?;
+        let chunk_count = chunks.len();
         let records: Vec<VectorRecord> = chunks
             .into_iter()
             .zip(vectors)
@@ -542,6 +682,10 @@ impl EmbeddingWorker {
             })
             .collect();
         self.engine.put_vectors(shadow, source, &records)?;
+        // The single choke point every embedding path funnels through —
+        // streaming, deferred re-check and backfill — so one increment here
+        // counts each exactly once.
+        self.counters.embedded(chunk_count);
         Ok(true)
     }
 
@@ -1322,6 +1466,85 @@ mod tests {
 
         assert_eq!(embedded, 1, "a document nobody embedded must not stay unembedded");
         assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deferred_document_is_dropped_when_another_node_owns_the_collection() {
+        // The gate that closes the residual amplification. Every node defers
+        // the same foreign writes, so when this node is not the rendezvous
+        // owner its re-check would be a duplicate of the owner's — and under
+        // replication lag measured on 2026-08-24 it *was*, three times over.
+        // Dropping here is safe because the owner holds the same deferral.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_owner_check(Box::new(|_| false));
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+        worker.process(&entry).await.unwrap();
+
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+
+        assert_eq!(embedded, 0, "a non-owner must not embed");
+        assert_eq!(
+            fake.calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no provider call may happen off-owner"
+        );
+        let counters = worker.counters();
+        assert!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+    }
+
+    #[tokio::test]
+    async fn a_backfill_is_skipped_when_another_node_owns_the_collection() {
+        // A ConfigureVectors entry replicates to every member. Without the
+        // ownership gate each of them ran the same full-collection scan —
+        // three complete corpora through the provider for one collection.
+        let (engine, _coll, mut worker, _dir) = setup_with_history(3).await;
+        worker.set_owner_check(Box::new(|_| false));
+        let entry = last_entry(&engine);
+
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Skipped);
+
+        let counters = worker.counters();
+        assert!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(
+            counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "an owned-elsewhere backfill must not embed anything"
+        );
+        // And the fingerprint stays unwritten, so if ownership moves here
+        // before any other node's vectors arrive, a later entry can still
+        // trigger this node's own scan.
+    }
+
+    #[tokio::test]
+    async fn without_an_owner_check_everything_is_owned() {
+        // Single-node deployments never install a check; they must keep the
+        // pre-ownership behaviour exactly — including picking up documents
+        // whose writer vanished, which is what makes deferral lossless.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        worker.process(&as_if_written_elsewhere(last_entry(&engine))).await.unwrap();
+        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
+
+        assert_eq!(embedded, 1);
+        let counters = worker.counters();
+        assert_eq!(
+            counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the default must be full ownership"
+        );
+        assert_eq!(
+            counters.chunks_embedded.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "\"hello world\" is eleven characters; one chunk under max_chars = 20"
+        );
+        assert_eq!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
