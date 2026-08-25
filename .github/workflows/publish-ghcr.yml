@@ -23,6 +23,17 @@ on:
       plan:
         required: true
         type: string
+  # Manual re-publish of an existing tag's image: same builds, same manifest,
+  # no release flow required. The input is the tag (v-prefixed), and every
+  # step that would have read github.sha or github.ref_name reads
+  # inputs.tag_name instead so a dispatch lands exactly where the release
+  # flow would have.
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: "Release tag to publish (e.g. v0.5.0)"
+        required: true
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -44,7 +55,26 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v5
+      # The tag is the source of truth: resolve it to its commit so the image
+      # reports the released code regardless of which ref dispatched this.
+      - name: Resolve release commit
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          if [ -n "$TAG" ]; then
+            SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha')
+            echo "commit=$SHA" >> "$GITHUB_OUTPUT"
+            echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "commit=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+            echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag_name || github.ref_name }}
 
       - uses: docker/setup-buildx-action@v3
 
@@ -66,10 +96,10 @@ jobs:
           # What `kimmyd` reports as its commit — the build context carries
           # no .git, so without this the image would say "unknown".
           build-args: |
-            GIT_COMMIT=${{ github.sha }}
+            GIT_COMMIT=${{ steps.rel.outputs.commit }}
           labels: |
             org.opencontainers.image.source=https://github.com/titusai-io/kimmydb
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.rel.outputs.commit }}
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           # Read-only reuse of the cache CI writes from main (base images and
           # the apt layer — see the note in ci.yml on why mode=min is enough).
@@ -128,10 +158,10 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=sha,format=short
-            type=raw,value=latest,enable=${{ !contains(github.ref_name, '-') }}
+            type=semver,pattern={{version}},value=${{ inputs.tag_name || github.ref_name }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ inputs.tag_name || github.ref_name }}
+            type=raw,value=sha-${{ steps.rel.outputs.short }}
+            type=raw,value=latest,enable=${{ !contains(inputs.tag_name || github.ref_name, '-') }}
 
       - name: Create multi-arch manifest
         working-directory: ${{ runner.temp }}/digests
