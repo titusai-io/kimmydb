@@ -131,7 +131,7 @@ node then:
 - publishes [protected resource metadata](http-api.md#protected-resource-metadata)
   at `/.well-known/oauth-protected-resource`, naming itself and its issuer;
 - points at that document from every 401, via `resource_metadata`;
-- lets `kimmy login --oidc --url https://kimmydb.example.com` work with nothing
+- lets `kimmy login --url https://kimmydb.example.com` work with nothing
   else configured, because the CLI reads both values off the node.
 
 The identifier is **not a free choice**. RFC 9728 §3 puts the metadata at
@@ -346,7 +346,7 @@ CLI cannot work out for itself:
 export KIMMY_URL=https://kimmydb.example.com
 export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 
-export KIMMY_TOKEN=$(kimmy login --oidc)                # RFC 8628 device flow
+export KIMMY_TOKEN=$(kimmy login)                     # RFC 8628 device flow, the default
 export KIMMY_TOKEN=$(kimmy login --client-credentials)  # a service; secret from
                                                         # KIMMY_OIDC_CLIENT_SECRET
 ```

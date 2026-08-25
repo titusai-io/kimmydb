@@ -6,6 +6,30 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-25 — **`kimmy login` federates by default, and `kimmy token` re-prints**
+
+Branch `feat/login-defaults-to-device-flow`. Two changes to how the CLI hands
+out credentials, both driven by how the test deployments actually authenticate:
+
+- **The default flipped.** Bare `kimmy login` now runs the device flow;
+  naming a user (`kimmy login ada`) is the local password path. The old
+  default refused with "name the user to log in as", so nothing scriptable
+  broke. `--oidc` is still accepted and now only spells the default out —
+  docs and scripts written against it keep working.
+- **New `kimmy token`.** Prints the token again: cache hit while fresh,
+  otherwise one federated flow whose result is cached. It is
+  `--cache-token` as a subcommand — ADR-075's "only when asked" holds because
+  invoking it *is* asking. Deliberately federated-only: a local token has no
+  issuer/client/resource to key a cache entry by, so `kimmy login <user>`
+  stays that path.
+
+Flow selection lives in one tested helper (`login_flow`: named user → Local,
+then `--client-credentials`, else Device). The unauthorized hint, after-help,
+and every doc example were updated to the new spellings; historical handoff
+sections keep their old ones on purpose.
+
+---
+
 ## As of 2026-08-25 — **the CLI can see a zero-grant identity coming**
 
 Branch `feat/cli-zero-grant-notice`. Companion to the merged

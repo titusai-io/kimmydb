@@ -355,7 +355,7 @@ stub identity provider in the harness. That is a piece of work with its own
 design, not a translation of this one.
 
 Until then, both clients are usable against a federated node exactly as they are
-against a local one, with a token from `kimmy login --oidc` or from the
+against a local one, with a token from `kimmy login` or from the
 application's own provider.
 
 ---
@@ -368,7 +368,7 @@ rather than merely present, and it worked: converting it found a public API that
 forced consumers to depend on `reqwest`, a login that could not fail over, and a
 missing `create-collection` that made a fresh database unusable from the tool.
 
-The one exception is `kimmy login --oidc` and `--client-credentials`, which talk
+The one exception is `kimmy login` — including its `--client-credentials` spelling — which talks
 to the **identity provider** rather than to a node. That is a different service
 with a different protocol, and putting it behind `kimmy-client` would give every
 application linking the crate an OAuth2 implementation it did not ask for.

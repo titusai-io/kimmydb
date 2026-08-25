@@ -29,6 +29,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   every federated caller held zero grants (empty listings, bare 403s). The
   variable takes one JSON array of mapping objects and **replaces** the file's
   list when set; every startup refusal applies unchanged (ADR-078).
+- **`kimmy token`.** Prints the caller's access token again: the cached one
+  while it stays fresh, otherwise one federated flow whose result is kept, so
+  `$(kimmy token)` costs nothing after the first call until the token nears
+  expiry. Caching is implied — invoking the command *is* the asking ADR-075
+  requires — and what is stored does not change: access token only, `0600`,
+  never a refresh token. Federated flows only; `kimmy login <user>` remains
+  how local accounts print a token.
+
+### Changed
+
+- **`kimmy login` federates by default.** With no arguments it runs the device
+  flow against the node's identity provider; naming a user (`kimmy login ada`)
+  logs into that local account as before. Previously bare `kimmy login`
+  refused with "name the user to log in as", so nothing scripted depended on
+  the old behaviour — but the flag spellings all still work, including
+  `--oidc`, which now only spells the default out.
 
 ## 0.5.0 - 2026-08-25
 
