@@ -25,6 +25,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   deletion, guarded like deletion is (not your own account, not the last
   enabled user).
 
+### Changed
+
+- **The system database never matches a wildcard (ADR-079).** A grant of
+  `{db:"*"}` no longer reaches `__kimmy` — whose `__users` collection holds
+  password hashes and token versions. Wildcard-granted callers stop seeing it
+  in listings and are refused on direct access; two doors remain, holding the
+  `admin` action anywhere (root and every admin deployment are untouched) or a
+  grant naming `__kimmy` exactly, down to its collection pattern. Anyone who
+  was deliberately reading system collections through a wildcard must write
+  that exact grant now.
+
 ## 0.6.0 - 2026-08-25
 
 ### Added

@@ -140,11 +140,11 @@ Rules worth internalizing:
   management are `admin` actions.
 - **Grants union.** A principal's grants are the union of every matching
   mapping plus direct grants; more than one mapping may contribute.
-- **Wildcards mean wildcards.** `{"db":"*"}` matches every database —
-  including the system database `__kimmy`, whose `__users` collection holds
-  password hashes and token versions. Grant `*/*` to identities you would let
-  read that; scope to named databases when you would not. (Whether system
-  collections should keep matching wildcards is an open design question.)
+- **Wildcards mean wildcards.** `{"db":"*"}` matches every database — except
+  the system database `__kimmy`, whose `__users` collection holds password
+  hashes and token versions: wildcards deliberately never reach it, and only
+  the `admin` action or an exact `{db:"__kimmy"}` grant does ([ADR-079]).
+  Scope to named databases when a caller needs nothing broader anyway.
 - **A mapping nobody matches is not an error.** It produces callers with zero
   grants, which presents as silently empty listings and bare 403s — the CLI
   announces that case since 0.6.0, but prevention beats diagnosis.
