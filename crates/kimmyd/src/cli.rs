@@ -109,11 +109,29 @@ pub struct Overrides {
 
     /// Claim carrying the caller's roles. `groups` for Entra ID.
     ///
-    /// There is deliberately no flag for the role mappings themselves: a grant
-    /// is a structure, and a command line is where structures go to be
-    /// mistyped. They live in the config file (ADR-066).
+    /// There is deliberately no way to spell individual mappings as repeated
+    /// flags: a grant is a structure, and a command line is where structures
+    /// go to be mistyped. They live in the config file (ADR-066), or in one
+    /// JSON document through --oidc-role-mappings (ADR-078).
     #[arg(long, env = "KIMMY_OIDC_ROLES_CLAIM")]
     pub oidc_roles_claim: Option<String>,
+
+    /// Claim values and what each earns here, overriding the config file.
+    ///
+    /// One JSON array of role mappings, aimed at deployments that configure
+    /// the node through an environment block — compose, swarm, kubernetes —
+    /// where editing a TOML file inside a container is not realistic:
+    ///
+    /// ```text
+    /// KIMMY_OIDC_ROLE_MAPPINGS='[{"claim_value":"developer","role":"analyst"}]'
+    /// ```
+    ///
+    /// Each mapping carries `claim_value` plus `role` and/or `grants`, exactly
+    /// as in the file, and every startup refusal applies unchanged. When set,
+    /// the variable **replaces** the file's list rather than merging with it,
+    /// so what runs is exactly what was passed.
+    #[arg(long, env = "KIMMY_OIDC_ROLE_MAPPINGS")]
+    pub oidc_role_mappings: Option<String>,
 
     /// How often to re-fetch the provider's signing keys, in seconds.
     #[arg(long, env = "KIMMY_OIDC_REFRESH_INTERVAL_SECS")]
@@ -202,7 +220,7 @@ impl Cli {
             Some(path) => Config::load(path)?,
             None => Config::default(),
         };
-        self.overrides.apply(&mut cfg);
+        self.overrides.apply(&mut cfg)?;
 
         // `restore` moves a file into a data directory and exits. It never
         // serves, never authenticates anybody, and never joins a cluster, so
@@ -217,7 +235,7 @@ impl Cli {
 }
 
 impl Overrides {
-    fn apply(&self, cfg: &mut Config) {
+    fn apply(&self, cfg: &mut Config) -> Result<()> {
         if let Some(bind) = self.bind {
             cfg.server.bind = bind;
         }
@@ -241,6 +259,9 @@ impl Overrides {
         }
         if let Some(claim) = &self.oidc_roles_claim {
             cfg.auth.oidc.roles_claim = claim.clone();
+        }
+        if let Some(raw) = &self.oidc_role_mappings {
+            cfg.auth.oidc.role_mappings = parse_role_mappings(raw)?;
         }
         if let Some(secs) = self.oidc_refresh_interval_secs {
             cfg.auth.oidc.refresh_interval_secs = secs;
@@ -310,7 +331,26 @@ impl Overrides {
         if self.telemetry_include_names {
             cfg.telemetry.include_names = true;
         }
+        Ok(())
     }
+}
+
+/// Parse the `KIMMY_OIDC_ROLE_MAPPINGS` value (ADR-078).
+///
+/// The error names the variable and shows the expected shape rather than
+/// surfacing a bare serde dump, for the same reason every other refusal in
+/// this file speaks in complete sentences: this is read out of an environment
+/// block, where the person debugging it cannot see a stack trace either.
+fn parse_role_mappings(raw: &str) -> Result<Vec<kimmy_auth::RoleMapping>> {
+    const EXAMPLE: &str = "[{\"claim_value\":\"user\",\"grants\":[{\"db\":\"*\",\"actions\":[\"read\"]}]},\
+                           {\"claim_value\":\"developer\",\"role\":\"analyst\"}]";
+    serde_json::from_str(raw).map_err(|e| {
+        anyhow::anyhow!(
+            "invalid KIMMY_OIDC_ROLE_MAPPINGS: {e}\n\
+             expected a JSON array of role mappings, each naming claim_value plus \
+             role and/or grants, e.g.\n  {EXAMPLE}"
+        )
+    })
 }
 
 #[cfg(test)]
@@ -360,7 +400,7 @@ mod tests {
     fn flags_override_defaults() {
         let cli = parse(&["--bind", "127.0.0.1:9999", "--data-dir", "/tmp/kimmy"]);
         let mut cfg = Config::default();
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
         assert_eq!(cfg.server.bind, "127.0.0.1:9999".parse().unwrap());
         assert_eq!(cfg.storage.data_dir, PathBuf::from("/tmp/kimmy"));
     }
@@ -370,7 +410,7 @@ mod tests {
         let cli = parse(&[]);
         let mut cfg = Config::default();
         cfg.auth.insecure_no_auth = true;
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.auth.insecure_no_auth, "an absent flag must not override the file");
     }
 
@@ -387,7 +427,7 @@ mod tests {
             "kimmydb-prod",
         ]);
         let mut cfg = Config::default();
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
 
         assert_eq!(cfg.telemetry.endpoint.as_deref(), Some("http://collector:4318"));
         assert_eq!(cfg.telemetry.protocol, "http/json");
@@ -401,12 +441,12 @@ mod tests {
         let cli = parse(&[]);
         let mut cfg = Config::default();
         cfg.telemetry.include_names = true;
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.telemetry.include_names, "an absent flag must not override the file");
 
         let cli = parse(&["--telemetry-include-names"]);
         let mut cfg = Config::default();
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.telemetry.include_names);
     }
 
@@ -414,7 +454,7 @@ mod tests {
     fn seeds_parse_and_imply_clustering() {
         let cli = parse(&["--seeds", "k8s:kimmy-headless.default.svc.cluster.local"]);
         let mut cfg = Config::default();
-        cli.overrides.apply(&mut cfg);
+        cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.cluster.enabled, "naming seeds should enable clustering");
         assert_eq!(cfg.cluster.seeds.len(), 1);
     }
@@ -428,5 +468,68 @@ mod tests {
     #[test]
     fn a_bad_seed_is_a_parse_error() {
         assert!(Cli::try_parse_from(["kimmyd", "--seeds", "static:garbage"]).is_err());
+    }
+
+    #[test]
+    fn role_mappings_env_replaces_the_file_list() {
+        let cli = parse(&[
+            "--oidc-role-mappings",
+            r#"[{"claim_value":"user","grants":[{"db":"*","actions":["read","search"]}]},
+                {"claim_value":"developer","role":"analyst"}]"#,
+        ]);
+        let mut cfg = Config::default();
+        // A file that already configured mappings must not survive alongside
+        // the variable: "what I passed is what runs", like every other
+        // override here.
+        cfg.auth.oidc.role_mappings = vec![kimmy_auth::RoleMapping {
+            claim_value: "from-the-file".into(),
+            role: None,
+            grants: vec![kimmy_auth::Grant::new("sales", "*", vec![kimmy_auth::Action::Read])],
+        }];
+        cli.overrides.apply(&mut cfg).unwrap();
+
+        assert_eq!(cfg.auth.oidc.role_mappings.len(), 2, "the file's mapping must be replaced");
+        assert_eq!(cfg.auth.oidc.role_mappings[0].claim_value, "user");
+        assert_eq!(
+            cfg.auth.oidc.role_mappings[0].grants[0].actions,
+            vec![kimmy_auth::Action::Read, kimmy_auth::Action::Search],
+            "lowercase action names are the wire form"
+        );
+        assert_eq!(cfg.auth.oidc.role_mappings[1].role.as_deref(), Some("analyst"));
+    }
+
+    #[test]
+    fn an_unparsable_role_mappings_value_names_the_variable() {
+        let cli = parse(&["--oidc-role-mappings", "[{claim_value: user}]"]);
+        let mut cfg = Config::default();
+        let err = cli.overrides.apply(&mut cfg).unwrap_err().to_string();
+        assert!(err.contains("KIMMY_OIDC_ROLE_MAPPINGS"), "must name the variable: {err}");
+        assert!(err.contains("claim_value"), "must show the expected shape: {err}");
+    }
+
+    #[test]
+    fn role_mappings_from_the_env_reach_validate() {
+        // The startup refusals are validate()'s to make, and the env form
+        // lands in the same field the file does. Asserting the refusal itself
+        // (not merely that something failed) is what keeps this test honest:
+        // a mapping naming neither role nor grants is a typo however it
+        // arrived.
+        let cli = parse(&["--oidc-role-mappings", r#"[{"claim_value":"user"}]"#]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("hunter2".into()),
+                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
+                oidc: crate::config::OidcConfig {
+                    issuer: Some("https://auth.example.com".into()),
+                    audience: Some("https://kimmydb.example.com".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("user"), "the error should name the mapping: {err}");
     }
 }

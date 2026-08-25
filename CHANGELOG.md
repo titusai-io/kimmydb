@@ -10,6 +10,18 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`KIMMY_OIDC_ROLE_MAPPINGS`: role mappings through an environment
+  variable.** A container deployment that configures the node with env vars
+  could federate but had no way to say what a federated identity was worth —
+  `role_mappings` was TOML-only, so such nodes ran with zero mappings and
+  every federated caller held zero grants (empty listings, bare 403s). The
+  variable takes one JSON array of mapping objects and **replaces** the file's
+  list when set; every startup refusal applies unchanged (ADR-078).
+
 ## 0.5.0 - 2026-08-25
 
 ### Added

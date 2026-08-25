@@ -83,8 +83,17 @@ grants = [{ db = "sales", collection = "orders*", actions = ["read", "search"] }
 ```
 
 Also settable as `KIMMY_OIDC_ISSUER`, `KIMMY_OIDC_AUDIENCE`,
-`KIMMY_OIDC_ROLES_CLAIM`. The mappings are file-only: a grant is a structure,
-and a command line is where structures go to be mistyped.
+`KIMMY_OIDC_ROLES_CLAIM`. The mappings have no per-mapping flags — a grant is
+a structure, and a command line is where structures go to be mistyped — but a
+deployment that configures the node through an environment block (compose,
+swarm, kubernetes) can pass the whole list as one JSON document instead:
+
+```sh
+KIMMY_OIDC_ROLE_MAPPINGS='[{"claim_value":"developer","role":"analyst"}]'
+```
+
+When set, the variable **replaces** the file's list rather than merging with it,
+and every refusal in the table below applies unchanged (ADR-078).
 
 Refused at startup, each because of what it would otherwise break:
 

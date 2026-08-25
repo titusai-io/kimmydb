@@ -332,11 +332,24 @@ token_ttl_secs = 3600
 # allow_federated_admin = false
 
 # Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
-# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM,
-# KIMMY_OIDC_REFRESH_INTERVAL_SECS. The mappings are file-only — a grant is a
-# structure, and a command line is where structures go to be mistyped. So is
-# allow_federated_admin, which is a boundary an operator should have to write
-# down and review in a diff rather than set from a shell.
+# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_REFRESH_INTERVAL_SECS.
+#
+# The mappings are file-only in the sense that there are still no per-mapping
+# flags — a grant is a structure, and a command line is where structures go to
+# be mistyped. But deployments that configure the node through an environment
+# block (compose, swarm, kubernetes) do not edit TOML files inside containers,
+# so the whole list can arrive as one JSON document instead:
+#
+#   KIMMY_OIDC_ROLE_MAPPINGS='[{"claim_value":"developer","role":"analyst"}]'
+#   KIMMY_OIDC_ROLE_MAPPINGS='[{"claim_value":"user","grants":[{"db":"sales","actions":["read"]}]}]'
+#
+# When set, the variable REPLACES the file's list rather than merging with it.
+# Every refusal above — empty mapping, inline `admin`, unknown action — applies
+# unchanged, so check-config catches a bad value before the service sees it
+# (ADR-078).
+#
+# allow_federated_admin stays file-only: it is a boundary an operator should
+# have to write down and review in a diff rather than set from a shell.
 #
 # `kimmyd check-config` reaches the provider and reports what it found, and
 # says whether this node publishes protected resource metadata. The server
