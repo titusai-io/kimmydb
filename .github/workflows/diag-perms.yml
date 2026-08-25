@@ -1,0 +1,23 @@
+name: diag perms
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: whoami + try release creation
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "--- authenticated as ---"
+          gh api /user --jq '.login' || true
+          echo "--- try POST /releases (dry shape: expect 422 already_exists or 201, NOT 403) ---"
+          gh api repos/titusai-io/kimmydb/releases \
+            -F tag_name=v9.9.9-diag -F name=diag-probe \
+            -F body=temporary diagnostics 2>&1 | head -3
+          echo "--- cleanup ---"
+          RID=$(gh api repos/titusai-io/kimmydb/releases/tags/v9.9.9-diag --jq '.id' 2>/dev/null)
+          [ -n "$RID" ] && gh api -X DELETE repos/titusai-io/kimmydb/releases/$RID && echo "cleaned up"
+          git push origin :refs/tags/v9.9.9-diag 2>/dev/null || true
