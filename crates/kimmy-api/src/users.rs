@@ -134,6 +134,54 @@ pub async fn set_grants(
     Ok(Json(json!({ "updated": name })))
 }
 
+#[derive(Deserialize)]
+pub struct DisabledRequest {
+    disabled: bool,
+}
+
+/// Disable or re-enable an account.
+///
+/// Guards mirror [`delete_user`], for the same reason: disabling the caller's
+/// own account is a lockout with no undo from outside, and disabling the last
+/// enabled user leaves a server nobody can administer. Both checks apply only
+/// to a *state change* — re-enabling carries no guard, because it only ever
+/// restores access, and writing `disabled: true` over an account already
+/// disabled changes nothing worth refusing.
+pub async fn set_disabled(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path(name): Path<String>,
+    JsonBody(body): JsonBody<DisabledRequest>,
+) -> Result<Json<Value>, ApiError> {
+    require_server_admin(&auth)?;
+    let user = state
+        .users
+        .get(&state.engine, &name)?
+        .ok_or_else(|| ApiError::not_found(format!("no user {name:?}")))?;
+
+    if body.disabled && !user.disabled {
+        if name == auth.principal().user {
+            return Err(ApiError::conflict("cannot disable the account you are signed in as"));
+        }
+        let enabled_others = state
+            .users
+            .list(&state.engine)?
+            .iter()
+            // `list` returns names; each candidate needs its record to know
+            // whether it is currently enabled. User counts are small.
+            .filter_map(|n| state.users.get(&state.engine, n).ok().flatten())
+            .filter(|u| !u.disabled && u.name != name)
+            .count();
+        if enabled_others == 0 {
+            return Err(ApiError::conflict("cannot disable the last remaining enabled user"));
+        }
+    }
+
+    state.users.set_disabled(&state.engine, &name, body.disabled)?;
+    state.sessions.evict(&name);
+    Ok(Json(json!({ "updated": name, "disabled": body.disabled })))
+}
+
 /// Who am I, and what may I do?
 pub async fn whoami(auth: Auth) -> Json<Value> {
     Json(json!({

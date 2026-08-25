@@ -86,6 +86,7 @@ fn routes(state: SharedState) -> Router {
         .route("/v1/users/{name}", get(crate::users::get_user).delete(crate::users::delete_user))
         .route("/v1/users/{name}/password", post(crate::users::set_password))
         .route("/v1/users/{name}/grants", post(crate::users::set_grants))
+        .route("/v1/users/{name}/disabled", post(crate::users::set_disabled))
         .route("/v1/users/{name}/roles", post(crate::roles::set_user_roles))
         // Written out as literals, like every route above, because the
         // documentation contract in `tests/openapi.rs` scans this file for

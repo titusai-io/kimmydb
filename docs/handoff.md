@@ -6,6 +6,27 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-25 — **the admin surface reaches the CLI**
+
+Branch `feat/admin-cli`. Implements [[kimmydb-admin-cli-roles-and-users-management]]:
+`kimmy roles` (list/show/create/grant/revoke/delete) and `kimmy users`
+(list/show/create/reset-password/set-grants/set-roles/disable/enable/delete).
+
+- **One server addition**: `POST /v1/users/{name}/disabled` — the `disabled`
+  field existed and the session check honored it, but nothing could set it.
+  Bumps `token_version` + evicts sessions, so disable *is* revocation;
+  re-enable does not restore those sessions. Guards mirror deletion (not
+  yourself; not the last enabled user — checked only on a real state change).
+- Grant shorthand everywhere: `db:actions` or `db:collection:actions`, e.g.
+  `--grant 'sales:orders*:read,search'`. Duplicates refused client-side.
+- `roles grant/revoke` are fetch-modify-post against the replace-semantics API
+  — the concurrent-operator race is documented, not hidden.
+- Docs contract satisfied: route literal in http-api.md table, openapi path +
+  driven twice in `tests/openapi.rs`, behavior tests in `api.rs` (disable ends
+  sessions & refuses logins; guards; 404). Full workspace green.
+
+---
+
 ## As of 2026-08-25 — **v0.6.0: the federation round ships**
 
 Release prep only — no behaviour changed on this branch. Workspace version

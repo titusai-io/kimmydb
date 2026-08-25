@@ -213,6 +213,17 @@ enum Command {
     /// federated login that succeeds while everything else refuses is almost
     /// always a token whose roles no mapping turned into grants.
     Whoami,
+    /// Manage stored roles — the named grant sets that OIDC role mappings
+    /// point at and local users can hold.
+    Roles {
+        #[command(subcommand)]
+        command: RolesSub,
+    },
+    /// Manage this node's local user accounts.
+    Users {
+        #[command(subcommand)]
+        command: UsersSub,
+    },
     /// List databases you can read.
     Databases,
     /// List collections in a database.
@@ -352,6 +363,76 @@ enum Command {
         #[arg(long, default_value = "kimmy.backup")]
         out: String,
     },
+}
+
+/// Subcommands of `kimmy roles`.
+#[derive(Subcommand)]
+enum RolesSub {
+    /// List every stored role by name.
+    List,
+    /// Print one role: its name and its grants.
+    Show { name: String },
+    /// Create a role. Repeat --grant for each grant; see `--grant` for the shape.
+    Create {
+        name: String,
+        /// `[collection]:action[,action…]`, or `db/collection:actions`. The
+        /// collection part defaults to `*`. Examples:
+        /// `--grant 'sales/orders*:read,search'`, `--grant '*:*:read'`.
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+    },
+    /// Add actions to one of a role's grants, creating the grant if absent.
+    Grant {
+        name: String,
+        /// Same shape as roles create's --grant. One grant per invocation.
+        grant: String,
+    },
+    /// Remove actions from one of a role's grants, dropping it when empty.
+    Revoke {
+        name: String,
+        /// Same shape as roles create's --grant (actions required).
+        grant: String,
+    },
+    /// Delete a role. Principals mapping to or holding it lose its grants
+    /// on their next request — nothing else is affected.
+    Delete { name: String },
+}
+
+/// Subcommands of `kimmy users`.
+#[derive(Subcommand)]
+enum UsersSub {
+    /// List local accounts with their state.
+    List,
+    /// Print one account: grants, disabled flag.
+    Show { user: String },
+    /// Create an account. The password is read from stdin, like login's.
+    ///
+    /// Repeat --grant for initial grants (same shape as roles create), and
+    /// --role to hold stored roles from birth.
+    Create {
+        user: String,
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+        #[arg(long = "role")]
+        roles: Vec<String>,
+    },
+    /// Set a new password. Read from stdin, like login's.
+    ResetPassword { user: String },
+    /// Replace an account's direct grants. Repeat --grant; none means empty.
+    SetGrants {
+        user: String,
+        #[arg(long = "grant")]
+        grants: Vec<String>,
+    },
+    /// Replace the stored roles an account holds. Names only; none clears.
+    SetRoles { user: String, roles: Vec<String> },
+    /// Disable an account: refused at authentication, existing sessions end,
+    /// record kept. The reversible form of delete.
+    Disable { user: String },
+    /// Re-enable a disabled account. Sessions ended by the disable stay gone.
+    Enable { user: String },
+    /// Delete an account outright.
+    Delete { user: String },
 }
 
 fn main() -> ExitCode {
@@ -524,6 +605,8 @@ async fn run() -> Result<()> {
             emit(&cli, &client.hybrid_search(db, coll, &body).await?);
         }
         Command::Topology => emit(&cli, &client.topology().await?),
+        Command::Roles { command } => roles_command(&cli, &client, command).await?,
+        Command::Users { command } => users_command(&cli, &client, command).await?,
         Command::CreateCollection { target } => {
             let (db, coll) = split_target(target)?;
             let created = client
@@ -1630,6 +1713,278 @@ fn collection_created(answer: kimmy_client::Result<Value>, collection: &str) -> 
     }
 }
 
+/// Parse a grant shorthand: `db:actions` or `db:collection:actions`.
+///
+/// Actions are comma-separated; the collection defaults to `*`. Colons split,
+/// actions last — so `*:*:read` is every database, every collection, read;
+/// `sales:orders*:read,search` is one database's order collections. Action
+/// spelling is the server's to judge: anything unrecognized is refused there
+/// with the list of valid ones rather than guessed at here.
+fn parse_grant_spec(spec: &str) -> Result<Value> {
+    let parts: Vec<&str> = spec.split(':').collect();
+    let (db, collection, actions) = match parts.as_slice() {
+        [db, actions] => (*db, "*", *actions),
+        [db, collection, actions] => (*db, *collection, *actions),
+        _ => anyhow::bail!(
+            "grant {spec:?} must be db:actions or db:collection:actions, \
+             e.g. '*:*:read' or 'sales:orders*:read,search'"
+        ),
+    };
+    let actions: Vec<&str> = actions.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if actions.is_empty() {
+        anyhow::bail!("grant {spec:?} names no actions");
+    }
+    if db.is_empty() {
+        anyhow::bail!("grant {spec:?} has an empty database part");
+    }
+    Ok(json!({ "db": db, "collection": collection, "actions": actions }))
+}
+
+/// Parse every `--grant` occurrence, refusing duplicates of the same
+/// db+collection pair — the server replaces wholesale, so two specs naming one
+/// grant would silently keep only the later.
+fn parse_grant_specs(specs: &[String]) -> Result<Vec<Value>> {
+    let mut grants: Vec<Value> = Vec::new();
+    for spec in specs {
+        let grant = parse_grant_spec(spec)?;
+        if grants.iter().any(|g| g["db"] == grant["db"] && g["collection"] == grant["collection"]) {
+            anyhow::bail!("grant {spec:?} repeats a db+collection already given");
+        }
+        grants.push(grant);
+    }
+    Ok(grants)
+}
+
+/// Apply `add` (union) or `revoke` (subtract) to one stored role's grants.
+///
+/// The API replaces a role's grants wholesale, so an incremental edit is
+/// fetch-modify-post here. Two operators editing one role concurrently race in
+/// the usual last-write-wins way; that is documented rather than hidden behind
+/// invented server semantics.
+async fn merge_role_grants(
+    cli: &Cli,
+    client: &Client,
+    name: &str,
+    spec: &str,
+    add: bool,
+) -> Result<()> {
+    let path = format!("/v1/roles/{name}");
+    let role = client.request(Method::Get, &path, None, Safety::Idempotent).await?;
+    let mut grants: Vec<Value> = role["grants"].as_array().cloned().ok_or_else(|| {
+        anyhow::anyhow!(
+            "role {name:?} answered without a grants array; is the node older than 0.4.0?"
+        )
+    })?;
+
+    let parsed = parse_grant_spec(spec)?;
+    let entry = grants
+        .iter_mut()
+        .find(|g| g["db"] == parsed["db"] && g["collection"] == parsed["collection"]);
+    match (entry, add) {
+        (Some(entry), true) => {
+            let held = entry["actions"].as_array().cloned().unwrap_or_default();
+            let fresh: Vec<&Value> = parsed["actions"]
+                .as_array()
+                .expect("parse_grant_spec builds an actions array")
+                .iter()
+                .filter(|a| !held.contains(a))
+                .collect();
+            entry["actions"] =
+                json!(held.iter().cloned().chain(fresh.into_iter().cloned()).collect::<Vec<_>>());
+        }
+        (Some(entry), false) => {
+            let kept: Vec<&Value> = entry["actions"]
+                .as_array()
+                .expect("parse_grant_spec builds an actions array")
+                .iter()
+                .filter(|a| !parsed["actions"].as_array().unwrap().contains(a))
+                .collect();
+            if kept.is_empty() {
+                let db = parsed["db"].clone();
+                let collection = parsed["collection"].clone();
+                grants.retain(|g| !(g["db"] == db && g["collection"] == collection));
+            } else {
+                entry["actions"] = json!(kept);
+            }
+        }
+        // Adding actions to a grant the role does not have: push it whole.
+        // Revoking from one it does not have changes nothing, so nothing is
+        // written — the caller sees today's definition either way.
+        (None, true) => grants.push(parsed),
+        (None, false) => {}
+    }
+
+    let updated = client
+        .request(
+            Method::Post,
+            &format!("/v1/roles/{name}/grants"),
+            Some(json!({ "grants": grants })),
+            Safety::Idempotent,
+        )
+        .await?;
+    emit(cli, &updated);
+    Ok(())
+}
+
+async fn roles_command(cli: &Cli, client: &Client, command: &RolesSub) -> Result<()> {
+    match command {
+        RolesSub::List => {
+            emit(cli, &client.request(Method::Get, "/v1/roles", None, Safety::Idempotent).await?)
+        }
+        RolesSub::Show { name } => emit(
+            cli,
+            &client
+                .request(Method::Get, &format!("/v1/roles/{name}"), None, Safety::Idempotent)
+                .await?,
+        ),
+        RolesSub::Create { name, grants } => {
+            let created = client
+                .request(
+                    Method::Post,
+                    "/v1/roles",
+                    Some(json!({ "name": name, "grants": parse_grant_specs(grants)? })),
+                    Safety::Idempotent,
+                )
+                .await;
+            emit(cli, &collection_created(created, name)?);
+        }
+        RolesSub::Grant { name, grant } => {
+            merge_role_grants(cli, client, name, grant, true).await?;
+        }
+        RolesSub::Revoke { name, grant } => {
+            merge_role_grants(cli, client, name, grant, false).await?;
+        }
+        RolesSub::Delete { name } => {
+            let deleted = client
+                .request(Method::Delete, &format!("/v1/roles/{name}"), None, Safety::Idempotent)
+                .await?;
+            emit(cli, &deleted);
+        }
+    }
+    Ok(())
+}
+
+/// Read a password for a user-management command — stdin or KIMMY_PASSWORD,
+/// exactly as `login` reads its own, for the same reasons.
+fn read_password_for(_user: &str) -> Result<String> {
+    read_password()
+}
+
+async fn users_command(cli: &Cli, client: &Client, command: &UsersSub) -> Result<()> {
+    match command {
+        UsersSub::List => {
+            // The listing endpoint answers names; each record carries the
+            // state worth seeing. Accounts are few; round trips are cheap.
+            let listed = client.request(Method::Get, "/v1/users", None, Safety::Idempotent).await?;
+            let names: Vec<String> = serde_json::from_value(
+                listed.get("users").cloned().context("listing answered without a users array")?,
+            )?;
+            let mut users = Vec::new();
+            for name in &names {
+                let record = client
+                    .request(Method::Get, &format!("/v1/users/{name}"), None, Safety::Idempotent)
+                    .await?;
+                users.push(json!({
+                    "user": record.get("user").cloned().unwrap_or(json!(name)),
+                    "disabled": record.get("disabled").cloned().unwrap_or(json!(false)),
+                }));
+            }
+            emit(cli, &json!({ "users": users }));
+        }
+        UsersSub::Show { user } => emit(
+            cli,
+            &client
+                .request(Method::Get, &format!("/v1/users/{user}"), None, Safety::Idempotent)
+                .await?,
+        ),
+        UsersSub::Create { user, grants, roles } => {
+            let password = read_password_for(user)?;
+            let mut payload = json!({ "user": user, "password": password });
+            let parsed = parse_grant_specs(grants)?;
+            if !parsed.is_empty() {
+                payload["grants"] = json!(parsed);
+            }
+            let created = client
+                .request(Method::Post, "/v1/users", Some(payload), Safety::Idempotent)
+                .await?;
+            if !roles.is_empty() {
+                client
+                    .request(
+                        Method::Post,
+                        &format!("/v1/users/{user}/roles"),
+                        Some(json!({ "roles": roles })),
+                        Safety::Idempotent,
+                    )
+                    .await?;
+            }
+            emit(cli, &created);
+        }
+        UsersSub::ResetPassword { user } => {
+            let password = read_password_for(user)?;
+            let updated = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/users/{user}/password"),
+                    Some(json!({ "password": password })),
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(cli, &updated);
+        }
+        UsersSub::SetGrants { user, grants } => {
+            let updated = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/users/{user}/grants"),
+                    Some(json!({ "grants": parse_grant_specs(grants)? })),
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(cli, &updated);
+        }
+        UsersSub::SetRoles { user, roles } => {
+            let updated = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/users/{user}/roles"),
+                    Some(json!({ "roles": roles })),
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(cli, &updated);
+        }
+        UsersSub::Disable { user } => {
+            let updated = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/users/{user}/disabled"),
+                    Some(json!({ "disabled": true })),
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(cli, &updated);
+        }
+        UsersSub::Enable { user } => {
+            let updated = client
+                .request(
+                    Method::Post,
+                    &format!("/v1/users/{user}/disabled"),
+                    Some(json!({ "disabled": false })),
+                    Safety::Idempotent,
+                )
+                .await?;
+            emit(cli, &updated);
+        }
+        UsersSub::Delete { user } => {
+            let deleted = client
+                .request(Method::Delete, &format!("/v1/users/{user}"), None, Safety::Idempotent)
+                .await?;
+            emit(cli, &deleted);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -1725,6 +2080,68 @@ mod tests {
             Cli::try_parse_from(["kimmy", "token", "ada"]).is_err(),
             "a local account has no provider to key a cache by; kimmy login <user> is that path"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // The admin surface: grant shorthand and command grouping
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn grant_shorthand_parses_all_three_shapes() {
+        let two = parse_grant_spec("notes:read").unwrap();
+        assert_eq!(two["db"], json!("notes"));
+        assert_eq!(two["collection"], json!("*"));
+        assert_eq!(two["actions"], json!(["read"]));
+
+        let three = parse_grant_spec("sales:orders*:read, search").unwrap();
+        assert_eq!(three["db"], json!("sales"));
+        assert_eq!(three["collection"], json!("orders*"));
+        assert_eq!(three["actions"], json!(["read", "search"]), "spaces around commas are trimmed");
+
+        let star = parse_grant_spec("*:*:read").unwrap();
+        assert_eq!(star["db"], json!("*"));
+        assert_eq!(star["collection"], json!("*"));
+    }
+
+    #[test]
+    fn a_malformed_grant_shorthand_is_refused_with_the_shape_in_the_error() {
+        for bad in ["no-colon", "db:coll:extra:read", "db:", ":read", "db:  "] {
+            let err = parse_grant_spec(bad).unwrap_err().to_string();
+            assert!(
+                err.contains("db:actions")
+                    || err.contains("names no actions")
+                    || err.contains("empty database"),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_grant_specs_are_refused_before_anything_is_sent() {
+        let specs = ["sales:read".to_string(), "sales:*:write".to_string()];
+        let err = parse_grant_specs(&specs).unwrap_err().to_string();
+        assert!(err.contains("repeats"), "{err}");
+    }
+
+    #[test]
+    fn roles_and_users_are_grouped_subcommands() {
+        for args in [
+            vec!["roles", "list"],
+            vec!["roles", "show", "analyst"],
+            vec!["roles", "create", "analyst", "--grant", "*:*:read"],
+            vec!["roles", "grant", "analyst", "shop:orders*:write"],
+            vec!["roles", "delete", "analyst"],
+            vec!["users", "list"],
+            vec!["users", "create", "ada"],
+            vec!["users", "disable", "ada"],
+            vec!["users", "enable", "ada"],
+            vec!["users", "set-roles", "ada", "analyst", "auditor"],
+            vec!["users", "delete", "ada"],
+        ] {
+            let mut full = vec!["kimmy"];
+            full.extend(args.iter());
+            assert!(Cli::try_parse_from(full).is_ok(), "expected {args:?} to parse");
+        }
     }
 
     /// One workspace version, one binary story (ADR-062): what

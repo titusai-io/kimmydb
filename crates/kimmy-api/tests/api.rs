@@ -1040,6 +1040,69 @@ async fn changing_a_password_ends_the_sessions_the_old_one_opened() {
 }
 
 #[tokio::test]
+async fn disabling_a_user_ends_its_sessions_and_refuses_new_logins() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(server.get("/v1/databases", Some(&ada)).await.status, 200);
+
+    server.post("/v1/users/ada/disabled", Some(&root), json!({"disabled":true})).await;
+
+    assert_eq!(
+        server.get("/v1/databases", Some(&ada)).await.status,
+        401,
+        "disabling must end the sessions the account holds"
+    );
+    let res =
+        server.post("/v1/auth/login", None, json!({"user":"ada","password":"ada-password"})).await;
+    assert_eq!(
+        res.status, 401,
+        "a disabled account must not authenticate even with the right password"
+    );
+
+    // The reversible form of deletion: re-enable and the same credentials
+    // work — but the sessions disabled away stay gone.
+    server.post("/v1/users/ada/disabled", Some(&root), json!({"disabled":false})).await;
+    let fresh = server.login("ada", "ada-password").await;
+    assert_eq!(server.get("/v1/databases", Some(&fresh)).await.status, 200);
+}
+
+#[tokio::test]
+async fn disabling_is_guarded_like_deletion() {
+    let server = Server::start().await;
+    let root = server.root().await;
+
+    // Disabling yourself is a lockout with no undo from outside.
+    let res = server.post("/v1/users/root/disabled", Some(&root), json!({"disabled":true})).await;
+    assert_eq!(res.status, 409);
+
+    // A second administrator makes cross-admin disables possible...
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({"user":"ada","password":"ada-password",
+                   "grants":[{"db":"*","collection":"*","actions":["admin"]}]}),
+        )
+        .await;
+    let ada = server.login("ada", "ada-password").await;
+    assert_eq!(
+        server.post("/v1/users/root/disabled", Some(&ada), json!({"disabled":true})).await.status,
+        200,
+        "one admin may disable another while remaining enabled"
+    );
+    let res = server
+        .post("/v1/auth/login", None, json!({"user":"root","password":"root-password"}))
+        .await;
+    assert_eq!(res.status, 401, "disabled root must not log in");
+
+    // ...and an unknown name is a 404, not a silent success.
+    let res = server.post("/v1/users/ghost/disabled", Some(&ada), json!({"disabled":true})).await;
+    assert_eq!(res.status, 404);
+}
+
+#[tokio::test]
 async fn narrowing_a_grant_takes_effect_without_waiting_for_the_token_to_expire() {
     // Grants ride inside the token, so before ADR-052 a *revoked* permission
     // kept working for the rest of the token's hour. This is the property that

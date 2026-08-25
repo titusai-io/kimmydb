@@ -698,6 +698,47 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/users/{name}/disabled:
+    parameters:
+      - $ref: "#/components/parameters/UserName"
+    post:
+      tags: [users]
+      operationId: setDisabled
+      summary: Disable or re-enable an account.
+      description: |
+        A disabled account is refused at authentication while its record stays
+        in place, and the bump to its token version ends every session it
+        holds; re-enabling does not restore those sessions. Refused for the
+        caller's own account and for the last remaining enabled user, for the
+        same reasons deletion is.
+      x-kimmy-action: admin over `*`
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [disabled]
+              properties:
+                disabled:
+                  type: boolean
+      responses:
+        "200":
+          description: Updated.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [updated, disabled]
+                properties:
+                  updated: { type: string }
+                  disabled: { type: boolean }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+
   /v1/users/{name}/grants:
     parameters:
       - $ref: "#/components/parameters/UserName"

@@ -796,6 +796,27 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         200,
     )
     .await;
+    // Disable is driven twice — off, then on again — so the documented
+    // operation is exercised without leaving the account disabled for the
+    // checks that log `clerk` in further down.
+    c.check(
+        "POST",
+        "/v1/users/{name}/disabled",
+        "/v1/users/clerk/disabled",
+        Some(&root),
+        Some(json!({ "disabled": true })),
+        200,
+    )
+    .await;
+    c.check(
+        "POST",
+        "/v1/users/{name}/disabled",
+        "/v1/users/clerk/disabled",
+        Some(&root),
+        Some(json!({ "disabled": false })),
+        200,
+    )
+    .await;
 
     // -- roles -------------------------------------------------------------
     c.check(

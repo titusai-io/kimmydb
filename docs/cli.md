@@ -62,6 +62,15 @@ grants any other client is.
 | `kimmy token` | The token again: prints the cached one while it is fresh, else one fresh flow |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
 | `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
+| `kimmy roles list` `show` `create` | Stored roles ([Security](security.md)). Create: repeat `--grant 'db:collection:actions'` |
+| `kimmy roles grant` `revoke` | Add or remove actions on one of a role's grants — live, no restart |
+| `kimmy roles delete <name>` | Principals lose its grants on their next request |
+| `kimmy users list` `show` | Local accounts and their state |
+| `kimmy users create <user>` | Password from stdin or `KIMMY_PASSWORD`. Repeatable `--grant`, `--role` |
+| `kimmy users reset-password <user>` | New password from stdin; existing sessions end |
+| `kimmy users set-grants` `set-roles` | Replace direct grants / stored roles wholesale |
+| `kimmy users disable` / `enable` | Disable ends sessions and refuses logins but keeps the record — reversible delete |
+| `kimmy users delete <user>` | Outright removal |
 | `kimmy topology` | The nodes of the cluster, and which are live |
 | `kimmy databases` | Databases you can read |
 | `kimmy collections <db>` | Collections in a database |

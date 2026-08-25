@@ -246,6 +246,22 @@ impl UserStore {
         self.put(engine, &user)
     }
 
+    /// Disable or re-enable an account, taking effect immediately.
+    ///
+    /// A disabled account is refused at authentication while its record stays
+    /// exactly where it is — the reversible form of deletion, and the right
+    /// shape for a leaver whose identifier an external issuer may still
+    /// assert. As with every other edit here, the bump to `token_version`
+    /// logs the account out of every session it holds; **re-enabling does not
+    /// restore them**, which is the point.
+    pub fn set_disabled(&self, engine: &Engine, name: &str, disabled: bool) -> Result<()> {
+        let mut user =
+            self.get(engine, name)?.ok_or_else(|| AuthError::UserNotFound(name.into()))?;
+        user.disabled = disabled;
+        user.token_version = user.token_version.wrapping_add(1);
+        self.put(engine, &user)
+    }
+
     fn put(&self, engine: &Engine, user: &User) -> Result<()> {
         let doc = bson::serialize_to_document(user)
             .map_err(|e| AuthError::Hashing(format!("encoding user: {e}")))?;
