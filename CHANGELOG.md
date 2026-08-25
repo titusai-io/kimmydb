@@ -27,6 +27,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Bare `kimmy` shows the help screen** — the same long help `--help`
+  prints, on stdout, exit 0. Previously it was a two-line usage error telling
+  the user to run again with a flag.
 - **The system database never matches a wildcard (ADR-079).** A grant of
   `{db:"*"}` no longer reaches `__kimmy` — whose `__users` collection holds
   password hashes and token versions. Wildcard-granted callers stop seeing it

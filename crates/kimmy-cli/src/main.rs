@@ -33,7 +33,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use kimmy_client::{Client, ErrorCode, Method, Query, Safety};
 use serde_json::{Value, json};
 
@@ -73,10 +73,10 @@ struct Cli {
     pretty: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Exchange credentials for a token, printed to stdout.
     ///
@@ -366,7 +366,7 @@ enum Command {
 }
 
 /// Subcommands of `kimmy roles`.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum RolesSub {
     /// List every stored role by name.
     List,
@@ -399,7 +399,7 @@ enum RolesSub {
 }
 
 /// Subcommands of `kimmy users`.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum UsersSub {
     /// List local accounts with their state.
     List,
@@ -460,11 +460,24 @@ fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
+    // Bare `kimmy` shows the same screen `--help` would — long form, stdout,
+    // success. The clap default for a missing subcommand is a two-line usage
+    // error telling the user to run it again with a flag, which is a wall the
+    // tool puts in front of its own front door.
+    let command = match &cli.command {
+        Some(command) => command,
+        None => {
+            let _ = Cli::command().print_long_help();
+            println!();
+            return Ok(());
+        }
+    };
+
     // `login` and `token` are the two commands that run without a token,
     // because producing one is what they are for. They share everything after
     // the arguments: Token is Login with the answers already decided —
     // federated always, cache always.
-    let token_request = match &cli.command {
+    let token_request = match &command {
         Command::Login {
             user,
             oidc,
@@ -571,7 +584,7 @@ async fn run() -> Result<()> {
     }
     let client = builder.connect().await?;
 
-    match &cli.command {
+    match &command {
         // Handled above, before a client was built.
         Command::Login { .. } | Command::Token { .. } => {
             unreachable!("token commands return early")
@@ -2033,9 +2046,22 @@ mod tests {
     }
 
     #[test]
+    fn bare_invocation_is_valid_and_means_help() {
+        // The clap default for a missing subcommand is a usage error; the
+        // flip makes bare `kimmy` parse cleanly and print the long help
+        // instead. run() owns the printing — this pins the parse half.
+        let cli = Cli::try_parse_from(["kimmy"]).unwrap();
+        assert!(cli.command.is_none(), "no args means no subcommand: {:?}", cli.command);
+        assert!(
+            Cli::command().render_help().to_string().contains("Commands:"),
+            "the rendered help is what a bare invocation shows"
+        );
+    }
+
+    #[test]
     fn whoami_is_a_known_subcommand() {
         let cli = Cli::try_parse_from(["kimmy", "whoami"]).unwrap();
-        assert!(matches!(cli.command, Command::Whoami));
+        assert!(matches!(cli.command, Some(Command::Whoami)));
     }
 
     // -----------------------------------------------------------------------
