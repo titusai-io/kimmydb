@@ -6,6 +6,21 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-25 — **v0.6.0: the federation round ships**
+
+Release prep only — no behaviour changed on this branch. Workspace version
+`0.5.0` → `0.6.0` and `## Unreleased` retitled to `## 0.6.0`, which is the step
+that has twice nearly shipped empty release notes; verify with
+`dist plan --tag=v0.6.0 --output-format=json` and a non-empty
+`announcement_changelog` before tagging.
+
+What the release carries, all merged 2026-08-25: `KIMMY_OIDC_ROLE_MAPPINGS`
+(#112, ADR-078), `kimmy whoami` + the zero-grant note (#113), and the flipped
+login default with `kimmy token` (#114). Together they close the gap where a
+federated caller authenticated successfully and still could not see anything.
+
+---
+
 ## As of 2026-08-25 — **`kimmy login` federates by default, and `kimmy token` re-prints**
 
 Branch `feat/login-defaults-to-device-flow`. Two changes to how the CLI hands
