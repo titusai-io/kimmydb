@@ -466,7 +466,7 @@ curl localhost:7878/.well-known/oauth-protected-resource
 ```
 
 Unauthenticated, necessarily: a client that has no token is exactly who needs
-it. It is what lets `kimmy login --oidc --url https://kimmydb.example.com` work
+it. It is what lets `kimmy login --url https://kimmydb.example.com` work
 with nothing else configured, and it is how a conformant MCP client discovers
 where to authenticate — see [mcp.md](mcp.md).
 

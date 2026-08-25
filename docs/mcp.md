@@ -97,7 +97,7 @@ curl http://localhost:7878/.well-known/oauth-protected-resource
 #  "bearer_methods_supported":["header"]}
 ```
 
-`kimmy login --oidc --url <node>` uses exactly the same path, so what an MCP
+`kimmy login --url <node>` uses exactly the same path, so what an MCP
 client does automatically is what the CLI does for a person. Full detail:
 [http-api.md](http-api.md#protected-resource-metadata) and
 [security.md](security.md#naming-this-node-the-audience-is-the-resource-identifier).

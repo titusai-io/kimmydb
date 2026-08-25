@@ -43,12 +43,15 @@ use serde_json::{Value, json};
     version = kimmy_core::build::ident(),
     about = "Terminal client for KimmyDB",
     after_help = "Authentication:\n  \
-        kimmy login root                  # reads the password from stdin or KIMMY_PASSWORD\n  \
+        kimmy login                        # federates by default: a browser code flow\n  \
+        export KIMMY_TOKEN=$(kimmy login)\n  \
+        kimmy token                        # prints the token again while the cached one is fresh\n\n\
+    A local account on the node itself instead:\n  \
+        kimmy login root                   # reads the password from stdin or KIMMY_PASSWORD\n  \
         export KIMMY_TOKEN=$(echo hunter2 | kimmy login root)\n\n\
-    Against a node federated with an OIDC provider:\n  \
+    The provider and resource are discovered from the node; to name them:\n  \
         export KIMMY_OIDC_ISSUER=https://auth.example.com\n  \
         export KIMMY_OIDC_CLIENT_ID=kimmy-cli\n  \
-        export KIMMY_TOKEN=$(kimmy login --oidc)              # opens a browser code flow\n  \
         export KIMMY_TOKEN=$(kimmy login --client-credentials) # for a service, secret from env\n\n\
     There is deliberately no --password flag and no --client-secret flag: either\n\
     would land in shell history and in `ps` output for every user on the machine.\n\
@@ -77,11 +80,18 @@ struct Cli {
 enum Command {
     /// Exchange credentials for a token, printed to stdout.
     ///
-    /// Three ways in, and the token comes out the same on all three: bare, on
-    /// stdout, so `$(kimmy login ...)` is directly usable. Nothing is written
-    /// to disk unless `--cache-token` asks for it.
+    /// Bare `kimmy login` federates: it runs the device flow against the
+    /// node's identity provider, because that is what nearly every deployment
+    /// of this database is configured with. Naming a local account —
+    /// `kimmy login ada` — takes the password path instead, so a node running
+    /// without any provider loses nothing.
+    ///
+    /// The token comes out bare on stdout, so `$(kimmy login ...)` is directly
+    /// usable. Nothing is written to disk unless `--cache-token` asks for it;
+    /// `kimmy token` is the spelling that asks by existing.
     Login {
-        /// Local user name. Omit it when using --oidc or --client-credentials.
+        /// Local user name. Given, this is a password login against the node's
+        /// own user store; omitted, the device flow answers.
         user: Option<String>,
 
         /// Log in through the node's OIDC provider, in a browser.
@@ -91,6 +101,9 @@ enum Command {
         /// The same flow `gh auth login` uses, and it is the one that works
         /// over SSH and in a container, where a redirect back to localhost
         /// does not.
+        ///
+        /// This is what bare `kimmy login` already does; the flag remains so
+        /// existing scripts and muscle memory keep working.
         #[arg(long, conflicts_with_all = ["user", "client_credentials"])]
         oidc: bool,
 
@@ -151,6 +164,44 @@ enum Command {
             value_parser = clap::builder::BoolishValueParser::new(),
         )]
         cache_token: bool,
+    },
+    /// Print the access token again — the cached one while it stays fresh.
+    ///
+    /// Where `kimmy login` authenticates, `kimmy token` answers "what is my
+    /// token right now": if a cached access token for this issuer, client and
+    /// resource is still good it prints immediately, and otherwise it runs the
+    /// federated flow once, keeps the result, and prints that. Every call
+    /// after the first costs nothing until the token nears expiry.
+    ///
+    /// Caching is not an option here because it is the point of the command:
+    /// invoking it *is* the asking ADR-075 requires of `--cache-token`. What
+    /// gets stored does not change — the access token alone, in a `0600`
+    /// file, never a refresh token.
+    ///
+    /// Federated flows only. A local account has no provider to key a cache
+    /// entry by, so `kimmy login <user>` stays how those print a token.
+    Token {
+        /// As a service, with OAuth2 client credentials rather than the device
+        /// flow. Secret from `KIMMY_OIDC_CLIENT_SECRET`, as with login.
+        #[arg(long)]
+        client_credentials: bool,
+
+        /// Issuer URL of the OIDC provider. Must match the node's.
+        #[arg(long, env = "KIMMY_OIDC_ISSUER")]
+        issuer: Option<String>,
+
+        /// OAuth2 client id registered with the provider for this CLI.
+        #[arg(long, env = "KIMMY_OIDC_CLIENT_ID")]
+        client_id: Option<String>,
+
+        /// The resource the token should be *for* (RFC 8707). Read off the
+        /// node named by --url when omitted.
+        #[arg(long, env = "KIMMY_OIDC_RESOURCE")]
+        resource: Option<String>,
+
+        /// Scopes to request. Defaults per flow exactly as `login` does.
+        #[arg(long, env = "KIMMY_OIDC_SCOPE")]
+        scope: Option<String>,
     },
     /// Health and readiness of the node.
     Ping,
@@ -328,32 +379,64 @@ fn main() -> ExitCode {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
 
-    // Login is the one command that runs without a token, because producing
-    // one is what it is for.
-    if let Command::Login {
-        user,
-        oidc,
-        client_credentials,
+    // `login` and `token` are the two commands that run without a token,
+    // because producing one is what they are for. They share everything after
+    // the arguments: Token is Login with the answers already decided —
+    // federated always, cache always.
+    let token_request = match &cli.command {
+        Command::Login {
+            user,
+            oidc,
+            client_credentials,
+            issuer,
+            client_id,
+            resource,
+            scope,
+            cache_token,
+        } => Some((
+            user.as_deref(),
+            *oidc,
+            *client_credentials,
+            *cache_token,
+            issuer,
+            client_id,
+            resource,
+            scope,
+        )),
+        Command::Token { client_credentials, issuer, client_id, resource, scope } => {
+            Some((None, false, *client_credentials, true, issuer, client_id, resource, scope))
+        }
+        _ => None,
+    };
+    if let Some((
+        login_user,
+        _oidc_flag,
+        cc_flag,
+        cache_token,
         issuer,
         client_id,
-        scope,
         resource,
-        cache_token,
-    } = &cli.command
+        scope,
+    )) = token_request
     {
-        // The token alone, with no decoration, so `$(kimmy login ...)` is
-        // usable directly. **Nothing is written to disk unless --cache-token
-        // asks for it**, and even then only the access token: a CLI that
-        // stores a bearer token has to answer for its permissions, its
-        // lifetime and its cleanup, and an environment variable answers all
-        // three by not existing afterwards. A refresh token is never requested
-        // and never kept, cache or no cache — it is the credential that
-        // outlives the session, and the one worth stealing.
-        let token = if *oidc || *client_credentials {
-            // Ask the node itself where to authenticate and what to ask the
-            // token to be for, so the usual invocation is `kimmy login --oidc`
-            // with nothing else set. A flag still wins, and a node that
-            // publishes nothing leaves both as they were.
+        // Which flow answers was decided by the arguments alone: a named
+        // local account wins over everything — `kimmy login ada` must never
+        // grow a browser step — then the service-account flag, and what
+        // remains is the device flow.
+        let flow = login_flow(login_user, cc_flag);
+        if !matches!(flow, LoginFlow::Local) {
+            // The token alone, with no decoration, so `$(kimmy ...)` is usable
+            // directly. Nothing is written to disk unless the invocation asked —
+            // --cache-token on login, always on token — and even then only the
+            // access token: a CLI that stores a bearer token has to answer for its
+            // permissions, its lifetime and its cleanup. A refresh token is never
+            // requested and never kept, cache or no cache — it is the credential
+            // that outlives the session, and the one worth stealing.
+            //
+            // Ask the node itself where to authenticate and what to ask the token
+            // to be for, so the usual invocation needs nothing else set. A flag
+            // still wins, and a node that publishes nothing leaves both as they
+            // were.
             let (issuer, resource) =
                 oidc::defaults_from_node(&cli.url, issuer.clone(), resource.clone()).await;
             let issuer = issuer.as_deref();
@@ -361,40 +444,42 @@ async fn run() -> Result<()> {
             let client_id = client_id.as_deref();
             // Scopes differ per flow when unset, because a service account has
             // no end user to describe. Explicit `--scope` overrides both.
-            let scope = scope.as_deref().unwrap_or(if *oidc {
-                oidc::DEVICE_SCOPE
-            } else {
+            let default_scope = if matches!(flow, LoginFlow::ClientCredentials) {
                 oidc::CLIENT_CREDENTIALS_SCOPE
-            });
+            } else {
+                oidc::DEVICE_SCOPE
+            };
+            let scope = scope.as_deref().unwrap_or(default_scope);
 
             let cache_key = cache::Key::new(issuer, client_id, resource);
-            if let Some(cached) = cache_key.as_ref().filter(|_| *cache_token).and_then(cache::get) {
+            if let Some(cached) = cache_key.as_ref().filter(|_| cache_token).and_then(cache::get) {
                 println!("{cached}");
                 return Ok(());
             }
 
-            let (token, expires_in) = if *oidc {
-                oidc::device_login(issuer, client_id, scope, resource).await?
-            } else {
-                oidc::client_credentials_login(issuer, client_id, scope, resource).await?
+            let (token, expires_in) = match flow {
+                LoginFlow::ClientCredentials => {
+                    oidc::client_credentials_login(issuer, client_id, scope, resource).await?
+                }
+                _ => oidc::device_login(issuer, client_id, scope, resource).await?,
             };
-            if *cache_token && let Some(key) = cache_key {
+            if cache_token && let Some(key) = cache_key {
                 // A cache that cannot be written is a slower login, not a
                 // failed one, so this reports and carries on.
                 if let Err(e) = cache::put(&key, &token, expires_in) {
                     eprintln!("warning: could not cache the token: {e:#}");
                 }
             }
-            token
-        } else {
-            let user = user.as_deref().context(
-                "name the user to log in as, or pass --oidc / --client-credentials to log in \
-                 through the node's identity provider",
-            )?;
-            let password = read_password()?;
-            let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
-            client.token().await.context("the server did not return a token")?
-        };
+            println!("{token}");
+            return Ok(());
+        }
+
+        // The local path: a named user, a password from stdin or the
+        // environment.
+        let user = login_user.expect("a local flow has a user by construction");
+        let password = read_password()?;
+        let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
+        let token = client.token().await.context("the server did not return a token")?;
         println!("{token}");
         return Ok(());
     }
@@ -407,7 +492,9 @@ async fn run() -> Result<()> {
 
     match &cli.command {
         // Handled above, before a client was built.
-        Command::Login { .. } => unreachable!("login returns early"),
+        Command::Login { .. } | Command::Token { .. } => {
+            unreachable!("token commands return early")
+        }
         Command::Ping => {
             let health = client.request(Method::Get, "/healthz", None, Safety::Idempotent).await?;
             let ready = client.request(Method::Get, "/readyz", None, Safety::Idempotent).await?;
@@ -738,7 +825,7 @@ fn read_password() -> Result<String> {
 fn unauthorized_hint(issuer: Option<String>) -> String {
     match issuer {
         Some(issuer) => format!(
-            "set --token, or KIMMY_TOKEN from `kimmy login --oidc` (issuer {issuer}); \
+            "set --token, or KIMMY_TOKEN from `kimmy login` (issuer {issuer}); \
              a local account still works with `kimmy login <user>`"
         ),
         None => "set --token, or KIMMY_TOKEN from `kimmy login`".to_string(),
@@ -813,7 +900,7 @@ mod oidc {
     fn issuer_or_bail(issuer: Option<&str>) -> Result<&str> {
         issuer.context(
             "no OIDC issuer: set KIMMY_OIDC_ISSUER or pass --issuer, using the same value the \
-             node is configured with",
+             node is configured with — or log in to a local account with `kimmy login <user>`",
         )
     }
 
@@ -1073,7 +1160,7 @@ mod oidc {
     /// RFC 8628 device authorization grant.
     ///
     /// Everything a person reads goes to **stderr** and only the token goes to
-    /// stdout, so `$(kimmy login --oidc)` captures the token and the
+    /// stdout, so `$(kimmy login)` captures the token and the
     /// instructions still reach the terminal.
     pub async fn device_login(
         issuer: Option<&str>,
@@ -1440,6 +1527,32 @@ mod cache {
     }
 }
 
+/// Which credential flow a token-producing command should run.
+#[derive(Debug, PartialEq, Eq)]
+enum LoginFlow {
+    /// Password login for a local account on the node's own user store.
+    Local,
+    /// RFC 8628 device flow through the node's identity provider.
+    Device,
+    /// OAuth2 client credentials for a service account.
+    ClientCredentials,
+}
+
+/// Decide a token-producing command's flow from its arguments alone.
+///
+/// A named user wins over every flag — `kimmy login ada` must never grow a
+/// browser step, however the defaults evolve. Then the service-account flag
+/// picks client credentials. What remains is the device flow: the default
+/// because it needs nothing but a browser and works everywhere one exists,
+/// including SSH sessions and containers.
+fn login_flow(user: Option<&str>, client_credentials: bool) -> LoginFlow {
+    match user {
+        Some(_) => LoginFlow::Local,
+        None if client_credentials => LoginFlow::ClientCredentials,
+        None => LoginFlow::Device,
+    }
+}
+
 fn emit(cli: &Cli, value: &Value) {
     let rendered =
         if cli.pretty { serde_json::to_string_pretty(value) } else { serde_json::to_string(value) };
@@ -1568,6 +1681,50 @@ mod tests {
     fn whoami_is_a_known_subcommand() {
         let cli = Cli::try_parse_from(["kimmy", "whoami"]).unwrap();
         assert!(matches!(cli.command, Command::Whoami));
+    }
+
+    // -----------------------------------------------------------------------
+    // The login default, and `kimmy token`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bare_login_defaults_to_the_device_flow() {
+        assert_eq!(login_flow(None, false), LoginFlow::Device);
+    }
+
+    #[test]
+    fn a_named_user_is_always_the_local_flow() {
+        assert_eq!(login_flow(Some("ada"), false), LoginFlow::Local);
+    }
+
+    #[test]
+    fn the_service_flag_picks_client_credentials_without_a_user() {
+        assert_eq!(login_flow(Some("ada"), true), LoginFlow::Local, "the user wins over flags");
+        assert_eq!(login_flow(None, true), LoginFlow::ClientCredentials);
+    }
+
+    #[test]
+    fn the_flipped_login_forms_parse() {
+        assert!(Cli::try_parse_from(["kimmy", "login"]).is_ok(), "bare login is now valid");
+        assert!(Cli::try_parse_from(["kimmy", "login", "ada"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_ok(),
+            "kept for muscle memory"
+        );
+        assert!(
+            Cli::try_parse_from(["kimmy", "login", "ada", "--oidc"]).is_err(),
+            "a user and --oidc are still mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn token_parses_and_takes_no_positional_user() {
+        assert!(Cli::try_parse_from(["kimmy", "token"]).is_ok());
+        assert!(Cli::try_parse_from(["kimmy", "token", "--client-credentials"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["kimmy", "token", "ada"]).is_err(),
+            "a local account has no provider to key a cache by; kimmy login <user> is that path"
+        );
     }
 
     /// One workspace version, one binary story (ADR-062): what
@@ -2080,7 +2237,11 @@ mod tests {
         assert!(!local.contains("--oidc"), "{local}");
 
         let federated = unauthorized_hint(Some("https://auth.example.com".into()));
-        assert!(federated.contains("kimmy login --oidc"), "{federated}");
+        assert!(federated.contains("kimmy login"), "{federated}");
+        assert!(
+            !federated.contains("--oidc"),
+            "the flag is now only a compatibility spelling: {federated}"
+        );
         assert!(federated.contains("auth.example.com"), "the issuer names itself: {federated}");
         // ...and it still says a local account works, because both do at once.
         assert!(federated.contains("kimmy login <user>"), "{federated}");

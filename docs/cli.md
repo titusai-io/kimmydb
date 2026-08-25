@@ -56,9 +56,10 @@ grants any other client is.
 
 | | |
 |---|---|
-| `kimmy login <user>` | Prints a token. Password from stdin or `KIMMY_PASSWORD` |
-| `kimmy login --oidc` | Prints a token from the node's OIDC provider, via the device flow |
-| `kimmy login --client-credentials` | Same, for a service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
+| `kimmy login` | Prints a token from the node's OIDC provider, via the device flow — the default |
+| `kimmy login <user>` | A local account instead. Password from stdin or `KIMMY_PASSWORD` |
+| `kimmy login --client-credentials` | A service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
+| `kimmy token` | The token again: prints the cached one while it is fresh, else one fresh flow |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
 | `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
 | `kimmy topology` | The nodes of the cluster, and which are live |
@@ -159,23 +160,25 @@ refresh token either — it never asks for one.
 
 ## Logging in through an identity provider
 
-Against a node federated with an OIDC provider
-([Security](security.md#two-ways-in-one-decision)):
+Bare `kimmy login` federates — the device flow against the node's OIDC
+provider is the default, because that is what a federated deployment almost
+always wants. Naming a local account takes the password path instead:
 
 ```bash
 export KIMMY_OIDC_ISSUER=https://auth.example.com
 export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 
-# A person, in a browser. RFC 8628 device authorization.
-export KIMMY_TOKEN=$(kimmy login --oidc)
+# A person, in a browser. RFC 8628 device authorization. `--oidc` spells the
+# default out, for scripts and muscle memory written before it was one.
+export KIMMY_TOKEN=$(kimmy login)
 
 # A service. The secret comes from KIMMY_OIDC_CLIENT_SECRET and nowhere else.
 export KIMMY_TOKEN=$(kimmy login --client-credentials)
 ```
 
-`--oidc` prints a code and a URL to **stderr**, waits while you approve it in a
-browser, and puts the bare token on **stdout** — so `$(...)` captures the token
-and the instructions still reach the terminal:
+The device flow prints a code and a URL to **stderr**, waits while you approve
+it in a browser, and puts the bare token on **stdout** — so `$(...)` captures
+the token and the instructions still reach the terminal:
 
 ```
 Open https://auth.example.com/device and enter the code: WDJB-MJHT
@@ -193,7 +196,8 @@ database client library is one every application linking it would inherit.
 
 ### Scopes differ between the two flows
 
-Left unset, `--oidc` asks for `openid profile` and `--client-credentials` asks
+Left unset, the device flow asks for `openid profile` and
+`--client-credentials` asks
 for **nothing**. That is not an oversight: there is no end user in the
 client-credentials grant, so `openid` requests an ID token that cannot be
 issued — providers split between ignoring it and refusing the request. A
@@ -210,17 +214,28 @@ the one that is always there — and a provider advertising nothing gets it.
 
 ### Reusing a token between commands
 
-Nothing is written to disk unless you ask:
+`kimmy token` is the spelling that reuses by existing: it prints the cached
+access token whenever one is still fresh, and otherwise runs one federated
+flow, keeps the result, and prints it — so after the first call,
+`$(kimmy token)` is instant until the token nears expiry:
 
 ```bash
-export KIMMY_TOKEN=$(kimmy login --oidc --cache-token)
+curl -s -H "Authorization: Bearer $(kimmy token)" "$KIMMY_URL/v1/databases"
 ```
 
-With `--cache-token` (or `KIMMY_TOKEN_CACHE=1`), the access token is kept in a
-`0600` file under `$XDG_CACHE_HOME/kimmy` — `~/.cache/kimmy/tokens.json` by
-default — keyed by issuer, client and resource, and reused until it is within a
-minute of expiring. A later `kimmy login --oidc --cache-token` then prints the
-cached token instead of making you approve the device flow again.
+`kimmy login` writes nothing to disk unless you ask:
+
+```bash
+export KIMMY_TOKEN=$(kimmy login --cache-token)
+```
+
+With `--cache-token` (or `KIMMY_TOKEN_CACHE=1`) — or by using `kimmy token`,
+where caching is the point rather than an option (ADR-075's "only when asked";
+invoking the command *is* asking) — the access token is kept in a `0600` file
+under `$XDG_CACHE_HOME/kimmy` — `~/.cache/kimmy/tokens.json` by default —
+keyed by issuer, client and resource, and reused until it is within a minute of
+expiring. A later `kimmy login --cache-token` then prints the cached token
+instead of making you approve the device flow again.
 
 **A refresh token is never requested and never stored**, flag or no flag. The
 access token is short-lived and audience-restricted; a refresh token outlives
@@ -269,7 +284,7 @@ federated route instead, because sending a federated user to `kimmy login
 <user>` asks them for a password they do not have:
 
 ```
-  set --token, or KIMMY_TOKEN from `kimmy login --oidc` (issuer
+  set --token, or KIMMY_TOKEN from `kimmy login` (issuer
   https://auth.example.com); a local account still works with `kimmy login <user>`
 ```
 

@@ -242,7 +242,7 @@ paths:
         Unauthenticated by necessity: a client holding no token is exactly who
         needs it. It names both the resource identifier to request a token for
         (the RFC 8707 `resource` parameter) and the authorization server to
-        request it from, so `kimmy login --oidc` needs nothing but the node URL.
+        request it from, so `kimmy login` needs nothing but the node URL.
         It is also how a conformant MCP client discovers where to authenticate.
 
         `scopes_supported` is deliberately absent: authorization here is roles
