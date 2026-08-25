@@ -3672,6 +3672,46 @@ everything without a special case. Dropping a non-owner's deferral is safe for
 the same reason every member deferred it in the first place: the owner holds
 its own copy of the same re-check.
 
+## ADR-078 — Role mappings reach the environment as one JSON document
+
+**Decision.** `auth.oidc.role_mappings` can be set through
+`KIMMY_OIDC_ROLE_MAPPINGS` as a single JSON array of mapping objects, parsed
+once at startup. When the variable is set it **replaces** the config file's
+list entirely; when it is absent the file stands alone. There are still no
+per-mapping flags, and `allow_federated_admin` remains file-only. Every
+startup refusal — a mapping naming neither `role` nor `grants`, an inline
+`admin` grant, an unknown action — applies to the env-supplied list unchanged,
+because both forms land in the same field before `validate` runs.
+
+**Alternatives.** Repeated flags (`--role-mapping claim_value=… role=…`) —
+rejected for the reason ADR-066 kept mappings out of the CLI in the first
+place: grants are structures, and a command line is where structures go to be
+mistyped. Merging the variable with the file's list — rejected because a merge
+needs an answer for "both sources name the same `claim_value`", and every
+possible answer (first wins, last wins, refuse) surprises somebody; replace
+matches how every other override here behaves: what was passed is what runs.
+A separate key-value file mounted into the container — rejected as a third
+place to look, and one that reintroduces exactly the file-plumbing problem
+orchestrator deployments turned to env vars to escape.
+
+**Why.** Federation shipped trusting one external issuer, but the deployment
+shape almost everyone actually runs — compose, swarm, kubernetes — configures
+the node through an environment block, and every other `[auth.oidc]` setting
+has a `KIMMY_OIDC_*` variable. Mappings did not, so those deployments could
+federate but could never say what a federated identity was *worth*: every such
+node started with zero mappings and every federated caller held zero grants,
+which looked exactly like a permissions problem and was really an
+expressiveness gap. This was found live: a legitimately authenticated cluster
+owner saw empty listings and bare 403s against his own database because the
+cluster he deployed through env vars had no way to configure a mapping.
+
+**Cost.** Two spellings of one setting, with replace-not-merge semantics that
+must be documented loudly — an operator who sets both sources gets only the
+variable's answer, which is discoverable but still surprising the first time.
+The JSON form also moves a syntax error from TOML-parse time (where the file's
+line number is reported) to a message naming the variable and showing the
+expected shape, which the parser does deliberately.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
