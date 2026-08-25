@@ -279,15 +279,46 @@ pub async fn run(config: Config) -> Result<()> {
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
     // as soon as its oplog entry is durable; embedding catches up behind it.
-    let worker_handle = tokio::spawn({
-        let engine = Arc::clone(&engine);
-        async move {
-            let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
-            if let Err(e) = worker.run().await {
-                warn!(error = %e, "embedding worker stopped");
+    //
+    // Disabled by `[vector] worker_enabled = false` or
+    // --disable-vector-worker: this node then consumes embeddings by
+    // replication instead of producing provider calls, which is how a
+    // deployment pins embedding work to designated members.
+    let worker_handle = if config.vector.worker_enabled {
+        // Ownership over the same rendezvous function as webhooks and expiry:
+        // per collection, derived from the live member set, no agreement
+        // needed. Backfill scans and deferred re-checks run only on the owner,
+        // which is what keeps a replicated `ConfigureVectors` entry from being
+        // a full-corpus provider bill on every member at once.
+        let worker_me = engine.node_id();
+        let worker_members = cluster.members.clone();
+        let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
+        state.metrics.set_vector_counters(Arc::clone(&worker_counters));
+        Some(tokio::spawn({
+            let engine = Arc::clone(&engine);
+            async move {
+                let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+                worker.set_owner_check(Box::new(move |key| match &worker_members {
+                    // No clustering: the candidate set is just this node,
+                    // which owns everything.
+                    Some(members) => {
+                        kimmy_api::ownership::owns(key, worker_me, &members.node_ids())
+                    }
+                    None => true,
+                }));
+                worker.set_counters(worker_counters);
+                if let Err(e) = worker.run().await {
+                    warn!(error = %e, "embedding worker stopped");
+                }
             }
-        }
-    });
+        }))
+    } else {
+        warn!(
+            "embedding worker is disabled; collections with server-side providers will not embed \
+             on this node — vectors arrive by replication from workers elsewhere"
+        );
+        None
+    };
 
     // Loaded before binding, so a bad certificate is a startup failure rather
     // than a handshake error for whoever connects first.
@@ -349,7 +380,10 @@ pub async fn run(config: Config) -> Result<()> {
     sessions_handle.abort();
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
-    worker_handle.abort();
+    // `None` when the worker is disabled — nothing to abort.
+    if let Some(handle) = worker_handle {
+        handle.abort();
+    }
     // Likewise the collector: a pass is a transaction, so an aborted one either
     // committed or did not, and the next start simply finds the same garbage.
     if let Some(handle) = gc_handle {

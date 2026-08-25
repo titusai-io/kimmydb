@@ -30,6 +30,49 @@ pub struct Config {
     pub audit: AuditConfig,
     pub log: LogConfig,
     pub telemetry: TelemetryConfig,
+    pub vector: VectorConfig,
+}
+
+/// Automatic-embedding settings.
+///
+/// The worker itself is configured per collection (the vector configuration
+/// names a provider and lives in the collection metadata); this section
+/// governs the *worker* — the oplog consumer that turns collection changes
+/// into provider calls on this node.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct VectorConfig {
+    /// Run the embedding worker on this node.
+    ///
+    /// On by default: every node consumes the oplog and keeps its own shadow
+    /// collections current. Turning it off makes this node a consumer of
+    /// embeddings rather than a producer of provider calls — vectors arrive
+    /// by replication from whichever nodes do run workers.
+    ///
+    /// The intended use is cost control, not correctness. With one worker
+    /// node the cluster's provider calls are exactly 1× the document count;
+    /// with three they are up to 3× during replication lag, because each
+    /// node's deferred re-check can fire before the owner's vectors have
+    /// replicated. A deployment against a metered or CPU-bound provider can
+    /// therefore run the worker on one designated member and set this to
+    /// false everywhere else — the same shape the TTL sweeper's single-owner
+    /// assignment gives for expiry, but chosen by the operator rather than
+    /// derived.
+    ///
+    /// Off does **not** stop this node serving vector or hybrid search; it
+    /// only stops producing new embeddings here. Search reads whatever has
+    /// replicated.
+    ///
+    /// Prefer `--disable-vector-worker` / `KIMMY_DISABLE_VECTOR_WORKER` for
+    /// the same effect from a flag, and see ADR-075 for why ownership is not
+    /// derived automatically in every case.
+    pub worker_enabled: bool,
+}
+
+impl Default for VectorConfig {
+    fn default() -> Self {
+        Self { worker_enabled: true }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

@@ -90,6 +90,15 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
 
+    /// Do not run the automatic embedding worker on this node.
+    ///
+    /// Vectors still replicate in from nodes that do run workers, and vector
+    /// search keeps working. One-way, like `--no-mcp`: the flag can only turn
+    /// the worker off, so omitting it cannot override a config file that
+    /// already disabled it.
+    #[arg(long, env = "KIMMY_DISABLE_VECTOR_WORKER")]
+    pub disable_vector_worker: bool,
+
     /// Issuer URL of an external OIDC provider to federate with. Must be https.
     #[arg(long, env = "KIMMY_OIDC_ISSUER")]
     pub oidc_issuer: Option<String>,
@@ -253,6 +262,12 @@ impl Overrides {
         // config file that already disabled it.
         if self.no_mcp {
             cfg.server.mcp = false;
+        }
+        // One-way, like `--no-mcp` below: off-only, so omitting it cannot
+        // override a config file that already set `[vector] worker_enabled =
+        // false`.
+        if self.disable_vector_worker {
+            cfg.vector.worker_enabled = false;
         }
         if self.cluster {
             cfg.cluster.enabled = true;

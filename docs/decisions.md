@@ -3634,6 +3634,44 @@ is told plainly that this is not the database for that job. That is the cheaper
 answer: the expensive one is implying it might arrive and being asked about it
 every quarter.
 
+
+## ADR-077 — Embedding work is owned per collection by rendezvous hash
+
+**Decision.** Backfill scans and deferred re-checks run only on the node the
+collection's `"{db}/{collection}"` key assigns through the same rendezvous
+function the webhook dispatcher and the TTL sweeper use
+(`kimmy_api::ownership`). The streaming path keeps its existing origin-node
+rule — whoever wrote a document embeds it immediately — because that path was
+never duplicated. A `[vector] worker_enabled` setting and its one-way
+`--disable-vector-worker` flag let an operator take a node out of embedding
+entirely, and the worker publishes `kimmy_embed_*` counters so the choice is
+observable.
+
+**Alternatives.** Deriving ownership inside `kimmy-vector` by depending on the
+cluster crates — rejected because it inverts a layering boundary to save one
+injected closure. Extending [`FOREIGN_GRACE`] until replication always wins —
+rejected because the grace is a guess about lag, and the load test of
+2026-08-24 measured hours of it: every expiry found stale vectors and all three
+members embedded the same backlog. Doing nothing — the duplicate calls were
+correct in their *results* (`vectors_are_stale` makes them no-ops on write) and
+wrong only in cost, but the cost scaled with cluster size and with exactly the
+metered-provider deployments this database targets.
+
+**Why.** The load test put 7,219 documents into one vector-enabled collection
+and watched all three members embed the same corpus against one shared
+provider: roughly three times the inference, three times the shadow-collection
+writes replicated twice each, and hours of provider saturation that ended with
+the provider itself thrashing. The origin-node rule already deduplicated the
+streaming path; what remained duplicated was everything *around* it — backfill,
+which had no origin to defer to, and deferrals whose grace expired before
+replication delivered the owner's vectors. Rendezvous ownership closes both
+with machinery the codebase already trusts and tests: a pure function over the
+live member set, where a node's departure moves only its own share, a
+disagreement produces a duplicate rather than a gap, and a single node owns
+everything without a special case. Dropping a non-owner's deferral is safe for
+the same reason every member deferred it in the first place: the owner holds
+its own copy of the same re-check.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

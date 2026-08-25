@@ -16,6 +16,7 @@
 //! replication lag is **pushed here by the replication loop**, which is the
 //! only place a peer's version vector exists.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -61,6 +62,13 @@ pub struct MetricsSnapshot {
     pub tls_reloads_failed: u64,
     pub jwks_refresh_ok: u64,
     pub jwks_refresh_failed: u64,
+    /// Embedding-worker counters, all zero when the worker is disabled on
+    /// this node — which is exactly the distinction an operator needs.
+    pub embed_documents_embedded: u64,
+    pub embed_chunks_embedded: u64,
+    pub embed_deferred: u64,
+    pub embed_skipped_not_owned: u64,
+    pub embed_failures: u64,
     /// Requests observed by the latency histogram — health and metrics routes
     /// excluded, so this is smaller than `requests` on any real node.
     pub latency_count: u64,
@@ -95,6 +103,11 @@ pub struct Metrics {
     jwks_refresh_failed: AtomicU64,
     ttl_expired: AtomicU64,
     ttl_skipped: AtomicU64,
+    /// Set once at startup when the embedding worker runs. `None` — the
+    /// renderer then reports zeros — means this node has
+    /// `[vector] worker_enabled = false`, which an operator must be able to
+    /// distinguish from "worker enabled but idle".
+    vector_counters: OnceLock<std::sync::Arc<kimmy_vector::WorkerCounters>>,
 }
 
 impl Default for Metrics {
@@ -126,11 +139,19 @@ impl Default for Metrics {
             tls_reloads_failed: AtomicU64::new(0),
             jwks_refresh_ok: AtomicU64::new(0),
             jwks_refresh_failed: AtomicU64::new(0),
+            vector_counters: OnceLock::new(),
         }
     }
 }
 
 impl Metrics {
+    /// Share the worker's counters with this renderer. Called once at node
+    /// startup, before the worker task is spawned; later calls are ignored,
+    /// because a renderer that switched handles mid-flight would report two
+    /// partial series where one total was meant.
+    pub fn set_vector_counters(&self, counters: std::sync::Arc<kimmy_vector::WorkerCounters>) {
+        let _ = self.vector_counters.set(counters);
+    }
     /// Count one finished request.
     ///
     /// The three specific counters are derived from the status rather than
@@ -318,6 +339,26 @@ impl Metrics {
             jwks_refresh_failed: self.get(&self.jwks_refresh_failed),
             latency_count: self.get(&self.latency_count),
             latency_sum_us: self.get(&self.latency_sum_us),
+            embed_documents_embedded: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.documents_embedded.load(Ordering::Relaxed)),
+            embed_chunks_embedded: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.chunks_embedded.load(Ordering::Relaxed)),
+            embed_deferred: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.deferred.load(Ordering::Relaxed)),
+            embed_skipped_not_owned: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.skipped_not_owned.load(Ordering::Relaxed)),
+            embed_failures: self
+                .vector_counters
+                .get()
+                .map_or(0, |c| c.failures.load(Ordering::Relaxed)),
         }
     }
 
@@ -327,6 +368,19 @@ impl Metrics {
     /// keeping them apart avoids giving this type a database handle purely to
     /// print two numbers.
     pub fn render(&self) -> String {
+        // Read once: the worker's atomics move as it runs, and a render that
+        // straddled an increment would show mismatched document/chunk pairs.
+        let vc = self.vector_counters.get();
+        let (embed_docs, embed_chunks, embed_deferred, embed_not_owned, embed_failures) = match vc {
+            Some(c) => (
+                c.documents_embedded.load(Ordering::Relaxed),
+                c.chunks_embedded.load(Ordering::Relaxed),
+                c.deferred.load(Ordering::Relaxed),
+                c.skipped_not_owned.load(Ordering::Relaxed),
+                c.failures.load(Ordering::Relaxed),
+            ),
+            None => (0, 0, 0, 0, 0),
+        };
         let mut out = format!(
             "# HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
@@ -384,7 +438,22 @@ impl Metrics {
              # HELP kimmy_jwks_refresh_total Attempts to refresh the OIDC provider's signing keys, by outcome. A failed refresh leaves the key set already in use verifying.\n\
              # TYPE kimmy_jwks_refresh_total counter\n\
              kimmy_jwks_refresh_total{{outcome=\"ok\"}} {jwks_ok}\n\
-             kimmy_jwks_refresh_total{{outcome=\"failed\"}} {jwks_fail}\n",
+             kimmy_jwks_refresh_total{{outcome=\"failed\"}} {jwks_fail}\n\
+             # HELP kimmy_embed_documents_total Documents whose vectors this node wrote.\n\
+             # TYPE kimmy_embed_documents_total counter\n\
+             kimmy_embed_documents_total {embed_docs}\n\
+             # HELP kimmy_embed_chunks_total Provider inputs embedded - the closest proxy for provider spend.\n\
+             # TYPE kimmy_embed_chunks_total counter\n\
+             kimmy_embed_chunks_total {embed_chunks}\n\
+             # HELP kimmy_embed_deferred_total Foreign-written documents held for a later re-check.\n\
+             # TYPE kimmy_embed_deferred_total counter\n\
+             kimmy_embed_deferred_total {embed_deferred}\n\
+             # HELP kimmy_embed_skipped_not_owned_total Documents dropped un-embedded because another node owns embedding - the duplicate provider calls this counts replacing is the 3x amplification measured in the August 2026 load test.\n\
+             # TYPE kimmy_embed_skipped_not_owned_total counter\n\
+             kimmy_embed_skipped_not_owned_total {embed_not_owned}\n\
+             # HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.\n\
+             # TYPE kimmy_embed_failures_total counter\n\
+             kimmy_embed_failures_total {embed_failures}\n",
             uptime = self.uptime_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
@@ -406,6 +475,11 @@ impl Metrics {
             lag = self.get(&self.replication_lag_secs),
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
+            embed_docs = embed_docs,
+            embed_chunks = embed_chunks,
+            embed_deferred = embed_deferred,
+            embed_not_owned = embed_not_owned,
+            embed_failures = embed_failures,
             jwks_ok = self.get(&self.jwks_refresh_ok),
             jwks_fail = self.get(&self.jwks_refresh_failed),
         );
@@ -567,6 +641,21 @@ kimmy_tls_reloads_total{outcome=\"failed\"} 1
 # TYPE kimmy_jwks_refresh_total counter
 kimmy_jwks_refresh_total{outcome=\"ok\"} 22
 kimmy_jwks_refresh_total{outcome=\"failed\"} 1
+# HELP kimmy_embed_documents_total Documents whose vectors this node wrote.
+# TYPE kimmy_embed_documents_total counter
+kimmy_embed_documents_total 0
+# HELP kimmy_embed_chunks_total Provider inputs embedded - the closest proxy for provider spend.
+# TYPE kimmy_embed_chunks_total counter
+kimmy_embed_chunks_total 0
+# HELP kimmy_embed_deferred_total Foreign-written documents held for a later re-check.
+# TYPE kimmy_embed_deferred_total counter
+kimmy_embed_deferred_total 0
+# HELP kimmy_embed_skipped_not_owned_total Documents dropped un-embedded because another node owns embedding - the duplicate provider calls this counts replacing is the 3x amplification measured in the August 2026 load test.
+# TYPE kimmy_embed_skipped_not_owned_total counter
+kimmy_embed_skipped_not_owned_total 0
+# HELP kimmy_embed_failures_total Failed provider calls, including each retry. Climbing while embed_documents stays flat is a provider outage.
+# TYPE kimmy_embed_failures_total counter
+kimmy_embed_failures_total 0
 # HELP kimmy_request_duration_seconds End-to-end request latency. Health and metrics routes are excluded, so scrapes do not crowd the buckets the real traffic lands in.
 # TYPE kimmy_request_duration_seconds histogram
 kimmy_request_duration_seconds_bucket{le=\"0.0001\"} 1
@@ -640,6 +729,11 @@ kimmy_request_duration_seconds_count 3
             "kimmy_jwks_refresh_total{{outcome=\"failed\"}} {}\n",
             s.jwks_refresh_failed
         ));
+        expect(&format!("kimmy_embed_documents_total {}\n", s.embed_documents_embedded));
+        expect(&format!("kimmy_embed_chunks_total {}\n", s.embed_chunks_embedded));
+        expect(&format!("kimmy_embed_deferred_total {}\n", s.embed_deferred));
+        expect(&format!("kimmy_embed_skipped_not_owned_total {}\n", s.embed_skipped_not_owned));
+        expect(&format!("kimmy_embed_failures_total {}\n", s.embed_failures));
         expect(&format!("kimmy_request_duration_seconds_count {}\n", s.latency_count));
 
         // Not a rendered series of its own — the histogram prints it in seconds
@@ -691,7 +785,7 @@ kimmy_request_duration_seconds_count 3
             samples += 1;
         }
         // 23 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 38, "expected one sample per series: {out}");
+        assert_eq!(samples, 43, "expected one sample per series: {out}");
     }
 
     #[test]
