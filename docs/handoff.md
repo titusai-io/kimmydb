@@ -6,15 +6,36 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-25 — **the CLI can see a zero-grant identity coming**
+
+Branch `feat/cli-zero-grant-notice`. Companion to the merged
+`feat/oidc-role-mappings-env` (#112, the server-side half). Two additions:
+
+- **`kimmy whoami`** — prints `/v1/auth/whoami` (an existing endpoint) as
+  one-line JSON: principal, federated flag, grants. The diagnostic that would
+  have answered the zero-grants session in one command.
+- **The note.** After `databases` or `collections` returns empty, the CLI asks
+  whoami once; if `grants` is present-and-empty it prints a stderr hint naming
+  `kimmy whoami`. Stdout is byte-identical either way (machine contract);
+  the gate is strictly "grants field exists and is empty", so an identity with
+  grants looking at a genuinely empty namespace is never nagged, and any
+  unexpected payload shape fails closed (no hint).
+
+Decision functions (`listing_is_empty`, `is_zero_grant`) are unit-tested
+including fail-closed shapes; whoami endpoint semantics stay covered by
+`crates/kimmy-api/tests/api.rs`. No route changes, openapi contract untouched.
+
+---
+
 ## As of 2026-08-25 — **role mappings become deployable from an environment block**
 
-Branch `feat/oidc-role-mappings-env`. The gap: a deployment configured through
-env vars (compose, swarm, k8s — i.e. both test clusters) could federate but
-could never configure `role_mappings`, which was TOML-only. Every federated
-caller on such a node holds zero grants, which presents as empty listings and
-bare 403s — found live by the cluster owner against his own database.
+Merged as #112. The gap: a deployment configured through env vars (compose,
+swarm, k8s) could federate but could never configure `role_mappings`, which was
+TOML-only. Every federated caller on such a node holds zero grants, which
+presents as empty listings and bare 403s — found live by the cluster owner
+against his own database.
 
-What this branch adds: `KIMMY_OIDC_ROLE_MAPPINGS` (ADR-078) — one JSON array,
+What landed: `KIMMY_OIDC_ROLE_MAPPINGS` (ADR-078) — one JSON array,
 **replaces** the file's list when set, no per-mapping flags (ADR-066's rationale
 stands), all startup refusals apply through the same `validate`. Parser errors
 name the variable and show the shape. Tests cover replace-over-file precedence,
@@ -22,9 +43,8 @@ the error message, and that validate still refuses an empty mapping arriving
 through the env form.
 
 Not decided here, deliberately: whether the test deployments adopt it is a
-change on the deployment side, outside this repository; the CLI-side
-zero-grant notice and `whoami` are a separate branch; IdP integration guides
-are their own docs page.
+change on the deployment side, outside this repository; IdP integration
+guides are their own docs page.
 
 ---
 

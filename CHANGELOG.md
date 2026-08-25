@@ -14,6 +14,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy whoami`.** How the node sees the caller: principal name, local or
+  federated, and the grants that identity holds — the one-command answer to
+  "I logged in fine, why does everything refuse?"
+- **A zero-grant note on empty listings.** `kimmy databases` and
+  `kimmy collections` filter through authorization server-side, so an identity
+  whose token carries no grants sees what an empty cluster looks like. When a
+  listing comes back empty and `/v1/auth/whoami` confirms the caller holds no
+  grants at all, the CLI says so on stderr; stdout is unchanged.
 - **`KIMMY_OIDC_ROLE_MAPPINGS`: role mappings through an environment
   variable.** A container deployment that configures the node with env vars
   could federate but had no way to say what a federated identity was worth —

@@ -60,6 +60,7 @@ grants any other client is.
 | `kimmy login --oidc` | Prints a token from the node's OIDC provider, via the device flow |
 | `kimmy login --client-credentials` | Same, for a service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
+| `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
 | `kimmy topology` | The nodes of the cluster, and which are live |
 | `kimmy databases` | Databases you can read |
 | `kimmy collections <db>` | Collections in a database |
@@ -271,6 +272,28 @@ federated route instead, because sending a federated user to `kimmy login
   set --token, or KIMMY_TOKEN from `kimmy login --oidc` (issuer
   https://auth.example.com); a local account still works with `kimmy login <user>`
 ```
+
+## Empty listings and zero grants
+
+`kimmy databases` lists databases you can **read** — authorization filters the
+listing server-side. So an identity whose token carries no grants sees exactly
+what an empty cluster looks like: `{"databases":[]}`, then a bare 403 on the
+first real operation. When a listing comes back empty, the CLI asks
+`/v1/auth/whoami` once and, if that identity holds no grants at all, adds one
+line on stderr:
+
+```
+note: this identity carries no grants, so listings only show what you are allowed to read.
+       run `kimmy whoami` to see how the node sees you.
+```
+
+stdout is unchanged — scripts piping into `jq` see the same bytes either way.
+The note appears only when grants are actually empty; an identity *with* grants
+seeing an empty result may simply be looking at an empty namespace.
+
+The usual cause on a federated login is a roles claim no `role_mappings`
+turned into grants (see [security](security.md)); on a local login it is a user
+record whose direct grants were never set or were revoked.
 
 ---
 

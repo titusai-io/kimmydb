@@ -154,6 +154,14 @@ enum Command {
     },
     /// Health and readiness of the node.
     Ping,
+    /// How this node sees the caller's identity.
+    ///
+    /// The principal name, whether it came from this node's own user store or
+    /// from its OIDC provider, and — the part worth reading after an empty
+    /// listing or a bare 403 — the grants that identity actually holds. A
+    /// federated login that succeeds while everything else refuses is almost
+    /// always a token whose roles no mapping turned into grants.
+    Whoami,
     /// List databases you can read.
     Databases,
     /// List collections in a database.
@@ -446,15 +454,27 @@ async fn run() -> Result<()> {
 
             emit(&cli, &collection_created(created, coll)?);
         }
+        Command::Whoami => emit(
+            &cli,
+            &client.request(Method::Get, "/v1/auth/whoami", None, Safety::Idempotent).await?,
+        ),
         Command::Databases => {
-            emit(
-                &cli,
-                &client.request(Method::Get, "/v1/databases", None, Safety::Idempotent).await?,
-            );
+            let listing =
+                client.request(Method::Get, "/v1/databases", None, Safety::Idempotent).await?;
+            let empty = listing_is_empty("databases", &listing);
+            emit(&cli, &listing);
+            if empty {
+                zero_grant_note(&client).await;
+            }
         }
         Command::Collections { database } => {
             let path = format!("/v1/db/{database}/collections");
-            emit(&cli, &client.request(Method::Get, &path, None, Safety::Idempotent).await?);
+            let listing = client.request(Method::Get, &path, None, Safety::Idempotent).await?;
+            let empty = listing_is_empty("collections", &listing);
+            emit(&cli, &listing);
+            if empty {
+                zero_grant_note(&client).await;
+            }
         }
         Command::Find { target, filter, sort, projection, limit, skip, explain } => {
             let (db, coll) = split_target(target)?;
@@ -1429,6 +1449,47 @@ fn emit(cli: &Cli, value: &Value) {
     }
 }
 
+/// Whether a listing response carries no entries.
+///
+/// The two listing shapes are fixed by the server; anything else (a missing
+/// key, an unexpected shape) is treated as "not empty" so a surprise payload
+/// can never manufacture a hint that does not apply.
+fn listing_is_empty(key: &str, listing: &Value) -> bool {
+    listing[key].as_array().is_some_and(|entries| entries.is_empty())
+}
+
+/// Whether a `/v1/auth/whoami` answer describes an identity with no grants.
+///
+/// Gated on the field being present *and* empty. A principal holding grants
+/// that sees an empty result may simply be looking at an empty namespace —
+/// nagging them would train people to ignore the note, which is worse than
+/// never printing it.
+fn is_zero_grant(whoami: &Value) -> bool {
+    whoami["grants"].as_array().is_some_and(|grants| grants.is_empty())
+}
+
+/// After an empty listing, tell a zero-grant identity why theirs is empty.
+///
+/// `list_databases` and `list_collections` filter through authorization
+/// server-side, so "you may see nothing" and "there is nothing" arrive
+/// byte-identical on stdout — and stdout must stay byte-identical, because it
+/// is a machine-readable contract. The note goes to stderr only when the
+/// caller's grants are actually empty, turning "this database does not exist"
+/// into "your token carries no grants" in one line. A whoami that fails for
+/// any reason is swallowed: this is a hint, never a second error.
+async fn zero_grant_note(client: &Client) {
+    let Ok(who) = client.request(Method::Get, "/v1/auth/whoami", None, Safety::Idempotent).await
+    else {
+        return;
+    };
+    if is_zero_grant(&who) {
+        eprintln!(
+            "note: this identity carries no grants, so listings only show what you are allowed \
+             to read.\n       run `kimmy whoami` to see how the node sees you."
+        );
+    }
+}
+
 /// What `create-collection` reports, given what the server answered.
 ///
 /// A collection that is already there is the state this command exists to
@@ -1465,6 +1526,48 @@ mod tests {
     #[test]
     fn cli_definition_is_valid() {
         Cli::command().debug_assert();
+    }
+
+    // -----------------------------------------------------------------------
+    // The zero-grant note: which listings and identities trigger it
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn an_empty_listing_is_detected_per_shape() {
+        assert!(listing_is_empty("databases", &json!({ "databases": [] })));
+        assert!(listing_is_empty("collections", &json!({ "collections": [] })));
+        assert!(!listing_is_empty("databases", &json!({ "databases": ["notes"] })));
+    }
+
+    #[test]
+    fn a_surprise_listing_shape_never_triggers_the_note() {
+        // The gate must fail closed: a payload this CLI does not recognise is
+        // treated as "not empty", so the hint can only ever appear when the
+        // server really said the list was empty.
+        assert!(!listing_is_empty("databases", &json!({})));
+        assert!(!listing_is_empty("databases", &json!({ "databases": null })));
+        assert!(!listing_is_empty("databases", &json!({ "databases": "[]" })));
+    }
+
+    #[test]
+    fn only_an_actually_empty_grants_array_is_zero_grant() {
+        // The exact shape a federated token with no mappings resolves to —
+        // proven live against a test cluster on 2026-08-24, where the
+        // cluster owner's own account saw it.
+        assert!(is_zero_grant(&json!({ "federated": true, "grants": [] })));
+        assert!(!is_zero_grant(&json!({ "grants": [{ "db": "*", "actions": ["read"] }] })));
+
+        // A principal with grants seeing an empty result may be looking at an
+        // empty namespace; the field being absent or odd means no hint at all.
+        assert!(!is_zero_grant(&json!({ "federated": false })));
+        assert!(!is_zero_grant(&json!({})));
+        assert!(!is_zero_grant(&json!({ "grants": null })));
+    }
+
+    #[test]
+    fn whoami_is_a_known_subcommand() {
+        let cli = Cli::try_parse_from(["kimmy", "whoami"]).unwrap();
+        assert!(matches!(cli.command, Command::Whoami));
     }
 
     /// One workspace version, one binary story (ADR-062): what
