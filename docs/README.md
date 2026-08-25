@@ -59,6 +59,7 @@ graph TD
 
     OPS --> OP["Operations<br/>config · deploy · observability"]
     OPS --> SEC["Security<br/>auth · RBAC · threat model"]
+    OPS --> FED["Federation<br/>OAuth2/OIDC identity providers"]
 
     DEV --> RM["Roadmap<br/>milestones and planned design"]
     DEV --> DEC["Decisions<br/>what was chosen and why"]
@@ -85,6 +86,7 @@ graph TD
 | [`examples/`](../examples/README.md) | One application, written three times — documents, paging, aggregation, vector search and a change stream |
 | [Compatibility](compatibility.md) | What `/v1` promises, what counts as additive, what forces `/v2` |
 | [Security](security.md) | Authentication, RBAC, what is and is not defended against |
+| [Federation](federation.md) | Wiring an external OAuth2/OIDC identity provider: recipes, provider notes, troubleshooting |
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |
 | [Decisions](decisions.md) | Architecture decision record — choices and their rationale |

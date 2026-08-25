@@ -273,5 +273,5 @@ wrong answers rather than crashes. These are property-tested:
 | [Change Streams](docs/change-streams.md) | The replay/live splice, resume, lag recovery |
 | [Query Language](docs/query-language.md) · [HTTP API](docs/http-api.md) | Using it |
 | [Vectors](docs/vectors.md) · [MCP](docs/mcp.md) | Embeddings, search, and the agent surface |
-| [Security](docs/security.md) · [Operations](docs/operations.md) | Running it |
+| [Security](docs/security.md) · [Federation](docs/federation.md) · [Operations](docs/operations.md) | Running it |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |
