@@ -10,6 +10,29 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## 0.5.0 - 2026-08-25
+
+### Added
+
+- **Embedding work is owned per collection.** Backfill scans and deferred
+  re-checks run on the node the collection's rendezvous hash assigns — the
+  same function webhooks and TTL expiry use — instead of on every member.
+  Closes the 3x provider-call amplification measured under replication lag
+  (ADR-077).
+- **The embedding worker can be turned off per node**: `[vector]
+  worker_enabled = false` or the one-way `--disable-vector-worker` flag /
+  `KIMMY_DISABLE_VECTOR_WORKER`. A disabled node consumes replicated vectors;
+  vector search is unaffected.
+- **Embedding observability**: `kimmy_embed_documents_total`,
+  `kimmy_embed_chunks_total`, `kimmy_embed_deferred_total`,
+  `kimmy_embed_skipped_not_owned_total` and `kimmy_embed_failures_total` on
+  `/metrics`.
+
+### Changed
+
+- `/metrics` gained five series; scrapers asserting an exact series set need
+  the additions.
+
 ## 0.4.0 - 2026-08-24
 
 ### Added

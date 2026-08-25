@@ -2217,3 +2217,22 @@ one and worth retiring once it is two behind — its durable lessons should have
 become invariants by then. The historical record lives in
 [Deviations](deviations.md) and [Decisions](decisions.md), which are
 append-mostly by design.
+
+---
+
+## Current state (2026-08-25, after v0.5.0)
+
+The load test of 2026-08-24 (7,219 documents into one vector-enabled
+collection on three Pi 3s) ended with every member OOM-killed and the swarm
+leaderless; its full reconstruction lives in the NexWiki load-test report.
+What shipped since, in order: the provider on the test cluster was
+right-sized (its container sat at 96% of its limit swap-thrashing), the Pi
+memory split was rebalanced (kimmydb 448M / rabbitmq 192M), rabbitmq was
+undeployed then redeployed alone, and PR #110 gave the embedding worker
+per-collection rendezvous ownership plus a disable flag and metrics.
+
+Known-open, in priority order: bounded catch-up replay batches (the one
+structural weakness the incident proved), catch-up-aware readiness, cheap
+collection counts, and the retest protocol in the NexWiki report. The test
+swarm is blank and healthy with force-fsck boots; kimmydb's next test home is
+likely three small GCP VMs.
