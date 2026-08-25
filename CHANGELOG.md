@@ -10,6 +10,21 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`kimmy roles …` and `kimmy users …`.** The administrative surface the
+  federation round made necessary: stored roles (ADR-073) — the things OIDC
+  role mappings point at — can now be created, inspected, granted against and
+  revoked from the CLI (`roles grant/revoke` are live edits; they apply on the
+  callers' next request), and local accounts can be created, granted,
+  disabled and deleted without curl. Disable is new server-side too:
+  `POST /v1/users/{name}/disabled` ends every session the account holds and
+  refuses new logins while keeping the record — the reversible form of
+  deletion, guarded like deletion is (not your own account, not the last
+  enabled user).
+
 ## 0.6.0 - 2026-08-25
 
 ### Added

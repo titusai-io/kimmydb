@@ -45,6 +45,7 @@ has been incomplete before.
 | `GET` `DELETE` | `/v1/users/{name}` | server admin |
 | `POST` | `/v1/users/{name}/password` | own account, or server admin |
 | `POST` | `/v1/users/{name}/grants` | server admin |
+| `POST` | `/v1/users/{name}/disabled` | server admin |
 | `POST` | `/v1/users/{name}/roles` | server admin |
 | `GET` `POST` | `/v1/roles` | server admin |
 | `GET` `DELETE` | `/v1/roles/{name}` | server admin |
