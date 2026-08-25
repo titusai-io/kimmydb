@@ -1098,6 +1098,7 @@ graph TB
 
 ## Next
 
+- [Federation](federation.md) — provider-by-provider recipes for the machinery above
 - [HTTP API](http-api.md) — the endpoints these rules protect
 - [Operations](operations.md) — configuration and deployment
 - [Decisions](decisions.md) — why JWT rather than sessions
