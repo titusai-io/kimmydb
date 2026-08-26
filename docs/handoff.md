@@ -6,6 +6,39 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **the embedding worker now survives a collected position**
+
+Branch `fix/vector-worker-lost-position`, found minutes after the 0.10.0 repair
+roll on the test cluster: a probe document inserted into a vector-configured
+collection was never embedded, and every `kimmy_embed_*` counter on the owner
+stayed at zero. The owner's log had the answer one second after its restart:
+`embedding worker stopped: change stream resume token is no longer available`.
+Member A had been dark for ten hours (see the two entries below), retention had
+collected the oplog past the worker's persisted position, `Engine::watch`
+refused the token (correctly — a silent skip would hide a gap), and
+`EmbeddingWorker::run` propagated the error, so `kimmyd` logged once and ran on
+with no worker. `ChangeEvent::Invalidate` mid-run ended it just as quietly.
+Fix: `run` is a recovery loop — on a refused position (or an invalidated
+stream) it reopens from the oldest retained entry *first* (`watch` subscribes
+before it reads, so nothing written during the scan is lost) and then
+`rescan_owned` walks every owned, server-embedded collection through the same
+`scan_collection` a `ConfigureVectors` backfill uses, idempotent via the
+staleness check. The stream loop moved into `drive`, which returns
+`StreamEnd::{Ended, Invalidated}` instead of breaking. Test: position recorded
+at the *first* oplog entry (the GC never collects the newest, which is why the
+first fixture attempt did not reproduce), GC with zero retention, `watch`
+asserted to refuse it, then the worker must embed a pre-outage document (the
+rescan) and a post-outage one (the fresh stream) and still be running. Fails on
+`main` — the worker task ends and neither document is embedded. Not an ADR: the
+recorded position's semantics are unchanged; only what happens when it is gone.
+**The 0.5.0 "dead embed counters" plan is likely the same symptom seen through
+a different lens** and should be re-measured after this ships: on 0.10.0 the
+counters are wired correctly end to end (`WorkerCounters` →
+`set_vector_counters` → `render`), and a worker that is not running reads as
+zeros.
+
+---
+
 ## As of 2026-08-26 — **snapshots could not encode half of all collection ids**
 
 Branch `fix/snapshot-collection-id-encoding`, found while verifying the

@@ -222,17 +222,72 @@ impl EmbeddingWorker {
     /// Starts from the recorded position, or from the beginning of the oplog
     /// on first run — which is what backfills a collection that already had
     /// documents when embedding was enabled.
+    ///
+    /// **A lost position is recovered, not fatal.** The recorded position is
+    /// an oplog arrival, and retention collects the oplog: a node that was
+    /// down, or partitioned, for longer than `oplog_retention_secs` comes
+    /// back to a position the oplog no longer holds. Before this, `watch`
+    /// refused it and the worker returned the error — `kimmyd` logged
+    /// "embedding worker stopped" once and ran on with **no embedding worker
+    /// at all**, silently, until the next restart hit the same position and
+    /// stopped again. Seen on a three-member cluster after a member spent ten
+    /// hours unable to sync: it came back, owned a collection, and embedded
+    /// nothing from then on. The same applies to a stream invalidated
+    /// mid-run, which used to end the worker just as quietly.
+    ///
+    /// Recovery is two steps in a deliberate order: open a fresh stream from
+    /// the oldest retained entry — `watch` subscribes before it reads, so
+    /// anything written from here on is in the stream — and *then* rescan
+    /// every owned, server-embedded collection for documents whose vectors
+    /// are stale or missing, which covers the history retention already
+    /// collected. Embedding is idempotent (`vectors_are_stale`), so the
+    /// overlap between the two costs storage reads, not provider calls.
     pub async fn run(&mut self) -> Result<()> {
-        let resume = self.engine.consumer_position(CONSUMER)?;
-        let options = WatchOptions {
-            resume_after: resume,
-            // No recorded position means everything so far is unembedded.
-            start_at: resume.is_none().then_some(Hlc::ZERO),
-        };
+        let mut resume = self.engine.consumer_position(CONSUMER)?;
+        let mut recovering = false;
+        loop {
+            let options = WatchOptions {
+                resume_after: resume,
+                // No recorded position means everything so far is unembedded.
+                start_at: resume.is_none().then_some(Hlc::ZERO),
+            };
+            let mut stream = match self.engine.watch(WatchScope::Cluster, options) {
+                Ok(stream) => stream,
+                Err(e) if is_lost_position(&e) && resume.is_some() => {
+                    warn!(
+                        error = %e,
+                        "embedding worker's recorded position has been collected; restarting \
+                         from the oldest retained entry and rescanning owned collections"
+                    );
+                    resume = None;
+                    recovering = true;
+                    continue;
+                }
+                Err(e) => return Err(e.into()),
+            };
+            info!(resumed = resume.is_some(), recovering, "embedding worker started");
 
-        let mut stream = self.engine.watch(WatchScope::Cluster, options)?;
-        info!(resumed = resume.is_some(), "embedding worker started");
+            if std::mem::take(&mut recovering) {
+                let embedded = self.rescan_owned().await?;
+                info!(embedded, "rescanned owned collections after a lost position");
+            }
 
+            match self.drive(&mut stream).await? {
+                StreamEnd::Ended => return Ok(()),
+                StreamEnd::Invalidated(reason) => {
+                    // An invalidated stream cannot be trusted to be gap-free,
+                    // and silently continuing would leave documents
+                    // unembedded. Neither would stopping.
+                    warn!(?reason, "change stream invalidated; recovering with a rescan");
+                    resume = None;
+                    recovering = true;
+                }
+            }
+        }
+    }
+
+    /// Process one stream until it ends or is invalidated.
+    async fn drive(&mut self, stream: &mut kimmy_storage::ChangeStream) -> Result<StreamEnd> {
         loop {
             // Timed rather than a plain await, so deferred documents are still
             // re-checked on a cluster that has gone quiet. `next` is safe to
@@ -242,18 +297,16 @@ impl EmbeddingWorker {
             // arrival index on the next call is what recovers it.
             let event = match tokio::time::timeout(DEFERRAL_TICK, stream.next(&self.engine)).await {
                 Ok(Some(event)) => event,
-                Ok(None) => break,
+                Ok(None) => return Ok(StreamEnd::Ended),
                 Err(_) => {
                     self.drain_deferred(Instant::now()).await;
                     continue;
                 }
             };
 
-            let ChangeEvent::Change { entry, token } = event else {
-                // An invalidated stream cannot be trusted to be gap-free, and
-                // silently continuing would leave documents unembedded.
-                warn!("change stream invalidated; embedding worker stopping");
-                break;
+            let (entry, token) = match event {
+                ChangeEvent::Change { entry, token } => (entry, token),
+                ChangeEvent::Invalidate { reason } => return Ok(StreamEnd::Invalidated(reason)),
             };
 
             // Retry rather than advance: losing an entry means a document stays
@@ -284,7 +337,42 @@ impl EmbeddingWorker {
             // wait for a lull.
             self.drain_deferred(Instant::now()).await;
         }
-        Ok(())
+    }
+
+    /// Bring every owned, server-embedded collection up to date by scanning
+    /// it — the recovery for a stream position the oplog no longer holds.
+    ///
+    /// Returns how many documents were embedded. Collections owned elsewhere
+    /// are skipped and counted, exactly as a replicated backfill is: their
+    /// owner runs the same recovery when its own position is lost, and
+    /// replication carries the vectors here.
+    async fn rescan_owned(&mut self) -> Result<usize> {
+        let mut embedded = 0;
+        for db in self.engine.list_databases()? {
+            for collection in self.engine.list_collections(&db.name)? {
+                if kimmy_core::vector_meta::is_shadow(&collection.name) {
+                    continue;
+                }
+                let Some(config) = collection.vector.clone() else {
+                    continue;
+                };
+                if !config.provider.embeds_server_side() {
+                    continue;
+                }
+                if !self.is_owner_of(&db.name, &collection.name) {
+                    self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
+                let Some(shadow) = self.engine.vector_collection(&db.name, &collection.name)?
+                else {
+                    continue;
+                };
+                embedded += self
+                    .scan_collection(&collection, &shadow, &config, "a lost stream position")
+                    .await?;
+            }
+        }
+        Ok(embedded)
     }
 
     /// Hold a remotely-written document for a later re-check.
@@ -560,6 +648,21 @@ impl EmbeddingWorker {
             return Ok(Outcome::Skipped);
         }
 
+        let embedded =
+            self.scan_collection(&collection, &shadow, &config, "a configuration change").await?;
+        Ok(Outcome::Backfilled { embedded })
+    }
+
+    /// Scan one collection, embedding every document whose vectors are stale
+    /// or missing. Returns how many were embedded. `reason` names the trigger
+    /// in the completion line.
+    async fn scan_collection(
+        &mut self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        reason: &'static str,
+    ) -> Result<usize> {
         // Whether this scan must re-embed regardless of per-document
         // staleness. The HLC check cannot see a configuration change —
         // configurations do not touch documents — so the decision comes from
@@ -569,14 +672,14 @@ impl EmbeddingWorker {
         // documents embed twice, which idempotent output makes harmless,
         // where the alternative — recording first — would leave the rest
         // embedded under the old model with nothing to notice.
-        let fingerprint = config_fingerprint(&config);
+        let fingerprint = config_fingerprint(config);
         let force = self.engine.vector_fingerprint(collection.id)? != Some(fingerprint);
 
         // Ids first, documents re-read one at a time: the scan must not hold
         // a read transaction across provider calls, and holding every
         // document in memory would make backfill cost O(collection).
         let mut ids = Vec::new();
-        self.engine.for_each_doc(&collection, |id, _| {
+        self.engine.for_each_doc(collection, |id, _| {
             ids.push(id);
             Ok(true)
         })?;
@@ -588,7 +691,7 @@ impl EmbeddingWorker {
             // streaming path does; a permanent failure skips the document
             // rather than stalling the rest of the scan.
             loop {
-                match self.embed_one(&collection, &shadow, &config, &source, force).await {
+                match self.embed_one(collection, shadow, config, &source, force).await {
                     Ok(true) => {
                         embedded += 1;
                         break;
@@ -613,9 +716,10 @@ impl EmbeddingWorker {
             collection = %collection.name,
             embedded,
             total,
-            "backfilled vectors after a configuration change"
+            reason,
+            "scanned a collection's vectors"
         );
-        Ok(Outcome::Backfilled { embedded })
+        Ok(embedded)
     }
 
     /// Bring one document's vectors up to date. `Ok(true)` if work was done.
@@ -723,6 +827,21 @@ impl EmbeddingWorker {
 /// the backfill decision needs; a build that changes the config's *shape*
 /// changes the fingerprint and costs one spurious full re-embed after
 /// upgrade, which is the safe direction to be wrong in.
+/// How a stream stopped yielding.
+enum StreamEnd {
+    /// The stream closed; there is nothing further to watch.
+    Ended,
+    /// The stream can no longer be trusted to be gap-free.
+    Invalidated(kimmy_storage::InvalidateReason),
+}
+
+/// Whether opening a stream failed because its resume position has been
+/// collected from the oplog — the one open-time failure the worker recovers
+/// from rather than reports.
+fn is_lost_position(e: &kimmy_storage::StorageError) -> bool {
+    matches!(e, kimmy_storage::StorageError::Core(kimmy_core::Error::ResumeTokenExpired))
+}
+
 fn config_fingerprint(config: &VectorConfig) -> u64 {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x100_0000_01b3;
@@ -1068,6 +1187,75 @@ mod tests {
         );
         assert!(!VectorError::DimensionMismatch { expected: 4, found: 8 }.is_retryable());
         assert!(!VectorError::MissingApiKey { var: "K".into() }.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_collected_position_is_recovered_by_a_rescan_and_a_fresh_stream() {
+        // A member that was down for longer than the oplog retains comes back
+        // to a recorded position the oplog no longer holds. This used to end
+        // the worker with one warning, leaving the node with no embedding
+        // worker at all — seen live on a cluster member that had been unable
+        // to sync for ten hours.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+
+        // The worker last recorded the oldest entry there is; then a document
+        // was written while it was "down", and retention collected everything
+        // but the newest entry — which the GC never removes, so the position
+        // must point below it to be collected at all.
+        let first = engine.read_oplog_from(Hlc::ZERO, 1).unwrap().remove(0);
+        let stale = kimmy_core::ResumeToken::new(first.stamp.hlc, first.stamp.node);
+        engine.put_consumer_position(CONSUMER, stale).unwrap();
+        let before = engine.insert(&coll, doc! { "_id": "before", "title": "before" }).unwrap();
+        engine
+            .collect_garbage_at(
+                kimmy_storage::physical_now_ms() + 1_000_000_000,
+                kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+            )
+            .unwrap();
+        let refused = engine
+            .watch(WatchScope::Cluster, WatchOptions { resume_after: Some(stale), start_at: None });
+        assert!(
+            matches!(&refused, Err(e) if is_lost_position(e)),
+            "the fixture must reproduce the refused position: {:?}",
+            refused.as_ref().err()
+        );
+        drop(refused);
+
+        let handle = tokio::spawn(async move { worker.run().await });
+
+        // The rescan covers what retention collected …
+        for _ in 0..1_000 {
+            if !engine.get_vectors(&shadow, &before).unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            engine.get_vectors(&shadow, &before).unwrap().len(),
+            1,
+            "the document written before the outage must be embedded by the rescan"
+        );
+
+        // … and the fresh stream covers what comes next.
+        let after = engine.insert(&coll, doc! { "_id": "after", "title": "after" }).unwrap();
+        for _ in 0..1_000 {
+            if !engine.get_vectors(&shadow, &after).unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            engine.get_vectors(&shadow, &after).unwrap().len(),
+            1,
+            "a document written after recovery must be embedded by the live stream"
+        );
+        assert!(!handle.is_finished(), "the worker must keep running");
+        assert_ne!(
+            engine.consumer_position(CONSUMER).unwrap(),
+            Some(stale),
+            "a fresh position must be recorded, so the next start resumes normally"
+        );
     }
 
     #[tokio::test]
