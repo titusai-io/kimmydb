@@ -288,29 +288,18 @@ pub async fn sync_once(
 
         write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
         let mut outcome = match read_frame(&mut stream).await? {
-            Message::Entries(entries) => {
-                // A short batch means the peer sent everything it is willing to
-                // send from `from` onward, so this node has now seen all of
-                // `theirs` — including entries the peer holds but deliberately
-                // never ships. A `UniqueViolation` is the standing example
-                // (ADR-029): it is in the sender's oplog and therefore in the
-                // vector it advertised, but `entries_for_peer` excludes it, so
-                // a receiver could never cover that stamp by receiving it and
-                // would ask again every round forever.
-                //
-                // Only on a *short* batch. A full one was truncated at the
-                // limit, and there is more to come.
-                let exhausted = entries.len() < MAX_BATCH;
-                let applied = engine
-                    .apply_batch(&entries)
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()));
-                if applied.is_ok() && exhausted {
-                    engine
-                        .absorb_witnessed(&theirs)
-                        .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-                }
-                applied
-            }
+            // The batch, and what it proved: a short one is the peer's whole
+            // tail, a full one a window ending at its last stamp. Either way
+            // the witnessed vector is raised for every origin the peer
+            // advertised, including stamps it holds but never ships — a
+            // `UniqueViolation` (ADR-029) — because otherwise such a stamp
+            // pins `behind` at its floor and the same window is re-served
+            // every round for the life of the cluster (ADR-082). The decision
+            // lives in storage (`coverage_after_batch`), where it is tested
+            // between engines without a network.
+            Message::Entries(entries) => engine
+                .apply_peer_batch(&theirs, &entries, MAX_BATCH)
+                .map_err(|e| ProtocolError::Malformed(e.to_string())),
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");

@@ -3817,6 +3817,72 @@ applied — a one-millisecond ambiguity that last-writer-wins cannot resolve and
 that failing closed protects the recreated collection's isolation, which is
 the property the whole guard exists for.
 
+## ADR-082 — A full batch proves coverage of its window, for every origin the peer advertised
+
+**Decision.** When a sync round receives a **full** batch — one truncated at
+`MAX_BATCH` — the receiver raises its witnessed vector, for **every origin
+the peer advertised**, to the lower of the peer's coverage of that origin and
+the last delivered stamp. A short batch keeps its existing meaning: the peer's
+whole tail, so the witnessed vector is raised to the peer's vector outright.
+The decision is one pure function in storage, `coverage_after_batch`, called
+from the one place the transport merges a served batch, `apply_peer_batch`.
+
+**The defect.** `VersionVector::behind` reduces "what am I missing" to one
+threshold: this node's *own* position at whichever trailing origin it holds
+least of — by design, so a catch-up is a single range read of an oplog keyed
+by time. The cost was known to be over-fetching. What was not seen: an
+advertised stamp the receiver can *never* be sent — a unique-violation entry
+is locally stamped, in the sender's vector, and filtered from every batch
+(ADR-029) — pins the threshold at that origin's floor. The cure for exactly
+that, absorbing the peer's vector, ran only on a short batch, and the comment
+beside it described the failure it guarded against ("would ask again every
+round forever") while guarding the cure away from the case that needs it.
+Once the sender holds a full batch of *other* origins' entries after the
+pinned floor — inevitable on any member that writes rarely and replicates
+much — every round re-serves the same window, every entry in it superseded,
+and the round is never short again.
+
+**Observed** on a three-member test cluster, 2026-08-26, at 0.7.0 with
+one member's storage and cluster targets at debug: 94 of 95 batches pulled
+from one peer over 25 minutes read `applied=0, superseded=1021`; the peer
+summary reported `ddl=3` from the same peer, and 1021 + 3 is `MAX_BATCH`. Two
+log lines, one loop. `kimmy_replication_lag_seconds` read 68 545 — the age of
+the cluster — because `lag_behind_ms` measures the pinned origin's gap from
+its floor. Replication itself was healthy throughout: a fresh write reached
+every member in under ten seconds, because it arrived through the *other*
+peer, whose vector this node was not behind.
+
+**Why raising to the window end is safe.** The sender serves contiguously in
+stamp order from the point asked for (`read_oplog_from`, then the violation
+filter). Nothing inside the delivered window was skipped except entries
+deliberately withheld, and claiming those is correct: every node observes a
+violation independently (ADR-029), so there is nothing to wait for. Bounding
+each origin by the peer's own coverage means the receiver never claims history
+the peer does not hold — another peer may. Bounding by the last delivered
+stamp means nothing past the window is claimed. Entries that *tie* with the
+last stamp from an origin with a higher node id sort after it and were not
+served; they are re-served next round, because the range read is inclusive at
+the stamp asked for. The one thing raised beyond what was delivered is the
+pinned origin's floor, and that is the point.
+
+**Why not fix `behind`.** Per-origin ranges would make a catch-up a scan and
+filter over a time-keyed oplog, on every round, for every peer — the cost
+ADR-054 and the `behind` doc comment deliberately declined. The threshold is
+lossy but load-bearing; this decision keeps it and stops the loss from
+compounding.
+
+**Alternatives.** Ship violation entries and have receivers drop them: moves
+the exclusion to the wrong side and doubles the wire cost of every collision.
+Advertise the servable vector minus violations: a second vector to keep
+consistent, and it does not cover the general shape — any advertised stamp
+behind a full window pins the same way, whatever withheld it.
+
+**Cost.** One `VersionVector` built per full batch, at most one entry per
+origin the peer advertised. The witnessed-vector write it feeds already
+happened per batch; this widens what it carries. A three-engine storage test
+reproduces the loop deterministically — `applied 0, superseded 7, ddl 1` on
+every round with the raise removed — and converges with it.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

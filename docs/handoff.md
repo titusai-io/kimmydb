@@ -6,6 +6,36 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **the sync livelock: a full batch now proves its window (ADR-082)**
+
+Branch `fix/sync-full-batch-progress`. Root-caused from a 25-minute debug
+window on member B at 0.7.0: 94 of 95 pulls from member C read `applied=0,
+superseded=1021` (plus `ddl=3` on the peer summary — 1024, a full batch), the
+lag gauge pinned at the cluster's age. Mechanism: `VersionVector::behind` is
+one threshold — my own floor at the origin I trail most — and an advertised
+stamp I can never receive (a unique-violation entry is locally stamped and
+never shipped, ADR-029) pins that floor; the cure, absorbing the peer's
+vector, ran only on a *short* batch, so once a full window of
+already-witnessed entries sat under the pin, no round was ever short again.
+Fix: `coverage_after_batch` in `kimmy-storage/src/sync.rs` — after a full
+batch, raise every advertised origin to `min(their coverage, last delivered
+stamp)`; short batches unchanged. The transport's `Entries` arm now calls one
+storage method, `apply_peer_batch`, so the decision is tested between engines
+with no network. **Trap found writing the test:** the batch limit applies
+*before* the violation filter, so a violation *inside* the raw window
+shortens the batch and the old cure fires — the pin needs the unshippable
+stamp *beyond* a full window, which is why it took a rarely-writing member
+with a large replicated backlog to show it. The three-engine test fails
+without the fix (`superseded 7, ddl 1` every round for the whole budget) and
+converges with it. Rider: the storage debug line `merged a batch from a peer`
+now prints `ddl` and `unknown_collection`; the asymmetry with the INFO
+summary cost an hour on the test cluster. Storage suite 262/0. After this
+rolls to the test cluster: expect batches to shrink then stop, the `ddl=5`
+lines to cease and the gauge to decay toward 0 — then remove member B's
+temporary `KIMMY_LOG_LEVEL` from the test deployment's compose file.
+
+---
+
 ## As of 2026-08-26 — **incarnation floors: the drop/recreate CI flake, root-caused**
 
 Same branch as below (`feat/cli-token-flow`) after its CI run tripped

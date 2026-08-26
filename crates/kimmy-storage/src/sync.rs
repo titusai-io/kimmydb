@@ -76,7 +76,70 @@ impl SyncOutcome {
     }
 }
 
+/// What a batch from a peer proved this node has seen, beyond the entries
+/// themselves.
+///
+/// The peer serves contiguously in stamp order from the point asked for, so a
+/// batch is a *window*: every entry the peer holds inside it was either
+/// delivered or deliberately withheld (`UniqueViolation`, ADR-029). Either
+/// way this node has now processed that window for **every origin the peer
+/// advertised** — not only the origins that happened to appear in it.
+///
+/// - A **short** batch (fewer than `limit`) is the peer's whole tail, so the
+///   window runs to the end of everything it advertised: the answer is
+///   `theirs` itself.
+/// - A **full** batch was truncated at `limit`, so the window ends at the last
+///   delivered stamp. Each advertised origin is raised to the *lower* of that
+///   stamp and the peer's own coverage of it: never past what the peer holds,
+///   and never past what was served. Ties at the last stamp from origins with
+///   a higher node id sort after it and were not served — they are re-served
+///   next round, because the range read is inclusive at the stamp asked for.
+///
+/// Why the full-batch case exists at all: an advertised stamp this node can
+/// never receive — a violation, a stamp whose entry sits behind the window —
+/// otherwise pins `VersionVector::behind` at that origin's floor, and once the
+/// peer holds a full batch after that floor, every round re-serves the same
+/// already-witnessed window forever. Observed as a cluster whose sync log read
+/// `applied=0, superseded=1021` every five seconds for the life of the
+/// cluster, and whose lag gauge read the cluster's age. See ADR-082.
+pub fn coverage_after_batch(
+    theirs: &VersionVector,
+    entries: &[OplogEntry],
+    limit: usize,
+) -> VersionVector {
+    if entries.len() < limit {
+        return theirs.clone();
+    }
+    let Some(last) = entries.last() else {
+        return theirs.clone();
+    };
+    let window_end = last.stamp.hlc;
+    let mut covered = VersionVector::new();
+    for (node, their_max) in theirs.iter() {
+        covered.insert(node, their_max.min(window_end));
+    }
+    covered
+}
+
 impl Engine {
+    /// Merge a batch a peer served in answer to `AskEntries`, and record what
+    /// the batch proved about coverage.
+    ///
+    /// The single path the replication transport uses for a served batch:
+    /// [`Self::apply_batch`] for the entries, then the witnessed vector raised
+    /// by [`coverage_after_batch`]. `limit` is the batch size that was asked
+    /// for, which is what decides whether the peer's tail was reached.
+    pub fn apply_peer_batch(
+        &self,
+        theirs: &VersionVector,
+        entries: &[OplogEntry],
+        limit: usize,
+    ) -> Result<SyncOutcome> {
+        let outcome = self.apply_batch(entries)?;
+        self.absorb_witnessed(&coverage_after_batch(theirs, entries, limit))?;
+        Ok(outcome)
+    }
+
     /// Entries at or after `from`, for a peer that asked to catch up.
     ///
     /// Stamp order, not arrival order: a peer's question is "what do you hold
@@ -129,6 +192,8 @@ impl Engine {
         debug!(
             applied = outcome.applied,
             superseded = outcome.superseded,
+            ddl = outcome.ddl,
+            unknown_collection = outcome.unknown_collection,
             "merged a batch from a peer"
         );
         Ok(outcome)
@@ -412,6 +477,163 @@ mod tests {
     fn sync(a: &Engine, b: &Engine) {
         pull(a, b);
         pull(b, a);
+    }
+
+    /// One direction of a *transport-shaped* round: what `sync_once` does,
+    /// between two engines in one process. Unlike [`pull`], this asks against
+    /// the witnessed vector and records what the batch proved, so it can show
+    /// a round making progress — or failing to.
+    fn round(into: &Engine, from: &Engine, limit: usize) -> SyncOutcome {
+        let mine = into.witnessed_vector().unwrap();
+        let theirs = from.version_vector().unwrap();
+        match mine.behind(&theirs) {
+            Some(start) => {
+                let entries = from.entries_for_peer(start, limit).unwrap();
+                let outcome = into.apply_peer_batch(&theirs, &entries, limit).unwrap();
+                let mine = into.witnessed_vector().unwrap();
+                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs), ..outcome }
+            }
+            None => SyncOutcome::default(),
+        }
+    }
+
+    #[test]
+    fn a_short_batch_proves_the_whole_advertised_vector() {
+        let mut theirs = VersionVector::new();
+        let origin = kimmy_core::NodeId::generate();
+        theirs.insert(origin, Hlc::new(5_000, 0));
+        let entries = vec![entry_from(origin, Hlc::new(1_000, 0))];
+        assert_eq!(coverage_after_batch(&theirs, &entries, 8), theirs);
+        assert_eq!(coverage_after_batch(&theirs, &[], 8), theirs, "an empty tail too");
+    }
+
+    #[test]
+    fn a_full_batch_proves_every_origin_up_to_its_last_stamp() {
+        // Three advertised origins: one whose coverage ends before the window
+        // does, one inside it, one beyond. Only the last is clipped.
+        let early = kimmy_core::NodeId::generate();
+        let inside = kimmy_core::NodeId::generate();
+        let beyond = kimmy_core::NodeId::generate();
+        let mut theirs = VersionVector::new();
+        theirs.insert(early, Hlc::new(1_000, 0));
+        theirs.insert(inside, Hlc::new(2_500, 0));
+        theirs.insert(beyond, Hlc::new(9_000, 0));
+        // A full batch of two, ending at 3_000 — from an origin that is not
+        // even advertised, which must make no difference.
+        let stranger = kimmy_core::NodeId::generate();
+        let entries = vec![
+            entry_from(stranger, Hlc::new(2_000, 0)),
+            entry_from(stranger, Hlc::new(3_000, 0)),
+        ];
+
+        let covered = coverage_after_batch(&theirs, &entries, 2);
+        assert_eq!(covered.get(early), Hlc::new(1_000, 0), "never past what the peer holds");
+        assert_eq!(covered.get(inside), Hlc::new(2_500, 0));
+        assert_eq!(covered.get(beyond), Hlc::new(3_000, 0), "clipped to the window end");
+        assert_eq!(covered.get(stranger), Hlc::ZERO, "an unadvertised origin is not claimed");
+    }
+
+    fn entry_from(node: kimmy_core::NodeId, hlc: Hlc) -> OplogEntry {
+        OplogEntry {
+            stamp: kimmy_core::Stamp::new(hlc, node),
+            kind: OpKind::Insert,
+            collection: kimmy_core::CollectionId::derive("db", "c"),
+            doc_id: Some(DocId::String("x".into())),
+            body: None,
+        }
+    }
+
+    #[test]
+    fn a_stamp_that_never_ships_cannot_pin_a_peer_behind_a_full_batch() {
+        // The test-cluster livelock (ADR-082), at its smallest.
+        //
+        // A's newest own stamp is a unique-violation entry: locally stamped,
+        // advertised in A's vector, and never shipped (ADR-029). *Before* it,
+        // in stamp order, A holds more than one batch of entries replicated
+        // from C — which B has already witnessed directly from C. So B trails
+        // A at one origin, A itself, from a floor below all of C's entries;
+        // every window served from that floor is full of entries B has seen,
+        // and the violation that would end the window sits beyond it.
+        //
+        // The order matters: a violation *inside* the raw window shortens the
+        // batch (the limit is applied before the filter) and the short-batch
+        // cure fires. The pin needs the unshippable stamp past a full window.
+        const LIMIT: usize = 8;
+        const DOCS: usize = 3 * LIMIT + 1;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let (c, _dc) = engine();
+
+        // (1) A creates the schema and one document; B witnesses A that far.
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+        assert!(round(&b, &a, LIMIT).total() > 0);
+        let floor = b.witnessed_vector().unwrap().get(a.node_id());
+        assert!(floor > Hlc::ZERO);
+
+        // (2) C writes more than a batch; A and B both take all of it from C.
+        c.create_collection("shop", "orders").unwrap();
+        let cc = c.get_collection("shop", "orders").unwrap();
+        for i in 0..DOCS {
+            c.insert(&cc, doc! { "_id": format!("c{i}"), "email": format!("{i}@c") }).unwrap();
+        }
+        for _ in 0..(DOCS / LIMIT + 2) {
+            round(&a, &c, LIMIT);
+            round(&b, &c, LIMIT);
+        }
+        assert!(a.witnessed_vector().unwrap().covers(&c.version_vector().unwrap()));
+        assert!(b.witnessed_vector().unwrap().covers(&c.version_vector().unwrap()));
+
+        // (3) A records a violation: its newest own stamp, never shipped, and
+        // stamped after everything C wrote.
+        let clash = OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(9_000, 0), kimmy_core::NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: ca.id,
+            doc_id: Some(DocId::String("remote".into())),
+            body: Some(
+                bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
+            ),
+        };
+        a.apply_remote(&ca, &clash).unwrap();
+        assert_eq!(a.unique_violations(), 1);
+        let a_adv = a.version_vector().unwrap();
+        assert!(a_adv.get(a.node_id()) > c.version_vector().unwrap().get(c.node_id()));
+        let shippable = a.entries_for_peer(floor, usize::MAX).unwrap();
+        assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
+
+        // B trails A, and the floor it would resume from is under all of it.
+        assert!(b.witnessed_vector().unwrap().behind(&a_adv).is_some());
+
+        // (4) Rounds from A must terminate, each consuming a window.
+        let budget = DOCS / LIMIT + 4;
+        let mut rounds = 0;
+        let mut last = SyncOutcome::default();
+        while rounds < budget {
+            rounds += 1;
+            last = round(&b, &a, LIMIT);
+            if b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()) {
+                break;
+            }
+        }
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "B never caught up with A in {budget} rounds; last round: {last:?}"
+        );
+        assert_eq!(last.lag_ms, 0, "and the gauge reads caught-up");
+        assert_eq!(
+            round(&b, &a, LIMIT),
+            SyncOutcome::default(),
+            "a further round transfers nothing"
+        );
+        // Nothing was invented and nothing lost: every document C wrote, A's
+        // own, and the clashing remote one — a violation is reported, not
+        // rejected (ADR-029), so it is a document on every node.
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2);
     }
 
     #[test]
