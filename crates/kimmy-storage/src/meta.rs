@@ -36,6 +36,21 @@ pub struct CollectionMeta {
     /// Auto-embedding configuration, when enabled for this collection.
     #[serde(default)]
     pub vector: Option<VectorConfig>,
+    /// The stamp below which an entry targets a **previous incarnation** of
+    /// this collection — set on every creation since ADR-081.
+    ///
+    /// Collections derive their id from `(db, name)`, so a drop-and-recreate
+    /// yields the same id, and replicated entries from the old life still
+    /// resolve. `created` alone cannot arbitrate that: a *replicated*
+    /// creation records the receiver's clock at apply time (which sits after
+    /// the entire catch-up backlog), not the moment the incarnation began.
+    /// The floor is the originating creation stamp instead, and it is
+    /// deliberately absent (`None`) on metas written before ADR-081 — for
+    /// those rows the tombstone comparison remains the only guard, exactly as
+    /// before, because inventing a floor from a local clock would suppress
+    /// legitimate catch-up.
+    #[serde(default)]
+    pub incarnation_floor: Option<Hlc>,
 }
 
 impl CollectionMeta {
@@ -44,6 +59,7 @@ impl CollectionMeta {
         db: impl Into<String>,
         name: impl Into<String>,
         created: Hlc,
+        incarnation_floor: Option<Hlc>,
     ) -> Self {
         Self {
             id,
@@ -53,6 +69,7 @@ impl CollectionMeta {
             indexes: Vec::new(),
             index_id_counter: 0,
             vector: None,
+            incarnation_floor,
         }
     }
 
@@ -75,7 +92,13 @@ mod tests {
     use super::*;
 
     fn meta() -> CollectionMeta {
-        CollectionMeta::new(CollectionId(1), "app", "orders", Hlc::new(10, 0))
+        CollectionMeta::new(
+            CollectionId(1),
+            "app",
+            "orders",
+            Hlc::new(10, 0),
+            Some(Hlc::new(10, 0)),
+        )
     }
 
     #[test]

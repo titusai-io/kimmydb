@@ -217,6 +217,23 @@ impl Engine {
             return Ok(());
         };
 
+        // A recreated collection derives the *same* id as its predecessor
+        // (`CollectionId::derive`), so an entry from the previous incarnation
+        // resolves here rather than missing. Its creation recorded the
+        // preceding drop's stamp as an incarnation floor; anything at or below
+        // that floor is the previous life, however the stamps sort against the
+        // drop itself — a peer's last pre-drop write can land in the same
+        // millisecond as the drop, where a strict comparison ties and the
+        // document slips through into the replacement. Collections created
+        // without a tombstone behind them carry no floor: independent creation
+        // on two nodes is convergence, not reincarnation.
+        if let Some(floor) = collection.incarnation_floor
+            && entry.stamp.hlc <= floor
+        {
+            outcome.superseded += 1;
+            return Ok(());
+        }
+
         if self.apply_remote(&collection, entry)? {
             outcome.applied += 1;
         } else {
@@ -649,6 +666,70 @@ mod tests {
         sync(&a, &b);
 
         assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_none(), "the delete must replicate");
+    }
+
+    #[test]
+    fn a_pre_recreation_entry_is_suppressed_even_when_it_ties_with_the_drop() {
+        // The deterministic form of the CI flake: the recreated collection
+        // derives the same id, and an entry whose stamp ties with the drop
+        // must still be filtered — by the incarnation floor (the drop's own
+        // stamp, compared inclusively), not by millisecond luck in a strict
+        // tombstone comparison.
+        let (a, _da) = engine();
+        let ca_old = {
+            a.create_collection("shop", "orders").unwrap();
+            a.get_collection("shop", "orders").unwrap()
+        };
+
+        a.drop_collection("shop", "orders").unwrap();
+        let ca_new = a.create_collection("shop", "orders").unwrap();
+        assert_eq!(ca_old.id, ca_new.id, "the id is derived from db and name");
+        let dropped_at = a.collection_dropped_at(ca_new.id).unwrap().unwrap().hlc;
+        assert_eq!(
+            ca_new.incarnation_floor,
+            Some(dropped_at),
+            "the recreation carries the drop as its incarnation floor"
+        );
+
+        // Stamps at or below the floor are the previous life — including the
+        // exact tie with the drop, which is where the old strict tombstone
+        // comparison let a peer's final pre-drop write walk into the
+        // replacement.
+        for hlc in [ca_old.created, dropped_at] {
+            let entry = OplogEntry {
+                stamp: kimmy_core::Stamp::new(hlc, kimmy_core::NodeId::generate()),
+                kind: OpKind::Insert,
+                collection: ca_new.id,
+                doc_id: Some(DocId::String("ghost".into())),
+                body: Some(bson::serialize_to_vec(&doc! { "_id": "ghost" }).unwrap()),
+            };
+            let outcome = a.apply_batch(&[entry]).unwrap();
+            assert_eq!(
+                outcome.superseded, 1,
+                "hlc {hlc:?}: a pre-recreation entry must not enter the new incarnation"
+            );
+            assert_eq!(a.count(&ca_new).unwrap(), 0);
+        }
+
+        // And genuinely post-recreation writes still apply: the floor is not
+        // a lid over the incarnation, only over its past.
+        for offset in [1u64, 2] {
+            let entry = OplogEntry {
+                stamp: kimmy_core::Stamp::new(
+                    Hlc::new(dropped_at.wall_ms + offset, 0),
+                    kimmy_core::NodeId::generate(),
+                ),
+                kind: OpKind::Insert,
+                collection: ca_new.id,
+                doc_id: Some(DocId::String(format!("live-{offset}"))),
+                body: Some(
+                    bson::serialize_to_vec(&doc! { "_id": format!("live-{offset}") }).unwrap(),
+                ),
+            };
+            let outcome = a.apply_batch(&[entry]).unwrap();
+            assert_eq!(outcome.applied, 1, "post-recreation writes must apply (offset {offset})");
+        }
+        assert_eq!(a.count(&ca_new).unwrap(), 2);
     }
 
     #[test]

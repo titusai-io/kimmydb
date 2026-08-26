@@ -3752,6 +3752,71 @@ direction to err in: the change hides information from people who were never
 meant to have it rather than revealing more. Root and every admin-flavored
 deployment are untouched, proven by the existing suite passing unmodified.
 
+## ADR-080 — The token cache is on by default, and every command reads it
+
+**Decision.** `kimmy login` caches the access token it mints — unconditionally,
+the way `kimmy token` already did — and every data command falls back to that
+cache when no token was said with `--token`, `KIMMY_TOKEN`, or the settings
+file. The `--cache-token` flag is removed. The device flow offers to open the
+verification URL in the default browser (Enter to accept; skipped entirely when
+stdin or stdout is not a terminal, so piped and scripted invocations are
+untouched). A refresh token remains never-requested, never-stored.
+
+**Why.** Found live, as the good ones are: the maintainer ran `init` → `login` →
+`whoami` and got a 401 telling him to run `login`. Login had printed a valid,
+correctly-audienceed token to his screen and kept nothing; whoami read only
+`--token` / `KIMMY_TOKEN` / the settings file, none of which existed. Two
+stores, zero consumers — the documented "log in once, then use the database"
+workflow had never actually worked without an `export KIMMY_TOKEN=$(…)` step
+nobody documents. A cache nobody reads is not privacy; it is ceremony.
+
+**Cost.** Storing a bearer token at `0600` under the user's cache directory is
+a responsibility the tool now always carries (ADR-075's original concern).
+Against it: printing the token already put an unguarded copy in terminal
+scrollback, so the disk copy is not the new exposure; what is stored did not
+grow (access token alone, one hour, audience-restricted); and revocation stays
+what it was — server-side `token_version`, honored because the cached copy dies
+at expiry with no refresh token to extend it.
+
+## ADR-081 — A recreated collection floors its previous incarnations at the drop
+
+**Decision.** When a collection is created over a drop tombstone of the same
+id — a recreate — the meta records that drop's stamp as an **incarnation
+floor**. Replicated documents resolving to the collection are counted
+superseded when their stamp is **at or below** the floor; collections created
+with no tombstone behind them carry no floor and behave exactly as before
+(serde-defaulted `None`, so legacy metas need no migration).
+
+**Why.** Collection ids are derived from `(db, name)` (deliberately — every
+node computes the same id, see `CollectionId::derive`), so drop-and-recreate
+produces the *same* id, and a replicated document from before the drop still
+resolves into the replacement. The existing tombstone guard compares
+*strictly*: an entry whose stamp ties with the drop escapes it. That tie is
+not exotic — a partitioned peer's final pre-drop write and the drop share one
+millisecond whenever both engines tick one wall clock, which is every
+same-host test run and any tight deployment. Observed as an intermittent CI
+failure (`documents_written_before_a_drop_do_not_return_to_a_recreated_
+collection`, left 1 / right 0), unreproducible across sixteen local runs.
+
+**Why the floor is the drop, not the creation stamp.** The first attempt
+floored at `meta.created`. It broke four replication tests, because a
+*replicated* creation records the receiver's clock at apply time — which sits
+after the entire catch-up backlog — so flooring there suppresses exactly the
+documents a joining node most needs. The drop stamp has no such ambiguity: the
+tombstone already travels with its originating stamp for precisely this class
+of reason, and the floor simply echoes it into the incarnation that followed.
+Entries stamped between drop and recreate cannot exist locally and are
+correctly suppressed from partitioned peers; entries stamped after recreate
+apply normally. Cross-host wall-clock skew can still place a peer's write
+after the drop in stamp order — that is inherent to last-writer-wins stamps
+and out of scope here.
+
+**Cost.** One optional field on the meta. Same-ms writes made *after* a
+recreate but sorting at or below the drop stamp are suppressed rather than
+applied — a one-millisecond ambiguity that last-writer-wins cannot resolve and
+that failing closed protects the recreated collection's isolation, which is
+the property the whole guard exists for.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

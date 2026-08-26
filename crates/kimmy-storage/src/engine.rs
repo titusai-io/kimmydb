@@ -728,6 +728,17 @@ impl Engine {
             // collection everywhere. See `CollectionId::derive`.
             let id = CollectionId::derive(db, name);
 
+            // If this creation follows a drop of the same id — a recreate —
+            // the drop's stamp becomes the new incarnation's floor: replicated
+            // entries stamped at or before it belong to the previous life and
+            // must not enter the replacement, however their stamps sort
+            // against the drop itself. A creation with no tombstone behind it
+            // carries no floor: two nodes deriving the same id independently
+            // is normal convergence, not reincarnation, and flooring there
+            // would make whichever node created second silently discard the
+            // first one's documents.
+            let incarnation_floor = self.collection_dropped_at(id)?.map(|stamp| stamp.hlc);
+
             // The derivation is a 64-bit hash, so a collision is possible in
             // principle. Checked rather than trusted, because the failure would
             // be two unrelated collections quietly sharing storage — refusing
@@ -750,7 +761,7 @@ impl Engine {
                 )));
             }
 
-            let meta = CollectionMeta::new(id, db, name, stamp.hlc);
+            let meta = CollectionMeta::new(id, db, name, stamp.hlc, incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
             meta
         };

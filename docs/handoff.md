@@ -6,6 +6,42 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **incarnation floors: the drop/recreate CI flake, root-caused**
+
+Same branch as below (`feat/cli-token-flow`) after its CI run tripped
+`documents_written_before_a_drop_do_not_return_to_a_recreated_collection` —
+left 1 / right 0, unreproducible locally across 16 runs. Mechanism: collection
+ids are *derived* (`CollectionId::derive(db, name)`), so drop-and-recreate
+reuses the id; the tombstone guard compares strictly and a peer's final
+pre-drop write tying with the drop's millisecond escapes it. Fix = **ADR-081**:
+`CollectionMeta.incarnation_floor` (serde-defaulted `None` for legacy rows, no
+migration), set to the **drop's own stamp** whenever a creation happens over a
+tombstone, compared inclusively (`<=`). First attempt floored at the creation
+stamp instead — broke four replication tests, because a replicated creation's
+meta records the *receiver's* clock, which postdates the whole catch-up
+backlog; the drop stamp is the boundary that travels correctly. Deterministic
+regression test drives stamps at exactly `dropped_at` and at `ca_old.created`.
+Full storage suite green 259/0; network replication suite green.
+
+---
+
+## As of 2026-08-26 — **login once, then the CLI just works (ADR-080)**
+
+Branch `feat/cli-token-flow`. The maintainer's own transcript broke it open: `init` →
+`login` → `whoami` returned 401 *missing Authorization header* because login
+printed a token and kept nothing, while whoami read only `--token` /
+`KIMMY_TOKEN` / the dotfile. Three changes: login caches unconditionally and
+`--cache-token` is removed (ADR-080 amends ADR-075); every data command falls
+back to that cache via `cached_bearer` — same discovery, same key precedence
+(`cached_key_client_id`, env > file, mirrored from apply_kimmy_file so lookups
+cannot drift from writes); the device flow offers Enter-to-open-browser,
+terminal-gated. Verified live by planting a fake cached token in a sandboxed
+XDG cache: whoami went from "missing Authorization header" to "authentication
+token is invalid" — proof the cached bearer is found and sent. The `.kimmy`
+`cache_token` key still parses but no longer wires to anything.
+
+---
+
 ## As of 2026-08-26 — **init discovers instead of interrogating; a shipped panic fixed**
 
 Branch `feat/init-discovery`. `kimmy init` asked nine questions and showed no

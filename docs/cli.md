@@ -233,21 +233,24 @@ flow, keeps the result, and prints it — so after the first call,
 curl -s -H "Authorization: Bearer $(kimmy token)" "$KIMMY_URL/v1/databases"
 ```
 
-`kimmy login` writes nothing to disk unless you ask:
+`kimmy login` caches the access token it mints — always, the same way `kimmy
+token` does — in a `0600` file under `$XDG_CACHE_HOME/kimmy`
+(`~/.cache/kimmy/tokens.json` by default), keyed by issuer, client and
+resource. Every other command falls back to that cache when no token was said
+with `--token`, `KIMMY_TOKEN`, or the settings file, so the whole workflow is:
 
 ```bash
-export KIMMY_TOKEN=$(kimmy login --cache-token)
+kimmy init    # one answer: the node URL; identity discovered from the node
+kimmy login   # one browser approval; the token is cached and reused
+kimmy whoami  # works — as do databases, collections, queries, watch
 ```
 
-With `--cache-token` (or `KIMMY_TOKEN_CACHE=1`) — or by using `kimmy token`,
-where caching is the point rather than an option (ADR-075's "only when asked";
-invoking the command *is* asking) — the access token is kept in a `0600` file
-under `$XDG_CACHE_HOME/kimmy` — `~/.cache/kimmy/tokens.json` by default —
-keyed by issuer, client and resource, and reused until it is within a minute of
-expiring. A later `kimmy login --cache-token` then prints the cached token
-instead of making you approve the device flow again.
+until the token nears expiry (a minute of margin is withheld), after which the
+next command reports 401 and `kimmy login` starts a new flow. A later
+`kimmy login` also prints the still-fresh cached token instead of making you
+approve anything again.
 
-**A refresh token is never requested and never stored**, flag or no flag. The
+**A refresh token is never requested and never stored**, cache or no cache. The
 access token is short-lived and audience-restricted; a refresh token outlives
 the session and can mint more, which makes caching it a different feature with
 a different risk ([ADR-075](decisions.md)).

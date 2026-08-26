@@ -10,6 +10,42 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **Every command uses the federated token cache.** After `kimmy login`,
+  `kimmy whoami`, `databases`, queries — all of it — just works until the
+  token nears expiry: commands with no explicit token fall back to the cache
+  login and `kimmy token` write, keyed by issuer, client and resource.
+- **The device flow offers to open the browser for you.** Print URL, press
+  Enter, default browser opens on the verification page (code pre-filled via
+  `verification_uri_complete` when the provider sends one). Skipped entirely
+  when stdin or stdout is not a terminal.
+
+### Changed
+
+- **`kimmy login` caches its token by design** (ADR-080): the opt-in from
+  ADR-075 lasted exactly as long as nobody read the cache — which was until
+  data commands started doing so today, and the documented workflow failed
+  with a misleading 401. `--cache-token` is removed along with the opt-in.
+- The post-401 hint says `run \`kimmy login\`` first now, instead of pointing
+  at flags when the common case has none to set.
+
+### Fixed
+
+- **A recreated collection can no longer inherit its predecessor's documents
+  through a stamp tie** (ADR-081). Collections derive their id from `(db,
+  name)`, so drop-and-recreate yields the same id, and the only guard against
+  a pre-drop document flowing back was a *strict* tombstone comparison — which
+  ties when the peer's last write and the drop share a millisecond, as two
+  engines on one machine routinely do. Recreations now record the drop's stamp
+  as an **incarnation floor** and suppress replicated entries at or below it.
+  Collections created without a drop behind them carry no floor and behave
+  exactly as before. Surfaced as an intermittent CI failure; the window was
+  reachable in production wherever a peer's final pre-drop write tied with the
+  millisecond of the drop.
+
 ## 0.8.0 - 2026-08-26
 
 ### Added
