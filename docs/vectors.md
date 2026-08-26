@@ -126,8 +126,27 @@ still wholly present in one of them.
 
 The default is 2000 characters ≈ 512 tokens. **It counts characters, not
 tokens** — a real token count depends on the model's tokenizer, which the
-storage layer has no business knowing. Dense text can therefore overshoot the
-model's window. Recorded in [Deviations](deviations.md).
+storage layer has no business knowing — and that proxy assumes prose at about
+four characters per token. Dense text runs at one to two: code, JSON, CJK.
+Seen live: a chunk cut at 2000 characters came to 1073 tokens and was refused
+by a provider with a 1024-token input limit, on every scan, with one `WARN`
+per scan as the only trace.
+
+`max_tokens` closes that gap. When set, a chunk is also cut once its
+*estimated* token count reaches it, estimated as one token per two bytes of
+UTF-8 — conservative for every common script (prose ≈ 4 bytes/token, code ≈
+2.5, CJK ≈ 3), so the estimate errs toward shorter chunks. Set it to the
+provider's per-input limit:
+
+```json
+{ "chunk": { "max_chars": 2000, "overlap": 200, "max_tokens": 1024 } }
+```
+
+Overlap stays in characters. Existing configurations without the field keep
+the character rule alone, exactly as before. A document that still cannot be
+embedded is skipped and named — database, collection and `_id` are on the
+`WARN`, and `kimmy_embed_failures_total` counts it — rather than stalling the
+rest of the collection.
 
 ---
 

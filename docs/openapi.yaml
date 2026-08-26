@@ -2919,6 +2919,15 @@ components:
             overlap:
               type: integer
               default: 200
+            max_tokens:
+              type: integer
+              minimum: 1
+              description: |
+                Also cut a chunk once its *estimated* token count reaches this
+                — one token per two bytes of UTF-8, conservative for prose,
+                code and CJK alike. Set it to the provider's per-input limit
+                so dense text cannot produce a chunk the provider refuses.
+                Absent means the character rule alone.
 
     ProviderConfig:
       type: object

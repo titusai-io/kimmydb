@@ -322,7 +322,12 @@ impl EmbeddingWorker {
                         // A permanent failure (bad config, wrong dimension)
                         // would retry forever. Record it and move on, so one
                         // poisoned document cannot stall every other one.
-                        warn!(error = %e, "embedding permanently failed; skipping this entry");
+                        warn!(
+                            error = %e,
+                            collection = ?entry.collection,
+                            doc = ?entry.doc_id,
+                            "embedding permanently failed; skipping this entry"
+                        );
                         break;
                     }
                 }
@@ -426,7 +431,12 @@ impl EmbeddingWorker {
                     break;
                 }
                 Err(e) => {
-                    warn!(error = %e, "deferred embedding permanently failed; skipping");
+                    warn!(
+                        error = %e,
+                        collection = %item.collection,
+                        doc = %item.source,
+                        "deferred embedding permanently failed; skipping"
+                    );
                 }
             }
         }
@@ -712,7 +722,13 @@ impl EmbeddingWorker {
                         tokio::time::sleep(RETRY_DELAY).await;
                     }
                     Err(e) => {
-                        warn!(error = %e, ?source, "backfill permanently failed for a document");
+                        warn!(
+                            error = %e,
+                            db = %collection.db,
+                            collection = %collection.name,
+                            doc = %source,
+                            "backfill permanently failed for a document"
+                        );
                         break;
                     }
                 }
@@ -992,7 +1008,7 @@ mod tests {
             },
             dim: 4,
             metric: Metric::Cosine,
-            chunk: ChunkConfig { max_chars: 20, overlap: 5 },
+            chunk: ChunkConfig { max_chars: 20, overlap: 5, max_tokens: None },
         }
     }
 

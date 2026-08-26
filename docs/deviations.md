@@ -2188,7 +2188,12 @@ be principled. A real BM25 would rank better on its own.
 
 **Chunking counts characters, not tokens.** A token count depends on the
 model's tokenizer, which the storage layer has no business knowing. The default
-(2000 chars ≈ 512 tokens) is conservative and can overshoot for dense text.
+(2000 chars ≈ 512 tokens) assumes prose and overshoots for dense text — a
+2000-character chunk of a transcript came to 1073 tokens on a live cluster and
+was refused by a 1024-token provider on every scan. `chunk.max_tokens` bounds
+that with a deliberately pessimistic estimate (two bytes per token); it is a
+ceiling on an estimate, not a tokenizer, and a model with an unusually dense
+tokenization can still be overshot. Set it below the provider's limit.
 
 **No minimum score threshold on search.** k-NN returns the `k` nearest even
 when nothing is genuinely similar, so a query against unrelated content still

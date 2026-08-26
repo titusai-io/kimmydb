@@ -231,12 +231,33 @@ pub struct ChunkConfig {
     /// Characters repeated between adjacent chunks, so a sentence split across
     /// a boundary still appears whole in one of them.
     pub overlap: usize,
+    /// A ceiling on the *estimated* token count of a chunk, on top of
+    /// `max_chars`.
+    ///
+    /// `max_chars` assumes prose at roughly four characters per token. Dense
+    /// text — code, JSON, CJK — runs at one to two, so a chunk that fits the
+    /// character budget can exceed the provider's window and be refused
+    /// outright: seen on a live cluster as a 1073-token chunk cut at 2000
+    /// characters, rejected with `400` on every scan. When set, a chunk is
+    /// also cut once its estimated token count reaches this — estimated as
+    /// **one token per two bytes of UTF-8**, which is conservative for every
+    /// script the model is likely to meet (prose ≈ 4 bytes/token, code ≈
+    /// 2.5, CJK ≈ 3). Set it to the provider's per-input limit. `None` keeps
+    /// the character rule alone, exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
 }
+
+/// The estimator behind [`ChunkConfig::max_tokens`]: bytes of UTF-8 per
+/// estimated token. Two rather than a tokenizer, because the storage layer
+/// has no business knowing the model's, and two is below every common
+/// script's real ratio — an overestimate, which is the safe direction.
+pub const BYTES_PER_TOKEN_ESTIMATE: usize = 2;
 
 impl Default for ChunkConfig {
     fn default() -> Self {
         // ~512 tokens at a typical 4 chars/token, with a sentence of overlap.
-        Self { max_chars: 2_000, overlap: 200 }
+        Self { max_chars: 2_000, overlap: 200, max_tokens: None }
     }
 }
 
@@ -250,30 +271,64 @@ impl ChunkConfig {
         if self.overlap >= self.max_chars {
             return Err("vector.chunk.overlap must be smaller than max_chars".into());
         }
+        if self.max_tokens == Some(0) {
+            return Err("vector.chunk.max_tokens must be greater than zero when set".into());
+        }
         Ok(())
+    }
+
+    /// The byte budget `max_tokens` translates to, if any.
+    fn max_bytes(&self) -> Option<usize> {
+        self.max_tokens.map(|t| t.saturating_mul(BYTES_PER_TOKEN_ESTIMATE))
+    }
+
+    /// Estimated tokens in a piece of text, by the same rule the splitter cuts on.
+    pub fn estimate_tokens(text: &str) -> usize {
+        text.len().div_ceil(BYTES_PER_TOKEN_ESTIMATE)
     }
 
     /// Split text into overlapping chunks.
     ///
-    /// Splits on character boundaries, never inside a UTF-8 sequence.
+    /// Splits on character boundaries, never inside a UTF-8 sequence. A chunk
+    /// ends at `max_chars` characters or, when `max_tokens` is set, at the
+    /// byte budget it implies — whichever comes first. Overlap is always
+    /// counted in characters.
     pub fn split(&self, text: &str) -> Vec<String> {
         let chars: Vec<char> = text.chars().collect();
         if chars.is_empty() {
             return Vec::new();
         }
-        if chars.len() <= self.max_chars {
+        let max_bytes = self.max_bytes();
+        if chars.len() <= self.max_chars && max_bytes.is_none_or(|b| text.len() <= b) {
             return vec![text.to_string()];
         }
 
-        let stride = self.max_chars - self.overlap;
         let mut out = Vec::new();
         let mut start = 0;
         while start < chars.len() {
-            let end = (start + self.max_chars).min(chars.len());
+            // The window: up to `max_chars` characters, shortened to fit the
+            // byte budget. At least one character always goes, so a single
+            // wide character cannot stall the splitter.
+            let mut end = (start + self.max_chars).min(chars.len());
+            if let Some(budget) = max_bytes {
+                let mut bytes = 0;
+                let mut fit = start;
+                for (i, c) in chars[start..end].iter().enumerate() {
+                    bytes += c.len_utf8();
+                    if bytes > budget && i > 0 {
+                        break;
+                    }
+                    fit = start + i + 1;
+                }
+                end = fit;
+            }
             out.push(chars[start..end].iter().collect());
             if end == chars.len() {
                 break;
             }
+            // Advance by this window's length less the overlap, never by
+            // less than one character.
+            let stride = (end - start).saturating_sub(self.overlap).max(1);
             start += stride;
         }
         out
@@ -400,9 +455,9 @@ mod tests {
     fn overlap_must_leave_room_to_advance() {
         // Equal overlap means the splitter never moves forward.
         let mut c = config();
-        c.chunk = ChunkConfig { max_chars: 100, overlap: 100 };
+        c.chunk = ChunkConfig { max_chars: 100, overlap: 100, max_tokens: None };
         assert!(c.validate().is_err());
-        c.chunk = ChunkConfig { max_chars: 100, overlap: 99 };
+        c.chunk = ChunkConfig { max_chars: 100, overlap: 99, max_tokens: None };
         assert!(c.validate().is_ok());
     }
 
@@ -483,14 +538,14 @@ mod tests {
 
     #[test]
     fn short_text_is_a_single_chunk() {
-        let c = ChunkConfig { max_chars: 100, overlap: 10 };
+        let c = ChunkConfig { max_chars: 100, overlap: 10, max_tokens: None };
         assert_eq!(c.split("hello"), vec!["hello"]);
         assert!(c.split("").is_empty());
     }
 
     #[test]
     fn long_text_splits_with_overlap() {
-        let c = ChunkConfig { max_chars: 10, overlap: 3 };
+        let c = ChunkConfig { max_chars: 10, overlap: 3, max_tokens: None };
         let chunks = c.split(&"abcdefghij".repeat(3)); // 30 chars
         assert!(chunks.len() > 1);
         for chunk in &chunks {
@@ -505,7 +560,7 @@ mod tests {
 
     #[test]
     fn splitting_covers_the_whole_input() {
-        let c = ChunkConfig { max_chars: 7, overlap: 2 };
+        let c = ChunkConfig { max_chars: 7, overlap: 2, max_tokens: None };
         let text = "abcdefghijklmnopqrstuvwxyz";
         let chunks = c.split(text);
         // Every character must appear somewhere, or embedding silently drops
@@ -519,12 +574,66 @@ mod tests {
 
     #[test]
     fn chunking_never_splits_a_multibyte_character() {
-        let c = ChunkConfig { max_chars: 5, overlap: 1 };
+        let c = ChunkConfig { max_chars: 5, overlap: 1, max_tokens: None };
         let text = "日本語のテキストです";
         let chunks = c.split(text);
         // Reassembling proves no chunk cut a UTF-8 sequence — a byte-based
         // split would have panicked or produced invalid strings.
         assert!(chunks.iter().all(|s| !s.is_empty()));
         assert!(chunks.concat().contains('日'));
+    }
+
+    #[test]
+    fn max_tokens_cuts_dense_text_the_character_rule_would_let_through() {
+        // 300 CJK characters are 900 bytes: ~450 estimated tokens, well past a
+        // 100-token window, while 300 characters is comfortably under the
+        // character budget. The character rule alone would ship one chunk.
+        let text: String = std::iter::repeat_n('漢', 300).collect();
+        let by_chars = ChunkConfig { max_chars: 2_000, overlap: 0, max_tokens: None };
+        assert_eq!(by_chars.split(&text).len(), 1);
+
+        let by_tokens = ChunkConfig { max_chars: 2_000, overlap: 0, max_tokens: Some(100) };
+        let chunks = by_tokens.split(&text);
+        assert!(chunks.len() >= 5, "{} chunks", chunks.len());
+        for chunk in &chunks {
+            assert!(chunk.len() <= 200, "a chunk exceeded the byte budget: {} bytes", chunk.len());
+            assert!(ChunkConfig::estimate_tokens(chunk) <= 100);
+        }
+        assert_eq!(chunks.concat().chars().count(), 300, "nothing lost, nothing repeated");
+    }
+
+    #[test]
+    fn max_tokens_leaves_prose_within_budget_alone() {
+        // 100 ASCII characters are 100 bytes ≈ 50 tokens: under a 512-token
+        // window, so the character rule decides and one chunk goes.
+        let text = "a".repeat(100);
+        let c = ChunkConfig { max_chars: 2_000, overlap: 200, max_tokens: Some(512) };
+        assert_eq!(c.split(&text), vec![text]);
+    }
+
+    #[test]
+    fn overlap_still_applies_when_the_byte_budget_cuts() {
+        // 40 two-byte characters, budget 10 tokens = 20 bytes = 10 chars per
+        // window, overlap 2: windows start at 0, 8, 16, 24, 32 — four full
+        // windows and a final one of the 8 characters that remain.
+        let text: String = std::iter::repeat_n('é', 40).collect();
+        let c = ChunkConfig { max_chars: 100, overlap: 2, max_tokens: Some(10) };
+        let chunks = c.split(&text);
+        let lengths: Vec<usize> = chunks.iter().map(|k| k.chars().count()).collect();
+        assert_eq!(lengths, vec![10, 10, 10, 10, 8], "{chunks:?}");
+    }
+
+    #[test]
+    fn max_tokens_of_zero_is_refused_and_absent_round_trips_absent() {
+        let mut c = config();
+        c.chunk = ChunkConfig { max_chars: 100, overlap: 10, max_tokens: Some(0) };
+        assert!(c.validate().is_err());
+
+        // Stored configurations from before the field existed decode with
+        // it absent, and one that never set it does not start writing it.
+        let json = serde_json::to_string(&ChunkConfig::default()).unwrap();
+        assert!(!json.contains("max_tokens"), "{json}");
+        let decoded: ChunkConfig = serde_json::from_str(r#"{"max_chars":50,"overlap":5}"#).unwrap();
+        assert_eq!(decoded.max_tokens, None);
     }
 }
