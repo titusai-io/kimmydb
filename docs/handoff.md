@@ -6,6 +6,20 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **one table for what each operation guarantees**
+
+Branch `docs/guarantee-table`, documentation only. The guarantees were
+spread over four places that had each drifted a little — the README list,
+`storage.md`'s durability table, `time-and-conflicts.md`'s consistency
+table, and prose in `http-api.md` — and the lost-update defect fixed in
+ADR-083 sat in the gap between them for months. `docs/compatibility.md`
+now carries "What each operation guarantees": every route, what it
+promises, where the engine enforces it, and the **test name** that defends
+it, so a claim without a test is visible as such. The other three places
+link to it and name it the authority. Found and fixed on the way:
+`time-and-conflicts.md`'s Status section still said the cluster transport
+"does not exist yet; M4 adds gossip" — nine milestones stale.
+
 ## As of 2026-08-26 — **`update` lost concurrent increments on a single node**
 
 Branch `fix/update-in-transaction`, ADR-083. Found by reading `exec::update`

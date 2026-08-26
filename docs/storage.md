@@ -263,6 +263,10 @@ pub fn next_index_id(&self) -> u32 {
 > `find_and_modify` gives: narrow the filter, or add an index and a tighter
 > one. There are still no transactions *across* requests.
 
+The per-operation view — every route, what it promises, and the test that
+defends it — is the ["What each operation guarantees"](compatibility.md#what-each-operation-guarantees)
+table in Compatibility. This table is the engine's side of the same facts.
+
 ---
 
 ## Format versioning

@@ -190,6 +190,9 @@ Read this before building on it.
   `tombstone_retention_secs`, documents deleted during it can resurrect when the
   partition heals. Set the window longer than any partition you would tolerate.
 
+Per operation — what each route promises and the test that defends it — see
+["What each operation guarantees"](docs/compatibility.md#what-each-operation-guarantees).
+
 These are the normal consequences of choosing leaderless availability over
 coordination. They are stated up front because the failure mode of an
 eventually-consistent store is a user who assumed otherwise.
