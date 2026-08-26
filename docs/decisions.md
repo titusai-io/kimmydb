@@ -3778,6 +3778,45 @@ grow (access token alone, one hour, audience-restricted); and revocation stays
 what it was — server-side `token_version`, honored because the cached copy dies
 at expiry with no refresh token to extend it.
 
+## ADR-081 — A recreated collection floors its previous incarnations at the drop
+
+**Decision.** When a collection is created over a drop tombstone of the same
+id — a recreate — the meta records that drop's stamp as an **incarnation
+floor**. Replicated documents resolving to the collection are counted
+superseded when their stamp is **at or below** the floor; collections created
+with no tombstone behind them carry no floor and behave exactly as before
+(serde-defaulted `None`, so legacy metas need no migration).
+
+**Why.** Collection ids are derived from `(db, name)` (deliberately — every
+node computes the same id, see `CollectionId::derive`), so drop-and-recreate
+produces the *same* id, and a replicated document from before the drop still
+resolves into the replacement. The existing tombstone guard compares
+*strictly*: an entry whose stamp ties with the drop escapes it. That tie is
+not exotic — a partitioned peer's final pre-drop write and the drop share one
+millisecond whenever both engines tick one wall clock, which is every
+same-host test run and any tight deployment. Observed as an intermittent CI
+failure (`documents_written_before_a_drop_do_not_return_to_a_recreated_
+collection`, left 1 / right 0), unreproducible across sixteen local runs.
+
+**Why the floor is the drop, not the creation stamp.** The first attempt
+floored at `meta.created`. It broke four replication tests, because a
+*replicated* creation records the receiver's clock at apply time — which sits
+after the entire catch-up backlog — so flooring there suppresses exactly the
+documents a joining node most needs. The drop stamp has no such ambiguity: the
+tombstone already travels with its originating stamp for precisely this class
+of reason, and the floor simply echoes it into the incarnation that followed.
+Entries stamped between drop and recreate cannot exist locally and are
+correctly suppressed from partitioned peers; entries stamped after recreate
+apply normally. Cross-host wall-clock skew can still place a peer's write
+after the drop in stamp order — that is inherent to last-writer-wins stamps
+and out of scope here.
+
+**Cost.** One optional field on the meta. Same-ms writes made *after* a
+recreate but sorting at or below the drop stamp are suppressed rather than
+applied — a one-millisecond ambiguity that last-writer-wins cannot resolve and
+that failing closed protects the recreated collection's isolation, which is
+the property the whole guard exists for.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
