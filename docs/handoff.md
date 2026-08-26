@@ -6,6 +6,29 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **`chunk.max_tokens`: a byte-budget ceiling under the character rule**
+
+Branch `feat/token-aware-chunks`, from `main`, no ADR (a config field with a
+non-breaking default). The test cluster's recovery rescan on 0.10.1 logged
+one `backfill permanently failed` for `app.transcripts`: llama-embed refused
+a 1073-token chunk that the 2000-character rule had let through, and the
+document has no vectors on any scan since. `ChunkConfig` gains `max_tokens:
+Option<usize>` (`serde(default)`, skipped when absent, so stored
+configurations round-trip unchanged) and `split` cuts a window at the earlier
+of `max_chars` characters or `max_tokens × 2` bytes — two bytes per estimated
+token is below prose (≈4), code (≈2.5) and CJK (≈3), so the estimate errs
+short. Overlap stays in characters; the stride is the window's own length
+less the overlap, never below one. Validation refuses `Some(0)`. The three
+permanent-failure `WARN`s in the worker now name the collection and document
+(`db`/`collection`/`doc` on backfill, `collection`/`doc` on the streaming and
+deferred paths) so an operator can find what was skipped. Tests: dense CJK is
+cut under a 100-token budget where the character rule shipped one chunk;
+prose under budget is untouched; overlap holds when the byte budget cuts;
+zero refused; absent round-trips absent. Docs: vectors.md Chunking, openapi
+`chunk.max_tokens`, deviations (the entry stays — it is a ceiling on an
+estimate, not a tokenizer). The test-cluster mitigation is separate and
+operator-side: raise llama-embed's `--ubatch-size`/`--batch-size` or set
+`max_tokens: 1024` on `app.transcripts` and reindex.
 ## As of 2026-08-26 — **retention guards: tombstones outlive the oplog, stale rejoiners are named**
 
 Branch `feat/retention-guards`, ADR-085, from `main`. Two operational

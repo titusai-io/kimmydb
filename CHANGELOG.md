@@ -35,6 +35,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   peer's entry until it is back within the window. Nothing is refused — the
   recommended action (reset the peer's data directory and let anti-entropy
   refill it) is the operator's call (ADR-085).
+- **`chunk.max_tokens` on a collection's vector configuration.** `max_chars`
+  assumes prose at about four characters per token; code, JSON and CJK run at
+  one to two, so a chunk that fit the character budget could exceed the
+  provider's input limit and be refused on every scan — seen live as a
+  1073-token chunk cut at 2000 characters. When set, a chunk is also cut once
+  its estimated token count (one token per two bytes of UTF-8, conservative
+  for every common script) reaches `max_tokens`. Absent keeps the character
+  rule alone. The permanent-failure `WARN` in the embedding worker now names
+  the database, collection and `_id` of the document it skipped.
 
 ### Fixed
 
