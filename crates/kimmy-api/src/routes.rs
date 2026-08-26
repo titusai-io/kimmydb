@@ -667,6 +667,8 @@ struct FindRequest {
     explain: bool,
     /// Resume after a previous page, using the `nextCursor` it returned.
     cursor: Option<String>,
+    /// Return each document's stamp in a parallel `stamps` array.
+    stamps: bool,
 }
 
 impl From<FindRequest> for exec::FindParams {
@@ -679,6 +681,7 @@ impl From<FindRequest> for exec::FindParams {
             skip: r.skip,
             explain: r.explain,
             cursor: r.cursor,
+            stamps: r.stamps,
         }
     }
 }
@@ -765,14 +768,21 @@ async fn get_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::get_doc(&state, &auth, &db, &coll, &id)?))
+) -> Result<impl IntoResponse, ApiError> {
+    let (stamp, document) = exec::get_doc_stamped(&state, &auth, &db, &coll, &id)?;
+    // The document's stamp as an entity tag, so a read by id pairs with a
+    // conditional write by id without a `find`. The body stays the document
+    // exactly as stored — a version is not one of its fields (ADR-084).
+    let etag = [(axum::http::header::ETAG, format!("\"{stamp}\""))];
+    Ok((etag, Json(document)))
 }
 
 #[derive(Deserialize, Default)]
 #[serde(default)]
 struct ReplaceQuery {
     upsert: bool,
+    /// Replace only if the document is at this stamp.
+    if_stamp: Option<String>,
 }
 
 async fn replace_doc(
@@ -782,15 +792,24 @@ async fn replace_doc(
     Query(q): Query<ReplaceQuery>,
     JsonBody(body): JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::replace(&state, &auth, &db, &coll, &id, &body, q.upsert)?))
+    let params = exec::ReplaceParams { upsert: q.upsert, if_stamp: q.if_stamp };
+    Ok(Json(exec::replace(&state, &auth, &db, &coll, &id, &body, params)?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct DeleteQuery {
+    /// Delete only if the document is at this stamp.
+    if_stamp: Option<String>,
 }
 
 async fn delete_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
+    Query(q): Query<DeleteQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id)?))
+    Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref())?))
 }
 
 #[derive(Deserialize)]
@@ -813,6 +832,9 @@ struct FindAndModifyRequest {
     return_document: Option<String>,
     #[serde(default)]
     projection: Option<Value>,
+    /// Write only if the chosen document is at this stamp.
+    #[serde(default)]
+    if_stamp: Option<String>,
 }
 
 async fn find_and_modify(
@@ -839,6 +861,7 @@ async fn find_and_modify(
         upsert: body.upsert,
         return_document,
         projection: body.projection,
+        if_stamp: body.if_stamp,
     };
     Ok(Json(exec::find_and_modify(&state, &auth, &db, &coll, spec)?))
 }
@@ -853,6 +876,9 @@ struct UpdateRequest {
     /// Report how the targets were found, as `find` does.
     #[serde(default)]
     explain: bool,
+    /// Write only if the matched document is at this stamp.
+    #[serde(default)]
+    if_stamp: Option<String>,
 }
 
 async fn update_docs(
@@ -861,8 +887,12 @@ async fn update_docs(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<UpdateRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let params =
-        exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
+    let params = exec::WriteParams {
+        filter: body.filter,
+        multi: body.multi,
+        explain: body.explain,
+        if_stamp: body.if_stamp,
+    };
     Ok(Json(exec::update(&state, &auth, &db, &coll, &body.update, params)?))
 }
 
@@ -875,6 +905,9 @@ struct DeleteRequest {
     /// Report how the targets were found, as `find` does.
     #[serde(default)]
     explain: bool,
+    /// Delete only if the matched document is at this stamp.
+    #[serde(default)]
+    if_stamp: Option<String>,
 }
 
 async fn delete_docs(
@@ -883,8 +916,12 @@ async fn delete_docs(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<DeleteRequest>,
 ) -> Result<Json<Value>, ApiError> {
-    let params =
-        exec::WriteParams { filter: body.filter, multi: body.multi, explain: body.explain };
+    let params = exec::WriteParams {
+        filter: body.filter,
+        multi: body.multi,
+        explain: body.explain,
+        if_stamp: body.if_stamp,
+    };
     Ok(Json(exec::delete(&state, &auth, &db, &coll, params)?))
 }
 

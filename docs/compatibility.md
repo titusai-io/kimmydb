@@ -205,6 +205,7 @@ two requests.
 | `update` / `delete` by filter, single document | Atomic read-modify-write on the accepting node: the operators run on the image the write transaction holds, so concurrent `$inc`s all land (ADR-083) | `modify.rs` `modify_where` — the same body as `find_and_modify` | `concurrent_increments_through_update_are_all_kept`, `concurrent_increments_are_all_kept` |
 | `update` / `delete` with `multi: true` | **One transaction for the whole request**, all or nothing, one fsync; **refused above 10,000 matches** rather than partly done | `modify_where` under `MAX_CANDIDATES` | `a_filtered_write_is_one_commit_for_every_match`, `a_failing_apply_on_a_later_match_writes_nothing_at_all`, `over_the_cap_refuses_a_filtered_write_too` |
 | Unique indexes | Enforced on the accepting node before the write is acknowledged; **across nodes, detected after the fact** — a collision that replicated in surfaces as a `UniqueViolation` oplog entry and a counter (ADR-029) | `index::maintain` locally; `sync.rs` on merge | `unique_violation_entries_are_never_sent` and the index tests |
+| Any single-document write with `if_stamp` | **Compare-and-set on the accepting node**: written only if the document is still at the named version, else `409 stale` and nothing written — no oplog entry, no event (ADR-084) | The stamp check inside `modify_in_txn` / `replace_if` / `delete_where` | `racing_conditional_writers_produce_exactly_one_winner`, `a_stale_write_leaves_the_document_the_oplog_and_the_commit_count_alone`, `racing_conditional_claims_have_exactly_one_winner` |
 | Anything across two requests | **No guarantee.** There are no multi-request transactions; two writes are two commits, and a reader may see the state between them | — | — |
 | The cluster | Basically available, soft state, eventually consistent: every node accepts writes, anti-entropy carries the oplog, whole-document last-writer-wins on a hybrid logical clock. Read-your-writes holds only on the node written to; convergence holds while a partition is shorter than tombstone retention | `kimmy-cluster` + `sync.rs` | `two_engines_converge_after_one_round`, `conflicting_writes_converge_to_the_same_document`, `three_nodes_converge_through_a_middle_peer` |
 
@@ -218,7 +219,9 @@ problem, and why a process killed mid-flight loses nothing it acknowledged.
 correct *across* nodes under a partition (each node's increments are correct;
 concurrent increments on two nodes resolve by LWW), and check-then-act across
 requests. The atomic tools are `find_and_modify` and `update` for one
-document, `insert_many` and `multi: true` for one bounded batch.
+document, `insert_many` and `multi: true` for one bounded batch, and
+`if_stamp` for check-then-act on one document across two requests — on the
+node that holds it.
 
 Where the same facts are told from another angle: [Storage](storage.md)
 (the durability table, from the engine's side),

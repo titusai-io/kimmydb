@@ -46,6 +46,9 @@ pub enum ErrorCode {
     Snapshot,
     NotImplemented,
     ProviderError,
+    /// A conditional write found the document at a different version than
+    /// the caller's `if_stamp`, or found no document where one was expected.
+    Stale,
 }
 
 /// What a client may do about a failure.
@@ -79,7 +82,7 @@ impl Retry {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 17] = [
+    pub const ALL: [ErrorCode; 18] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -97,6 +100,7 @@ impl ErrorCode {
         Self::Snapshot,
         Self::NotImplemented,
         Self::ProviderError,
+        Self::Stale,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -119,6 +123,7 @@ impl ErrorCode {
             Self::Snapshot => "snapshot",
             Self::NotImplemented => "not_implemented",
             Self::ProviderError => "provider_error",
+            Self::Stale => "stale",
         }
     }
 
@@ -141,7 +146,11 @@ impl ErrorCode {
             // The resume point is collected. Resubscribing is a new request,
             // not a retry of this one, and a client that retries the same
             // token loops forever.
-            | Self::ResumeTokenExpired => Retry::No,
+            | Self::ResumeTokenExpired
+            // The document moved on. The client re-reads, decides again, and
+            // sends a *different* request carrying the new stamp; repeating
+            // this one can only fail the same way.
+            | Self::Stale => Retry::No,
 
             // `not_implemented` has two sources and takes the conservative
             // answer. `CoreError::Unsupported` is a capability that exists
@@ -209,6 +218,23 @@ impl ApiError {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, ErrorCode::Conflict, message)
+    }
+
+    /// A conditional write refused because the document is not at the
+    /// expected version. Names the current stamp so a client that wants to
+    /// can skip the re-read — but the honest loop is read, decide, write.
+    pub fn stale(current: Option<kimmy_core::Stamp>) -> Self {
+        let message = match current {
+            Some(stamp) => format!(
+                "the document is at stamp {} rather than the one `if_stamp` named; \
+                 re-read it and retry with the current stamp",
+                stamp.encode()
+            ),
+            None => "no live document is at the stamp `if_stamp` named; it was deleted \
+                     or never existed"
+                .to_string(),
+        };
+        Self::new(StatusCode::CONFLICT, ErrorCode::Stale, message)
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
@@ -319,7 +345,8 @@ impl From<CoreError> for ApiError {
             | CoreError::InvalidDocumentId { .. }
             | CoreError::UnsupportedOperator(_)
             | CoreError::MalformedResumeToken
-            | CoreError::MalformedCursor => ApiError::bad_request(e.to_string()),
+            | CoreError::MalformedCursor
+            | CoreError::MalformedStamp => ApiError::bad_request(e.to_string()),
             CoreError::ResumeTokenExpired => {
                 ApiError::new(StatusCode::GONE, ErrorCode::ResumeTokenExpired, e.to_string())
             }
@@ -332,6 +359,9 @@ impl From<StorageError> for ApiError {
     fn from(e: StorageError) -> Self {
         match e {
             StorageError::Core(inner) => inner.into(),
+            // The caller's condition did not hold. Theirs to act on, and the
+            // current stamp is the one thing they need to act.
+            StorageError::Stale { current } => ApiError::stale(current),
             // Storage-level failures are the server's fault, not the caller's,
             // and their text can name on-disk internals, so it is logged rather
             // than returned.

@@ -130,6 +130,8 @@ pub enum ErrorCode {
     Snapshot,
     NotImplemented,
     ProviderError,
+    /// A conditional write's `if_stamp` did not match. Re-read and decide again.
+    Stale,
     /// A code this client does not know. The string is kept.
     Unknown(&'static str),
 }
@@ -154,6 +156,7 @@ impl ErrorCode {
             "snapshot" => Self::Snapshot,
             "not_implemented" => Self::NotImplemented,
             "provider_error" => Self::ProviderError,
+            "stale" => Self::Stale,
             _ => Self::Unknown("unknown"),
         }
     }
@@ -179,6 +182,7 @@ impl fmt::Display for ErrorCode {
             Self::Snapshot => "snapshot",
             Self::NotImplemented => "not_implemented",
             Self::ProviderError => "provider_error",
+            Self::Stale => "stale",
             Self::Unknown(s) => s,
         };
         f.write_str(name)

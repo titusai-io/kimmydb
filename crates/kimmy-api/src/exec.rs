@@ -161,6 +161,9 @@ pub struct FindParams {
     pub explain: bool,
     /// Resume after a previous page. See [`kimmy_core::Cursor`].
     pub cursor: Option<String>,
+    /// Return each document's stamp alongside it, for a conditional write
+    /// that follows (ADR-084).
+    pub stamps: bool,
 }
 
 pub fn find(
@@ -213,7 +216,7 @@ pub fn find(
     // safe for unsorted queries. A cursor is `_id`-ordered, which the scan
     // already delivers, so it may stop early too.
     let stop_after = (sort.is_empty() || cursor.is_some()).then_some(skip + limit);
-    let (mut matched, stats) = collect_matching_after(
+    let (mut matched, stats) = collect_matching_stamped_after(
         state,
         &meta,
         &filter,
@@ -221,9 +224,15 @@ pub fn find(
         cursor.as_ref().map(|c| c.key()),
     )?;
 
-    shape::sort(&sort, &mut matched);
+    // The stamp travels with its document through the sort. Stable, so the
+    // scan's order holds for documents the sort does not separate — the
+    // same rule `shape::sort` follows.
+    if !sort.is_empty() {
+        matched.sort_by(|a, b| shape::compare(&sort, &a.1, &b.1));
+    }
 
-    let page_docs: Vec<bson::Document> = matched.into_iter().skip(skip).take(limit).collect();
+    let (page_stamps, page_docs): (Vec<kimmy_core::Stamp>, Vec<bson::Document>) =
+        matched.into_iter().skip(skip).take(limit).unzip();
 
     // Offered whenever this query *could* be continued, so a caller's first
     // request needs no cursor and no flag — it asks for a page, and the reply
@@ -244,6 +253,12 @@ pub fn find(
         .collect();
 
     let mut body = json!({ "documents": page, "count": page.len() });
+    if params.stamps {
+        // Parallel to `documents` rather than a field inside each one: the
+        // document is the caller's data and comes back exactly as stored.
+        let stamps: Vec<String> = page_stamps.iter().map(kimmy_core::Stamp::encode).collect();
+        body["stamps"] = json!(stamps);
+    }
     if let Some(next) = next {
         body["nextCursor"] = json!(next.encode());
     }
@@ -251,6 +266,11 @@ pub fn find(
         body["explain"] = stats.to_json();
     }
     Ok(body)
+}
+
+/// A caller's `if_stamp`, decoded — `None` when the write is unconditional.
+fn parse_if_stamp(raw: Option<&str>) -> Result<Option<kimmy_core::Stamp>, ApiError> {
+    raw.map(|s| kimmy_core::Stamp::decode(s).map_err(ApiError::from)).transpose()
 }
 
 /// Whether a sort specification is exactly `_id` ascending.
@@ -293,11 +313,24 @@ pub fn get_doc(
     coll: &str,
     id: &str,
 ) -> Result<Value, ApiError> {
+    get_doc_stamped(state, auth, db, coll, id).map(|(_, doc)| doc)
+}
+
+/// [`get_doc`], with the document's stamp — what the HTTP edge serves as
+/// `ETag`, so a read by id and a conditional write by id pair up without a
+/// `find`.
+pub fn get_doc_stamped(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    id: &str,
+) -> Result<(String, Value), ApiError> {
     let _span = op_span("get_doc", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let doc_id = parse_id(id)?;
-    match state.engine.get(&meta, &doc_id)? {
-        Some(doc) => Ok(document_to_json(&doc)),
+    match state.engine.get_stamped(&meta, &doc_id)? {
+        Some((stamp, doc)) => Ok((stamp.encode(), document_to_json(&doc))),
         None => Err(ApiError::not_found(format!("no document with _id {id}"))),
     }
 }
@@ -361,11 +394,6 @@ pub fn collect_matching(
 }
 
 /// [`collect_matching`], resuming strictly after an encoded document key.
-///
-/// Both access paths are already in `_id` order — the documents table by its
-/// key, an index candidate list because `scan_range_in` sorts by document key —
-/// so resuming is a bound rather than a filter, and a page costs its own size
-/// rather than everything before it.
 pub fn collect_matching_after(
     state: &SharedState,
     meta: &CollectionMeta,
@@ -373,6 +401,23 @@ pub fn collect_matching_after(
     stop_after: Option<usize>,
     after: Option<&[u8]>,
 ) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
+    let (matched, stats) = collect_matching_stamped_after(state, meta, filter, stop_after, after)?;
+    Ok((matched.into_iter().map(|(_, doc)| doc).collect(), stats))
+}
+
+/// The one read scan, carrying each document's stamp.
+///
+/// Both access paths are already in `_id` order — the documents table by its
+/// key, an index candidate list because `scan_range_in` sorts by document key —
+/// so resuming is a bound rather than a filter, and a page costs its own size
+/// rather than everything before it.
+pub fn collect_matching_stamped_after(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    stop_after: Option<usize>,
+    after: Option<&[u8]>,
+) -> Result<(Vec<(kimmy_core::Stamp, bson::Document)>, QueryStats), ApiError> {
     let mut matched = Vec::new();
     let mut examined = 0usize;
 
@@ -389,12 +434,12 @@ pub fn collect_matching_after(
             }
             // A key naming no document is an ordinary miss, not an error: the
             // filter asked for an `_id` nothing was stored under.
-            let Some(doc) = state.engine.get_by_encoded_key(meta, key)? else {
+            let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, key)? else {
                 continue;
             };
             examined += 1;
             if filter::matches(filter, &doc) {
-                matched.push(doc);
+                matched.push((stamp, doc));
                 if stop_after.is_some_and(|n| matched.len() >= n) {
                     break;
                 }
@@ -452,12 +497,12 @@ pub fn collect_matching_after(
                 if after.is_some_and(|bound| key.as_slice() <= bound) {
                     continue;
                 }
-                let Some(doc) = state.engine.get_by_encoded_key(meta, &key)? else {
+                let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, &key)? else {
                     continue;
                 };
                 examined += 1;
                 if filter::matches(filter, &doc) {
-                    matched.push(doc);
+                    matched.push((stamp, doc));
                     if stop_after.is_some_and(|n| matched.len() >= n) {
                         break;
                     }
@@ -465,10 +510,10 @@ pub fn collect_matching_after(
             }
         }
         None => {
-            state.engine.for_each_doc_after(meta, after, |_, doc| {
+            state.engine.for_each_record_after(meta, after, |_, stamp, doc| {
                 examined += 1;
                 if filter::matches(filter, &doc) {
-                    matched.push(doc);
+                    matched.push((stamp, doc));
                 }
                 Ok(!stop_after.is_some_and(|n| matched.len() >= n))
             })?;
@@ -500,8 +545,11 @@ pub fn insert(
     let _span = op_span("insert", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc = json_to_document(document)?;
-    let id = state.engine.insert(&meta, doc)?;
-    Ok(json!({ "insertedId": crate::json::bson_to_json(&id.to_bson()) }))
+    let (id, stamp) = state.engine.insert_stamped(&meta, doc)?;
+    Ok(json!({
+        "insertedId": crate::json::bson_to_json(&id.to_bson()),
+        "stamp": stamp.encode(),
+    }))
 }
 
 /// Insert many documents in one durable commit, or none of them.
@@ -555,6 +603,15 @@ fn at_index(index: usize, e: ApiError) -> ApiError {
     ApiError { message: format!("document at index {index}: {}", e.message), ..e }
 }
 
+/// A replace-by-id's options, mirroring [`WriteParams`].
+#[derive(Default)]
+pub struct ReplaceParams {
+    /// Create the document when none exists.
+    pub upsert: bool,
+    /// Replace only if the document is at this stamp (ADR-084).
+    pub if_stamp: Option<String>,
+}
+
 pub fn replace(
     state: &SharedState,
     auth: &Auth,
@@ -562,13 +619,14 @@ pub fn replace(
     coll: &str,
     id: &str,
     document: &Value,
-    upsert: bool,
+    params: ReplaceParams,
 ) -> Result<Value, ApiError> {
     let _span = op_span("replace", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let doc = json_to_document(document)?;
-    let outcome = state.engine.replace(&meta, &doc_id, doc, upsert)?;
+    let expected = parse_if_stamp(params.if_stamp.as_deref())?;
+    let outcome = state.engine.replace_if(&meta, &doc_id, doc, params.upsert, expected)?;
     // Counts, not booleans, even though a replace touches at most one document.
     //
     // `WriteOutcome` is three bools and this route used to serialize them
@@ -577,11 +635,15 @@ pub fn replace(
     // the type, so nothing disagreed until the specification's contract test
     // drove both routes and compared them (ADR-056). `upserted` stays a
     // boolean because it genuinely is one.
-    Ok(json!({
+    let mut body = json!({
         "matched": u8::from(outcome.matched),
         "modified": u8::from(outcome.modified),
         "upserted": outcome.upserted,
-    }))
+    });
+    if let Some(stamp) = outcome.stamp {
+        body["stamp"] = json!(stamp.encode());
+    }
+    Ok(body)
 }
 
 pub fn delete_by_id(
@@ -590,11 +652,13 @@ pub fn delete_by_id(
     db: &str,
     coll: &str,
     id: &str,
+    if_stamp: Option<&str>,
 ) -> Result<Value, ApiError> {
     let _span = op_span("delete_by_id", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
-    let deleted = state.engine.delete(&meta, &doc_id)?;
+    let expected = parse_if_stamp(if_stamp)?;
+    let deleted = state.engine.delete_if(&meta, &doc_id, expected)?;
     Ok(json!({ "deleted": u8::from(deleted) }))
 }
 
@@ -610,6 +674,23 @@ pub struct WriteParams {
     pub multi: bool,
     /// Report how the targets were found, as `find` does.
     pub explain: bool,
+    /// Write only if the matched document is at this stamp (ADR-084).
+    /// Single-document only: a version names one document.
+    pub if_stamp: Option<String>,
+}
+
+impl WriteParams {
+    /// The caller's condition, decoded — and refused alongside `multi`,
+    /// because one stamp cannot describe several documents.
+    fn expected(&self) -> Result<Option<kimmy_core::Stamp>, ApiError> {
+        if self.multi && self.if_stamp.is_some() {
+            return Err(ApiError::bad_request(
+                "`if_stamp` names one document's version, so it cannot be combined with \
+                 `multi: true`",
+            ));
+        }
+        parse_if_stamp(self.if_stamp.as_deref())
+    }
 }
 
 pub fn update(
@@ -625,6 +706,7 @@ pub fn update(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
     let update = update::parse(&json_to_document(update_json)?)?;
+    let expected = params.expected()?;
 
     // Match and write in one transaction. This used to collect the targets
     // in a read transaction and `replace` each in its own write transaction,
@@ -640,6 +722,7 @@ pub fn update(
         update: Some(&update),
         upsert: None,
         now: now_millis(),
+        expected,
     };
     let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
@@ -748,6 +831,8 @@ pub struct FindAndModifySpec {
     pub upsert: bool,
     pub return_document: ReturnDocument,
     pub projection: Option<Value>,
+    /// Write only if the chosen document is at this stamp (ADR-084).
+    pub if_stamp: Option<String>,
 }
 
 /// The caller's half of [`kimmy_storage::ModifySpec`] — pure functions over
@@ -759,9 +844,15 @@ struct Modify<'a> {
     update: Option<&'a update::Update>,
     upsert: Option<Document>,
     now: i64,
+    /// The version the write is conditional on, if any.
+    expected: Option<kimmy_core::Stamp>,
 }
 
 impl kimmy_storage::ModifySpec for Modify<'_> {
+    fn expected_stamp(&self) -> Option<kimmy_core::Stamp> {
+        self.expected
+    }
+
     fn matches(&self, doc: &Document) -> bool {
         filter::matches(self.filter, doc)
     }
@@ -873,8 +964,20 @@ pub fn find_and_modify(
     // writer, because only the index planner ran here.
     let (candidates, _) = candidates_for(&filter, &meta);
 
-    let modify =
-        Modify { filter: &filter, sort: &sort, update: update.as_ref(), upsert: upsert_doc, now };
+    let expected = parse_if_stamp(spec.if_stamp.as_deref())?;
+    if expected.is_some() && spec.upsert {
+        // An upsert says "create it if it is not there"; a stamp says "it
+        // must be there, at this version". Both at once has no reading.
+        return Err(ApiError::bad_request("`if_stamp` cannot be combined with `upsert`"));
+    }
+    let modify = Modify {
+        filter: &filter,
+        sort: &sort,
+        update: update.as_ref(),
+        upsert: upsert_doc,
+        now,
+        expected,
+    };
 
     let outcome = state.engine.find_and_modify(&meta, &candidates, &modify)?;
 
@@ -894,6 +997,15 @@ pub fn find_and_modify(
     if let Some(id) = outcome.upserted {
         body["upsertedId"] = crate::json::bson_to_json(&id.to_bson());
     }
+    if let Some(stamp) = outcome.stamp {
+        // The version the write produced — what the next conditional write
+        // names. A removal produces a tombstone's stamp, which nothing can
+        // be conditional on, so it is reported only for a document that
+        // still exists.
+        if outcome.after.is_some() {
+            body["stamp"] = json!(stamp.encode());
+        }
+    }
     Ok(body)
 }
 
@@ -908,14 +1020,21 @@ pub fn delete(
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
+    let expected = params.expected()?;
 
     // The same one-transaction path as `update`, with the spec removing
     // rather than replacing: what the filter matched is exactly what is
     // tombstoned, with no read-then-write gap for another writer.
     let stop_after = if multi { None } else { Some(1) };
     let (candidates, planned) = candidates_for(&filter, &meta);
-    let modify =
-        Modify { filter: &filter, sort: &[], update: None, upsert: None, now: now_millis() };
+    let modify = Modify {
+        filter: &filter,
+        sort: &[],
+        update: None,
+        upsert: None,
+        now: now_millis(),
+        expected,
+    };
     let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
     let mut body = json!({ "deleted": outcome.modified });

@@ -315,6 +315,7 @@ impl KimmyMcp {
             // the thing these tool descriptions already steer away from —
             // `limit` and a narrower filter are the right answers here.
             cursor: None,
+            stamps: false,
         };
         render(exec::find(&self.state, &auth, &args.database, &args.collection, params))
     }
@@ -439,7 +440,12 @@ impl KimmyMcp {
         // `explain` is not surfaced to an agent: `find` already offers it for
         // working out whether an index applies, and a write is not the place
         // to go looking.
-        let params = exec::WriteParams { filter: args.filter, multi: args.multi, explain: false };
+        let params = exec::WriteParams {
+            filter: args.filter,
+            multi: args.multi,
+            explain: false,
+            if_stamp: None,
+        };
         render(exec::update(
             &self.state,
             &auth,
@@ -459,7 +465,12 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let params = exec::WriteParams { filter: args.filter, multi: args.multi, explain: false };
+        let params = exec::WriteParams {
+            filter: args.filter,
+            multi: args.multi,
+            explain: false,
+            if_stamp: None,
+        };
         render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
     }
 

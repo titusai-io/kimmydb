@@ -57,6 +57,9 @@ pub enum Capability {
     TtlIndexes,
     VectorSearch,
     Webhooks,
+    /// `if_stamp` on writes, `stamps` on `find`, `ETag` on a read by id, and
+    /// the `stale` error code (ADR-084).
+    ConditionalWrites,
     /// In-process embedding. **The one that varies between builds**, and the
     /// reason this list is not a constant: a `local` provider is accepted on a
     /// node built with `local-embeddings` and refused on one without.
@@ -64,7 +67,7 @@ pub enum Capability {
 }
 
 impl Capability {
-    pub const ALL: [Capability; 15] = [
+    pub const ALL: [Capability; 16] = [
         Self::Aggregation,
         Self::BulkInsert,
         Self::Backup,
@@ -79,6 +82,7 @@ impl Capability {
         Self::TtlIndexes,
         Self::VectorSearch,
         Self::Webhooks,
+        Self::ConditionalWrites,
         Self::LocalEmbeddings,
     ];
 
@@ -98,6 +102,7 @@ impl Capability {
             Self::TtlIndexes => "ttl-indexes",
             Self::VectorSearch => "vector-search",
             Self::Webhooks => "webhooks",
+            Self::ConditionalWrites => "conditional-writes",
             Self::LocalEmbeddings => "local-embeddings",
         }
     }

@@ -1183,6 +1183,9 @@ paths:
                 required: [insertedId]
                 properties:
                   insertedId: {}
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: The version the insert produced.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1351,9 +1354,14 @@ paths:
       operationId: update
       summary: Update matching documents.
       description: |
-        **Not atomic across documents.** Updates apply one document at a time
-        and can stop partway on an error, leaving earlier ones changed. Bulk
-        *insert* is all-or-nothing; this is not.
+        The operators run **inside the write transaction**, on the image it
+        holds, so concurrent updates to one document all land (ADR-083). A
+        `multi: true` request is one transaction — all of it or none — and
+        is refused above 10,000 matches rather than partly done.
+
+        With `if_stamp`, the write happens only if the matched document is
+        at that version; otherwise `409 stale` and nothing is written
+        (ADR-084). Single-document only: a stamp names one document.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1373,6 +1381,11 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                if_stamp:
+                  allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                  description: |
+                    Write only if the matched document is at this stamp.
+                    Cannot be combined with `multi`.
       responses:
         "200":
           description: What changed.
@@ -1441,6 +1454,11 @@ paths:
                   enum: [before, after]
                   default: before
                 projection: { $ref: "#/components/schemas/Document" }
+                if_stamp:
+                  allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                  description: |
+                    Change the chosen document only if it is at this stamp;
+                    otherwise `409 stale`. Cannot be combined with `upsert`.
       responses:
         "200":
           description: |
@@ -1459,6 +1477,12 @@ paths:
                   matched:
                     type: integer
                   upsertedId: {}
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: |
+                      The version the write produced. Absent when nothing was
+                      written, and after a removal — nothing can be
+                      conditional on a document that is gone.
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1474,7 +1498,10 @@ paths:
       tags: [documents]
       operationId: deleteDocuments
       summary: Delete matching documents.
-      description: Like `update`, applies document by document and can stop partway.
+      description: |
+        Like `update`: matched and tombstoned in one transaction, `multi: true`
+        is all or none and refused above 10,000 matches, and `if_stamp` makes
+        a single-document delete conditional on its version.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1490,6 +1517,11 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                if_stamp:
+                  allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                  description: |
+                    Delete only if the matched document is at this stamp.
+                    Cannot be combined with `multi`.
       responses:
         "200":
           description: How many were deleted.
@@ -1518,13 +1550,20 @@ paths:
       operationId: getDocument
       summary: Read one document by `_id`.
       description: |
-        The point path. `find` with a filter on `_id` is a collection scan —
-        the planner does not consult the primary key — so this is the route to
-        reach for when the id is known.
+        The point path. `find` with a filter on `_id` takes the same primary-key
+        path, so either works when the id is known; this one needs no body and
+        answers with the document alone.
       x-kimmy-action: read
       responses:
         "200":
-          description: The document.
+          description: |
+            The document, exactly as stored. Its version travels as the
+            `ETag` rather than as a field: pass the tag's value (without
+            the quotes) as `if_stamp` on a following write.
+          headers:
+            ETag:
+              schema: { type: string }
+              description: The document's stamp, quoted as an entity tag.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Document" }
@@ -1547,6 +1586,15 @@ paths:
           required: false
           schema: { type: boolean, default: false }
           description: Insert the document when no existing one matches.
+        - name: if_stamp
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/Stamp" }
+          description: |
+            Replace only if the document is at this stamp; otherwise
+            `409 stale` and nothing is written. A missing document is stale
+            too, `upsert` or not — the condition says "at this version",
+            not "or create it".
       requestBody:
         required: true
         content:
@@ -1576,6 +1624,9 @@ paths:
                   upserted:
                     type: boolean
                     description: Genuinely a yes/no, so it stays one.
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: The version the write produced. Absent when nothing was written.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1586,6 +1637,14 @@ paths:
       operationId: deleteDocument
       summary: Delete one document by `_id`.
       x-kimmy-action: write
+      parameters:
+        - name: if_stamp
+          in: query
+          required: false
+          schema: { $ref: "#/components/schemas/Stamp" }
+          description: |
+            Delete only if the document is at this stamp; otherwise
+            `409 stale` and nothing is written.
       responses:
         "200":
           description: 1 if a document was deleted, 0 if there was none.
@@ -2412,6 +2471,7 @@ components:
         | `internal` | 500 | elsewhere | A storage failure on this node. Details are logged, never returned |
         | `misconfigured` | 500 | elsewhere | This node lacks something it needs, such as an API key named by its vector configuration |
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
+        | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
       enum:
         - bad_request
         - payload_too_large
@@ -2430,6 +2490,7 @@ components:
         - snapshot
         - not_implemented
         - provider_error
+        - stale
 
     Capability:
       type: string
@@ -2458,6 +2519,7 @@ components:
         | `client-supplied-vectors` | `PUT .../docs/{id}/vectors`, which is what makes the `byo` provider usable |
         | `cursor-paging` | `nextCursor` on `find`, and the `cursor` parameter that continues it |
         | `find-and-modify` | `POST .../find_and_modify` |
+        | `conditional-writes` | `if_stamp` on every single-document write, `stamps` on `find`, `ETag` on a read by id, and the `stale` error code (ADR-084) |
         | `hybrid-search` | `POST .../hybrid_search` |
         | `local-embeddings` | This build can embed in-process; a `local` provider will be accepted |
         | `partial-indexes` | `partialFilterExpression` on index creation |
@@ -2472,6 +2534,7 @@ components:
         - bulk-insert
         - change-streams
         - client-supplied-vectors
+        - conditional-writes
         - cursor-paging
         - find-and-modify
         - hybrid-search
@@ -2654,6 +2717,13 @@ components:
             the cursor describes, and silently honouring one of the two is how a
             client ends up reading a different set than it asked for. A token
             that is not one is also a `400`.
+        stamps:
+          type: boolean
+          default: false
+          description: |
+            Return each document's stamp in a parallel `stamps` array, for a
+            conditional write that follows. Off by default: a version is not
+            one of the document's fields, and most reads do not want one.
 
     FindResponse:
       type: object
@@ -2665,6 +2735,12 @@ components:
         count:
           type: integer
           description: Documents in *this page*, not in the collection.
+        stamps:
+          type: array
+          items: { $ref: "#/components/schemas/Stamp" }
+          description: |
+            Present when the request set `stamps: true`. Parallel to
+            `documents`: `stamps[i]` is the version of `documents[i]`.
         nextCursor:
           type: string
           description: |
@@ -2678,6 +2754,16 @@ components:
             empty; the walk ends when a page comes back short or without a
             token, not when a token stops being offered.
         explain: { $ref: "#/components/schemas/Explain" }
+
+    Stamp:
+      type: string
+      description: |
+        A document's version: the stamp of the write that produced it, as an
+        opaque token. Returned by every write, by `find` with `stamps: true`,
+        and as the `ETag` of a read by id; passed back as `if_stamp` to make a
+        write conditional on the document still being at that version
+        (ADR-084). Compare for equality only — nothing about its shape is
+        promised.
 
     Explain:
       type: object

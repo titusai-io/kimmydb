@@ -699,6 +699,239 @@ async fn concurrent_increments_through_update_are_all_kept() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Conditional writes (ADR-084)
+// ---------------------------------------------------------------------------
+
+/// The stamp a write reported, or the one a stamped read returned.
+fn stamp_of(body: &Value) -> String {
+    body["stamp"].as_str().expect("a stamp is a string").to_string()
+}
+
+#[tokio::test]
+async fn a_read_by_id_carries_its_stamp_as_an_etag_and_find_can_return_stamps() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    let stamp = stamp_of(&inserted.body);
+
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.header("etag").as_deref(), Some(format!("\"{stamp}\"").as_str()));
+    assert_eq!(res.body, json!({"_id": 1, "n": 0}), "the body is the document, nothing added");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "stamps": true }),
+        )
+        .await;
+    assert_eq!(res.body["stamps"], json!([stamp]), "stamps parallel documents");
+    assert_eq!(res.body["documents"][0], json!({"_id": 1, "n": 0}));
+
+    let res = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({ "filter": {} })).await;
+    assert!(res.body.get("stamps").is_none(), "stamps only when asked for");
+
+    let version = server.get("/v1/version", None).await;
+    assert!(
+        version.body["capabilities"].as_array().unwrap().contains(&json!("conditional-writes")),
+        "{:?}",
+        version.body
+    );
+}
+
+#[tokio::test]
+async fn a_conditional_replace_succeeds_at_the_current_stamp_and_moves_it() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    let first = stamp_of(&inserted.body);
+
+    let res = server
+        .put(&format!("/v1/db/shop/coll/c/docs/1?if_stamp={first}"), Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    let second = stamp_of(&res.body);
+    assert_ne!(second, first, "a write moves the stamp");
+
+    // The old stamp is now stale; the new one is current.
+    let res = server
+        .put(&format!("/v1/db/shop/coll/c/docs/1?if_stamp={first}"), Some(&token), json!({"n": 2}))
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "stale");
+    assert_eq!(res.body["retry"], "no");
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["n"], 1, "a stale write changes nothing");
+
+    let res = server
+        .put(&format!("/v1/db/shop/coll/c/docs/1?if_stamp={second}"), Some(&token), json!({"n": 2}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_stale_write_leaves_the_document_the_oplog_and_the_commit_count_alone() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    let first = stamp_of(&inserted.body);
+    // Move the document on, so `first` is stale.
+    server.put("/v1/db/shop/coll/c/docs/1", Some(&token), json!({"n": 1})).await;
+
+    let oplog_before = oplog_len(&server.state);
+    let commits_before = server.state.engine.commits();
+
+    let update = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$inc": {"n": 10}}, "if_stamp": first }),
+        )
+        .await;
+    assert_eq!(update.status, 409, "{:?}", update.body);
+    assert_eq!(update.body["error"], "stale");
+
+    let fam = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"n": 99}}, "if_stamp": first }),
+        )
+        .await;
+    assert_eq!(fam.status, 409, "{:?}", fam.body);
+    assert_eq!(fam.body["error"], "stale");
+
+    let delete =
+        server.delete(&format!("/v1/db/shop/coll/c/docs/1?if_stamp={first}"), Some(&token)).await;
+    assert_eq!(delete.status, 409, "{:?}", delete.body);
+    assert_eq!(delete.body["error"], "stale");
+
+    assert_eq!(oplog_len(&server.state), oplog_before, "a refused write mints no oplog entry");
+    assert_eq!(server.state.engine.commits(), commits_before, "a refused write commits nothing");
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["n"], 1);
+}
+
+#[tokio::test]
+async fn a_conditional_write_on_a_missing_document_is_stale_not_a_no_op() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1})).await;
+    let stamp = stamp_of(&inserted.body);
+    server.delete("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+
+    // Unconditional: a missing document is an ordinary miss.
+    let res = server.put("/v1/db/shop/coll/c/docs/1", Some(&token), json!({"n": 1})).await;
+    assert_eq!(res.body["matched"], 0);
+    // Conditional: the caller expected a version, and it is gone.
+    let res = server
+        .put(&format!("/v1/db/shop/coll/c/docs/1?if_stamp={stamp}"), Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "stale");
+    // Even with upsert: the condition says "at this version", not "or create".
+    let res = server
+        .put(
+            &format!("/v1/db/shop/coll/c/docs/1?upsert=true&if_stamp={stamp}"),
+            Some(&token),
+            json!({"n": 1}),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"n": 1}}, "if_stamp": stamp }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    assert_eq!(res.body["error"], "stale");
+}
+
+#[tokio::test]
+async fn if_stamp_refuses_multi_upsert_and_garbage() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1})).await;
+    let stamp = stamp_of(&inserted.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$set": {"n": 1}}, "multi": true, "if_stamp": stamp }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"n": 1}}, "upsert": true,
+                    "if_stamp": stamp }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let res = server
+        .put("/v1/db/shop/coll/c/docs/1?if_stamp=not-a-stamp", Some(&token), json!({"n": 1}))
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+}
+
+/// The reason to have this at all: check-then-act on one document, with
+/// exactly one winner and no coordination.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_conditional_writers_produce_exactly_one_winner() {
+    let server = Arc::new(Server::start().await);
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"owner":null})).await;
+    let stamp = stamp_of(&inserted.body);
+
+    let mut tasks = Vec::new();
+    for writer in 0..8u64 {
+        let server = Arc::clone(&server);
+        let token = token.clone();
+        let stamp = stamp.clone();
+        tasks.push(tokio::spawn(async move {
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/c/find_and_modify",
+                    Some(&token),
+                    json!({ "filter": {"_id": 1}, "update": {"$set": {"owner": writer}},
+                            "if_stamp": stamp, "returnDocument": "after" }),
+                )
+                .await;
+            (writer, res.status, res.body)
+        }));
+    }
+    let mut winners = Vec::new();
+    for task in tasks {
+        let (writer, status, body) = task.await.unwrap();
+        match status {
+            200 => winners.push(writer),
+            409 => assert_eq!(body["error"], "stale"),
+            other => panic!("writer {writer}: unexpected {other} {body:?}"),
+        }
+    }
+    assert_eq!(winners.len(), 1, "exactly one conditional writer wins: {winners:?}");
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.body["owner"], winners[0]);
+}
+
 #[tokio::test]
 async fn extended_json_types_survive_the_boundary() {
     let server = Server::start().await;

@@ -3937,6 +3937,70 @@ filters add microseconds; an unindexed one adds the scan, exactly as
 that used to partly succeed on a mid-way failure now fails whole — the
 behaviour the durability table always claimed.
 
+## ADR-084 — Conditional writes by stamp, node-local, with one error code
+
+**Decision.** Every write reports the stamp it produced; every
+single-document write accepts `if_stamp`, and lands only if the document is
+still at that version. The check runs inside the write transaction, in the
+one per-document body every filtered write already shares (`modify_in_txn`,
+ADR-083) and in `replace_if` / `delete_where` for the by-id routes, so there
+is no window between check and write and no second code path to drift. A
+mismatch — a different version, or no live document where one was expected
+— is **`409 stale`, `retry: no`**, on every route alike, and writes nothing:
+no document, no oplog entry, no event. `find` returns versions on request
+(`stamps: true`, a parallel array), a read by id carries its version as
+`ETag`, and the whole thing is advertised as the `conditional-writes`
+capability.
+
+**What it is for.** Check-then-act on one document: read, decide, write —
+with the write refused if anyone else got there first. The lost-update fix
+(ADR-083) made `update` atomic *within* a request; this is the tool for the
+race *between* two requests, and it is the honest one on an AP store, because
+it coordinates nothing. It is node-local by construction: two nodes can each
+accept a conditional write against the same version during a partition, and
+last-writer-wins decides when they meet. The docs say so in every place the
+feature is described.
+
+**Why a stamp, and why opaque.** The document's version already exists — the
+stamp of the write that produced it, which last-writer-wins runs on — so no
+new counter, no per-document field, and nothing to migrate. It is encoded as
+an opaque token (the HLC's order-preserving bytes, then the node id, in
+base64url) rather than exposed as a structure, for the same reason cursors
+and resume tokens are: a client compares for equality and hands it back, and
+the encoding can change without a client noticing.
+
+**Why bodies and query strings rather than `If-Match`.** `If-Match` is the
+HTTP-native spelling for the by-id routes, and its failure is `412`. But
+`update` and `find_and_modify` carry their condition in a JSON body, and one
+feature answering `412` on two routes and `409` on two others is a client
+branching on the route rather than the code. One code, one status, one retry
+class, across all four — the envelope contract of ADR-057 — won. `ETag` is
+still set on a read by id, because it costs nothing and is what a curl user
+looks for; nothing is conditional on it being sent back as a header.
+
+**Why a missing document is stale, even with `upsert`.** The caller said "at
+this version". A document that is gone is not at that version, and creating a
+fresh one under an `upsert` would silently turn a lost race into a resurrected
+document with the caller's stale image. Refusing is the only reading a caller
+can act on correctly.
+
+**Why not `stamps` inside each document.** A `_stamp` field in `find` results
+would come back on the next `PUT` as data, and would collide with a user's
+own field of that name. A parallel array keeps the document exactly as
+stored.
+
+**Alternatives.** A per-document integer version: a second counter beside
+the stamp, with nothing the stamp does not already give. `If-Match` / `412`
+on the by-id routes only: two spellings of one condition. Server-side retry
+on `stale`: the server cannot re-run the caller's decision, and a client that
+wants blind retry has `update` operators for that.
+
+**Cost.** One `Stamp` comparison inside the transaction, for callers that
+pass `if_stamp`; nothing for callers that do not. Response bodies gain a
+`stamp` field (additive under `/v1`). Three clients gain conditional variants
+and a typed `stale`; the conformance suite gains a scenario that holds all
+three to the same answer.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

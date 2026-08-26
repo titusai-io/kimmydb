@@ -26,6 +26,14 @@ pub enum StorageError {
 
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// A conditional write found a different version than the caller expected.
+    ///
+    /// `current` is the stamp the document holds now, or `None` when there is
+    /// no live document — the caller expected a version and it is gone.
+    /// Nothing was written, minted or published.
+    #[error("the document is not at the expected version; re-read it and retry")]
+    Stale { current: Option<kimmy_core::Stamp> },
 }
 
 // redb splits failures across several error types that all mean "the storage

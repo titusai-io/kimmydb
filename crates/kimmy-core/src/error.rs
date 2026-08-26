@@ -68,6 +68,9 @@ pub enum Error {
     #[error("malformed cursor")]
     MalformedCursor,
 
+    #[error("malformed stamp: pass back a stamp exactly as the server returned it")]
+    MalformedStamp,
+
     #[error("bson error: {0}")]
     Bson(String),
 

@@ -45,6 +45,7 @@ SCENARIOS = [
     "dropped_collection_ends_stream",
     "recreated_collection_serves_its_own_history",
     "stale_resume_token_is_refused",
+    "stale_write_is_typed",
 ]
 
 PASSWORD = os.environ.get("KIMMY_ROOT_PASSWORD", "conformance-password")
@@ -257,6 +258,22 @@ def run(scenario: str, base: str, dead: str) -> dict:
         event = next_event(stream)
         stream.close()
         return {"first_id": event.document_id}
+
+    if scenario == "stale_write_is_typed":
+        db = connect(base)
+        seed(db, 0)
+        stamp = db.insert("shop", "orders", {"_id": 0, "qty": 0})["stamp"]
+        first = db.update("shop", "orders", {"_id": 0}, {"$set": {"qty": 1}}, if_stamp=stamp)
+        try:
+            db.update("shop", "orders", {"_id": 0}, {"$set": {"qty": 2}}, if_stamp=stamp)
+            raise AssertionError("the same stamp a second time must be refused")
+        except KimmyError as e:
+            return {
+                "first_write_ok": first["modified"] == 1,
+                "code": e.code,
+                "retry": e.retry.value,
+                "status": e.status,
+            }
 
     if scenario == "stale_resume_token_is_refused":
         db = connect(base)

@@ -104,6 +104,33 @@ impl Stamp {
     pub fn wins_over(&self, other: &Stamp) -> bool {
         self > other
     }
+
+    /// The stamp as an opaque token a client can hand back.
+    ///
+    /// 26 bytes — the HLC's order-preserving encoding, then the node id —
+    /// in base64url without padding, the same alphabet cursors and resume
+    /// tokens use. Opaque on purpose: a client compares tokens for equality
+    /// and passes one back as `if_stamp`; nothing about its shape is
+    /// promised, so the encoding can change without a client noticing.
+    pub fn encode(&self) -> String {
+        use base64::Engine as _;
+        let mut raw = Vec::with_capacity(26);
+        raw.extend_from_slice(&self.hlc.to_bytes());
+        raw.extend_from_slice(&self.node.to_bytes());
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(raw)
+    }
+
+    /// The inverse of [`Stamp::encode`].
+    pub fn decode(token: &str) -> crate::Result<Self> {
+        use base64::Engine as _;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(token)
+            .map_err(|_| crate::Error::MalformedStamp)?;
+        let (hlc, node) = raw.split_at_checked(10).ok_or(crate::Error::MalformedStamp)?;
+        let hlc: [u8; 10] = hlc.try_into().map_err(|_| crate::Error::MalformedStamp)?;
+        let node: [u8; 16] = node.try_into().map_err(|_| crate::Error::MalformedStamp)?;
+        Ok(Self { hlc: Hlc::from_bytes(hlc), node: NodeId::from_bytes(node) })
+    }
 }
 
 /// A monotonic hybrid logical clock.

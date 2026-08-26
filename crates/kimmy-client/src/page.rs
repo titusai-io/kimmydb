@@ -18,6 +18,7 @@ pub struct Query {
     limit: Option<usize>,
     skip: Option<usize>,
     explain: bool,
+    stamps: bool,
 }
 
 impl Query {
@@ -55,6 +56,13 @@ impl Query {
     }
 
     /// Ask how the query was answered.
+    /// Ask for each document's stamp in a parallel `stamps` array, for a
+    /// conditional write that follows.
+    pub fn stamps(mut self, stamps: bool) -> Self {
+        self.stamps = stamps;
+        self
+    }
+
     pub fn explain(mut self, explain: bool) -> Self {
         self.explain = explain;
         self
@@ -62,6 +70,9 @@ impl Query {
 
     pub(crate) fn to_body(&self) -> Value {
         let mut body = json!({ "explain": self.explain });
+        if self.stamps {
+            body["stamps"] = json!(true);
+        }
         for (key, value) in [
             ("filter", self.filter.clone()),
             ("sort", self.sort.clone()),

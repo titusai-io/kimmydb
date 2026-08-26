@@ -25,7 +25,7 @@ use serde_json::{Value, json};
 /// Every scenario this driver implements. The runner checks this against the
 /// declared list, so a client that quietly stops covering one is a failure
 /// rather than a silence.
-const SCENARIOS: [&str; 16] = [
+const SCENARIOS: [&str; 17] = [
     "capabilities",
     "documents_round_trip",
     "unlimited_find_is_a_page",
@@ -42,6 +42,7 @@ const SCENARIOS: [&str; 16] = [
     "dropped_collection_ends_stream",
     "recreated_collection_serves_its_own_history",
     "stale_resume_token_is_refused",
+    "stale_write_is_typed",
 ];
 
 #[tokio::main]
@@ -380,6 +381,32 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
                 .map_err(|e| e.to_string())?;
             let event = next_event(&mut stream).await?;
             Ok(json!({ "first_id": event.document_id().and_then(Value::as_i64).unwrap_or(-1) }))
+        }
+
+        "stale_write_is_typed" => {
+            let client = connect(base).await?;
+            seeded(&client, 0).await?;
+            let inserted = client
+                .insert("shop", "orders", &json!({ "_id": 0, "qty": 0 }))
+                .await
+                .map_err(|e| e.to_string())?;
+            let stamp =
+                inserted["stamp"].as_str().ok_or("an insert reports its stamp")?.to_string();
+            let filter = json!({ "_id": 0 });
+            let first = client
+                .update_if("shop", "orders", &filter, &json!({ "$set": { "qty": 1 } }), &stamp)
+                .await
+                .map_err(|e| e.to_string())?;
+            let error = client
+                .update_if("shop", "orders", &filter, &json!({ "$set": { "qty": 2 } }), &stamp)
+                .await
+                .expect_err("the same stamp a second time must be refused");
+            Ok(json!({
+                "first_write_ok": first["modified"] == 1,
+                "code": error.code().map(|c| c.to_string()),
+                "retry": retry_name(error.retry()),
+                "status": error.status(),
+            }))
         }
 
         "stale_resume_token_is_refused" => {

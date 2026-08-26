@@ -193,16 +193,22 @@ class Client:
         skip: Optional[int] = None,
         cursor: Optional[str] = None,
         explain: bool = False,
+        stamps: bool = False,
     ) -> Dict[str, Any]:
         """One page of a query.
 
         **Omitting ``limit`` returns 100 documents, not all of them.** That is
         the server's behaviour; hiding it here would only move the surprise.
         Use :meth:`pages` to read a whole collection.
+
+        ``stamps=True`` adds a ``stamps`` list parallel to ``documents`` — each
+        document's version, for an ``if_stamp`` write that follows.
         """
         body = _query_body(filter, sort, projection, limit, skip, explain)
         if cursor is not None:
             body["cursor"] = cursor
+        if stamps:
+            body["stamps"] = True
         return self.request(
             "POST", f"/v1/db/{db}/coll/{collection}/find", json=body, idempotent=True
         )
@@ -272,12 +278,21 @@ class Client:
         update: Mapping[str, Any],
         *,
         multi: bool = False,
+        if_stamp: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self.request(
-            "POST",
-            f"/v1/db/{db}/coll/{collection}/update",
-            json={"filter": filter, "update": update, "multi": multi},
-        )
+        """Update matching documents.
+
+        ``if_stamp`` makes a single-document update conditional on the
+        document still being at that version (a stamp from a write's
+        response or from ``find(..., stamps=True)``). A mismatch raises a
+        :class:`KimmyError` whose :attr:`~KimmyError.is_stale` is true and
+        writes nothing; re-read and decide again. Cannot be combined with
+        ``multi``.
+        """
+        body: Dict[str, Any] = {"filter": filter, "update": update, "multi": multi}
+        if if_stamp is not None:
+            body["if_stamp"] = if_stamp
+        return self.request("POST", f"/v1/db/{db}/coll/{collection}/update", json=body)
 
     def delete(
         self,
@@ -286,12 +301,13 @@ class Client:
         filter: Mapping[str, Any],
         *,
         multi: bool = False,
+        if_stamp: Optional[str] = None,
     ) -> Dict[str, Any]:
-        return self.request(
-            "POST",
-            f"/v1/db/{db}/coll/{collection}/delete",
-            json={"filter": filter, "multi": multi},
-        )
+        """Delete matching documents; ``if_stamp`` as on :meth:`update`."""
+        body: Dict[str, Any] = {"filter": filter, "multi": multi}
+        if if_stamp is not None:
+            body["if_stamp"] = if_stamp
+        return self.request("POST", f"/v1/db/{db}/coll/{collection}/delete", json=body)
 
     def aggregate(
         self, db: str, collection: str, pipeline: Sequence[Mapping[str, Any]]

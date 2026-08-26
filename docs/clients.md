@@ -50,6 +50,15 @@ caller's decision.
 nodes, so a reconnect may land elsewhere and continue correctly — verified on a
 real cluster rather than argued from the design.
 
+**Make a check-then-act conditional, and never retry a `stale` refusal.**
+Every write answers with the version it produced (`stamp`), `find` returns
+versions on request, and a single-document write carrying `if_stamp` lands
+only if the document is still at that version. A `409 stale` means the
+document moved on: the client re-reads, decides again, and sends a *new*
+request — the first-party clients expose the code (`ErrorCode::Stale`,
+`is_stale`, `Stale()`) and do not retry it, because repeating the same request
+can only fail the same way.
+
 **Ignore what it does not recognize.** Unknown response fields, unknown
 capabilities, unknown enum values. [Compatibility](compatibility.md) is the
 full contract.

@@ -79,6 +79,11 @@
       "expect": { "first_id": 99 }
     },
     {
+      "id": "stale_write_is_typed",
+      "why": "A conditional write with the current stamp lands; the same stamp a second time is refused as `stale`, with nothing written. Check-then-act on one document needs exactly this and nothing more.",
+      "expect": { "first_write_ok": true, "code": "stale", "retry": "no", "status": 409 }
+    },
+    {
       "id": "stale_resume_token_is_refused",
       "why": "A token from before a drop names a position in a collection that no longer exists. Refused rather than moved forward silently, because the gap is real.",
       "expect": { "code": "resume_token_expired" }
