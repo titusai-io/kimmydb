@@ -188,6 +188,46 @@ this project has been wrong before about claims nothing checked.
 
 ---
 
+## What each operation guarantees
+
+The one table to read before relying on a write. The short form: **ACID at
+the granularity of one request on one node, BASE everywhere else** — AP by
+design. Every row below is enforced by one redb write transaction on the
+accepting node; nothing below coordinates across nodes, and nothing spans
+two requests.
+
+| Operation | Guarantee | Enforced by | Defended by |
+|---|---|---|---|
+| `POST .../docs`, `PUT .../docs/{id}`, `DELETE .../docs/{id}` | Atomic and durable at commit: the document, its index entries and its oplog entry land together or not at all; the commit is an fsync | One write transaction in `docs.rs` (`insert`, `replace`, `delete_guarded`) | `one_insert_is_one_commit` |
+| `POST .../bulk` (`insert_many`) | **All or nothing.** A duplicate `_id` anywhere in the batch inserts nothing, mints no oplog entry, and does not move the clock | One transaction for the whole batch (`insert_in_txn`) | `a_batch_is_one_commit_however_many_documents_it_holds`, `a_bulk_insert_with_a_duplicate_id_inserts_nothing` |
+| `find`, `count`, `GET .../docs/{id}`, aggregation | Snapshot-isolated per request: one read transaction, so a query never sees half a write | redb read transaction per query | Snapshot isolation is redb's; the executor opens exactly one read transaction per request |
+| `find_and_modify` | Atomic claim-and-return: filter, sort, operators and write inside one write transaction; two callers never claim the same document | `modify.rs` `find_and_modify` → `modify_in_txn` | `concurrent_claims_never_hand_out_the_same_job_twice` |
+| `update` / `delete` by filter, single document | Atomic read-modify-write on the accepting node: the operators run on the image the write transaction holds, so concurrent `$inc`s all land (ADR-083) | `modify.rs` `modify_where` — the same body as `find_and_modify` | `concurrent_increments_through_update_are_all_kept`, `concurrent_increments_are_all_kept` |
+| `update` / `delete` with `multi: true` | **One transaction for the whole request**, all or nothing, one fsync; **refused above 10,000 matches** rather than partly done | `modify_where` under `MAX_CANDIDATES` | `a_filtered_write_is_one_commit_for_every_match`, `a_failing_apply_on_a_later_match_writes_nothing_at_all`, `over_the_cap_refuses_a_filtered_write_too` |
+| Unique indexes | Enforced on the accepting node before the write is acknowledged; **across nodes, detected after the fact** — a collision that replicated in surfaces as a `UniqueViolation` oplog entry and a counter (ADR-029) | `index::maintain` locally; `sync.rs` on merge | `unique_violation_entries_are_never_sent` and the index tests |
+| Anything across two requests | **No guarantee.** There are no multi-request transactions; two writes are two commits, and a reader may see the state between them | — | — |
+| The cluster | Basically available, soft state, eventually consistent: every node accepts writes, anti-entropy carries the oplog, whole-document last-writer-wins on a hybrid logical clock. Read-your-writes holds only on the node written to; convergence holds while a partition is shorter than tombstone retention | `kimmy-cluster` + `sync.rs` | `two_engines_converge_after_one_round`, `conflicting_writes_converge_to_the_same_document`, `three_nodes_converge_through_a_middle_peer` |
+
+**Durability mechanism, stated once.** redb runs `Durability::Immediate`
+everywhere — no `set_durability` call exists in the workspace — so a commit
+does not return until the data is fsynced. That is why the per-commit write
+rate in [Benchmarks](benchmarks.md) is a physical floor rather than a tuning
+problem, and why a process killed mid-flight loses nothing it acknowledged.
+
+**What this rules out.** Cross-node unique constraints, counters that are
+correct *across* nodes under a partition (each node's increments are correct;
+concurrent increments on two nodes resolve by LWW), and check-then-act across
+requests. The atomic tools are `find_and_modify` and `update` for one
+document, `insert_many` and `multi: true` for one bounded batch.
+
+Where the same facts are told from another angle: [Storage](storage.md)
+(the durability table, from the engine's side),
+[Time and conflicts](time-and-conflicts.md) (the cluster's side), and the
+README's consistency-model list (the summary). This table is the authority
+when they disagree.
+
+---
+
 ## Next
 
 - [HTTP API](http-api.md) — the reference

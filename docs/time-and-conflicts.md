@@ -239,6 +239,11 @@ document rewritten after the restart could lose to its own older version.
 | Convergence | Eventual, given the partition is shorter than tombstone retention |
 | Monotonic reads | Not guaranteed across nodes |
 
+This is the cluster's side. The per-operation table — each route, its
+guarantee, and the test that defends it — is
+["What each operation guarantees"](compatibility.md#what-each-operation-guarantees)
+in Compatibility.
+
 ### In CAP terms
 
 KimmyDB is **AP**: available and partition-tolerant, not linearizable. Every
@@ -284,11 +289,11 @@ Full reasoning in [ADR-020](decisions.md).
 
 ## Status
 
-Everything above is **implemented and tested**, including `apply_remote` and
-convergence across two independent engines. What does not exist yet is the
-**transport**: nothing currently carries oplog entries between nodes. The
-conflict machinery is ready; M4 adds gossip and anti-entropy. See
-[Roadmap](roadmap.md).
+Everything above is **implemented and tested**, including `apply_remote`,
+convergence across independent engines, and the transport that carries
+oplog entries between nodes — SWIM membership and anti-entropy in
+`kimmy-cluster`, see [Architecture](architecture.md). What is still open is
+recorded in the [Roadmap](roadmap.md).
 
 ---
 
