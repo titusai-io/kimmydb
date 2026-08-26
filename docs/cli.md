@@ -56,7 +56,7 @@ grants any other client is.
 
 | | |
 |---|---|
-| `kimmy init` | Interactively write the settings file — Enter keeps each value shown |
+| `kimmy init` | Writes the settings file: asks for the node URL, discovers the rest from the node itself |
 | `kimmy login` | Prints a token from the node's OIDC provider, via the device flow — the default |
 | `kimmy login <user>` | A local account instead. Password from stdin or `KIMMY_PASSWORD` |
 | `kimmy login --client-credentials` | A service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
@@ -264,11 +264,18 @@ IdP claim ([ADR-067](decisions.md)).
 
 ### A settings file: `~/.config/kimmydb/.kimmy`
 
-`kimmy init` writes it for you: one prompt per setting with the current value
-shown as the default — Enter keeps it, typing replaces it, and a setting left
-empty with nothing to keep is not written. Running init again re-prompts and
-overwrites the file wholesale; the file is written `0600` because it can carry
-secrets.
+`kimmy init` writes it for you, and needs one answer: the node URL. Everything
+else the node says for itself — the resource identifier and issuer come off its
+RFC 9728 metadata (the same document `login` reads), and the client id shows
+its registered default (`kimmy-cli`) for Enter to keep. Only when a node
+publishes no metadata does init fall back to asking for those by hand; Enter
+skips any prompt you cannot answer. Re-running init keeps what it is shown and
+carries existing secret keys into the new file untouched.
+
+The file is written `0600` because it can carry secrets — though init never
+reads one interactively (a typed secret lives in terminal scrollback forever).
+Point `KIMMY_PASSWORD` / `KIMMY_OIDC_CLIENT_SECRET` at login time instead, or
+write them into this file yourself.
 
 Everything you keep retyping can live there, dotenv-style:
 

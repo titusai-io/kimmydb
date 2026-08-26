@@ -471,10 +471,10 @@ async fn run() -> Result<()> {
         }
     };
 
-    // init writes the settings file and touches no node, so it runs before
-    // any client is built.
+    // init writes the settings file and touches no node beyond a metadata
+    // probe, so it runs before any client is built.
     if matches!(command, Command::Init) {
-        return run_init();
+        return run_init().await;
     }
 
     // `login` and `token` are the two commands that run without a token,
@@ -1042,6 +1042,32 @@ mod oidc {
         let discovered_resource =
             document.get("resource").and_then(Value::as_str).map(str::to_string);
         (issuer.or(discovered_issuer), resource.or(discovered_resource))
+    }
+
+    /// Pull `(resource, issuer)` out of a protected-resource document.
+    ///
+    /// `authorization_servers` is a list because a resource may trust several;
+    /// this node trusts exactly one (ADR-064), so the first entry is the only
+    /// entry. Both halves are required: a document naming one without the
+    /// other is not usable for setup and is reported as no metadata at all.
+    pub(super) fn extract_discovery(document: &Value) -> Option<(String, String)> {
+        let resource = document.get("resource").and_then(Value::as_str)?;
+        let issuer = document
+            .get("authorization_servers")
+            .and_then(Value::as_array)
+            .and_then(|servers| servers.first())
+            .and_then(Value::as_str)?;
+        Some((resource.to_string(), issuer.to_string()))
+    }
+
+    /// Ask a node what it is and who it trusts — the two answers `kimmy init`
+    /// used to make an operator hand-type.
+    ///
+    /// `None` when the node publishes nothing usable: too old to have the
+    /// endpoint, unreachable, or an opaque-audience deployment. The caller
+    /// decides what that means; for init it means falling back to prompts.
+    pub(super) async fn discover_from_node(url: &str) -> Option<(String, String)> {
+        extract_discovery(&protected_resource_metadata(url).await?)
     }
 
     /// The node's own RFC 9728 document, if it publishes one.
@@ -2145,7 +2171,10 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
         cli.token = Some(v);
     }
 
-    // Provider settings ride on the login/token subcommands.
+    // Provider settings ride on the login/token subcommands. No other
+    // subcommand carries those arguments, and asking clap for a value source
+    // by name panics on a command that lacks the id — so anything else skips
+    // this block entirely rather than falling through it.
     type ProviderFields<'a> = (
         &'a mut Option<String>,
         &'a mut Option<String>,
@@ -2161,7 +2190,9 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
             Command::Token { issuer, client_id, resource, scope, .. } => {
                 (issuer, client_id, resource, scope, None)
             }
-            _ => (&mut None, &mut None, &mut None, &mut None, None),
+            _ => {
+                return Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret));
+            }
         };
         if !from_cli("issuer")
             && env_absent("KIMMY_OIDC_ISSUER")
@@ -2235,53 +2266,153 @@ fn prompt_setting(prompt: &str, current: Option<&str>) -> Result<Option<String>>
     })
 }
 
-/// The whole of `kimmy init`: prompt per setting, overwrite the file.
+/// Wrap text in an SGR sequence when decoration applies: stdout is a terminal
+/// and `NO_COLOR` is unset. Decoration only — data lines stay plain.
+fn ansi(code: &str, text: &str) -> String {
+    use std::io::IsTerminal;
+    let enabled = std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    if enabled { format!("\x1b[{code}m{text}\x1b[0m") } else { text.to_string() }
+}
+
+/// Accept http(s) URLs only, trimmed of a trailing slash — the shape every
+/// other command assumes when joining paths onto the base.
+fn normalize_node_url(input: &str) -> Option<String> {
+    let parsed = input.trim().parse::<reqwest::Url>().ok()?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return None;
+    }
+    parsed.host_str()?;
+    let mut s = parsed.as_str().to_string();
+    while s.ends_with('/') {
+        s.pop();
+    }
+    Some(s)
+}
+
+/// The whole of `kimmy init`: one required answer — the node URL — then the
+/// node describes itself.
 ///
-/// Prefills come from the existing file first, then the environment — what
-/// the tool is *currently* using is what Enter keeps. Writing is wholesale:
-/// nine keys considered, only the non-empty ones land on disk, and a second
-/// run replaces the first run's file without ceremony (the prompts are the
-/// confirmation).
-fn run_init() -> Result<()> {
+/// The RFC 9728 document every node publishes names both the resource
+/// identifier and the issuer (`oidc::discover_from_node`), which is what makes
+/// the old nine-prompt walk unnecessary. Asking an operator to hand-type a
+/// value the node already publishes is how `kimmy.x` gets typed where
+/// `kimmydb.x` belongs — and a mistyped resource fails later, silently, as a
+/// token audience mismatch. Only when discovery comes up empty (a node too old
+/// to publish metadata) does init fall back to asking, with Enter skipping.
+///
+/// Secrets are never read interactively here: a typed secret lives in terminal
+/// scrollback forever. Secret keys already in an existing file are carried
+/// into the rewritten one untouched, so re-running init cannot silently drop
+/// them; setting them fresh happens through the environment or flags.
+async fn run_init() -> Result<()> {
     let existing = load_kimmy_file()?.map(|(_, settings)| settings);
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
-    let prefill = |key: &str| -> Option<String> {
-        let from_file = existing.as_ref().and_then(|s| match key {
-            "url" => s.url.clone(),
-            "token" => s.token.clone(),
-            "password" => s.password.clone(),
-            "issuer" => s.issuer.clone(),
-            "client_id" => s.client_id.clone(),
-            "client_secret" => s.client_secret.clone(),
-            "resource" => s.resource.clone(),
-            "scope" => s.scope.clone(),
-            _ => None,
-        });
-        from_file.or_else(|| env(&format!("KIMMY_{}", key.to_uppercase())))
+    let path = kimmy_file_path()?;
+
+    eprintln!(
+        "{}",
+        ansi(
+            "2",
+            &format!(
+                "Configure {} — one answer needed; the node describes the rest.",
+                path.display()
+            )
+        )
+    );
+
+    // The one thing nothing else can supply: which node to talk to.
+    let url_prefill = existing.as_ref().and_then(|s| s.url.clone()).or_else(|| env("KIMMY_URL"));
+    let url = loop {
+        match prompt_setting("Node URL (any cluster member)", url_prefill.as_deref())? {
+            Some(u) => match normalize_node_url(&u) {
+                Some(v) => break v,
+                None => eprintln!(
+                    "{}",
+                    ansi(
+                        "33",
+                        "  that is not an http(s) URL — try again, e.g. https://kimmy1.example.com"
+                    )
+                ),
+            },
+            None => {
+                anyhow::bail!("a node URL is required: there is nothing to discover without one")
+            }
+        }
     };
+    let mut pairs: Vec<(&'static str, String)> = vec![("url", url.clone())];
 
-    eprintln!("Configure ~/.config/kimmydb/.kimmy — Enter keeps the value shown.\n");
-
-    let mut pairs: Vec<(&'static str, String)> = Vec::new();
-    for (key, hint) in [
-        ("url", "Base URL of the node"),
-        ("issuer", "OIDC issuer URL"),
-        ("client_id", "OAuth client id"),
-        ("resource", "RFC 8707 resource (usually the node URL)"),
-        ("scope", "OAuth scope(s)"),
-        ("token", "A bearer token"),
-        ("password", "A local account's password"),
-        ("client_secret", "OAuth client secret"),
-        ("cache_token", "Cache tokens? true/false/1/0/yes/no/on/off"),
-    ] {
-        let current = prefill(key);
-        let current = current.as_deref();
-        if let Some(value) = prompt_setting(&format!("  {hint} ({key})"), current)? {
-            pairs.push((key, value));
+    // Everything else the node can say for itself.
+    match oidc::discover_from_node(&url).await {
+        Some((resource, issuer)) => {
+            eprintln!(
+                "{}",
+                ansi("32", &format!("  \u{2713} resource  {resource}  (discovered from the node)"))
+            );
+            eprintln!(
+                "{}",
+                ansi("32", &format!("  \u{2713} issuer    {issuer}  (discovered from the node)"))
+            );
+            pairs.push(("resource", resource));
+            pairs.push(("issuer", issuer));
+        }
+        None => {
+            eprintln!(
+                "{}",
+                ansi(
+                    "33",
+                    "  no metadata from this node (an older build?) — enter its identity by hand; Enter skips each"
+                )
+            );
+            let prev_resource = existing
+                .as_ref()
+                .and_then(|s| s.resource.clone())
+                .or_else(|| env("KIMMY_OIDC_RESOURCE"));
+            if let Some(v) = prompt_setting(
+                "Resource identifier (what tokens name this node)",
+                prev_resource.as_deref(),
+            )? {
+                pairs.push(("resource", v));
+            }
+            let prev_issuer = existing
+                .as_ref()
+                .and_then(|s| s.issuer.clone())
+                .or_else(|| env("KIMMY_OIDC_ISSUER"));
+            if let Some(v) = prompt_setting("OIDC issuer URL", prev_issuer.as_deref())? {
+                pairs.push(("issuer", v));
+            }
         }
     }
 
-    let path = kimmy_file_path()?;
+    // The client id has no discoverable source — it names THIS program's
+    // registration with the provider. Its registered name is the answer
+    // almost everywhere, so it is shown and kept rather than asked cold.
+    const DEFAULT_CLIENT_ID: &str = "kimmy-cli";
+    let client_id_prefill = existing
+        .as_ref()
+        .and_then(|s| s.client_id.clone())
+        .or_else(|| env("KIMMY_OIDC_CLIENT_ID"))
+        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+    if let Some(v) = prompt_setting("OAuth client id", Some(&client_id_prefill))? {
+        pairs.push(("client_id", v));
+    }
+
+    // Carry secrets forward untouched rather than re-asking or dropping them.
+    if let Some(prev) = &existing {
+        for (key, value) in [
+            ("token", prev.token.clone()),
+            ("password", prev.password.clone()),
+            ("client_secret", prev.client_secret.clone()),
+            ("scope", prev.scope.clone()),
+        ] {
+            if let Some(value) = value {
+                pairs.push((key, value));
+            }
+        }
+        if let Some(cache_token) = prev.cache_token {
+            pairs.push(("cache_token", cache_token.to_string()));
+        }
+    }
+
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -2294,7 +2425,19 @@ fn run_init() -> Result<()> {
             .with_context(|| format!("restricting {}", path.display()))?;
     }
 
-    let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+    eprintln!("{}", ansi("32", &format!("\u{2713} wrote {} (0600)", path.display())));
+    eprintln!(
+        "{}",
+        ansi(
+            "2",
+            "  scope/token/password/client-secret were not asked for: login discovers or \
+             prompts for what it needs. Override anytime with --scope / --client-id / \
+             KIMMY_PASSWORD."
+        )
+    );
+    eprintln!("{}", ansi("2", "  try it:  kimmy whoami"));
+
+    let keys: Vec<String> = pairs.iter().map(|(k, _)| k.to_string()).collect();
     println!("{}", json!({ "written": path.display().to_string(), "keys": keys }));
     Ok(())
 }
@@ -2356,6 +2499,51 @@ mod tests {
         assert!(body.contains("url = https://kimmy1.example.com\n"));
         assert!(body.contains("client_id = kimmy-cli\n"));
         assert!(!body.lines().any(|l| l.starts_with("password = ")));
+    }
+
+    // ---------------------------------------------------------------------
+    // init: discovery and URL handling
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn discovery_extracts_resource_and_first_authorization_server() {
+        let doc = json!({
+            "resource": "https://kimmydb.example.com",
+            "authorization_servers": ["https://auth.example.com"],
+        });
+        assert_eq!(
+            oidc::extract_discovery(&doc),
+            Some((
+                "https://kimmydb.example.com".to_string(),
+                "https://auth.example.com".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn discovery_needs_both_halves_of_the_document() {
+        // Either half alone cannot set up a client; reporting "no metadata"
+        // sends init down the explicit-prompt path for the whole pair.
+        assert!(oidc::extract_discovery(&json!({ "resource": "https://k" })).is_none());
+        assert!(oidc::extract_discovery(&json!({ "authorization_servers": [] })).is_none());
+        assert!(oidc::extract_discovery(&json!({})).is_none());
+    }
+
+    #[test]
+    fn node_urls_normalize_and_refuse_nonsense() {
+        assert_eq!(
+            normalize_node_url("https://kimmy1.example.com").as_deref(),
+            Some("https://kimmy1.example.com")
+        );
+        assert_eq!(
+            normalize_node_url(" https://kimmy1.example.com/ ").as_deref(),
+            Some("https://kimmy1.example.com")
+        );
+        // No scheme, wrong scheme, or scheme-only: all refused, because every
+        // other command joins paths onto this base sight unseen.
+        assert!(normalize_node_url("kimmy1.example.com").is_none());
+        assert!(normalize_node_url("ftp://kimmy1.example.com").is_none());
+        assert!(normalize_node_url("https://").is_none());
     }
 
     #[test]

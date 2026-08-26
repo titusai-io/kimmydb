@@ -10,6 +10,28 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`kimmy init` discovers instead of interrogating.** It now asks for one
+  thing — the node URL — and reads the RFC 8707 resource identifier and the
+  issuer from the node itself, the same document `kimmy login` already
+  consumes. The client id shows its registered default (`kimmy-cli`) and Enter
+  keeps it; explicit prompts return only for nodes too old to publish
+  metadata. Re-runs carry existing secret keys forward rather than dropping
+  them, secrets are never read interactively, and the output says what was
+  written and what was deliberately left to flags and environment.
+
+### Changed
+
+- **Re-running `kimmy init` no longer panics — and neither does anything
+  else.** With a settings file present, every subcommand without OIDC flags
+  (`databases`, `ping`, `whoami`, …) aborted with `` "issuer" is not an id of
+  an argument`` before doing any work: the dotfile loader asked clap for value
+  sources that exist only on `login`/`token`. Those commands now skip the
+  provider settings entirely.
+
 ## 0.7.0 - 2026-08-26
 
 ### Added
