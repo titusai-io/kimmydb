@@ -3883,6 +3883,60 @@ happened per batch; this widens what it carries. A three-engine storage test
 reproduces the loop deterministically — `applied 0, superseded 7, ddl 1` on
 every round with the raise removed — and converges with it.
 
+## ADR-083 — `update` and `delete` by filter run inside the write transaction
+
+**Decision.** A filtered write matches and writes in **one** write
+transaction. `Engine::modify_where` collects the matches under the writer,
+applies the caller's operators to the image the transaction holds, writes
+each result with its oplog entry, commits once, and publishes afterwards. It
+is the same per-document body `find_and_modify` uses — one function,
+`modify_in_txn`, behind both — so a rule added to one filtered write holds
+for every filtered write. `multi: false` is `stop_after = 1` on the same
+path. The executor plans the access path the way `find` does — primary key,
+then index, then scan — and hands the engine a `Candidates`, which gains a
+`Keys` variant for the primary-key case.
+
+**The defect.** `exec::update` collected its targets in a read transaction,
+applied the operators in memory, and stored each result through
+`Engine::replace` in its own write transaction. The operators therefore ran
+on an image another writer could already have moved past: two concurrent
+`$inc`s on one document both read 5 and both stored 6. A lost update, on a
+single node, in the plainest write there is — against the documented
+per-document atomicity. Measured before the fix: four writers × 500
+increments through the API left the counter at 500. `delete` had the same
+read-then-write split, and a `multi` update that failed part-way had
+already committed the documents before the failure.
+
+**Why reuse `find_and_modify`'s body rather than lock around the old path.**
+The body already existed, was already correct, and was already tested for
+exactly the property that was missing. A lock around read-then-write would
+have kept two code paths that must agree and left the second one to drift.
+The `insert` / `insert_many` / `insert_in_txn` pattern is the precedent.
+
+**What it changes for a `multi: true` request.** It is now one transaction:
+all of it lands or none of it does, and the request costs one fsync rather
+than one per document. The price is that the writer is held for the whole
+request, so the same 10,000-match ceiling `find_and_modify` has applies —
+refused, not truncated, because a filtered write over a prefix of the matches
+would silently leave the rest. Lifting the ceiling by committing in bounded
+chunks is a separate decision; this one closes the correctness gap.
+
+**`find_and_modify` on `_id` no longer scans.** Only the index planner ran
+for it, so a filter on the primary key scanned the collection under the
+writer. Sharing the executor's planner with `update` fixed that in passing.
+
+**Alternatives.** Re-read each target inside its own write transaction and
+re-apply the operators there: correct per document, but `multi` stays one
+commit per document and the two paths still diverge. Optimistic retry on a
+stamp mismatch: needs the stamp exposed first, and retries a race the single
+writer can simply prevent.
+
+**Cost.** One transaction held across the match. Indexed and primary-key
+filters add microseconds; an unindexed one adds the scan, exactly as
+`find_and_modify` already did, bounded by the same cap. A `multi` update
+that used to partly succeed on a mid-way failure now fails whole — the
+behaviour the durability table always claimed.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

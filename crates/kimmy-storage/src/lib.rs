@@ -33,7 +33,7 @@ pub use error::{Result, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
-pub use modify::{Candidates, MAX_CANDIDATES, ModifyOutcome, ModifySpec};
+pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
 pub use snapshot::{CollectionState, SNAPSHOT_PAGE, SnapshotCursor, SnapshotDoc, SnapshotPage};
 pub use sync::{SyncOutcome, lag_behind_ms};
 pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};

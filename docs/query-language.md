@@ -260,6 +260,10 @@ writer:
 would return a document the sort did not pick, with no way for a caller to tell.
 Narrow the filter, or add an index.
 
+`update` and `delete` go through the same in-transaction path since ADR-083,
+so the same table and the same ceiling apply to them: a `multi: true` request
+over more than 10,000 matches is refused rather than partly done.
+
 `update` and `delete` plan too, so an index applies to all three. Pass
 `"explain": true` on any of `find`, `count`, `update` or `delete` to see which
 access path was chosen.

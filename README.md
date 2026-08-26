@@ -183,7 +183,9 @@ Read this before building on it.
 - **Conflicts resolve by last-writer-wins** at whole-document granularity, using
   a hybrid logical clock with the node id as a tiebreak. Concurrent writes to the
   same document mean the losing write is discarded, not merged.
-- **There is no multi-document atomicity.** No transactions across documents.
+- **There are no transactions across requests.** One `multi: true` update or
+  delete commits as a single unit on the accepting node; nothing spans two
+  operations.
 - **Deletes are tombstones with a retention window.** If a partition outlasts
   `tombstone_retention_secs`, documents deleted during it can resurrect when the
   partition heals. Set the window longer than any partition you would tolerate.

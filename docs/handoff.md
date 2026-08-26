@@ -6,6 +6,41 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **`update` lost concurrent increments on a single node**
+
+Branch `fix/update-in-transaction`, ADR-083. Found by reading `exec::update`
+against the durability table rather than by an incident: the route collected
+its targets through `collect_matching` in a read transaction, applied the
+operators in memory, and stored each document through `Engine::replace` in
+its own write transaction — so the operators ran on an image another writer
+could already have replaced. A multi-threaded API test (four tasks × 500
+`$inc` on one document) left the counter at **500** on main. `delete` had
+the same shape, and a `multi` update that failed on a later document had
+already committed the earlier ones.
+
+Fix: `Engine::modify_where` in `kimmy-storage/src/modify.rs` — the
+`find_and_modify` body applied to every match instead of a chosen one, with
+`modify_in_txn` as the single per-document function behind both and
+`collect_matches` as the single candidate scan (with a `limit`, so
+`multi: false` is `stop_after = 1` on the same path). `Candidates` gained a
+`Keys` variant, because the storage enum had no primary-key path and routing
+`update {_id: 1}` through it would have scanned the collection under the
+writer; `exec::candidates_for` now plans primary key → index → scan for
+`update`, `delete` **and** `find_and_modify` — the last of which had been
+scanning on `_id` all along. `explain` reports the plan as chosen, from a
+`PlannedAccess` plus the engine's `examined`/`matched` counts.
+
+Consequences worth knowing: a `multi: true` request is one transaction
+(one fsync, all-or-nothing) and inherits `MAX_CANDIDATES` as a refusal —
+CHANGELOG `### Changed` calls it out. `modified` still counts documents
+written, not changed (the documented deviation). Tests: the API race test
+(`multi_thread` flavour — a current-thread runtime cannot interleave two
+synchronous executors and passes either way), eight storage tests in
+`modify.rs` covering one-commit-per-request, `stop_after`, no-op, all-or-
+nothing abort, removal, `Keys` lookup/dedup, an eight-thread counter, and
+the cap. Suite 1371 passed / 0 failed. Lifting the cap by committing in
+bounded chunks is the next storage decision, not this branch.
+
 ## As of 2026-08-26 — **the streaming path never counted its embeddings**
 
 Branch `fix/streaming-embed-counters`, the last of the day's finds and the

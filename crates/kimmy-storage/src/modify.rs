@@ -1,11 +1,12 @@
-//! Atomic find-modify-return, inside one write transaction.
+//! Atomic filtered writes — find-modify-return and update/delete by filter —
+//! inside one write transaction.
 //!
 //! # Why the match happens here rather than in a read pass
 //!
-//! `update` and `delete` collect their targets in a *read* transaction and then
-//! write them one at a time. That is fine when the answer is "change everything
-//! matching", and wrong when the answer is "claim exactly one" — two callers
-//! scanning concurrently both see the same pending job, and both claim it.
+//! Matching in a *read* transaction and writing afterwards is wrong whenever
+//! the write depends on what was read: two callers claiming "exactly one"
+//! pending job both see it and both claim it, and two callers incrementing
+//! the same counter both read the same image and one increment is lost.
 //!
 //! redb has a single writer, so a match found *inside* the write transaction
 //! cannot be taken by anyone else between the match and the commit. That makes
@@ -26,6 +27,17 @@
 //! same shape as the guard [`crate::Engine::delete_guarded`] takes, one step
 //! further: there the caller decides "still eligible?", here it also decides
 //! "which one?" and "changed how?".
+//!
+//! # Why `update` and `delete` come through here too
+//!
+//! They used to match in a read pass and write afterwards, on the grounds
+//! that "change everything matching" did not care which image it changed. It
+//! did: the operators ran on the image the *read* pass returned, so two
+//! concurrent `$inc`s on one document could both read `n = 5` and both store
+//! `n = 6` — a lost update on a single node, against the documented
+//! per-document atomicity (ADR-083). [`Engine::modify_where`] is the same
+//! in-transaction body as [`Engine::find_and_modify`], applied to every match
+//! instead of a chosen one, so the two cannot drift apart.
 
 use std::cmp::Ordering;
 
@@ -57,6 +69,12 @@ pub const MAX_CANDIDATES: usize = 10_000;
 pub enum Candidates {
     /// Every live document in the collection.
     Scan,
+    /// Exactly these encoded document keys, looked up directly.
+    ///
+    /// What a filter pinning `_id` plans to. Without this variant an update
+    /// by primary key — the commonest write there is — would scan the whole
+    /// collection under the single writer to find one document.
+    Keys(Vec<Vec<u8>>),
     /// The union of one index's key ranges, both bounds inclusive.
     Index {
         index_id: u32,
@@ -99,7 +117,75 @@ pub struct ModifyOutcome {
     pub upserted: Option<DocId>,
 }
 
+/// What a filtered write did, counted inside the transaction that did it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModifyManyOutcome {
+    /// Documents the candidate scan looked at.
+    pub examined: u64,
+    /// Documents the spec matched.
+    pub matched: u64,
+    /// Documents written — replaced, or tombstoned when the spec removed them.
+    ///
+    /// Equal to `matched` today: every match is written, whether or not the
+    /// operators changed anything (the `modified` deviation is documented).
+    /// Reported separately so a guard that declines a match has somewhere to
+    /// show up.
+    pub modified: u64,
+}
+
 impl Engine {
+    /// Change every matching document — or the first `stop_after` of them, in
+    /// scan order — atomically, in one write transaction.
+    ///
+    /// The operators run on the image the write transaction holds, so there
+    /// is no window between matching and writing for another writer to slip
+    /// into. A failure anywhere aborts the whole transaction: nothing is
+    /// written, no oplog entry is minted, no event is published.
+    ///
+    /// Bounded by [`MAX_CANDIDATES`] exactly as `find_and_modify` is, and for
+    /// the same reason — the matches are held under the single writer.
+    pub fn modify_where(
+        &self,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        stop_after: Option<usize>,
+    ) -> Result<ModifyManyOutcome> {
+        let txn = self.begin_write()?;
+
+        let (matches, examined) =
+            match self.collect_matches(&txn, coll, candidates, spec, stop_after) {
+                Ok(found) => found,
+                Err(e) => {
+                    txn.abort()?;
+                    return Err(e);
+                }
+            };
+
+        let mut entries = Vec::with_capacity(matches.len());
+        for before in &matches {
+            match self.modify_in_txn(&txn, coll, before, spec) {
+                Ok((_, entry)) => entries.push(entry),
+                Err(e) => {
+                    txn.abort()?;
+                    return Err(e);
+                }
+            }
+        }
+
+        let matched = matches.len() as u64;
+        if entries.is_empty() {
+            // Nothing matched: a no-op must not commit, mint or publish.
+            txn.abort()?;
+            return Ok(ModifyManyOutcome { examined, matched, modified: 0 });
+        }
+
+        txn.commit()?;
+        let modified = entries.len() as u64;
+        self.publish(entries);
+        Ok(ModifyManyOutcome { examined, matched, modified })
+    }
+
     /// Find one document, change it, and return it — atomically.
     pub fn find_and_modify(
         &self,
@@ -151,18 +237,8 @@ impl Engine {
             });
         };
 
-        let id = extract_id(&before)?;
-        let next = match spec.apply(&before) {
-            Ok(next) => next,
-            Err(e) => {
-                txn.abort()?;
-                return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(e)));
-            }
-        };
-
-        let result = self.write_chosen(&txn, coll, &id, &before, next.clone());
-        let entry = match result {
-            Ok(entry) => entry,
+        let (next, entry) = match self.modify_in_txn(&txn, coll, &before, spec) {
+            Ok(done) => done,
             Err(e) => {
                 txn.abort()?;
                 return Err(e);
@@ -175,6 +251,28 @@ impl Engine {
         Ok(ModifyOutcome { before: Some(before), after: next, matched: true, upserted: None })
     }
 
+    /// Apply the spec to one matched document and write the result.
+    ///
+    /// The one body behind both `find_and_modify` and `modify_where`, the
+    /// way `insert` and `insert_many` share `insert_in_txn`: a rule added
+    /// here — a guard, a stamp check — holds for every filtered write at
+    /// once. Returns the image written (`None` for a removal) and the oplog
+    /// entry to publish once the transaction commits.
+    fn modify_in_txn(
+        &self,
+        txn: &redb::WriteTransaction,
+        coll: &CollectionMeta,
+        before: &Document,
+        spec: &dyn ModifySpec,
+    ) -> Result<(Option<Document>, OplogEntry)> {
+        let id = extract_id(before)?;
+        let next = spec
+            .apply(before)
+            .map_err(|e| StorageError::Core(kimmy_core::Error::InvalidQuery(e)))?;
+        let entry = self.write_chosen(txn, coll, &id, before, next.clone())?;
+        Ok((next, entry))
+    }
+
     /// Collect matches inside the transaction and pick the first after sorting.
     fn choose(
         &self,
@@ -183,58 +281,8 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
     ) -> Result<Option<Document>> {
-        let mut matches: Vec<Document> = Vec::new();
-
-        let consider = |doc: Document, matches: &mut Vec<Document>| -> Result<()> {
-            if !spec.matches(&doc) {
-                return Ok(());
-            }
-            matches.push(doc);
-            if matches.len() > MAX_CANDIDATES {
-                // Refused, not truncated: choosing from a prefix would return
-                // a document that is not the one the sort asked for, and no
-                // caller could tell.
-                return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
-                    "find_and_modify matched more than {MAX_CANDIDATES} documents; \
-                     narrow the filter, or add an index and a tighter one"
-                ))));
-            }
-            Ok(())
-        };
-
-        let docs = txn.open_table(tables::DOCS)?;
-        match candidates {
-            Candidates::Index { index_id, ranges, both_bounds } => {
-                // The multikey flag is re-read here, in the transaction that
-                // scans — a `false` from the caller's earlier read proves
-                // nothing about this snapshot.
-                let sound = !both_bounds || !self.index_is_multikey(txn, coll, *index_id)?;
-                if sound {
-                    let mut seen: std::collections::BTreeSet<Vec<u8>> = Default::default();
-                    for (lower, upper) in ranges {
-                        for key in
-                            index::scan_range_in_write(txn, coll.id, *index_id, lower, Some(upper))?
-                        {
-                            // A `$in` union can offer one document twice.
-                            if !seen.insert(key.clone()) {
-                                continue;
-                            }
-                            let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
-                                continue;
-                            };
-                            let record = codec::decode_doc_record(raw.value())?;
-                            if record.deleted {
-                                continue;
-                            }
-                            consider(bson::deserialize_from_slice(&record.body)?, &mut matches)?;
-                        }
-                    }
-                } else {
-                    scan_all(&docs, coll, &mut |doc| consider(doc, &mut matches))?;
-                }
-            }
-            Candidates::Scan => scan_all(&docs, coll, &mut |doc| consider(doc, &mut matches))?,
-        }
+        // Every match, because the sort has to see them all to pick one.
+        let (mut matches, _) = self.collect_matches(txn, coll, candidates, spec, None)?;
 
         if matches.is_empty() {
             return Ok(None);
@@ -244,6 +292,97 @@ impl Engine {
         // scan's order for documents the sort does not separate.
         matches.sort_by(|a, b| spec.compare(a, b));
         Ok(Some(matches.swap_remove(0)))
+    }
+
+    /// Every live document among the candidates that the spec matches, in
+    /// scan order, with how many were examined to find them.
+    ///
+    /// `limit` stops the scan once that many have matched — what a
+    /// single-document `update` wants. `None` collects them all, which is
+    /// what a sort needs and what `multi` means.
+    fn collect_matches(
+        &self,
+        txn: &redb::WriteTransaction,
+        coll: &CollectionMeta,
+        candidates: &Candidates,
+        spec: &dyn ModifySpec,
+        limit: Option<usize>,
+    ) -> Result<(Vec<Document>, u64)> {
+        let mut matches: Vec<Document> = Vec::new();
+        let mut examined = 0u64;
+
+        // `Ok(false)` asks the scan to stop: the limit is reached.
+        let mut consider = |doc: Document, matches: &mut Vec<Document>| -> Result<bool> {
+            examined += 1;
+            if !spec.matches(&doc) {
+                return Ok(true);
+            }
+            matches.push(doc);
+            if matches.len() > MAX_CANDIDATES {
+                // Refused, not truncated: choosing from a prefix would return
+                // a document that is not the one the sort asked for, and a
+                // filtered write over a prefix would silently leave the rest
+                // — and no caller could tell either happened.
+                return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
+                    "the filter matched more than {MAX_CANDIDATES} documents; \
+                     narrow the filter, or add an index and a tighter one"
+                ))));
+            }
+            Ok(!limit.is_some_and(|n| matches.len() >= n))
+        };
+
+        let docs = txn.open_table(tables::DOCS)?;
+
+        // Direct lookups share one body: a `$in` union of index ranges and a
+        // list of primary keys can both offer one document twice.
+        let mut lookup =
+            |keys: &mut dyn Iterator<Item = Vec<u8>>, matches: &mut Vec<Document>| -> Result<()> {
+                let mut seen: std::collections::BTreeSet<Vec<u8>> = Default::default();
+                for key in keys {
+                    if !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+                        continue;
+                    };
+                    let record = codec::decode_doc_record(raw.value())?;
+                    if record.deleted {
+                        continue;
+                    }
+                    if !consider(bson::deserialize_from_slice(&record.body)?, matches)? {
+                        break;
+                    }
+                }
+                Ok(())
+            };
+
+        match candidates {
+            Candidates::Keys(keys) => lookup(&mut keys.iter().cloned(), &mut matches)?,
+            Candidates::Index { index_id, ranges, both_bounds } => {
+                // The multikey flag is re-read here, in the transaction that
+                // scans — a `false` from the caller's earlier read proves
+                // nothing about this snapshot.
+                let sound = !both_bounds || !self.index_is_multikey(txn, coll, *index_id)?;
+                if sound {
+                    let mut keys = Vec::new();
+                    for (lower, upper) in ranges {
+                        keys.extend(index::scan_range_in_write(
+                            txn,
+                            coll.id,
+                            *index_id,
+                            lower,
+                            Some(upper),
+                        )?);
+                    }
+                    lookup(&mut keys.into_iter(), &mut matches)?;
+                } else {
+                    scan_until(&docs, coll, &mut |doc| consider(doc, &mut matches))?;
+                }
+            }
+            Candidates::Scan => scan_until(&docs, coll, &mut |doc| consider(doc, &mut matches))?,
+        }
+
+        Ok((matches, examined))
     }
 
     fn index_is_multikey(
@@ -296,11 +435,12 @@ impl Engine {
     }
 }
 
-/// Every live document in the collection, inside the caller's transaction.
-fn scan_all(
+/// Every live document in the collection, inside the caller's transaction,
+/// until `f` answers `false`.
+fn scan_until(
     docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
     coll: &CollectionMeta,
-    f: &mut impl FnMut(Document) -> Result<()>,
+    f: &mut impl FnMut(Document) -> Result<bool>,
 ) -> Result<()> {
     for entry in docs.range(doc_range(coll.id))? {
         let (_, value) = entry?;
@@ -308,7 +448,9 @@ fn scan_all(
         if record.deleted {
             continue;
         }
-        f(bson::deserialize_from_slice(&record.body)?)?;
+        if !f(bson::deserialize_from_slice(&record.body)?)? {
+            break;
+        }
     }
     Ok(())
 }
@@ -645,5 +787,237 @@ mod tests {
             "a job was claimed twice: {claimed:?} — the match is not atomic"
         );
         assert_eq!(claimed, vec![0, 1, 2, 3], "every job claimed exactly once");
+    }
+
+    // -----------------------------------------------------------------------
+    // modify_where — update and delete by filter
+    // -----------------------------------------------------------------------
+
+    /// Claim every pending job, in scan order, without sorting.
+    fn claim_all() -> impl ModifySpec {
+        TestSpec {
+            matches: |d: &Document| d.get_str("status").map(|s| s == "pending").unwrap_or(false),
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| {
+                let mut next = d.clone();
+                next.insert("status", "claimed");
+                Ok(Some(next))
+            },
+            upsert: None,
+        }
+    }
+
+    fn drain(rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<OplogEntry>>) -> Vec<OpKind> {
+        let mut kinds = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            kinds.push(entry.kind);
+        }
+        kinds
+    }
+
+    #[test]
+    fn a_filtered_write_is_one_commit_for_every_match() {
+        // The whole point: every match written in the transaction that found
+        // it, and one fsync for the request rather than one per document.
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let mut rx = engine.subscribe();
+
+        let before = engine.commits();
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
+        assert_eq!(engine.commits() - before, 1, "one request, one commit");
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3 });
+
+        for id in [1i64, 2, 4] {
+            let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(doc.get_str("status").unwrap(), "claimed", "_id {id}");
+        }
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(3)).unwrap().unwrap().get_str("status").unwrap(),
+            "done",
+            "a non-match is untouched"
+        );
+        assert_eq!(
+            drain(&mut rx),
+            vec![OpKind::Replace; 3],
+            "one event per document, after commit"
+        );
+    }
+
+    #[test]
+    fn stop_after_takes_the_first_matches_in_scan_order() {
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(1)).unwrap();
+        // Documents scan in key order and _id 1 is pending, so the scan
+        // stops at the first document it looks at.
+        assert_eq!(out, ModifyManyOutcome { examined: 1, matched: 1, modified: 1 });
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
+            "claimed"
+        );
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(2)).unwrap().unwrap().get_str("status").unwrap(),
+            "pending",
+            "the second match is left for the next request"
+        );
+    }
+
+    #[test]
+    fn nothing_matched_commits_nothing_and_publishes_nothing() {
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let mut rx = engine.subscribe();
+
+        let spec = TestSpec {
+            matches: |_: &Document| false,
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| Ok(Some(d.clone())),
+            upsert: None,
+        };
+        let before = engine.commits();
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 0, modified: 0 });
+        assert_eq!(engine.commits() - before, 0, "a no-op must not reach the disk");
+        assert!(rx.try_recv().is_err(), "a no-op must publish nothing");
+    }
+
+    #[test]
+    fn a_failing_apply_on_a_later_match_writes_nothing_at_all() {
+        // All or nothing: the earlier matches were written in the same
+        // transaction, so the abort takes them back too.
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let mut rx = engine.subscribe();
+
+        let spec = TestSpec {
+            matches: |d: &Document| d.get_str("status").map(|s| s == "pending").unwrap_or(false),
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| {
+                if i64_of(d, "_id") == 4 {
+                    return Err("nope".to_string());
+                }
+                let mut next = d.clone();
+                next.insert("status", "claimed");
+                Ok(Some(next))
+            },
+            upsert: None,
+        };
+        let before = engine.commits();
+        assert!(engine.modify_where(&coll, &Candidates::Scan, &spec, None).is_err());
+        assert_eq!(engine.commits() - before, 0);
+        for id in [1i64, 2, 4] {
+            let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(doc.get_str("status").unwrap(), "pending", "_id {id} must be untouched");
+        }
+        assert!(rx.try_recv().is_err(), "a failed request must publish nothing");
+    }
+
+    #[test]
+    fn a_removing_spec_tombstones_every_match() {
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let mut rx = engine.subscribe();
+
+        let spec = TestSpec {
+            matches: |d: &Document| d.get_str("status").map(|s| s == "pending").unwrap_or(false),
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |_: &Document| Ok(None),
+            upsert: None,
+        };
+        let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3 });
+        for id in [1i64, 2, 4] {
+            assert!(engine.get(&coll, &DocId::Int64(id)).unwrap().is_none(), "_id {id} removed");
+        }
+        assert!(engine.get(&coll, &DocId::Int64(3)).unwrap().is_some());
+        assert_eq!(drain(&mut rx), vec![OpKind::Delete; 3], "removals are ordinary deletes");
+    }
+
+    #[test]
+    fn keys_are_looked_up_directly_and_deduplicated() {
+        // A primary-key plan: no scan, missing and tombstoned keys are plain
+        // misses, and a key offered twice is examined once.
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        assert!(engine.delete(&coll, &DocId::Int64(2)).unwrap());
+
+        let key = |id: i64| crate::docs::doc_key(&DocId::Int64(id)).unwrap();
+        let candidates = Candidates::Keys(vec![key(2), key(99), key(1), key(1), key(3)]);
+
+        let out = engine.modify_where(&coll, &candidates, &claim_all(), None).unwrap();
+        assert_eq!(out, ModifyManyOutcome { examined: 2, matched: 1, modified: 1 });
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
+            "claimed"
+        );
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(4)).unwrap().unwrap().get_str("status").unwrap(),
+            "pending",
+            "a key not offered is not touched"
+        );
+    }
+
+    #[test]
+    fn concurrent_increments_are_all_kept() {
+        // The lost-update defect, at the engine: eight threads each add one
+        // to the same counter a hundred times. Every increment must land.
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "counters").unwrap();
+        engine.insert(&coll, doc! {"_id": 1i64, "n": 0i64}).unwrap();
+        let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let coll = coll.clone();
+            let candidates = Candidates::Keys(vec![key.clone()]);
+            handles.push(std::thread::spawn(move || {
+                let spec = TestSpec {
+                    matches: |_: &Document| true,
+                    compare: |_: &Document, _: &Document| Ordering::Equal,
+                    apply: |d: &Document| {
+                        let mut next = d.clone();
+                        next.insert("n", i64_of(d, "n") + 1);
+                        Ok(Some(next))
+                    },
+                    upsert: None,
+                };
+                for _ in 0..100 {
+                    let out = engine.modify_where(&coll, &candidates, &spec, Some(1)).unwrap();
+                    assert_eq!(out.modified, 1);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let doc = engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        assert_eq!(i64_of(&doc, "n"), 800, "an increment was lost");
+    }
+
+    #[test]
+    fn over_the_cap_refuses_a_filtered_write_too() {
+        // The same ceiling as `find_and_modify`, for the same reason: the
+        // matches are held under the single writer. Refused, so nothing is
+        // silently left behind.
+        let (engine, coll, _dir) = engine();
+        let batch: Vec<Document> = (0..=MAX_CANDIDATES as i64)
+            .map(|id| doc! {"_id": id, "created": id, "status": "pending"})
+            .collect();
+        engine.insert_many(&coll, batch).unwrap();
+
+        let before = engine.commits();
+        assert!(engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).is_err());
+        assert_eq!(engine.commits() - before, 0);
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(0)).unwrap().unwrap().get_str("status").unwrap(),
+            "pending"
+        );
     }
 }
