@@ -54,6 +54,10 @@ pub struct Engine {
     /// which is what M11 task 1 needed: the daemon was paying two commits per
     /// insert where a bare engine paid one, and nothing said so.
     commits: std::sync::atomic::AtomicU64,
+    /// Documents a `multi: true` filtered write commits per transaction
+    /// (ADR-086). Set from configuration at startup; the storage default
+    /// stands for a bare engine.
+    multi_chunk_docs: std::sync::atomic::AtomicUsize,
 }
 
 /// A write transaction that counts itself when it commits.
@@ -158,6 +162,9 @@ impl Engine {
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
+            multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
+                crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
+            ),
         })
     }
 
@@ -198,6 +205,20 @@ impl Engine {
     /// and this is where that shows up.
     pub fn commits(&self) -> u64 {
         self.commits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How many documents a `multi: true` filtered write commits per
+    /// transaction (ADR-086).
+    pub fn multi_chunk_docs(&self) -> usize {
+        self.multi_chunk_docs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Set the chunk size. Clamped to `1..=MAX_CANDIDATES`: zero would never
+    /// advance, and more than the cap would hold the writer for longer than
+    /// `find_and_modify` is allowed to.
+    pub fn set_multi_chunk_docs(&self, docs: usize) {
+        let docs = docs.clamp(1, crate::modify::MAX_CANDIDATES);
+        self.multi_chunk_docs.store(docs, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn count_unique_violation(&self) {

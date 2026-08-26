@@ -253,15 +253,17 @@ pub fn next_index_id(&self) -> u32 {
 | Single-document write | Atomic and durable at commit |
 | Document + its oplog entry | Same transaction — cannot diverge |
 | `update` / `delete` by filter | Operators applied **inside the write transaction**, on the image it holds; matched and written as one unit (ADR-083) |
-| `update` / `delete` with `multi: true` | **One transaction for the whole request**, bounded at 10,000 matches — more is refused, not truncated |
-| Crash mid-request | Nothing of the request landed, or all of it; the oplog reflects exactly what landed |
+| `update` / `delete` with `multi: true` | **Chunked**: one transaction per `storage.multi_chunk_docs` documents (default 1,000), each chunk all or nothing, the writer released between chunks (ADR-086) |
+| Crash mid-request | Every chunk that committed stays; the chunk in flight is lost whole; the oplog reflects exactly what landed, and the response's `commits` says how many chunks did |
 | `insert_many` | One transaction; all or nothing |
 
-> **Sharp edge.** A `multi: true` update or delete holds the single writer for
-> the whole match and the whole write, which is why it is capped at 10,000
-> matches. Above that the request is refused with the same error
-> `find_and_modify` gives: narrow the filter, or add an index and a tighter
-> one. There are still no transactions *across* requests.
+> **Sharp edge.** A `multi: true` update or delete is atomic per *chunk*, not
+> per request: a failure in the third chunk leaves the first two committed and
+> the response is an error, so a caller that needs to know what landed reads
+> the collection (or a change stream) rather than assuming nothing did. Set
+> `storage.multi_chunk_docs` to 10,000 to make requests up to that size
+> all-or-nothing again, at the price of holding the writer for the whole
+> request. There are still no transactions *across* requests.
 
 The per-operation view — every route, what it promises, and the test that
 defends it — is the ["What each operation guarantees"](compatibility.md#what-each-operation-guarantees)

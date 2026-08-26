@@ -726,7 +726,11 @@ pub fn update(
     };
     let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
-    let mut body = json!({ "matched": outcome.matched, "modified": outcome.modified });
+    let mut body = json!({
+        "matched": outcome.matched,
+        "modified": outcome.modified,
+        "commits": outcome.commits,
+    });
     if explain {
         body["explain"] = planned.stats(&outcome).to_json();
     }
@@ -1037,7 +1041,7 @@ pub fn delete(
     };
     let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
-    let mut body = json!({ "deleted": outcome.modified });
+    let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if explain {
         body["explain"] = planned.stats(&outcome).to_json();
     }

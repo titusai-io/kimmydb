@@ -46,7 +46,7 @@ use kimmy_core::{DocId, DocRecord, OpKind, OplogEntry, Stamp};
 use redb::ReadableTable;
 
 use crate::docs::extract_id;
-use crate::engine::{append_oplog, doc_range};
+use crate::engine::{append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
 use crate::{Engine, codec, index, tables};
@@ -60,6 +60,14 @@ use crate::{Engine, codec, index, tables};
 /// **refusal** rather than a truncation, because silently choosing from a
 /// prefix of the matches would return the wrong document with no way to tell.
 pub const MAX_CANDIDATES: usize = 10_000;
+
+/// Documents a `multi: true` filtered write commits per transaction when
+/// nothing configured otherwise (ADR-086).
+///
+/// The same order as the TTL per-pass cap: large enough that the per-commit
+/// fsync is amortised across a thousand documents, small enough that the
+/// single writer is released every few milliseconds of scanning.
+pub const DEFAULT_MULTI_CHUNK_DOCS: usize = 1_000;
 
 /// Where to look for candidate documents, in the engine's own terms.
 ///
@@ -144,19 +152,28 @@ pub struct ModifyManyOutcome {
     /// Reported separately so a guard that declines a match has somewhere to
     /// show up.
     pub modified: u64,
+    /// Write transactions the request cost — one per chunk (ADR-086). Zero
+    /// when nothing matched.
+    pub commits: u64,
 }
 
 impl Engine {
     /// Change every matching document — or the first `stop_after` of them, in
-    /// scan order — atomically, in one write transaction.
+    /// scan order — in write transactions of at most
+    /// [`Engine::multi_chunk_docs`] documents each (ADR-086).
     ///
-    /// The operators run on the image the write transaction holds, so there
-    /// is no window between matching and writing for another writer to slip
-    /// into. A failure anywhere aborts the whole transaction: nothing is
-    /// written, no oplog entry is minted, no event is published.
+    /// Within a chunk the operators run on the image the write transaction
+    /// holds, so there is no window between matching and writing for another
+    /// writer to slip into, and a failure aborts the chunk whole: nothing of
+    /// it is written, minted or published. Between chunks the writer is
+    /// released; the next chunk resumes strictly after the last document key
+    /// the previous one wrote, so a document is never visited twice and a
+    /// writer that slips in between chunks is an ordinary concurrent writer.
+    /// A failure in a later chunk leaves the earlier ones committed — the
+    /// oplog reflects exactly what landed.
     ///
-    /// Bounded by [`MAX_CANDIDATES`] exactly as `find_and_modify` is, and for
-    /// the same reason — the matches are held under the single writer.
+    /// A single-document request (`stop_after = Some(1)`) is one chunk of
+    /// one, and behaves exactly as before.
     pub fn modify_where(
         &self,
         coll: &CollectionMeta,
@@ -164,43 +181,82 @@ impl Engine {
         spec: &dyn ModifySpec,
         stop_after: Option<usize>,
     ) -> Result<ModifyManyOutcome> {
-        let txn = self.begin_write()?;
+        let chunk = self.multi_chunk_docs();
+        let mut outcome = ModifyManyOutcome::default();
+        let mut after: Option<Vec<u8>> = None;
 
-        let (matches, examined) =
-            match self.collect_matches(&txn, coll, candidates, spec, stop_after) {
+        loop {
+            // This chunk's budget: the chunk size, or what is left of
+            // `stop_after`, whichever is smaller.
+            let remaining =
+                stop_after.map_or(usize::MAX, |n| n.saturating_sub(outcome.matched as usize));
+            let budget = remaining.min(chunk);
+            if budget == 0 {
+                break;
+            }
+
+            let txn = self.begin_write()?;
+            let (matches, examined) = match self.collect_matches(
+                &txn,
+                coll,
+                candidates,
+                spec,
+                Some(budget),
+                after.as_deref(),
+            ) {
                 Ok(found) => found,
                 Err(e) => {
                     txn.abort()?;
                     return Err(e);
                 }
             };
+            outcome.examined += examined;
 
-        let mut entries = Vec::with_capacity(matches.len());
-        for (stamp, before) in &matches {
-            match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
-                Ok((_, entry)) => entries.push(entry),
+            let Some((_, last)) = matches.last() else {
+                // Nothing (more) matched: a no-op must not commit, mint or
+                // publish.
+                txn.abort()?;
+                break;
+            };
+            let last_key = match extract_id(last).and_then(|id| crate::docs::doc_key(&id)) {
+                Ok(key) => key,
                 Err(e) => {
                     txn.abort()?;
                     return Err(e);
                 }
+            };
+
+            let mut entries = Vec::with_capacity(matches.len());
+            for (stamp, before) in &matches {
+                match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
+                    Ok((_, entry)) => entries.push(entry),
+                    Err(e) => {
+                        txn.abort()?;
+                        return Err(e);
+                    }
+                }
+            }
+
+            txn.commit()?;
+            outcome.commits += 1;
+            outcome.matched += matches.len() as u64;
+            outcome.modified += entries.len() as u64;
+            // Published per chunk, after its commit: a subscriber sees a
+            // chunk whole before the next one begins.
+            self.publish(entries);
+
+            let short = matches.len() < budget;
+            after = Some(last_key);
+            if short {
+                break;
             }
         }
 
-        let matched = matches.len() as u64;
-        if entries.is_empty() {
-            // Nothing matched: a no-op must not commit, mint or publish —
-            // unless the caller expected a version to be there.
-            txn.abort()?;
-            if spec.expected_stamp().is_some() {
-                return Err(StorageError::Stale { current: None });
-            }
-            return Ok(ModifyManyOutcome { examined, matched, modified: 0 });
+        if outcome.matched == 0 && spec.expected_stamp().is_some() {
+            // The caller expected a version to be there, and nothing was.
+            return Err(StorageError::Stale { current: None });
         }
-
-        txn.commit()?;
-        let modified = entries.len() as u64;
-        self.publish(entries);
-        Ok(ModifyManyOutcome { examined, matched, modified })
+        Ok(outcome)
     }
 
     /// Find one document, change it, and return it — atomically.
@@ -319,7 +375,7 @@ impl Engine {
         spec: &dyn ModifySpec,
     ) -> Result<Option<(Stamp, Document)>> {
         // Every match, because the sort has to see them all to pick one.
-        let (mut matches, _) = self.collect_matches(txn, coll, candidates, spec, None)?;
+        let (mut matches, _) = self.collect_matches(txn, coll, candidates, spec, None, None)?;
 
         if matches.is_empty() {
             return Ok(None);
@@ -332,11 +388,16 @@ impl Engine {
     }
 
     /// Every live document among the candidates that the spec matches, in
-    /// scan order, with how many were examined to find them.
+    /// document-key order, with how many were examined to find them.
     ///
     /// `limit` stops the scan once that many have matched — what a
-    /// single-document `update` wants. `None` collects them all, which is
-    /// what a sort needs and what `multi` means.
+    /// single-document `update` wants, and what a chunk of a `multi` one
+    /// wants. `None` collects them all, which is what a sort needs; only then
+    /// does the [`MAX_CANDIDATES`] refusal apply, because a bounded scan
+    /// cannot hold the writer for an unbounded time. `after` resumes strictly
+    /// past an encoded document key, which is how one chunk follows another
+    /// without revisiting anything — every candidate path delivers keys in
+    /// order, so it is a bound, not a filter.
     fn collect_matches(
         &self,
         txn: &redb::WriteTransaction,
@@ -344,6 +405,7 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
         limit: Option<usize>,
+        after: Option<&[u8]>,
     ) -> Result<(Vec<(Stamp, Document)>, u64)> {
         let mut matches: Vec<(Stamp, Document)> = Vec::new();
         let mut examined = 0u64;
@@ -356,11 +418,10 @@ impl Engine {
                     return Ok(true);
                 }
                 matches.push((stamp, doc));
-                if matches.len() > MAX_CANDIDATES {
+                if limit.is_none() && matches.len() > MAX_CANDIDATES {
                     // Refused, not truncated: choosing from a prefix would return
-                    // a document that is not the one the sort asked for, and a
-                    // filtered write over a prefix would silently leave the rest
-                    // — and no caller could tell either happened.
+                    // a document that is not the one the sort asked for, and no
+                    // caller could tell it happened.
                     return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
                         "the filter matched more than {MAX_CANDIDATES} documents; \
                      narrow the filter, or add an index and a tighter one"
@@ -372,13 +433,14 @@ impl Engine {
         let docs = txn.open_table(tables::DOCS)?;
 
         // Direct lookups share one body: a `$in` union of index ranges and a
-        // list of primary keys can both offer one document twice.
-        let mut lookup = |keys: &mut dyn Iterator<Item = Vec<u8>>,
-                          matches: &mut Vec<(Stamp, Document)>|
-         -> Result<()> {
-            let mut seen: std::collections::BTreeSet<Vec<u8>> = Default::default();
+        // list of primary keys can both offer one document twice. Keys are
+        // sorted first so the walk is in key order, which `after` relies on.
+        let mut lookup = |keys: Vec<Vec<u8>>, matches: &mut Vec<(Stamp, Document)>| -> Result<()> {
+            let mut keys = keys;
+            keys.sort();
+            keys.dedup();
             for key in keys {
-                if !seen.insert(key.clone()) {
+                if after.is_some_and(|bound| key.as_slice() <= bound) {
                     continue;
                 }
                 let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
@@ -397,7 +459,7 @@ impl Engine {
         };
 
         match candidates {
-            Candidates::Keys(keys) => lookup(&mut keys.iter().cloned(), &mut matches)?,
+            Candidates::Keys(keys) => lookup(keys.clone(), &mut matches)?,
             Candidates::Index { index_id, ranges, both_bounds } => {
                 // The multikey flag is re-read here, in the transaction that
                 // scans — a `false` from the caller's earlier read proves
@@ -414,14 +476,16 @@ impl Engine {
                             Some(upper),
                         )?);
                     }
-                    lookup(&mut keys.into_iter(), &mut matches)?;
+                    lookup(keys, &mut matches)?;
                 } else {
-                    scan_until(&docs, coll, &mut |stamp, doc| consider(stamp, doc, &mut matches))?;
+                    scan_until(&docs, coll, after, &mut |stamp, doc| {
+                        consider(stamp, doc, &mut matches)
+                    })?;
                 }
             }
-            Candidates::Scan => {
-                scan_until(&docs, coll, &mut |stamp, doc| consider(stamp, doc, &mut matches))?
-            }
+            Candidates::Scan => scan_until(&docs, coll, after, &mut |stamp, doc| {
+                consider(stamp, doc, &mut matches)
+            })?,
         }
 
         Ok((matches, examined))
@@ -477,14 +541,15 @@ impl Engine {
     }
 }
 
-/// Every live document in the collection, inside the caller's transaction,
-/// until `f` answers `false`.
+/// Every live document in the collection strictly after `after`, inside the
+/// caller's transaction, until `f` answers `false`.
 fn scan_until(
     docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
     coll: &CollectionMeta,
+    after: Option<&[u8]>,
     f: &mut impl FnMut(Stamp, Document) -> Result<bool>,
 ) -> Result<()> {
-    for entry in docs.range(doc_range(coll.id))? {
+    for entry in docs.range(doc_range_after(coll.id, after))? {
         let (_, value) = entry?;
         let record = codec::decode_doc_record(value.value())?;
         if record.deleted {
@@ -868,7 +933,7 @@ mod tests {
         let before = engine.commits();
         let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
         assert_eq!(engine.commits() - before, 1, "one request, one commit");
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3 });
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1 });
 
         for id in [1i64, 2, 4] {
             let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
@@ -894,7 +959,7 @@ mod tests {
         let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(1)).unwrap();
         // Documents scan in key order and _id 1 is pending, so the scan
         // stops at the first document it looks at.
-        assert_eq!(out, ModifyManyOutcome { examined: 1, matched: 1, modified: 1 });
+        assert_eq!(out, ModifyManyOutcome { examined: 1, matched: 1, modified: 1, commits: 1 });
         assert_eq!(
             engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
             "claimed"
@@ -920,7 +985,7 @@ mod tests {
         };
         let before = engine.commits();
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 0, modified: 0 });
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 0, modified: 0, commits: 0 });
         assert_eq!(engine.commits() - before, 0, "a no-op must not reach the disk");
         assert!(rx.try_recv().is_err(), "a no-op must publish nothing");
     }
@@ -969,7 +1034,7 @@ mod tests {
             upsert: None,
         };
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3 });
+        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1 });
         for id in [1i64, 2, 4] {
             assert!(engine.get(&coll, &DocId::Int64(id)).unwrap().is_none(), "_id {id} removed");
         }
@@ -989,7 +1054,7 @@ mod tests {
         let candidates = Candidates::Keys(vec![key(2), key(99), key(1), key(1), key(3)]);
 
         let out = engine.modify_where(&coll, &candidates, &claim_all(), None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 2, matched: 1, modified: 1 });
+        assert_eq!(out, ModifyManyOutcome { examined: 2, matched: 1, modified: 1, commits: 1 });
         assert_eq!(
             engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
             "claimed"
@@ -1044,22 +1109,123 @@ mod tests {
     }
 
     #[test]
-    fn over_the_cap_refuses_a_filtered_write_too() {
-        // The same ceiling as `find_and_modify`, for the same reason: the
-        // matches are held under the single writer. Refused, so nothing is
-        // silently left behind.
+    fn a_filtered_write_past_the_cap_commits_in_chunks_rather_than_refusing() {
+        // What `find_and_modify` refuses, a `multi` write chunks (ADR-086):
+        // 10,001 matches at the default chunk of 1,000 is eleven commits,
+        // every document written, none visited twice.
         let (engine, coll, _dir) = engine();
         let batch: Vec<Document> = (0..=MAX_CANDIDATES as i64)
             .map(|id| doc! {"_id": id, "created": id, "status": "pending"})
             .collect();
         engine.insert_many(&coll, batch).unwrap();
 
+        // `find_and_modify` still refuses: it has to sort the whole set.
+        assert!(engine.find_and_modify(&coll, &Candidates::Scan, &claim()).is_err());
+
         let before = engine.commits();
-        assert!(engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).is_err());
-        assert_eq!(engine.commits() - before, 0);
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
+        assert_eq!(out.commits, 11);
+        assert_eq!(engine.commits() - before, 11);
+        assert_eq!((out.matched, out.modified), (10_001, 10_001));
+        assert_eq!(out.examined, 10_001, "no document examined twice across chunks");
         assert_eq!(
-            engine.get(&coll, &DocId::Int64(0)).unwrap().unwrap().get_str("status").unwrap(),
-            "pending"
+            engine.get(&coll, &DocId::Int64(10_000)).unwrap().unwrap().get_str("status").unwrap(),
+            "claimed"
+        );
+    }
+
+    #[test]
+    fn a_multi_write_commits_in_chunks_of_the_configured_size() {
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(5);
+        assert_eq!(engine.multi_chunk_docs(), 5);
+        let batch: Vec<Document> =
+            (0..12i64).map(|id| doc! {"_id": id, "created": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        let mut rx = engine.subscribe();
+
+        let before = engine.commits();
+        let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
+        assert_eq!(out, ModifyManyOutcome { examined: 12, matched: 12, modified: 12, commits: 3 });
+        assert_eq!(engine.commits() - before, 3, "5 + 5 + 2");
+
+        // Events arrive chunk by chunk, in key order: a subscriber sees the
+        // first five whole before the second chunk begins.
+        let mut ids = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            ids.push(entry.doc_id.clone().unwrap().to_string());
+        }
+        let expected: Vec<String> = (0..12i64).map(|i| DocId::Int64(i).to_string()).collect();
+        assert_eq!(ids, expected);
+
+        // The clamp: zero would never advance, and above the cap would hold
+        // the writer longer than `find_and_modify` may.
+        engine.set_multi_chunk_docs(0);
+        assert_eq!(engine.multi_chunk_docs(), 1);
+        engine.set_multi_chunk_docs(usize::MAX);
+        assert_eq!(engine.multi_chunk_docs(), MAX_CANDIDATES);
+    }
+
+    #[test]
+    fn a_failure_in_a_later_chunk_leaves_the_earlier_chunks_committed() {
+        // The bound on what a crash or a refusal can lose is one chunk: what
+        // landed before it stays, and the oplog says exactly what that was.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(4);
+        let batch: Vec<Document> =
+            (0..10i64).map(|id| doc! {"_id": id, "created": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+        let mut rx = engine.subscribe();
+
+        let spec = TestSpec {
+            matches: |d: &Document| d.get_str("status").map(|s| s == "pending").unwrap_or(false),
+            compare: |_: &Document, _: &Document| Ordering::Equal,
+            apply: |d: &Document| {
+                if i64_of(d, "_id") == 6 {
+                    return Err("nope".to_string());
+                }
+                let mut next = d.clone();
+                next.insert("status", "claimed");
+                Ok(Some(next))
+            },
+            upsert: None,
+        };
+        let before = engine.commits();
+        assert!(engine.modify_where(&coll, &Candidates::Scan, &spec, None).is_err());
+        assert_eq!(engine.commits() - before, 1, "chunk one committed, chunk two aborted");
+        for id in 0..4i64 {
+            let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(doc.get_str("status").unwrap(), "claimed", "_id {id} is in chunk one");
+        }
+        for id in 4..10i64 {
+            let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(doc.get_str("status").unwrap(), "pending", "_id {id} is past the failure");
+        }
+        let mut events = 0;
+        while rx.try_recv().is_ok() {
+            events += 1;
+        }
+        assert_eq!(events, 4, "exactly the committed chunk was published");
+    }
+
+    #[test]
+    fn chunks_resume_through_keys_and_an_index_without_revisiting() {
+        // `after` is a bound on every candidate path, not only the scan.
+        let (engine, coll, _dir) = engine();
+        engine.set_multi_chunk_docs(3);
+        let batch: Vec<Document> =
+            (0..8i64).map(|id| doc! {"_id": id, "created": id, "status": "pending"}).collect();
+        engine.insert_many(&coll, batch).unwrap();
+
+        // Keys, offered out of order and with a duplicate.
+        let key = |id: i64| crate::docs::doc_key(&DocId::Int64(id)).unwrap();
+        let keys = Candidates::Keys(vec![key(7), key(2), key(5), key(2), key(0), key(3), key(6)]);
+        let out = engine.modify_where(&coll, &keys, &claim_all(), None).unwrap();
+        assert_eq!(out, ModifyManyOutcome { examined: 6, matched: 6, modified: 6, commits: 2 });
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
+            "pending",
+            "a key not offered is untouched"
         );
     }
 

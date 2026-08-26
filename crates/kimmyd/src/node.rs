@@ -65,6 +65,7 @@ pub async fn run(config: Config) -> Result<()> {
     let engine = Arc::new(
         Engine::open(&path).with_context(|| format!("opening database {}", path.display()))?,
     );
+    engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
 
     // Version and commit together, because during a rolling upgrade or an
     // incident the question is "which build is this exactly", and a version

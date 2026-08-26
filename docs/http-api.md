@@ -306,18 +306,21 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
 writes in one transaction, on the image that transaction holds, so two
 concurrent `$inc`s on one document both land — the same guarantee
 `find_and_modify` makes, through the same engine path (ADR-083). A
-`multi: true` request commits as **one transaction**: all of it or none of
-it, and one fsync rather than one per document.
+`multi: true` request commits in **chunks** of `storage.multi_chunk_docs`
+documents (default 1,000): each chunk is one transaction and one fsync, the
+writer is released between chunks, and the response's `commits` field says
+how many chunks landed ([ADR-086](decisions.md)).
 
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
 names one document.
 
-> **Sharp edge.** Because the writer is held for the whole request, a
-> `multi: true` update or delete is **refused above 10,000 matches** — the
-> same ceiling and the same error as `find_and_modify`. Narrow the filter, or
-> add an index and a tighter one. See [Storage](storage.md).
+> **Sharp edge.** A `multi: true` request is atomic per chunk, not per
+> request: a failure in a later chunk leaves the earlier chunks committed and
+> answers with an error. Nothing is visited twice and the oplog reflects
+> exactly what landed, but a caller that needs the count reads it back. See
+> [Storage](storage.md).
 
 ### Describe
 

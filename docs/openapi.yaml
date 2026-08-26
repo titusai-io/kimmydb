@@ -1356,8 +1356,10 @@ paths:
       description: |
         The operators run **inside the write transaction**, on the image it
         holds, so concurrent updates to one document all land (ADR-083). A
-        `multi: true` request is one transaction — all of it or none — and
-        is refused above 10,000 matches rather than partly done.
+        `multi: true` request commits in chunks of `storage.multi_chunk_docs`
+        documents (default 1,000), releasing the writer between chunks; each
+        chunk is all or none, and a failure in a later chunk leaves the
+        earlier ones committed — `commits` says how many landed (ADR-086).
 
         With `if_stamp`, the write happens only if the matched document is
         at that version; otherwise `409 stale` and nothing is written
@@ -1403,6 +1405,12 @@ paths:
                       Matched but unchanged documents count in `matched` and
                       not here — an update that sets a field to the value it
                       already holds modifies nothing.
+                  commits:
+                    type: integer
+                    description: |
+                      Write transactions the request cost — one per chunk of
+                      `storage.multi_chunk_docs` documents, zero when nothing
+                      matched (ADR-086).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1499,9 +1507,10 @@ paths:
       operationId: deleteDocuments
       summary: Delete matching documents.
       description: |
-        Like `update`: matched and tombstoned in one transaction, `multi: true`
-        is all or none and refused above 10,000 matches, and `if_stamp` makes
-        a single-document delete conditional on its version.
+        Like `update`: matched and tombstoned inside the write transaction,
+        `multi: true` commits in chunks of `storage.multi_chunk_docs` with the
+        writer released between them, and `if_stamp` makes a single-document
+        delete conditional on its version.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1533,6 +1542,9 @@ paths:
                 properties:
                   deleted:
                     type: integer
+                  commits:
+                    type: integer
+                    description: Write transactions the request cost — one per chunk (ADR-086).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }

@@ -245,6 +245,14 @@ pub struct StorageConfig {
     ///
     /// Zero disables expiry, which leaves any TTL index defined but inert.
     pub ttl_interval_secs: u64,
+    /// Documents a `multi: true` update or delete commits per transaction
+    /// (ADR-086).
+    ///
+    /// The writer is released between chunks, so this bounds how long one
+    /// request can hold it; a crash or a refusal loses at most the chunk in
+    /// flight. Must be between 1 and 10,000 — the same ceiling
+    /// `find_and_modify` holds the writer for.
+    pub multi_chunk_docs: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -845,6 +853,7 @@ impl Default for StorageConfig {
             // rather than a deadline, so a tighter interval would multiply
             // scans for accuracy no caller can observe.
             ttl_interval_secs: 60,
+            multi_chunk_docs: kimmy_storage::modify::DEFAULT_MULTI_CHUNK_DOCS,
         }
     }
 }
@@ -1029,6 +1038,18 @@ impl Config {
         // against, and its own older image of the document wins. Retention set
         // the other way round is the only configuration in which a partition
         // shorter than the oplog window resurrects data (ADR-085).
+        if self.storage.multi_chunk_docs == 0
+            || self.storage.multi_chunk_docs > kimmy_storage::MAX_CANDIDATES
+        {
+            anyhow::bail!(
+                "storage.multi_chunk_docs ({}) must be between 1 and {}: zero would never \
+                 advance, and more would hold the single writer for longer than any other \
+                 request may",
+                self.storage.multi_chunk_docs,
+                kimmy_storage::MAX_CANDIDATES,
+            );
+        }
+
         if self.storage.tombstone_retention_secs < self.storage.oplog_retention_secs {
             anyhow::bail!(
                 "storage.tombstone_retention_secs ({}) is shorter than \
@@ -1322,6 +1343,19 @@ mod tests {
         cfg.storage.tombstone_retention_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn the_multi_chunk_size_is_bounded() {
+        let mut cfg = valid();
+        cfg.storage.multi_chunk_docs = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("multi_chunk_docs"));
+        cfg.storage.multi_chunk_docs = kimmy_storage::MAX_CANDIDATES + 1;
+        assert!(cfg.validate().is_err());
+        cfg.storage.multi_chunk_docs = kimmy_storage::MAX_CANDIDATES;
+        cfg.validate().unwrap();
+        cfg.storage.multi_chunk_docs = 1;
+        cfg.validate().unwrap();
     }
 
     #[test]
