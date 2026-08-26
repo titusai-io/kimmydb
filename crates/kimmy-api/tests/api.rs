@@ -706,6 +706,8 @@ async fn a_multi_update_reports_its_commits() {
         )
         .await;
     assert_eq!(res.body["commits"], 0, "nothing matched, nothing committed");
+}
+
 /// A cross-node unique collision is reported until one side is gone (ADR-087).
 ///
 /// The collision is manufactured through `apply_remote`, exactly as the
