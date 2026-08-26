@@ -311,7 +311,9 @@ same key and converge to one document, so primary-key uniqueness holds by
 construction. The residue is that the losing insert's content is discarded
 where a client might have expected a `409` — a lost-update, not a duplicate.
 
-Full reasoning in [ADR-020](decisions.md).
+Full reasoning in [ADR-020](decisions.md). What still stands is queryable:
+`GET …/violations` reports the collisions whose documents all still exist,
+per index or as groups with their documents ([ADR-087](decisions.md)).
 
 ---
 

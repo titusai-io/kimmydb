@@ -4093,6 +4093,52 @@ gap ADR-083 closed. A configurable "all or nothing up to N": that is
 **Cost.** One more field on two responses; one configuration key; a chunk
 boundary is a place a concurrent writer can interleave, which the documents
 call out. `examined` and `matched` sum across chunks.
+## ADR-087 — Standing unique violations are a query, derived from the oplog
+
+**Decision.** `GET /v1/db/{db}/coll/{coll}/violations` reports the unique
+violations that still stand on a collection: a count per index, or with
+`?index=<name>` the colliding groups, each with its `_id`s, the `_id` whose
+merge revealed the collision, and the documents themselves. It is derived on
+request from the retained oplog's `UniqueViolation` entries (ADR-029),
+deduplicated by index and id set, keeping only those whose named documents
+all still exist. Authorised as `read`. Nothing new is stored and nothing is
+written by the route.
+
+**Why derived rather than kept.** A table of open violations would be a
+second record of a fact the oplog already holds, with its own lifecycle —
+cleared when? by whom? — and a second thing replication would have to carry.
+The oplog entry is already there on every node that merged the collision, it
+already names the documents, and "still standing" is one read per named id.
+A pass over the retained oplog costs what retention bounds, on a route
+nobody calls in a loop.
+
+**Why "all documents still exist" is the definition of standing.** The
+violation is that two `_id`s share a key. Once either document is gone the
+key is unique again, so a delete always resolves it and the report clears. A
+rewrite that changes the colliding value *also* resolves it — but this route
+does not notice, because it does not re-evaluate keys. That is the honest
+limit of deriving from the event: the report can over-state after a rewrite,
+never under-state after a delete. The recipe in `indexes.md` says so, and a
+client that rewrote can confirm with `find`. Re-evaluating keys on the route
+would mean re-running index maintenance in order to read, which is where a
+cheap derived query stops being cheap.
+
+**Why `read` rather than `admin`.** The documents are readable, and the
+`uniqueViolation` change-stream event that announced the collision is
+readable by anyone with `watch`. Hiding the resolution view behind `admin`
+would make the one principal that has to fix the data the one that cannot
+see what is broken. `/metrics` keeps its name-free count for the same reason
+it always has.
+
+**Alternatives.** Refuse the merge instead: ADR-029 already declined that —
+refusing a replicated write is how two nodes stop agreeing. Emit only the
+event: it is the durable record, but a client that missed it has nothing to
+ask. A metric with index labels: leaks schema on an unauthenticated port.
+
+**Cost.** One oplog pass and one read per named document, per request; a
+report that can over-state after a rewrite, documented; bounded by retention
+— a collision older than the oplog window is no longer listed, and the
+change-stream event is the record that outlives it.
 
 ## Next
 

@@ -1673,6 +1673,64 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
 
+  /v1/db/{db}/coll/{coll}/violations:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+      - $ref: "#/components/parameters/Coll"
+    get:
+      tags: [indexes]
+      operationId: listViolations
+      summary: Unique-index violations still standing on a collection.
+      description: |
+        Uniqueness is enforced on the accepting node and only *detected* across
+        nodes, after the fact, when a replicated write is merged (ADR-029). Each
+        detection is a `uniqueViolation` change-stream event and a count on
+        `/metrics`; this route is the resolution side — which violations still
+        stand *now*. A violation whose colliding documents no longer all exist
+        is resolved and is not reported (ADR-087).
+
+        Without `index`, a count per index. With `index`, the colliding groups
+        on that index with their documents, at most 10,000 groups.
+      x-kimmy-action: read
+      parameters:
+        - name: index
+          in: query
+          required: false
+          schema: { type: string }
+          description: Return the colliding groups on this index rather than counts.
+      responses:
+        "200":
+          description: Counts per index, or the groups on one index.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - type: object
+                    required: [count, indexes]
+                    properties:
+                      count:
+                        type: integer
+                        description: Violations standing across every index.
+                      indexes:
+                        type: array
+                        items:
+                          type: object
+                          required: [name, count]
+                          properties:
+                            name: { type: string }
+                            count: { type: integer }
+                  - type: object
+                    required: [index, count, groups]
+                    properties:
+                      index: { type: string }
+                      count: { type: integer }
+                      groups:
+                        type: array
+                        items: { $ref: "#/components/schemas/ViolationGroup" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
   /v1/db/{db}/coll/{coll}/indexes:
     parameters:
       - $ref: "#/components/parameters/Db"
@@ -2829,6 +2887,22 @@ components:
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.
+
+    ViolationGroup:
+      type: object
+      description: |
+        Documents sharing a key under a unique index, all of which still exist.
+        `merged` is the one whose arrival revealed the collision — the
+        actionable one, since the others were already visible to clients.
+      required: [ids, merged, documents]
+      properties:
+        ids:
+          type: array
+          items: {}
+        merged: {}
+        documents:
+          type: array
+          items: { $ref: "#/components/schemas/Document" }
 
     Index:
       type: object

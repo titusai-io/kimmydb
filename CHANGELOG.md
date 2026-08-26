@@ -18,6 +18,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   or delete commits per transaction (default 1,000; 1 to 10,000). `update`
   and `delete` responses gain `commits`, the number of chunks the request
   landed (ADR-086).
+- **`GET /v1/db/{db}/coll/{coll}/violations`** — the unique-index violations
+  still standing on a collection: counts per index, or with `?index=<name>`
+  the colliding groups with their documents. Derived from the retained
+  oplog's `uniqueViolation` entries, keeping only those whose documents all
+  still exist, so deleting one side resolves it. Authorised as `read`;
+  `/metrics` keeps its name-free count (ADR-087).
 
 ### Changed
 
