@@ -682,6 +682,66 @@ impl Engine {
     /// A separate transaction from the merge itself, deliberately. The merge
     /// must not fail because reporting failed: a converged write with an
     /// unreported violation is bad, but a *rejected* replicated write is worse,
+    /// Unique violations still standing on a collection (ADR-087).
+    ///
+    /// Every `UniqueViolation` entry in the retained oplog for this
+    /// collection whose named documents **all still exist** — one deleted
+    /// resolves it, and it is not reported. Deduplicated by index and id set,
+    /// because a collision is recorded once per node that merged it and a
+    /// resend must not read as two. Costs one pass over the retained oplog,
+    /// which retention bounds; a route, not a hot path.
+    pub fn live_unique_violations(
+        &self,
+        coll: &CollectionMeta,
+    ) -> Result<Vec<kimmy_core::UniqueViolationDetail>> {
+        const PAGE: usize = 1024;
+        let mut out = Vec::new();
+        let mut seen: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
+        let mut from = kimmy_core::Hlc::ZERO;
+        let mut last_seen: Option<Stamp> = None;
+        loop {
+            let page = self.read_oplog_from(from, PAGE)?;
+            let Some(last) = page.last() else { break };
+            let last_stamp = last.stamp;
+            for entry in &page {
+                // `read_oplog_from` is inclusive at `from`, so the first
+                // entries of a page can repeat the previous page's tail.
+                if last_seen.is_some_and(|s| entry.stamp <= s) {
+                    continue;
+                }
+                if entry.kind != OpKind::UniqueViolation || entry.collection != coll.id {
+                    continue;
+                }
+                let Some(body) = &entry.body else { continue };
+                let detail: kimmy_core::UniqueViolationDetail = bson::deserialize_from_slice(body)?;
+                if detail.ids.is_empty() {
+                    continue;
+                }
+                let mut key: Vec<String> = detail.ids.iter().map(|id| id.to_string()).collect();
+                key.sort();
+                if !seen.insert((detail.index.clone(), key)) {
+                    continue;
+                }
+                let mut all_live = true;
+                for id in &detail.ids {
+                    if self.get(coll, id)?.is_none() {
+                        all_live = false;
+                        break;
+                    }
+                }
+                if all_live {
+                    out.push(detail);
+                }
+            }
+            if page.len() < PAGE {
+                break;
+            }
+            from = last_stamp.hlc;
+            last_seen = Some(last_stamp);
+        }
+        Ok(out)
+    }
+
     /// because the nodes then never agree.
     fn log_unique_violation(
         &self,

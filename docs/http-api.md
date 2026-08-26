@@ -72,6 +72,7 @@ has been incomplete before.
 | `DELETE` | `/v1/db/{db}/coll/{coll}/webhooks/{id}` | `webhook` ([Webhooks](webhooks.md)) |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
+| `GET` | `/v1/db/{db}/coll/{coll}/violations` | `read` — unique violations still standing ([Indexes](indexes.md#resolving-a-unique-violation)) |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
 | `GET` | `/v1/admin/backup` | `admin` over `*` — see [Backup](#backup) |
 | `POST` | `/mcp` | authenticated; per-tool ([MCP](mcp.md)) |
@@ -444,6 +445,13 @@ a client can rely on.
 A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 `"enforcement": "coordinated"` returns **501** until clustering lands — a
 `local` unique index is a single-node guarantee. See [Indexes](indexes.md).
+
+Across nodes a collision is detected when the replicated write is merged, not
+prevented, and both documents stay. `GET …/violations` lists what still
+stands — counts per index, or with `?index=<name>` the colliding groups with
+their documents — so the application can choose; a violation whose documents
+no longer all exist drops out of the report
+([resolving a unique violation](indexes.md#resolving-a-unique-violation)).
 
 Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
 an index was used:

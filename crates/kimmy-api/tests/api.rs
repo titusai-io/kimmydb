@@ -706,6 +706,82 @@ async fn a_multi_update_reports_its_commits() {
         )
         .await;
     assert_eq!(res.body["commits"], 0, "nothing matched, nothing committed");
+/// A cross-node unique collision is reported until one side is gone (ADR-087).
+///
+/// The collision is manufactured through `apply_remote`, exactly as the
+/// storage tests do: a remote insert carrying a value a local document
+/// already holds under a unique index. That is the same code path a
+/// replicated write takes, without spawning a second process.
+#[tokio::test]
+async fn standing_unique_violations_are_reported_until_resolved() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    server
+        .post(
+            "/v1/db/shop/coll/users/docs",
+            Some(&token),
+            json!({"_id": "local", "email": "clash@x"}),
+        )
+        .await;
+
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
+
+    // A peer inserted the same email under another _id; merging it breaks
+    // the constraint on this node.
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    let remote = kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(9_000, 0),
+            kimmy_core::NodeId::generate(),
+        ),
+        kind: kimmy_core::OpKind::Insert,
+        collection: meta.id,
+        doc_id: Some(kimmy_core::DocId::String("remote".into())),
+        body: Some(
+            bson::serialize_to_vec(&bson::doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
+        ),
+    };
+    server.state.engine.apply_remote(&meta, &remote).unwrap();
+
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    assert_eq!(res.body["indexes"], json!([{ "name": "email_1", "count": 1 }]));
+
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    let group = &res.body["groups"][0];
+    assert_eq!(group["merged"], "remote");
+    let mut ids: Vec<String> =
+        group["ids"].as_array().unwrap().iter().map(|v| v.as_str().unwrap().to_string()).collect();
+    ids.sort();
+    assert_eq!(ids, vec!["local", "remote"]);
+    assert_eq!(
+        group["documents"].as_array().unwrap().len(),
+        2,
+        "both documents, to choose between"
+    );
+
+    let res = server.get("/v1/db/shop/coll/users/violations?index=other", Some(&token)).await;
+    assert_eq!(res.body["count"], 0);
+
+    // Resolve it by deleting one side: the report clears.
+    server.delete("/v1/db/shop/coll/users/docs/remote", Some(&token)).await;
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body["count"], 0, "{:?}", res.body);
+
+    // Read is enough to look; a principal without it is refused.
+    let res = server.get("/v1/db/shop/coll/users/violations", None).await;
+    assert_eq!(res.status, 401);
 }
 
 /// Concurrent `$inc`s on one document must all land.

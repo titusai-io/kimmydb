@@ -115,6 +115,7 @@ fn routes(state: SharedState) -> Router {
         .route("/v1/db/{db}/coll/{coll}/describe", get(describe_collection))
         .route("/v1/db/{db}/coll/{coll}/indexes", get(list_indexes).post(create_index))
         .route("/v1/db/{db}/coll/{coll}/indexes/{name}", delete(drop_index))
+        .route("/v1/db/{db}/coll/{coll}/violations", get(list_violations))
         .route(
             "/v1/db/{db}/coll/{coll}/vector",
             get(crate::vectors::get_vector_config)
@@ -1010,6 +1011,22 @@ async fn list_indexes(
     Path((db, coll)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::list_indexes(&state, &auth, &db, &coll)?))
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ViolationsQuery {
+    /// Name the index to get its colliding groups rather than counts.
+    index: Option<String>,
+}
+
+async fn list_violations(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path((db, coll)): Path<(String, String)>,
+    Query(q): Query<ViolationsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(exec::violations(&state, &auth, &db, &coll, q.index.as_deref())?))
 }
 
 async fn drop_index(

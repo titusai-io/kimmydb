@@ -989,6 +989,25 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     )
     .await;
 
+    c.check(
+        "GET",
+        "/v1/db/{db}/coll/{coll}/violations",
+        "/v1/db/shop/coll/orders/violations",
+        Some(&root),
+        None,
+        200,
+    )
+    .await;
+    c.check(
+        "GET",
+        "/v1/db/{db}/coll/{coll}/violations",
+        "/v1/db/shop/coll/orders/violations?index=sku_1",
+        Some(&root),
+        None,
+        200,
+    )
+    .await;
+
     // -- indexes -----------------------------------------------------------
     let index = c
         .check(

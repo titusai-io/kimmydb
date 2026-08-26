@@ -1129,6 +1129,52 @@ pub fn list_indexes(
     Ok(json!({ "indexes": indexes }))
 }
 
+/// Unique violations standing on a collection — the ones a client has to
+/// resolve, not the ones that were ever recorded (ADR-087).
+///
+/// Without `index`: a count per index. With it: the colliding groups on that
+/// index, each with its documents, so the caller can decide which to keep.
+/// Authorised as `read`: the documents are readable already, and so is the
+/// change-stream event that announced the collision. `/metrics` keeps its
+/// name-free count.
+pub fn violations(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    index: Option<&str>,
+) -> Result<Value, ApiError> {
+    let _span = op_span("violations", db, Some(coll)).entered();
+    let meta = authorize(state, auth, Action::Read, db, coll)?;
+    let live = state.engine.live_unique_violations(&meta)?;
+
+    let Some(name) = index else {
+        let mut per_index: std::collections::BTreeMap<&str, u64> = Default::default();
+        for v in &live {
+            *per_index.entry(v.index.as_str()).or_default() += 1;
+        }
+        let indexes: Vec<Value> =
+            per_index.iter().map(|(name, count)| json!({ "name": name, "count": count })).collect();
+        return Ok(json!({ "count": live.len(), "indexes": indexes }));
+    };
+
+    let mut groups = Vec::new();
+    for v in live.iter().filter(|v| v.index == name).take(MAX_LIMIT) {
+        let mut documents = Vec::with_capacity(v.ids.len());
+        for id in &v.ids {
+            if let Some(doc) = state.engine.get(&meta, id)? {
+                documents.push(document_to_json(&doc));
+            }
+        }
+        groups.push(json!({
+            "ids": v.ids.iter().map(|id| crate::json::bson_to_json(&id.to_bson())).collect::<Vec<_>>(),
+            "merged": crate::json::bson_to_json(&v.merged.to_bson()),
+            "documents": documents,
+        }));
+    }
+    Ok(json!({ "index": name, "count": groups.len(), "groups": groups }))
+}
+
 pub fn drop_index(
     state: &SharedState,
     auth: &Auth,

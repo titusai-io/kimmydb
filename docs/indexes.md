@@ -400,6 +400,39 @@ enough to prove containment.
 
 ---
 
+## Resolving a unique violation
+
+A `local` unique index is enforced on the node that accepts a write and only
+*detected* across nodes, after the fact, when a replicated write is merged
+([ADR-029](decisions.md)): both documents exist, the constraint is broken, and
+the database cannot choose between them. Detection is a `uniqueViolation`
+change-stream event and the `kimmy_unique_violations` count; **resolution**
+is the application's, and `GET …/violations` is where it starts
+([ADR-087](decisions.md)):
+
+```bash
+# Which indexes have violations standing right now, and how many
+curl localhost:7878/v1/db/shop/coll/users/violations -H "$A"
+# -> { "count": 1, "indexes": [ { "name": "email_1", "count": 1 } ] }
+
+# The colliding groups on one index, each with its documents
+curl 'localhost:7878/v1/db/shop/coll/users/violations?index=email_1' -H "$A"
+# -> { "index": "email_1", "count": 1, "groups": [
+#      { "ids": ["local", "remote"], "merged": "remote",
+#        "documents": [ {...}, {...} ] } ] }
+```
+
+The recipe: for each group, decide which document keeps the value — `merged`
+is the one whose arrival revealed the collision, the others were already
+visible — then delete or rewrite the rest. A violation whose documents no
+longer all exist is resolved and stops being reported; nothing is written by
+the route itself. The report is derived from the retained oplog, so a
+collision older than `storage.oplog_retention_secs` is no longer listed even
+if both documents still exist — the change-stream event is the durable
+record, and an application that needs longer memory keeps it.
+
+---
+
 ## TTL indexes — expiring documents
 
 An index with `expireAfterSeconds` also becomes a **policy**: a background pass

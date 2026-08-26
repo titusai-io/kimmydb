@@ -6,6 +6,27 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **standing unique violations are a query**
+
+Branch `feat/unique-violation-surfacing`, ADR-087. `GET
+/v1/db/{db}/coll/{coll}/violations` — counts per index, or with
+`?index=<name>` the colliding groups with their documents — derived on
+request from the retained oplog: `Engine::live_unique_violations` pages
+`read_oplog_from` (inclusive at `from`, so the previous page's tail is
+skipped by stamp), keeps `UniqueViolation` entries for the collection,
+deduplicates by index and id set (a resend records twice), and keeps only
+those whose named documents all still exist. `exec::violations` shapes the
+two responses; authorised as `read`. Spec: the path, a `ViolationGroup`
+schema, and both shapes driven by the contract test. Docs: a "Resolving a
+unique violation" recipe in `indexes.md`, the route table and a paragraph in
+`http-api.md`, a pointer in `time-and-conflicts.md`. Known limit, recorded
+in the ADR: a rewrite that changes the colliding value resolves the
+constraint but not the report, because the route does not re-evaluate keys;
+a delete always clears it. Test: the collision is manufactured through
+`apply_remote` in the API harness — the same path a replicated write takes
+— rather than the multi-process cluster harness (deviation recorded on the
+plan, same reasoning as WS6): report appears with both documents, names the
+merged one, clears on delete, and the route is `read`-authorised.
 ## As of 2026-08-26 — **`multi` commits in chunks; the 10,000 cap is gone**
 
 Branch `feat/multi-chunked-commits`, ADR-086. ADR-083 had made a
