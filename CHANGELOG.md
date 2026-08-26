@@ -14,6 +14,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`kimmy init` and a settings file: `~/.config/kimmydb/.kimmy`.** Init
+  prompts once per setting — the current value shown as the default, Enter
+  keeps it — then writes the file `0600`; running it again re-prompts and
+  overwrites. The file is dotenv-style and covers url, token, password,
+  issuer, client_id, client_secret, resource, scope, cache_token. Precedence
+  per setting is **flag > environment variable > file**, so it fills gaps and
+  never overrides something already said. Unknown keys and broken lines are
+  errors naming the line.
 - **`kimmy roles …` and `kimmy users …`.** The administrative surface the
   federation round made necessary: stored roles (ADR-073) — the things OIDC
   role mappings point at — can now be created, inspected, granted against and
@@ -27,6 +35,9 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Bare `kimmy` shows the help screen** — the same long help `--help`
+  prints, on stdout, exit 0. Previously it was a two-line usage error telling
+  the user to run again with a flag.
 - **The system database never matches a wildcard (ADR-079).** A grant of
   `{db:"*"}` no longer reaches `__kimmy` — whose `__users` collection holds
   password hashes and token versions. Wildcard-granted callers stop seeing it

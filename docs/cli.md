@@ -56,6 +56,7 @@ grants any other client is.
 
 | | |
 |---|---|
+| `kimmy init` | Interactively write the settings file — Enter keeps each value shown |
 | `kimmy login` | Prints a token from the node's OIDC provider, via the device flow — the default |
 | `kimmy login <user>` | A local account instead. Password from stdin or `KIMMY_PASSWORD` |
 | `kimmy login --client-credentials` | A service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
@@ -260,6 +261,34 @@ rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/kimmy/tokens.json"
 Local accounts still work on a federated node, and `kimmy login <user>` is how
 you reach the break-glass administrator: `admin` cannot be granted through an
 IdP claim ([ADR-067](decisions.md)).
+
+### A settings file: `~/.config/kimmydb/.kimmy`
+
+`kimmy init` writes it for you: one prompt per setting with the current value
+shown as the default — Enter keeps it, typing replaces it, and a setting left
+empty with nothing to keep is not written. Running init again re-prompts and
+overwrites the file wholesale; the file is written `0600` because it can carry
+secrets.
+
+Everything you keep retyping can live there, dotenv-style:
+
+```sh
+# ~/.config/kimmydb/.kimmy
+url = https://kimmydb.example.com
+issuer = https://auth.example.com
+client_id = kimmy-cli
+```
+
+Keys: `url`, `token`, `password`, `issuer`, `client_id`, `client_secret`,
+`resource`, `scope`, `cache_token` — the same names as the environment
+variables, minus the prefix. `#` comments; values may be quoted.
+
+Precedence per setting: **flag > environment variable > this file**. The file
+fills gaps; it never overrides something the caller or the environment already
+said. An unknown key or a broken line is an error naming the file and line — a
+typoed key that silently did nothing would be worse than a loud failure.
+`XDG_CONFIG_HOME` moves it; there is no flag for the file itself, so scripts
+can trust their explicit flags to always win.
 
 ---
 

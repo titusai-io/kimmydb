@@ -33,7 +33,7 @@ use std::io::Read;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use kimmy_client::{Client, ErrorCode, Method, Query, Safety};
 use serde_json::{Value, json};
 
@@ -53,6 +53,8 @@ use serde_json::{Value, json};
         export KIMMY_OIDC_ISSUER=https://auth.example.com\n  \
         export KIMMY_OIDC_CLIENT_ID=kimmy-cli\n  \
         export KIMMY_TOKEN=$(kimmy login --client-credentials) # for a service, secret from env\n\n\
+    Settings file: ~/.config/kimmydb/.kimmy — url, token, issuer, client_id and\n\
+    friends; a flag or environment variable always wins over the file.\n\
     There is deliberately no --password flag and no --client-secret flag: either\n\
     would land in shell history and in `ps` output for every user on the machine.\n\
     No token is written to disk unless you pass --cache-token, and a refresh token\n\
@@ -73,10 +75,10 @@ struct Cli {
     pretty: bool,
 
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum Command {
     /// Exchange credentials for a token, printed to stdout.
     ///
@@ -93,19 +95,6 @@ enum Command {
         /// Local user name. Given, this is a password login against the node's
         /// own user store; omitted, the device flow answers.
         user: Option<String>,
-
-        /// Log in through the node's OIDC provider, in a browser.
-        ///
-        /// RFC 8628 device authorization: this prints a code and a URL to
-        /// stderr, you approve it in a browser, and the token lands on stdout.
-        /// The same flow `gh auth login` uses, and it is the one that works
-        /// over SSH and in a container, where a redirect back to localhost
-        /// does not.
-        ///
-        /// This is what bare `kimmy login` already does; the flag remains so
-        /// existing scripts and muscle memory keep working.
-        #[arg(long, conflicts_with_all = ["user", "client_credentials"])]
-        oidc: bool,
 
         /// Log in as a service, with OAuth2 client credentials.
         ///
@@ -205,6 +194,15 @@ enum Command {
     },
     /// Health and readiness of the node.
     Ping,
+    /// Interactively write ~/.config/kimmydb/.kimmy.
+    ///
+    /// Prompts once per known setting, showing any current value (from the
+    /// existing file or the environment) as the default — Enter keeps it,
+    /// typing replaces it, and a setting left empty with nothing to keep is
+    /// simply not written. Running init again re-prompts and overwrites the
+    /// file wholesale. The file is written 0600: it can carry a token, a
+    /// password and a client secret.
+    Init,
     /// How this node sees the caller's identity.
     ///
     /// The principal name, whether it came from this node's own user store or
@@ -366,7 +364,7 @@ enum Command {
 }
 
 /// Subcommands of `kimmy roles`.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum RolesSub {
     /// List every stored role by name.
     List,
@@ -399,7 +397,7 @@ enum RolesSub {
 }
 
 /// Subcommands of `kimmy users`.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum UsersSub {
     /// List local accounts with their state.
     List,
@@ -458,16 +456,34 @@ fn main() -> ExitCode {
 
 #[tokio::main(flavor = "current_thread")]
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    let (dot_password, dot_secret) = apply_kimmy_file(&mut cli)?;
+
+    // Bare `kimmy` shows byte-for-byte what `--help` shows — same screen,
+    // stdout, success. The clap default for a missing subcommand is a two-
+    // line usage error telling the user to run it again with a flag, which
+    // is a wall the tool puts in front of its own front door.
+    let command = match &cli.command {
+        Some(command) => command,
+        None => {
+            let _ = Cli::command().print_help();
+            return Ok(());
+        }
+    };
+
+    // init writes the settings file and touches no node, so it runs before
+    // any client is built.
+    if matches!(command, Command::Init) {
+        return run_init();
+    }
 
     // `login` and `token` are the two commands that run without a token,
     // because producing one is what they are for. They share everything after
     // the arguments: Token is Login with the answers already decided —
     // federated always, cache always.
-    let token_request = match &cli.command {
+    let token_request = match &command {
         Command::Login {
             user,
-            oidc,
             client_credentials,
             issuer,
             client_id,
@@ -476,7 +492,6 @@ async fn run() -> Result<()> {
             cache_token,
         } => Some((
             user.as_deref(),
-            *oidc,
             *client_credentials,
             *cache_token,
             issuer,
@@ -485,20 +500,12 @@ async fn run() -> Result<()> {
             scope,
         )),
         Command::Token { client_credentials, issuer, client_id, resource, scope } => {
-            Some((None, false, *client_credentials, true, issuer, client_id, resource, scope))
+            Some((None, *client_credentials, true, issuer, client_id, resource, scope))
         }
         _ => None,
     };
-    if let Some((
-        login_user,
-        _oidc_flag,
-        cc_flag,
-        cache_token,
-        issuer,
-        client_id,
-        resource,
-        scope,
-    )) = token_request
+    if let Some((login_user, cc_flag, cache_token, issuer, client_id, resource, scope)) =
+        token_request
     {
         // Which flow answers was decided by the arguments alone: a named
         // local account wins over everything — `kimmy login ada` must never
@@ -540,7 +547,14 @@ async fn run() -> Result<()> {
 
             let (token, expires_in) = match flow {
                 LoginFlow::ClientCredentials => {
-                    oidc::client_credentials_login(issuer, client_id, scope, resource).await?
+                    oidc::client_credentials_login(
+                        issuer,
+                        client_id,
+                        scope,
+                        resource,
+                        dot_secret.as_deref(),
+                    )
+                    .await?
                 }
                 _ => oidc::device_login(issuer, client_id, scope, resource).await?,
             };
@@ -558,7 +572,7 @@ async fn run() -> Result<()> {
         // The local path: a named user, a password from stdin or the
         // environment.
         let user = login_user.expect("a local flow has a user by construction");
-        let password = read_password()?;
+        let password = read_password(dot_password.as_deref())?;
         let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
         let token = client.token().await.context("the server did not return a token")?;
         println!("{token}");
@@ -571,8 +585,9 @@ async fn run() -> Result<()> {
     }
     let client = builder.connect().await?;
 
-    match &cli.command {
+    match &command {
         // Handled above, before a client was built.
+        Command::Init => unreachable!("init returns early"),
         Command::Login { .. } | Command::Token { .. } => {
             unreachable!("token commands return early")
         }
@@ -606,7 +621,9 @@ async fn run() -> Result<()> {
         }
         Command::Topology => emit(&cli, &client.topology().await?),
         Command::Roles { command } => roles_command(&cli, &client, command).await?,
-        Command::Users { command } => users_command(&cli, &client, command).await?,
+        Command::Users { command } => {
+            users_command(&cli, &client, command, dot_password.as_deref()).await?
+        }
         Command::CreateCollection { target } => {
             let (db, coll) = split_target(target)?;
             let created = client
@@ -884,9 +901,12 @@ fn index_spec(
 /// There is deliberately no `--password` flag. It would be recorded in shell
 /// history and visible in `ps` to every user on the machine — a credential that
 /// leaks by being typed.
-fn read_password() -> Result<String> {
+fn read_password(from_dotfile: Option<&str>) -> Result<String> {
     if let Ok(password) = std::env::var("KIMMY_PASSWORD") {
         return Ok(password);
+    }
+    if let Some(password) = from_dotfile.filter(|p| !p.is_empty()) {
+        return Ok(password.to_string());
     }
     let mut buf = String::new();
     std::io::stdin().read_to_string(&mut buf).context("reading the password from stdin")?;
@@ -1362,13 +1382,20 @@ mod oidc {
         client_id: Option<&str>,
         scope: &str,
         resource: Option<&str>,
+        secret_from_dotfile: Option<&str>,
     ) -> Result<(String, Option<u64>)> {
         let issuer = issuer_or_bail(issuer)?;
         let client_id = client_id_or_bail(client_id)?;
-        let secret =
-            std::env::var("KIMMY_OIDC_CLIENT_SECRET").ok().filter(|s| !s.is_empty()).context(
-                "no client secret: set KIMMY_OIDC_CLIENT_SECRET. There is deliberately no flag \
-                 for it — it would land in shell history and in `ps` output.",
+        // The environment wins over the settings file — the same precedence
+        // every setting here follows.
+        let secret = std::env::var("KIMMY_OIDC_CLIENT_SECRET")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(|| secret_from_dotfile.map(str::to_string))
+            .context(
+                "no client secret: set KIMMY_OIDC_CLIENT_SECRET or add client_secret to \
+                 ~/.config/kimmydb/.kimmy. There is deliberately no flag for it — it would \
+                 land in shell history and in `ps` output.",
             )?;
 
         let http = http()?;
@@ -1866,11 +1893,16 @@ async fn roles_command(cli: &Cli, client: &Client, command: &RolesSub) -> Result
 
 /// Read a password for a user-management command — stdin or KIMMY_PASSWORD,
 /// exactly as `login` reads its own, for the same reasons.
-fn read_password_for(_user: &str) -> Result<String> {
-    read_password()
+fn read_password_for(_user: &str, dotfile: Option<&str>) -> Result<String> {
+    read_password(dotfile)
 }
 
-async fn users_command(cli: &Cli, client: &Client, command: &UsersSub) -> Result<()> {
+async fn users_command(
+    cli: &Cli,
+    client: &Client,
+    command: &UsersSub,
+    password_override: Option<&str>,
+) -> Result<()> {
     match command {
         UsersSub::List => {
             // The listing endpoint answers names; each record carries the
@@ -1898,7 +1930,7 @@ async fn users_command(cli: &Cli, client: &Client, command: &UsersSub) -> Result
                 .await?,
         ),
         UsersSub::Create { user, grants, roles } => {
-            let password = read_password_for(user)?;
+            let password = read_password_for(user, password_override)?;
             let mut payload = json!({ "user": user, "password": password });
             let parsed = parse_grant_specs(grants)?;
             if !parsed.is_empty() {
@@ -1920,7 +1952,7 @@ async fn users_command(cli: &Cli, client: &Client, command: &UsersSub) -> Result
             emit(cli, &created);
         }
         UsersSub::ResetPassword { user } => {
-            let password = read_password_for(user)?;
+            let password = read_password_for(user, password_override)?;
             let updated = client
                 .request(
                     Method::Post,
@@ -1985,6 +2017,288 @@ async fn users_command(cli: &Cli, client: &Client, command: &UsersSub) -> Result
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// The settings file: ~/.config/kimmydb/.kimmy
+//
+// One dotenv-style file for the settings a person keeps setting: url, token,
+// password, issuer, client_id, client_secret, resource, scope, cache_token.
+// Precedence per setting is explicit flag > environment variable > this file
+// > built-in default — the file is what fills the gaps, never what overrides
+// something the caller or the environment already said.
+// ---------------------------------------------------------------------------
+
+/// Everything `~/.config/kimmydb/.kimmy` can supply.
+#[derive(Default, Debug)]
+struct DotfileSettings {
+    url: Option<String>,
+    token: Option<String>,
+    password: Option<String>,
+    issuer: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    resource: Option<String>,
+    scope: Option<String>,
+    cache_token: Option<bool>,
+}
+
+const DOTFILE_KEYS: &str = "url, token, password, issuer, client_id, \
+     client_secret, resource, scope, cache_token";
+
+fn parse_kimmy_file(text: &str) -> Result<DotfileSettings> {
+    let mut out = DotfileSettings::default();
+    for (idx, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        let n = idx + 1;
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (key, value) = line
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!("line {n}: expected `key = value`, found {raw:?}"))?;
+        let key = key.trim();
+        let mut value = value.trim();
+        // One level of matching quotes is stripped, so values may contain
+        // spaces and `#` without ceremony.
+        if value.len() >= 2
+            && ((value.starts_with('"') && value.ends_with('"'))
+                || (value.starts_with('\'') && value.ends_with('\'')))
+        {
+            value = &value[1..value.len() - 1];
+        }
+        match key {
+            "url" => out.url = Some(value.into()),
+            "token" => out.token = Some(value.into()),
+            "password" => out.password = Some(value.into()),
+            "issuer" => out.issuer = Some(value.into()),
+            "client_id" => out.client_id = Some(value.into()),
+            "client_secret" => out.client_secret = Some(value.into()),
+            "resource" => out.resource = Some(value.into()),
+            "scope" => out.scope = Some(value.into()),
+            "cache_token" => {
+                out.cache_token = Some(match value {
+                    "true" | "1" | "yes" | "on" => true,
+                    "false" | "0" | "no" | "off" => false,
+                    other => anyhow::bail!(
+                        "line {n}: cache_token {other:?} is not one of \
+                         true/false/1/0/yes/no/on/off"
+                    ),
+                });
+            }
+            other => anyhow::bail!("line {n}: unknown key {other:?}. Known keys: {DOTFILE_KEYS}"),
+        }
+    }
+    Ok(out)
+}
+
+/// Where the settings file lives. Missing is normal; unreadable is an error.
+fn kimmy_file_path() -> Result<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => std::path::PathBuf::from(
+            std::env::var_os("HOME").context("neither XDG_CONFIG_HOME nor HOME is set")?,
+        )
+        .join(".config"),
+    };
+    Ok(base.join("kimmydb").join(".kimmy"))
+}
+
+fn load_kimmy_file() -> Result<Option<(std::path::PathBuf, DotfileSettings)>> {
+    let path = kimmy_file_path()?;
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_kimmy_file(&text)
+            .map(|settings| Some((path.clone(), settings)))
+            .map_err(|e| anyhow::anyhow!("{}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!("reading {}: {e}", path.display())),
+    }
+}
+
+/// Fill unset settings from the dotfile, returning the two values no flag
+/// carries (password, client secret) for their call sites to pick up.
+///
+/// Precedence per setting: **explicit flag > environment variable > this
+/// file**. A flag is detected by its clap source rather than by comparing
+/// values, so `--url localhost:7878` still beats a dotfile that names another
+/// node; an environment variable wins because clap has already folded it into
+/// the parsed field before this runs.
+fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
+    use clap::parser::ValueSource;
+
+    let matches = Cli::command().get_matches();
+    let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let env_absent = |name: &str| std::env::var_os(name).is_none();
+    let Some((_, dot)) = load_kimmy_file()? else {
+        return Ok((None, None));
+    };
+
+    // Globals first.
+    if !from_cli("url")
+        && env_absent("KIMMY_URL")
+        && let Some(v) = dot.url
+    {
+        cli.url = v;
+    }
+    if !from_cli("token")
+        && env_absent("KIMMY_TOKEN")
+        && let Some(v) = dot.token
+    {
+        cli.token = Some(v);
+    }
+
+    // Provider settings ride on the login/token subcommands.
+    type ProviderFields<'a> = (
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        &'a mut Option<String>,
+        Option<&'a mut bool>,
+    );
+    if let Some(command) = &mut cli.command {
+        let (issuer, client_id, resource, scope, cache_token): ProviderFields<'_> = match command {
+            Command::Login { issuer, client_id, resource, scope, cache_token, .. } => {
+                (issuer, client_id, resource, scope, Some(cache_token))
+            }
+            Command::Token { issuer, client_id, resource, scope, .. } => {
+                (issuer, client_id, resource, scope, None)
+            }
+            _ => (&mut None, &mut None, &mut None, &mut None, None),
+        };
+        if !from_cli("issuer")
+            && env_absent("KIMMY_OIDC_ISSUER")
+            && let Some(v) = dot.issuer
+        {
+            *issuer = Some(v);
+        }
+        if !from_cli("client_id")
+            && env_absent("KIMMY_OIDC_CLIENT_ID")
+            && let Some(v) = dot.client_id
+        {
+            *client_id = Some(v);
+        }
+        if !from_cli("resource")
+            && env_absent("KIMMY_OIDC_RESOURCE")
+            && let Some(v) = dot.resource
+        {
+            *resource = Some(v);
+        }
+        if !from_cli("scope")
+            && env_absent("KIMMY_OIDC_SCOPE")
+            && let Some(v) = dot.scope
+        {
+            *scope = Some(v);
+        }
+        if let Some(cache_token) = cache_token
+            && !from_cli("cache_token")
+            && env_absent("KIMMY_TOKEN_CACHE")
+            && let Some(v) = dot.cache_token
+        {
+            *cache_token = v;
+        }
+    }
+
+    // The two settings no flag carries, consumed by their call sites.
+    Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret))
+}
+
+// ---------------------------------------------------------------------------
+// kimmy init: prompt for the settings file
+// ---------------------------------------------------------------------------
+
+/// Render the settings file body from collected `key = value` pairs.
+fn render_kimmy_file(pairs: &[(&str, String)]) -> String {
+    let mut out = String::from(
+        "# Written by `kimmy init`. Flags and environment variables win over\n\
+         # anything in this file. Keys: url, token, password, issuer,\n\
+         # client_id, client_secret, resource, scope, cache_token.\n",
+    );
+    for (key, value) in pairs {
+        out.push_str(&format!("{key} = {value}\n"));
+    }
+    out
+}
+
+/// One interactive prompt: shows the current value as the default; Enter keeps
+/// it (or skips the setting when there is nothing to keep).
+fn prompt_setting(prompt: &str, current: Option<&str>) -> Result<Option<String>> {
+    use std::io::Write;
+    match current {
+        Some(current) => print!("{prompt} [{current}]: "),
+        None => print!("{prompt}: "),
+    }
+    std::io::stdout().flush()?;
+    let mut buf = String::new();
+    std::io::stdin().read_line(&mut buf).context("reading input")?;
+    let answer = buf.trim();
+    Ok(match (answer.is_empty(), current) {
+        (true, kept) => kept.map(str::to_string),
+        (false, _) => Some(answer.to_string()),
+    })
+}
+
+/// The whole of `kimmy init`: prompt per setting, overwrite the file.
+///
+/// Prefills come from the existing file first, then the environment — what
+/// the tool is *currently* using is what Enter keeps. Writing is wholesale:
+/// nine keys considered, only the non-empty ones land on disk, and a second
+/// run replaces the first run's file without ceremony (the prompts are the
+/// confirmation).
+fn run_init() -> Result<()> {
+    let existing = load_kimmy_file()?.map(|(_, settings)| settings);
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let prefill = |key: &str| -> Option<String> {
+        let from_file = existing.as_ref().and_then(|s| match key {
+            "url" => s.url.clone(),
+            "token" => s.token.clone(),
+            "password" => s.password.clone(),
+            "issuer" => s.issuer.clone(),
+            "client_id" => s.client_id.clone(),
+            "client_secret" => s.client_secret.clone(),
+            "resource" => s.resource.clone(),
+            "scope" => s.scope.clone(),
+            _ => None,
+        });
+        from_file.or_else(|| env(&format!("KIMMY_{}", key.to_uppercase())))
+    };
+
+    eprintln!("Configure ~/.config/kimmydb/.kimmy — Enter keeps the value shown.\n");
+
+    let mut pairs: Vec<(&'static str, String)> = Vec::new();
+    for (key, hint) in [
+        ("url", "Base URL of the node"),
+        ("issuer", "OIDC issuer URL"),
+        ("client_id", "OAuth client id"),
+        ("resource", "RFC 8707 resource (usually the node URL)"),
+        ("scope", "OAuth scope(s)"),
+        ("token", "A bearer token"),
+        ("password", "A local account's password"),
+        ("client_secret", "OAuth client secret"),
+        ("cache_token", "Cache tokens? true/false/1/0/yes/no/on/off"),
+    ] {
+        let current = prefill(key);
+        let current = current.as_deref();
+        if let Some(value) = prompt_setting(&format!("  {hint} ({key})"), current)? {
+            pairs.push((key, value));
+        }
+    }
+
+    let path = kimmy_file_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let body = render_kimmy_file(&pairs);
+    std::fs::write(&path, body).with_context(|| format!("writing {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("restricting {}", path.display()))?;
+    }
+
+    let keys: Vec<&str> = pairs.iter().map(|(k, _)| *k).collect();
+    println!("{}", json!({ "written": path.display().to_string(), "keys": keys }));
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use clap::CommandFactory;
@@ -2033,9 +2347,76 @@ mod tests {
     }
 
     #[test]
+    fn init_renders_only_what_was_collected() {
+        let body = render_kimmy_file(&[
+            ("url", "https://kimmy1.example.com".into()),
+            ("client_id", "kimmy-cli".into()),
+        ]);
+        assert!(body.starts_with("# Written by `kimmy init`"));
+        assert!(body.contains("url = https://kimmy1.example.com\n"));
+        assert!(body.contains("client_id = kimmy-cli\n"));
+        assert!(!body.lines().any(|l| l.starts_with("password = ")));
+    }
+
+    #[test]
+    fn init_is_a_known_subcommand() {
+        assert!(Cli::try_parse_from(["kimmy", "init"]).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // The settings file: ~/.config/kimmydb/.kimmy
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_settings_file_parses_comments_quotes_and_every_key() {
+        let dot = parse_kimmy_file(
+            "# my node\n\
+             url = https://kimmy1.example.com\n\
+             \n\
+             issuer = 'https://auth.example.com'\n\
+             client_id = kimmy-cli\n\
+             cache_token = on\n",
+        )
+        .unwrap();
+        assert_eq!(dot.url.as_deref(), Some("https://kimmy1.example.com"));
+        assert_eq!(dot.issuer.as_deref(), Some("https://auth.example.com"));
+        assert_eq!(dot.client_id.as_deref(), Some("kimmy-cli"));
+        assert_eq!(dot.cache_token, Some(true));
+        assert!(dot.password.is_none());
+    }
+
+    #[test]
+    fn a_settings_file_refuses_unknown_keys_and_broken_lines_by_number() {
+        let err = parse_kimmy_file("url = x\nusrer = typo\n").unwrap_err().to_string();
+        assert!(err.contains("line 2") && err.contains("usrer"), "{err}");
+
+        let err = parse_kimmy_file("no equals sign here\n").unwrap_err().to_string();
+        assert!(err.contains("line 1"), "{err}");
+    }
+
+    #[test]
+    fn cache_token_is_boolish_or_refused() {
+        assert_eq!(parse_kimmy_file("cache_token = off").unwrap().cache_token, Some(false));
+        assert!(parse_kimmy_file("cache_token = maybe").is_err());
+    }
+
+    #[test]
+    fn bare_invocation_is_valid_and_means_help() {
+        // The clap default for a missing subcommand is a usage error; the
+        // flip makes bare `kimmy` parse cleanly and print the long help
+        // instead. run() owns the printing — this pins the parse half.
+        let cli = Cli::try_parse_from(["kimmy"]).unwrap();
+        assert!(cli.command.is_none(), "no args means no subcommand: {:?}", cli.command);
+        assert!(
+            Cli::command().render_help().to_string().contains("Commands:"),
+            "the rendered help is what a bare invocation shows"
+        );
+    }
+
+    #[test]
     fn whoami_is_a_known_subcommand() {
         let cli = Cli::try_parse_from(["kimmy", "whoami"]).unwrap();
-        assert!(matches!(cli.command, Command::Whoami));
+        assert!(matches!(cli.command, Some(Command::Whoami)));
     }
 
     // -----------------------------------------------------------------------
@@ -2062,14 +2443,10 @@ mod tests {
     fn the_flipped_login_forms_parse() {
         assert!(Cli::try_parse_from(["kimmy", "login"]).is_ok(), "bare login is now valid");
         assert!(Cli::try_parse_from(["kimmy", "login", "ada"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_ok(),
-            "kept for muscle memory"
-        );
-        assert!(
-            Cli::try_parse_from(["kimmy", "login", "ada", "--oidc"]).is_err(),
-            "a user and --oidc are still mutually exclusive"
-        );
+        // The flag is gone outright: it only ever spelled the default out,
+        // and a spelling nobody needs is one more thing to misread.
+        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "login", "ada", "--oidc"]).is_err());
     }
 
     #[test]
@@ -2635,14 +3012,11 @@ mod tests {
 
     #[test]
     fn login_takes_a_user_or_a_federated_flag_but_not_both() {
-        // The user argument became optional so that `--oidc` can stand alone.
         // Clap has to keep the combinations honest, or the wrong pair reaches
         // the handler and fails somewhere less obvious.
         assert!(Cli::try_parse_from(["kimmy", "login", "root"]).is_ok());
-        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_ok());
         assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials"]).is_ok());
-        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc", "root"]).is_err());
-        assert!(Cli::try_parse_from(["kimmy", "login", "--oidc", "--client-credentials"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials", "root"]).is_err());
     }
 
     #[test]
