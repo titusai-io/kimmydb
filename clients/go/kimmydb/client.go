@@ -301,10 +301,16 @@ type Query struct {
 	Limit      int
 	Skip       int
 	Explain    bool
+	// Stamps asks for each document's version in a parallel "stamps" array,
+	// for a conditional write that follows.
+	Stamps bool
 }
 
 func (q Query) body() map[string]any {
 	body := map[string]any{"explain": q.Explain}
+	if q.Stamps {
+		body["stamps"] = true
+	}
 	if q.Filter != nil {
 		body["filter"] = q.Filter
 	}
@@ -356,6 +362,23 @@ func (c *Client) Update(ctx context.Context, db, collection string, filter, upda
 func (c *Client) Delete(ctx context.Context, db, collection string, filter map[string]any, multi bool) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "delete"),
 		map[string]any{"filter": filter, "multi": multi}, unsafeToRetry)
+}
+
+// UpdateIf is Update for one document, conditional on its version.
+//
+// ifStamp is a stamp from an earlier write's response or from a Find with
+// Query.Stamps. The server writes only if the matched document is still at
+// that version; otherwise the error is an *APIError whose Stale() is true,
+// nothing was written, and the caller re-reads and decides again.
+func (c *Client) UpdateIf(ctx context.Context, db, collection string, filter, update map[string]any, ifStamp string) (map[string]any, error) {
+	return c.request(ctx, http.MethodPost, path(db, collection, "update"),
+		map[string]any{"filter": filter, "update": update, "if_stamp": ifStamp}, unsafeToRetry)
+}
+
+// DeleteIf is Delete for one document, conditional on its version — see UpdateIf.
+func (c *Client) DeleteIf(ctx context.Context, db, collection string, filter map[string]any, ifStamp string) (map[string]any, error) {
+	return c.request(ctx, http.MethodPost, path(db, collection, "delete"),
+		map[string]any{"filter": filter, "if_stamp": ifStamp}, unsafeToRetry)
 }
 
 // Aggregate runs a pipeline.

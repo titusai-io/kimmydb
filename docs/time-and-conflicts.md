@@ -246,6 +246,18 @@ guarantee, and the test that defends it — is
 ["What each operation guarantees"](compatibility.md#what-each-operation-guarantees)
 in Compatibility.
 
+### What a stamp makes possible
+
+Every write reports the stamp it produced, and every single-document write
+accepts `if_stamp`: write only if the document is still at that version,
+otherwise `409 stale` and nothing written ([ADR-084](decisions.md)). That is
+check-then-act on one document without the server coordinating anything —
+optimistic concurrency, node-local. It is **not** a cross-node guarantee: two
+nodes can each accept a conditional write against the same version during a
+partition, and last-writer-wins decides when they meet. What it rules out is
+the single-node race — two clients reading the same version and both
+"winning".
+
 ### In CAP terms
 
 KimmyDB is **AP**: available and partition-tolerant, not linearizable. Every

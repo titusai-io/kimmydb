@@ -213,6 +213,27 @@ are dropped — and `_id` always comes from the path, never the body.
 `200 {"matched": 0}` and nothing is written. A test built on the assumption
 that this creates the document writes nothing and passes.
 
+**Every write reports the version it produced**, as `stamp` — an opaque token
+— and a read by id carries the document's version as its `ETag`. Pass one
+back as `if_stamp` to make the next write conditional:
+
+```bash
+curl -i localhost:7878/v1/db/shop/coll/orders/docs/42 -H "$A"
+# ETag: "AAABmR3k9...."
+curl -XPUT 'localhost:7878/v1/db/shop/coll/orders/docs/42?if_stamp=AAABmR3k9....' \
+  -H "$A" -d '{"item":"gadget","qty":6}'
+curl -XDELETE 'localhost:7878/v1/db/shop/coll/orders/docs/42?if_stamp=AAABmR3k9....' -H "$A"
+```
+
+The write happens only if the document is still at that version. Otherwise
+the answer is **`409 stale`** with `retry: no` and *nothing is written* — not
+the document, not an oplog entry, not a change-stream event. A missing
+document is stale too, `upsert` or not: the condition says "at this version",
+not "or create it". Re-read, decide again, and send a new request with the
+current stamp. This is check-then-act on one document, on one node, with no
+coordination ([ADR-084](decisions.md)); it says nothing about other nodes,
+where last-writer-wins still decides.
+
 ### Find
 
 ```bash
@@ -232,6 +253,12 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/find -H "$A" -d '{
 Every field is optional. `count` is the size of the returned page, not the
 total match count — use `/count` for that. Operator reference:
 [Query Language](query-language.md).
+
+`"stamps": true` adds a `stamps` array **parallel to `documents`** — each
+document's version, for an `if_stamp` write that follows. Parallel rather
+than a field inside each document, because the document is your data and
+comes back exactly as stored. A `find` on `_id` takes the primary-key path,
+so this is the cheap way to read one document *with* its version.
 
 **Default limit 100, maximum 10,000, and both are silent.** Omitting `limit`
 returns a page of 100 rather than the collection, and a larger `limit` is
@@ -281,6 +308,11 @@ concurrent `$inc`s on one document both land — the same guarantee
 `find_and_modify` makes, through the same engine path (ADR-083). A
 `multi: true` request commits as **one transaction**: all of it or none of
 it, and one fsync rather than one per document.
+
+`if_stamp` makes a single-document `update` or `delete` conditional on the
+matched document's version, exactly as on the by-id routes above: `409 stale`
+and nothing written otherwise. It cannot be combined with `multi` — one stamp
+names one document.
 
 > **Sharp edge.** Because the writer is held for the whole request, a
 > `multi: true` update or delete is **refused above 10,000 matches** — the

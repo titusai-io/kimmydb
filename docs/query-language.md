@@ -244,6 +244,11 @@ queue never hands out the same job twice.
   `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
   seeded, because a match does not imply it.
 - **A removal is an ordinary delete** in the change stream and to replication.
+- **`if_stamp` makes it conditional** on the chosen document being at that
+  version — `409 stale` and nothing written otherwise. Cannot be combined
+  with `upsert`. The response's `stamp` is the version the write produced,
+  so a loop of read → decide → `find_and_modify` needs no separate read
+  ([ADR-084](decisions.md)).
 
 ### The cost, stated plainly
 

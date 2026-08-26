@@ -27,6 +27,11 @@ pub struct WriteOutcome {
     pub matched: bool,
     pub modified: bool,
     pub upserted: bool,
+    /// The stamp the write produced, when it wrote anything.
+    ///
+    /// What a caller hands back as `if_stamp` to make its next write
+    /// conditional on nothing having happened in between.
+    pub stamp: Option<Stamp>,
 }
 
 /// A bulk insert's failure, and which document caused it.
@@ -113,6 +118,22 @@ impl Engine {
     where
         F: FnMut(DocId, Document) -> Result<bool>,
     {
+        self.for_each_record_after(coll, after, |id, _, doc| f(id, doc))
+    }
+
+    /// [`Engine::for_each_doc_after`], with each document's stamp.
+    ///
+    /// The one scan behind both: a read that wants versions — `find` with
+    /// `stamps: true` — walks exactly the documents a plain read does.
+    pub fn for_each_record_after<F>(
+        &self,
+        coll: &CollectionMeta,
+        after: Option<&[u8]>,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DocId, Stamp, Document) -> Result<bool>,
+    {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         for entry in docs.range(doc_range_after(coll.id, after))? {
@@ -123,11 +144,20 @@ impl Engine {
             }
             let doc: Document = bson::deserialize_from_slice(&record.body)?;
             let id = extract_id(&doc)?;
-            if !f(id, doc)? {
+            if !f(id, record.stamp, doc)? {
                 break;
             }
         }
         Ok(())
+    }
+
+    /// One live document with its stamp, or `None` if absent or tombstoned.
+    pub fn get_stamped(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+    ) -> Result<Option<(Stamp, Document)>> {
+        self.get_record_by_encoded_key(coll, &doc_key(id)?)
     }
 
     /// The stamp of a live document, or `None` if it is absent or tombstoned.
@@ -168,6 +198,12 @@ impl Engine {
     /// Generates an ObjectId when `_id` is absent, and returns the id either
     /// way so the caller need not re-read.
     pub fn insert(&self, coll: &CollectionMeta, doc: Document) -> Result<DocId> {
+        self.insert_stamped(coll, doc).map(|(id, _)| id)
+    }
+
+    /// [`Engine::insert`], also returning the stamp the write produced — the
+    /// version a caller needs for a conditional write that follows.
+    pub fn insert_stamped(&self, coll: &CollectionMeta, doc: Document) -> Result<(DocId, Stamp)> {
         let txn = self.begin_write()?;
         let (id, entry) = match self.insert_in_txn(&txn, coll, doc) {
             Ok(pair) => pair,
@@ -177,9 +213,10 @@ impl Engine {
             }
         };
         txn.commit()?;
+        let stamp = entry.stamp;
         self.publish(vec![entry]);
 
-        Ok(id)
+        Ok((id, stamp))
     }
 
     /// Insert many documents in a single transaction, or none of them.
@@ -304,8 +341,26 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         id: &DocId,
+        doc: Document,
+        upsert: bool,
+    ) -> Result<WriteOutcome> {
+        self.replace_if(coll, id, doc, upsert, None)
+    }
+
+    /// [`Engine::replace`], conditional on the document's current version.
+    ///
+    /// With `expected`, the write happens only if the live document carries
+    /// exactly that stamp; otherwise — a different version, or no live
+    /// document at all — nothing is written and [`StorageError::Stale`]
+    /// carries what is there now. The comparison runs inside the write
+    /// transaction, so there is no window between the check and the write.
+    pub fn replace_if(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
         mut doc: Document,
         upsert: bool,
+        expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
         // The id is part of the document's identity, not its content: a replace
         // must not be able to move a document to a different key.
@@ -320,16 +375,29 @@ impl Engine {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The previous image is needed to remove the index entries it
             // contributed — they are derived from the old value, not the new.
-            let previous = match docs.get((coll.id.0, key.as_slice()))? {
-                Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
-                None => None,
+            let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => {
+                    let record = codec::decode_doc_record(raw.value())?;
+                    (record.is_live().then_some(record.stamp), record.document()?)
+                }
+                None => (None, None),
             };
             let existed = previous.is_some();
 
+            if expected.is_some() && current != expected {
+                drop(docs);
+                txn.abort()?;
+                return Err(StorageError::Stale { current });
+            }
             if !existed && !upsert {
                 drop(docs);
                 txn.abort()?;
-                return Ok(WriteOutcome { matched: false, modified: false, upserted: false });
+                return Ok(WriteOutcome {
+                    matched: false,
+                    modified: false,
+                    upserted: false,
+                    stamp: None,
+                });
             }
 
             let record = DocRecord::live(stamp, body.clone());
@@ -360,7 +428,12 @@ impl Engine {
         txn.commit()?;
         self.publish(vec![entry]);
 
-        Ok(WriteOutcome { matched: existed, modified: existed, upserted: !existed })
+        Ok(WriteOutcome {
+            matched: existed,
+            modified: existed,
+            upserted: !existed,
+            stamp: Some(stamp),
+        })
     }
 
     /// Delete a document, leaving a tombstone.
@@ -369,7 +442,34 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        self.delete_guarded(coll, id, |_| true)
+        self.delete_where(coll, id, |_, _| Ok(true))
+    }
+
+    /// [`Engine::delete`], conditional on the document's current version.
+    ///
+    /// The same contract as [`Engine::replace_if`]: a different version, or
+    /// no live document, writes nothing and returns [`StorageError::Stale`].
+    pub fn delete_if(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        expected: Option<Stamp>,
+    ) -> Result<bool> {
+        let Some(expected) = expected else {
+            return self.delete(coll, id);
+        };
+        // The absent case is decided here rather than in the guard, which
+        // only ever sees a live document.
+        match self.delete_where(coll, id, |current, _| {
+            if current == expected {
+                Ok(true)
+            } else {
+                Err(StorageError::Stale { current: Some(current) })
+            }
+        })? {
+            true => Ok(true),
+            false => Err(StorageError::Stale { current: None }),
+        }
     }
 
     /// [`Engine::delete`], but only if `guard` still approves the document it
@@ -382,15 +482,28 @@ impl Engine {
     /// reason to have a TTL at all — would otherwise be deleted while live.
     /// Re-reading here means what the guard approves is exactly what the
     /// commit removes.
-    ///
-    /// One delete body, shared: a check added to expiry must not be added
-    /// *beside* the ordinary delete, for the same reason `insert` and
-    /// `insert_many` share `insert_in_txn`.
     pub(crate) fn delete_guarded(
         &self,
         coll: &CollectionMeta,
         id: &DocId,
         guard: impl Fn(&Document) -> bool,
+    ) -> Result<bool> {
+        self.delete_where(coll, id, |_, doc| Ok(guard(doc)))
+    }
+
+    /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
+    /// a check added to one must not be added *beside* the others, for the
+    /// same reason `insert` and `insert_many` share `insert_in_txn`.
+    ///
+    /// `guard` sees the live document's stamp and image inside the write
+    /// transaction. `Ok(false)` declines quietly — nothing is written and no
+    /// oplog entry is minted, so a refused expiry is invisible to replication
+    /// and to change streams. An error aborts the same way and is returned.
+    fn delete_where(
+        &self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<bool> {
         let key = doc_key(id)?;
         let stamp = self.next_stamp();
@@ -398,22 +511,30 @@ impl Engine {
         let txn = self.begin_write()?;
         let previous = {
             let mut docs = txn.open_table(tables::DOCS)?;
-            let previous = match docs.get((coll.id.0, key.as_slice()))? {
-                Some(raw) => codec::decode_doc_record(raw.value())?.document()?,
-                None => None,
+            let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
+                Some(raw) => {
+                    let record = codec::decode_doc_record(raw.value())?;
+                    (record.stamp, record.document()?)
+                }
+                None => (stamp, None),
             };
-            if previous.is_none() {
+            let Some(image) = previous.as_ref() else {
                 drop(docs);
                 txn.abort()?;
                 return Ok(false);
-            }
-            if !previous.as_ref().is_some_and(&guard) {
-                // Still here, but no longer eligible. Nothing is written and
-                // no oplog entry is minted, so a refused expiry is invisible
-                // to replication and to change streams.
-                drop(docs);
-                txn.abort()?;
-                return Ok(false);
+            };
+            match guard(current, image) {
+                Ok(true) => {}
+                Ok(false) => {
+                    drop(docs);
+                    txn.abort()?;
+                    return Ok(false);
+                }
+                Err(e) => {
+                    drop(docs);
+                    txn.abort()?;
+                    return Err(e);
+                }
             }
             docs.insert(
                 (coll.id.0, key.as_slice()),
@@ -929,7 +1050,8 @@ mod tests {
         let id = engine.insert(&coll, doc! { "_id": 1, "a": 1, "b": 2 }).unwrap();
 
         let outcome = engine.replace(&coll, &id, doc! { "a": 9 }, false).unwrap();
-        assert_eq!(outcome, WriteOutcome { matched: true, modified: true, upserted: false });
+        assert_eq!((outcome.matched, outcome.modified, outcome.upserted), (true, true, false));
+        assert!(outcome.stamp.is_some(), "a write reports the stamp it produced");
 
         let found = engine.get(&coll, &id).unwrap().unwrap();
         assert_eq!(found.get_i32("a").unwrap(), 9);
@@ -941,7 +1063,10 @@ mod tests {
         let (engine, coll, _dir) = engine();
         let id = DocId::Int64(404);
         let outcome = engine.replace(&coll, &id, doc! { "a": 1 }, false).unwrap();
-        assert_eq!(outcome, WriteOutcome { matched: false, modified: false, upserted: false });
+        assert_eq!(
+            outcome,
+            WriteOutcome { matched: false, modified: false, upserted: false, stamp: None }
+        );
         assert!(engine.get(&coll, &id).unwrap().is_none());
     }
 
@@ -1382,5 +1507,70 @@ mod tests {
             !entries.iter().any(|e| e.kind == OpKind::UniqueViolation),
             "a merge that broke nothing must not report a violation"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional writes by id (ADR-084)
+    // -----------------------------------------------------------------------
+
+    fn stale_of(err: StorageError) -> Option<Stamp> {
+        match err {
+            StorageError::Stale { current } => current,
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_conditional_replace_needs_the_current_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("app", "docs").unwrap();
+        let id = DocId::Int64(1);
+        let (_, first) = engine.insert_stamped(&coll, doc! {"_id": 1i64, "n": 0}).unwrap();
+
+        let out = engine.replace_if(&coll, &id, doc! {"n": 1}, false, Some(first)).unwrap();
+        assert!(out.modified);
+        let second = out.stamp.unwrap();
+        assert_ne!(second, first);
+
+        let mut rx = engine.subscribe();
+        let _ = rx.try_recv();
+        let before = engine.commits();
+        let err = engine.replace_if(&coll, &id, doc! {"n": 2}, false, Some(first)).unwrap_err();
+        assert_eq!(stale_of(err), Some(second), "the refusal names the current stamp");
+        assert_eq!(engine.commits() - before, 0, "a refused replace commits nothing");
+        assert!(rx.try_recv().is_err(), "a refused replace publishes nothing");
+        assert_eq!(engine.get(&coll, &id).unwrap().unwrap().get_i32("n").unwrap(), 1);
+
+        // Upsert does not rescue a stale condition: the caller said "at this
+        // version", not "or create it".
+        assert!(engine.delete(&coll, &id).unwrap());
+        let err = engine.replace_if(&coll, &id, doc! {"n": 3}, true, Some(second)).unwrap_err();
+        assert_eq!(stale_of(err), None);
+        assert!(engine.get(&coll, &id).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_conditional_delete_needs_the_current_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let coll = engine.create_collection("app", "docs").unwrap();
+        let id = DocId::Int64(1);
+        let (_, first) = engine.insert_stamped(&coll, doc! {"_id": 1i64}).unwrap();
+        let second = engine.replace(&coll, &id, doc! {"n": 1}, false).unwrap().stamp.unwrap();
+
+        let before = engine.commits();
+        let err = engine.delete_if(&coll, &id, Some(first)).unwrap_err();
+        assert_eq!(stale_of(err), Some(second));
+        assert_eq!(engine.commits() - before, 0);
+        assert!(engine.get(&coll, &id).unwrap().is_some(), "a stale delete removes nothing");
+
+        assert!(engine.delete_if(&coll, &id, Some(second)).unwrap());
+        assert!(engine.get(&coll, &id).unwrap().is_none());
+
+        // Gone now: expecting any version of it is stale, while an
+        // unconditional delete of a missing document is an ordinary `false`.
+        assert_eq!(stale_of(engine.delete_if(&coll, &id, Some(second)).unwrap_err()), None);
+        assert!(!engine.delete_if(&coll, &id, None).unwrap());
     }
 }

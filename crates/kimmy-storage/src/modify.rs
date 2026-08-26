@@ -42,7 +42,7 @@
 use std::cmp::Ordering;
 
 use bson::Document;
-use kimmy_core::{DocId, DocRecord, OpKind, OplogEntry};
+use kimmy_core::{DocId, DocRecord, OpKind, OplogEntry, Stamp};
 use redb::ReadableTable;
 
 use crate::docs::extract_id;
@@ -104,6 +104,17 @@ pub trait ModifySpec {
 
     /// The document to insert when nothing matched, if this is an upsert.
     fn upsert(&self) -> Option<std::result::Result<Document, String>>;
+
+    /// The version the caller expects the matched document to be at.
+    ///
+    /// `Some` makes the write conditional: a match at any other stamp — or
+    /// no match at all, when the caller expected one — aborts the whole
+    /// transaction with [`StorageError::Stale`]. Checked inside the write
+    /// transaction, against the image about to be written, so there is no
+    /// window between the check and the write.
+    fn expected_stamp(&self) -> Option<Stamp> {
+        None
+    }
 }
 
 /// What happened, and the images either side of it.
@@ -115,6 +126,8 @@ pub struct ModifyOutcome {
     pub after: Option<Document>,
     pub matched: bool,
     pub upserted: Option<DocId>,
+    /// The stamp the write produced, when it wrote anything.
+    pub stamp: Option<Stamp>,
 }
 
 /// What a filtered write did, counted inside the transaction that did it.
@@ -163,8 +176,8 @@ impl Engine {
             };
 
         let mut entries = Vec::with_capacity(matches.len());
-        for before in &matches {
-            match self.modify_in_txn(&txn, coll, before, spec) {
+        for (stamp, before) in &matches {
+            match self.modify_in_txn(&txn, coll, *stamp, before, spec) {
                 Ok((_, entry)) => entries.push(entry),
                 Err(e) => {
                     txn.abort()?;
@@ -175,8 +188,12 @@ impl Engine {
 
         let matched = matches.len() as u64;
         if entries.is_empty() {
-            // Nothing matched: a no-op must not commit, mint or publish.
+            // Nothing matched: a no-op must not commit, mint or publish —
+            // unless the caller expected a version to be there.
             txn.abort()?;
+            if spec.expected_stamp().is_some() {
+                return Err(StorageError::Stale { current: None });
+            }
             return Ok(ModifyManyOutcome { examined, matched, modified: 0 });
         }
 
@@ -203,9 +220,14 @@ impl Engine {
             }
         };
 
-        let Some(before) = chosen else {
-            // Nothing matched. An upsert inserts; anything else is a no-op,
-            // and a no-op must not mint an oplog entry or publish an event.
+        let Some((stamp, before)) = chosen else {
+            // Nothing matched. A caller that expected a version finds it
+            // gone; otherwise an upsert inserts, and anything else is a
+            // no-op that must not mint an oplog entry or publish an event.
+            if spec.expected_stamp().is_some() {
+                txn.abort()?;
+                return Err(StorageError::Stale { current: None });
+            }
             let Some(doc) = spec.upsert() else {
                 txn.abort()?;
                 return Ok(ModifyOutcome::default());
@@ -228,16 +250,18 @@ impl Engine {
                 entry.body.as_deref().expect("an insert carries its body"),
             )?;
             txn.commit()?;
+            let stamp = entry.stamp;
             self.publish(vec![entry]);
             return Ok(ModifyOutcome {
                 before: None,
                 after: Some(inserted),
                 matched: false,
                 upserted: Some(id),
+                stamp: Some(stamp),
             });
         };
 
-        let (next, entry) = match self.modify_in_txn(&txn, coll, &before, spec) {
+        let (next, entry) = match self.modify_in_txn(&txn, coll, stamp, &before, spec) {
             Ok(done) => done,
             Err(e) => {
                 txn.abort()?;
@@ -246,9 +270,16 @@ impl Engine {
         };
 
         txn.commit()?;
+        let stamp = entry.stamp;
         self.publish(vec![entry]);
 
-        Ok(ModifyOutcome { before: Some(before), after: next, matched: true, upserted: None })
+        Ok(ModifyOutcome {
+            before: Some(before),
+            after: next,
+            matched: true,
+            upserted: None,
+            stamp: Some(stamp),
+        })
     }
 
     /// Apply the spec to one matched document and write the result.
@@ -262,9 +293,15 @@ impl Engine {
         &self,
         txn: &redb::WriteTransaction,
         coll: &CollectionMeta,
+        current: Stamp,
         before: &Document,
         spec: &dyn ModifySpec,
     ) -> Result<(Option<Document>, OplogEntry)> {
+        if let Some(expected) = spec.expected_stamp()
+            && expected != current
+        {
+            return Err(StorageError::Stale { current: Some(current) });
+        }
         let id = extract_id(before)?;
         let next = spec
             .apply(before)
@@ -280,7 +317,7 @@ impl Engine {
         coll: &CollectionMeta,
         candidates: &Candidates,
         spec: &dyn ModifySpec,
-    ) -> Result<Option<Document>> {
+    ) -> Result<Option<(Stamp, Document)>> {
         // Every match, because the sort has to see them all to pick one.
         let (mut matches, _) = self.collect_matches(txn, coll, candidates, spec, None)?;
 
@@ -290,7 +327,7 @@ impl Engine {
         // `sort_by` rather than picking a minimum: the comparator is the
         // caller's whole sort specification, and a stable sort keeps the
         // scan's order for documents the sort does not separate.
-        matches.sort_by(|a, b| spec.compare(a, b));
+        matches.sort_by(|a, b| spec.compare(&a.1, &b.1));
         Ok(Some(matches.swap_remove(0)))
     }
 
@@ -307,54 +344,57 @@ impl Engine {
         candidates: &Candidates,
         spec: &dyn ModifySpec,
         limit: Option<usize>,
-    ) -> Result<(Vec<Document>, u64)> {
-        let mut matches: Vec<Document> = Vec::new();
+    ) -> Result<(Vec<(Stamp, Document)>, u64)> {
+        let mut matches: Vec<(Stamp, Document)> = Vec::new();
         let mut examined = 0u64;
 
         // `Ok(false)` asks the scan to stop: the limit is reached.
-        let mut consider = |doc: Document, matches: &mut Vec<Document>| -> Result<bool> {
-            examined += 1;
-            if !spec.matches(&doc) {
-                return Ok(true);
-            }
-            matches.push(doc);
-            if matches.len() > MAX_CANDIDATES {
-                // Refused, not truncated: choosing from a prefix would return
-                // a document that is not the one the sort asked for, and a
-                // filtered write over a prefix would silently leave the rest
-                // — and no caller could tell either happened.
-                return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
-                    "the filter matched more than {MAX_CANDIDATES} documents; \
+        let mut consider =
+            |stamp: Stamp, doc: Document, matches: &mut Vec<(Stamp, Document)>| -> Result<bool> {
+                examined += 1;
+                if !spec.matches(&doc) {
+                    return Ok(true);
+                }
+                matches.push((stamp, doc));
+                if matches.len() > MAX_CANDIDATES {
+                    // Refused, not truncated: choosing from a prefix would return
+                    // a document that is not the one the sort asked for, and a
+                    // filtered write over a prefix would silently leave the rest
+                    // — and no caller could tell either happened.
+                    return Err(StorageError::Core(kimmy_core::Error::InvalidQuery(format!(
+                        "the filter matched more than {MAX_CANDIDATES} documents; \
                      narrow the filter, or add an index and a tighter one"
-                ))));
-            }
-            Ok(!limit.is_some_and(|n| matches.len() >= n))
-        };
+                    ))));
+                }
+                Ok(!limit.is_some_and(|n| matches.len() >= n))
+            };
 
         let docs = txn.open_table(tables::DOCS)?;
 
         // Direct lookups share one body: a `$in` union of index ranges and a
         // list of primary keys can both offer one document twice.
-        let mut lookup =
-            |keys: &mut dyn Iterator<Item = Vec<u8>>, matches: &mut Vec<Document>| -> Result<()> {
-                let mut seen: std::collections::BTreeSet<Vec<u8>> = Default::default();
-                for key in keys {
-                    if !seen.insert(key.clone()) {
-                        continue;
-                    }
-                    let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
-                        continue;
-                    };
-                    let record = codec::decode_doc_record(raw.value())?;
-                    if record.deleted {
-                        continue;
-                    }
-                    if !consider(bson::deserialize_from_slice(&record.body)?, matches)? {
-                        break;
-                    }
+        let mut lookup = |keys: &mut dyn Iterator<Item = Vec<u8>>,
+                          matches: &mut Vec<(Stamp, Document)>|
+         -> Result<()> {
+            let mut seen: std::collections::BTreeSet<Vec<u8>> = Default::default();
+            for key in keys {
+                if !seen.insert(key.clone()) {
+                    continue;
                 }
-                Ok(())
-            };
+                let Some(raw) = docs.get((coll.id.0, key.as_slice()))? else {
+                    continue;
+                };
+                let record = codec::decode_doc_record(raw.value())?;
+                if record.deleted {
+                    continue;
+                }
+                let doc = bson::deserialize_from_slice(&record.body)?;
+                if !consider(record.stamp, doc, matches)? {
+                    break;
+                }
+            }
+            Ok(())
+        };
 
         match candidates {
             Candidates::Keys(keys) => lookup(&mut keys.iter().cloned(), &mut matches)?,
@@ -376,10 +416,12 @@ impl Engine {
                     }
                     lookup(&mut keys.into_iter(), &mut matches)?;
                 } else {
-                    scan_until(&docs, coll, &mut |doc| consider(doc, &mut matches))?;
+                    scan_until(&docs, coll, &mut |stamp, doc| consider(stamp, doc, &mut matches))?;
                 }
             }
-            Candidates::Scan => scan_until(&docs, coll, &mut |doc| consider(doc, &mut matches))?,
+            Candidates::Scan => {
+                scan_until(&docs, coll, &mut |stamp, doc| consider(stamp, doc, &mut matches))?
+            }
         }
 
         Ok((matches, examined))
@@ -440,7 +482,7 @@ impl Engine {
 fn scan_until(
     docs: &impl ReadableTable<(u64, &'static [u8]), &'static [u8]>,
     coll: &CollectionMeta,
-    f: &mut impl FnMut(Document) -> Result<bool>,
+    f: &mut impl FnMut(Stamp, Document) -> Result<bool>,
 ) -> Result<()> {
     for entry in docs.range(doc_range(coll.id))? {
         let (_, value) = entry?;
@@ -448,7 +490,7 @@ fn scan_until(
         if record.deleted {
             continue;
         }
-        if !f(bson::deserialize_from_slice(&record.body)?)? {
+        if !f(record.stamp, bson::deserialize_from_slice(&record.body)?)? {
             break;
         }
     }
@@ -1019,5 +1061,137 @@ mod tests {
             engine.get(&coll, &DocId::Int64(0)).unwrap().unwrap().get_str("status").unwrap(),
             "pending"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Conditional writes (ADR-084)
+    // -----------------------------------------------------------------------
+
+    /// `claim()`, conditional on the chosen document being at `expected`.
+    struct ConditionalClaim {
+        expected: Option<Stamp>,
+    }
+
+    impl ModifySpec for ConditionalClaim {
+        fn matches(&self, d: &Document) -> bool {
+            d.get_str("status").map(|s| s == "pending").unwrap_or(false)
+        }
+        fn compare(&self, a: &Document, b: &Document) -> Ordering {
+            i64_of(a, "created").cmp(&i64_of(b, "created"))
+        }
+        fn apply(&self, d: &Document) -> std::result::Result<Option<Document>, String> {
+            let mut next = d.clone();
+            next.insert("status", "claimed");
+            Ok(Some(next))
+        }
+        fn upsert(&self) -> Option<std::result::Result<Document, String>> {
+            None
+        }
+        fn expected_stamp(&self) -> Option<Stamp> {
+            self.expected
+        }
+    }
+
+    fn stale_of(err: StorageError) -> Option<Stamp> {
+        match err {
+            StorageError::Stale { current } => current,
+            other => panic!("expected Stale, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_conditional_modify_succeeds_at_the_current_stamp_and_moves_it() {
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let (current, _) = engine.get_stamped(&coll, &DocId::Int64(2)).unwrap().unwrap();
+
+        let spec = ConditionalClaim { expected: Some(current) };
+        let out = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap();
+        assert!(out.matched);
+        let produced = out.stamp.expect("a write reports its stamp");
+        assert_ne!(produced, current);
+        assert_eq!(engine.get_stamped(&coll, &DocId::Int64(2)).unwrap().unwrap().0, produced);
+
+        // Through `modify_where` too: the same body, so the same behaviour.
+        let (current, _) = engine.get_stamped(&coll, &DocId::Int64(1)).unwrap().unwrap();
+        let key = crate::docs::doc_key(&DocId::Int64(1)).unwrap();
+        let spec = ConditionalClaim { expected: Some(current) };
+        let out = engine.modify_where(&coll, &Candidates::Keys(vec![key]), &spec, Some(1)).unwrap();
+        assert_eq!(out.modified, 1);
+    }
+
+    #[test]
+    fn a_stale_stamp_aborts_writes_nothing_and_publishes_nothing() {
+        let (engine, coll, _dir) = engine();
+        seed(&engine, &coll);
+        let (old, _) = engine.get_stamped(&coll, &DocId::Int64(2)).unwrap().unwrap();
+        // Move the document on so `old` is stale.
+        engine.find_and_modify(&coll, &Candidates::Scan, &claim()).unwrap();
+        let (current, _) = engine.get_stamped(&coll, &DocId::Int64(2)).unwrap().unwrap();
+        assert_ne!(current, old);
+        // Put it back to pending so the conditional claim matches it again.
+        let mut doc = engine.get(&coll, &DocId::Int64(2)).unwrap().unwrap();
+        doc.insert("status", "pending");
+        let current = engine.replace(&coll, &DocId::Int64(2), doc, false).unwrap().stamp.unwrap();
+
+        let mut rx = engine.subscribe();
+        let before = engine.commits();
+        let spec = ConditionalClaim { expected: Some(old) };
+        let err = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap_err();
+        assert_eq!(stale_of(err), Some(current), "the refusal names the current stamp");
+        assert_eq!(engine.commits() - before, 0);
+        assert!(rx.try_recv().is_err(), "a refused write publishes nothing");
+        assert_eq!(
+            engine.get(&coll, &DocId::Int64(2)).unwrap().unwrap().get_str("status").unwrap(),
+            "pending"
+        );
+
+        // `modify_where` refuses the same way, even mid-batch: nothing lands.
+        let key = crate::docs::doc_key(&DocId::Int64(2)).unwrap();
+        let err =
+            engine.modify_where(&coll, &Candidates::Keys(vec![key]), &spec, None).unwrap_err();
+        assert_eq!(stale_of(err), Some(current));
+        assert_eq!(engine.commits() - before, 0);
+    }
+
+    #[test]
+    fn expecting_a_version_of_a_document_that_is_gone_is_stale() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! {"_id": 1i64, "status": "done"}).unwrap();
+        let (stamp, _) = engine.get_stamped(&coll, &DocId::Int64(1)).unwrap().unwrap();
+
+        // Nothing matches (status is not pending) but a version was expected.
+        let spec = ConditionalClaim { expected: Some(stamp) };
+        let err = engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap_err();
+        assert_eq!(stale_of(err), None);
+        let err = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap_err();
+        assert_eq!(stale_of(err), None);
+
+        // Without an expectation the same non-match is an ordinary no-op.
+        let spec = ConditionalClaim { expected: None };
+        assert!(!engine.find_and_modify(&coll, &Candidates::Scan, &spec).unwrap().matched);
+    }
+
+    #[test]
+    fn racing_conditional_claims_have_exactly_one_winner() {
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "jobs").unwrap();
+        engine.insert(&coll, doc! {"_id": 1i64, "created": 1i64, "status": "pending"}).unwrap();
+        let (stamp, _) = engine.get_stamped(&coll, &DocId::Int64(1)).unwrap().unwrap();
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let engine = Arc::clone(&engine);
+            let coll = coll.clone();
+            handles.push(std::thread::spawn(move || {
+                let spec = ConditionalClaim { expected: Some(stamp) };
+                engine.find_and_modify(&coll, &Candidates::Scan, &spec).is_ok()
+            }));
+        }
+        let wins = handles.into_iter().map(|h| h.join().unwrap()).filter(|w| *w).count();
+        assert_eq!(wins, 1, "every racer named the same version; one may win");
     }
 }

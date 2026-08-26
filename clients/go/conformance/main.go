@@ -44,6 +44,7 @@ var scenarios = []string{
 	"dropped_collection_ends_stream",
 	"recreated_collection_serves_its_own_history",
 	"stale_resume_token_is_refused",
+	"stale_write_is_typed",
 }
 
 func password() string {
@@ -474,6 +475,36 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 			break
 		}
 		return map[string]any{"first_id": first}, nil
+
+	case "stale_write_is_typed":
+		db, err := connect(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		if err := seed(ctx, db, 0); err != nil {
+			return nil, err
+		}
+		inserted, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": 0, "qty": 0})
+		if err != nil {
+			return nil, err
+		}
+		stamp, _ := inserted["stamp"].(string)
+		filter := map[string]any{"_id": 0}
+		first, err := db.UpdateIf(ctx, "shop", "orders", filter, map[string]any{"$set": map[string]any{"qty": 1}}, stamp)
+		if err != nil {
+			return nil, err
+		}
+		_, err = db.UpdateIf(ctx, "shop", "orders", filter, map[string]any{"$set": map[string]any{"qty": 2}}, stamp)
+		var apiErr *kimmydb.APIError
+		if !errors.As(err, &apiErr) {
+			return nil, fmt.Errorf("the same stamp a second time must be refused, got %v", err)
+		}
+		return map[string]any{
+			"first_write_ok": first["modified"] == float64(1),
+			"code":           apiErr.Code,
+			"retry":          string(apiErr.Retry),
+			"status":         apiErr.Status,
+		}, nil
 
 	case "stale_resume_token_is_refused":
 		db, err := connect(ctx, base)

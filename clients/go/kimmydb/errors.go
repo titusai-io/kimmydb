@@ -59,6 +59,10 @@ func (e *APIError) Unauthorized() bool { return e.Code == "unauthorized" }
 // NotFound reports whether the target does not exist.
 func (e *APIError) NotFound() bool { return e.Code == "not_found" }
 
+// Stale reports that a conditional write's if_stamp did not match; nothing
+// was written. Re-read and decide again.
+func (e *APIError) Stale() bool { return e.Code == "stale" }
+
 // errorFrom builds an APIError from a refusal.
 //
 // A body that is not the envelope — a proxy's HTML error page, say — still

@@ -64,6 +64,11 @@ class KimmyError(Exception):
     def is_not_found(self) -> bool:
         return self.code == "not_found"
 
+    @property
+    def is_stale(self) -> bool:
+        """A conditional write's ``if_stamp`` did not match; nothing was written."""
+        return self.code == "stale"
+
     @classmethod
     def from_response(
         cls,

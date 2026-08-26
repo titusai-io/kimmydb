@@ -12,6 +12,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **Conditional writes.** Every write now reports the version it produced
+  (`stamp`, an opaque token), `find` returns versions on request
+  (`"stamps": true`, a `stamps` array parallel to `documents`), and a read
+  by id carries the document's version as its `ETag`. Every single-document
+  write — `PUT`/`DELETE` by id (`?if_stamp=`), `update`, `delete` and
+  `find_and_modify` (`if_stamp` in the body) — accepts a stamp and lands only
+  if the document is still at that version; otherwise **`409 stale`**,
+  `retry: no`, and nothing is written. A missing document is stale too,
+  `upsert` or not. Check-then-act on one document, node-local, with no
+  coordination (ADR-084). Advertised as the `conditional-writes` capability;
+  `stale` joins the closed error-code set. The Rust, Python and Go clients
+  gain the conditional variants and a typed `stale`, and the conformance
+  suite holds all three to it.
+
 ### Fixed
 
 - **`update` and `delete` by filter no longer lose concurrent writes.** The

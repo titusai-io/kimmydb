@@ -804,10 +804,22 @@ impl crate::Engine {
         coll: &crate::CollectionMeta,
         key: &[u8],
     ) -> Result<Option<Document>> {
+        Ok(self.get_record_by_encoded_key(coll, key)?.map(|(_, doc)| doc))
+    }
+
+    /// [`Engine::get_by_encoded_key`], with the document's stamp.
+    pub fn get_record_by_encoded_key(
+        &self,
+        coll: &crate::CollectionMeta,
+        key: &[u8],
+    ) -> Result<Option<(kimmy_core::Stamp, Document)>> {
         let txn = self.db().begin_read()?;
         let docs = txn.open_table(tables::DOCS)?;
         match docs.get((coll.id.0, key))? {
-            Some(raw) => Ok(crate::codec::decode_doc_record(raw.value())?.document()?),
+            Some(raw) => {
+                let record = crate::codec::decode_doc_record(raw.value())?;
+                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+            }
             None => Ok(None),
         }
     }

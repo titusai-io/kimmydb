@@ -6,6 +6,35 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **conditional writes: `if_stamp`, `stale`, and stamps everywhere**
+
+Branch `feat/if-stamp-cas`, ADR-084, stacked on `docs/guarantee-table`. The
+check-then-act primitive an AP store can honestly offer: every write reports
+the stamp it produced, `find` returns stamps on request (`stamps: true`, a
+parallel array), a read by id sets `ETag`, and every single-document write
+accepts `if_stamp` — `PUT` / `DELETE` by id as a query parameter, `update` /
+`delete` / `find_and_modify` as a body field. A mismatch is `409 stale`,
+`retry: no`, on every route alike, and writes nothing. Engine:
+`Stamp::encode/decode` (opaque base64url of hlc‖node) in `kimmy-core`;
+`StorageError::Stale { current }`; `replace_if` / `delete_if` on top of a
+shared `delete_where` in `docs.rs`; `ModifySpec::expected_stamp` checked in
+`modify_in_txn`, with `collect_matches` now carrying each match's stamp;
+`insert_stamped`, `get_stamped`, `get_record_by_encoded_key`,
+`for_each_record_after` as the stamped twins of the existing reads. API:
+`ErrorCode::Stale` (the closed set is now 18), `Capability::ConditionalWrites`,
+`exec::parse_if_stamp`, `ReplaceParams`, and `multi` + `if_stamp` /
+`upsert` + `if_stamp` refused as `400`. Spec: every touched operation, the
+`Stamp` schema, the `stale` row, the capability row — and two stale
+descriptions fixed on the way (`update`/`delete` "one document at a time",
+`getDocument` "find on `_id` is a scan"). Clients: Rust `update_if` /
+`replace_document_if` / `delete_document_if` / `Query::stamps` /
+`ErrorCode::Stale`; Python `if_stamp=` on `update` / `delete`, `stamps=` on
+`find`, `is_stale`; Go `UpdateIf` / `DeleteIf` / `Query.Stamps` / `Stale()`.
+Conformance scenario `stale_write_is_typed` in all three drivers. Tests: six
+API tests including an eight-writer race with exactly one winner; four
+`modify.rs` tests; two `docs.rs` tests. Deliberate non-goals, recorded in the
+ADR: `If-Match`/`412`, and any cross-node meaning.
+
 ## As of 2026-08-26 — **one table for what each operation guarantees**
 
 Branch `docs/guarantee-table`, documentation only. The guarantees were

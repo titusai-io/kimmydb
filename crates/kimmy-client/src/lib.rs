@@ -373,6 +373,31 @@ impl Client {
         .await
     }
 
+    /// [`Client::update`] for one document, conditional on its version.
+    ///
+    /// `if_stamp` is a stamp from an earlier write's response, a `find` with
+    /// `Query::stamps`, or a read's `ETag`. The server writes only if the
+    /// matched document is still at that version; otherwise the error's code
+    /// is [`ErrorCode::Stale`], nothing was written, and the caller re-reads
+    /// and decides again. Not retried: the same request can only fail the
+    /// same way.
+    pub async fn update_if(
+        &self,
+        db: &str,
+        collection: &str,
+        filter: &Value,
+        update: &Value,
+        if_stamp: &str,
+    ) -> Result<Value> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/v1/db/{db}/coll/{collection}/update"),
+            Some(json!({ "filter": filter, "update": update, "if_stamp": if_stamp })),
+            Safety::Unsafe,
+        )
+        .await
+    }
+
     pub async fn aggregate(&self, db: &str, collection: &str, pipeline: &Value) -> Result<Value> {
         self.send(
             reqwest::Method::POST,
@@ -567,6 +592,43 @@ impl Client {
         self.send(
             reqwest::Method::DELETE,
             &format!("/v1/db/{db}/coll/{collection}/docs/{id}"),
+            None,
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    /// [`Client::replace_document`], only if the document is at `if_stamp`.
+    pub async fn replace_document_if(
+        &self,
+        db: &str,
+        collection: &str,
+        id: &str,
+        document: &Value,
+        upsert: bool,
+        if_stamp: &str,
+    ) -> Result<Value> {
+        let upsert = if upsert { "&upsert=true" } else { "" };
+        self.send(
+            reqwest::Method::PUT,
+            &format!("/v1/db/{db}/coll/{collection}/docs/{id}?if_stamp={if_stamp}{upsert}"),
+            Some(document.clone()),
+            Safety::Idempotent,
+        )
+        .await
+    }
+
+    /// [`Client::delete_document`], only if the document is at `if_stamp`.
+    pub async fn delete_document_if(
+        &self,
+        db: &str,
+        collection: &str,
+        id: &str,
+        if_stamp: &str,
+    ) -> Result<Value> {
+        self.send(
+            reqwest::Method::DELETE,
+            &format!("/v1/db/{db}/coll/{collection}/docs/{id}?if_stamp={if_stamp}"),
             None,
             Safety::Idempotent,
         )
