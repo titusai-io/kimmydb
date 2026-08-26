@@ -6,6 +6,30 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **init discovers instead of interrogating; a shipped panic fixed**
+
+Branch `feat/init-discovery`. `kimmy init` asked nine questions and showed no
+defaults on first run, made the operator hand-type the RFC 8707 resource (the
+one value the node already publishes — and the easiest to mistype), and read
+secrets with terminal echo on. Now it asks for the node URL alone, discovers
+resource + issuer from the node's RFC 9728 metadata (`oidc::discover_from_node`,
+same document `login` already consumed), shows `kimmy-cli` as a real default
+for the client id, falls back to explicit prompts only when the node publishes
+no metadata, carries existing secret keys forward untouched on re-runs, and
+never reads an interactive secret. Colors gate on tty + `NO_COLOR`.
+
+The re-run exposed a **v0.7.0 panic**: with any settings file present,
+`apply_kimmy_file`'s `_` arm still asked clap for `issuer`'s value source on
+subcommands that have no such argument — so every non-login command
+(`databases`, `ping`, …) died with `"issuer" is not an id of an argument` until
+the file was deleted. Fixed by skipping provider-field application for anything
+that is not Login/Token. Manual matrix verified: init first run, init re-run,
+databases and ping with file present. Gap worth closing later: no test harness
+drives apply_kimmy_file against arbitrary subcommands; the fix is guarded by
+manual verification only.
+
+---
+
 ## As of 2026-08-25 — **wildcards no longer reach the system database**
 
 Branch `feat/system-db-wildcard` (ADR-079). `{db:"*"}` stopped matching
