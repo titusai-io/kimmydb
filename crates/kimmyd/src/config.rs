@@ -253,6 +253,15 @@ pub struct StorageConfig {
     /// flight. Must be between 1 and 10,000 — the same ceiling
     /// `find_and_modify` holds the writer for.
     pub multi_chunk_docs: usize,
+    /// How a commit becomes durable (ADR-088): `durable` (every commit
+    /// fsyncs before it returns; the default) or `coalesced` (a commit
+    /// waits for the next shared fsync, one per `commit_coalesce_ms`
+    /// window, so concurrent writers share it). Both are durable when the
+    /// response returns; there is deliberately no class that is not.
+    pub durability: String,
+    /// The coalescing window, in milliseconds, for `durability = "coalesced"`.
+    /// Ignored under `durable`. 1 to 1000.
+    pub commit_coalesce_ms: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -854,6 +863,11 @@ impl Default for StorageConfig {
             // scans for accuracy no caller can observe.
             ttl_interval_secs: 60,
             multi_chunk_docs: kimmy_storage::modify::DEFAULT_MULTI_CHUNK_DOCS,
+            durability: "durable".into(),
+            // A few milliseconds: long enough that concurrent writers land
+            // in the same window, short enough to be invisible next to the
+            // fsync it replaces.
+            commit_coalesce_ms: 5,
         }
     }
 }
@@ -1038,6 +1052,20 @@ impl Config {
         // against, and its own older image of the document wins. Retention set
         // the other way round is the only configuration in which a partition
         // shorter than the oplog window resurrects data (ADR-085).
+        if kimmy_storage::DurabilityClass::parse(&self.storage.durability).is_none() {
+            anyhow::bail!(
+                "storage.durability must be \"durable\" or \"coalesced\", got {:?}; there is \
+                 deliberately no class under which an acknowledged write can be lost",
+                self.storage.durability
+            );
+        }
+        if !(1..=1000).contains(&self.storage.commit_coalesce_ms) {
+            anyhow::bail!(
+                "storage.commit_coalesce_ms ({}) must be between 1 and 1000",
+                self.storage.commit_coalesce_ms
+            );
+        }
+
         if self.storage.multi_chunk_docs == 0
             || self.storage.multi_chunk_docs > kimmy_storage::MAX_CANDIDATES
         {
@@ -1343,6 +1371,22 @@ mod tests {
         cfg.storage.tombstone_retention_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn the_durability_class_is_one_of_two_and_the_window_is_bounded() {
+        let mut cfg = valid();
+        cfg.storage.durability = "fast".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("acknowledged write"), "{err}");
+        cfg.storage.durability = "coalesced".into();
+        cfg.validate().unwrap();
+        cfg.storage.commit_coalesce_ms = 0;
+        assert!(cfg.validate().is_err());
+        cfg.storage.commit_coalesce_ms = 5000;
+        assert!(cfg.validate().is_err());
+        cfg.storage.commit_coalesce_ms = 1000;
+        cfg.validate().unwrap();
     }
 
     #[test]

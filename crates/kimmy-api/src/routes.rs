@@ -358,6 +358,12 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
          # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
          # TYPE kimmy_commits counter\n\
          kimmy_commits {commits}\n\
+         # HELP kimmy_fsyncs Times the disk was asked to make something durable: one per commit under durable, one per shared flush under coalesced.\n\
+         # TYPE kimmy_fsyncs counter\n\
+         kimmy_fsyncs {fsyncs}\n\
+         # HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.\n\
+         # TYPE kimmy_commits_grouped_total counter\n\
+         kimmy_commits_grouped_total {grouped}\n\
          # HELP kimmy_storage_bytes Size of the database file on disk.\n\
          # TYPE kimmy_storage_bytes gauge\n\
          kimmy_storage_bytes {storage}\n\
@@ -374,6 +380,10 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
         // write that costs two commits costs twice as much as one that costs
         // one, and no latency figure says which of those is happening.
         commits = state.engine.commits(),
+        // Under `coalesced` the two diverge, and the gap is the win: commits
+        // that reached the disk without paying for their own fsync (ADR-088).
+        fsyncs = state.engine.fsyncs(),
+        grouped = state.engine.grouped_commits(),
         storage = state.engine.storage_bytes(),
         process = state.metrics.render(),
     ))

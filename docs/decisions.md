@@ -4140,6 +4140,60 @@ report that can over-state after a rewrite, documented; bounded by retention
 — a collision older than the oplog window is no longer listed, and the
 change-stream event is the record that outlives it.
 
+## ADR-088 — Two durability classes, and the one there is not
+
+**Decision.** `storage.durability` selects how a commit reaches the disk.
+`durable`, the default, is unchanged: every commit fsyncs before it returns.
+`coalesced` writes a commit with redb's `Durability::None` and then waits at
+a barrier for the next shared fsync — one durable commit, carrying a marker
+so it is never empty, per `commit_coalesce_ms` window (default 5 ms) — so
+that N concurrent writers pay one fsync rather than N. Both classes are
+durable when the write's response returns. The class is reported by
+`GET /v1/version` as `durability`, and `/metrics` gains `kimmy_fsyncs` and
+`kimmy_commits_grouped_total`. There is no third class.
+
+**The barrier.** No background thread and no handle to the engine: the
+committers run it. The first to arrive after a flush becomes the leader,
+sleeps one window so others can join, performs the flush, and wakes everyone
+whose commit it covered; arrivals during the window only wait. Every
+committer waits for a flush that *started after* its own commit, which is
+the whole of the durability argument, and the leader's sleep is what turns
+concurrency into grouping. A single-writer loop gains nothing from it — each
+commit waits a window for company that never comes — and the documentation
+says so; it pays off under concurrency, which is where the single-writer
+line in the benchmarks was flat.
+
+**Why not `fast`.** The spike showed redb would allow it cleanly: commit
+with `None`, fsync on a timer, respond at once. It was declined (the maintainer,
+2026-08-26) because it changes what a 200 means — an acknowledged write
+becomes losable for up to an interval — and because the loss is not even
+local: replication and change streams read the oplog before the disk has
+it, so a peer or a subscriber can hold an entry this node then forgets,
+which anti-entropy would later refill from the peer as if the node had
+never written it. A knob that quietly weakens the one promise the durability
+table makes is the kind that gets turned on and forgotten. `coalesced`
+takes the throughput without touching the promise.
+
+**Why a field on `/v1/version` rather than a capability.** The capability
+set is closed by an enum and checked against the specification; a value
+like `durability:coalesced` is configuration, not a feature a client
+depends on, and a client has nothing to branch on either way. A field
+answers the operator's question — "which class is this node running?" —
+without pretending it is a protocol feature.
+
+**Alternatives.** Group commit by merging transactions: redb's single writer
+cannot merge two open transactions, and the leader pattern gives the same
+amortisation without changing what a transaction is. A background flusher
+thread: needs a handle to the database from outside the engine and a
+lifecycle of its own; the leader-elected barrier has neither. Per-request
+durability choice: a request that asks for less than the node's class is a
+request that changed the promise for everyone sharing its fsync.
+
+**Cost.** One mutex-guarded ticket per commit under `coalesced`, one window
+of latency per write, one marker key in `meta` rewritten per flush. Two
+configuration keys, one field on `/v1/version`, two metric series. Under
+`durable` nothing changes but a counter.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

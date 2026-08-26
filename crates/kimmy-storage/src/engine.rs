@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use kimmy_core::{
     CollectionId, Error as CoreError, Hlc, HlcClock, NodeId, OpKind, OplogEntry, Stamp, vector_meta,
 };
-use parking_lot::Mutex;
+use parking_lot::{Condvar, Mutex};
 use redb::{Database, ReadableDatabase, ReadableTable};
 use tokio::sync::broadcast;
 use tracing::{debug, info};
@@ -58,9 +58,80 @@ pub struct Engine {
     /// (ADR-086). Set from configuration at startup; the storage default
     /// stands for a bare engine.
     multi_chunk_docs: std::sync::atomic::AtomicUsize,
+    /// How a commit becomes durable (ADR-088). `None` is the default class,
+    /// `durable`: every commit fsyncs before it returns. `Some` is
+    /// `coalesced`: commits skip their own fsync and wait at a shared barrier
+    /// that fsyncs once per window.
+    coalescer: Mutex<Option<Coalescer>>,
+    /// Wakes committers waiting at the barrier; beside the mutex rather than
+    /// inside it so a wait can re-acquire the lock it released.
+    coalesce_woken: Condvar,
+    /// Commits that reached the disk with their own fsync, or the shared
+    /// fsync of a barrier flush — the number of times the disk was asked to
+    /// make something durable.
+    fsyncs: std::sync::atomic::AtomicU64,
+    /// Commits that skipped their own fsync and were made durable by a
+    /// barrier flush shared with others (ADR-088).
+    grouped_commits: std::sync::atomic::AtomicU64,
 }
 
-/// A write transaction that counts itself when it commits.
+/// How a commit becomes durable (ADR-088).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DurabilityClass {
+    /// Every commit fsyncs before it returns. The default, and what every
+    /// release before 0.12 did.
+    Durable,
+    /// A commit is written without its own fsync and then **waits** for the
+    /// next shared fsync, which runs once per `commit_coalesce_ms` window and
+    /// covers every commit that arrived during it. Durable when the call
+    /// returns, exactly as `Durable`; what changes is that N concurrent
+    /// writers pay one fsync rather than N.
+    Coalesced,
+}
+
+impl DurabilityClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Coalesced => "coalesced",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "durable" => Some(Self::Durable),
+            "coalesced" => Some(Self::Coalesced),
+            _ => None,
+        }
+    }
+}
+
+/// The shared-fsync barrier behind [`DurabilityClass::Coalesced`].
+///
+/// No background thread and no handle to the engine: the committers
+/// themselves run it. The first committer to arrive after a flush becomes
+/// the *leader*, sleeps one window so others can join, then performs one
+/// durable commit and wakes everyone whose commit it covered. Later arrivals
+/// during the window are *followers* and only wait. A committer always
+/// waits for a flush that started after its own commit, which is what makes
+/// "durable when the call returns" hold.
+struct Coalescer {
+    window: std::time::Duration,
+    /// Commits so far that are waiting on, or have had, a flush.
+    requested: u64,
+    /// Commits covered by the last completed flush.
+    flushed: u64,
+    leader_running: bool,
+}
+
+impl Coalescer {
+    fn new(window: std::time::Duration) -> Self {
+        Self { window, requested: 0, flushed: 0, leader_running: false }
+    }
+}
+
+/// A write transaction that counts itself when it commits, and makes itself
+/// durable the way the engine's durability class says (ADR-088).
 ///
 /// Aborts are not counted, deliberately: an abort does not fsync, and the
 /// question this exists to answer is how many times a write path reaches the
@@ -68,7 +139,10 @@ pub struct Engine {
 /// unchanged at the call sites.
 pub(crate) struct WriteTxn<'a> {
     txn: redb::WriteTransaction,
-    commits: &'a std::sync::atomic::AtomicU64,
+    engine: &'a Engine,
+    /// Whether this transaction was opened without its own fsync and must
+    /// wait at the barrier after committing.
+    coalesced: bool,
 }
 
 impl WriteTxn<'_> {
@@ -86,7 +160,13 @@ impl WriteTxn<'_> {
         // disabled-span check every other `tracing` call site already pays.
         let _span = tracing::info_span!("storage.commit").entered();
         self.txn.commit()?;
-        self.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.coalesced {
+            self.engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.engine.wait_for_flush()?;
+        } else {
+            self.engine.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         Ok(())
     }
 
@@ -165,6 +245,10 @@ impl Engine {
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
             ),
+            coalescer: Mutex::new(None),
+            coalesce_woken: Condvar::new(),
+            fsyncs: std::sync::atomic::AtomicU64::new(0),
+            grouped_commits: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -617,7 +701,118 @@ impl Engine {
     /// them: opening the database, migrating it, and restoring a backup into a
     /// fresh file.
     pub(crate) fn begin_write(&self) -> std::result::Result<WriteTxn<'_>, redb::TransactionError> {
-        Ok(WriteTxn { txn: self.db.begin_write()?, commits: &self.commits })
+        let mut txn = self.db.begin_write()?;
+        let coalesced = self.coalescer.lock().is_some();
+        if coalesced {
+            // No persistent savepoints exist in this engine, so the one
+            // reason redb refuses a reduced durability cannot apply.
+            txn.set_durability(redb::Durability::None)
+                .expect("no persistent savepoint was touched in a fresh transaction");
+        }
+        Ok(WriteTxn { txn, engine: self, coalesced })
+    }
+
+    /// The durability class this engine commits under (ADR-088).
+    pub fn durability(&self) -> DurabilityClass {
+        if self.coalescer.lock().is_some() {
+            DurabilityClass::Coalesced
+        } else {
+            DurabilityClass::Durable
+        }
+    }
+
+    /// Choose how commits become durable. `window` is the coalescing window
+    /// and is ignored for `Durable`. Set once at startup; switching while
+    /// writes are in flight is safe (each transaction reads the class when it
+    /// opens) but pointless.
+    pub fn set_durability(&self, class: DurabilityClass, window: std::time::Duration) {
+        let mut coalescer = self.coalescer.lock();
+        *coalescer = match class {
+            DurabilityClass::Durable => None,
+            DurabilityClass::Coalesced => Some(Coalescer::new(window)),
+        };
+    }
+
+    /// Times the disk was asked to make something durable: one per commit
+    /// under `durable`, one per barrier flush under `coalesced`.
+    pub fn fsyncs(&self) -> u64 {
+        self.fsyncs.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Commits made durable by a shared barrier flush rather than their own
+    /// fsync (ADR-088). Zero under `durable`.
+    pub fn grouped_commits(&self) -> u64 {
+        self.grouped_commits.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Wait until a barrier flush that started after this commit has landed,
+    /// running the flush if nobody else is.
+    fn wait_for_flush(&self) -> std::result::Result<(), redb::CommitError> {
+        let window;
+        let my_ticket;
+        {
+            let mut guard = self.coalescer.lock();
+            let Some(c) = guard.as_mut() else {
+                // The class changed to `durable` between open and commit:
+                // nothing will flush for us, so flush ourselves.
+                drop(guard);
+                return self.flush_now();
+            };
+            c.requested += 1;
+            my_ticket = c.requested;
+            window = c.window;
+            if c.leader_running {
+                // A leader is collecting. Its flush starts after its window,
+                // which is after now, so it covers this ticket; if the class
+                // is switched off meanwhile the wait ends with nothing left
+                // to wait for.
+                while guard.as_ref().is_some_and(|c| c.flushed < my_ticket) {
+                    self.coalesce_woken.wait(&mut guard);
+                }
+                return Ok(());
+            }
+            c.leader_running = true;
+        }
+
+        // Leader: give the window to whoever is about to commit, then flush.
+        std::thread::sleep(window);
+        let result = self.flush_now();
+        let mut guard = self.coalescer.lock();
+        if let Some(c) = guard.as_mut() {
+            if result.is_ok() {
+                c.flushed = c.requested;
+            }
+            c.leader_running = false;
+        }
+        self.coalesce_woken.notify_all();
+        result
+    }
+
+    /// One durable commit that also carries every earlier non-durable one to
+    /// the disk. Writes a marker so the transaction is never empty — an
+    /// empty commit is one redb could reasonably skip, and the point here is
+    /// the fsync.
+    fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
+        let mut txn = self.db.begin_write().map_err(|e| {
+            redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
+        })?;
+        txn.set_durability(redb::Durability::Immediate).expect("Immediate is always permitted");
+        {
+            let mut meta = txn.open_table(tables::META).map_err(|e| {
+                redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })?;
+            let n = self.fsyncs.load(std::sync::atomic::Ordering::Relaxed);
+            meta.insert("durability_flush", n.to_be_bytes().as_slice()).map_err(|e| {
+                redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(
+                    e.to_string(),
+                )))
+            })?;
+        }
+        txn.commit()?;
+        self.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
     }
 
     /// Publish committed events to live subscribers.
@@ -1382,5 +1577,74 @@ mod tests {
             matches!(Engine::open(&path), Err(StorageError::UnsupportedFormat { found: 99, .. })),
             "opening must refuse rather than misread the records"
         );
+    }
+
+    #[test]
+    fn coalesced_commits_share_fsyncs_and_are_readable_after_reopen() {
+        // ADR-088: N concurrent writers, N commits, fewer than N fsyncs —
+        // and every document is on disk when the engine is reopened.
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        engine.set_durability(DurabilityClass::Coalesced, std::time::Duration::from_millis(5));
+        assert_eq!(engine.durability(), DurabilityClass::Coalesced);
+        let coll = engine.create_collection("app", "c").unwrap();
+        let fsyncs_before = engine.fsyncs();
+        let commits_before = engine.commits();
+        let grouped_before = engine.grouped_commits();
+
+        let mut handles = Vec::new();
+        for w in 0..8i64 {
+            let engine = Arc::clone(&engine);
+            let coll = coll.clone();
+            handles.push(std::thread::spawn(move || {
+                for i in 0..20i64 {
+                    engine.insert(&coll, doc! {"_id": w * 100 + i, "w": w}).unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let commits = engine.commits() - commits_before;
+        let fsyncs = engine.fsyncs() - fsyncs_before;
+        assert_eq!(commits, 160, "one commit per insert, still");
+        assert_eq!(
+            engine.grouped_commits() - grouped_before,
+            160,
+            "every one of them went through the barrier"
+        );
+        assert!(
+            fsyncs < commits,
+            "the barrier must have grouped some: {fsyncs} fsyncs for {commits} commits"
+        );
+        assert!(fsyncs >= 1);
+
+        drop(engine);
+        let reopened = Engine::open(&path).unwrap();
+        let coll = reopened.get_collection("app", "c").unwrap();
+        assert_eq!(reopened.count(&coll).unwrap(), 160, "durable when the call returned");
+    }
+
+    #[test]
+    fn durable_is_the_default_and_pays_one_fsync_per_commit() {
+        use bson::doc;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        assert_eq!(engine.durability(), DurabilityClass::Durable);
+        let coll = engine.create_collection("app", "c").unwrap();
+        let (c0, f0) = (engine.commits(), engine.fsyncs());
+        for i in 0..5i64 {
+            engine.insert(&coll, doc! {"_id": i}).unwrap();
+        }
+        assert_eq!(engine.commits() - c0, 5);
+        assert_eq!(engine.fsyncs() - f0, 5, "under durable every commit is its own fsync");
+        assert_eq!(engine.grouped_commits(), 0);
+
+        assert_eq!(DurabilityClass::parse("coalesced"), Some(DurabilityClass::Coalesced));
+        assert_eq!(DurabilityClass::parse("fast"), None, "there is no such class");
+        assert_eq!(DurabilityClass::Durable.as_str(), "durable");
     }
 }

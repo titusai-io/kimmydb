@@ -292,6 +292,33 @@ What that decides:
 
 ---
 
+## Coalesced durability — the flat line bends
+
+Taken 2026-08-26 on a different machine from the rest of this page (an
+Apple-silicon laptop, `cargo bench -p kimmy-storage --bench
+concurrent_writes`; Criterion medians over 10 samples, the same three-field
+document, ten inserts per writer per iteration), so compare the two columns
+with each other rather than with the tables above. `durable` is every commit
+fsyncing for itself; `coalesced` is `storage.durability = "coalesced"` with
+a 5 ms window ([ADR-088](decisions.md)).
+
+| Writers | `durable` | `coalesced` | Ratio |
+|---:|---:|---:|---:|
+| 1 | 170 docs/s | 79 docs/s | 0.46× |
+| 2 | 177 docs/s | 137 docs/s | 0.77× |
+| 4 | 176 docs/s | 327 docs/s | 1.9× |
+| 8 | 177 docs/s | 536 docs/s | 3.0× |
+| 16 | 182 docs/s | 1,114 docs/s | 6.1× |
+
+Two things to read off it, and the unflattering one first. **A lone writer
+is slower under `coalesced`** — each commit waits a full window for company
+that never comes, so it pays the fsync *and* the wait. The class is for
+concurrency; a single ingest loop should stay on `durable` or batch. **From
+four writers up, the fsync is shared**: sixteen concurrent writers land
+1,114 documents a second through the same single writer that gives 182 with
+one fsync each. Every one of those documents was on disk when its call
+returned — the class changes who pays for the fsync, not whether it happens.
+
 ## Batching into one commit — 176×
 
 Taken 2026-08-11 on the same machine (`cargo bench -p kimmy-storage --bench

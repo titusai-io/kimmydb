@@ -14,6 +14,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`storage.durability`** — `durable` (every commit fsyncs before it
+  returns; the default and unchanged behaviour) or `coalesced` (a commit is
+  written without its own fsync and waits for the next shared one, one per
+  `storage.commit_coalesce_ms` window, so N concurrent writers pay one fsync
+  rather than N). Both are durable when the response returns; there is
+  deliberately no class that is not. `GET /v1/version` reports the class as
+  `durability`; `/metrics` gains `kimmy_fsyncs` and
+  `kimmy_commits_grouped_total` (ADR-088).
+
 - **`storage.multi_chunk_docs`** — how many documents a `multi: true` update
   or delete commits per transaction (default 1,000; 1 to 10,000). `update`
   and `delete` responses gain `commits`, the number of chunks the request

@@ -143,6 +143,10 @@ pub async fn version(State(state): State<SharedState>) -> impl IntoResponse {
         // this answer came from.
         "node": state.engine.node_id().to_string(),
         "capabilities": capabilities(),
+        // A fact about this node's configuration rather than its build, so
+        // a field rather than a capability: the capability set is closed by
+        // an enum, and "durable" is not a feature a client uses (ADR-088).
+        "durability": state.engine.durability().as_str(),
     })) as Json<Value>
 }
 
