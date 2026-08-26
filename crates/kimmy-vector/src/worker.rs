@@ -567,7 +567,16 @@ impl EmbeddingWorker {
         }
 
         let provider = self.provider_for(collection.id.0, &config)?;
-        let vectors = provider.embed(&chunks).await?;
+        // Counted here as well as in `embed_one`: this is the streaming path
+        // for a document this node wrote, and it embeds from the entry rather
+        // than re-reading the document, so it does not go through `embed_one`.
+        // Shipped uncounted in 0.5.0 — on a healthy owner every
+        // `kimmy_embed_{documents,chunks,failures}_total` stayed at zero while
+        // the vectors demonstrably landed, which is the one thing a spend
+        // counter must never do.
+        let vectors = provider.embed(&chunks).await.inspect_err(|_| {
+            self.counters.failures.fetch_add(1, Ordering::Relaxed);
+        })?;
 
         let records: Vec<VectorRecord> = chunks
             .into_iter()
@@ -584,6 +593,7 @@ impl EmbeddingWorker {
 
         let count = records.len();
         self.engine.put_vectors(&shadow, &source, &records)?;
+        self.counters.embedded(count);
         debug!(chunks = count, "embedded a document");
         Ok(Outcome::Embedded { chunks: count })
     }
@@ -786,9 +796,11 @@ impl EmbeddingWorker {
             })
             .collect();
         self.engine.put_vectors(shadow, source, &records)?;
-        // The single choke point every embedding path funnels through —
-        // streaming, deferred re-check and backfill — so one increment here
-        // counts each exactly once.
+        // Deferred re-checks and scans funnel through here; the streaming
+        // path for a locally written document embeds from its entry in
+        // `process` and counts there. Two sites, each reached exactly once
+        // per embedding — a comment here once claimed this was the only one,
+        // and the streaming path shipped uncounted on the strength of it.
         self.counters.embedded(chunk_count);
         Ok(true)
     }
@@ -1001,6 +1013,44 @@ mod tests {
     /// The oplog entry a write produced.
     fn last_entry(engine: &Engine) -> kimmy_core::OplogEntry {
         engine.read_oplog_from(Hlc::ZERO, 10_000).unwrap().pop().expect("an entry")
+    }
+
+    #[tokio::test]
+    async fn a_locally_written_document_is_counted_when_embedded() {
+        // The streaming path — a document this node wrote, embedded from its
+        // own entry — is the common case on an owner, and it shipped in 0.5.0
+        // with no counter on it: on a test cluster the owner's vectors
+        // landed within ten seconds of every insert while
+        // `kimmy_embed_documents_total` read 1 from a rescan and never moved.
+        // The tests that asserted the counters moved all went through
+        // `embed_one` (deferred re-checks and scans), never through here.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        engine.insert(&coll, doc! { "_id": 1i64, "title": "hello", "body": "world" }).unwrap();
+
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert!(matches!(outcome, Outcome::Embedded { chunks: 1 }), "{outcome:?}");
+
+        let counters = worker.counters();
+        assert_eq!(counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counters.chunks_embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counters.failures.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // And a provider outage on this path is counted per attempt — the
+        // "provider is down" signature is failures climbing while
+        // documents_embedded does not, and it needs both sides to be live.
+        fake.fail_times.store(1, std::sync::atomic::Ordering::SeqCst);
+        engine.insert(&coll, doc! { "_id": 2i64, "title": "again" }).unwrap();
+        let entry = last_entry(&engine);
+        let err = worker.process(&entry).await.unwrap_err();
+        assert!(err.is_retryable(), "{err}");
+        assert_eq!(counters.failures.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // The retry succeeds and is counted once, like any other embedding.
+        assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
+        assert_eq!(counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(counters.failures.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

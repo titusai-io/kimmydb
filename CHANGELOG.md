@@ -10,6 +10,22 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **`kimmy_embed_documents_total`, `kimmy_embed_chunks_total` and
+  `kimmy_embed_failures_total` now count the streaming path.** The common
+  case on an owner — a document this node wrote, embedded from its own oplog
+  entry — was never counted: since 0.5.0 those three series moved only for
+  deferred re-checks and scans, so a healthy owner read zero while its
+  vectors demonstrably landed, and a provider outage on the live path was
+  invisible to the one signature (`failures` climbing while
+  `documents_embedded` does not) the counters were added for. Seen on the
+  test cluster, where an owner's `documents_embedded` read 1 from a rescan
+  and never moved as inserts were embedded within seconds. Failures are
+  counted per attempt, retries included, on both paths.
+
 ## 0.10.1 - 2026-08-26
 
 ### Fixed

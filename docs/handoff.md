@@ -6,6 +6,30 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **the streaming path never counted its embeddings**
+
+Branch `fix/streaming-embed-counters`, the last of the day's finds and the
+oldest: the 0.5.0 "three of five `kimmy_embed_*` counters never move" report,
+finally reproduced cleanly once the 0.10.1 roll gave the test cluster a live
+owner worker. A probe insert into `testdb.notes` embedded and replicated in
+under ten seconds while member A's `documents_embedded` stayed at the 1 its
+recovery rescan had counted. `EmbeddingWorker::process` embeds a locally
+written document inline from its entry — `provider.embed` then `put_vectors`
+— and neither line touched `self.counters`; `embed_one` carried a comment
+calling itself "the single choke point every embedding path funnels through",
+which was false, and every counter test went through it (deferred re-checks
+and scans), never through `process` with a local entry. Fix: `inspect_err` on
+the provider call and `counters.embedded(count)` after the write, mirroring
+`embed_one`; both comments now say there are two sites. Test drives `process`
+with a locally written entry (1 doc / 1 chunk / 0 failures), then a
+`fail_times` provider outage (1 failure, docs unchanged, retryable error) and
+the retry (2 docs, still 1 failure). Fails on `main` at the first counter
+assertion. The 0.5.0 investigation had eliminated the plumbing correctly and
+pointed at "vectors are being written without passing through `embed_one`",
+which was exactly right.
+
+---
+
 ## As of 2026-08-26 — **the embedding worker now survives a collected position**
 
 Branch `fix/vector-worker-lost-position`, found minutes after the 0.10.0 repair
