@@ -10,6 +10,27 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The embedding worker stopped for good when its position had been
+  collected.** The worker resumes from a recorded oplog position, and
+  retention collects the oplog: a member down or partitioned for longer than
+  `oplog_retention_secs` came back to a position the oplog no longer held,
+  `watch` refused it, and the worker returned the error — one `embedding
+  worker stopped` warning, then a node with **no embedding worker at all**
+  until the next restart hit the same position and stopped again. A stream
+  invalidated mid-run ended the worker the same way. Seen on a test
+  cluster after a member spent ten hours unable to sync: it came back owning
+  a collection and embedded nothing from then on. The worker now recovers:
+  it opens a fresh stream from the oldest retained entry, then rescans every
+  owned, server-embedded collection for stale or missing vectors, and keeps
+  running. Embedding is idempotent, so the overlap costs storage reads, not
+  provider calls. The scan's completion line now reads `scanned a
+  collection's vectors` with a `reason` field (`a configuration change` or
+  `a lost stream position`).
+
 ## 0.10.0 - 2026-08-26
 
 ### Fixed
