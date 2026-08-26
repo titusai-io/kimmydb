@@ -10,6 +10,28 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **Every command uses the federated token cache.** After `kimmy login`,
+  `kimmy whoami`, `databases`, queries — all of it — just works until the
+  token nears expiry: commands with no explicit token fall back to the cache
+  login and `kimmy token` write, keyed by issuer, client and resource.
+- **The device flow offers to open the browser for you.** Print URL, press
+  Enter, default browser opens on the verification page (code pre-filled via
+  `verification_uri_complete` when the provider sends one). Skipped entirely
+  when stdin or stdout is not a terminal.
+
+### Changed
+
+- **`kimmy login` caches its token by design** (ADR-080): the opt-in from
+  ADR-075 lasted exactly as long as nobody read the cache — which was until
+  data commands started doing so today, and the documented workflow failed
+  with a misleading 401. `--cache-token` is removed along with the opt-in.
+- The post-401 hint says `run \`kimmy login\`` first now, instead of pointing
+  at flags when the common case has none to set.
+
 ## 0.8.0 - 2026-08-26
 
 ### Added

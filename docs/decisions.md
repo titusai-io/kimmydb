@@ -3752,6 +3752,32 @@ direction to err in: the change hides information from people who were never
 meant to have it rather than revealing more. Root and every admin-flavored
 deployment are untouched, proven by the existing suite passing unmodified.
 
+## ADR-080 — The token cache is on by default, and every command reads it
+
+**Decision.** `kimmy login` caches the access token it mints — unconditionally,
+the way `kimmy token` already did — and every data command falls back to that
+cache when no token was said with `--token`, `KIMMY_TOKEN`, or the settings
+file. The `--cache-token` flag is removed. The device flow offers to open the
+verification URL in the default browser (Enter to accept; skipped entirely when
+stdin or stdout is not a terminal, so piped and scripted invocations are
+untouched). A refresh token remains never-requested, never-stored.
+
+**Why.** Found live, as the good ones are: the maintainer ran `init` → `login` →
+`whoami` and got a 401 telling him to run `login`. Login had printed a valid,
+correctly-audienceed token to his screen and kept nothing; whoami read only
+`--token` / `KIMMY_TOKEN` / the settings file, none of which existed. Two
+stores, zero consumers — the documented "log in once, then use the database"
+workflow had never actually worked without an `export KIMMY_TOKEN=$(…)` step
+nobody documents. A cache nobody reads is not privacy; it is ceremony.
+
+**Cost.** Storing a bearer token at `0600` under the user's cache directory is
+a responsibility the tool now always carries (ADR-075's original concern).
+Against it: printing the token already put an unguarded copy in terminal
+scrollback, so the disk copy is not the new exposure; what is stored did not
+grow (access token alone, one hour, audience-restricted); and revocation stays
+what it was — server-side `token_version`, honored because the cached copy dies
+at expiry with no refresh token to extend it.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

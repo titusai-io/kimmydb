@@ -379,16 +379,18 @@ a redirect needs a browser and a loopback listener on the same machine, and a
 database CLI is run over SSH and inside containers. The code and URL go to
 **stderr** so the bare token on stdout stays capturable.
 
-**Nothing is stored on disk unless `--cache-token` asks for it**, and **a
-refresh token is never requested or stored at all**. Without the flag an
-environment variable answers for the token's permissions, its lifetime and its
-cleanup by not existing afterwards. With it, the access token is kept in a
-`0600` file under `$XDG_CACHE_HOME/kimmy`, keyed by issuer, client and
-resource, and reused until it is within a minute of expiring — the same thing
-`gh` and `aws` do, made a decision rather than a default because storing a
-bearer token is a responsibility ([ADR-075](decisions.md)). Applications get a
-fresh token the same way, through the Rust client's `token_provider` callback
-([Clients](clients.md)).
+**The access token is cached — the access token alone**, and **a refresh token
+is never requested or stored at all**. Without a cached copy an environment
+variable answers for the token's permissions, its lifetime and its cleanup by
+not existing afterwards. The cache keeps the access token in a `0600` file
+under `$XDG_CACHE_HOME/kimmy`, keyed by issuer, client and resource, and
+reuses it until it is within a minute of expiring — the same thing `gh` and
+`aws` do. It began opt-in (ADR-075) and became the default once data commands
+read it (ADR-080): storing a bearer token makes the tool answer for file
+permissions, lifetime, and cleanup either way — printing one to scrollback
+already did, and ADR-075's responsibility stands recorded with it.
+Applications get a fresh token the same way, through the Rust client's
+`token_provider` callback ([Clients](clients.md)).
 
 The refresh token is where the line is drawn, and not arbitrarily: an access
 token is short-lived and audience-restricted to one node, while a refresh token

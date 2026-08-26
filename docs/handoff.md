@@ -6,6 +6,23 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **login once, then the CLI just works (ADR-080)**
+
+Branch `feat/cli-token-flow`. The maintainer's own transcript broke it open: `init` →
+`login` → `whoami` returned 401 *missing Authorization header* because login
+printed a token and kept nothing, while whoami read only `--token` /
+`KIMMY_TOKEN` / the dotfile. Three changes: login caches unconditionally and
+`--cache-token` is removed (ADR-080 amends ADR-075); every data command falls
+back to that cache via `cached_bearer` — same discovery, same key precedence
+(`cached_key_client_id`, env > file, mirrored from apply_kimmy_file so lookups
+cannot drift from writes); the device flow offers Enter-to-open-browser,
+terminal-gated. Verified live by planting a fake cached token in a sandboxed
+XDG cache: whoami went from "missing Authorization header" to "authentication
+token is invalid" — proof the cached bearer is found and sent. The `.kimmy`
+`cache_token` key still parses but no longer wires to anything.
+
+---
+
 ## As of 2026-08-26 — **init discovers instead of interrogating; a shipped panic fixed**
 
 Branch `feat/init-discovery`. `kimmy init` asked nine questions and showed no

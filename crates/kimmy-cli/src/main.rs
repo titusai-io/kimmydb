@@ -57,9 +57,10 @@ use serde_json::{Value, json};
     friends; a flag or environment variable always wins over the file.\n\
     There is deliberately no --password flag and no --client-secret flag: either\n\
     would land in shell history and in `ps` output for every user on the machine.\n\
-    No token is written to disk unless you pass --cache-token, and a refresh token\n\
-    is never requested or stored at all -- an environment variable answers for a\n\
-    token's permissions, its lifetime and its cleanup by not existing afterwards."
+    The access token is cached in a 0600 file under the user's cache directory\n\
+    so every other command works afterwards; a refresh token is never requested\n\
+    or stored at all -- an environment variable answers for a token's\n\
+    permissions, its lifetime and its cleanup by not existing afterwards."
 )]
 struct Cli {
     /// Base URL of the node.
@@ -89,8 +90,11 @@ enum Command {
     /// without any provider loses nothing.
     ///
     /// The token comes out bare on stdout, so `$(kimmy login ...)` is directly
-    /// usable. Nothing is written to disk unless `--cache-token` asks for it;
-    /// `kimmy token` is the spelling that asks by existing.
+    /// usable. The access token is kept in a `0600` file under the user's
+    /// cache directory, keyed by issuer, client and resource — that cache is
+    /// what makes every other command work afterwards without `--token`, and
+    /// what lets `kimmy token` answer instantly while it stays fresh. A
+    /// refresh token is never requested and never stored.
     Login {
         /// Local user name. Given, this is a password login against the node's
         /// own user store; omitted, the device flow answers.
@@ -132,27 +136,6 @@ enum Command {
         /// providers ignore it and some refuse the request outright.
         #[arg(long, env = "KIMMY_OIDC_SCOPE")]
         scope: Option<String>,
-
-        /// Reuse a cached token instead of authenticating again.
-        ///
-        /// Off unless asked for. When on, the access token is kept in a
-        /// `0600` file under `$XDG_CACHE_HOME/kimmy` (or `~/.cache/kimmy`),
-        /// keyed by issuer, client and resource, and reused until it is within
-        /// a minute of expiring. A refresh token is never requested and never
-        /// stored.
-        ///
-        /// As an environment variable this takes any of the usual spellings —
-        /// `1`, `true`, `yes`, `on` — rather than only `true`. Nothing else
-        /// enables it: an unrecognised value is an error, never a quiet yes,
-        /// because the setting decides whether a bearer token is written to
-        /// disk.
-        #[arg(
-            long,
-            env = "KIMMY_TOKEN_CACHE",
-            action = clap::ArgAction::SetTrue,
-            value_parser = clap::builder::BoolishValueParser::new(),
-        )]
-        cache_token: bool,
     },
     /// Print the access token again — the cached one while it stays fresh.
     ///
@@ -163,7 +146,7 @@ enum Command {
     /// after the first costs nothing until the token nears expiry.
     ///
     /// Caching is not an option here because it is the point of the command:
-    /// invoking it *is* the asking ADR-075 requires of `--cache-token`. What
+    /// invoking it *is* the asking. What
     /// gets stored does not change — the access token alone, in a `0600`
     /// file, never a refresh token.
     ///
@@ -482,23 +465,9 @@ async fn run() -> Result<()> {
     // the arguments: Token is Login with the answers already decided —
     // federated always, cache always.
     let token_request = match &command {
-        Command::Login {
-            user,
-            client_credentials,
-            issuer,
-            client_id,
-            resource,
-            scope,
-            cache_token,
-        } => Some((
-            user.as_deref(),
-            *client_credentials,
-            *cache_token,
-            issuer,
-            client_id,
-            resource,
-            scope,
-        )),
+        Command::Login { user, client_credentials, issuer, client_id, resource, scope } => {
+            Some((user.as_deref(), *client_credentials, true, issuer, client_id, resource, scope))
+        }
         Command::Token { client_credentials, issuer, client_id, resource, scope } => {
             Some((None, *client_credentials, true, issuer, client_id, resource, scope))
         }
@@ -514,12 +483,13 @@ async fn run() -> Result<()> {
         let flow = login_flow(login_user, cc_flag);
         if !matches!(flow, LoginFlow::Local) {
             // The token alone, with no decoration, so `$(kimmy ...)` is usable
-            // directly. Nothing is written to disk unless the invocation asked —
-            // --cache-token on login, always on token — and even then only the
-            // access token: a CLI that stores a bearer token has to answer for its
-            // permissions, its lifetime and its cleanup. A refresh token is never
-            // requested and never kept, cache or no cache — it is the credential
-            // that outlives the session, and the one worth stealing.
+            // directly. The access token lands in the cache — that is what
+            // makes every other command work without `--token` afterwards —
+            // and only the access token: a CLI that stores a bearer token has
+            // to answer for its permissions, its lifetime and its cleanup. A
+            // refresh token is never requested and never kept, cache or no
+            // cache — it is the credential that outlives the session, and the
+            // one worth stealing.
             //
             // Ask the node itself where to authenticate and what to ask the token
             // to be for, so the usual invocation needs nothing else set. A flag
@@ -582,6 +552,12 @@ async fn run() -> Result<()> {
     let mut builder = Client::builder(&cli.url);
     if let Some(token) = &cli.token {
         builder = builder.token(token);
+    } else if let Some(token) = cached_bearer(&cli.url).await {
+        // No token was said anywhere, but a federated flow this identity ran
+        // earlier left a still-fresh access token in the cache. Using it is
+        // what makes "log in once, then just use the database" true; the
+        // lookup keys on exactly what the flow keyed on.
+        builder = builder.token(&token);
     }
     let client = builder.connect().await?;
 
@@ -928,10 +904,13 @@ fn read_password(from_dotfile: Option<&str>) -> Result<String> {
 fn unauthorized_hint(issuer: Option<String>) -> String {
     match issuer {
         Some(issuer) => format!(
-            "set --token, or KIMMY_TOKEN from `kimmy login` (issuer {issuer}); \
-             a local account still works with `kimmy login <user>`"
+            "run `kimmy login` (issuer {issuer}); its token is cached and reused \
+             automatically — or set --token / KIMMY_TOKEN. A local account still \
+             works with `kimmy login <user>`"
         ),
-        None => "set --token, or KIMMY_TOKEN from `kimmy login`".to_string(),
+        None => "run `kimmy login`; its token is cached and reused automatically — \
+                 or set --token / KIMMY_TOKEN"
+            .to_string(),
     }
 }
 
@@ -1340,6 +1319,7 @@ mod oidc {
             .context("the provider returned no verification_uri")?;
 
         eprintln!("Open {verification} and enter the code: {user_code}");
+        super::offer_browser(verification).await;
         eprintln!("Waiting for approval...");
 
         // The provider's own pacing, honoured: polling faster than it asked for
@@ -1476,15 +1456,19 @@ mod oidc {
     }
 }
 
-/// An opt-in cache for the access token `kimmy login` just obtained.
+/// The cache for access tokens that federated flows mint.
 ///
-/// # It is off unless asked for, and that is the decision
+/// # On by default, and why that changed
 ///
 /// `gh`, `aws`, `az` and `kubectl` all cache credentials at `0600`, so doing
-/// so is unremarkable. It is still opt-in here, because storing a bearer token
-/// changes what this tool is responsible for: file permissions, a lifetime,
-/// and cleanup. Nobody who does not ask for it inherits any of that, and the
-/// default behaviour is byte-for-byte what shipped before this existed.
+/// so is unremarkable. It began opt-in (ADR-075) and stayed there only until
+/// the cache had a consumer: with data commands reading it, "log in once, then
+/// use the database" is the whole product, and an off-by-default cache made
+/// every command after login fail with a misleading 401 — observed live,
+/// not hypothesised. What is stored did not grow to buy this: still the
+/// access token alone, still `0600`, never a refresh token. A token in
+/// terminal scrollback — which printing one already implies — was always the
+/// less guarded copy.
 ///
 /// # A refresh token is never stored, and never even requested
 ///
@@ -2180,15 +2164,14 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
         &'a mut Option<String>,
         &'a mut Option<String>,
         &'a mut Option<String>,
-        Option<&'a mut bool>,
     );
     if let Some(command) = &mut cli.command {
-        let (issuer, client_id, resource, scope, cache_token): ProviderFields<'_> = match command {
-            Command::Login { issuer, client_id, resource, scope, cache_token, .. } => {
-                (issuer, client_id, resource, scope, Some(cache_token))
+        let (issuer, client_id, resource, scope): ProviderFields<'_> = match command {
+            Command::Login { issuer, client_id, resource, scope, .. } => {
+                (issuer, client_id, resource, scope)
             }
             Command::Token { issuer, client_id, resource, scope, .. } => {
-                (issuer, client_id, resource, scope, None)
+                (issuer, client_id, resource, scope)
             }
             _ => {
                 return Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret));
@@ -2218,17 +2201,43 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
         {
             *scope = Some(v);
         }
-        if let Some(cache_token) = cache_token
-            && !from_cli("cache_token")
-            && env_absent("KIMMY_TOKEN_CACHE")
-            && let Some(v) = dot.cache_token
-        {
-            *cache_token = v;
-        }
     }
 
     // The two settings no flag carries, consumed by their call sites.
     Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret))
+}
+
+/// The client id a cache key is built from: environment first, then the
+/// settings file.
+///
+/// The same precedence `apply_kimmy_file` gives the login/token flags, so a
+/// fallback lookup lands on the exact key a flow wrote under — a lookup that
+/// resolved differently would miss silently and look like "no token", which is
+/// the one outcome worse than asking for one. The environment value arrives as
+/// a parameter rather than being read here so the precedence stays testable
+/// without process-global mutation.
+fn cached_key_client_id(
+    env_client_id: Option<String>,
+    dotfile_client_id: Option<String>,
+) -> Option<String> {
+    env_client_id.filter(|v| !v.is_empty()).or(dotfile_client_id)
+}
+
+/// The bearer an earlier federated flow left behind, when there is one.
+///
+/// Data commands never run flows themselves — a browser round-trip out of
+/// `kimmy databases` would be a surprise — but `kimmy login` and `kimmy token`
+/// cache what they mint, and this is what makes that cache count: same node,
+/// same discovery, same key. Explicit tokens (`--token`, `KIMMY_TOKEN`, the
+/// settings file) win by arriving through `cli.token` instead of here.
+async fn cached_bearer(url: &str) -> Option<String> {
+    let (issuer, resource) = oidc::defaults_from_node(url, None, None).await;
+    let env_client_id = std::env::var("KIMMY_OIDC_CLIENT_ID").ok();
+    let dotfile_client_id =
+        load_kimmy_file().ok().flatten().and_then(|(_, settings)| settings.client_id);
+    let client_id = cached_key_client_id(env_client_id, dotfile_client_id);
+    let key = cache::Key::new(issuer.as_deref(), client_id.as_deref(), resource.as_deref())?;
+    cache::get(&key)
 }
 
 // ---------------------------------------------------------------------------
@@ -2287,6 +2296,52 @@ fn normalize_node_url(input: &str) -> Option<String> {
         s.pop();
     }
     Some(s)
+}
+
+/// Offer to open the verification URL in the default browser, the way `gh`
+/// does: the URL is already on screen, Enter is one keystroke, and a failure
+/// to spawn changes nothing at all — the URL remains the instruction.
+///
+/// Only when stdin and stdout are both terminals. A piped or scripted run
+/// keeps today's behavior exactly, which is also what keeps `$(kimmy login)`
+/// from hanging on a human who is not there.
+async fn offer_browser(url: &str) {
+    use std::io::{IsTerminal, Write};
+    use tokio::io::AsyncBufReadExt;
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return;
+    }
+
+    eprint!("{}", ansi("2", "Press Enter to open it in your browser"));
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    // The prompt has been shown and the URL printed above it; a read that
+    // fails or ends just means no browser, not no login.
+    let _ = tokio::io::BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
+
+    if open_in_browser(url) {
+        eprintln!("{}", ansi("2", "Opened. Approve the request in the browser."));
+    } else {
+        eprintln!("{}", ansi("33", "Could not open a browser — use the URL above."));
+    }
+}
+
+/// Hand the URL to the platform's default browser. Best effort by design.
+fn open_in_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg(url).spawn().is_ok()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open").arg(url).spawn().is_ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = url;
+        false
+    }
 }
 
 /// The whole of `kimmy init`: one required answer — the node URL — then the
@@ -2635,6 +2690,33 @@ mod tests {
         // and a spelling nobody needs is one more thing to misread.
         assert!(Cli::try_parse_from(["kimmy", "login", "--oidc"]).is_err());
         assert!(Cli::try_parse_from(["kimmy", "login", "ada", "--oidc"]).is_err());
+    }
+
+    #[test]
+    fn the_removed_cache_token_flag_is_gone_outright() {
+        // Login caches by design now (ADR-080): a flag that spelled the
+        // default out is one more thing to misread, and an opt-in nobody
+        // could see broke every command after login with a 401.
+        assert!(Cli::try_parse_from(["kimmy", "login", "--cache-token"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "login", "--cache-token=false"]).is_err());
+    }
+
+    #[test]
+    fn the_cache_key_client_id_prefers_the_environment_over_the_file() {
+        assert_eq!(
+            cached_key_client_id(None, Some("from-file".into())).as_deref(),
+            Some("from-file")
+        );
+        assert_eq!(
+            cached_key_client_id(Some("from-env".into()), Some("from-file".into())).as_deref(),
+            Some("from-env")
+        );
+        assert_eq!(
+            cached_key_client_id(Some(String::new()), Some("from-file".into())).as_deref(),
+            Some("from-file"),
+            "an empty variable is unset, not a client id"
+        );
+        assert_eq!(cached_key_client_id(None, None), None);
     }
 
     #[test]
