@@ -139,6 +139,27 @@ mod tests {
     }
 
     #[test]
+    fn behind_is_pinned_by_the_lowest_trailing_origin() {
+        // One threshold, not a range per origin: the resume point is this
+        // vector's *own* position at whichever trailing origin it holds least
+        // of — even when it is far ahead everywhere else. Coverage that never
+        // moves for one origin therefore never moves the threshold at all,
+        // which is what `coverage_after_batch` in storage exists to prevent
+        // (ADR-082). This test pins the semantics that fix compensates for.
+        let stuck = node();
+        let busy = node();
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(Hlc::new(1_000_000, 0), busy));
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(Hlc::new(50, 0), stuck));
+        theirs.observe(Stamp::new(Hlc::new(2_000_000, 0), busy));
+
+        assert_eq!(mine.behind(&theirs), Some(Hlc::ZERO), "pinned at the unseen origin's floor");
+        mine.observe(Stamp::new(Hlc::new(5_000_000, 0), busy));
+        assert_eq!(mine.behind(&theirs), Some(Hlc::ZERO), "and no progress elsewhere moves it");
+    }
+
+    #[test]
     fn being_behind_reports_where_to_resume_from() {
         let n = node();
         let mut mine = VersionVector::new();

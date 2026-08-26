@@ -12,6 +12,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **Anti-entropy could loop on the same window forever.** A member whose
+  newest own stamp is one it never ships — a unique-violation record — left
+  every peer's resume point pinned below it, and once a full batch of other
+  members' entries lay between the two, each sync round re-served that batch
+  unchanged: `applied=0, superseded=1021` every five seconds, and
+  `kimmy_replication_lag_seconds` reading the cluster's age rather than any
+  backlog. A full batch now advances the witnessed vector to the end of the
+  window it delivered, for every origin the peer advertised, so each round
+  consumes a window and the round that reaches the tail clears the rest
+  (ADR-082). Data replication was unaffected — writes still arrived through
+  the other peer — so upgrading changes what the gauge and the sync log say,
+  not what the members hold. The storage-level `merged a batch from a peer`
+  debug line now carries `ddl` and `unknown_collection`, matching the peer
+  summary above it.
+
 ### Changed
 
 - **Quieter auth flow.** `kimmy init` lost its preamble and closing hints —
