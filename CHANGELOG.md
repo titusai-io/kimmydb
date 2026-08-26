@@ -14,6 +14,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A snapshot could not carry half of all collections.** The snapshot page
+  and cursor named collections by a bare `u64`, and BSON has no unsigned
+  64-bit integer, so any collection whose derived id sits above `i64::MAX`
+  made the page unencodable: the serving member logged `cannot fit into
+  BSON` and closed the connection, and the member asking — one beyond its
+  peers' oplog retention horizon, the only case a snapshot serves — never
+  caught up. The same defect was fixed for oplog entries in ADR-031; the
+  snapshot types kept the raw integer, and the in-process snapshot tests
+  never serialised a page. Both fields are now `CollectionId`, which
+  encodes as reinterpreted signed bits. Found on a test cluster, where
+  every pair went dark 24 h after birth once retention passed the pinned
+  floors described below.
+
 - **Anti-entropy could loop on the same window forever.** A member whose
   newest own stamp is one it never ships — a unique-violation record — left
   every peer's resume point pinned below it, and once a full batch of other

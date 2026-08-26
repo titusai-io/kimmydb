@@ -292,6 +292,43 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
 }
 
 #[tokio::test]
+async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
+    // The test above passes for a collection whose derived id happens to sit
+    // below i64::MAX. Half of them do not, and BSON has no unsigned 64-bit
+    // integer: with the snapshot types carrying a bare u64, every page naming
+    // such a collection failed to encode, the serving side logged "cannot fit
+    // into BSON", and a member past its peers' retention horizon — the only
+    // case a snapshot serves — never caught up. Observed on a three-member
+    // cluster whose every pair went dark 24 h after birth.
+    let name = (0u32..)
+        .map(|i| format!("orders-{i}"))
+        .find(|n| kimmy_core::CollectionId::derive("shop", n).0 > i64::MAX as u64)
+        .unwrap();
+
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", &name).unwrap();
+    assert!(ca.id.0 > i64::MAX as u64);
+    for i in 0..50i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+
+    let b = node().await;
+    let first = sync_once(&b.engine, a.addr, SECRET).await.expect("the snapshot must encode");
+    assert_eq!(first.applied, 50);
+    let cb = b.engine.get_collection("shop", &name).expect("the collection must arrive");
+    assert_eq!(b.engine.count(&cb).unwrap(), 50);
+
+    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
+}
+
+#[tokio::test]
 async fn a_snapshot_is_only_used_when_the_oplog_cannot_serve() {
     // Snapshots transfer everything, so they must be the fallback rather than
     // the ordinary path.

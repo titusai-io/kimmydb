@@ -6,6 +6,30 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **snapshots could not encode half of all collection ids**
+
+Branch `fix/snapshot-collection-id-encoding`, found while verifying the
+livelock fix below against the test cluster: at 06:40–06:55Z — 24 h after
+cluster birth — every pair's pinned resume point fell behind the 24 h oplog
+retention horizon, every round fell back to a snapshot, and every snapshot
+failed. The serving side said why: `malformed frame: Unsigned integer
+10245841737121747810 cannot fit into BSON`. `SnapshotCursor.collection` and
+`SnapshotDoc.collection` were bare `u64`; `CollectionId` itself learned to
+serialise as reinterpreted `i64` bits in ADR-031, but the snapshot types
+never picked it up, and `snapshot.rs`'s tests transfer pages in-process
+without serialising. The existing network horizon test passed only because
+`("shop", "orders")` happens to hash below `i64::MAX`. Fix: both fields are
+`CollectionId`. Tests: a storage BSON round-trip of a page (cursor included)
+for a collection found by searching names until the derived id has the top
+bit set, and a network horizon test with the same fixture — which fails on
+`main` with exactly the test cluster's error and passes here. No ADR: a
+defect fix. **Operationally this is the release that un-darkens the test
+cluster**: with it, each member's first round past the horizon pulls a
+snapshot, and `absorb_version_vector` raises the witnessed vector too, so the
+pin clears.
+
+---
+
 ## As of 2026-08-26 — **the sync livelock: a full batch now proves its window (ADR-082)**
 
 Branch `fix/sync-full-batch-progress`. Root-caused from a 25-minute debug
