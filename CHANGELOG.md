@@ -27,6 +27,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `stale` joins the closed error-code set. The Rust, Python and Go clients
   gain the conditional variants and a typed `stale`, and the conformance
   suite holds all three to it.
+- **A stale rejoiner is named.** A peer that comes back trailing this node
+  by more than `storage.tombstone_retention_secs` may hold documents the
+  cluster deleted and already collected the tombstones for, and merging it
+  can resurrect them. The replication loop now logs one `WARN` the round it
+  notices, and `GET /v1/topology` shows `staleSince` and `behindSecs` on that
+  peer's entry until it is back within the window. Nothing is refused — the
+  recommended action (reset the peer's data directory and let anti-entropy
+  refill it) is the operator's call (ADR-085).
 
 ### Fixed
 
@@ -44,6 +52,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **`storage.tombstone_retention_secs` shorter than `storage.oplog_retention_secs`
+  is refused at startup.** It was the one retention setting under which a
+  partition shorter than the oplog window could resurrect deleted documents:
+  a peer replays the delete's oplog entry after the tombstone it needs to
+  lose against has been collected. Anyone who set retention backwards must
+  raise tombstone retention to at least the oplog window; the defaults (24 h
+  both) pass unchanged (ADR-085).
 - **A `multi: true` update or delete is one transaction.** All of it lands or
   none of it does, and it costs one fsync rather than one per document. The
   writer is held for the whole request, so the request is **refused above

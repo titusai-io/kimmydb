@@ -1023,6 +1023,23 @@ impl Config {
             );
         }
 
+        // A tombstone collected before the oplog entry that carried the delete
+        // is a delete a peer can still be *told about* but can no longer
+        // *out-argue*: the peer replays the entry, finds no tombstone to lose
+        // against, and its own older image of the document wins. Retention set
+        // the other way round is the only configuration in which a partition
+        // shorter than the oplog window resurrects data (ADR-085).
+        if self.storage.tombstone_retention_secs < self.storage.oplog_retention_secs {
+            anyhow::bail!(
+                "storage.tombstone_retention_secs ({}) is shorter than \
+                 storage.oplog_retention_secs ({}); a delete would be collected while the \
+                 oplog still offers it to peers, and a peer that missed it could resurrect \
+                 the document. Raise tombstone retention to at least the oplog window.",
+                self.storage.tombstone_retention_secs,
+                self.storage.oplog_retention_secs,
+            );
+        }
+
         // A collection pass rarer than the window it enforces means records
         // outlive their retention by up to a whole interval. Not unsafe, but it
         // makes `oplog_retention_secs` a number that does not mean what it says,
@@ -1305,6 +1322,26 @@ mod tests {
         cfg.storage.tombstone_retention_secs = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+    }
+
+    #[test]
+    fn tombstone_retention_shorter_than_the_oplog_window_is_rejected() {
+        // The one retention setting that makes a partition *shorter* than the
+        // oplog window resurrect data: a peer replays the delete's entry
+        // after the tombstone it needs to lose against is gone (ADR-085).
+        let mut cfg = valid();
+        cfg.storage.oplog_retention_secs = 3_600;
+        cfg.storage.tombstone_retention_secs = 600;
+        cfg.storage.gc_interval_secs = 60;
+
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("resurrect"), "the error should say what breaks: {err}");
+
+        // Equal is the floor, and longer is the recommendation.
+        cfg.storage.tombstone_retention_secs = 3_600;
+        cfg.validate().unwrap();
+        cfg.storage.tombstone_retention_secs = 86_400;
+        cfg.validate().unwrap();
     }
 
     #[test]

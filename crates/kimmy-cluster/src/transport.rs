@@ -266,9 +266,12 @@ pub async fn sync_once(
         crate::tls::binding(conn).map_err(ProtocolError::Malformed)?
     };
 
-    tokio::time::timeout(HANDSHAKE_TIMEOUT, open_handshake(engine, &mut stream, secret, &binding))
-        .await
-        .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
+    let their_node = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        open_handshake(engine, &mut stream, secret, &binding),
+    )
+    .await
+    .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
 
     let round = async {
         write_frame(&mut stream, &Message::AskVersions {}).await?;
@@ -283,7 +286,14 @@ pub async fn sync_once(
         let mine =
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         let Some(from) = mine.behind(&theirs) else {
-            return Ok(SyncOutcome::default());
+            // Nothing to pull, but the peer's own position is still news:
+            // how far *it* trails *us* is what says whether it has been
+            // away longer than tombstone retention.
+            return Ok(SyncOutcome {
+                peer: Some(their_node),
+                behind_ms: kimmy_storage::lag_behind_ms(&theirs, &mine),
+                ..SyncOutcome::default()
+            });
         };
 
         write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
@@ -317,6 +327,13 @@ pub async fn sync_once(
         let mine =
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs);
+        // The same measure the other way round: how far the peer trails this
+        // node. A peer that is more than tombstone retention behind may be
+        // holding documents this node has deleted and already collected the
+        // tombstones for — the resurrection case (ADR-085). Reported, not
+        // acted on: the loop decides what to say about it.
+        outcome.behind_ms = kimmy_storage::lag_behind_ms(&theirs, &mine);
+        outcome.peer = Some(their_node);
         Ok(outcome)
     };
 
@@ -362,20 +379,23 @@ where
 }
 
 /// Open a handshake: challenge them, check the answer, then answer theirs.
+///
+/// Returns the peer's node id, as it introduced itself and then proved it
+/// holds the cluster secret — the name a sync outcome is reported under.
 async fn open_handshake<S>(
     engine: &Engine,
     stream: &mut S,
     secret: &str,
     binding: &[u8],
-) -> Result<(), ProtocolError>
+) -> Result<kimmy_core::NodeId, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let ours = nonce(engine.node_id());
     write_frame(stream, &Message::Hello { node: engine.node_id(), nonce: ours.clone() }).await?;
 
-    let (their_nonce, proof) = match read_frame(stream).await? {
-        Message::Welcome { nonce, proof, .. } => (nonce, proof),
+    let (their_node, their_nonce, proof) = match read_frame(stream).await? {
+        Message::Welcome { node, nonce, proof } => (node, nonce, proof),
         Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
         other => {
             return Err(ProtocolError::Malformed(format!("expected Welcome, got {other:?}")));
@@ -390,5 +410,5 @@ where
     }
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
-    Ok(())
+    Ok(their_node)
 }

@@ -987,6 +987,13 @@ async fn spawn_cluster(
             // Cloned: the replication loop and the webhook dispatcher both
             // read the same live set, and `Members` is a shared handle.
             members: members.clone(),
+            tombstone_retention: Duration::from_secs(config.storage.tombstone_retention_secs),
+            // A stale rejoiner is a fact about a peer's vector, which only the
+            // loop sees; the API keeps the record for `/v1/topology` (ADR-085).
+            on_peer_staleness: Some(std::sync::Arc::new({
+                let state = state.clone();
+                move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
+            })),
             // The replication loop is the only place a peer's version vector
             // exists, so lag is pushed from there into the gauge (ADR-046).
             on_lag: Some(std::sync::Arc::new(move |secs| {

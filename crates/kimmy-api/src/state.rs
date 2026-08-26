@@ -54,9 +54,46 @@ pub struct AppState {
     /// there is one issuer for the life of the process (ADR-064) — federation
     /// is not something a running node starts or stops doing.
     pub(crate) federation: std::sync::OnceLock<Arc<crate::federation::Federation>>,
+    /// Peers the replication loop has reported as trailing this node by more
+    /// than tombstone retention (ADR-085), for `/v1/topology`.
+    pub(crate) stale_peers:
+        parking_lot::Mutex<std::collections::BTreeMap<kimmy_core::NodeId, StalePeer>>,
+}
+
+/// A peer that has been away longer than tombstone retention.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StalePeer {
+    /// When this node first noticed, in milliseconds since the epoch.
+    pub since_ms: u64,
+    /// How far the peer trailed at the last round, in milliseconds.
+    pub behind_ms: u64,
 }
 
 impl AppState {
+    /// What the replication loop learned about a peer this round: `Some`
+    /// with how far it trails when that exceeds tombstone retention, `None`
+    /// when it is within the window. The first report starts the clock;
+    /// later ones only refresh the distance, so `since` says how long the
+    /// condition has held rather than when it was last seen.
+    pub fn report_peer_staleness(&self, node: kimmy_core::NodeId, behind_ms: Option<u64>) {
+        let mut stale = self.stale_peers.lock();
+        match behind_ms {
+            Some(behind_ms) => {
+                let since_ms =
+                    stale.get(&node).map_or_else(kimmy_storage::physical_now_ms, |s| s.since_ms);
+                stale.insert(node, StalePeer { since_ms, behind_ms });
+            }
+            None => {
+                stale.remove(&node);
+            }
+        }
+    }
+
+    /// The stale-rejoiner record for a peer, if it has one.
+    pub fn stale_peer(&self, node: kimmy_core::NodeId) -> Option<StalePeer> {
+        self.stale_peers.lock().get(&node).copied()
+    }
+
     /// Hand the state the live member set. Called once, after the cluster
     /// starts; a second call is ignored.
     pub fn set_members(&self, members: kimmy_cluster::Members) {

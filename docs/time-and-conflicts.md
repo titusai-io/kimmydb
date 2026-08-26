@@ -212,6 +212,20 @@ sequenceDiagram
 > than any partition you would tolerate. This is inherent to tombstone-based
 > deletion in an AP store, not a bug awaiting a fix.
 
+Two things bound it operationally ([ADR-085](decisions.md)). The node
+**refuses to start** with `tombstone_retention_secs` shorter than
+`oplog_retention_secs` — the one setting under which a partition *shorter*
+than the oplog window resurrects data, because a peer replays the delete's
+entry after the tombstone it needs to lose against is gone. And a peer that
+comes back trailing this node by **more than tombstone retention** is named:
+one `WARN` from the replication loop the round it is noticed, and
+`staleSince` / `behindSecs` on its entry in `GET /v1/topology` until it is
+back within the window. The merge is *not* refused — that is a policy the
+operator owns — but the recommended action for a stale rejoiner is to stop
+it, reset its data directory, and let anti-entropy refill it from members
+that never left; merging it as-is can bring back what the cluster deleted
+while it was away.
+
 ---
 
 ## Clock resumption

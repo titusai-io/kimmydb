@@ -4000,6 +4000,55 @@ pass `if_stamp`; nothing for callers that do not. Response bodies gain a
 `stamp` field (additive under `/v1`). Three clients gain conditional variants
 and a typed `stale`; the conformance suite gains a scenario that holds all
 three to the same answer.
+## ADR-085 — Tombstones outlive the oplog, and a stale rejoiner is named, not refused
+
+**Decision.** Two operational guards around partition resurrection. First, a
+node refuses to start with `storage.tombstone_retention_secs` shorter than
+`storage.oplog_retention_secs`. Second, the replication loop measures how far
+each peer trails *this* node — the same per-origin lag it already computes,
+with the roles swapped — and when that exceeds tombstone retention it logs
+one `WARN` on the transition and reports the peer to the API, which shows
+`staleSince` and `behindSecs` on the peer's `GET /v1/topology` entry until
+the peer is back within the window. The merge itself is not refused.
+
+**Why the refusal.** A tombstone exists to out-argue a late write. The oplog
+entry that carries a delete can be served to a peer for `oplog_retention`;
+the tombstone that makes applying it *mean* something lives for
+`tombstone_retention`. Set the second shorter than the first and there is a
+window in which a peer is told about a delete it has nothing to lose
+against: the replay finds no tombstone, the peer's own older image of the
+document wins, and a partition shorter than the oplog window has resurrected
+data. It is the only retention configuration with that property, the
+defaults (24 h and 24 h) never had it, and nothing legitimate needs it.
+
+**Why name rather than refuse the rejoiner.** Refusing a merge is a policy
+decision with a real cost: a cluster that quarantines a member on its own
+authority is one an operator has to reason about mid-incident, and the
+observed case on the test cluster (2026-08-26) was not a partitioned member
+but every member at once, each behind the others' horizon after ten hours
+dark — a refusal would have left the cluster refusing itself. The warning
+and the topology field give the operator the fact and the recommended
+action (stop the peer, reset its data directory, let anti-entropy refill
+it) at the moment they matter; had they existed, the outage would have been
+named in the first sync round after the horizon passed rather than found by
+reading storage sizes diverge.
+
+**Why the measure is per origin and ignores unseen origins.** "Behind by
+more than retention" is only meaningful for history the peer *has*: a
+brand-new member has seen nothing and holds nothing old enough to
+resurrect, so it must not read as stale on its first round. The existing
+`lag_behind_ms` already skips origins the trailing side has never observed;
+reusing it reversed keeps one definition of lag.
+
+**Alternatives.** Refuse the merge when stale: see above. Raise the peer's
+floor silently (treat it as fresh): hides exactly the event the operator
+needs to see. A metric only: a gauge cannot name the peer, and the topology
+route is where a peer already has a row.
+
+**Cost.** One vector comparison per successful round, already computed for
+lag; a `BTreeMap` of stale peers in API state; two additive fields on a
+topology entry, present only while the condition holds. The refusal is a
+behaviour change for a configuration nobody should have had.
 
 ## Next
 

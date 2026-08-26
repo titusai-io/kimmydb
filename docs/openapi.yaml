@@ -2635,6 +2635,21 @@ components:
         self:
           type: boolean
           description: Whether this is the node that answered.
+        staleSince:
+          type: integer
+          description: |
+            Present only while the answering node's replication loop finds
+            this peer trailing it by more than `storage.tombstone_retention_secs`
+            — milliseconds since the epoch at which that was first noticed.
+            Such a peer may hold documents this node has deleted and already
+            collected the tombstones for; merging it can resurrect them. The
+            recommended action is to reset that peer's data directory and let
+            anti-entropy refill it (ADR-085).
+        behindSecs:
+          type: integer
+          description: |
+            With `staleSince`: how far the peer trailed at the last round, in
+            seconds.
 
     Token:
       type: object

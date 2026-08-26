@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kimmy_core::NodeId;
 use kimmy_storage::Engine;
 use tracing::{Instrument, debug, info, warn};
 
@@ -23,6 +24,11 @@ pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
 /// seconds. But it must happen *repeatedly* — a node that resolved only at
 /// startup would never see a peer that joined after it.
 pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
+
+/// What the loop reports about a peer's staleness after each successful round:
+/// the peer, and how far it trails this node when that exceeds tombstone
+/// retention (`None` when within the window).
+pub type PeerStalenessHook = Arc<dyn Fn(NodeId, Option<u64>) + Send + Sync>;
 
 pub struct ReplicationConfig {
     pub seeds: Vec<SeedSource>,
@@ -61,6 +67,14 @@ pub struct ReplicationConfig {
     /// has *unknown* lag, and overwriting the last known value with zero
     /// would report the outage as perfect health.
     pub on_lag: Option<std::sync::Arc<dyn Fn(u64) + Send + Sync>>,
+    /// This node's `storage.tombstone_retention_secs`: the window past which a
+    /// peer that has not caught up may resurrect a delete (ADR-085).
+    pub tombstone_retention: Duration,
+    /// Called after every successful round with the peer's id and, when it
+    /// trails this node by more than tombstone retention, by how much;
+    /// `None` when it is within the window. Same shape as `on_lag`, for the
+    /// same reason: the peer's vector exists nowhere but this loop.
+    pub on_peer_staleness: Option<PeerStalenessHook>,
 }
 
 impl ReplicationConfig {
@@ -75,6 +89,10 @@ impl ReplicationConfig {
             announce: None,
             members: None,
             on_lag: None,
+            // The storage default; a caller with a configured window passes
+            // its own, and zero disables the check.
+            tombstone_retention: Duration::from_secs(24 * 60 * 60),
+            on_peer_staleness: None,
         }
     }
 }
@@ -85,6 +103,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut health = PeerHealth::new(config.fanout, config.sync_interval);
     let mut discovery = tokio::time::interval(config.discovery_interval);
     let mut sync = tokio::time::interval(config.sync_interval);
+
+    // Peers currently flagged as stale rejoiners, so the warning fires on the
+    // transition and not on every round they stay that way.
+    let mut stale_peers: BTreeSet<NodeId> = BTreeSet::new();
+    let retention_ms = config.tombstone_retention.as_millis() as u64;
 
     loop {
         tokio::select! {
@@ -153,6 +176,29 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             span.record("lag_ms", outcome.lag_ms as i64);
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
+                            if let Some(node) = outcome.peer {
+                                let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
+                                let was = stale_peers.contains(&node);
+                                if stale && !was {
+                                    stale_peers.insert(node);
+                                    warn!(
+                                        %peer,
+                                        node = %node,
+                                        behind_secs = outcome.behind_ms / 1_000,
+                                        retention_secs = retention_ms / 1_000,
+                                        "peer trails this node by more than tombstone \
+                                         retention; deletes it missed may already be \
+                                         collected here, so merging it can resurrect them \
+                                         — a stale rejoiner should be reset, not merged"
+                                    );
+                                } else if !stale && was {
+                                    stale_peers.remove(&node);
+                                    info!(%peer, node = %node, "peer is back within tombstone retention");
+                                }
+                                if let Some(report) = &config.on_peer_staleness {
+                                    report(node, stale.then_some(outcome.behind_ms));
+                                }
+                            }
                             if outcome.total() > 0 {
                                 info!(
                                     %peer,

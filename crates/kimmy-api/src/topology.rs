@@ -105,7 +105,10 @@ pub async fn topology(
         let node = id.to_string();
         let is_me = node == me.to_string();
         me_seen |= is_me;
-        nodes.push(entry(&document, &node, is_me, is_me || contains(&live, &node)));
+        // What replication last learned about this peer's distance behind
+        // us, when that distance exceeds tombstone retention (ADR-085).
+        let stale = node.parse::<kimmy_core::NodeId>().ok().and_then(|n| state.stale_peer(n));
+        nodes.push(entry(&document, &node, is_me, is_me || contains(&live, &node), stale));
         Ok(true)
     })?;
 
@@ -131,8 +134,14 @@ pub async fn topology(
     Ok(axum::Json(json!({ "nodes": nodes, "count": nodes.len() })))
 }
 
-fn entry(document: &Document, node: &str, is_me: bool, live: bool) -> Value {
-    json!({
+fn entry(
+    document: &Document,
+    node: &str,
+    is_me: bool,
+    live: bool,
+    stale: Option<crate::state::StalePeer>,
+) -> Value {
+    let mut entry = json!({
         "node": node,
         "endpoint": document.get_str("endpoint").ok(),
         "version": document.get_str("version").ok(),
@@ -140,7 +149,15 @@ fn entry(document: &Document, node: &str, is_me: bool, live: bool) -> Value {
         // is not the same as it being unreachable from the client.
         "status": if live { "live" } else { "unknown" },
         "self": is_me,
-    })
+    });
+    // Present only while the condition holds: a client that never looks
+    // sees the shape it always saw, and one that does look need not
+    // distinguish "absent" from "null".
+    if let Some(stale) = stale {
+        entry["staleSince"] = json!(stale.since_ms);
+        entry["behindSecs"] = json!(stale.behind_ms / 1_000);
+    }
+    entry
 }
 
 fn contains(live: &std::collections::BTreeSet<kimmy_core::NodeId>, node: &str) -> bool {
