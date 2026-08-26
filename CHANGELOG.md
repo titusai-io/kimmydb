@@ -10,6 +10,16 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **Quieter auth flow.** `kimmy init` lost its preamble and closing hints —
+  what remains is the question, the discovered answers, and where the file
+  landed (the machine-readable line on stdout is unchanged). The device flow
+  no longer narrates "Opened." after the fact: silence is confirmation, and a
+  browser that failed to open still says so.
+
 ## 0.9.0 - 2026-08-26
 
 ### Added
