@@ -231,10 +231,11 @@ document rewritten after the restart could lose to its own older version.
 | Property | Guarantee |
 |---|---|
 | Single-document write | Atomic and durable on the accepting node |
+| Read-modify-write via `update` / `find_and_modify` | Atomic on the accepting node — the operators run inside the write transaction, so concurrent `$inc`s never lose one (ADR-083) |
 | Read-your-writes | **Only on the node you wrote to** |
 | Cross-node reads | No guarantee — a peer may not have converged yet |
 | Conflict resolution | Whole-document LWW; losing write discarded |
-| Multi-document atomicity | **None** |
+| Multi-document atomicity | **None across requests.** One `multi: true` update or delete commits as a single transaction on the accepting node, but nothing spans two operations |
 | Convergence | Eventual, given the partition is shorter than tombstone retention |
 | Monotonic reads | Not guaranteed across nodes |
 

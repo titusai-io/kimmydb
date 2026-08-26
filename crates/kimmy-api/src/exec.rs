@@ -626,36 +626,92 @@ pub fn update(
     let filter = parse_filter(params.filter.as_ref())?;
     let update = update::parse(&json_to_document(update_json)?)?;
 
-    // Collect the targets first: mutating while scanning would mean the read
-    // transaction and the write transaction disagree about what matched.
-    //
-    // Through `collect_matching`, which is what `find` uses — so an index
-    // applies here exactly as it does to a read. This path used to call
-    // `for_each_doc` directly and scan the whole collection however selective
-    // the filter was.
+    // Match and write in one transaction. This used to collect the targets
+    // in a read transaction and `replace` each in its own write transaction,
+    // which applied the operators to an image another writer could have
+    // already moved on from: two concurrent `$inc`s both read 5 and both
+    // stored 6. The engine now runs the same in-transaction body
+    // `find_and_modify` has, over every match.
     let stop_after = if multi { None } else { Some(1) };
-    let (targets, stats) = collect_matching(state, &meta, &filter, stop_after)?;
-    let matched = targets.len() as u64;
+    let (candidates, planned) = candidates_for(&filter, &meta);
+    let modify = Modify {
+        filter: &filter,
+        sort: &[],
+        update: Some(&update),
+        upsert: None,
+        now: now_millis(),
+    };
+    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
-    let now = now_millis();
-    let mut modified = 0u64;
-    for mut doc in targets {
-        let id = document_id(&doc)?;
-        update::apply(&update, &mut doc, now)?;
-        // Counted from the write's own answer rather than assumed. The match
-        // came from a read transaction, so a document deleted between the two
-        // reports `matched: false` and writes nothing — claiming it as
-        // modified would be a number nobody could reconcile with the data.
-        if state.engine.replace(&meta, &id, doc, false)?.modified {
-            modified += 1;
-        }
-    }
-
-    let mut body = json!({ "matched": matched, "modified": modified });
+    let mut body = json!({ "matched": outcome.matched, "modified": outcome.modified });
     if explain {
-        body["explain"] = stats.to_json();
+        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
+}
+
+/// Where a filtered write looks, in the engine's terms, plus what `explain`
+/// should say about it.
+///
+/// The same planner `find` runs, in the same order — primary key first, then
+/// an index, then a scan — so an update is found exactly the way a read is.
+/// The engine re-checks a both-bounds index plan inside the transaction that
+/// scans, which is stricter than the read path can be.
+fn candidates_for(
+    filter: &filter::Filter,
+    meta: &CollectionMeta,
+) -> (kimmy_storage::Candidates, PlannedAccess) {
+    if let Some(pk) = plan::choose_primary_key(filter) {
+        let probes = pk.keys.len();
+        return (kimmy_storage::Candidates::Keys(pk.keys), PlannedAccess::PrimaryKey { probes });
+    }
+    match plan::choose(filter, &meta.indexes) {
+        Some(p) => (
+            kimmy_storage::Candidates::Index {
+                index_id: p.index_id,
+                ranges: p.ranges.clone(),
+                both_bounds: p.both_bounds,
+            },
+            PlannedAccess::Index {
+                name: p.index_name.clone(),
+                fields_used: p.fields_used,
+                probes: p.ranges.len(),
+            },
+        ),
+        None => (kimmy_storage::Candidates::Scan, PlannedAccess::Scan),
+    }
+}
+
+/// The access path a filtered write was planned to, for `explain`.
+///
+/// Reports the plan as chosen. The one case where the engine departs from it
+/// — a both-bounds index plan found multikey inside the transaction, which
+/// falls back to a scan — is not reflected, exactly as `find` reports the
+/// plan it chose rather than the scan it fell back to.
+enum PlannedAccess {
+    PrimaryKey { probes: usize },
+    Index { name: String, fields_used: usize, probes: usize },
+    Scan,
+}
+
+impl PlannedAccess {
+    fn stats(&self, outcome: &kimmy_storage::ModifyManyOutcome) -> QueryStats {
+        let (index, fields_used, probes, id_lookup) = match self {
+            PlannedAccess::PrimaryKey { probes } => (None, 0, *probes, true),
+            PlannedAccess::Index { name, fields_used, probes } => {
+                (Some(name.clone()), *fields_used, *probes, false)
+            }
+            PlannedAccess::Scan => (None, 0, 0, false),
+        };
+        QueryStats {
+            index,
+            fields_used,
+            examined: outcome.examined as usize,
+            matched: outcome.matched as usize,
+            probes,
+            id_lookup,
+        }
+    }
 }
 
 /// The `_id` of a document that came out of storage.
@@ -812,17 +868,10 @@ pub fn find_and_modify(
         None
     };
 
-    // The planner runs out here; the engine re-validates a both-bounds plan
-    // inside the transaction that scans, which is stricter than the read path
-    // can be.
-    let candidates = match plan::choose(&filter, &meta.indexes) {
-        Some(p) => kimmy_storage::Candidates::Index {
-            index_id: p.index_id,
-            ranges: p.ranges.clone(),
-            both_bounds: p.both_bounds,
-        },
-        None => kimmy_storage::Candidates::Scan,
-    };
+    // Planned the way `update` is — which now includes the primary key: a
+    // `find_and_modify` on `_id` used to scan the collection under the
+    // writer, because only the index planner ran here.
+    let (candidates, _) = candidates_for(&filter, &meta);
 
     let modify =
         Modify { filter: &filter, sort: &sort, update: update.as_ref(), upsert: upsert_doc, now };
@@ -860,21 +909,18 @@ pub fn delete(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
 
-    // Planner-aware, for the same reason `update` is.
+    // The same one-transaction path as `update`, with the spec removing
+    // rather than replacing: what the filter matched is exactly what is
+    // tombstoned, with no read-then-write gap for another writer.
     let stop_after = if multi { None } else { Some(1) };
-    let (targets, stats) = collect_matching(state, &meta, &filter, stop_after)?;
+    let (candidates, planned) = candidates_for(&filter, &meta);
+    let modify =
+        Modify { filter: &filter, sort: &[], update: None, upsert: None, now: now_millis() };
+    let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
-    let mut deleted = 0u64;
-    for doc in targets {
-        let id = document_id(&doc)?;
-        if state.engine.delete(&meta, &id)? {
-            deleted += 1;
-        }
-    }
-
-    let mut body = json!({ "deleted": deleted });
+    let mut body = json!({ "deleted": outcome.modified });
     if explain {
-        body["explain"] = stats.to_json();
+        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
 }

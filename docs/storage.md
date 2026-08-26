@@ -252,13 +252,16 @@ pub fn next_index_id(&self) -> u32 {
 |---|---|
 | Single-document write | Atomic and durable at commit |
 | Document + its oplog entry | Same transaction — cannot diverge |
-| Multi-document update/delete | **Each write individually atomic; the batch is not** |
-| Crash mid-batch | Some documents updated, others not; the oplog reflects exactly what landed |
+| `update` / `delete` by filter | Operators applied **inside the write transaction**, on the image it holds; matched and written as one unit (ADR-083) |
+| `update` / `delete` with `multi: true` | **One transaction for the whole request**, bounded at 10,000 matches — more is refused, not truncated |
+| Crash mid-request | Nothing of the request landed, or all of it; the oplog reflects exactly what landed |
+| `insert_many` | One transaction; all or nothing |
 
-> **Sharp edge.** `POST .../update` and `POST .../delete` with `multi: true`
-> collect matches, then write them one at a time. This is consistent with the
-> no-multi-document-atomicity model, but it is a real behaviour rather than only
-> a stated limitation: a crash partway leaves a partial result.
+> **Sharp edge.** A `multi: true` update or delete holds the single writer for
+> the whole match and the whole write, which is why it is capped at 10,000
+> matches. Above that the request is refused with the same error
+> `find_and_modify` gives: narrow the filter, or add an index and a tighter
+> one. There are still no transactions *across* requests.
 
 ---
 

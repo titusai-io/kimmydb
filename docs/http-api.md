@@ -275,9 +275,17 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
 > with a filter describing the state you want. Recorded in
 > [Deviations](deviations.md).
 
-> **Sharp edge.** A multi-document update or delete is **not atomic as a batch**.
-> Each write is individually atomic and logged, but a crash partway leaves a
-> partial result. See [Storage](storage.md).
+**The operators run inside the write transaction.** An `update` matches and
+writes in one transaction, on the image that transaction holds, so two
+concurrent `$inc`s on one document both land — the same guarantee
+`find_and_modify` makes, through the same engine path (ADR-083). A
+`multi: true` request commits as **one transaction**: all of it or none of
+it, and one fsync rather than one per document.
+
+> **Sharp edge.** Because the writer is held for the whole request, a
+> `multi: true` update or delete is **refused above 10,000 matches** — the
+> same ceiling and the same error as `find_and_modify`. Narrow the filter, or
+> add an index and a tighter one. See [Storage](storage.md).
 
 ### Describe
 

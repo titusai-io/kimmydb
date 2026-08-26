@@ -10,6 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **`update` and `delete` by filter no longer lose concurrent writes.** The
+  operators ran on an image collected in a read transaction and the result
+  was stored in a separate write transaction, so two concurrent `$inc`s on
+  one document could both read the same value and one increment was lost —
+  on a single node, against the documented per-document atomicity. Four
+  writers × 500 increments left the counter at 500. Both routes now match
+  and write inside one write transaction, through the same engine body
+  `find_and_modify` has always used (ADR-083).
+- **`find_and_modify` with a filter on `_id` no longer scans the
+  collection** under the writer; it looks the document up directly, as
+  `find` and `update` already did.
+
+### Changed
+
+- **A `multi: true` update or delete is one transaction.** All of it lands or
+  none of it does, and it costs one fsync rather than one per document. The
+  writer is held for the whole request, so the request is **refused above
+  10,000 matches** — the same ceiling and error as `find_and_modify` —
+  where it previously ran to completion one document at a time. Narrow the
+  filter or add an index; a request that failed part-way used to leave the
+  earlier documents written and now leaves none.
+
 ## 0.10.2 - 2026-08-26
 
 ### Fixed

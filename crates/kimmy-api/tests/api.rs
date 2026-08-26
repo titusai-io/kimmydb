@@ -652,6 +652,53 @@ async fn updates_apply_operators() {
     assert_eq!(res.body["n"], 15);
 }
 
+/// Concurrent `$inc`s on one document must all land.
+///
+/// Multi-threaded on purpose: the defect this pins was a read transaction
+/// collecting the match and a *separate* write transaction storing the
+/// result, so two callers could read the same image and one increment was
+/// lost — on a single node, against the documented per-document atomicity.
+/// A current-thread runtime cannot interleave two synchronous executors and
+/// would pass either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_increments_through_update_are_all_kept() {
+    const WRITERS: u64 = 4;
+    const EACH: u64 = 500;
+
+    let server = Arc::new(Server::start().await);
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
+
+    let mut tasks = Vec::new();
+    for _ in 0..WRITERS {
+        let server = Arc::clone(&server);
+        let token = token.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..EACH {
+                let res = server
+                    .post(
+                        "/v1/db/shop/coll/c/update",
+                        Some(&token),
+                        json!({ "filter": {"_id": 1}, "update": {"$inc": {"n": 1}} }),
+                    )
+                    .await;
+                assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+
+    let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(
+        res.body["n"],
+        WRITERS * EACH,
+        "an increment was lost: the operators ran outside the write transaction"
+    );
+}
+
 #[tokio::test]
 async fn extended_json_types_survive_the_boundary() {
     let server = Server::start().await;
