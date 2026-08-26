@@ -49,7 +49,12 @@ pub const SNAPSHOT_PAGE: usize = 512;
 /// Where a snapshot left off, so it can resume rather than restart.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotCursor {
-    pub collection: u64,
+    /// `CollectionId`, not a bare `u64`: BSON has no unsigned 64-bit type, and
+    /// half of all derived ids sit above `i64::MAX`. A bare integer here made
+    /// every snapshot page naming such a collection unencodable, so a node
+    /// beyond a peer's retention horizon — the only case a snapshot serves —
+    /// could never catch up. Same defect as ADR-031's, on the other wire type.
+    pub collection: CollectionId,
     /// Encoded document key; the next page starts strictly after it.
     pub after_key: Vec<u8>,
 }
@@ -66,7 +71,8 @@ pub struct CollectionState {
 /// One document, as it currently stands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotDoc {
-    pub collection: u64,
+    /// See [`SnapshotCursor::collection`] for why this is not a `u64`.
+    pub collection: CollectionId,
     pub id: DocId,
     pub stamp: Stamp,
     /// `None` for a tombstone, which travels so a delete is not undone by a
@@ -134,7 +140,7 @@ impl Engine {
         // `Excluded` on the resume point, so the document that ended the last
         // page is not sent twice.
         let start = match &after {
-            Some(c) => std::ops::Bound::Excluded((c.collection, c.after_key.as_slice())),
+            Some(c) => std::ops::Bound::Excluded((c.collection.0, c.after_key.as_slice())),
             None => std::ops::Bound::Unbounded,
         };
 
@@ -155,10 +161,18 @@ impl Engine {
                 None => continue,
             };
 
-            out.push(SnapshotDoc { collection, id, stamp: record.stamp, body: Some(record.body) });
+            out.push(SnapshotDoc {
+                collection: CollectionId(collection),
+                id,
+                stamp: record.stamp,
+                body: Some(record.body),
+            });
 
             if out.len() >= SNAPSHOT_PAGE {
-                cursor = Some(SnapshotCursor { collection, after_key: doc_key.to_vec() });
+                cursor = Some(SnapshotCursor {
+                    collection: CollectionId(collection),
+                    after_key: doc_key.to_vec(),
+                });
                 break;
             }
         }
@@ -174,10 +188,10 @@ impl Engine {
 
         let mut applied = 0usize;
         for document in &page.documents {
-            let Some(collection) = self.collection_by_id(CollectionId(document.collection))? else {
+            let Some(collection) = self.collection_by_id(document.collection)? else {
                 // The definition should have arrived on the first page; a
                 // document without one means a truncated or reordered snapshot.
-                debug!(collection = document.collection, "snapshot document has no collection");
+                debug!(collection = document.collection.0, "snapshot document has no collection");
                 continue;
             };
 
@@ -282,6 +296,41 @@ mod tests {
             }
         }
         applied
+    }
+
+    /// A `(db, name)` whose derived id has the top bit set — the half of the
+    /// id space BSON cannot carry as an unsigned integer.
+    fn high_bit_collection(db: &str) -> String {
+        (0u32..)
+            .map(|i| format!("orders-{i}"))
+            .find(|name| CollectionId::derive(db, name).0 > i64::MAX as u64)
+            .unwrap()
+    }
+
+    #[test]
+    fn a_snapshot_page_naming_a_high_bit_collection_survives_bson() {
+        // The in-process transfer above never serialises, which is how a page
+        // that BSON refused to encode passed every test here while every real
+        // snapshot on a cluster failed with "cannot fit into BSON".
+        let (a, _da) = engine();
+        let name = high_bit_collection("shop");
+        let ca = a.create_collection("shop", &name).unwrap();
+        assert!(ca.id.0 > i64::MAX as u64, "the fixture must sit in the unencodable half");
+        for i in 0..(SNAPSHOT_PAGE + 1) as i64 {
+            a.insert(&ca, doc! { "_id": i }).unwrap();
+        }
+
+        let page = a.snapshot_page(None).unwrap();
+        assert!(page.next.is_some(), "the cursor must be exercised too");
+        let bytes = bson::serialize_to_vec(&page).expect("a page must always encode");
+        let back: SnapshotPage = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(back, page, "and round-trip exactly, cursor included");
+
+        let (b, _db) = engine();
+        assert_eq!(transfer(&b, &a), SNAPSHOT_PAGE + 1);
+        let cb = b.get_collection("shop", &name).unwrap();
+        assert_eq!(cb.id, ca.id);
+        assert_eq!(b.count(&cb).unwrap() as usize, SNAPSHOT_PAGE + 1);
     }
 
     #[test]
