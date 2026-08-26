@@ -96,6 +96,7 @@ pub fn state_with_egress(
         sessions,
         members: std::sync::OnceLock::new(),
         federation: std::sync::OnceLock::new(),
+        stale_peers: Default::default(),
     }))
 }
 

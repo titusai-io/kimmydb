@@ -89,6 +89,7 @@ runtime confusion:
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
+| `tombstone_retention_secs` < `oplog_retention_secs` | The oplog would still offer a delete to peers after its tombstone was collected; a peer replaying it has nothing to lose against and its older image wins. Tombstones must outlive the oplog window (ADR-085) |
 | `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |
 | An unknown `audit.mode` | A typo would produce a server recording nothing, which looks exactly like a server nobody has attacked |
 | A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |

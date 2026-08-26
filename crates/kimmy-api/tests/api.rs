@@ -1169,6 +1169,51 @@ async fn a_registered_peer_is_reported_unknown_until_membership_sees_it() {
     assert_eq!(entry["status"], "live", "membership is what makes it live: {nodes}");
 }
 
+/// The replication loop reports a peer that trails this node by more than
+/// tombstone retention; topology shows it, and stops showing it once the peer
+/// is back within the window (ADR-085).
+#[tokio::test]
+async fn topology_reports_a_peer_that_has_been_away_longer_than_tombstone_retention() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    let peer = kimmy_core::NodeId::generate();
+    server.register_peer(&peer, "http://peer.example:7878").await;
+
+    let find = |body: &Value| -> Value {
+        body["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["node"] == peer.to_string())
+            .cloned()
+            .expect("the registered peer is listed")
+    };
+
+    let res = server.get("/v1/topology", Some(&token)).await;
+    let entry = find(&res.body);
+    assert!(entry.get("staleSince").is_none(), "fresh by default: {entry}");
+
+    // Two rounds: the second refreshes the distance but not the start.
+    server.state.report_peer_staleness(peer, Some(90_000_000));
+    let first = find(&server.get("/v1/topology", Some(&token)).await.body);
+    assert_eq!(first["behindSecs"], 90_000);
+    assert!(first["staleSince"].is_number(), "{first}");
+    server.state.report_peer_staleness(peer, Some(91_000_000));
+    let second = find(&server.get("/v1/topology", Some(&token)).await.body);
+    assert_eq!(second["behindSecs"], 91_000);
+    assert_eq!(second["staleSince"], first["staleSince"], "the clock starts once");
+
+    // This node itself is never stale to itself.
+    let res = server.get("/v1/topology", Some(&token)).await;
+    let me = res.body["nodes"].as_array().unwrap().iter().find(|n| n["self"] == true).unwrap();
+    assert!(me.get("staleSince").is_none());
+
+    // Caught up: the record goes, and the entry is the shape it always was.
+    server.state.report_peer_staleness(peer, None);
+    let entry = find(&server.get("/v1/topology", Some(&token)).await.body);
+    assert!(entry.get("staleSince").is_none() && entry.get("behindSecs").is_none(), "{entry}");
+}
+
 #[tokio::test]
 async fn topology_needs_a_token() {
     // Unlike /v1/version. A version is a fact about software; this is a map of

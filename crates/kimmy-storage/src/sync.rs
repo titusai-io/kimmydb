@@ -17,7 +17,7 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
-use kimmy_core::{Hlc, OpKind, OplogEntry, VersionVector};
+use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, VersionVector};
 use tracing::{debug, warn};
 
 use crate::engine::Engine;
@@ -40,6 +40,12 @@ pub struct SyncOutcome {
     /// out of the peer's oplog — counted rather than silently dropped, because
     /// that case is a gap in coverage rather than convergence.
     pub unknown_collection: usize,
+    /// The peer the round was with, once it has introduced itself.
+    pub peer: Option<NodeId>,
+    /// How far the peer trails *this* node, in milliseconds — the mirror of
+    /// `lag_ms`. Above tombstone retention it names a stale rejoiner
+    /// (ADR-085).
+    pub behind_ms: u64,
     /// Milliseconds of the peer's history still unapplied after this round.
     ///
     /// Zero when caught up; non-zero when the peer holds more than one batch
@@ -59,6 +65,11 @@ pub struct SyncOutcome {
 /// and `newest − zero` is the age of the epoch, not of the backlog. A joining
 /// node's lag becomes meaningful with its first applied batch — moments in —
 /// rather than starting at a fifty-year lie.
+/// Symmetric in its arguments' roles, so `lag_behind_ms(theirs, mine)` is how
+/// far the *peer* trails this node — what decides whether it has been away
+/// longer than tombstone retention. Origins the trailing side has never seen
+/// at all do not count: a brand-new member holds nothing old enough to
+/// resurrect, and treating it as stale would flag every join.
 pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector) -> u64 {
     theirs
         .iter()
@@ -1397,5 +1408,32 @@ mod tests {
 
     fn field(path: &str) -> crate::meta::IndexField {
         crate::meta::IndexField { path: path.into(), descending: false }
+    }
+
+    #[test]
+    fn the_same_lag_measure_reversed_says_how_far_a_peer_trails_us() {
+        // What the stale-rejoiner check runs on (ADR-085): how far the peer
+        // is behind *this* node, per origin, ignoring origins it has never
+        // seen at all.
+        use kimmy_core::{NodeId, Stamp};
+        let a = NodeId::from_bytes([1; 16]);
+        let b = NodeId::from_bytes([2; 16]);
+        let c = NodeId::from_bytes([3; 16]);
+
+        let mut mine = VersionVector::default();
+        mine.observe(Stamp::new(Hlc::new(100_000, 0), a));
+        mine.observe(Stamp::new(Hlc::new(90_000, 0), b));
+        mine.observe(Stamp::new(Hlc::new(50_000, 0), c));
+
+        // The peer last saw `a` at 10s, `b` at 90s (level), never `c`.
+        let mut theirs = VersionVector::default();
+        theirs.observe(Stamp::new(Hlc::new(10_000, 0), a));
+        theirs.observe(Stamp::new(Hlc::new(90_000, 0), b));
+
+        assert_eq!(lag_behind_ms(&theirs, &mine), 90_000, "90 s behind on `a`; `c` does not count");
+        assert_eq!(lag_behind_ms(&mine, &theirs), 0, "and we trail it by nothing");
+
+        // A fresh member trails nobody: it holds nothing old enough to resurrect.
+        assert_eq!(lag_behind_ms(&VersionVector::default(), &mine), 0);
     }
 }

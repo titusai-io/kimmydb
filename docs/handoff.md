@@ -6,6 +6,29 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **retention guards: tombstones outlive the oplog, stale rejoiners are named**
+
+Branch `feat/retention-guards`, ADR-085, from `main`. Two operational
+guards around partition resurrection. `Config::validate` refuses
+`tombstone_retention_secs < oplog_retention_secs` — the one setting under
+which a partition shorter than the oplog window resurrects data — with a
+message saying why, a row in `operations.md`'s refused-at-startup table, and
+a unit test. The replication loop now knows which peer it talked to
+(`open_handshake` returns the `NodeId` from `Welcome`) and how far that peer
+trails us (`SyncOutcome::behind_ms` = `lag_behind_ms(theirs, mine)`); when
+that exceeds `ReplicationConfig::tombstone_retention` it warns once on the
+transition, logs once on recovery, and calls `on_peer_staleness` — the same
+callback shape as `on_lag`, for the same reason. `AppState` keeps the record
+(`report_peer_staleness` / `stale_peer`, `StalePeer { since_ms, behind_ms }`,
+the clock starting on the first report) and `/v1/topology` adds `staleSince`
+/ `behindSecs` to the peer's entry only while the condition holds; spec
+updated. Tests: config refusal, the reversed-lag unit test in `sync.rs`
+(a fresh member trails nobody), and an API test that injects reports and
+watches the entry appear, keep its start, and disappear. Not done: a
+multi-process cluster-harness test — the harness has no way to restart a
+node on its data directory (`Drop` SIGKILLs), and a two-second retention
+would make the cluster flag itself while idle; the decision is a pure
+function and is tested as one.
 ## As of 2026-08-26 — **conditional writes: `if_stamp`, `stale`, and stamps everywhere**
 
 Branch `feat/if-stamp-cas`, ADR-084, stacked on `docs/guarantee-table`. The
