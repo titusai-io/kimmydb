@@ -2321,7 +2321,7 @@ async fn offer_browser(url: &str) {
     let _ = tokio::io::BufReader::new(tokio::io::stdin()).read_line(&mut line).await;
 
     if open_in_browser(url) {
-        eprintln!("{}", ansi("2", "Opened. Approve the request in the browser."));
+        // Silence is confirmation: the browser is in front of them.
     } else {
         eprintln!("{}", ansi("33", "Could not open a browser — use the URL above."));
     }
@@ -2363,17 +2363,6 @@ async fn run_init() -> Result<()> {
     let existing = load_kimmy_file()?.map(|(_, settings)| settings);
     let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
     let path = kimmy_file_path()?;
-
-    eprintln!(
-        "{}",
-        ansi(
-            "2",
-            &format!(
-                "Configure {} — one answer needed; the node describes the rest.",
-                path.display()
-            )
-        )
-    );
 
     // The one thing nothing else can supply: which node to talk to.
     let url_prefill = existing.as_ref().and_then(|s| s.url.clone()).or_else(|| env("KIMMY_URL"));
@@ -2481,17 +2470,6 @@ async fn run_init() -> Result<()> {
     }
 
     eprintln!("{}", ansi("32", &format!("\u{2713} wrote {} (0600)", path.display())));
-    eprintln!(
-        "{}",
-        ansi(
-            "2",
-            "  scope/token/password/client-secret were not asked for: login discovers or \
-             prompts for what it needs. Override anytime with --scope / --client-id / \
-             KIMMY_PASSWORD."
-        )
-    );
-    eprintln!("{}", ansi("2", "  try it:  kimmy whoami"));
-
     let keys: Vec<String> = pairs.iter().map(|(k, _)| k.to_string()).collect();
     println!("{}", json!({ "written": path.display().to_string(), "keys": keys }));
     Ok(())
