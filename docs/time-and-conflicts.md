@@ -203,7 +203,9 @@ sequenceDiagram
 ```
 
 **Retention.** Tombstones are kept for `storage.tombstone_retention_secs`
-(default 24 h). Collection is 📋 planned.
+(default 24 h) and collected past that age by the retention pass in
+`kimmy-storage/src/gc.rs`, alongside oplog entries older than
+`storage.oplog_retention_secs`.
 
 > **Sharp edge — resurrection.** If a partition outlasts the retention window,
 > documents deleted during it resurrect when it heals. Set the window longer
