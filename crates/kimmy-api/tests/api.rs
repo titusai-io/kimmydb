@@ -652,6 +652,62 @@ async fn updates_apply_operators() {
     assert_eq!(res.body["n"], 15);
 }
 
+/// A `multi: true` request lands in chunks of `storage.multi_chunk_docs`
+/// (the engine default here, 1,000) and says how many (ADR-086).
+#[tokio::test]
+async fn a_multi_update_reports_its_commits() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for batch in [0..1000i64, 1000..2000, 2000..2500] {
+        let docs: Vec<Value> = batch.map(|i| json!({"_id": i, "n": 0})).collect();
+        let res = server.post("/v1/db/shop/coll/c/bulk", Some(&token), json!(docs)).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    let commits_before = server.state.engine.commits();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$inc": {"n": 1}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 2500);
+    assert_eq!(res.body["modified"], 2500);
+    assert_eq!(res.body["commits"], 3, "1,000 + 1,000 + 500");
+    assert_eq!(server.state.engine.commits() - commits_before, 3);
+
+    let res = server.get("/v1/db/shop/coll/c/docs/2499", Some(&token)).await;
+    assert_eq!(res.body["n"], 1);
+
+    let res = server
+        .post("/v1/db/shop/coll/c/delete", Some(&token), json!({ "filter": {}, "multi": true }))
+        .await;
+    assert_eq!(res.body["deleted"], 2500);
+    assert_eq!(res.body["commits"], 3);
+
+    // A single-document request is one chunk of one, and reports it.
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1, "n": 0})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$inc": {"n": 1}} }),
+        )
+        .await;
+    assert_eq!(res.body["commits"], 1);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 99}, "update": {"$inc": {"n": 1}} }),
+        )
+        .await;
+    assert_eq!(res.body["commits"], 0, "nothing matched, nothing committed");
+}
+
 /// Concurrent `$inc`s on one document must all land.
 ///
 /// Multi-threaded on purpose: the defect this pins was a read transaction

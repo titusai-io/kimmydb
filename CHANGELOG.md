@@ -10,6 +10,25 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`storage.multi_chunk_docs`** — how many documents a `multi: true` update
+  or delete commits per transaction (default 1,000; 1 to 10,000). `update`
+  and `delete` responses gain `commits`, the number of chunks the request
+  landed (ADR-086).
+
+### Changed
+
+- **A `multi: true` update or delete commits in chunks** rather than one
+  transaction, releasing the single writer between chunks, and the 10,000-
+  match refusal that 0.11.0 introduced for `multi` is gone — any number of
+  matches is allowed. Each chunk is still all or nothing; a failure in a
+  later chunk leaves the earlier ones committed and answers with an error.
+  `find_and_modify` keeps its 10,000-match ceiling, because it sorts the
+  whole set before choosing.
+
 ## 0.11.0 - 2026-08-26
 
 ### Added

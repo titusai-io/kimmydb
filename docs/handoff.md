@@ -6,6 +6,29 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **`multi` commits in chunks; the 10,000 cap is gone**
+
+Branch `feat/multi-chunked-commits`, ADR-086. ADR-083 had made a
+`multi: true` request one transaction and, because that holds the single
+writer for the whole request, capped it at `MAX_CANDIDATES` with a refusal —
+a new failure mode for a request that used to run to completion. Now
+`Engine::modify_where` loops: one write transaction per chunk of
+`Engine::multi_chunk_docs()` documents (an `AtomicUsize` set from
+`storage.multi_chunk_docs` at startup, default `DEFAULT_MULTI_CHUNK_DOCS` =
+1,000, clamped to `1..=MAX_CANDIDATES`), `collect_matches` taking an `after`
+key bound that every candidate path honours (`Keys` and the index union are
+sorted and deduplicated first; the scan uses `doc_range_after`), publish per
+chunk after its commit, resume strictly after the last key written. The
+`MAX_CANDIDATES` refusal now applies only when `limit` is `None`, i.e. to
+`find_and_modify`'s `choose`. `ModifyManyOutcome` gains `commits`; `update`
+and `delete` responses carry it; the spec, storage/http-api/query-language/
+compatibility docs and README say "chunked" where they said "refused above
+10,000". Tests: 10,001 documents → 11 commits and none visited twice; chunk
+size 5 over 12 documents → 3 commits with events arriving chunk by chunk in
+key order; a failure in chunk two leaves chunk one committed and exactly its
+events published; `Keys` offered out of order and duplicated resume
+correctly; config bounds; an API test of `commits` over 2,500 documents.
+
 ## As of 2026-08-26 — **`chunk.max_tokens`: a byte-budget ceiling under the character rule**
 
 Branch `feat/token-aware-chunks`, from `main`, no ADR (a config field with a

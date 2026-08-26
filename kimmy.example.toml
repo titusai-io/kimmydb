@@ -166,6 +166,15 @@ oplog_retention_secs = 86400
 # replication problem, and never what you want in production.
 gc_interval_secs = 600
 
+# How many documents a `multi: true` update or delete commits per transaction.
+#
+# The single writer is released between chunks, so this bounds how long one
+# request can hold it, and a crash or a refusal loses at most the chunk in
+# flight — the oplog reflects exactly what landed. Larger amortises the
+# per-commit fsync over more documents; smaller lets other writers in sooner.
+# Must be between 1 and 10,000.
+multi_chunk_docs = 1000
+
 [auth]
 # Run with no authentication at all. Only permitted when `server.bind` is a
 # loopback address; the server refuses to start otherwise.

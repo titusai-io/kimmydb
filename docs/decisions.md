@@ -4050,6 +4050,50 @@ lag; a `BTreeMap` of stale peers in API state; two additive fields on a
 topology entry, present only while the condition holds. The refusal is a
 behaviour change for a configuration nobody should have had.
 
+## ADR-086 — A `multi` write commits in bounded chunks
+
+**Decision.** `update` and `delete` with `multi: true` commit in chunks of
+`storage.multi_chunk_docs` documents (default 1,000; 1 to 10,000). Each chunk
+is one write transaction, matched and written inside it exactly as ADR-083
+made a single-document write; the writer is released between chunks; the
+next chunk resumes strictly after the last document key the previous one
+wrote, on every candidate path. A failure in a later chunk leaves the earlier
+ones committed and answers with an error. The response gains `commits`. The
+10,000-match refusal that ADR-083 gave `multi` is gone; `find_and_modify`
+keeps it, because it has to sort the whole match set before choosing.
+
+**Why not keep one transaction per request.** It held the single writer for
+the whole match and the whole write, which is why it had to be capped — and
+the cap was a refusal on a filtered write, which is a new failure mode for
+a request that used to run to completion. Chunking is what the TTL expiry
+pass already does (1,000 documents per pass, precisely so a backlog does not
+hold the writer), and it gives the same two properties here: bounded writer
+hold, and a bounded loss — at most the chunk in flight.
+
+**Why resume by key rather than re-scan.** Every candidate path delivers
+documents in key order — the documents table by its key, a primary-key list
+and an index union once sorted — so "strictly after the last key written" is
+a range bound, not a filter. A chunk costs its own size, a document is never
+visited twice, and a document that stops matching between chunks (another
+writer changed it) is simply not matched by the next chunk, which is the
+same answer a concurrent writer gets between any two requests.
+
+**Why the failure answer is an error and not a partial count.** A response
+carrying both an error and "but 2,000 landed" is a shape no client handles;
+the envelope's contract (ADR-057) is one code per answer. What landed is
+exactly what the oplog and the collection show, and `commits` on the success
+path already tells a caller the request was chunked. A caller that must know
+after a failure reads the collection.
+
+**Alternatives.** Keep the cap and document it: the cap was the problem.
+One transaction with the scan outside it: reintroduces the read-then-write
+gap ADR-083 closed. A configurable "all or nothing up to N": that is
+`multi_chunk_docs = 10000`, which is allowed.
+
+**Cost.** One more field on two responses; one configuration key; a chunk
+boundary is a place a concurrent writer can interleave, which the documents
+call out. `examined` and `matched` sum across chunks.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made
