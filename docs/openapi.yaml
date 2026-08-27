@@ -2721,6 +2721,16 @@ components:
             `live` if the answering node currently sees it in the cluster, or if
             it *is* the answering node. `unknown` otherwise — registered, but
             not currently vouched for.
+
+            **`unknown` is not `down`, and it may be permanent.** It means the
+            answering node has not heard from that peer, which is not the same
+            as the peer being unreachable from the client. A node that was
+            decommissioned stays listed as `unknown` indefinitely — records are
+            written at startup and never aged out — until an operator deletes
+            its registry document (see deviations.md, "A decommissioned node
+            stays in the topology"). A client choosing a failover target should
+            prefer `live` nodes and treat a persistently `unknown` one as
+            possibly gone, not merely momentarily quiet.
         self:
           type: boolean
           description: Whether this is the node that answered.
