@@ -158,8 +158,8 @@ will need to re-authenticate rather than assuming a connection stays good.
 
 | Tool | |
 |---|---|
-| `list_databases` | Databases the caller may read |
-| `list_collections` | Collections in a database, filtered by grant |
+| `list_databases` | Databases the caller may read; `__kimmy` omitted ([ADR-092](decisions.md)) |
+| `list_collections` | Collections in a database, filtered by grant; `.__vectors` shadows omitted ([ADR-092](decisions.md)) |
 | `describe_collection` | **Sampled schema.** See below |
 | `find` | Query with the full filter language, with `sort`, `projection`, paging, and `explain` |
 | `count` | Match count without returning documents |
@@ -261,7 +261,9 @@ Guessing a URI does not help: `resources/read` runs the same check.
 `.__vectors` shadow collections. Not as an access control (a superuser can still
 read them through `find`, exactly as through REST) but because a resource is
 material an agent attaches to its context, and the user store is a column of
-password hashes. [ADR-027](decisions.md) has the reasoning.
+password hashes. [ADR-027](decisions.md) has the reasoning. The two *listing*
+tools apply the same default, for the same reason — a listing is an invitation
+— while every tool still reaches an internal by name ([ADR-092](decisions.md)).
 
 ---
 

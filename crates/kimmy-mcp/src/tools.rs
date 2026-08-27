@@ -255,19 +255,28 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::list_databases(&self.state, &auth))
+        render(
+            exec::list_databases(&self.state, &auth).map(|value| {
+                omit_internal(value, "databases", crate::resources::is_internal_database)
+            }),
+        )
     }
 
     /// List collections in a database.
     #[tool(description = "List the collections in a database. Only collections you are \
-                       authorized to read are returned.")]
+                       authorized to read are returned. KimmyDB's own internals -- the \
+                       `.__vectors` shadow collections that back vector search -- are \
+                       omitted; describe_collection reports whether a collection has \
+                       vectors, and the shadow is still reachable by name if you must.")]
     async fn list_collections(
         &self,
         Parameters(args): Parameters<DatabaseArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        render(exec::list_collections(&self.state, &auth, &args.database))
+        render(exec::list_collections(&self.state, &auth, &args.database).map(|value| {
+            omit_internal(value, "collections", crate::resources::is_internal_collection)
+        }))
     }
 
     /// Sampled schema of a collection.
@@ -552,6 +561,22 @@ fn search_request(args: SearchArgs) -> (String, String, vectors::SearchRequest) 
 /// Structured content carries the JSON; the text block carries the same thing
 /// serialized, because not every client renders structured content and an
 /// answer no client shows is not an answer.
+/// Drop KimmyDB's own internals from a listing (ADR-092).
+///
+/// A listing is an invitation: an agent that sees `orders.__vectors` next to
+/// `orders` will open it, and find a collection of float arrays that says
+/// nothing the source does not, at a great cost in context. Resources have
+/// omitted these since ADR-027 for the same reason; this applies the same
+/// default to the two listing tools. It is a default, not a control -- the
+/// access decision is unchanged, and `find`, `count` and `describe_collection`
+/// reach an internal by name exactly as before.
+fn omit_internal(mut value: Value, key: &str, is_internal: fn(&str) -> bool) -> Value {
+    if let Some(names) = value.get_mut(key).and_then(Value::as_array_mut) {
+        names.retain(|name| name.as_str().is_none_or(|n| !is_internal(n)));
+    }
+    value
+}
+
 pub(crate) fn render(result: Result<Value, ApiError>) -> Result<CallToolResult, ErrorData> {
     match result {
         Ok(value) => Ok(ok(value)),
