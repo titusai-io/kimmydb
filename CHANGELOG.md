@@ -14,6 +14,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **A replicated document costs about its own size on the wire, not twelve
+  times it** — **breaking, and not a rolling upgrade**. `OplogEntry.body` and
+  `SnapshotDoc.body` are `Vec<u8>`, which serde encodes as a BSON *array of
+  int32s*: one element, with its own index key, per byte. Every replicated
+  document and every snapshot page was therefore inflated roughly twelvefold —
+  a 1 MiB document became a 12.5 MiB entry, so a sync batch reached the 64 MiB
+  frame limit at around 5 MiB of real data. Both fields are now `serde_bytes`,
+  which encodes them as binary: measured at 12 520 922 bytes before and
+  1 048 784 after for the same 1 MiB document, a **92% reduction** in
+  replication and snapshot traffic.
+
+  **Every node must be restarted together.** An un-upgraded peer reads binary
+  where it expects an array and cannot decode the frame, so a mixed-version
+  cluster does not replicate while the upgrade is in flight. Stop the cluster,
+  upgrade it, start it again — the stored data is untouched, because storage
+  has always written these bodies as raw bytes through its own codec, so
+  nothing is migrated and nothing is at risk.
+
 - **The MCP `list_databases` and `list_collections` tools omit KimmyDB's own
   internals** — the `__kimmy` system database and the `.__vectors` shadow
   collections — as `resources/list` has since ADR-027. A listing is an

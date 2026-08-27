@@ -9,6 +9,7 @@ description = "Core types for KimmyDB: HLC, identifiers, document records, oplog
 
 [dependencies]
 serde.workspace = true
+serde_bytes.workspace = true
 serde_json.workspace = true
 bson.workspace = true
 thiserror.workspace = true

@@ -77,6 +77,12 @@ pub struct SnapshotDoc {
     pub stamp: Stamp,
     /// `None` for a tombstone, which travels so a delete is not undone by a
     /// peer that still holds the document.
+    ///
+    /// Binary rather than serde's default array-of-int32s, for the reason on
+    /// [`kimmy_core::OplogEntry::body`]. It matters at least as much here: a
+    /// snapshot is a whole collection by definition, so this is the largest
+    /// thing the cluster ever sends.
+    #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
 }
 

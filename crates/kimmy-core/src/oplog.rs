@@ -94,6 +94,14 @@ pub struct OplogEntry {
     /// application idempotent and order-independent (just compare stamps and
     /// overwrite), and it lets change-stream subscribers get `fullDocument`
     /// without a second read.
+    ///
+    /// **`serde_bytes` is load-bearing, not tidiness.** Serde encodes a bare
+    /// `Vec<u8>` as an array of int32s — one BSON element, with its own index
+    /// key, per byte — which made a replicated document about twelve times its
+    /// own size. A 1 MiB document became a 12.5 MiB entry, so a batch reached
+    /// the 64 MiB frame limit at roughly 5 MiB of real data. As binary it is
+    /// the document's own length plus a few bytes.
+    #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
 }
 
