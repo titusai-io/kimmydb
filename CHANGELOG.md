@@ -19,6 +19,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   client needs: it is not `down`, and for a decommissioned node it is
   permanent until an operator deletes the registry document. Documentation
   only; no behaviour changed.
+- **README states the data guarantees and the measured write speeds.** A
+  "Data guarantees: ACID where, BASE where" section replaces the
+  consistency-model list — per-request ACID on the accepting node, BASE
+  across the cluster, the two durability classes, and the benchmark figures
+  a reader needs before sizing a write workload — and the roadmap table now
+  runs to M11. `compatibility.md` no longer claims that no `set_durability`
+  call exists (false since ADR-088), and `benchmarks.md` no longer says the
+  API offers no batching.
 
 ## 0.13.0 - 2026-08-27
 

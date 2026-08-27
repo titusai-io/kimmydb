@@ -209,11 +209,16 @@ two requests.
 | Anything across two requests | **No guarantee.** There are no multi-request transactions; two writes are two commits, and a reader may see the state between them | — | — |
 | The cluster | Basically available, soft state, eventually consistent: every node accepts writes, anti-entropy carries the oplog, whole-document last-writer-wins on a hybrid logical clock. Read-your-writes holds only on the node written to; convergence holds while a partition is shorter than tombstone retention | `kimmy-cluster` + `sync.rs` | `two_engines_converge_after_one_round`, `conflicting_writes_converge_to_the_same_document`, `three_nodes_converge_through_a_middle_peer` |
 
-**Durability mechanism, stated once.** redb runs `Durability::Immediate`
-everywhere — no `set_durability` call exists in the workspace — so a commit
-does not return until the data is fsynced. That is why the per-commit write
-rate in [Benchmarks](benchmarks.md) is a physical floor rather than a tuning
-problem, and why a process killed mid-flight loses nothing it acknowledged.
+**Durability mechanism, stated once.** Under the default `durable` class
+every commit runs redb's `Durability::Immediate` and does not return until
+the data is fsynced. Under `coalesced` (ADR-088) a commit is written with
+`Durability::None` and then waits at a barrier for the next shared fsync
+before its response returns — the only `set_durability` calls in the
+workspace are that switch and the barrier's own flush. Either way a commit
+has reached the disk when the caller hears about it: that is why the
+per-commit write rate in [Benchmarks](benchmarks.md) is a physical floor
+rather than a tuning problem, and why a process killed mid-flight loses
+nothing it acknowledged.
 
 **What this rules out.** Cross-node unique constraints, counters that are
 correct *across* nodes under a partition (each node's increments are correct;
@@ -226,7 +231,7 @@ node that holds it.
 Where the same facts are told from another angle: [Storage](storage.md)
 (the durability table, from the engine's side),
 [Time and conflicts](time-and-conflicts.md) (the cluster's side), and the
-README's consistency-model list (the summary). This table is the authority
+README's "Data guarantees" section (the summary). This table is the authority
 when they disagree.
 
 ---
