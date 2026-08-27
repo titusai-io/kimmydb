@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.14.0 - 2026-08-27
 
 ### Added
 
@@ -39,6 +39,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   caller can read nothing and to an empty one, so a mistyped name looked like
   an empty result. A database that exists and hides everything from the
   caller still lists as `[]`: zero grants is not a refusal (ADR-066).
+  Breaking for a client that treated the empty list as "no such database";
+  it is why this is `0.14.0` rather than a patch.
 - **The MCP instructions name the action each tool needs**, and the
   `hybrid_search` description says its scores are rank-fusion values that are
   not comparable with `vector_search` similarities — an agent carrying a
