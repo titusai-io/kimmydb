@@ -652,6 +652,41 @@ async fn updates_apply_operators() {
     assert_eq!(res.body["n"], 15);
 }
 
+/// `modified` counts documents **written**, not documents changed, so it equals
+/// `matched` even when the operators moved nothing. This is the deliberate
+/// deviation in `docs/deviations.md`, and `docs/openapi.yaml` stated the
+/// opposite until 2026-08-26 — nothing caught it because nothing ever asserted
+/// on the value for an update that changes nothing.
+#[tokio::test]
+async fn a_no_op_update_still_counts_as_modified() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"g":"x"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"g":"x"})).await;
+
+    // Every document is already in the state the update asks for.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$set": {"g": "x"}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 2);
+    assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
+
+    // The same holds for `$unset` of a field that was never present.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {}, "update": {"$unset": {"never_here": ""}}, "multi": true }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
+}
+
 /// A `multi: true` request lands in chunks of `storage.multi_chunk_docs`
 /// (the engine default here, 1,000) and says how many (ADR-086).
 #[tokio::test]
