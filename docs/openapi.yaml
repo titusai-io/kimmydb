@@ -1412,9 +1412,18 @@ paths:
                   modified:
                     type: integer
                     description: |
-                      Matched but unchanged documents count in `matched` and
-                      not here — an update that sets a field to the value it
-                      already holds modifies nothing.
+                      Documents **written**, not documents changed — so this
+                      equals `matched`. Every match is written back whether or
+                      not the operators moved anything: a `$set` to the value a
+                      field already holds still counts, as does an `$unset` of
+                      a field that was never there.
+
+                      **MongoDB's `nModified` means the other thing**, and
+                      excludes those, so a client ported from it gets a number
+                      that looks right and is not. To ask "did anything
+                      change?", compare `matched` against a `count` filtered on
+                      the state you want. See
+                      [Deviations](deviations.md).
                   commits:
                     type: integer
                     description: |

@@ -57,10 +57,22 @@ many documents the filter found, and a `count` with a filter describing the
 desired state says how many are already that way — which is the honest way to
 learn whether an update would change anything, in either database.
 
-Also noted in [the HTTP API](http-api.md#count-update-delete-by-filter) and
-[Query language](query-language.md), which are where someone writing an update
-will meet it — rather than in [Compatibility](compatibility.md), which is about
-this project's own `/v1` promise and not about MongoDB.
+Also noted in [the HTTP API](http-api.md#count-update-delete-by-filter),
+[Query language](query-language.md) and [`openapi.yaml`](openapi.yaml), which
+are where someone writing an update will meet it — rather than in
+[Compatibility](compatibility.md), which is about this project's own `/v1`
+promise and not about MongoDB.
+
+**`openapi.yaml` was the one that got out of step**, and it stated the opposite
+until 2026-08-26: *"Matched but unchanged documents count in `matched` and not
+here."* Found by someone writing a fourth client (.NET) from the specification,
+which is the only document a client author is obliged to read — so the register
+was right about the behaviour everywhere except in the contract. Same shape as
+the `409` on a second collection create, below: a false sentence about an
+*outcome* survives because the specification's coverage assertion checks that
+every *operation* is exercised, not every documented outcome. The contract test
+now pins `modified == matched` for a no-op `$set`, so the sentence and the
+server cannot drift apart again in silence.
 
 ---
 
