@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.13.0 - 2026-08-27
 
 ### Removed
 
@@ -24,6 +24,14 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   ignored rather than rejected, and `kimmy init` drops it on rewrite. Migration:
   replace `$(kimmy login --client-credentials)` with a personal access token
   (ADR-089).
+
+### Fixed
+
+- **`openapi.yaml` described `modified` wrongly.** The update response's
+  `modified` counts documents *written*, which is every match, so it equals
+  `matched`; the contract said it excluded unchanged documents. The other
+  documents already said this correctly; the OpenAPI file — the one a client
+  author is obliged to read — now agrees with them.
 
 ## 0.12.0 - 2026-08-27
 
