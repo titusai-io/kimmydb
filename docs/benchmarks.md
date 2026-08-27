@@ -181,11 +181,13 @@ shape all disappear underneath it. `delete` + `insert` is 6.8 ms because it is
 two commits, not because deleting is expensive.
 
 So the lever for ingest throughput is **batching mutations into one
-transaction**, not tuning anything inside a write. Nothing in the API offers
-that today — every route commits per operation — which makes it the obvious
-next thing to look at if ingest rate ever matters. It also sets the ceiling
-the embedding worker runs against, since it stores vectors one document at a
-time.
+transaction**, not tuning anything inside a write. When this was first
+written nothing in the API offered that; `POST .../bulk` (`insert_many`) now
+does, and "Batching into one commit" below is what it was worth. The other
+lever, sharing one fsync between concurrent commits, is the `coalesced`
+durability class measured further down. Per-document commits still set the
+ceiling the embedding worker runs against, since it stores vectors one
+document at a time.
 
 ---
 

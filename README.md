@@ -16,12 +16,15 @@ awkward to get together:
 📚 **[Full documentation is in `docs/`](docs/README.md)** — architecture, internals,
 API reference, operations, and the decision record.
 
-> **Status: early development.** Multi-user document CRUD, Mongo-style queries,
-> secondary indexes, live change streams over WebSocket, automatic embeddings
-> with vector and hybrid search, and an in-process MCP server at `/mcp` all
-> work. **Clustering works too** — every node accepts writes, membership is
-> SWIM and convergence is anti-entropy over the oplog; `docker-compose.yml`
-> brings up three nodes. See [Roadmap](#roadmap).
+> **Status: early development, released.** Multi-user document CRUD, Mongo-style
+> queries and aggregation, secondary indexes, live change streams over
+> WebSocket, signed webhooks, automatic embeddings with vector and hybrid
+> search, an in-process MCP server at `/mcp`, OIDC federation, and a
+> versioned `/v1` contract with Rust, Python and Go clients all work.
+> **Clustering works too** — every node accepts writes, membership is SWIM and
+> convergence is anti-entropy over the oplog; `docker-compose.yml` brings up
+> three nodes. Pre-1.0: a minor release may break things and the
+> [changelog](CHANGELOG.md) says so. See [Roadmap](#roadmap).
 
 ## Why it is built this way
 
@@ -40,8 +43,8 @@ seen a peer.
 
 ## Install
 
-Releases are cut by tag; every artifact below appears with the first `v*`
-release. The server ships as a container image, the CLI ships everywhere.
+Releases are cut by tag. The server ships as a container image, the CLI ships
+everywhere.
 
 ```bash
 # The server — multi-arch (amd64 + arm64) image on GHCR
@@ -173,25 +176,90 @@ The settings worth knowing before you deploy:
 is refused without seeds and secrets. These are startup errors, not runtime
 surprises.
 
-## Consistency model
+## Data guarantees: ACID where, BASE where
 
-Read this before building on it.
+Read this before building on it. The short form: **ACID at the granularity of
+one request on one node; BASE across the cluster** — AP by design, not by
+accident.
 
-- **Single-document writes are atomic and durable** on the node that accepts them.
+**On the node that accepts a write, it is ACID.** Every write is one redb
+transaction holding the document, its index entries and its oplog entry, and
+the transaction is fsynced before the response returns — so what a node
+acknowledges survives a crash, and a reader never sees half a write.
+
+| Scope | Guarantee |
+|---|---|
+| One document, one request | Atomic, isolated, durable. Whole-document replacement or operator update; `if_stamp` makes it a compare-and-set against the version a previous response returned (`409 stale` otherwise) |
+| `update` / `delete` by filter | Atomic read-modify-write inside the write transaction — concurrent `$inc`s all land |
+| `find_and_modify` | Atomic claim-and-return; two callers never claim the same document |
+| Bulk insert (`insert_many`) | All or nothing: a duplicate `_id` anywhere inserts nothing |
+| `update` / `delete` with `multi: true` | Atomic **per chunk** of `storage.multi_chunk_docs` documents (default 1,000); the writer is released between chunks and the response's `commits` says how many landed |
+| Reads | Snapshot-isolated per request |
+| Anything across two requests | **No guarantee.** There are no multi-request or multi-document transactions, and none are planned |
+
+**Across the cluster, it is BASE** — basically available, soft state,
+eventually consistent:
+
+- **Every node accepts writes**; there is no primary and no quorum.
 - **Read-your-writes holds only on the node you wrote to.** There are no
   cross-node read guarantees.
-- **Conflicts resolve by last-writer-wins** at whole-document granularity, using
-  a hybrid logical clock with the node id as a tiebreak. Concurrent writes to the
-  same document mean the losing write is discarded, not merged.
-- **There are no transactions across requests.** A `multi: true` update or
-  delete commits in chunks (1,000 documents by default), each chunk a single
-  unit on the accepting node; nothing spans two operations.
+- **Conflicts resolve by last-writer-wins** at whole-document granularity, on a
+  hybrid logical clock with the node id as a tiebreak. The losing write is
+  discarded, not merged.
+- **Unique indexes are enforced per node**; a collision that arrives by
+  replication is recorded, surfaced as a `uniqueViolation` event, and queryable
+  at `.../violations`, rather than refused.
 - **Deletes are tombstones with a retention window.** If a partition outlasts
-  `tombstone_retention_secs`, documents deleted during it can resurrect when the
-  partition heals. Set the window longer than any partition you would tolerate.
+  `storage.tombstone_retention_secs`, documents deleted during it can resurrect
+  when it heals. Set the window longer than any partition you would tolerate;
+  a peer that rejoins from further back than that is named in `/v1/topology`.
 
-Per operation — what each route promises and the test that defends it — see
+Per operation — what each route promises, where the engine enforces it, and
+the test that defends it — see
 ["What each operation guarantees"](docs/compatibility.md#what-each-operation-guarantees).
+That table is the authority when any other document disagrees with it.
+
+### Durability classes
+
+`storage.durability` chooses how a commit reaches the disk
+([ADR-088](docs/decisions.md)). Both classes are durable when the response
+returns; there is deliberately no class that is not.
+
+| Class | Mechanism | Use it when |
+|---|---|---|
+| `durable` (default) | Every commit fsyncs before it returns | Always safe; a single ingest loop should stay here or batch |
+| `coalesced` | A commit waits for the next shared fsync, one per `commit_coalesce_ms` window (default 5 ms), so N concurrent writers pay one fsync rather than N | Many concurrent writers each insisting on their own commit |
+
+### Write speed, as measured
+
+Every number here is from [Benchmarks](docs/benchmarks.md), which records
+method and machine; they are useful as ratios rather than absolutes.
+
+- **The commit is the cost.** A durable single-document write is **~3.4 ms at
+  the engine** (~290/s), and document size and index count disappear
+  underneath it — zero, one and two secondary indexes cost the same. Through
+  the HTTP API the same insert is **~7.0 ms** at one client, because the
+  embedding worker's position record adds a second commit.
+- **Concurrency does not raise it.** One to eight concurrent writers under
+  `durable` land 296 → 304 docs/s — flat, because redb has one writer and they
+  share it cleanly. Under `coalesced`, sixteen writers go from 182 to
+  **1,114 docs/s** (6.1×); a lone writer is *slower* under `coalesced`
+  (79 vs 170/s), because it waits a window for company that never comes.
+- **Batching does.** A bulk insert of 1,000 documents commits once and lands
+  **51,320 docs/s** at the engine — the marginal document costs ~13 µs. Over a
+  socket, one client gets **143 inserts/s** one at a time and **7,300 docs/s**
+  in batches of 100; thirty-two clients get **24,400 docs/s**. On a real
+  three-node cluster over a LAN, batches of 250 sustained ~2,000 docs/s.
+- **Reads scale; writes do not.** Point reads go from 8,000/s at one client
+  to ~70,000/s at thirty-two; a `find` page of 100 in ~0.5 ms; an indexed
+  equality lookup in 0.003 ms against an 8 ms scan of 10,000 documents.
+- **The tail shows the single writer.** Thirty-two contending single-document
+  writers push p99 from 10 ms to 246 ms.
+
+The question to ask of a write workload is not "how many writes per second"
+but **"can these writes be batched, or are there enough concurrent writers to
+share an fsync?"** — and if either answer is yes, throughput is unlikely to be
+the constraint.
 
 These are the normal consequences of choosing leaderless availability over
 coordination. They are stated up front because the failure mode of an
@@ -208,6 +276,11 @@ eventually-consistent store is a user who assumed otherwise.
 | **M4** | Gossip membership, DNS/k8s discovery, anti-entropy replication | ✅ Complete |
 | **M5** | Rate limiting, TLS, benchmarks, aggregation, backup and point-in-time restore, audit log, metrics, CLI | ✅ Complete |
 | **M6** | Webhooks — register a URL, the node pushes change events to it | ✅ Complete |
+| **M7** | Query engine completion — the planner's carried gaps | ✅ Complete |
+| **M8** | Prove, persist, polish — cluster harness, vector durability, observability | ✅ Complete |
+| **M9** | Computed expressions, TTL, `findAndModify`, partial indexes, cursors | ✅ Complete |
+| **M10** | The client protocol, formalized — `openapi.yaml`, Rust, Python and Go clients | ✅ Complete |
+| **M11** | Index-ordered scans — sorted queries that stop early | 🚧 Task 1 of 5; paused |
 
 Where the build departs from what was planned — and why — is tracked in
 [Deviations](docs/deviations.md), in one place rather than scattered.
@@ -279,4 +352,6 @@ wrong answers rather than crashes. These are property-tested:
 | [Query Language](docs/query-language.md) · [HTTP API](docs/http-api.md) | Using it |
 | [Vectors](docs/vectors.md) · [MCP](docs/mcp.md) | Embeddings, search, and the agent surface |
 | [Security](docs/security.md) · [Federation](docs/federation.md) · [Operations](docs/operations.md) | Running it |
+| [CLI](docs/cli.md) · [Clients](docs/clients.md) · [Compatibility](docs/compatibility.md) | The `kimmy` terminal client, the first-party libraries, and what `/v1` promises |
+| [Benchmarks](docs/benchmarks.md) | What has been measured, with method |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |
