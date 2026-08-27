@@ -51,8 +51,8 @@ has been incomplete before.
 | `GET` `DELETE` | `/v1/roles/{name}` | server admin |
 | `POST` | `/v1/roles/{name}/grants` | server admin |
 | `GET` | `/v1/databases` | `read` (filtered) |
-| `GET` `POST` | `/v1/db/{db}/collections` | `read` (filtered) / `admin` |
-| `DELETE` | `/v1/db/{db}/coll/{coll}` | `admin` |
+| `GET` `POST` | `/v1/db/{db}/collections` | `read` (filtered; 404 if the database does not exist) / `ddl` |
+| `DELETE` | `/v1/db/{db}/coll/{coll}` | `ddl` |
 | `POST` | `/v1/db/{db}/coll/{coll}/docs` | `write` |
 | `GET` | `/v1/db/{db}/coll/{coll}/docs` | `read` |
 | `POST` | `/v1/db/{db}/coll/{coll}/bulk` | `write` |
@@ -64,14 +64,14 @@ has been incomplete before.
 | `POST` | `/v1/db/{db}/coll/{coll}/delete` | `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/aggregate` | `read` — see [Aggregation](aggregation.md) |
 | `GET` | `/v1/db/{db}/coll/{coll}/describe` | `read` |
-| `POST` | `/v1/db/{db}/coll/{coll}/vector` | `admin` — configure embedding ([Vectors](vectors.md)) |
+| `POST` | `/v1/db/{db}/coll/{coll}/vector` | `ddl` — configure embedding ([Vectors](vectors.md)) |
 | `GET` `PUT` `DELETE` | `/v1/db/{db}/coll/{coll}/docs/{id}/vectors` | `read` / `write` / `write` |
 | `POST` | `/v1/db/{db}/coll/{coll}/vector_search` | `search` ([Vectors](vectors.md)) |
 | `POST` | `/v1/db/{db}/coll/{coll}/hybrid_search` | `search` ([Vectors](vectors.md)) |
 | `GET` `POST` | `/v1/db/{db}/coll/{coll}/webhooks` | `webhook` ([Webhooks](webhooks.md)) |
 | `DELETE` | `/v1/db/{db}/coll/{coll}/webhooks/{id}` | `webhook` ([Webhooks](webhooks.md)) |
-| `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `admin` |
-| `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `admin` |
+| `GET` `POST` | `/v1/db/{db}/coll/{coll}/indexes` | `read` / `ddl` |
+| `DELETE` | `/v1/db/{db}/coll/{coll}/indexes/{name}` | `ddl` |
 | `GET` | `/v1/db/{db}/coll/{coll}/violations` | `read` — unique violations still standing ([Indexes](indexes.md#resolving-a-unique-violation)) |
 | `GET` | `/v1/db/{db}/coll/{coll}/watch` | `watch` (WebSocket) |
 | `GET` | `/v1/admin/backup` | `admin` over `*` — see [Backup](#backup) |

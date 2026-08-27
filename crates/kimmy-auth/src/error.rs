@@ -51,7 +51,7 @@ pub enum AuthError {
     #[error(
         "the OIDC role mapping for {claim_value:?} grants the `admin` action, which is reserved \
          to local users: an identity provider that is misconfigured or taken over must not be \
-         able to mint a superuser over this database. Grant read/write/watch/search/webhook \
+         able to mint a superuser over this database. Grant read/write/watch/search/webhook/ddl \
          instead, and keep administration on a local account."
     )]
     AdminNotFederatable { claim_value: String },

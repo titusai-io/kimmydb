@@ -136,8 +136,11 @@ Rules worth internalizing:
   stored role resolving to it has the action dropped unless
   `allow_federated_admin = true` — a boundary that stays TOML-only so an
   operator reviews it in a diff (ADR-067, ADR-074). Administration stays with a
-  local break-glass account: collection creation, index management, and user
-  management are `admin` actions.
+  local break-glass account: user and role management, backup and the system
+  database are `admin`. Collection creation, index management and embedding
+  configuration are `ddl`, which maps freely — an agent behind an IdP can
+  create the collection it writes to without anyone handing it the server
+  (ADR-090).
 - **Grants union.** A principal's grants are the union of every matching
   mapping plus direct grants; more than one mapping may contribute.
 - **Wildcards mean wildcards.** `{"db":"*"}` matches every database — except

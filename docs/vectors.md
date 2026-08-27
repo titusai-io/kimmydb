@@ -339,8 +339,15 @@ above:
 
 - **Scores are recomputed** from the current stored vector, never taken from the
   graph's distances. An updated document scores by its new vector.
-- **Missing records are skipped.** A deleted document cannot surface, even
-  though its node is still in the graph.
+- **Missing records are skipped.** A chunk whose record is gone is dropped from
+  the candidates, even though its node is still in the graph.
+- **A deleted document cannot surface.** The chunks themselves outlive the
+  document: a delete commits, and the embedding worker removes the chunks when
+  it reaches that entry in the stream — later, or much later if the worker is
+  behind. So every hit is checked against the source collection after ranking,
+  and one whose document no longer exists is dropped. A result can therefore be
+  shorter than `k` by the number of deletions the worker has not caught up with
+  ([ADR-091](decisions.md)).
 
 So the only effect of staleness is that a document written in the last 30
 seconds may not be found yet. That is **bounded recall loss on new data, never

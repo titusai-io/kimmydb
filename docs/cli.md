@@ -255,7 +255,8 @@ rm -f "${XDG_CACHE_HOME:-$HOME/.cache}/kimmy/tokens.json"
 
 Local accounts still work on a federated node, and `kimmy login <user>` is how
 you reach the break-glass administrator: `admin` cannot be granted through an
-IdP claim ([ADR-067](decisions.md)).
+IdP claim ([ADR-067](decisions.md)). Creating collections and indexes is `ddl`,
+which can ([ADR-090](decisions.md)).
 
 ### A settings file: `~/.config/kimmydb/.kimmy`
 

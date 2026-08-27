@@ -2178,7 +2178,140 @@ async fn indexes_can_be_listed_and_dropped() {
 }
 
 #[tokio::test]
-async fn managing_indexes_requires_admin() {
+async fn listing_collections_of_a_missing_database_is_a_404() {
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&root), json!({ "name": "c" })).await;
+
+    assert_eq!(server.get("/v1/db/shop/collections", Some(&root)).await.status, 200);
+    let missing = server.get("/v1/db/shopp/collections", Some(&root)).await;
+    assert_eq!(missing.status, 404, "{:?}", missing.body);
+
+    // Exists, but nothing in it is visible to this caller: still a list, and
+    // still empty — zero grants is not a refusal (ADR-066).
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({
+                "user": "elsewhere", "password": "elsewhere-password",
+                "grants": [{ "db": "other", "collection": "*", "actions": ["read"] }]
+            }),
+        )
+        .await;
+    let elsewhere = server.login("elsewhere", "elsewhere-password").await;
+    let hidden = server.get("/v1/db/shop/collections", Some(&elsewhere)).await;
+    assert_eq!(hidden.status, 200, "{:?}", hidden.body);
+    assert_eq!(hidden.body["collections"], json!([]));
+}
+
+#[tokio::test]
+async fn filtered_writes_report_a_stamp_only_when_one_document_was_written() {
+    // ADR-084 refuses `if_stamp` with `multi` because one version cannot name
+    // several documents; the response is honest in the same way.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&root), json!({ "name": "c" })).await;
+    let bulk = server
+        .post(
+            "/v1/db/shop/coll/c/bulk",
+            Some(&root),
+            json!([{ "_id": 1, "n": 1 }, { "_id": 2, "n": 2 }]),
+        )
+        .await;
+    assert_eq!(bulk.status, 200, "{:?}", bulk.body);
+    let stamps = bulk.body["stamps"].as_array().expect("stamps").clone();
+    assert_eq!(stamps.len(), 2);
+
+    let one = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&root),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "n": 10 } } }),
+        )
+        .await;
+    assert_eq!(one.status, 200, "{:?}", one.body);
+    let stamp = one.body["stamp"].as_str().expect("a single update reports its stamp");
+
+    // And the stamp is the one a conditional write wants.
+    let conditional = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&root),
+            json!({ "filter": { "_id": 1 }, "update": { "$set": { "n": 11 } }, "if_stamp": stamp }),
+        )
+        .await;
+    assert_eq!(conditional.status, 200, "{:?}", conditional.body);
+    assert_ne!(conditional.body["stamp"], one.body["stamp"]);
+
+    let many = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&root),
+            json!({ "filter": {}, "update": { "$set": { "seen": true } }, "multi": true }),
+        )
+        .await;
+    assert_eq!(many.status, 200, "{:?}", many.body);
+    assert!(
+        many.body.get("stamp").is_none(),
+        "a multi write has no single version: {:?}",
+        many.body
+    );
+
+    let gone = server
+        .post("/v1/db/shop/coll/c/delete", Some(&root), json!({ "filter": { "_id": 2 } }))
+        .await;
+    assert_eq!(gone.status, 200, "{:?}", gone.body);
+    assert!(gone.body["stamp"].is_string(), "{:?}", gone.body);
+}
+
+#[tokio::test]
+async fn ddl_shapes_collections_without_administering_the_server() {
+    // ADR-090: `ddl` is the part of `admin` that is about the data — create
+    // and drop collections, manage indexes — and none of the part that is
+    // about the server. A principal holding exactly `ddl` can do the former
+    // and nothing else: it cannot write into what it created, cannot manage
+    // users, and cannot reach the system database.
+    let server = Server::start().await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/users",
+            Some(&root),
+            json!({
+                "user": "shaper", "password": "shaper-password",
+                "grants": [{ "db": "shop", "collection": "*", "actions": ["ddl"] }]
+            }),
+        )
+        .await;
+    let shaper = server.login("shaper", "shaper-password").await;
+
+    let created =
+        server.post("/v1/db/shop/collections", Some(&shaper), json!({ "name": "c" })).await;
+    assert_eq!(created.status, 200, "ddl creates collections: {:?}", created.body);
+    let indexed = server
+        .post("/v1/db/shop/coll/c/indexes", Some(&shaper), json!({ "fields": [{ "path": "a" }] }))
+        .await;
+    assert_eq!(indexed.status, 200, "ddl creates indexes: {:?}", indexed.body);
+    assert_eq!(server.delete("/v1/db/shop/coll/c/indexes/a_1", Some(&shaper)).await.status, 200);
+    assert_eq!(server.delete("/v1/db/shop/coll/c", Some(&shaper)).await.status, 200);
+
+    // Not a bundle: shaping a collection says nothing about its contents.
+    server.post("/v1/db/shop/collections", Some(&shaper), json!({ "name": "c" })).await;
+    let inserted = server.post("/v1/db/shop/coll/c/docs", Some(&shaper), json!({ "x": 1 })).await;
+    assert_eq!(inserted.status, 403, "ddl must not imply write: {:?}", inserted.body);
+    assert_eq!(server.get("/v1/db/shop/coll/c/docs", Some(&shaper)).await.status, 403);
+
+    // And not `admin`: the server, and the database that holds its users, stay
+    // closed.
+    assert_eq!(server.get("/v1/users", Some(&shaper)).await.status, 403);
+    let elsewhere =
+        server.post("/v1/db/other/collections", Some(&shaper), json!({ "name": "c" })).await;
+    assert_eq!(elsewhere.status, 403, "the grant is scoped to its database");
+}
+
+#[tokio::test]
+async fn managing_indexes_requires_ddl() {
     let server = Server::start().await;
     let root = server.root().await;
     server.post("/v1/db/shop/collections", Some(&root), json!({ "name": "c" })).await;
@@ -2246,6 +2379,68 @@ async fn searching_a_collection_with_no_vectors_says_so() {
     assert_eq!(res.body["error"], "no_vectors");
     let message = res.body["message"].as_str().unwrap_or_default();
     assert!(message.contains("/vectors"), "the message must say how to fix it: {message}");
+}
+
+#[tokio::test]
+async fn a_deleted_document_does_not_surface_from_search() {
+    // The shadow collection is cleaned up by the embedding worker *after* the
+    // delete commits, from the oplog. Between the two — and for as long as it
+    // takes, if the worker is behind or disabled, as it is in this harness —
+    // the chunks are still there to be scored. ADR-022 promised that a deleted
+    // document cannot surface; this is the check that keeps it (ADR-091).
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    for (id, vector) in [("a", [1.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0])] {
+        server
+            .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": id }))
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": id }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+
+    let deleted = server.delete("/v1/db/shop/coll/docs/docs/a", Some(&token)).await;
+    assert_eq!(deleted.status, 200, "{:?}", deleted.body);
+
+    // The nearest vector to the query is the deleted document's.
+    let found = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2 }),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{:?}", found.body);
+    let ids: Vec<&str> = found.body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b"], "the deleted document must not surface: {:?}", found.body);
+    assert_eq!(found.body["count"], 1, "and the count agrees with the list");
+
+    // Hybrid ranks by keyword too, and "a" is the keyword.
+    let hybrid = server
+        .post(
+            "/v1/db/shop/coll/docs/hybrid_search",
+            Some(&token),
+            json!({ "query": "a", "vector": [1.0, 0.0, 0.0], "k": 2 }),
+        )
+        .await;
+    assert_eq!(hybrid.status, 200, "{:?}", hybrid.body);
+    let ids: Vec<&str> = hybrid.body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["b"], "nor from hybrid search: {:?}", hybrid.body);
 }
 
 #[tokio::test]
@@ -4396,6 +4591,47 @@ async fn allow_federated_admin_is_what_changes_that_answer() {
         200,
         "with the flag on, a role may carry admin to a federated principal"
     );
+}
+
+#[tokio::test]
+async fn a_federated_principal_keeps_ddl_from_a_role_while_admin_is_stripped() {
+    // The reason `ddl` exists (ADR-090): an agent authenticating through an
+    // identity provider must be able to create the collection it will write
+    // to, and before the split the only action that allowed it was the one
+    // ADR-067 refuses to federate. The same role carries both; only `admin`
+    // is dropped.
+    let server = Server::start_federated_with_role("builder", false).await;
+    let root = server.root().await;
+    server
+        .post(
+            "/v1/roles",
+            Some(&root),
+            json!({
+                "name": "builder",
+                "grants": [{"db":"*","collection":"*","actions":["ddl","write","admin"]}],
+            }),
+        )
+        .await;
+
+    let federated = oidc::token(oidc::claims("agent@example.com", json!(["kimmydb-analyst"])));
+    let created = server
+        .post("/v1/db/app/collections", Some(&federated), json!({ "name": "memories" }))
+        .await;
+    assert_eq!(created.status, 200, "ddl federates: {:?}", created.body);
+    let inserted = server
+        .post("/v1/db/app/coll/memories/docs", Some(&federated), json!({ "text": "hello" }))
+        .await;
+    assert_eq!(inserted.status, 200, "{:?}", inserted.body);
+
+    assert_eq!(
+        server.get("/v1/users", Some(&federated)).await.status,
+        403,
+        "`admin` is still stripped from the same role"
+    );
+    let system = server
+        .post("/v1/db/__kimmy/collections", Some(&federated), json!({ "name": "__users" }))
+        .await;
+    assert_eq!(system.status, 403, "ddl over `*` must not reach the system database");
 }
 
 #[tokio::test]

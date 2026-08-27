@@ -220,8 +220,11 @@ token comes from, not a bearer-protected resource.
 ### `admin` is not federatable
 
 **A role mapping that grants the `admin` action stops the node at startup.**
-Administration — creating and dropping collections, managing indexes, managing
-users, taking a backup — is reachable only through a local account.
+Administration — managing users and roles, taking a backup, reaching the system
+database — is reachable only through a local account. Shaping the data is not
+administration: creating and dropping collections, managing indexes and
+configuring embeddings are the `ddl` action, which maps freely
+([ADR-090](decisions.md)).
 
 This is a break-glass boundary. Federation makes an external system a dependency
 of authentication; a compromised provider that can mint a reader is bad, and one
@@ -229,7 +232,8 @@ that can mint a superuser over the database is unrecoverable from inside it.
 Keeping `admin` local means the answer to "the IdP has been taken over" is still
 "log in as root and turn federation off" ([ADR-067](decisions.md)).
 
-Every other action — `read`, `write`, `watch`, `search`, `webhook` — maps freely.
+Every other action — `read`, `write`, `watch`, `search`, `webhook`, `ddl` —
+maps freely.
 
 **`auth.oidc.allow_federated_admin` is what changes this**, and it defaults to
 `false`, which is exactly the behaviour above. It exists because the absolute
@@ -523,7 +527,8 @@ A grant is a set of actions over a set of collections:
 | `watch` | Open a change stream |
 | `search` | Vector and hybrid search. Implied by `read` but grantable alone, so an agent can search without reading raw documents |
 | `webhook` | Register an endpoint the node pushes change events to |
-| `admin` | Create/drop collections, manage users |
+| `ddl` | Create/drop collections, create/drop indexes, configure or disable embeddings. Says nothing about the contents: a role that shapes a collection and fills it names `ddl` and `write` both. Federates ([ADR-090](decisions.md)) |
+| `admin` | Everything, including users, roles, backup and the system database. Does not federate by default |
 
 ### Named roles
 
@@ -600,6 +605,7 @@ graph BT
     A --> WA["watch"]
     A --> R["read"]
     A --> S["search"]
+    A --> D["ddl"]
     W --> R
     R --> S
 
@@ -619,6 +625,11 @@ graph BT
   grant never named long after that token expires. Handing out an egress path is
   a different act from being allowed to read, so it is granted separately. Only
   `admin` implies it.
+- **`ddl` is independent, and implies no data access.** Creating a collection
+  says nothing about reading or writing what goes into it, and `write` does not
+  let a principal create the collection it writes to. Only `admin` implies it —
+  and `ddl` never reaches the system database, which stays behind `admin`
+  alone ([ADR-090](decisions.md)).
 
 ### Patterns
 

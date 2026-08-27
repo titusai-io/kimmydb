@@ -48,7 +48,10 @@ impl KimmyMcp {
                  meaning-based retrieval, and `hybrid_search` when the query has both \
                  (a specific term plus a general intent).\n\n\
                  Tools you are not authorized for still appear in this list; calling one \
-                 returns an authorization error rather than being hidden.",
+                 returns an authorization error rather than being hidden. Reading needs \
+                 the `read` action, writing `write`, searching `search`, and creating a \
+                 collection or an index `ddl` — if `create_collection` is refused, ask an \
+                 operator for `ddl` rather than retrying.",
             )
     }
 }
@@ -384,7 +387,10 @@ impl KimmyMcp {
                        must appear — a product code, a name, an error string — as well \
                        as a general intent; pure vector search can rank an exact term \
                        below a paraphrase. Requires `query` text, since the keyword \
-                       half needs words.")]
+                       half needs words. Scores are rank-fusion values (small numbers, \
+                       around 0.03), not similarities: they order the results and are \
+                       not comparable with vector_search scores, so do not threshold \
+                       them.")]
     async fn hybrid_search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
@@ -477,7 +483,8 @@ impl KimmyMcp {
     /// Create a collection.
     #[tool(description = "Create a collection, and its database if that does not exist \
                        yet. Call this before inserting: writing to a collection that \
-                       does not exist fails rather than creating it.")]
+                       does not exist fails rather than creating it. Needs the `ddl` \
+                       action on the collection's name; `write` alone is not enough.")]
     async fn create_collection(
         &self,
         Parameters(args): Parameters<CreateCollectionArgs>,
@@ -491,7 +498,8 @@ impl KimmyMcp {
     #[tool(description = "Create a secondary index. Building one blocks until existing \
                        documents are indexed, so it is not free on a large collection. \
                        Check `find` with explain first: a query that already reports \
-                       strategy \"index\" does not need another one.")]
+                       strategy \"index\" does not need another one. Needs the `ddl` \
+                       action on the collection.")]
     async fn create_index(
         &self,
         Parameters(args): Parameters<CreateIndexArgs>,

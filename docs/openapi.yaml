@@ -1015,7 +1015,10 @@ paths:
       tags: [collections]
       operationId: listCollections
       summary: List collections in a database.
-      description: Filtered by grant, and excluding system and shadow collections.
+      description: |
+        Filtered by grant. A database that exists but in which the caller can
+        read nothing lists as `[]`; a database that does not exist is a 404,
+        so a mistyped name is not mistaken for an empty one.
       x-kimmy-action: read (filtered)
       responses:
         "200":
@@ -1030,11 +1033,12 @@ paths:
                     type: array
                     items: { type: string }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
     post:
       tags: [collections]
       operationId: createCollection
       summary: Create a collection.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       requestBody:
         required: true
         content:
@@ -1086,7 +1090,7 @@ paths:
       tags: [collections]
       operationId: dropCollection
       summary: Drop a collection and everything in it.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       responses:
         "200":
           description: Dropped, or there was nothing to drop.
@@ -1235,13 +1239,20 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [inserted, insertedIds]
+                required: [inserted, insertedIds, stamps]
                 properties:
                   inserted:
                     type: integer
                   insertedIds:
                     type: array
                     items: {}
+                  stamps:
+                    type: array
+                    items: { $ref: "#/components/schemas/Stamp" }
+                    description: |
+                      The version each document landed at, positionally
+                      parallel to `insertedIds` — what `insert` reports as
+                      `stamp`, once per document.
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
         "401": { $ref: "#/components/responses/Unauthorized" }
@@ -1430,6 +1441,13 @@ paths:
                       Write transactions the request cost — one per chunk of
                       `storage.multi_chunk_docs` documents, zero when nothing
                       matched (ADR-086).
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: |
+                      The version the write produced. Present only when the
+                      request wrote exactly one document without `multi` — a
+                      version names one document, and a multi write has no
+                      single one to name (ADR-084).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1564,6 +1582,11 @@ paths:
                   commits:
                     type: integer
                     description: Write transactions the request cost — one per chunk (ADR-086).
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: |
+                      The tombstone's version. Present only when the request
+                      deleted exactly one document without `multi` (ADR-084).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1790,7 +1813,7 @@ paths:
         provably fall inside the index" is a decision rather than a guess.
         Anything outside that language is refused here rather than producing an
         index that silently answers with a subset.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       requestBody:
         required: true
         content:
@@ -1858,7 +1881,7 @@ paths:
       tags: [indexes]
       operationId: dropIndex
       summary: Drop an index.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       responses:
         "200":
           description: Dropped, or there was nothing to drop.
@@ -1911,7 +1934,7 @@ paths:
 
         Embedding is off the write path: a write returns as soon as its oplog
         entry is durable, and vectors follow.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       requestBody:
         required: true
         content:
@@ -1941,7 +1964,7 @@ paths:
       tags: [vectors]
       operationId: disableVectors
       summary: Stop embedding a collection.
-      x-kimmy-action: admin
+      x-kimmy-action: ddl
       parameters:
         - name: drop_vectors
           in: query
@@ -2682,12 +2705,15 @@ components:
           type: array
           items:
             type: string
-            enum: [read, write, watch, search, webhook, admin]
+            enum: [read, write, watch, search, webhook, ddl, admin]
             description: |
               `admin` implies everything and `write` implies `read`, so those
-              do not need listing separately. `watch`, `search` and `webhook`
-              are independent: a webhook hands out an ongoing egress path,
-              which is a different act from being allowed to read.
+              do not need listing separately. `watch`, `search`, `webhook` and
+              `ddl` are independent: a webhook hands out an ongoing egress
+              path, which is a different act from being allowed to read, and
+              `ddl` shapes a collection — create, drop, index, configure
+              embeddings — without granting access to what is in it. `ddl`
+              federates; `admin` does not (ADR-090).
 
     Node:
       type: object

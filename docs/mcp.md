@@ -170,7 +170,7 @@ will need to re-authenticate rather than assuming a connection stays good.
 | Tool | |
 |---|---|
 | `vector_search` | Semantic k-NN, optionally composed with a filter |
-| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion |
+| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion. Scores are fusion ranks (around 0.03), not similarities, and not comparable with `vector_search` scores |
 
 Both require the collection to have embeddings configured — see
 [Vectors](vectors.md).
@@ -183,8 +183,15 @@ Both require the collection to have embeddings configured — see
 | `insert_many` | Up to 1000 documents in one commit, all or nothing |
 | `update` | Update operators against a filter |
 | `delete` | Delete against a filter |
-| `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it |
-| `create_index` | Secondary index |
+| `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it. Needs `ddl` |
+| `create_index` | Secondary index. Needs `ddl` |
+
+`ddl` is its own action, and it federates ([ADR-090](decisions.md)): an agent
+authenticating through an identity provider can be given the right to create
+the collection it writes to without being given the server. Before 0.14.0 both
+tools needed `admin`, which a federated principal cannot hold, so an agent
+following the instructions above was refused at its first write to anything
+new.
 
 `aggregate` is the one an agent should reach for when it wants a *number*
 rather than rows. Left to `find`, a model pulls documents into its context and
@@ -293,7 +300,10 @@ they are the only documentation a model gets:
 > of an empty result.
 >
 > Tools you are not authorized for still appear in this list; calling one
-> returns an authorization error rather than being hidden.
+> returns an authorization error rather than being hidden. Reading needs the
+> `read` action, writing `write`, searching `search`, and creating a collection
+> or an index `ddl` — if `create_collection` is refused, ask an operator for
+> `ddl` rather than retrying.
 
 The second paragraph matters as much as the first. Without it a model reads an
 authorization error as a malfunction and retries; with it, the refusal is a fact

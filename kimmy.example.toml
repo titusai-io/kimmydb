@@ -314,8 +314,11 @@ token_ttl_secs = 3600
 # `admin` is NOT mappable by default and a mapping that names it stops the node
 # at startup. Administration is reserved to local accounts as a break-glass
 # boundary: if this provider is misconfigured or taken over, nobody gets
-# superuser over the database through it (ADR-067). read, write, watch, search
-# and webhook all map freely. See allow_federated_admin below.
+# superuser over the database through it (ADR-067). read, write, watch, search,
+# webhook and ddl all map freely — ddl (create/drop collections, indexes,
+# embedding configuration) is the part of administration that is about the
+# data rather than the server, and was split out so an agent behind an IdP can
+# create the collection it writes to (ADR-090). See allow_federated_admin below.
 # [[auth.oidc.role_mappings]]
 # claim_value = "kimmydb-analyst"
 # grants = [{ db = "sales", collection = "orders*", actions = ["read", "search"] }]

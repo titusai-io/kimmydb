@@ -531,20 +531,27 @@ impl EmbeddingWorker {
         if kimmy_core::vector_meta::is_shadow(&collection.name) {
             return Ok(Outcome::Skipped);
         }
-        // `byo` means the client supplies vectors, so there is nothing to do.
-        if !config.provider.embeds_server_side() {
-            return Ok(Outcome::Skipped);
-        }
 
         let shadow = self.engine.get_collection(
             &collection.db,
             &kimmy_core::vector_meta::shadow_name(&collection.name),
         )?;
 
+        // Before the provider check, deliberately: a `byo` collection's
+        // vectors are the client's to supply, but not the client's to clean
+        // up after — the client sees a document, not the chunks behind it.
+        // Until 0.14.0 this branch sat below the bail and a deleted `byo`
+        // document's vectors stayed searchable until someone called the
+        // explicit vectors DELETE route by hand.
         if entry.kind == OpKind::Delete {
             let removed = self.engine.delete_vectors(&shadow, &source)?;
             debug!(chunks = removed, "removed vectors for a deleted document");
             return Ok(Outcome::Removed);
+        }
+
+        // `byo` means the client supplies vectors, so there is nothing to embed.
+        if !config.provider.embeds_server_side() {
+            return Ok(Outcome::Skipped);
         }
 
         let Some(document) = entry.document()? else {
@@ -587,6 +594,26 @@ impl EmbeddingWorker {
         let vectors = provider.embed(&chunks).await.inspect_err(|_| {
             self.counters.failures.fetch_add(1, Ordering::Relaxed);
         })?;
+
+        // The provider call is the long part, and the document can move while
+        // it runs. Embedding from the entry's own image is what makes this
+        // path cheap, but writing that image's vectors after the document has
+        // been deleted would leave chunks with no source — and the `Delete`
+        // entry that would have removed them has already gone by. A newer
+        // version is the same case with a different ending: its own entry is
+        // behind this one and will do the work, so this write would only be
+        // overwritten. Either way, nothing to store.
+        match self.engine.document_stamp(&collection, &source)? {
+            Some(current) if current.hlc == entry.stamp.hlc => {}
+            Some(_) => {
+                debug!("document moved while it was being embedded; its own entry follows");
+                return Ok(Outcome::Skipped);
+            }
+            None => {
+                debug!("document was deleted while it was being embedded");
+                return Ok(Outcome::Skipped);
+            }
+        }
 
         let records: Vec<VectorRecord> = chunks
             .into_iter()
@@ -1161,6 +1188,77 @@ mod tests {
 
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_byo_document_removes_its_vectors_too() {
+        // The client supplies a `byo` collection's vectors, but it deletes
+        // documents, not chunks — so the cleanup is still the worker's. Until
+        // 0.14.0 the byo bail sat above the delete branch and these chunks
+        // stayed searchable for ever.
+        let (engine, _coll, mut worker, _dir) = setup().await;
+        let byo = VectorConfig { provider: ProviderConfig::Byo, ..config(&["title"]) };
+        engine.configure_vectors("app", "docs", byo).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+
+        let id = engine.insert(&coll, doc! { "_id": 1i64, "title": "text" }).unwrap();
+        let stamp = engine.document_stamp(&coll, &id).unwrap().unwrap();
+        engine
+            .put_vectors(
+                &shadow,
+                &id,
+                &[VectorRecord {
+                    source: id.clone(),
+                    chunk: 0,
+                    source_hlc: stamp.hlc,
+                    vector: vec![1.0, 0.0, 0.0, 0.0],
+                    text: "text".into(),
+                }],
+            )
+            .unwrap();
+        assert_eq!(engine.get_vectors(&shadow, &id).unwrap().len(), 1);
+
+        engine.delete(&coll, &id).unwrap();
+        assert_eq!(worker.process(&last_entry(&engine)).await.unwrap(), Outcome::Removed);
+        assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_embed_that_finishes_after_the_delete_writes_nothing() {
+        // The streaming path embeds from the entry's image while the document
+        // is free to move. If the provider call outlasts a delete, the chunks
+        // would land after the `Delete` entry that should have removed them,
+        // with nothing left to remove them ever.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let id = engine.insert(&coll, doc! { "_id": 1i64, "title": "text" }).unwrap();
+        let insert_entry = last_entry(&engine);
+
+        // The delete happens "during" the embed: before the worker gets to
+        // the insert entry at all, which is the same thing from the write's
+        // point of view.
+        engine.delete(&coll, &id).unwrap();
+        assert_eq!(worker.process(&insert_entry).await.unwrap(), Outcome::Skipped);
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_embed_of_a_superseded_version_writes_nothing() {
+        // Same shape as a delete, different ending: the newer version has its
+        // own entry behind this one, and that entry does the work.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let id = engine.insert(&coll, doc! { "_id": 1i64, "title": "before" }).unwrap();
+        let insert_entry = last_entry(&engine);
+        engine.replace(&coll, &id, doc! { "title": "after" }, false).unwrap();
+
+        assert_eq!(worker.process(&insert_entry).await.unwrap(), Outcome::Skipped);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty(), "nothing stale landed");
+
+        worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(engine.get_vectors(&shadow, &id).unwrap()[0].text, "after");
     }
 
     #[tokio::test]

@@ -25,7 +25,7 @@ pub async fn configure_vectors(
     Path((db, coll)): Path<(String, String)>,
     JsonBody(body): JsonBody<VectorConfig>,
 ) -> Result<Json<Value>, ApiError> {
-    auth.require(Action::Admin, &db, Some(&coll))?;
+    auth.require(Action::Ddl, &db, Some(&coll))?;
     let meta = state.engine.configure_vectors(&db, &coll, body)?;
     // A changed dimension or metric makes any cached graph meaningless.
     invalidate_index(&state, &db, &coll);
@@ -59,7 +59,7 @@ pub async fn disable_vectors(
     Path((db, coll)): Path<(String, String)>,
     axum::extract::Query(q): axum::extract::Query<DisableQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    auth.require(Action::Admin, &db, Some(&coll))?;
+    auth.require(Action::Ddl, &db, Some(&coll))?;
     // Resolved *before* the call: dropping the vectors also drops the shadow
     // collection, and afterwards there is no id left to forget the graph under.
     let shadow = state.engine.vector_collection(&db, &coll).ok().flatten().map(|s| s.id);
@@ -282,12 +282,12 @@ pub async fn run_vector_search(
     coll: &str,
     body: &SearchRequest,
 ) -> Result<Value, ApiError> {
-    let (shadow, config, options) = prepare(state, auth, db, coll, body)?;
+    let (source, shadow, config, options) = prepare(state, auth, db, coll, body)?;
     let query = resolve_query_vector(&config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
     let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
-    Ok(render(&hits))
+    Ok(render(&only_live(state, &source, hits)?))
 }
 
 /// k-NN by whichever path the index cache selects.
@@ -326,7 +326,7 @@ pub async fn run_hybrid_search(
     coll: &str,
     body: &SearchRequest,
 ) -> Result<Value, ApiError> {
-    let (shadow, config, options) = prepare(state, auth, db, coll, body)?;
+    let (source, shadow, config, options) = prepare(state, auth, db, coll, body)?;
 
     // Hybrid needs the *text* for the lexical half; a bare vector cannot
     // produce one, so the ambiguity is refused rather than silently degrading
@@ -350,7 +350,7 @@ pub async fn run_hybrid_search(
         search::keyword_search(&state.engine, &shadow, &text, &wide).map_err(vector_error)?;
 
     let fused = search::reciprocal_rank_fusion(&[dense, lexical], options.k);
-    Ok(render(&fused))
+    Ok(render(&only_live(state, &source, fused)?))
 }
 
 /// Shared setup: authorize, resolve the shadow collection, read the options.
@@ -360,7 +360,10 @@ fn prepare(
     db: &str,
     coll: &str,
     body: &SearchRequest,
-) -> Result<(kimmy_storage::CollectionMeta, VectorConfig, SearchOptions), ApiError> {
+) -> Result<
+    (kimmy_storage::CollectionMeta, kimmy_storage::CollectionMeta, VectorConfig, SearchOptions),
+    ApiError,
+> {
     // `search` is its own action; it is implied by `read` but can be granted
     // alone. See docs/security.md.
     auth.require(Action::Search, db, Some(coll))?;
@@ -395,7 +398,35 @@ fn prepare(
         metric: config.metric,
         per_document: body.per_document.unwrap_or(1).max(1),
     };
-    Ok((shadow, config, options))
+    Ok((meta, shadow, config, options))
+}
+
+/// Keep only the hits whose source document still exists.
+///
+/// The shadow collection is maintained *after* the write that changes it: a
+/// delete commits, and the embedding worker removes the chunks when it reaches
+/// that entry in the stream. Between the two, the chunks are still there to be
+/// scored — and ADR-022's promise that "a deleted document cannot surface" was
+/// only ever kept for a missing chunk record, not a missing document. The
+/// search paths score from the shadow alone, so the check belongs here, once,
+/// on whatever they ranked: one point read per hit, after ranking, against the
+/// collection the caller actually asked about.
+///
+/// A hit lost here is not replaced, so a result can be shorter than `k` by the
+/// number of deletions the worker has not caught up with. That is the honest
+/// answer; padding it would mean ranking again.
+fn only_live(
+    state: &SharedState,
+    source: &kimmy_storage::CollectionMeta,
+    hits: Vec<Hit>,
+) -> Result<Vec<Hit>, ApiError> {
+    let mut live = Vec::with_capacity(hits.len());
+    for hit in hits {
+        if state.engine.document_stamp(source, &hit.id)?.is_some() {
+            live.push(hit);
+        }
+    }
+    Ok(live)
 }
 
 /// Turn the request into a query vector.
