@@ -10,6 +10,16 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **`openapi.yaml` says what a persistent `unknown` node status means.**
+  `unknown` was described accurately but without the fact a failover-writing
+  client needs: it is not `down`, and for a decommissioned node it is
+  permanent until an operator deletes the registry document. Documentation
+  only; no behaviour changed.
+
 ## 0.13.0 - 2026-08-27
 
 ### Removed

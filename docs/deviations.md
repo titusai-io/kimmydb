@@ -1247,6 +1247,13 @@ task: the registry is an ordinary collection, so removing a decommissioned node
 is deleting its document. An explicit route belongs with whatever operational
 tooling comes after M10, not inside the client protocol.
 
+**Documents that have to say this, kept in step (2026-08-27):** this entry,
+ADR-060's "what is not solved", and `openapi.yaml`'s `Node.status` — which
+until 2026-08-27 described `unknown` accurately but said nothing about it
+being permanent for a decommissioned node, the one fact a client writing
+failover logic needs. The sweep that found the `modified` drift flagged it;
+it now says so.
+
 ---
 
 ## 🟢 Cursors are a protocol promise, and the promise is tested (M10 task 6)
