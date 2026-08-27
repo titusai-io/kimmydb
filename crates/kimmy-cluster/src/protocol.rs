@@ -40,14 +40,20 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// A length prefix read from the network is attacker-controlled, so trusting it
 /// enough to allocate is how a single malformed frame becomes an out-of-memory
-/// kill. 64 MiB is far above a full oplog batch and far below anything that
-/// threatens a node.
+/// kill. 64 MiB is far below anything that threatens a node.
+///
+/// It is **not** above every full oplog batch, which this comment used to claim.
+/// [`MAX_BATCH`] bounds a response by entry count and this bounds it by bytes, so
+/// entries averaging over 64 KiB — a collection carrying 1024-dimension vectors
+/// reaches that easily — make a full batch exceed the frame. See
+/// [`Message::BatchTooLarge`] for what happens then.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// Entries a peer will send in one response.
 ///
 /// Bounded so a node that is far behind catches up over several rounds rather
-/// than in one frame it may not have the memory to hold.
+/// than in one frame it may not have the memory to hold. A *count*, so it does
+/// not on its own keep a batch inside [`MAX_FRAME`] — see [`Message::BatchTooLarge`].
 pub const MAX_BATCH: usize = 1024;
 
 /// What one side says to the other.
@@ -71,6 +77,23 @@ pub enum Message {
     AskEntries { from: Hlc, limit: usize },
     /// The answer, in stamp order.
     Entries(Vec<OplogEntry>),
+    /// "That many entries will not fit in a frame; ask for this many."
+    ///
+    /// [`MAX_BATCH`] bounds a response by entry count and [`MAX_FRAME`] bounds it
+    /// by bytes, so entries averaging over 64 KiB — a collection carrying
+    /// 1024-dimension vectors reaches that easily — make a full batch too large to
+    /// send. Answering with the count that *does* fit lets the requester retry once
+    /// rather than probing.
+    ///
+    /// **The sender must not simply serve fewer entries.** A batch shorter than the
+    /// limit means "this is my whole tail": `sync_once` passes the limit it used to
+    /// `apply_peer_batch`, which reads it that way. Quietly truncating would tell
+    /// the receiver it had caught up while entries it has never seen remain — the
+    /// silent gap ADR-082 and `BeyondHorizon` both exist to prevent.
+    ///
+    /// `fits` is zero when one entry alone exceeds the frame, which no limit can
+    /// carry; the requester reports that rather than probing forever.
+    BatchTooLarge { fits: usize },
     /// "I have collected the history you asked for; ask for a snapshot."
     ///
     /// Sent instead of `Entries` when the requester is below the sender's
