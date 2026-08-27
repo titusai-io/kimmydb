@@ -66,6 +66,48 @@ async fn two_nodes_converge_over_the_network() {
     }
 }
 
+/// A batch of large entries must not exceed the frame limit and wedge the cluster.
+///
+/// `MAX_BATCH` bounds a response by *entry count* while `MAX_FRAME` bounds it by *bytes*,
+/// so entries big enough to average over 64 KiB make a full batch exceed the frame. The
+/// serving side then fails to write it and drops the connection — and because the same
+/// oversized batch is the next thing to send, it does so on every round, for ever. Nothing
+/// converges and nothing recovers.
+///
+/// Seen on a three-node 0.13.0 cluster carrying 1024-dimension vectors:
+/// `frame of 67789268 bytes exceeds the 67108864 byte limit`, every five seconds,
+/// indefinitely.
+#[tokio::test]
+async fn a_batch_of_large_entries_still_replicates() {
+    let a = node().await;
+    let b = node().await;
+
+    // 40 documents of 256 KiB. That is only 10 MiB of documents, but an oplog entry
+    // carries its post-image as `Vec<u8>`, which serde encodes as a BSON *array of
+    // integers* rather than binary — about twelve bytes on the wire per byte stored.
+    // So this is roughly 120 MiB of frame, comfortably past the limit, in far fewer
+    // than the 1024 entries a batch is allowed.
+    let ca = a.engine.create_collection("shop", "big").unwrap();
+    let payload = "x".repeat(256 * 1024);
+    for i in 0..40 {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}"), "blob": &payload }).unwrap();
+    }
+
+    // Several rounds, because a batch this heavy is deliberately not served in one.
+    // The point is that it converges at all, rather than the peer refusing the same
+    // oversized frame for ever. Ten is generous and still bounded, so a regression
+    // fails rather than hangs.
+    for _ in 0..10 {
+        sync_once(&b.engine, a.addr, SECRET).await.expect("b should pull from a");
+    }
+
+    let cb = b.engine.get_collection("shop", "big").expect("the collection should have replicated");
+    let missing: Vec<usize> = (0..40)
+        .filter(|i| b.engine.get(&cb, &DocId::String(format!("d{i}"))).unwrap().is_none())
+        .collect();
+    assert!(missing.is_empty(), "these never replicated: {missing:?}");
+}
+
 #[tokio::test]
 async fn a_collection_whose_id_is_above_i64_max_replicates() {
     // Every other test in this file uses "shop"."orders", whose derived id

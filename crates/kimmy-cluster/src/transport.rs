@@ -31,9 +31,48 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, info, warn};
 
+use kimmy_core::oplog::OplogEntry;
+
 use crate::protocol::{
-    MAX_BATCH, Message, ProtocolError, nonce, proof_is_valid, prove, read_frame, write_frame,
+    MAX_BATCH, MAX_FRAME, Message, ProtocolError, nonce, proof_is_valid, prove, read_frame,
+    write_frame,
 };
+
+/// How much of a frame the entries themselves may occupy.
+///
+/// The rest is the `Entries` envelope and BSON's per-element overhead in an array,
+/// both small; a mebibyte of slack is far more than either needs and costs one
+/// entry's worth of throughput in the rare case this matters at all.
+const ENTRY_BUDGET: usize = MAX_FRAME - (1024 * 1024);
+
+/// Whether a batch fits in one frame, and how much of it does if not.
+enum Fits {
+    All,
+    Only(usize),
+}
+
+/// How many leading entries fit inside [`ENTRY_BUDGET`].
+///
+/// Sizes each entry once and takes a running total, rather than serializing the
+/// whole batch to find out it is too big and then doing it again for a smaller one.
+/// The common case is a single pass that says `All`.
+fn how_many_fit(entries: &[OplogEntry]) -> Fits {
+    let mut total = 0usize;
+    for (i, entry) in entries.iter().enumerate() {
+        let size = match bson::serialize_to_vec(entry) {
+            Ok(bytes) => bytes.len(),
+            // Unencodable here means unencodable in the batch too, so stopping short
+            // hands the caller the prefix that can be sent and lets the real error
+            // surface where it is reported properly.
+            Err(_) => return Fits::Only(i),
+        };
+        if total + size > ENTRY_BUDGET {
+            return Fits::Only(i);
+        }
+        total += size;
+    }
+    Fits::All
+}
 
 /// How long a peer has to complete the handshake.
 ///
@@ -168,7 +207,20 @@ where
                 let entries = engine
                     .entries_for_peer(from, limit)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-                write_frame(&mut stream, &Message::Entries(entries)).await?;
+
+                // Large entries can put a full batch over the frame limit. Failing the
+                // write would drop the connection, and the same oversized batch is the
+                // next thing to send on every round — so replication would never
+                // recover. Answer with the count that fits instead, and let the
+                // requester ask again; see `Message::BatchTooLarge` for why serving
+                // fewer entries unasked would be a silent gap rather than a kindness.
+                match how_many_fit(&entries) {
+                    Fits::All => write_frame(&mut stream, &Message::Entries(entries)).await?,
+                    Fits::Only(fits) => {
+                        warn!(%limit, %fits, "batch does not fit in a frame; asking the peer for fewer");
+                        write_frame(&mut stream, &Message::BatchTooLarge { fits }).await?;
+                    }
+                }
             }
             Message::AskSnapshot { after } => {
                 let page = engine
@@ -296,8 +348,31 @@ pub async fn sync_once(
             });
         };
 
-        write_frame(&mut stream, &Message::AskEntries { from, limit: MAX_BATCH }).await?;
-        let mut outcome = match read_frame(&mut stream).await? {
+        // Ask for a full batch; if the peer says that will not fit, ask again for the
+        // number it named. At most one retry, because the peer answers with a count
+        // rather than a refusal. The limit actually settled on is what
+        // `apply_peer_batch` is told below, so a batch shorter than it still means
+        // "the peer's whole tail" and the coverage rules are untouched.
+        let mut limit = MAX_BATCH;
+        write_frame(&mut stream, &Message::AskEntries { from, limit }).await?;
+        let mut answer = read_frame(&mut stream).await?;
+
+        if let Message::BatchTooLarge { fits } = answer {
+            if fits == 0 {
+                // One entry alone exceeds the frame, so no limit can carry it. Name it
+                // rather than probing: this cannot replicate until the entry is gone.
+                return Err(ProtocolError::Malformed(format!(
+                    "a single oplog entry at or after {from:?} exceeds the {MAX_FRAME} \
+                     byte frame limit and cannot replicate"
+                )));
+            }
+            limit = fits;
+            warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
+            write_frame(&mut stream, &Message::AskEntries { from, limit }).await?;
+            answer = read_frame(&mut stream).await?;
+        }
+
+        let mut outcome = match answer {
             // The batch, and what it proved: a short one is the peer's whole
             // tail, a full one a window ending at its last stamp. Either way
             // the witnessed vector is raised for every origin the peer
@@ -308,7 +383,7 @@ pub async fn sync_once(
             // lives in storage (`coverage_after_batch`), where it is tested
             // between engines without a network.
             Message::Entries(entries) => engine
-                .apply_peer_batch(&theirs, &entries, MAX_BATCH)
+                .apply_peer_batch(&theirs, &entries, limit)
                 .map_err(|e| ProtocolError::Malformed(e.to_string())),
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
