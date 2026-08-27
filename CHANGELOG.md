@@ -10,7 +10,25 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## 0.15.0 - 2026-08-27
+## 0.15.1 - 2026-08-27
+
+The first release of the 0.15 line that actually shipped. `v0.15.0` was
+tagged, but its release build was cancelled before anything was published
+— no GitHub release, no image — so everything listed under 0.15.0 below
+arrives with this version. Operators upgrading from 0.14.0 should read the
+0.15.0 notes: the replication wire format changed, and the upgrade is not a
+rolling one.
+
+### Changed
+
+- **`DocRecord` no longer derives `Serialize`/`Deserialize`.** It was never
+  on the wire or in a response — every use goes through the storage codec,
+  which writes the body as raw bytes — and the derives were a trap: the
+  first code to serialize one would have paid twelve bytes per byte, the
+  defect 0.15.0 removed from `OplogEntry` and `SnapshotDoc`. Removing them
+  makes that a compile error. No behaviour changes.
+
+## 0.15.0 - 2026-08-27 (tagged, never published; see 0.15.1)
 
 ### Changed
 
