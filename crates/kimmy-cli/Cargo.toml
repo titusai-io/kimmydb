@@ -27,7 +27,7 @@ serde.workspace = true
 serde_json.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
-# For `kimmy login --oidc` and `--client-credentials` only. Talking to an
+# For the device flow behind `kimmy login` only. Talking to an
 # identity provider is not a KimmyDB request — it is a different service with a
 # different protocol — so it does not belong behind `kimmy-client`, and putting
 # it there would give every application that links the client crate an OAuth2

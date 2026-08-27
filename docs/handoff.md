@@ -6,6 +6,24 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **the CLI is for people: `client_credentials` removed**
+
+Branch `feat/drop-client-credentials`, ADR-089. `kimmy login
+--client-credentials` and `kimmy token --client-credentials` are gone, with
+`KIMMY_OIDC_CLIENT_SECRET` and the `.kimmy` `client_secret` key. `LoginFlow`
+has two variants and `login_flow(user)` one argument; `apply_kimmy_file`
+returns the password alone. Deleted with the grant, because nothing else
+used them: `client_credentials_login`, `prefers_basic_auth`,
+`form_urlencode`, `CLIENT_CREDENTIALS_SCOPE`, and their tests. The one
+design point: `parse_kimmy_file` names `client_secret` explicitly, warns on
+stderr and skips it — a retired key is not a typo, and the unknown-key error
+stays loud for everything else; `kimmy init` no longer carries the key
+forward. The machine path is `KIMMY_TOKEN` set to a token minted elsewhere
+(for example, a personal access token), and the docs say so with the PAT's
+limits stated. Breaking, so the next release is `0.13.0`.
+
+---
+
 ## As of 2026-08-26 — **durability classes: `durable` and `coalesced`, and no `fast`**
 
 Branch `feat/durability-classes`, ADR-088. `Engine` gains a durability

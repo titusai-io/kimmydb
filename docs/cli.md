@@ -59,8 +59,8 @@ grants any other client is.
 | `kimmy init` | Writes the settings file: asks for the node URL, discovers the rest from the node itself |
 | `kimmy login` | Prints a token from the node's OIDC provider, via the device flow — the default |
 | `kimmy login <user>` | A local account instead. Password from stdin or `KIMMY_PASSWORD` |
-| `kimmy login --client-credentials` | A service account. Secret from `KIMMY_OIDC_CLIENT_SECRET` |
 | `kimmy token` | The token again: prints the cached one while it is fresh, else one fresh flow |
+| `KIMMY_TOKEN=…` | A script or a service: a token minted elsewhere, e.g. a personal access token. The CLI never mints a machine credential (ADR-089) |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
 | `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
 | `kimmy roles list` `show` `create` | Stored roles ([Security](security.md)). Create: repeat `--grant 'db:collection:actions'` |
@@ -178,13 +178,21 @@ always wants. Naming a local account takes the password path instead:
 export KIMMY_OIDC_ISSUER=https://auth.example.com
 export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 
-# A person, in a browser. RFC 8628 device authorization. `--oidc` spells the
-# default out, for scripts and muscle memory written before it was one.
+# A person, in a browser. RFC 8628 device authorization.
 export KIMMY_TOKEN=$(kimmy login)
 
-# A service. The secret comes from KIMMY_OIDC_CLIENT_SECRET and nowhere else.
-export KIMMY_TOKEN=$(kimmy login --client-credentials)
+# A script or a service is not a person and does not log in: it sets the
+# same variable to a token minted elsewhere — for example, a personal
+access
+# token from the console, audienced at the node.
+export KIMMY_TOKEN=<personal access token>
 ```
+
+That is the whole machine path, by design (ADR-089): the CLI runs no
+client-credentials grant. A personal access token is user-scoped and expires
+(90 days by default, 365 at most), so a true service identity for KimmyDB is a
+*service* holding client credentials and calling the token endpoint itself,
+not a CLI flag.
 
 The device flow prints a code and a URL to **stderr**, waits while you approve
 it in a browser, and puts the bare token on **stdout** — so `$(...)` captures
@@ -204,23 +212,7 @@ These talk to the **identity provider**, not to a node — the one place this to
 does not go through `kimmy-client`, because an OAuth2 implementation inside a
 database client library is one every application linking it would inherit.
 
-### Scopes differ between the two flows
-
-Left unset, the device flow asks for `openid profile` and
-`--client-credentials` asks
-for **nothing**. That is not an oversight: there is no end user in the
-client-credentials grant, so `openid` requests an ID token that cannot be
-issued — providers split between ignoring it and refusing the request. A
-service client gets whatever scopes it is registered for. `--scope` overrides
-either flow.
-
-### Client authentication
-
-`--client-credentials` sends the id and secret as **HTTP Basic** when the
-provider advertises `client_secret_basic`, and in the request body only when
-the provider advertises the body and not Basic. RFC 6749 §2.3.1 requires every
-authorization server to support Basic and leaves the body optional, so Basic is
-the one that is always there — and a provider advertising nothing gets it.
+Left unset, the device flow asks for `openid profile`; `--scope` overrides it.
 
 ### Reusing a token between commands
 
@@ -277,8 +269,10 @@ carries existing secret keys into the new file untouched.
 
 The file is written `0600` because it can carry secrets — though init never
 reads one interactively (a typed secret lives in terminal scrollback forever).
-Point `KIMMY_PASSWORD` / `KIMMY_OIDC_CLIENT_SECRET` at login time instead, or
-write them into this file yourself.
+Point `KIMMY_PASSWORD` at login time instead, or write it into this file
+yourself. A `client_secret` line from before 0.13.0 is warned about and ignored
+— the CLI no longer runs the client-credentials grant (ADR-089) — and a re-run
+of `kimmy init` drops it rather than carrying it forward.
 
 Everything you keep retyping can live there, dotenv-style:
 
@@ -289,8 +283,8 @@ issuer = https://auth.example.com
 client_id = kimmy-cli
 ```
 
-Keys: `url`, `token`, `password`, `issuer`, `client_id`, `client_secret`,
-`resource`, `scope`, `cache_token` — the same names as the environment
+Keys: `url`, `token`, `password`, `issuer`, `client_id`, `resource`, `scope`,
+`cache_token` — the same names as the environment
 variables, minus the prefix. `#` comments; values may be quoted.
 
 Precedence per setting: **flag > environment variable > this file**. The file

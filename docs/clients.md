@@ -377,7 +377,7 @@ rather than merely present, and it worked: converting it found a public API that
 forced consumers to depend on `reqwest`, a login that could not fail over, and a
 missing `create-collection` that made a fresh database unusable from the tool.
 
-The one exception is `kimmy login` — including its `--client-credentials` spelling — which talks
+The one exception is `kimmy login`, which talks
 to the **identity provider** rather than to a node. That is a different service
 with a different protocol, and putting it behind `kimmy-client` would give every
 application linking the crate an OAuth2 implementation it did not ask for.
