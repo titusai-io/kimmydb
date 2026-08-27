@@ -38,6 +38,8 @@ fails fast on a bad volume mount.
 | `storage.tombstone_retention_secs` | — | `86400` | **Must exceed your worst tolerable partition.** Governs deleted documents *and* dropped collections |
 | `storage.oplog_retention_secs` | — | `86400` | Bounds resume and peer catch-up |
 | `storage.gc_interval_secs` | — | `600` | How often retention is enforced. `0` disables it |
+| `storage.durability` | — | `durable` | `durable` (every commit fsyncs before it returns) or `coalesced` (a commit waits for the next shared fsync, one per window, so concurrent writers share it). Both are durable when the response returns; there is no class that is not (ADR-088) |
+| `storage.commit_coalesce_ms` | — | `5` | The coalescing window for `coalesced`, 1–1000 ms. Ignored under `durable` |
 | `storage.ttl_interval_secs` | — | `60` | How often TTL indexes are checked for expired documents. Separate from `gc_interval_secs`: that reclaims *garbage*, this deletes *live documents* a policy says are due. `0` leaves any TTL index defined but inert |
 | `cluster.sync_interval_secs` | — | `5` | How often to run an anti-entropy round against each peer |
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
@@ -90,6 +92,7 @@ runtime confusion:
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
 | `tombstone_retention_secs` < `oplog_retention_secs` | The oplog would still offer a delete to peers after its tombstone was collected; a peer replaying it has nothing to lose against and its older image wins. Tombstones must outlive the oplog window (ADR-085) |
+| `durability` not `durable` or `coalesced`; `commit_coalesce_ms` outside 1–1000 | There is deliberately no class under which an acknowledged write can be lost, and a window of zero would never coalesce |
 | `gc_interval_secs` > `oplog_retention_secs` | Records would outlive their window by up to a whole interval, so the retention setting would not mean what it says |
 | An unknown `audit.mode` | A typo would produce a server recording nothing, which looks exactly like a server nobody has attacked |
 | A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |

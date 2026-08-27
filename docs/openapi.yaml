@@ -424,6 +424,16 @@ paths:
                   capabilities:
                     type: array
                     items: { $ref: "#/components/schemas/Capability" }
+                  durability:
+                    type: string
+                    enum: [durable, coalesced]
+                    description: |
+                      How this node makes a commit durable (ADR-088). Both
+                      classes are durable when a write's response returns;
+                      `coalesced` shares one fsync among concurrent writers
+                      at the cost of a few milliseconds of latency. A fact
+                      about configuration rather than build, so a field
+                      rather than a capability.
 
   /v1/auth/refresh:
     post:

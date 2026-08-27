@@ -6,6 +6,29 @@ A running note for picking work back up. Updated at the end of each branch.
 
 ---
 
+## As of 2026-08-26 — **durability classes: `durable` and `coalesced`, and no `fast`**
+
+Branch `feat/durability-classes`, ADR-088. `Engine` gains a durability
+class: `Durable` (unchanged) or `Coalesced`, under which `begin_write` sets
+redb's `Durability::None` on the transaction and `WriteTxn::commit` then
+waits at a leader-elected barrier — the first committer after a flush
+sleeps one `commit_coalesce_ms` window, runs one `Immediate` commit (with a
+marker in `meta` so it is never an empty transaction redb might skip), and
+wakes everyone it covered; arrivals in the window only wait. No thread, no
+`Arc`. Counters `fsyncs` and `grouped_commits` beside `commits`;
+`/metrics` renders them as `kimmy_fsyncs` and `kimmy_commits_grouped_total`
+(the exact-series tripwire updated); `/v1/version` gains `durability`.
+Config `storage.durability` / `storage.commit_coalesce_ms`, validated,
+applied after the engine opens; `kimmy.example.toml` explains when
+`coalesced` pays (concurrency) and when it does not (a single loop).
+`fast` was spiked, found cleanly implementable, and declined — recorded in
+the ADR with the replication argument. Tests: eight threads × twenty
+inserts under `coalesced` → 160 commits, fewer fsyncs, all 160 readable
+after reopen; `durable` pays one fsync per commit; config bounds; the
+version field. Benchmark: `writers_coalesced` beside `writers` in
+`concurrent_writes.rs`, both now at 1/2/4/8/16; numbers in
+`docs/benchmarks.md`.
+
 ## As of 2026-08-26 — **standing unique violations are a query**
 
 Branch `feat/unique-violation-surfacing`, ADR-087. `GET

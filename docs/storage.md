@@ -265,6 +265,23 @@ pub fn next_index_id(&self) -> u32 {
 > all-or-nothing again, at the price of holding the writer for the whole
 > request. There are still no transactions *across* requests.
 
+### Durability classes
+
+How a commit reaches the disk is `storage.durability` ([ADR-088](decisions.md)),
+and it is queryable: `GET /v1/version` reports it as `durability`.
+
+| Class | Mechanism | Durable when the response returns? | What a crash can lose | Cost |
+|---|---|---|---|---|
+| `durable` (default) | Every commit fsyncs before it returns | Yes | Nothing acknowledged | One fsync per commit — the ~3 ms floor in [Benchmarks](benchmarks.md) |
+| `coalesced` | A commit is written without its own fsync and **waits** for the next shared fsync, one per `commit_coalesce_ms` window (default 5) | Yes | Nothing acknowledged | Up to one window of latency per write; N concurrent writers share one fsync |
+
+There is deliberately no third class. A "fast" class — respond before the
+fsync — would make an acknowledged write losable, and because replication
+and change streams read the oplog before the disk has it, a peer could hold
+an entry this node then forgets. `/metrics` shows the effect of `coalesced`
+as the gap between `kimmy_commits` and `kimmy_fsyncs`, and counts the shared
+ones as `kimmy_commits_grouped_total`.
+
 The per-operation view — every route, what it promises, and the test that
 defends it — is the ["What each operation guarantees"](compatibility.md#what-each-operation-guarantees)
 table in Compatibility. This table is the engine's side of the same facts.

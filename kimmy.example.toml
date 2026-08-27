@@ -175,6 +175,21 @@ gc_interval_secs = 600
 # Must be between 1 and 10,000.
 multi_chunk_docs = 1000
 
+# How a commit becomes durable.
+#
+#   "durable"   — every commit fsyncs before it returns. The default.
+#   "coalesced" — a commit is written without its own fsync and waits for the
+#                 next shared fsync, one per commit_coalesce_ms window, so N
+#                 concurrent writers pay one fsync rather than N. Still durable
+#                 when the response returns; the cost is up to one window of
+#                 latency per write.
+#
+# There is deliberately no class under which an acknowledged write can be
+# lost. Single-writer loops gain nothing from "coalesced" (they wait a window
+# for company that never comes); it pays off under concurrency.
+durability = "durable"
+commit_coalesce_ms = 5
+
 [auth]
 # Run with no authentication at all. Only permitted when `server.bind` is a
 # loopback address; the server refuses to start otherwise.

@@ -66,6 +66,11 @@ pub async fn run(config: Config) -> Result<()> {
         Engine::open(&path).with_context(|| format!("opening database {}", path.display()))?,
     );
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
+    // Validation already refused anything else; the fallback is only so a
+    // future class name cannot silently mean "durable".
+    let class = kimmy_storage::DurabilityClass::parse(&config.storage.durability)
+        .unwrap_or(kimmy_storage::DurabilityClass::Durable);
+    engine.set_durability(class, Duration::from_millis(config.storage.commit_coalesce_ms));
 
     // Version and commit together, because during a rolling upgrade or an
     // incident the question is "which build is this exactly", and a version

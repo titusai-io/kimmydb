@@ -27,10 +27,21 @@ use kimmy_storage::Engine;
 const DOCS_PER_WRITER: usize = 10;
 
 fn concurrent_writers(c: &mut Criterion) {
-    let mut group = c.benchmark_group("writers");
+    writers_under(c, "writers", kimmy_storage::DurabilityClass::Durable);
+}
+
+/// The same measurement under `coalesced` durability (ADR-088): commits skip
+/// their own fsync and share one per 5 ms window, so this is where the
+/// single writer's flat line is expected to bend upward with concurrency.
+fn coalesced_writers(c: &mut Criterion) {
+    writers_under(c, "writers_coalesced", kimmy_storage::DurabilityClass::Coalesced);
+}
+
+fn writers_under(c: &mut Criterion, name: &str, class: kimmy_storage::DurabilityClass) {
+    let mut group = c.benchmark_group(name);
     group.sample_size(10);
 
-    for writers in [1usize, 2, 4, 8] {
+    for writers in [1usize, 2, 4, 8, 16] {
         group.throughput(Throughput::Elements((writers * DOCS_PER_WRITER) as u64));
         group.bench_with_input(BenchmarkId::from_parameter(writers), &writers, |b, &writers| {
             b.iter_custom(|iters| {
@@ -40,6 +51,7 @@ fn concurrent_writers(c: &mut Criterion) {
                 // sustained load looks like.
                 let dir = tempfile::tempdir().unwrap();
                 let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+                engine.set_durability(class, std::time::Duration::from_millis(5));
                 engine.create_collection("bench", "docs").unwrap();
                 let meta = engine.get_collection("bench", "docs").unwrap();
 
@@ -80,5 +92,5 @@ fn concurrent_writers(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, concurrent_writers);
+criterion_group!(benches, concurrent_writers, coalesced_writers);
 criterion_main!(benches);

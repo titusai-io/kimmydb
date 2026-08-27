@@ -874,6 +874,7 @@ async fn a_read_by_id_carries_its_stamp_as_an_etag_and_find_can_return_stamps() 
         "{:?}",
         version.body
     );
+    assert_eq!(version.body["durability"], "durable", "the class is queryable (ADR-088)");
 }
 
 #[tokio::test]
@@ -3839,6 +3840,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_collections",
             "kimmy_unique_violations",
             "kimmy_commits",
+            "kimmy_fsyncs",
+            "kimmy_commits_grouped_total",
             "kimmy_storage_bytes",
             "kimmy_up",
             "kimmy_uptime_seconds",
