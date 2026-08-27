@@ -62,6 +62,10 @@ async-trait = "0.1"
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Encodes a `Vec<u8>` as BSON binary rather than as an array of int32s, which is
+# what serde does by default and what made every replicated document twelve times
+# its own size on the wire. Pure Rust, and already in the tree under `bson`.
+serde_bytes = "0.11"
 bson = { version = "3", features = ["serde", "serde_json-1", "uuid-1"] }
 toml = "1"
 

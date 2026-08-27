@@ -44,9 +44,12 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 ///
 /// It is **not** above every full oplog batch, which this comment used to claim.
 /// [`MAX_BATCH`] bounds a response by entry count and this bounds it by bytes, so
-/// entries averaging over 64 KiB — a collection carrying 1024-dimension vectors
-/// reaches that easily — make a full batch exceed the frame. See
+/// entries averaging over 64 KiB make a full batch exceed the frame. See
 /// [`Message::BatchTooLarge`] for what happens then.
+///
+/// Documents now travel as binary rather than as arrays of int32s, so an entry
+/// costs about the document's own size and 64 KiB each is a genuinely large
+/// document rather than an 5 KiB one. Reachable, but no longer routine.
 pub const MAX_FRAME: usize = 64 * 1024 * 1024;
 
 /// Entries a peer will send in one response.
@@ -80,8 +83,7 @@ pub enum Message {
     /// "That many entries will not fit in a frame; ask for this many."
     ///
     /// [`MAX_BATCH`] bounds a response by entry count and [`MAX_FRAME`] bounds it
-    /// by bytes, so entries averaging over 64 KiB — a collection carrying
-    /// 1024-dimension vectors reaches that easily — make a full batch too large to
+    /// by bytes, so entries averaging over 64 KiB make a full batch too large to
     /// send. Answering with the count that *does* fit lets the requester retry once
     /// rather than probing.
     ///

@@ -66,6 +66,45 @@ async fn two_nodes_converge_over_the_network() {
     }
 }
 
+/// A replicated document costs about its own size on the wire, not twelve times it.
+///
+/// Serde encodes a bare `Vec<u8>` as a BSON array of int32s — one element, with its own
+/// index key, per byte. `OplogEntry::body` and `SnapshotDoc::body` therefore inflated every
+/// replicated document roughly twelvefold: a 1 MiB document became a 12.5 MiB entry, and a
+/// batch hit the 64 MiB frame limit at around 5 MiB of real data. `serde_bytes` makes them
+/// binary.
+///
+/// Bounded from **both** sides on purpose. An upper bound alone passes just as happily when
+/// the body is dropped altogether — the first version of this test did exactly that, and
+/// went green while measuring a 27-byte schema entry it had picked by mistake.
+#[tokio::test]
+async fn a_replicated_document_costs_about_its_own_size_on_the_wire() {
+    let a = node().await;
+
+    let ca = a.engine.create_collection("shop", "wide").unwrap();
+    let payload = "x".repeat(1024 * 1024);
+    a.engine.insert(&ca, doc! { "_id": "d0", "blob": payload.clone() }).unwrap();
+
+    let entries = a.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap();
+    let insert =
+        entries.iter().find(|e| e.kind == kimmy_core::OpKind::Insert).expect("the insert entry");
+
+    let body = insert.body.as_ref().expect("the insert carries its post-image").len();
+    assert!(body > payload.len(), "the body should hold the document, got {body} bytes");
+
+    let encoded = bson::serialize_to_vec(insert).unwrap().len();
+    assert!(encoded >= body, "the encoding cannot be smaller than the body it carries");
+    assert!(
+        encoded < body + (64 * 1024),
+        "a {body}-byte body should cost about that on the wire, not {encoded} bytes"
+    );
+
+    // And it must still come back, which is the half an encoding change can quietly break.
+    let round_tripped: kimmy_core::OplogEntry =
+        bson::deserialize_from_slice(&bson::serialize_to_vec(insert).unwrap()).unwrap();
+    assert_eq!(round_tripped.body.as_deref(), insert.body.as_deref());
+}
+
 /// A batch of large entries must not exceed the frame limit and wedge the cluster.
 ///
 /// `MAX_BATCH` bounds a response by *entry count* while `MAX_FRAME` bounds it by *bytes*,
@@ -82,14 +121,14 @@ async fn a_batch_of_large_entries_still_replicates() {
     let a = node().await;
     let b = node().await;
 
-    // 40 documents of 256 KiB. That is only 10 MiB of documents, but an oplog entry
-    // carries its post-image as `Vec<u8>`, which serde encodes as a BSON *array of
-    // integers* rather than binary — about twelve bytes on the wire per byte stored.
-    // So this is roughly 120 MiB of frame, comfortably past the limit, in far fewer
-    // than the 1024 entries a batch is allowed.
+    // Enough to exceed the 64 MiB frame in far fewer than the 1024 entries a batch is
+    // allowed. It has to be this much real data now: bodies travel as binary, so a
+    // document costs about its own size rather than twelve times it. When they were
+    // arrays of int32s a tenth of this was plenty — which is exactly the sort of
+    // quiet slackening that leaves a regression test measuring nothing.
     let ca = a.engine.create_collection("shop", "big").unwrap();
-    let payload = "x".repeat(256 * 1024);
-    for i in 0..40 {
+    let payload = "x".repeat(1024 * 1024);
+    for i in 0..70 {
         a.engine.insert(&ca, doc! { "_id": format!("d{i}"), "blob": &payload }).unwrap();
     }
 
@@ -102,7 +141,7 @@ async fn a_batch_of_large_entries_still_replicates() {
     }
 
     let cb = b.engine.get_collection("shop", "big").expect("the collection should have replicated");
-    let missing: Vec<usize> = (0..40)
+    let missing: Vec<usize> = (0..70)
         .filter(|i| b.engine.get(&cb, &DocId::String(format!("d{i}"))).unwrap().is_none())
         .collect();
     assert!(missing.is_empty(), "these never replicated: {missing:?}");
