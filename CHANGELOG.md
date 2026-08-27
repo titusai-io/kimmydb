@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **The MCP `list_databases` and `list_collections` tools omit KimmyDB's own
+  internals** — the `__kimmy` system database and the `.__vectors` shadow
+  collections — as `resources/list` has since ADR-027. A listing is an
+  invitation, and an agent shown `notes.__vectors` next to `notes` opens a
+  collection of float arrays that says nothing the source does not.
+  `describe_collection` already reports whether a collection has vectors, and
+  every tool still reaches an internal by name under the ordinary access
+  check. The REST listing is unchanged (ADR-092).
+
 ## 0.14.0 - 2026-08-27
 
 ### Added

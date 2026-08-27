@@ -2193,6 +2193,13 @@ agent attaches to its context, and the user store is a column of password
 hashes. Tools still reach them under the ordinary access check, so this is a
 default rather than a control. [ADR-027](decisions.md).
 
+**The MCP listing tools exclude them too.** `list_databases` and
+`list_collections` omit the same internals resources do — a listing is an
+invitation to open what it names — while `find`, `count` and
+`describe_collection` reach an internal by name as before. The REST listing
+stays complete: the CLI and operators target `orders.__vectors` on purpose.
+[ADR-092](decisions.md).
+
 **Sessions are disabled.** Stateless, so a token that expires mid-conversation
 stops working rather than riding an already-open session. The cost is that a
 long-running agent must re-authenticate.

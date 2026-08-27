@@ -4354,3 +4354,41 @@ consulted — the `filter` path, which scans them — is unchanged.
 
 - [Roadmap](roadmap.md) — decisions still to be made
 - [Testing](testing.md) — how these choices are defended
+
+## ADR-092 — MCP listing tools omit KimmyDB's own internals
+
+**Decision.** The `list_databases` and `list_collections` tools omit what
+`resources/list` has omitted since ADR-027: the `__kimmy` system database, and
+any `__`-prefixed or `.__vectors` collection. `find`, `count`,
+`describe_collection` and every other tool reach an internal by name exactly
+as before, under the ordinary access check.
+
+**Why.** ADR-027 drew the line between a resource — material an agent attaches
+to its context — and a tool — a specific question a caller asks. A listing sits
+on the resource side of that line even though it is a tool: its whole purpose
+is to tell an agent what to open next. Driving the server after 0.14.0 through
+an MCP client, `list_collections` on a database with embeddings answered
+`["notes", "notes.__vectors"]`, and the honest expectation of an agent reading
+that is that both are things to look at. The second is a collection of
+1024-float arrays that describes nothing `notes` does not, and
+`describe_collection` on `notes` already says the vectors exist. Naming the
+shadow in the list invites the wrong call at a great cost in context.
+
+**Why not hide it everywhere.** The REST API's listing stays complete. The CLI
+targets `orders.__vectors` by name on purpose (`kimmy` splits
+`shop.orders.__vectors` into a database and a collection because a collection
+name may contain a dot), operators back up and inspect shadows, and a human
+reading a REST response is not an agent deciding what to open. The
+implementation detail belongs to the MCP layer, in the same function resources
+use, so the two cannot disagree about what "internal" means.
+
+**Not a security control.** It is a default. The access decision remains
+`Principal::can`; a superuser can still `count` `__kimmy.__users` through a
+tool call, and a federated principal still cannot. Anyone who needs the shadow
+knows its name.
+
+**Cost.** An agent that genuinely wants to inspect a shadow collection has to
+know the naming rule, which `list_collections`'s description now states.
+
+---
+

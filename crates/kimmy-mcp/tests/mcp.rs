@@ -441,6 +441,49 @@ async fn listing_a_database_that_does_not_exist_is_an_error_not_an_empty_list() 
 }
 
 #[tokio::test]
+async fn listings_omit_internals_but_tools_still_reach_them_by_name() {
+    // A listing is an invitation (ADR-092): an agent shown `orders.__vectors`
+    // next to `orders` opens it and pays for a collection of float arrays that
+    // says nothing the source does not. The shadow is left out of the list --
+    // and the system database out of the database list -- while `count` on it
+    // by name still answers, because that is a specific question under the
+    // ordinary access check, not a default.
+    let server = Server::start().await;
+    seed(&server);
+    server
+        .engine
+        .configure_vectors(
+            "sales",
+            "orders",
+            kimmy_core::vector_meta::VectorConfig {
+                fields: vec!["status".into()],
+                provider: kimmy_core::vector_meta::ProviderConfig::Byo,
+                dim: 4,
+                metric: Default::default(),
+                chunk: Default::default(),
+            },
+        )
+        .unwrap();
+    assert!(server.engine.get_collection("sales", "orders.__vectors").is_ok(), "the shadow exists");
+    let root = server.root();
+
+    let listed = server.call_ok(&root, "list_collections", json!({"database":"sales"})).await;
+    let names = listed["collections"].as_array().unwrap();
+    assert!(names.contains(&json!("orders")), "{listed}");
+    assert!(!names.contains(&json!("orders.__vectors")), "the shadow is not listed: {listed}");
+
+    let databases = server.call_ok(&root, "list_databases", json!({})).await;
+    let names = databases["databases"].as_array().unwrap();
+    assert!(names.contains(&json!("sales")), "{databases}");
+    assert!(!names.contains(&json!("__kimmy")), "the system database is not listed: {databases}");
+
+    let counted = server
+        .call_ok(&root, "count", json!({"database":"sales","collection":"orders.__vectors"}))
+        .await;
+    assert!(counted["count"].is_number(), "reachable by name: {counted}");
+}
+
+#[tokio::test]
 async fn every_write_tool_reports_the_stamp_it_produced() {
     // `insert` reported one from the start; the other three did not, so a
     // client wanting to follow a bulk load or a single update with a

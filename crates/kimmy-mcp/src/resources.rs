@@ -119,7 +119,12 @@ impl ServerHandler for KimmyMcp {
 }
 
 /// Whether a database holds KimmyDB's own bookkeeping rather than user data.
-fn is_internal_database(name: &str) -> bool {
+///
+/// Shared with the listing tools (ADR-092): a listing is an invitation, so
+/// `list_databases` and `list_collections` omit the same internals resources
+/// do, while `find`, `count` and `describe_collection` still reach them by
+/// name under the ordinary access check.
+pub(crate) fn is_internal_database(name: &str) -> bool {
     name == kimmy_auth::users::SYSTEM_DB
 }
 
@@ -127,7 +132,7 @@ fn is_internal_database(name: &str) -> bool {
 ///
 /// The `__` prefix is reserved for system objects, so this covers the shadow
 /// collections that back vector search as well as anything added later.
-fn is_internal_collection(name: &str) -> bool {
+pub(crate) fn is_internal_collection(name: &str) -> bool {
     kimmy_core::vector_meta::is_shadow(name)
         || name.split('.').any(|segment| segment.starts_with("__"))
 }
