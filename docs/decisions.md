@@ -4194,6 +4194,58 @@ of latency per write, one marker key in `meta` rewritten per flush. Two
 configuration keys, one field on `/v1/version`, two metric series. Under
 `durable` nothing changes but a counter.
 
+## ADR-089 — The CLI is for people: `client_credentials` leaves `kimmy`
+
+**Decision.** `kimmy login --client-credentials` and `kimmy token
+--client-credentials` are removed, with the `KIMMY_OIDC_CLIENT_SECRET`
+variable and the `client_secret` settings key they existed to consume. The
+CLI runs exactly two flows: a password login for a named local account, and
+the RFC 8628 device flow for everyone else. A script, a cron job or a
+healthcheck sets `KIMMY_TOKEN` (or the settings file's `token`) to a bearer
+token minted elsewhere — for example, a personal access token from the
+console, audienced at the node — and every command works as it always did. A
+`client_secret` line left in an existing `.kimmy` is warned about and
+ignored rather than rejected; `kimmy init` drops it when it rewrites the
+file.
+
+**Why.** The CLI is, by intent, a tool for humans, and the grant was there on
+the claim that it was the only non-interactive way to a token. It was not:
+`--token` / `KIMMY_TOKEN` has been a global argument on every subcommand
+since the tool existed, and `$(kimmy login --client-credentials)` only ever
+produced a value for it. Where a bearer token came from is not the CLI's
+concern. No other tool in the field carries the grant unless its platform has
+no other machine credential — `gh` has none at all, `stripe` and `doctl` take
+an API key from the environment — and KimmyDB has two: a local account, and
+a token from the provider. Against the deployment it ships in, the flag was
+also inert: `kimmy-cli` is registered as a *public* client, and a public
+client has no secret to present, so the grant could never succeed under the
+CLI's own id. Worst, the affordance misled: twice in one session it pulled a
+careful reader toward minting a machine token for a person's session. An
+option that steers competent readers wrong is evidence about the option,
+not about the readers.
+
+**Rejected: keep the flag and fix the documentation.** A documentation fix
+keeps the pull; it only adds a sign next to it. Nothing depends on the flag —
+no repository invokes it, and the one service that does use the grant (a
+sibling project's agents) has its own implementation and never shelled out to
+`kimmy`. Removal breaks nothing that exists, and pre-1.0 a `0.MINOR` may
+carry a breaking change that produces the better design.
+
+**Rejected: reject a stale `client_secret` key.** The settings file treats
+an unknown key as an error, deliberately, because a typo that silently did
+nothing is worse than a loud failure. A retired key is not a typo: refusing
+every command over a line that used to be valid is the worse failure. So
+that one key is named, warned about on stderr and skipped, and every other
+unknown key still fails loudly.
+
+**Cost.** A personal access token is user-scoped and expires — 90 days by
+default, 365 at most — so it is not a true non-human identity. If KimmyDB
+ever wants one, that is a *service* holding client credentials and calling
+the token endpoint itself, which is a different piece of work and still not
+a CLI flag. The Basic-auth encoding, the auth-method discovery and the
+empty-scope rule that the grant needed all leave with it; the device flow
+never used them.
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

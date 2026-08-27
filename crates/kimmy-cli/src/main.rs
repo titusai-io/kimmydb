@@ -51,12 +51,13 @@ use serde_json::{Value, json};
         export KIMMY_TOKEN=$(echo hunter2 | kimmy login root)\n\n\
     The provider and resource are discovered from the node; to name them:\n  \
         export KIMMY_OIDC_ISSUER=https://auth.example.com\n  \
-        export KIMMY_OIDC_CLIENT_ID=kimmy-cli\n  \
-        export KIMMY_TOKEN=$(kimmy login --client-credentials) # for a service, secret from env\n\n\
+        export KIMMY_OIDC_CLIENT_ID=kimmy-cli\n\n\
+    A script or a service is not a person, so it does not log in: it sets\n  \
+        export KIMMY_TOKEN=<a token minted elsewhere, e.g. a personal access token>\n\n\
     Settings file: ~/.config/kimmydb/.kimmy — url, token, issuer, client_id and\n\
     friends; a flag or environment variable always wins over the file.\n\
-    There is deliberately no --password flag and no --client-secret flag: either\n\
-    would land in shell history and in `ps` output for every user on the machine.\n\
+    There is deliberately no --password flag: it would land in shell history\n\
+    and in `ps` output for every user on the machine.\n\
     The access token is cached in a 0600 file under the user's cache directory\n\
     so every other command works afterwards; a refresh token is never requested\n\
     or stored at all -- an environment variable answers for a token's\n\
@@ -100,14 +101,6 @@ enum Command {
         /// own user store; omitted, the device flow answers.
         user: Option<String>,
 
-        /// Log in as a service, with OAuth2 client credentials.
-        ///
-        /// The client secret is read from `KIMMY_OIDC_CLIENT_SECRET` and from
-        /// nowhere else: a flag would put it in shell history and in `ps`
-        /// output, the same reason there is no --password.
-        #[arg(long, conflicts_with = "user")]
-        client_credentials: bool,
-
         /// Issuer URL of the OIDC provider. Must match the node's.
         #[arg(long, env = "KIMMY_OIDC_ISSUER")]
         issuer: Option<String>,
@@ -129,11 +122,8 @@ enum Command {
         /// Scopes to request. The node reads roles from the token, so the
         /// provider has to be configured to put them there.
         ///
-        /// Left unset the two flows differ, because they have to: the device
-        /// flow asks for `openid profile`, and client credentials asks for
-        /// nothing at all. There is no end user behind a service account, so
-        /// `openid` there requests an ID token that cannot exist — some
-        /// providers ignore it and some refuse the request outright.
+        /// Left unset the device flow asks for `openid profile`: there is a
+        /// person behind it, so `openid` is meaningful.
         #[arg(long, env = "KIMMY_OIDC_SCOPE")]
         scope: Option<String>,
     },
@@ -153,11 +143,6 @@ enum Command {
     /// Federated flows only. A local account has no provider to key a cache
     /// entry by, so `kimmy login <user>` stays how those print a token.
     Token {
-        /// As a service, with OAuth2 client credentials rather than the device
-        /// flow. Secret from `KIMMY_OIDC_CLIENT_SECRET`, as with login.
-        #[arg(long)]
-        client_credentials: bool,
-
         /// Issuer URL of the OIDC provider. Must match the node's.
         #[arg(long, env = "KIMMY_OIDC_ISSUER")]
         issuer: Option<String>,
@@ -440,7 +425,7 @@ fn main() -> ExitCode {
 #[tokio::main(flavor = "current_thread")]
 async fn run() -> Result<()> {
     let mut cli = Cli::parse();
-    let (dot_password, dot_secret) = apply_kimmy_file(&mut cli)?;
+    let dot_password = apply_kimmy_file(&mut cli)?;
 
     // Bare `kimmy` shows byte-for-byte what `--help` shows — same screen,
     // stdout, success. The clap default for a missing subcommand is a two-
@@ -465,22 +450,19 @@ async fn run() -> Result<()> {
     // the arguments: Token is Login with the answers already decided —
     // federated always, cache always.
     let token_request = match &command {
-        Command::Login { user, client_credentials, issuer, client_id, resource, scope } => {
-            Some((user.as_deref(), *client_credentials, true, issuer, client_id, resource, scope))
+        Command::Login { user, issuer, client_id, resource, scope } => {
+            Some((user.as_deref(), true, issuer, client_id, resource, scope))
         }
-        Command::Token { client_credentials, issuer, client_id, resource, scope } => {
-            Some((None, *client_credentials, true, issuer, client_id, resource, scope))
+        Command::Token { issuer, client_id, resource, scope } => {
+            Some((None, true, issuer, client_id, resource, scope))
         }
         _ => None,
     };
-    if let Some((login_user, cc_flag, cache_token, issuer, client_id, resource, scope)) =
-        token_request
-    {
+    if let Some((login_user, cache_token, issuer, client_id, resource, scope)) = token_request {
         // Which flow answers was decided by the arguments alone: a named
-        // local account wins over everything — `kimmy login ada` must never
-        // grow a browser step — then the service-account flag, and what
-        // remains is the device flow.
-        let flow = login_flow(login_user, cc_flag);
+        // local account is the password login — `kimmy login ada` must never
+        // grow a browser step — and anything else is the device flow.
+        let flow = login_flow(login_user);
         if !matches!(flow, LoginFlow::Local) {
             // The token alone, with no decoration, so `$(kimmy ...)` is usable
             // directly. The access token lands in the cache — that is what
@@ -500,14 +482,7 @@ async fn run() -> Result<()> {
             let issuer = issuer.as_deref();
             let resource = resource.as_deref();
             let client_id = client_id.as_deref();
-            // Scopes differ per flow when unset, because a service account has
-            // no end user to describe. Explicit `--scope` overrides both.
-            let default_scope = if matches!(flow, LoginFlow::ClientCredentials) {
-                oidc::CLIENT_CREDENTIALS_SCOPE
-            } else {
-                oidc::DEVICE_SCOPE
-            };
-            let scope = scope.as_deref().unwrap_or(default_scope);
+            let scope = scope.as_deref().unwrap_or(oidc::DEVICE_SCOPE);
 
             let cache_key = cache::Key::new(issuer, client_id, resource);
             if let Some(cached) = cache_key.as_ref().filter(|_| cache_token).and_then(cache::get) {
@@ -515,19 +490,8 @@ async fn run() -> Result<()> {
                 return Ok(());
             }
 
-            let (token, expires_in) = match flow {
-                LoginFlow::ClientCredentials => {
-                    oidc::client_credentials_login(
-                        issuer,
-                        client_id,
-                        scope,
-                        resource,
-                        dot_secret.as_deref(),
-                    )
-                    .await?
-                }
-                _ => oidc::device_login(issuer, client_id, scope, resource).await?,
-            };
+            let (token, expires_in) =
+                oidc::device_login(issuer, client_id, scope, resource).await?;
             if cache_token && let Some(key) = cache_key {
                 // A cache that cannot be written is a slower login, not a
                 // failed one, so this reports and carries on.
@@ -950,18 +914,6 @@ mod oidc {
     /// what makes the exchange an OpenID Connect one rather than bare OAuth 2.
     pub(super) const DEVICE_SCOPE: &str = "openid profile";
 
-    /// Scopes the client-credentials flow asks for when nothing was specified:
-    /// **none**.
-    ///
-    /// `openid` requests an ID token, and an ID token describes an end user
-    /// authenticating. There is no end user in this grant — RFC 6749 §4.4 is
-    /// the client acting for itself — so the request is asking for something
-    /// that cannot be issued. Providers split on what to do about it: some
-    /// ignore the scope, some refuse the whole request. Asking for nothing is
-    /// the interoperable answer, and a client's own registered scopes are what
-    /// it gets.
-    pub(super) const CLIENT_CREDENTIALS_SCOPE: &str = "";
-
     /// Where a node publishes what it is, as an OAuth 2.0 protected resource.
     ///
     /// Written out here rather than shared with the server's constant in
@@ -1075,59 +1027,6 @@ mod oidc {
         form
     }
 
-    /// Whether the provider accepts HTTP Basic for client authentication.
-    ///
-    /// RFC 6749 §2.3.1 says an authorization server **MUST** support Basic and
-    /// **MAY** support credentials in the request body, so Basic is the method
-    /// that is always there and the body is the optional one. This reads the
-    /// provider's own `token_endpoint_auth_methods_supported` rather than
-    /// assuming either.
-    ///
-    /// A provider that advertises nothing gets Basic, because that is what
-    /// §2.3.1 makes mandatory and what OpenID Connect Discovery names as the
-    /// default when the member is absent.
-    pub(super) fn prefers_basic_auth(document: &Value) -> bool {
-        let Some(methods) = document.get("token_endpoint_auth_methods_supported") else {
-            return true;
-        };
-        let Some(methods) = methods.as_array() else { return true };
-        let named = |want: &str| methods.iter().filter_map(Value::as_str).any(|m| m == want);
-        // Only fall back to the body when the provider says it takes that and
-        // says it does not take Basic. Both advertised means Basic.
-        if named("client_secret_basic") {
-            return true;
-        }
-        !named("client_secret_post")
-    }
-
-    /// One credential, encoded the way RFC 6749 §2.3.1 requires before it goes
-    /// into an `Authorization: Basic` header.
-    ///
-    /// **Not the same as base64ing `id:secret` directly.** §2.3.1 says the
-    /// client id and password are each encoded with the
-    /// `application/x-www-form-urlencoded` algorithm *first*, and only then
-    /// used as the username and password. It matters whenever a secret
-    /// contains a `:`, a `+`, a space or any non-ASCII character — a provider
-    /// that decodes to the letter then sees a different secret than the one
-    /// that was set, and the failure reads as a wrong password.
-    ///
-    /// Written out rather than pulled from a crate: it is a dozen lines, and
-    /// this binary's short dependency list is deliberate.
-    pub(super) fn form_urlencode(value: &str) -> String {
-        let mut out = String::with_capacity(value.len());
-        for byte in value.bytes() {
-            match byte {
-                // The set the HTML form serializer leaves alone.
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'*' | b'-' | b'.' | b'_' => {
-                    out.push(byte as char)
-                }
-                b' ' => out.push('+'),
-                _ => out.push_str(&format!("%{byte:02X}")),
-            }
-        }
-        out
-    }
-
     fn client_id_or_bail(client_id: Option<&str>) -> Result<&str> {
         client_id.context(
             "no OIDC client id: set KIMMY_OIDC_CLIENT_ID or pass --client-id, using an \
@@ -1183,7 +1082,7 @@ mod oidc {
 
     /// An endpoint named by the discovery document, required to be https.
     ///
-    /// Every caller of this sends either client credentials or a device code
+    /// Every caller of this sends a device code
     /// to the URL it returns, and receives an access token back. RFC 8414 §2
     /// requires these to be https for exactly that reason, and the node
     /// refuses a non-https issuer outright (`OidcConfig::validate`), so a
@@ -1282,7 +1181,8 @@ mod oidc {
         let document = discover(&http, issuer).await?;
         let device_endpoint = endpoint(&document, "device_authorization_endpoint").context(
             "this provider does not advertise the device authorization endpoint; \
-             --client-credentials works for a service account",
+             `kimmy login <user>` is the local-account path, and KIMMY_TOKEN takes a \
+             token minted elsewhere",
         )?;
         let token_endpoint = endpoint(&document, "token_endpoint")?;
 
@@ -1376,71 +1276,6 @@ mod oidc {
                 _ => bail!("the provider refused the token request: {}", describe(&body)),
             }
         }
-    }
-
-    /// OAuth2 client credentials, for a service rather than a person.
-    ///
-    /// The secret comes from the environment and from nowhere else, for the
-    /// same reason there is no `--password`: a flag lands in shell history and
-    /// in `ps` output for every user on the machine.
-    pub async fn client_credentials_login(
-        issuer: Option<&str>,
-        client_id: Option<&str>,
-        scope: &str,
-        resource: Option<&str>,
-        secret_from_dotfile: Option<&str>,
-    ) -> Result<(String, Option<u64>)> {
-        let issuer = issuer_or_bail(issuer)?;
-        let client_id = client_id_or_bail(client_id)?;
-        // The environment wins over the settings file — the same precedence
-        // every setting here follows.
-        let secret = std::env::var("KIMMY_OIDC_CLIENT_SECRET")
-            .ok()
-            .filter(|s| !s.is_empty())
-            .or_else(|| secret_from_dotfile.map(str::to_string))
-            .context(
-                "no client secret: set KIMMY_OIDC_CLIENT_SECRET or add client_secret to \
-                 ~/.config/kimmydb/.kimmy. There is deliberately no flag for it — it would \
-                 land in shell history and in `ps` output.",
-            )?;
-
-        let http = http()?;
-        let document = discover(&http, issuer).await?;
-        let token_endpoint = endpoint(&document, "token_endpoint")?;
-
-        let mut form = vec![("grant_type", "client_credentials")];
-        // An empty scope is omitted rather than sent blank: `scope=` is a
-        // parameter with no value, which is not the same request as one that
-        // named no scope at all, and providers are entitled to refuse it.
-        if !scope.is_empty() {
-            form.push(("scope", scope));
-        }
-
-        let basic = prefers_basic_auth(&document);
-        if !basic {
-            form.push(("client_id", client_id));
-            form.push(("client_secret", secret.as_str()));
-        }
-
-        let mut request = http.post(&token_endpoint);
-        if basic {
-            request = request
-                .basic_auth(form_urlencode(client_id), Some(form_urlencode(secret.as_str())));
-        }
-
-        let body: Value = request
-            .form(&with_resource(form, resource))
-            .send()
-            .await
-            .with_context(|| format!("requesting a token from {token_endpoint}"))?
-            .json()
-            .await
-            .context("parsing the token response")?;
-
-        if !oauth_error(&body).is_empty() {
-            bail!("the provider refused the token request: {}", describe(&body));
-        }
-        Ok((access_token(&body)?, expires_in(&body)))
     }
 
     /// An OAuth2 error, as something a person can act on.
@@ -1654,21 +1489,19 @@ enum LoginFlow {
     Local,
     /// RFC 8628 device flow through the node's identity provider.
     Device,
-    /// OAuth2 client credentials for a service account.
-    ClientCredentials,
 }
 
 /// Decide a token-producing command's flow from its arguments alone.
 ///
-/// A named user wins over every flag — `kimmy login ada` must never grow a
-/// browser step, however the defaults evolve. Then the service-account flag
-/// picks client credentials. What remains is the device flow: the default
-/// because it needs nothing but a browser and works everywhere one exists,
-/// including SSH sessions and containers.
-fn login_flow(user: Option<&str>, client_credentials: bool) -> LoginFlow {
+/// A named user is the local flow — `kimmy login ada` must never grow a
+/// browser step, however the defaults evolve. Anything else is the device
+/// flow: the default because it needs nothing but a browser and works
+/// everywhere one exists, including SSH sessions and containers. There is no
+/// machine flow, by design (ADR-089): a script sets `KIMMY_TOKEN` to a token
+/// minted elsewhere.
+fn login_flow(user: Option<&str>) -> LoginFlow {
     match user {
         Some(_) => LoginFlow::Local,
-        None if client_credentials => LoginFlow::ClientCredentials,
         None => LoginFlow::Device,
     }
 }
@@ -2031,7 +1864,7 @@ async fn users_command(
 // The settings file: ~/.config/kimmydb/.kimmy
 //
 // One dotenv-style file for the settings a person keeps setting: url, token,
-// password, issuer, client_id, client_secret, resource, scope, cache_token.
+// password, issuer, client_id, resource, scope, cache_token.
 // Precedence per setting is explicit flag > environment variable > this file
 // > built-in default — the file is what fills the gaps, never what overrides
 // something the caller or the environment already said.
@@ -2045,14 +1878,12 @@ struct DotfileSettings {
     password: Option<String>,
     issuer: Option<String>,
     client_id: Option<String>,
-    client_secret: Option<String>,
     resource: Option<String>,
     scope: Option<String>,
     cache_token: Option<bool>,
 }
 
-const DOTFILE_KEYS: &str = "url, token, password, issuer, client_id, \
-     client_secret, resource, scope, cache_token";
+const DOTFILE_KEYS: &str = "url, token, password, issuer, client_id, resource, scope, cache_token";
 
 fn parse_kimmy_file(text: &str) -> Result<DotfileSettings> {
     let mut out = DotfileSettings::default();
@@ -2081,7 +1912,21 @@ fn parse_kimmy_file(text: &str) -> Result<DotfileSettings> {
             "password" => out.password = Some(value.into()),
             "issuer" => out.issuer = Some(value.into()),
             "client_id" => out.client_id = Some(value.into()),
-            "client_secret" => out.client_secret = Some(value.into()),
+            // Retired in 0.13.0 with the client_credentials grant (ADR-089).
+            // A key that used to be valid is not a typo, and refusing every
+            // command over it would be the worse failure — so it is named,
+            // warned about, and skipped. Every other unknown key still fails.
+            // The file is read more than once per invocation, so the warning
+            // is gated to print once rather than once per read.
+            "client_secret" => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    eprintln!(
+                        "warning: line {n}: client_secret is no longer used by kimmy — the \
+                         client_credentials grant was removed in 0.13.0; remove the line"
+                    )
+                });
+            }
             "resource" => out.resource = Some(value.into()),
             "scope" => out.scope = Some(value.into()),
             "cache_token" => {
@@ -2131,14 +1976,14 @@ fn load_kimmy_file() -> Result<Option<(std::path::PathBuf, DotfileSettings)>> {
 /// values, so `--url localhost:7878` still beats a dotfile that names another
 /// node; an environment variable wins because clap has already folded it into
 /// the parsed field before this runs.
-fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
+fn apply_kimmy_file(cli: &mut Cli) -> Result<Option<String>> {
     use clap::parser::ValueSource;
 
     let matches = Cli::command().get_matches();
     let from_cli = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
     let env_absent = |name: &str| std::env::var_os(name).is_none();
     let Some((_, dot)) = load_kimmy_file()? else {
-        return Ok((None, None));
+        return Ok(None);
     };
 
     // Globals first.
@@ -2174,7 +2019,7 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
                 (issuer, client_id, resource, scope)
             }
             _ => {
-                return Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret));
+                return Ok(dot.password.filter(|p| !p.is_empty()));
             }
         };
         if !from_cli("issuer")
@@ -2203,8 +2048,8 @@ fn apply_kimmy_file(cli: &mut Cli) -> Result<(Option<String>, Option<String>)> {
         }
     }
 
-    // The two settings no flag carries, consumed by their call sites.
-    Ok((dot.password.filter(|p| !p.is_empty()), dot.client_secret))
+    // The one setting no flag carries, consumed by its call site.
+    Ok(dot.password.filter(|p| !p.is_empty()))
 }
 
 /// The client id a cache key is built from: environment first, then the
@@ -2249,7 +2094,7 @@ fn render_kimmy_file(pairs: &[(&str, String)]) -> String {
     let mut out = String::from(
         "# Written by `kimmy init`. Flags and environment variables win over\n\
          # anything in this file. Keys: url, token, password, issuer,\n\
-         # client_id, client_secret, resource, scope, cache_token.\n",
+         # client_id, resource, scope, cache_token.\n",
     );
     for (key, value) in pairs {
         out.push_str(&format!("{key} = {value}\n"));
@@ -2445,7 +2290,6 @@ async fn run_init() -> Result<()> {
         for (key, value) in [
             ("token", prev.token.clone()),
             ("password", prev.password.clone()),
-            ("client_secret", prev.client_secret.clone()),
             ("scope", prev.scope.clone()),
         ] {
             if let Some(value) = value {
@@ -2610,6 +2454,13 @@ mod tests {
     fn a_settings_file_refuses_unknown_keys_and_broken_lines_by_number() {
         let err = parse_kimmy_file("url = x\nusrer = typo\n").unwrap_err().to_string();
         assert!(err.contains("line 2") && err.contains("usrer"), "{err}");
+        // ADR-089: `client_secret` used to be valid. A retired key is not a
+        // typo, so it is skipped with a warning rather than refusing every
+        // command; the loud contract holds for everything else.
+        let dot = parse_kimmy_file("client_secret = hunter2\nurl = x\n").expect("a retired key");
+        assert_eq!(dot.url.as_deref(), Some("x"));
+        assert!(parse_kimmy_file("clientsecret = hunter2\n").is_err());
+        assert!(!render_kimmy_file(&[]).contains("client_secret"), "init still lists the key");
 
         let err = parse_kimmy_file("no equals sign here\n").unwrap_err().to_string();
         assert!(err.contains("line 1"), "{err}");
@@ -2646,18 +2497,20 @@ mod tests {
 
     #[test]
     fn bare_login_defaults_to_the_device_flow() {
-        assert_eq!(login_flow(None, false), LoginFlow::Device);
+        assert_eq!(login_flow(None), LoginFlow::Device);
     }
 
     #[test]
     fn a_named_user_is_always_the_local_flow() {
-        assert_eq!(login_flow(Some("ada"), false), LoginFlow::Local);
+        assert_eq!(login_flow(Some("ada")), LoginFlow::Local);
     }
 
     #[test]
-    fn the_service_flag_picks_client_credentials_without_a_user() {
-        assert_eq!(login_flow(Some("ada"), true), LoginFlow::Local, "the user wins over flags");
-        assert_eq!(login_flow(None, true), LoginFlow::ClientCredentials);
+    fn no_user_is_the_device_flow_and_there_is_no_machine_flow() {
+        // ADR-089: the CLI is for people. A script sets KIMMY_TOKEN.
+        assert_eq!(login_flow(None), LoginFlow::Device);
+        assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "token", "--client-credentials"]).is_err());
     }
 
     #[test]
@@ -2700,7 +2553,6 @@ mod tests {
     #[test]
     fn token_parses_and_takes_no_positional_user() {
         assert!(Cli::try_parse_from(["kimmy", "token"]).is_ok());
-        assert!(Cli::try_parse_from(["kimmy", "token", "--client-credentials"]).is_ok());
         assert!(
             Cli::try_parse_from(["kimmy", "token", "ada"]).is_err(),
             "a local account has no provider to key a cache by; kimmy login <user> is that path"
@@ -2783,7 +2635,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn the_resource_rides_on_both_oauth_flows() {
+    fn the_resource_rides_on_the_device_flow() {
         // The gap this workstream exists to close: without it the only audience
         // `kimmy login` could ever obtain was the provider's default, so the
         // correct configuration was unreachable from this tool.
@@ -2792,12 +2644,6 @@ mod tests {
             Some("https://kimmydb.example.com"),
         );
         assert!(device.contains(&("resource", "https://kimmydb.example.com")));
-
-        let service = oidc::with_resource(
-            vec![("grant_type", "client_credentials")],
-            Some("https://kimmydb.example.com"),
-        );
-        assert!(service.contains(&("resource", "https://kimmydb.example.com")));
     }
 
     #[test]
@@ -2872,60 +2718,6 @@ mod tests {
         ] {
             assert!(oidc::is_secure_url(url), "{url} must count as secure");
         }
-    }
-
-    #[test]
-    fn basic_is_preferred_and_is_what_an_unhelpful_provider_gets() {
-        // RFC 6749 §2.3.1: a server MUST support Basic and MAY support the
-        // body, so Basic is the one that is always available. The body is used
-        // only when the provider says it takes that and does not take Basic.
-        let advertising =
-            |methods: Value| json!({ "token_endpoint_auth_methods_supported": methods });
-
-        assert!(oidc::prefers_basic_auth(&advertising(json!(["client_secret_basic"]))));
-        assert!(oidc::prefers_basic_auth(&advertising(json!([
-            "client_secret_post",
-            "client_secret_basic"
-        ]))));
-        assert!(
-            !oidc::prefers_basic_auth(&advertising(json!(["client_secret_post"]))),
-            "a provider that takes only the body must get the body"
-        );
-
-        // Absent, empty, or the wrong JSON type: RFC 6749 makes Basic
-        // mandatory, so it is the answer whenever the provider has not said
-        // otherwise.
-        assert!(oidc::prefers_basic_auth(&json!({})));
-        assert!(oidc::prefers_basic_auth(&advertising(json!([]))));
-        assert!(oidc::prefers_basic_auth(&advertising(json!("client_secret_post"))));
-    }
-
-    #[test]
-    fn credentials_are_form_encoded_before_they_are_sent_as_basic() {
-        // RFC 6749 §2.3.1 encodes the id and the secret with the form
-        // algorithm *before* they become the username and password. Skipping
-        // it means a provider decoding to the letter sees a different secret
-        // than the one that was set, and the failure reads as a wrong
-        // password rather than as an encoding bug.
-        assert_eq!(oidc::form_urlencode("kimmy-cli"), "kimmy-cli");
-        assert_eq!(oidc::form_urlencode("s3cr3t.va_lue-*"), "s3cr3t.va_lue-*");
-        // The characters that actually bite: a colon separates the two halves
-        // of a Basic credential, and `+` and space are each other's encoding.
-        assert_eq!(oidc::form_urlencode("a:b"), "a%3Ab");
-        assert_eq!(oidc::form_urlencode("a b"), "a+b");
-        assert_eq!(oidc::form_urlencode("a+b"), "a%2Bb");
-        assert_eq!(oidc::form_urlencode("a%b"), "a%25b");
-        // Non-ASCII goes out as UTF-8 bytes, percent-encoded one at a time.
-        assert_eq!(oidc::form_urlencode("é"), "%C3%A9");
-    }
-
-    #[test]
-    fn the_two_flows_ask_for_different_scopes_by_default() {
-        // A service account has no end user, so `openid` would request an ID
-        // token that cannot be issued — ignored by some providers, refused by
-        // others. The device flow does have a person behind it.
-        assert_eq!(oidc::DEVICE_SCOPE, "openid profile");
-        assert_eq!(oidc::CLIENT_CREDENTIALS_SCOPE, "", "a service account asks for no scope");
     }
 
     #[test]
@@ -3245,26 +3037,10 @@ mod tests {
     }
 
     #[test]
-    fn there_is_no_client_secret_flag_either() {
-        // Same property as `--password`, same reason: a secret on a command
-        // line is in shell history and in `ps` for every user on the machine.
-        // It is read from KIMMY_OIDC_CLIENT_SECRET and from nowhere else.
-        fn has(cmd: &clap::Command, long: &str) -> bool {
-            cmd.get_arguments().any(|a| a.get_long() == Some(long))
-                || cmd.get_subcommands().any(|c| has(c, long))
-        }
-        let mut command = Cli::command();
-        command.build();
-        assert!(!has(&command, "client-secret"), "a --client-secret flag has been added");
-    }
-
-    #[test]
-    fn login_takes_a_user_or_a_federated_flag_but_not_both() {
-        // Clap has to keep the combinations honest, or the wrong pair reaches
-        // the handler and fails somewhere less obvious.
+    fn login_takes_a_user_or_nothing() {
         assert!(Cli::try_parse_from(["kimmy", "login", "root"]).is_ok());
-        assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials"]).is_ok());
-        assert!(Cli::try_parse_from(["kimmy", "login", "--client-credentials", "root"]).is_err());
+        assert!(Cli::try_parse_from(["kimmy", "login"]).is_ok());
+        assert!(Cli::try_parse_from(["kimmy", "login", "root", "ada"]).is_err());
     }
 
     #[test]

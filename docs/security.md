@@ -346,9 +346,13 @@ CLI cannot work out for itself:
 export KIMMY_URL=https://kimmydb.example.com
 export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 
-export KIMMY_TOKEN=$(kimmy login)                     # RFC 8628 device flow, the default
-export KIMMY_TOKEN=$(kimmy login --client-credentials)  # a service; secret from
-                                                        # KIMMY_OIDC_CLIENT_SECRET
+export KIMMY_TOKEN=$(kimmy login)   # RFC 8628 device flow, the default
+
+# A script or a service is not a person and does not log in. It sets
+# KIMMY_TOKEN to a token minted elsewhere — for example, a personal
+access
+# token from the console, audienced at the node (ADR-089).
+export KIMMY_TOKEN=<personal access token>
 ```
 
 The issuer and the resource come from the node's own metadata document. Set
@@ -396,13 +400,6 @@ The refresh token is where the line is drawn, and not arbitrarily: an access
 token is short-lived and audience-restricted to one node, while a refresh token
 outlives the session and mints more. Caching the first has a worst case that
 expires on its own.
-
-**Client authentication uses HTTP Basic** when the provider advertises
-`client_secret_basic`, falling back to the request body only when the provider
-takes the body and not Basic — RFC 6749 §2.3.1 makes Basic mandatory for a
-server and the body optional. The id and secret are form-encoded before the
-header is built, as §2.3.1 requires, which matters as soon as a secret contains
-a `:`, a `+`, a space or a non-ASCII character.
 
 ---
 

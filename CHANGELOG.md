@@ -10,6 +10,21 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Removed
+
+- **`kimmy login --client-credentials` and `kimmy token --client-credentials`**
+  — **breaking**. The CLI is a tool for people; it no longer runs the OAuth2
+  client_credentials grant, reads `KIMMY_OIDC_CLIENT_SECRET`, or uses a
+  `client_secret` key in `~/.config/kimmydb/.kimmy`. A script or a service sets
+  `KIMMY_TOKEN` (or the settings file's `token`) to a token minted elsewhere —
+  for example, a personal access token from the console, audienced at the node.
+  A leftover `client_secret` line in the settings file is warned about and
+  ignored rather than rejected, and `kimmy init` drops it on rewrite. Migration:
+  replace `$(kimmy login --client-credentials)` with a personal access token
+  (ADR-089).
+
 ## 0.12.0 - 2026-08-27
 
 ### Added
