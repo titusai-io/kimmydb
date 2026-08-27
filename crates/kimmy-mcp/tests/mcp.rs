@@ -387,6 +387,112 @@ async fn a_read_only_token_can_read_but_not_write() {
 }
 
 #[tokio::test]
+async fn a_ddl_token_can_create_a_collection_and_write_needs_its_own_grant() {
+    // The first thing an agent does with a fresh database is create the
+    // collection it will write to. `ddl` is what allows that (ADR-090), and it
+    // is not implied by `write` — so a writer without it is told no, in the
+    // words the executor uses everywhere else.
+    let server = Server::start().await;
+    let builder =
+        server.token("builder", vec![Grant::new("app", "*", vec![Action::Ddl, Action::Write])]);
+    let created = server
+        .call_ok(&builder, "create_collection", json!({"database":"app","name":"memories"}))
+        .await;
+    assert_eq!(created["created"], "memories");
+    let indexed = server
+        .call_ok(
+            &builder,
+            "create_index",
+            json!({"database":"app","collection":"memories","fields":[{"path":"topic"}]}),
+        )
+        .await;
+    assert!(!indexed.is_null(), "a ddl token creates indexes too");
+    server
+        .call_ok(
+            &builder,
+            "insert",
+            json!({"database":"app","collection":"memories","document":{"topic":"x"}}),
+        )
+        .await;
+
+    let writer = server.token("writer", vec![Grant::new("app", "*", vec![Action::Write])]);
+    let refused =
+        server.call(&writer, "create_collection", json!({"database":"app","name":"other"})).await;
+    assert!(!refused["error"].is_null(), "write must not imply ddl: {refused}");
+    assert!(
+        refused["error"]["message"].as_str().unwrap_or_default().contains("not authorized"),
+        "the refusal names itself: {refused}"
+    );
+}
+
+#[tokio::test]
+async fn listing_a_database_that_does_not_exist_is_an_error_not_an_empty_list() {
+    // `[]` already means "nothing you can see"; a mistyped database name must
+    // not read the same way.
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+    let listed = server.call_ok(&root, "list_collections", json!({"database":"sales"})).await;
+    assert!(listed["collections"].as_array().unwrap().contains(&json!("orders")));
+
+    let missing = server.call(&root, "list_collections", json!({"database":"salez"})).await;
+    let message = missing["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("salez"), "the error names the database: {missing}");
+}
+
+#[tokio::test]
+async fn every_write_tool_reports_the_stamp_it_produced() {
+    // `insert` reported one from the start; the other three did not, so a
+    // client wanting to follow a bulk load or a single update with a
+    // conditional write (ADR-084) had no version to name.
+    let server = Server::start().await;
+    seed(&server);
+    let root = server.root();
+
+    let many = server
+        .call_ok(
+            &root,
+            "insert_many",
+            json!({"database":"sales","collection":"orders",
+                   "documents":[{"_id":"s1","total":1},{"_id":"s2","total":2}]}),
+        )
+        .await;
+    let stamps = many["stamps"].as_array().expect("stamps");
+    assert_eq!(stamps.len(), 2);
+    assert_ne!(stamps[0], stamps[1], "each document lands at its own version");
+
+    let updated = server
+        .call_ok(
+            &root,
+            "update",
+            json!({"database":"sales","collection":"orders",
+                   "filter":{"_id":"s1"},"update":{"$set":{"total":10}}}),
+        )
+        .await;
+    assert!(updated["stamp"].is_string(), "a single update names its version: {updated}");
+    assert_ne!(updated["stamp"], stamps[0], "and it moved");
+
+    let deleted = server
+        .call_ok(
+            &root,
+            "delete",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"s2"}}),
+        )
+        .await;
+    assert!(deleted["stamp"].is_string(), "a single delete names the tombstone: {deleted}");
+
+    let multi = server
+        .call_ok(
+            &root,
+            "update",
+            json!({"database":"sales","collection":"orders",
+                   "filter":{},"update":{"$set":{"seen":true}},"multi":true}),
+        )
+        .await;
+    assert!(multi["stamp"].is_null(), "a multi write has no single version: {multi}");
+}
+
+#[tokio::test]
 async fn grants_are_scoped_per_collection() {
     let server = Server::start().await;
     seed(&server);

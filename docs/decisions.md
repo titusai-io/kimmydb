@@ -4246,6 +4246,110 @@ a CLI flag. The Basic-auth encoding, the auth-method discovery and the
 empty-scope rule that the grant needed all leave with it; the device flow
 never used them.
 
+## ADR-090 — `ddl` is its own action, and it federates
+
+**Decision.** A new action, `ddl`, covers creating and dropping collections,
+creating and dropping indexes, and configuring or disabling embeddings. Those
+operations required `admin` before; they require `ddl` now, and `admin` still
+implies it. `ddl` implies no data access and never reaches the system database.
+It maps through an identity provider like `read` and `write` do; the
+federation refusal stays exactly where it was, on `admin`.
+
+**What prompted it.** An agent connecting over MCP through an external
+identity provider — a federated principal — was told to `create_collection`
+before inserting, by the server's own instructions, and was refused: the tool
+needed `admin`, and ADR-067 forbids federating that. The instructions said one
+thing and the authorization model another, and the only ways to reconcile them
+without this change were to hide the tool (ADR-025 says why not), to hand the
+agent `allow_federated_admin` (a superuser with user management and backup, to
+create a collection), or to have a person create every collection an agent
+might want. None of those is the model; the model was wrong about what `admin`
+bundled.
+
+**Why a split rather than a flag.** `admin` conflated two things: shaping the
+*data* and administering the *server*. The break-glass argument in ADR-067 is
+about the second — a compromised provider that can mint a user manager, take a
+backup, or open `__users` is unrecoverable from inside the database. A
+provider that can mint a principal that creates collections is in the same
+position as one that mints a writer: bounded by grants, revocable by editing a
+mapping, and nothing the root account cannot undo. So the boundary moves to
+where the argument actually applies.
+
+**Alternatives rejected.** *`write` implies `ddl`* — a writer that can drop
+the collection it writes to has a much larger blast radius than one that can
+only change rows, and "can insert" should not silently mean "can drop".
+*`ddl` implies `read`* — shaping a collection is not reading it; a role that
+needs both names both, as `watch` and `read` already work. *Making
+`configure_vectors` stay `admin`* — enabling embeddings creates a shadow
+collection and disabling them can drop it, which is collection DDL by any
+reading; leaving it behind `admin` would have reproduced the original problem
+one step later, when the agent tried to make its new collection searchable.
+
+**The system database.** `Principal::system_access` opens `__kimmy` to any
+holder of `admin`, on any grant. `ddl` gets no such door: a `ddl` grant over
+`*` creates collections everywhere except there. The unit test that says so
+is the one that must never be deleted.
+
+**Cost.** One more action to explain, and every grant that meant "this role
+may create collections" now has to say `ddl` if it did not already say
+`admin` — no existing grant loses anything, because `admin` implies `ddl`.
+The OpenAPI enum, the CLI docs, the actions table and the startup-refusal
+message all grow a word.
+
+**Consequence.** The recommended agent role is `read`, `write`, `search`,
+`ddl` over the databases it owns — everything it needs to build and use its
+own collections, and nothing about the server.
+
+---
+
+## ADR-091 — Search verifies the source document, not only the chunk
+
+**Decision.** `vector_search` and `hybrid_search` check every hit against the
+source collection after ranking, and drop the ones whose document no longer
+exists. Separately, the embedding worker removes a deleted document's chunks
+regardless of provider (`byo` included), and its streaming path re-reads the
+document's current stamp after the provider returns and before it writes, so
+an embed that outlasts a delete or an update stores nothing.
+
+**What was wrong.** ADR-022 promises that "a deleted document cannot surface".
+It was kept for a missing *chunk record* — the graph skips a candidate whose
+record is gone — and not for a missing *document*. Deleting a document never
+touched the shadow collection; the worker removed the chunks when it reached
+the `Delete` entry in the stream. Until then the chunks were scored and
+returned like any other, with an `_id` that resolved to nothing. That window
+was a second or two on a healthy owner and unbounded when the worker was
+behind, disabled, or not this node's. Two further defects hid in the same
+code: a `byo` collection's chunks were never cleaned up at all, because the
+"nothing to embed" bail preceded the delete branch; and the streaming path
+embedded from the entry's own image without checking that the document still
+existed when the provider came back, so a slow embed could land chunks *after*
+the delete that should have removed them, permanently.
+
+**Why at read time, not in the delete transaction.** Removing the chunks
+inside `delete_where` would make the promise structural, and it is the
+obvious fix. It is not the chosen one, for three reasons. The write path is
+bounded deliberately (ADR-083, ADR-086) and the shadow's chunk keys are not
+reachable from the source collection's metadata without a scan or a new
+index. TTL expiry, drop-collection and a replica applying a remote delete are
+all further delete paths, and each would need the cascade too — the read-time
+check covers every one of them at once. And the check is one point read per
+hit, after ranking, on a result that is at most `MAX_K` long: cheap in the
+place where a mistake is visible, rather than a cost on every write to keep a
+structure the search path does not trust anyway (ADR-022's own principle).
+
+**What it does not do.** A hit dropped here is not replaced, so a result may
+be shorter than `k` by the number of deletions the worker has not yet caught
+up with. That is reported honestly rather than papered over by ranking again.
+Updated documents are unchanged by this decision: their old chunks are
+replaced when the worker re-embeds, and until then the old text is what
+matches — bounded staleness on live data, which ADR-022 already accepts.
+
+**Consequence.** The `vectors.md` statement of the invariant now distinguishes
+the chunk from the document. The one place source documents were already
+consulted — the `filter` path, which scans them — is unchanged.
+
+---
+
 ## Next
 
 - [Roadmap](roadmap.md) — decisions still to be made

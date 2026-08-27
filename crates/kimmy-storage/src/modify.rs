@@ -155,6 +155,14 @@ pub struct ModifyManyOutcome {
     /// Write transactions the request cost — one per chunk (ADR-086). Zero
     /// when nothing matched.
     pub commits: u64,
+    /// The stamp of the last document written, when one was.
+    ///
+    /// One version names one document, so this is only *the* result when the
+    /// request wrote one — the single-document form of `update` and `delete`,
+    /// which is where a caller needs it for the conditional write that follows
+    /// (ADR-084). A multi write reports it too, but it describes the last
+    /// document of the last chunk and nothing else.
+    pub stamp: Option<Stamp>,
 }
 
 impl Engine {
@@ -241,6 +249,7 @@ impl Engine {
             outcome.commits += 1;
             outcome.matched += matches.len() as u64;
             outcome.modified += entries.len() as u64;
+            outcome.stamp = entries.last().map(|e| e.stamp);
             // Published per chunk, after its commit: a subscriber sees a
             // chunk whole before the next one begins.
             self.publish(entries);
@@ -933,7 +942,10 @@ mod tests {
         let before = engine.commits();
         let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
         assert_eq!(engine.commits() - before, 1, "one request, one commit");
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1, ..out }
+        );
 
         for id in [1i64, 2, 4] {
             let doc = engine.get(&coll, &DocId::Int64(id)).unwrap().unwrap();
@@ -959,7 +971,10 @@ mod tests {
         let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), Some(1)).unwrap();
         // Documents scan in key order and _id 1 is pending, so the scan
         // stops at the first document it looks at.
-        assert_eq!(out, ModifyManyOutcome { examined: 1, matched: 1, modified: 1, commits: 1 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 1, matched: 1, modified: 1, commits: 1, ..out }
+        );
         assert_eq!(
             engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
             "claimed"
@@ -985,7 +1000,10 @@ mod tests {
         };
         let before = engine.commits();
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 0, modified: 0, commits: 0 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 4, matched: 0, modified: 0, commits: 0, ..out }
+        );
         assert_eq!(engine.commits() - before, 0, "a no-op must not reach the disk");
         assert!(rx.try_recv().is_err(), "a no-op must publish nothing");
     }
@@ -1034,7 +1052,10 @@ mod tests {
             upsert: None,
         };
         let out = engine.modify_where(&coll, &Candidates::Scan, &spec, None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 4, matched: 3, modified: 3, commits: 1, ..out }
+        );
         for id in [1i64, 2, 4] {
             assert!(engine.get(&coll, &DocId::Int64(id)).unwrap().is_none(), "_id {id} removed");
         }
@@ -1054,7 +1075,10 @@ mod tests {
         let candidates = Candidates::Keys(vec![key(2), key(99), key(1), key(1), key(3)]);
 
         let out = engine.modify_where(&coll, &candidates, &claim_all(), None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 2, matched: 1, modified: 1, commits: 1 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 2, matched: 1, modified: 1, commits: 1, ..out }
+        );
         assert_eq!(
             engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
             "claimed"
@@ -1146,7 +1170,10 @@ mod tests {
 
         let before = engine.commits();
         let out = engine.modify_where(&coll, &Candidates::Scan, &claim_all(), None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 12, matched: 12, modified: 12, commits: 3 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 12, matched: 12, modified: 12, commits: 3, ..out }
+        );
         assert_eq!(engine.commits() - before, 3, "5 + 5 + 2");
 
         // Events arrive chunk by chunk, in key order: a subscriber sees the
@@ -1221,7 +1248,10 @@ mod tests {
         let key = |id: i64| crate::docs::doc_key(&DocId::Int64(id)).unwrap();
         let keys = Candidates::Keys(vec![key(7), key(2), key(5), key(2), key(0), key(3), key(6)]);
         let out = engine.modify_where(&coll, &keys, &claim_all(), None).unwrap();
-        assert_eq!(out, ModifyManyOutcome { examined: 6, matched: 6, modified: 6, commits: 2 });
+        assert_eq!(
+            out,
+            ModifyManyOutcome { examined: 6, matched: 6, modified: 6, commits: 2, ..out }
+        );
         assert_eq!(
             engine.get(&coll, &DocId::Int64(1)).unwrap().unwrap().get_str("status").unwrap(),
             "pending",

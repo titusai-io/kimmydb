@@ -237,6 +237,17 @@ impl Engine {
         coll: &CollectionMeta,
         docs: Vec<Document>,
     ) -> std::result::Result<Vec<DocId>, BulkInsertError> {
+        self.insert_many_stamped(coll, docs).map(|v| v.into_iter().map(|(id, _)| id).collect())
+    }
+
+    /// [`Engine::insert_many`], also returning each document's stamp — every
+    /// document in the batch gets its own, so a caller that wants to follow
+    /// up one of them with a conditional write has the version to name.
+    pub fn insert_many_stamped(
+        &self,
+        coll: &CollectionMeta,
+        docs: Vec<Document>,
+    ) -> std::result::Result<Vec<(DocId, Stamp)>, BulkInsertError> {
         // Nothing to do, and nothing to log: an empty batch must not open a
         // transaction, or it would append an oplog entry for a write that
         // never happened.
@@ -255,7 +266,7 @@ impl Engine {
             // stored state — redb reads see the writes of their own txn.
             match self.insert_in_txn(&txn, coll, doc) {
                 Ok((id, entry)) => {
-                    ids.push(id);
+                    ids.push((id, entry.stamp));
                     entries.push(entry);
                 }
                 Err(source) => {

@@ -116,6 +116,14 @@ pub fn list_databases(state: &SharedState, auth: &Auth) -> Result<Value, ApiErro
 
 pub fn list_collections(state: &SharedState, auth: &Auth, db: &str) -> Result<Value, ApiError> {
     let _span = op_span("list_collections", db, None).entered();
+    // A database that does not exist is an error, not an empty list: the list
+    // is filtered by grant, so `[]` already means "nothing you can see", and
+    // a caller that mistyped the name would otherwise read it as exactly
+    // that. What stays `[]` is a database that exists and in which the
+    // caller can read nothing — zero grants is not a refusal (ADR-066).
+    if !state.engine.database_exists(db)? {
+        return Err(kimmy_core::Error::DatabaseNotFound(db.to_string()).into());
+    }
     let all = state.engine.list_collections(db)?;
     let names: Vec<&str> =
         auth.principal().visible(Action::Read, db, all.iter().map(|c| c.name.as_str()));
@@ -129,7 +137,7 @@ pub fn create_collection(
     name: &str,
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_collection", db, Some(name)).entered();
-    auth.require(Action::Admin, db, Some(name))?;
+    auth.require(Action::Ddl, db, Some(name))?;
     let meta = state.engine.create_collection(db, name)?;
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
@@ -141,7 +149,7 @@ pub fn drop_collection(
     coll: &str,
 ) -> Result<Value, ApiError> {
     let _span = op_span("drop_collection", db, Some(coll)).entered();
-    auth.require(Action::Admin, db, Some(coll))?;
+    auth.require(Action::Ddl, db, Some(coll))?;
     Ok(json!({ "dropped": state.engine.drop_collection(db, coll)? }))
 }
 
@@ -581,17 +589,21 @@ pub fn insert_many(
         .map(|(i, value)| json_to_document(value).map_err(|e| at_index(i, e)))
         .collect::<Result<Vec<_>, _>>()?;
 
-    let ids = state.engine.insert_many(&meta, docs).map_err(|e| match e.index {
+    let stamped = state.engine.insert_many_stamped(&meta, docs).map_err(|e| match e.index {
         Some(i) => at_index(i, e.source.into()),
         None => e.source.into(),
     })?;
 
+    // Positionally parallel to `insertedIds`: every document gets its own
+    // stamp, and a caller following one up with a conditional write needs
+    // the version it landed at, exactly as `insert` reports.
     Ok(json!({
-        "inserted": ids.len(),
-        "insertedIds": ids
+        "inserted": stamped.len(),
+        "insertedIds": stamped
             .iter()
-            .map(|id| crate::json::bson_to_json(&id.to_bson()))
+            .map(|(id, _)| crate::json::bson_to_json(&id.to_bson()))
             .collect::<Vec<_>>(),
+        "stamps": stamped.iter().map(|(_, stamp)| stamp.encode()).collect::<Vec<_>>(),
     }))
 }
 
@@ -731,10 +743,28 @@ pub fn update(
         "modified": outcome.modified,
         "commits": outcome.commits,
     });
+    if let Some(stamp) = single_stamp(multi, &outcome) {
+        body["stamp"] = json!(stamp.encode());
+    }
     if explain {
         body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
+}
+
+/// The stamp a filtered write produced, when there is exactly one to report.
+///
+/// A single-document write names one version, the one a caller passes back
+/// as `if_stamp` next time — the same thing `insert` and `replace` report. A
+/// `multi` write has no single version by construction (ADR-084 refuses
+/// `if_stamp` alongside it for the same reason), so it reports none rather
+/// than the last chunk's last document, which would look like the answer
+/// and not be it.
+fn single_stamp(
+    multi: bool,
+    outcome: &kimmy_storage::ModifyManyOutcome,
+) -> Option<kimmy_core::Stamp> {
+    (!multi && outcome.modified == 1).then_some(outcome.stamp).flatten()
 }
 
 /// Where a filtered write looks, in the engine's terms, plus what `explain`
@@ -1042,6 +1072,9 @@ pub fn delete(
     let outcome = state.engine.modify_where(&meta, &candidates, &modify, stop_after)?;
 
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
+    if let Some(stamp) = single_stamp(multi, &outcome) {
+        body["stamp"] = json!(stamp.encode());
+    }
     if explain {
         body["explain"] = planned.stats(&outcome).to_json();
     }
@@ -1080,7 +1113,7 @@ pub fn create_index(
     spec: IndexSpec,
 ) -> Result<Value, ApiError> {
     let _span = op_span("create_index", db, Some(coll)).entered();
-    auth.require(Action::Admin, db, Some(coll))?;
+    auth.require(Action::Ddl, db, Some(coll))?;
 
     let fields: Vec<kimmy_storage::IndexField> = spec
         .fields
@@ -1183,7 +1216,7 @@ pub fn drop_index(
     name: &str,
 ) -> Result<Value, ApiError> {
     let _span = op_span("drop_index", db, Some(coll)).entered();
-    auth.require(Action::Admin, db, Some(coll))?;
+    auth.require(Action::Ddl, db, Some(coll))?;
     Ok(json!({ "dropped": state.engine.drop_index(db, coll, name)? }))
 }
 

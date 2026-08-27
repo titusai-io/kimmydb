@@ -107,7 +107,7 @@ pub fn mode() -> AuditMode {
 /// `search` and `watch` are reads: one ranks documents, the other observes
 /// them. Neither writes, so neither is included at `Writes`.
 fn is_write(action: Action) -> bool {
-    matches!(action, Action::Write | Action::Admin)
+    matches!(action, Action::Write | Action::Ddl | Action::Admin)
 }
 
 /// Record one authorization decision.
@@ -288,6 +288,7 @@ mod tests {
         assert!(!is_write(Action::Watch));
         assert!(!is_write(Action::Read));
         assert!(is_write(Action::Write));
+        assert!(is_write(Action::Ddl), "creating or dropping a collection changes state");
         assert!(is_write(Action::Admin));
     }
 }

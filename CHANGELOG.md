@@ -12,7 +12,59 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **A `ddl` action, split out of `admin`, and it federates.** Creating and
+  dropping collections, creating and dropping indexes, and configuring or
+  disabling embeddings now require `ddl` rather than `admin`; `admin` still
+  implies it, so no existing grant loses anything. `ddl` implies no data
+  access and never reaches the system database. Unlike `admin` it maps freely
+  through an identity provider — the case that forced it was an agent over
+  MCP, federated through an OAuth server, told by the server's own
+  instructions to `create_collection` before inserting and refused because
+  the only action that allowed it was the one ADR-067 will not federate.
+  The recommended agent role is `read`, `write`, `search`, `ddl` over the
+  databases it owns (ADR-090).
+- **Every write reports the stamp it produced.** `insert` already did;
+  bulk insert now returns `stamps`, positionally parallel to `insertedIds`,
+  and the filtered `update` and `delete` return `stamp` when they wrote
+  exactly one document without `multi` — the version a conditional write
+  (`if_stamp`, ADR-084) needs next. A multi write reports none, because one
+  version cannot name several documents.
+
 ### Changed
+
+- **Listing the collections of a database that does not exist is a 404.**
+  It was `{"collections": []}`, byte-identical to a database in which the
+  caller can read nothing and to an empty one, so a mistyped name looked like
+  an empty result. A database that exists and hides everything from the
+  caller still lists as `[]`: zero grants is not a refusal (ADR-066).
+- **The MCP instructions name the action each tool needs**, and the
+  `hybrid_search` description says its scores are rank-fusion values that are
+  not comparable with `vector_search` similarities — an agent carrying a
+  similarity threshold across the two was dropping every hybrid result.
+
+### Fixed
+
+- **A deleted document could be returned by `vector_search` and
+  `hybrid_search`.** Its chunks were removed by the embedding worker when it
+  reached the `Delete` entry, not by the delete itself, so for a second or two
+  on a healthy owner — and indefinitely if the worker was behind, disabled or
+  another node's — the chunks were scored and returned with an `_id` that
+  resolved to nothing. Both searches now check every hit against the source
+  collection after ranking and drop the ones whose document is gone; a result
+  can be shorter than `k` by the number of deletions the worker has not
+  caught up with (ADR-091).
+- **A `byo` collection's chunks were never removed when the document was
+  deleted.** The "nothing to embed" bail sat above the delete branch in the
+  worker, so client-supplied vectors stayed searchable until someone called
+  the vectors `DELETE` route by hand.
+- **An embed that finished after the document was deleted or replaced stored
+  its chunks anyway.** The streaming path embedded from the oplog entry's
+  image and wrote without re-reading the document; a slow provider call could
+  land chunks after the `Delete` entry that should have removed them, with
+  nothing left to remove them ever. The worker now re-reads the document's
+  stamp after the provider returns and skips the write if it moved.
 
 - **`openapi.yaml` says what a persistent `unknown` node status means.**
   `unknown` was described accurately but without the fact a failover-writing

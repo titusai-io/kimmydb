@@ -951,7 +951,14 @@ mod tests {
             grants: vec![Grant::new(
                 "sales",
                 "*",
-                vec![Action::Read, Action::Write, Action::Watch, Action::Search, Action::Webhook],
+                vec![
+                    Action::Read,
+                    Action::Write,
+                    Action::Watch,
+                    Action::Search,
+                    Action::Webhook,
+                    Action::Ddl,
+                ],
             )],
         }];
         settings.validate().unwrap();

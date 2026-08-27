@@ -26,7 +26,17 @@ pub enum Action {
     /// path is a different act from being allowed to read, so it is granted
     /// separately rather than arriving bundled with reading.
     Webhook,
-    /// Create/drop collections, manage indexes and users.
+    /// Shape the data: create and drop collections, manage indexes, and
+    /// configure embeddings.
+    ///
+    /// Split out of `admin` so that it federates. An agent working through an
+    /// identity provider needs to create the collection it will write to, and
+    /// that is a decision about *data*, not about *the server*. Managing users
+    /// and roles, taking a backup, and opening the system database stay with
+    /// `admin`, which is the break-glass boundary (ADR-067, ADR-090).
+    Ddl,
+    /// Everything, including user and role management, backup, and the
+    /// system database.
     Admin,
 }
 
@@ -45,6 +55,9 @@ impl Action {
             // Only `Admin` implies it. `Watch` deliberately does not: see the
             // variant's documentation.
             Action::Webhook => &[Action::Webhook, Action::Admin],
+            // `Ddl` implies no data access: a role that shapes a collection
+            // and also fills it names both actions.
+            Action::Ddl => &[Action::Ddl, Action::Admin],
             Action::Admin => &[Action::Admin],
         }
     }
@@ -322,6 +335,34 @@ mod tests {
     }
 
     #[test]
+    fn ddl_does_not_open_the_system_database() {
+        // `ddl` federates, and the system database is where the user store
+        // lives. A federated principal that could create a collection there —
+        // or drop `__users` — would have found the break-glass boundary's back
+        // door. Only `admin` opens it, and `ddl` is exactly the part of
+        // `admin` that does not.
+        let mut p = Principal::new("agent", vec![Grant::new("*", "*", vec![Action::Ddl])]);
+        p.token_version = 0;
+        assert!(p.can(Action::Ddl, "app", Some("memories")));
+        assert!(!p.can(Action::Ddl, crate::users::SYSTEM_DB, Some("__users")));
+        assert!(!p.can(Action::Read, crate::users::SYSTEM_DB, Some("__users")));
+    }
+
+    #[test]
+    fn ddl_implies_no_data_access_and_admin_implies_ddl() {
+        let shaper = Principal::new("s", vec![Grant::new("db", "*", vec![Action::Ddl])]);
+        assert!(shaper.can(Action::Ddl, "db", Some("c")));
+        assert!(!shaper.can(Action::Read, "db", Some("c")));
+        assert!(!shaper.can(Action::Write, "db", Some("c")));
+
+        let writer = Principal::new("w", vec![Grant::new("db", "*", vec![Action::Write])]);
+        assert!(!writer.can(Action::Ddl, "db", Some("c")), "write must not imply ddl");
+
+        let admin = Principal::new("a", vec![Grant::new("db", "*", vec![Action::Admin])]);
+        assert!(admin.can(Action::Ddl, "db", Some("c")));
+    }
+
+    #[test]
     fn an_exact_system_grant_is_honored_down_to_its_collection_pattern() {
         let mut sys = Principal::new(
             "sys",
@@ -392,7 +433,15 @@ mod tests {
     #[test]
     fn admin_implies_everything() {
         let p = Principal::new("a", vec![Grant::new("db", "*", vec![Action::Admin])]);
-        for action in [Action::Read, Action::Write, Action::Watch, Action::Search, Action::Admin] {
+        for action in [
+            Action::Read,
+            Action::Write,
+            Action::Watch,
+            Action::Search,
+            Action::Webhook,
+            Action::Ddl,
+            Action::Admin,
+        ] {
             assert!(p.can(action, "db", Some("c")), "admin should imply {action:?}");
         }
     }
