@@ -1,7 +1,5 @@
 //! The stored form of a document.
 
-use serde::{Deserialize, Serialize};
-
 use crate::hlc::Stamp;
 
 /// A document as it lives on disk.
@@ -11,7 +9,21 @@ use crate::hlc::Stamp;
 /// concurrent insert that arrives from a peer *after* the delete replicated —
 /// without one, the insert would look like a brand-new document and the delete
 /// would silently undo itself.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+/// **Deliberately not `Serialize`/`Deserialize`.** Nothing serialized this — the
+/// whole workspace, tests included, compiles without the derives — and having
+/// them was a trap rather than a convenience: `body` is a bare `Vec<u8>`, which
+/// serde encodes as a BSON array of int32s, so anything that started putting a
+/// `DocRecord` on the wire would silently pay twelve bytes per byte. That is the
+/// defect just removed from `OplogEntry::body` and `SnapshotDoc::body`.
+///
+/// Without the derives it is a compile error instead of a quiet cost. If one is
+/// ever genuinely needed on the wire, add `#[serde(with = "serde_bytes")]` to
+/// `body` in the same change.
+///
+/// Storage does not want them either: it writes this through its own binary
+/// codec (`kimmy_storage::codec::encode_doc_record`), which has always stored
+/// the body as raw bytes.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DocRecord {
     /// When and where this version was written. Drives last-writer-wins.
     pub stamp: Stamp,
