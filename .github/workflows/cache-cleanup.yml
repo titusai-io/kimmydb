@@ -15,6 +15,12 @@ name: cache cleanup
 on:
   pull_request:
     types: [closed]
+  # After CI on main has saved its caches, prune the ones it superseded.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
 
 jobs:
   cleanup:
@@ -49,3 +55,56 @@ jobs:
               && echo "deleted $id" \
               || echo "could not delete $id (already gone?)"
           done
+
+  # Every rust-cache key ends in the Cargo.lock hash, and a cache is immutable,
+  # so each change to Cargo.lock -- every release bump, every dependency
+  # update -- writes a whole new set for main alongside the old one. Nothing
+  # removes the old set but the 7-day timer and the 10 GiB LRU eviction, and
+  # the eviction is blind: found 2026-08-27 with four complete sets on main,
+  # 10.0 GiB of a 10 GiB limit, and current entries being evicted to keep
+  # stale ones. Keep the newest entry per key family; delete the rest.
+  prune-main:
+    name: prune superseded main caches
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete every main cache but the newest of its family
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          # A family is the key minus its trailing hash segment: for rust-cache,
+          # `v0-rust-<job>-<os>-<envhash>-<lockhash>` minus `-<lockhash>`, so
+          # the entries that differ only by lockfile group together. Anything
+          # not keyed that way (a single segment) is its own family and is kept.
+          gh api --paginate \
+            "/repos/$REPO/actions/caches?ref=refs/heads/main&per_page=100" \
+            --jq '.actions_caches[] | [.id, .created_at, .size_in_bytes, .key] | @tsv' \
+          | awk -F'\t' '{
+              key=$4; family=key; sub(/-[^-]*$/, "", family);
+              print family "\t" $2 "\t" $1 "\t" $3 "\t" key
+            }' \
+          | sort -t$'\t' -k1,1 -k2,2r > caches.tsv
+
+          total=0; freed=0
+          while IFS=$'\t' read -r family created id size key; do
+            total=$((total + size))
+            if [ "${seen:-}" = "$family" ]; then
+              # Best-effort: an entry can be evicted between listing and
+              # deleting, and a 404 for something already gone is not a failure.
+              if gh api --method DELETE "/repos/$REPO/actions/caches/$id" >/dev/null; then
+                freed=$((freed + size)); echo "deleted  $key ($((size / 1048576)) MiB, $created)"
+              else
+                echo "could not delete $key (already gone?)"
+              fi
+            else
+              seen="$family"; echo "kept     $key ($((size / 1048576)) MiB, $created)"
+            fi
+          done < caches.tsv
+
+          echo "main caches: $((total / 1048576)) MiB before, $(((total - freed) / 1048576)) MiB after"
+
