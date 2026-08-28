@@ -29,9 +29,12 @@ publish-jobs = ["homebrew", "./publish-ghcr"]
 # that runs on any distribution and in a scratch container, and redb and ring
 # both build cleanly against musl on both architectures — verified empirically
 # on aarch64 (ADR-063) before this was written down.
+# No x86_64-apple-darwin: Intel Macs are not supported (decided 2026-08-28).
+# It was also the release's longest build at over twelve minutes — the macOS
+# x86_64 runners are the slowest dist offers — for a platform Apple stopped
+# selling in 2023.
 targets = [
     "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
     "aarch64-unknown-linux-musl",
     "x86_64-unknown-linux-musl",
 ]
