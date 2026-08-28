@@ -10,7 +10,12 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.16.2 - 2026-08-28
+
+A patch: no wire, storage-format or API change; rolling upgrade. Two
+cluster defects found the same day by driving bulk writes through a
+per-request load balancer — one of them data loss — and one build change.
+Operators of a multi-member cluster should take this one.
 
 ### Fixed
 
