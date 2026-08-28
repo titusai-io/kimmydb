@@ -121,8 +121,14 @@ jobs:
           --ignored --exact
           index::tests::a_healthy_graph_at_a_realistic_width_is_not_rebuilt
 
-  python-client:
-    name: python client
+  # One release build of `kimmyd`, shared. The Python, Go, conformance, and
+  # docker jobs all drive a real server, and each used to compile its own —
+  # four identical `cargo build --release` runs per push, the docker one from
+  # cold inside BuildKit where no Rust cache reaches. Now this job builds once
+  # against the warm cache and the others download the result. The artifact
+  # is deleted after a day: it is a hand-off between jobs, not a release.
+  build:
+    name: build kimmyd
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
@@ -136,11 +142,36 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Build the server and the Rust conformance driver
+        run: |
+          cargo build --release --bin kimmyd
+          cargo build --release --example conformance -p kimmy-client
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kimmyd
+          path: |
+            target/release/kimmyd
+            target/release/examples/conformance
+          if-no-files-found: error
+          retention-days: 1
+
+  python-client:
+    name: python client
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
       # The Python tests drive a real `kimmyd`, the same way the Rust client's
       # do. A mocked server would only assert what the client already
-      # believes, which is the half that was never in doubt.
-      - name: Build kimmyd
-        run: cargo build --release --bin kimmyd
+      # believes, which is the half that was never in doubt. The binary lands
+      # where the tests already look; artifacts do not keep the execute bit.
+      - uses: actions/download-artifact@v4
+        with:
+          name: kimmyd
+          path: target/release
+      - run: chmod +x target/release/kimmyd
 
       - uses: astral-sh/setup-uv@v5
 
@@ -151,22 +182,17 @@ jobs:
   go-client:
     name: go client
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    needs: build
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # Save only from main — see the note on the `check` job above.
-      - uses: Swatinem/rust-cache@v2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-
       # Same reasoning as the Python job: the tests drive a real `kimmyd`,
       # because a mocked server asserts only what the client already believes.
-      - name: Build kimmyd
-        run: cargo build --release --bin kimmyd
+      - uses: actions/download-artifact@v4
+        with:
+          name: kimmyd
+          path: target/release
+      - run: chmod +x target/release/kimmyd
 
       - uses: actions/setup-go@v5
         with:
@@ -188,17 +214,15 @@ jobs:
   conformance:
     name: client conformance
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    needs: build
     steps:
       - uses: actions/checkout@v5
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      # Save only from main — see the note on the `check` job above.
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v4
         with:
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: kimmyd
+          path: target/release
+      - run: chmod +x target/release/kimmyd target/release/examples/conformance
 
       - uses: astral-sh/setup-uv@v5
 
@@ -210,11 +234,9 @@ jobs:
       # One set of scenarios, three clients. This is the job that would catch
       # the day one client starts paging differently from the other two —
       # which no per-language suite can, because each would still pass its own.
-      - name: Build the server and the drivers
-        run: |
-          cargo build --release --bin kimmyd
-          cargo build --release --example conformance -p kimmy-client
-          cd clients/go && go build -o conformance-driver ./conformance
+      - name: Build the Go driver
+        working-directory: clients/go
+        run: go build -o conformance-driver ./conformance
 
       - name: Conformance
         run: ./clients/conformance/run.py
@@ -229,9 +251,20 @@ jobs:
   docker:
     name: docker build
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+    needs: build
     steps:
       - uses: actions/checkout@v5
+
+      # The Dockerfile's `prebuilt` stage takes this binary instead of
+      # compiling inside BuildKit, which was the single slowest step in CI:
+      # `target/` is dockerignored and no Rust cache reaches a BuildKit cache
+      # mount, so every push paid a cold release build. The release publish
+      # still compiles in-container, per platform, with the default stage.
+      - uses: actions/download-artifact@v4
+        with:
+          name: kimmyd
+          path: .prebuilt
+      - run: chmod +x .prebuilt/kimmyd
 
       - uses: docker/setup-buildx-action@v3
 
@@ -242,17 +275,12 @@ jobs:
           push: false
           load: true
           tags: kimmydb:ci
+          build-args: |
+            KIMMYD_SOURCE=prebuilt
           cache-from: type=gha
           # `mode=min`, and only written from main, for the same scoping reason
-          # as the Rust cache above.
-          #
-          # `mode=max` was storing every intermediate stage — 224 blobs and
-          # 1.26 GiB — to cache almost nothing that matters: the Dockerfile
-          # builds under `--mount=type=cache`, and BuildKit cache mounts are
-          # **not** exported by `type=gha`. With `COPY crates ./crates`
-          # changing on every commit, the `cargo build --release` layer misses
-          # every run regardless. What is left worth caching is the base images
-          # and the apt layer, which `mode=min` covers.
+          # as the Rust cache above: what is worth caching is the base images
+          # and the apt layer, which the release publish reads too.
           cache-to: ${{ github.ref == 'refs/heads/main' && 'type=gha,mode=min' || '' }}
 
       - name: Smoke test the image

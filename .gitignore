@@ -19,3 +19,6 @@
 .idea/
 .vscode/
 *.swp
+
+# CI drops the prebuilt kimmyd here for the docker job (see ci.yml)
+.prebuilt/

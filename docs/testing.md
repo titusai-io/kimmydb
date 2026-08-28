@@ -1136,8 +1136,13 @@ cargo test -p kimmy-api --test api       # integration only
 PROPTEST_CASES=10000 cargo test -p kimmy-core   # deeper property search
 ```
 
-CI runs fmt, clippy, and tests, then the cluster harness in its own job, then
-builds the Docker image and smoke-tests it with `check-config`.
+CI runs fmt, clippy, and tests, with the cluster harness and the vector
+reachability check in their own jobs. A `build` job compiles `kimmyd` and the
+Rust conformance driver once, in release, and uploads them as a one-day
+artifact; the Python client, Go client, conformance, and Docker jobs download
+that binary rather than each compiling their own. The Docker job passes
+`KIMMYD_SOURCE=prebuilt` so the Dockerfile copies the binary in instead of
+building it, then smoke-tests the image with `check-config`.
 
 **Caches are written only from `main`.** A GitHub Actions cache is scoped to the
 ref that wrote it, and a pull request can already read the base branch's — so
@@ -1148,12 +1153,15 @@ entries to make room for copies of them. `save-if` on the Rust cache and a
 conditional `cache-to` on the Docker build fix that; `cache-cleanup.yml` removes
 a pull request's caches when it closes.
 
-Worth knowing if the Docker job ever looks slow: the Dockerfile builds under
-`--mount=type=cache`, and **BuildKit cache mounts are not exported by
-`type=gha`**. The `cargo build --release` layer therefore misses on every run
-regardless of caching, because `COPY crates ./crates` changes with every commit.
-What the registry cache buys is the base images and the apt layer, which is why
-it is `mode=min`.
+Why the Docker job takes a prebuilt binary: the Dockerfile's default `build`
+stage compiles under `--mount=type=cache`, and **BuildKit cache mounts are not
+exported by `type=gha`**. Compiled in-container on CI, the `cargo build
+--release` layer missed on every run — `COPY crates ./crates` changes with
+every commit — and was a cold nine-minute build, the slowest thing in the
+workflow. Compiling once against the warm Rust cache and handing the binary to
+the image sidesteps that entirely. The release publish still compiles
+in-container, per platform, with the default stage. What the registry cache
+buys is the base images and the apt layer, which is why it is `mode=min`.
 
 ---
 

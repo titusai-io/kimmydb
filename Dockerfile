@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile:1
 
+# Where the kimmyd binary comes from. `build` (the default) compiles it in the
+# stage below, which is what a laptop `docker build` and the multi-arch
+# release publish do. CI passes `prebuilt` to take the binary its `build` job
+# already compiled once for every other job, from `.prebuilt/kimmyd` in the
+# context, instead of compiling it a second time from cold inside BuildKit.
+ARG KIMMYD_SOURCE=build
+
 # ---- build ----------------------------------------------------------------
 FROM rust:1-slim-trixie AS build
 
@@ -22,6 +29,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cargo build --release --bin kimmyd && \
     cp target/release/kimmyd /usr/local/bin/kimmyd
 
+# ---- prebuilt -------------------------------------------------------------
+# Only evaluated when KIMMYD_SOURCE=prebuilt, so the missing file is harmless
+# for every other build.
+FROM scratch AS prebuilt
+COPY .prebuilt/kimmyd /usr/local/bin/kimmyd
+
+# The stage the runtime copies from, resolved by the build arg above.
+FROM ${KIMMYD_SOURCE} AS kimmyd-bin
+
 # ---- runtime --------------------------------------------------------------
 FROM debian:trixie-slim AS runtime
 
@@ -37,7 +53,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --uid 10001 --home-dir /var/lib/kimmy --shell /usr/sbin/nologin kimmy
 
-COPY --from=build /usr/local/bin/kimmyd /usr/local/bin/kimmyd
+COPY --from=kimmyd-bin /usr/local/bin/kimmyd /usr/local/bin/kimmyd
 
 # The data directory is a volume: it holds the redb file and, critically, the
 # node identity. Losing it makes a restarted node a stranger to its own writes.
