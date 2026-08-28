@@ -355,3 +355,16 @@ wrong answers rather than crashes. These are property-tested:
 | [CLI](docs/cli.md) · [Clients](docs/clients.md) · [Compatibility](docs/compatibility.md) | The `kimmy` terminal client, the first-party libraries, and what `/v1` promises |
 | [Benchmarks](docs/benchmarks.md) | What has been measured, with method |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |
+
+## License
+
+KimmyDB is developed by [Titus AI LLC](https://titusai.io).
+
+- **Server** (`kimmyd` and the crates it is built from): [GNU AGPL-3.0](LICENSE).
+  Run it anywhere, including commercially, under the terms of that license.
+- **Client libraries** (`kimmy-client` for Rust, `clients/go`, `clients/python`):
+  [Apache-2.0](LICENSE-APACHE). Use them in anything.
+- **Commercial license**: for embedding or distributing KimmyDB without the
+  AGPL's obligations, write to <licensing@titusai.io>.
+
+[LICENSING.md](LICENSING.md) explains the split in plain language.

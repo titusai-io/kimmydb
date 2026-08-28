@@ -18,9 +18,10 @@ members = [
 version = "0.15.1"
 edition = "2024"
 rust-version = "1.89"
+license = "AGPL-3.0-only"
 repository = "https://github.com/titusai-io/kimmydb"
 homepage = "https://github.com/titusai-io/kimmydb"
-authors = ["Chris Gruber <chris@titusai.io>"]
+authors = ["Titus AI LLC <licensing@titusai.io>"]
 
 [workspace.dependencies]
 # Internal crates

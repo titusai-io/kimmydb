@@ -3,6 +3,10 @@ name = "kimmy-client"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+# Apache-2.0, not the workspace's AGPL: this crate is what applications link
+# against, and nothing an application does with it should carry an obligation.
+# See LICENSING.md at the repository root.
+license = "Apache-2.0"
 repository.workspace = true
 authors.workspace = true
 description = "Rust client for KimmyDB"

@@ -10,6 +10,20 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+KimmyDB is now developed by Titus AI LLC, and this is the first release to
+declare a licence. The server (`kimmyd`, the crates it is built from, and the
+`kimmy` CLI) is licensed under the GNU AGPL-3.0; the client libraries
+(`kimmy-client`, `clients/go`, `clients/python`) are Apache-2.0; commercial
+licenses for the server are available from <licensing@titusai.io>.
+[LICENSING.md](LICENSING.md) has the plain-language version. Nothing in the
+protocol, the storage format, or the client APIs changes — this is a legal
+change, not a technical one.
+
+Contributions now go through a [Contributor License Agreement](CLA.md), and
+security reports through [SECURITY.md](SECURITY.md).
+
 ## 0.15.1 - 2026-08-27
 
 The first release of the 0.15 line that actually shipped. `v0.15.0` was
