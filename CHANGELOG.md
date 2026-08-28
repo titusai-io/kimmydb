@@ -12,6 +12,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **Storage commits no longer stall the async runtime.** Every write
+  transaction — the wait for redb's single writer lock and the fsync at
+  commit — ran inline on a tokio worker thread. A few concurrent writers
+  (bulk inserts spread across members through a load balancer, plus
+  anti-entropy applying peers' batches, plus the embedding worker) pinned
+  every worker: peers' TLS handshakes timed out after 5 s, `/metrics` hung
+  for 10 s, SWIM marked the member down and back up, and per-collection
+  ownership flapped with it. `Engine::begin_write` and the commit now yield
+  the worker (`block_in_place` on a multi-thread runtime; no change off one),
+  and `/metrics` gains `kimmy_runtime_stall_seconds` — the worst delay a
+  250 ms timer on the runtime saw since the last scrape — so a blocked
+  worker is a number before it is a handshake timeout.
+
 ### Removed
 
 - **Intel Mac builds.** Releases no longer ship `x86_64-apple-darwin`
