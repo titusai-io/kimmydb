@@ -39,10 +39,10 @@ pub const CONSUMER: &str = "embedding-worker";
 /// delays embedding but never silently loses it.
 const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How long a node waits before embedding a document written somewhere else.
+/// How long a non-owner waits before re-checking a document it did not embed.
 ///
-/// Every node runs a worker and every node sees every write, so before this
-/// existed all of them embedded the same document at once. The stored result
+/// Every node runs a worker and every node sees every write, so before
+/// ownership existed all of them embedded the same document at once. The stored result
 /// was still correct — `vectors_are_stale` makes a losing write a no-op, which
 /// is why the shadow collection holds one chunk per document and not one per
 /// node — but the *provider calls* were not deduplicated. Measured against a
@@ -50,15 +50,30 @@ const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 /// metered API that is the bill; locally it is CPU and latency; either way it
 /// scales with the number of nodes.
 ///
-/// The node that originated the write embeds immediately, so the common path
-/// costs nothing. Everyone else waits this long and then checks again: by then
-/// the originator's vectors have normally replicated, `vectors_are_stale` says
-/// no, and no provider call happens at all.
+/// The collection's rendezvous owner embeds every write it sees immediately,
+/// whether it wrote the document or not (ADR-077, as amended 2026-08-28).
+/// Everyone else holds the document and, this long later, asks one question:
+/// *am I the owner now?* Ownership is a pure function of the live member set,
+/// so the answer changes exactly when the owner has left — and then the
+/// survivor that inherited the collection embeds what the owner never got to.
+/// While the owner is alive the re-check embeds nothing, however far behind
+/// the owner is, which is what keeps a bulk load at one provider call per
+/// document: a 2026-08-28 ingest of 361 documents cost 570 under the old
+/// rule, where the originator embedded immediately *and* the owner took over
+/// everything the originator had not reached within this grace.
 ///
 /// It has to exceed one anti-entropy round comfortably — the default sync
-/// interval is 5s — or the deferral expires before the originator's work could
-/// have arrived and the duplicate call happens anyway.
+/// interval is 5s — so that a re-check on a new owner finds the vectors the
+/// old owner did write before it left.
 const FOREIGN_GRACE: Duration = Duration::from_secs(30);
+
+/// How long a non-owner keeps re-checking a deferred document before letting
+/// it go. Long enough to outlast a member's failure detection and the first
+/// rounds of replication onto whoever inherits the collection; bounded so a
+/// sustained bulk load on a healthy cluster does not pin its whole history in
+/// every non-owner's queue. Past this, the document is the owner's alone —
+/// and the owner's own oplog stream, or a lost-position rescan, still has it.
+const DEFERRAL_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 
 /// How often the worker wakes to re-check deferred documents when no writes
 /// are arriving to wake it anyway.
@@ -175,6 +190,9 @@ struct Deferred {
     collection: kimmy_core::CollectionId,
     source: kimmy_core::DocId,
     due: Instant,
+    /// When the document was first deferred; the age [`DEFERRAL_MAX_AGE`] is
+    /// measured from.
+    since: Instant,
 }
 
 /// What one processed entry did, so tests and metrics can tell the cases apart.
@@ -189,9 +207,22 @@ pub enum Outcome {
     /// Nothing to do: not a vector-enabled collection, no embeddable text, or
     /// the vectors were already current.
     Skipped,
-    /// Written by another node, so its owner is given first refusal. Re-checked
-    /// after [`FOREIGN_GRACE`] and embedded then if nobody else did.
+    /// This node does not own the collection, so the write is held rather
+    /// than embedded. Re-checked after [`FOREIGN_GRACE`] and embedded then
+    /// only if ownership has moved here in the meantime.
     Deferred,
+}
+
+/// What re-checking one deferred document found.
+enum Recheck {
+    /// This node owns the collection now and the vectors were missing.
+    Embedded,
+    /// This node owns the collection and the vectors were already current.
+    Current,
+    /// Someone else still owns the collection.
+    NotOwner,
+    /// Nothing to embed: the collection is gone or no longer server-embedded.
+    Gone,
 }
 
 impl EmbeddingWorker {
@@ -401,15 +432,17 @@ impl EmbeddingWorker {
         Ok(embedded)
     }
 
-    /// Hold a remotely-written document for a later re-check.
+    /// Hold a document this node does not own for a later re-check.
     fn defer(&mut self, collection: kimmy_core::CollectionId, source: kimmy_core::DocId) {
         // Replaced rather than duplicated: a document written twice in quick
         // succession only needs one re-check, and it needs the later deadline.
         self.deferred.retain(|d| !(d.collection == collection && d.source == source));
+        let now = Instant::now();
         self.deferred.push_back(Deferred {
             collection,
             source,
-            due: Instant::now() + FOREIGN_GRACE,
+            due: now + FOREIGN_GRACE,
+            since: now,
         });
         self.counters.deferred.fetch_add(1, Ordering::Relaxed);
 
@@ -422,28 +455,40 @@ impl EmbeddingWorker {
         }
     }
 
-    /// Embed any deferred document whose owner has had its chance and did not
-    /// take it.
+    /// Re-check every due deferral: embed it if this node has become the
+    /// collection's owner and the vectors are still missing, hold it a while
+    /// longer if someone else still owns it, let it go once it is older than
+    /// [`DEFERRAL_MAX_AGE`].
     ///
-    /// Nearly always a no-op beyond a storage read: by the time a deferral is
-    /// due the originator's vectors have replicated, `embed_one` finds them
-    /// current, and no provider is called.
-    /// `now` is a parameter so a test can reach the deadline without sleeping
-    /// through [`FOREIGN_GRACE`].
+    /// On a healthy cluster this embeds nothing and costs a storage read per
+    /// item: the owner embedded the document from its own stream long before
+    /// the grace ran out. `now` is a parameter so a test can reach the
+    /// deadline without sleeping through [`FOREIGN_GRACE`].
     pub async fn drain_deferred(&mut self, now: Instant) -> usize {
         let mut embedded = 0;
 
         while self.deferred.front().is_some_and(|d| d.due <= now) {
             let Some(item) = self.deferred.pop_front() else { break };
             match self.embed_deferred(&item).await {
-                Ok(true) => {
+                Ok(Recheck::Embedded) => {
                     embedded += 1;
                     debug!(
                         collection = %item.collection,
-                        "embedded a document its own node did not"
+                        "embedded a document whose previous owner did not"
                     );
                 }
-                Ok(false) => {}
+                Ok(Recheck::Current | Recheck::Gone) => {}
+                Ok(Recheck::NotOwner) => {
+                    if now.duration_since(item.since) < DEFERRAL_MAX_AGE {
+                        // Still someone else's: look again after another
+                        // grace, in case that someone leaves.
+                        self.deferred.push_back(Deferred { due: now + FOREIGN_GRACE, ..item });
+                    } else {
+                        // The owner has had ten minutes of being alive to do
+                        // this; from here the document is its stream's alone.
+                        self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
                 // Put back to try again rather than lost: a provider that is
                 // briefly down must not cost the document.
                 Err(e) if e.is_retryable() => {
@@ -464,42 +509,44 @@ impl EmbeddingWorker {
         embedded
     }
 
-    async fn embed_deferred(&mut self, item: &Deferred) -> Result<bool> {
+    async fn embed_deferred(&mut self, item: &Deferred) -> Result<Recheck> {
         let Some(collection) = self.engine.collection_by_id(item.collection)? else {
             // The collection was dropped while this waited. Nothing to embed,
             // and the drop took the vectors with it.
-            return Ok(false);
+            return Ok(Recheck::Gone);
         };
-        // Not the owner: drop rather than re-check. Every node defers the
-        // same foreign writes, so the owner holds this document in its own
-        // queue — embedding it here too would be exactly the duplicate
-        // provider call the deferral mechanism exists to prevent. The one
-        // scenario dropping could lose coverage is the owner dying *and*
-        // this node being its only survivor, and there the rendezvous owner
-        // among the survivors has the same deferral and takes the work.
+        // The only question a re-check asks. Ownership is computed over the
+        // live member set, so "not mine" means the owner is alive and the
+        // document is in its stream — embedding it here would be the
+        // duplicate provider call ownership exists to prevent. "Mine" means
+        // the owner left and this node inherited the collection, and the
+        // staleness check below says whether it left this document undone.
         //
-        // Measured cost of leaving this gate out, from the 2026-08-24 load
-        // test on a three-node cluster whose replication had fallen hours
-        // behind: every node's [`FOREIGN_GRACE`] expiry found vectors that
-        // were still stale, so all three embedded the same backlog against
-        // one provider — the "3× amplification" that motivated this gate.
+        // Measured cost of getting this wrong, from the 2026-08-24 load test
+        // on a three-node cluster whose replication had fallen hours behind:
+        // every node's grace expiry found vectors that were still stale, so
+        // all three embedded the same backlog against one provider.
         if !self.is_owner_of(&collection.db, &collection.name) {
-            self.counters.skipped_not_owned.fetch_add(1, Ordering::Relaxed);
-            return Ok(false);
+            return Ok(Recheck::NotOwner);
         };
         let Some(config) = collection.vector.clone() else {
-            return Ok(false);
+            return Ok(Recheck::Gone);
         };
         if !config.provider.embeds_server_side() {
-            return Ok(false);
+            return Ok(Recheck::Gone);
         }
         let shadow = self.engine.get_collection(
             &collection.db,
             &kimmy_core::vector_meta::shadow_name(&collection.name),
         )?;
         // `force: false` is the whole point: this re-reads the document's
-        // current stamp and does nothing if the owner's vectors arrived.
-        self.embed_one(&collection, &shadow, &config, &item.source, false).await
+        // current stamp and does nothing if the previous owner's vectors
+        // arrived before it left.
+        Ok(if self.embed_one(&collection, &shadow, &config, &item.source, false).await? {
+            Recheck::Embedded
+        } else {
+            Recheck::Current
+        })
     }
 
     /// Handle one oplog entry.
@@ -585,12 +632,15 @@ impl EmbeddingWorker {
             return Ok(Outcome::Skipped);
         }
 
-        // Written elsewhere: let the node that wrote it embed it, and look
-        // again later. Deciding by the entry's own stamp needs no membership
-        // view and no agreement — every node reaches the same conclusion from
-        // the entry alone, and the one that reaches "mine" is by definition
-        // the one that has the document already.
-        if entry.stamp.node != self.engine.node_id() {
+        // Ownership decides, not origin. Until 2026-08-28 the node that wrote
+        // the document embedded it immediately and everyone else deferred; on
+        // a bulk load the owner's re-checks then found everything the writer
+        // had not reached yet and embedded it too — 570 provider calls for
+        // 361 documents on a three-member cluster. Now the owner embeds every write
+        // it sees, from its own oplog image, the moment it sees it (the write
+        // reaches it by replication within a sync round), and a non-owner
+        // holds the document only against the owner leaving.
+        if !self.is_owner_of(&collection.db, &collection.name) {
             self.defer(entry.collection, source);
             return Ok(Outcome::Deferred);
         }
@@ -606,7 +656,7 @@ impl EmbeddingWorker {
 
         let provider = self.provider_for(collection.id.0, &config)?;
         // Counted here as well as in `embed_one`: this is the streaming path
-        // for a document this node wrote, and it embeds from the entry rather
+        // for a document this node owns, and it embeds from the entry rather
         // than re-reading the document, so it does not go through `embed_one`.
         // Shipped uncounted in 0.5.0 — on a healthy owner every
         // `kimmy_embed_{documents,chunks,failures}_total` stayed at zero while
@@ -1781,17 +1831,28 @@ mod tests {
         assert_eq!(built_b.dim(), 8, "a changed configuration must rebuild the provider");
     }
 
-    /// The same entry as if a different node had written it.
-    ///
-    /// Only the stamp's node changes: that is the whole input to the decision,
-    /// which is what makes it need no membership view.
+    /// The same entry as if a different node had written it. Since ownership
+    /// replaced the origin rule this changes nothing about what the worker
+    /// does with it — which is exactly what the tests below check.
     fn as_if_written_elsewhere(mut entry: kimmy_core::OplogEntry) -> kimmy_core::OplogEntry {
         entry.stamp.node = kimmy_core::NodeId::from_bytes([0xAB; 16]);
         entry
     }
 
+    /// An ownership check a test can flip mid-flight, standing in for the
+    /// member set changing under a running worker.
+    fn switchable_owner(
+        worker: &mut EmbeddingWorker,
+        initially: bool,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(initially));
+        let seen = Arc::clone(&flag);
+        worker.set_owner_check(Box::new(move |_| seen.load(std::sync::atomic::Ordering::SeqCst)));
+        flag
+    }
+
     #[tokio::test]
-    async fn a_document_written_elsewhere_is_not_embedded_immediately() {
+    async fn a_non_owner_does_not_embed_a_document_written_elsewhere() {
         // Every node runs a worker and every node sees every write, so all of
         // them used to embed the same document at once. The stored result was
         // right -- the staleness check makes a losing write a no-op -- but the
@@ -1800,6 +1861,7 @@ mod tests {
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, false);
 
         engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
         let entry = as_if_written_elsewhere(last_entry(&engine));
@@ -1808,15 +1870,52 @@ mod tests {
         assert_eq!(
             fake.calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
-            "the node that wrote the document embeds it; nobody else pays for it too"
+            "the owner pays; nobody else"
         );
     }
 
     #[tokio::test]
+    async fn a_non_owner_does_not_embed_a_document_it_wrote_itself() {
+        // The half of the origin rule that cost 570 provider calls for 361
+        // documents on 2026-08-28: the node the client happened to write to
+        // embedded everything itself while the owner, thirty seconds behind,
+        // embedded it all again. The writer is just another non-owner now.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, false);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = last_entry(&engine);
+
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn the_owner_embeds_a_document_written_elsewhere_without_waiting() {
+        // The other half of the fix. The owner used to hold a foreign write
+        // for the full grace before looking at it; now a replicated write is
+        // embedded the moment the owner's stream delivers it, from the
+        // entry's own image, exactly as a local write always was.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, true);
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
+        let entry = as_if_written_elsewhere(last_entry(&engine));
+
+        assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(worker.deferred.is_empty(), "the owner has nothing to re-check");
+    }
+
+    #[tokio::test]
     async fn a_document_this_node_wrote_is_embedded_without_waiting() {
-        // The other half. Deferring everything would trade duplicated work for
-        // embedding nothing until a timer fired, so the common path has to stay
-        // immediate.
+        // Deferring everything would trade duplicated work for embedding
+        // nothing until a timer fired, so the owner's path has to stay
+        // immediate. With no check installed this node owns everything.
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
@@ -1836,12 +1935,16 @@ mod tests {
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let owner = switchable_owner(&mut worker, false);
 
         engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
         let entry = as_if_written_elsewhere(last_entry(&engine));
-        worker.process(&entry).await.unwrap();
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
 
         // Nothing replicated in the meantime: the owner never embedded it.
+        // The owner leaves before embedding it; the rendezvous hash over the
+        // survivors now lands the collection here.
+        owner.store(true, std::sync::atomic::Ordering::SeqCst);
         let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
 
         assert_eq!(embedded, 1, "a document nobody embedded must not stay unembedded");
@@ -1849,7 +1952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_deferred_document_is_dropped_when_another_node_owns_the_collection() {
+    async fn a_deferred_document_is_held_while_another_node_owns_the_collection() {
         // The gate that closes the residual amplification. Every node defers
         // the same foreign writes, so when this node is not the rendezvous
         // owner its re-check would be a duplicate of the owner's — and under
@@ -1864,16 +1967,29 @@ mod tests {
         let entry = as_if_written_elsewhere(last_entry(&engine));
         worker.process(&entry).await.unwrap();
 
-        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
-
-        assert_eq!(embedded, 0, "a non-owner must not embed");
+        let deferred_at = Instant::now();
+        // Grace after grace, the owner is still alive: nothing is embedded and
+        // the document stays in the queue against the owner leaving later.
+        for i in 1..=3 {
+            let embedded = worker.drain_deferred(deferred_at + FOREIGN_GRACE * i).await;
+            assert_eq!(embedded, 0, "a non-owner must not embed");
+            assert_eq!(worker.deferred.len(), 1, "held, not dropped, while the owner is alive");
+        }
         assert_eq!(
             fake.calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "no provider call may happen off-owner"
         );
         let counters = worker.counters();
-        assert!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert_eq!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        // Past the age cap the document is the owner's alone, and the queue
+        // does not keep a healthy cluster's whole history.
+        let embedded = worker.drain_deferred(deferred_at + DEFERRAL_MAX_AGE + FOREIGN_GRACE).await;
+        assert_eq!(embedded, 0);
+        assert!(worker.deferred.is_empty(), "let go once older than DEFERRAL_MAX_AGE");
+        assert_eq!(counters.skipped_not_owned.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
@@ -1909,10 +2025,10 @@ mod tests {
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
 
         engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
-        worker.process(&as_if_written_elsewhere(last_entry(&engine))).await.unwrap();
-        let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
-
-        assert_eq!(embedded, 1);
+        let outcome = worker.process(&as_if_written_elsewhere(last_entry(&engine))).await.unwrap();
+        assert!(matches!(outcome, Outcome::Embedded { .. }), "owned, so embedded at once");
+        assert!(worker.deferred.is_empty());
+        assert_eq!(worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await, 0);
         let counters = worker.counters();
         assert_eq!(
             counters.documents_embedded.load(std::sync::atomic::Ordering::SeqCst),
@@ -1935,10 +2051,11 @@ mod tests {
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let owner = switchable_owner(&mut worker, false);
 
         engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
         let entry = as_if_written_elsewhere(last_entry(&engine));
-        worker.process(&entry).await.unwrap();
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
 
         // Stand in for replication: the owner's vectors land before the deadline.
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
@@ -1958,9 +2075,13 @@ mod tests {
             )
             .unwrap();
 
+        // Ownership moves here after the old owner's vectors landed: the
+        // re-check finds them current and calls nobody.
+        owner.store(true, std::sync::atomic::Ordering::SeqCst);
         let embedded = worker.drain_deferred(Instant::now() + FOREIGN_GRACE).await;
 
         assert_eq!(embedded, 0);
+        assert!(worker.deferred.is_empty());
         assert_eq!(
             fake.calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -1973,10 +2094,11 @@ mod tests {
         let (engine, coll, mut worker, _dir) = setup().await;
         let fake = FakeProvider::new(4);
         worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        switchable_owner(&mut worker, false);
 
         engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello", "body": "world" }).unwrap();
         let entry = as_if_written_elsewhere(last_entry(&engine));
-        worker.process(&entry).await.unwrap();
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Deferred);
 
         assert_eq!(worker.drain_deferred(Instant::now()).await, 0, "the owner still has time");
         assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
