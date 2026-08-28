@@ -366,5 +366,3 @@ KimmyDB is developed by [Titus AI LLC](https://titusai.io).
   [Apache-2.0](LICENSE-APACHE). Use them in anything.
 - **Commercial license**: for embedding or distributing KimmyDB without the
   AGPL's obligations, write to <licensing@titusai.io>.
-
-[LICENSING.md](LICENSING.md) explains the split in plain language.
