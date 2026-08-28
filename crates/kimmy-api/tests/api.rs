@@ -4108,6 +4108,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_embed_provider_errors_total",
             "kimmy_embed_provider_errors_total",
             "kimmy_embed_provider_errors_total",
+            "kimmy_embed_provider_requests_total",
+            "kimmy_embed_provider_tokens_total",
             "kimmy_request_duration_seconds_bucket",
             "kimmy_request_duration_seconds_bucket",
             "kimmy_request_duration_seconds_bucket",
