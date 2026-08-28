@@ -350,7 +350,12 @@ impl Engine {
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
                         ..
                     })) => {
-                        self.create_collection_inner(&target.db, &target.name, false)?;
+                        self.create_collection_inner(
+                            &target.db,
+                            &target.name,
+                            false,
+                            Some(entry.stamp.hlc),
+                        )?;
                         debug!(db = %target.db, collection = %target.name, "created a replicated collection");
                     }
                     Err(e) => return Err(e),
@@ -358,6 +363,42 @@ impl Engine {
             }
             OpKind::DropCollection => {
                 let target: kimmy_core::CollectionRef = bson::deserialize_from_slice(body)?;
+                // A drop is the one arm that destroys state, so it is the one
+                // arm that has to know *which* incarnation it was aimed at. A
+                // recreated collection derives the same id as the one that was
+                // dropped, and overlapping ranges are re-delivered as a matter
+                // of course — so a drop from the previous life arrives again
+                // after the recreation, resolves to the current collection,
+                // and without this check empties it. Seen on a three-member
+                // cluster on 2026-08-28: one member left with 211 of 361
+                // documents, every member missing vectors, lag 0 throughout.
+                //
+                // Stale if it predates the create that produced the current
+                // incarnation (origin stamps on both sides), or is at or
+                // before the drop that incarnation was created after.
+                match self.get_collection(&target.db, &target.name) {
+                    Ok(current) => {
+                        let predates_create = entry.stamp.hlc < current.created;
+                        let at_or_before_floor =
+                            current.incarnation_floor.is_some_and(|floor| entry.stamp.hlc <= floor);
+                        if predates_create || at_or_before_floor {
+                            debug!(
+                                db = %target.db,
+                                collection = %target.name,
+                                "ignored a drop older than the collection's current incarnation"
+                            );
+                            // The tombstone is still worth remembering (it never
+                            // moves backwards), so a straggling pre-drop write
+                            // is superseded here as it would be anywhere else.
+                            self.record_collection_drop(entry.collection, entry.stamp)?;
+                            return Ok(true);
+                        }
+                    }
+                    Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+                        ..
+                    })) => {}
+                    Err(e) => return Err(e),
+                }
                 // The originating stamp, not a local one: the tombstone has to
                 // sort before any recreation that legitimately followed the
                 // drop, or the name becomes unusable on this node forever.
@@ -1293,6 +1334,84 @@ mod tests {
 
         let cb = b.get_collection("shop", "orders").expect("the recreation must replicate");
         assert!(b.get(&cb, &DocId::String("new".into())).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_replayed_drop_from_the_previous_incarnation_does_not_empty_the_recreation() {
+        // The 2026-08-28 data loss. A creates, drops and recreates `orders`
+        // and writes into the recreation; B has followed all of it. Then the
+        // range containing the old drop is delivered again — the normal case
+        // for overlapping batches — and must change nothing.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let recreated = a.create_collection("shop", "orders").unwrap();
+        a.insert(&recreated, doc! { "_id": "kept" }).unwrap();
+        pull(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "kept-on-b" }).unwrap();
+        pull(&a, &b);
+        assert_eq!(a.count(&recreated).unwrap(), 2);
+        assert_eq!(b.count(&cb).unwrap(), 2);
+
+        // Re-deliver A's whole history to B, and B's whole history to A,
+        // twice: the old drop rides along both times.
+        for _ in 0..2 {
+            let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+            assert!(everything.iter().any(|e| e.kind == OpKind::DropCollection));
+            b.apply_batch(&everything).unwrap();
+            let everything = b.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+            a.apply_batch(&everything).unwrap();
+        }
+
+        let ca = a.get_collection("shop", "orders").expect("a still has the recreation");
+        let cb = b.get_collection("shop", "orders").expect("b still has the recreation");
+        assert_eq!(a.count(&ca).unwrap(), 2, "a replayed drop must not empty the recreation");
+        assert_eq!(b.count(&cb).unwrap(), 2, "a replayed drop must not empty the recreation");
+    }
+
+    #[test]
+    fn a_replayed_drop_is_ignored_on_a_peer_that_only_ever_saw_the_recreation() {
+        // C never recorded the first drop, so it has no incarnation floor;
+        // the guard has to fall back to the create's origin stamp.
+        let (a, _da) = engine();
+        let (c, _dc) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        let recreated = a.create_collection("shop", "orders").unwrap();
+        a.insert(&recreated, doc! { "_id": "kept" }).unwrap();
+
+        let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+        let old_drop =
+            everything.iter().find(|e| e.kind == OpKind::DropCollection).cloned().unwrap();
+        let after_the_drop: Vec<_> =
+            everything.iter().filter(|e| e.stamp > old_drop.stamp).cloned().collect();
+
+        // C learns the recreation and the document first…
+        c.apply_batch(&after_the_drop).unwrap();
+        let cc = c.get_collection("shop", "orders").unwrap();
+        assert_eq!(c.count(&cc).unwrap(), 1);
+        // …and the old drop only afterwards.
+        c.apply_batch(std::slice::from_ref(&old_drop)).unwrap();
+        let cc = c.get_collection("shop", "orders").expect("the stale drop must not apply");
+        assert_eq!(c.count(&cc).unwrap(), 1);
+    }
+
+    #[test]
+    fn a_later_drop_still_drops_a_recreated_collection() {
+        // The guard must not turn every drop after a recreation into a no-op.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.drop_collection("shop", "orders").unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        pull(&b, &a);
+        assert!(b.get_collection("shop", "orders").is_ok());
+
+        a.drop_collection("shop", "orders").unwrap();
+        pull(&b, &a);
+        assert!(b.get_collection("shop", "orders").is_err(), "a genuinely later drop applies");
     }
 
     #[test]

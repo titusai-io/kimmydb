@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DatabaseMeta {
     pub name: String,
+    /// The stamp of the create that produced this incarnation, at its
+    /// origin: this node's clock for a local create, the entry's stamp for a
+    /// replicated one. A replayed drop older than this is history.
     pub created: Hlc,
 }
 

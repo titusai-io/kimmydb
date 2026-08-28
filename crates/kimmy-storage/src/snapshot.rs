@@ -228,7 +228,7 @@ impl Engine {
     /// Recreate a collection and its indexes from a snapshot.
     fn restore_collection(&self, state: &CollectionState) -> Result<()> {
         if self.get_collection(&state.db, &state.name).is_err() {
-            self.create_collection_inner(&state.db, &state.name, false)?;
+            self.create_collection_inner(&state.db, &state.name, false, None)?;
         }
 
         for index in &state.indexes {
