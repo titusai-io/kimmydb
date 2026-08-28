@@ -58,6 +58,8 @@ pub struct MetricsSnapshot {
     pub webhook_backlog_secs: u64,
     pub cluster_members: u64,
     pub replication_lag_secs: u64,
+    /// Worst runtime scheduling delay since the last scrape, microseconds.
+    pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
     pub tls_reloads_failed: u64,
     pub jwks_refresh_ok: u64,
@@ -85,6 +87,10 @@ pub struct Metrics {
     latency_sum_us: AtomicU64,
     latency_count: AtomicU64,
     replication_lag_secs: AtomicU64,
+    /// The worst scheduling delay the runtime probe saw since the last
+    /// scrape, in microseconds. A worker that blocks on a storage commit
+    /// shows up here before it shows up as a peer's handshake timeout.
+    runtime_stall_us: AtomicU64,
     requests: AtomicU64,
     responses_2xx: AtomicU64,
     responses_4xx: AtomicU64,
@@ -121,6 +127,7 @@ impl Default for Metrics {
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             replication_lag_secs: AtomicU64::new(0),
+            runtime_stall_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
             responses_4xx: AtomicU64::new(0),
@@ -298,6 +305,18 @@ impl Metrics {
         self.started.elapsed().as_secs()
     }
 
+    /// Record how late the runtime probe woke up. Keeps the maximum until the
+    /// next scrape reads it, so a one-off stall between scrapes is not lost.
+    pub fn record_runtime_stall(&self, late: std::time::Duration) {
+        let us = u64::try_from(late.as_micros()).unwrap_or(u64::MAX);
+        self.runtime_stall_us.fetch_max(us, Ordering::Relaxed);
+    }
+
+    /// The worst runtime stall since the last call, in seconds.
+    fn take_runtime_stall_secs(&self) -> f64 {
+        self.runtime_stall_us.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
     fn get(&self, counter: &AtomicU64) -> u64 {
         counter.load(Ordering::Relaxed)
     }
@@ -336,6 +355,7 @@ impl Metrics {
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: self.get(&self.cluster_members),
             replication_lag_secs: self.get(&self.replication_lag_secs),
+            runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
             jwks_refresh_ok: self.get(&self.jwks_refresh_ok),
@@ -394,6 +414,9 @@ impl Metrics {
             "# HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
+             # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.\n\
+             # TYPE kimmy_runtime_stall_seconds gauge\n\
+             kimmy_runtime_stall_seconds {stall}\n\
              # HELP kimmy_requests_total HTTP requests handled.\n\
              # TYPE kimmy_requests_total counter\n\
              kimmy_requests_total {requests}\n\
@@ -470,6 +493,7 @@ impl Metrics {
              kimmy_embed_provider_errors_total{{kind=\"reset\"}} {t_reset}\n\
              kimmy_embed_provider_errors_total{{kind=\"other\"}} {t_other}\n",
             uptime = self.uptime_secs(),
+            stall = self.take_runtime_stall_secs(),
             requests = self.get(&self.requests),
             ok = self.get(&self.responses_2xx),
             client = self.get(&self.responses_4xx),
@@ -602,6 +626,9 @@ mod tests {
 # HELP kimmy_uptime_seconds Seconds since this process started serving.
 # TYPE kimmy_uptime_seconds gauge
 kimmy_uptime_seconds 0
+# HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.
+# TYPE kimmy_runtime_stall_seconds gauge
+kimmy_runtime_stall_seconds 0
 # HELP kimmy_requests_total HTTP requests handled.
 # TYPE kimmy_requests_total counter
 kimmy_requests_total 10
@@ -808,8 +835,8 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 27 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 47, "expected one sample per series: {out}");
+        // 28 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 48, "expected one sample per series: {out}");
     }
 
     #[test]

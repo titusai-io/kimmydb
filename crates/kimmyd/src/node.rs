@@ -250,6 +250,23 @@ pub async fn run(config: Config) -> Result<()> {
         })
     };
 
+    // The runtime-stall probe behind `kimmy_runtime_stall_seconds`: a timer
+    // that should fire every 250 ms and records how late it was. It runs on
+    // the same workers as everything else, so a worker blocked on the storage
+    // lock or an fsync shows up here as a number before it shows up as a
+    // peer's 5 s handshake timeout or a member marked down.
+    let stall_probe = {
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let period = std::time::Duration::from_millis(250);
+            loop {
+                let t = std::time::Instant::now();
+                tokio::time::sleep(period).await;
+                state.metrics.record_runtime_stall(t.elapsed().saturating_sub(period));
+            }
+        })
+    };
+
     // TTL expiry. Ownership is rendezvous-hashed per collection through the
     // same live member set the dispatcher uses, so one node expires a given
     // collection and one expired document produces one delete cluster-wide
@@ -384,6 +401,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
     // Holds only a cache, which the next start rebuilds by reading.
     sessions_handle.abort();
+    stall_probe.abort();
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.
     // `None` when the worker is disabled — nothing to abort.

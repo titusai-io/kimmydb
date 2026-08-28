@@ -106,6 +106,31 @@ impl DurabilityClass {
     }
 }
 
+/// Run a blocking storage step without holding a tokio worker hostage.
+///
+/// redb has a single writer: `begin_write` waits for whoever holds the lock,
+/// and `commit` ends in an fsync. Both are fine on a thread of their own and
+/// ruinous on an async worker — a handful of concurrent writers pin every
+/// worker of the runtime, and nothing else that needs one runs: peers' TLS
+/// handshakes time out, `/metrics` hangs, SWIM probes go unanswered and the
+/// member is marked down by its peers. Measured on a three-member cluster on
+/// 2026-08-28 with bulk inserts spread across members: 5 s handshake timeouts
+/// on every pair, a 10 s `/metrics` stall, membership flapping for 30 s.
+///
+/// `block_in_place` tells the runtime this worker is about to block, so it
+/// moves the worker's queued tasks elsewhere and carries on; the blocking
+/// step then runs inline with no thread hop and no `Send` bound. Off a
+/// multi-thread runtime — the CLI, a `current_thread` test, a plain thread —
+/// there is nothing to yield to and the closure simply runs.
+pub fn blocking<T>(f: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(h) if h.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(f)
+        }
+        _ => f(),
+    }
+}
+
 /// The shared-fsync barrier behind [`DurabilityClass::Coalesced`].
 ///
 /// No background thread and no handle to the engine: the committers
@@ -159,15 +184,20 @@ impl WriteTxn<'_> {
         // configured a collector, and if none is configured this is the same
         // disabled-span check every other `tracing` call site already pays.
         let _span = tracing::info_span!("storage.commit").entered();
-        self.txn.commit()?;
-        self.engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if self.coalesced {
-            self.engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.engine.wait_for_flush()?;
-        } else {
-            self.engine.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        Ok(())
+        let WriteTxn { txn, engine, coalesced } = self;
+        // The fsync (or the wait at the barrier) is the blocking part; see
+        // [`blocking`] for why it must not happen on an async worker.
+        blocking(move || {
+            txn.commit()?;
+            engine.commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if coalesced {
+                engine.grouped_commits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                engine.wait_for_flush()?;
+            } else {
+                engine.fsyncs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            Ok(())
+        })
     }
 
     pub(crate) fn abort(self) -> std::result::Result<(), redb::StorageError> {
@@ -701,7 +731,8 @@ impl Engine {
     /// them: opening the database, migrating it, and restoring a backup into a
     /// fresh file.
     pub(crate) fn begin_write(&self) -> std::result::Result<WriteTxn<'_>, redb::TransactionError> {
-        let mut txn = self.db.begin_write()?;
+        // Waiting for redb's single writer lock is the other blocking step.
+        let mut txn = blocking(|| self.db.begin_write())?;
         let coalesced = self.coalescer.lock().is_some();
         if coalesced {
             // No persistent savepoints exist in this engine, so the one
@@ -793,7 +824,7 @@ impl Engine {
     /// empty commit is one redb could reasonably skip, and the point here is
     /// the fsync.
     fn flush_now(&self) -> std::result::Result<(), redb::CommitError> {
-        let mut txn = self.db.begin_write().map_err(|e| {
+        let mut txn = blocking(|| self.db.begin_write()).map_err(|e| {
             redb::CommitError::Storage(redb::StorageError::Io(std::io::Error::other(e.to_string())))
         })?;
         txn.set_durability(redb::Durability::Immediate).expect("Immediate is always permitted");

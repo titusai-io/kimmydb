@@ -28,7 +28,7 @@ pub mod watch;
 
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome};
 pub use engine::physical_now_ms;
-pub use engine::{DurabilityClass, Engine};
+pub use engine::{DurabilityClass, Engine, blocking};
 pub use error::{Result, StorageError};
 pub use expiry::{ExpiryOutcome, MAX_EXPIRED_PER_PASS, ttl_indexes};
 pub use gc::{GcOutcome, RetentionPolicy};
