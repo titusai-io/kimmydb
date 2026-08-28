@@ -10,6 +10,15 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Removed
+
+- **Intel Mac builds.** Releases no longer ship `x86_64-apple-darwin`
+  binaries, and the Homebrew formula installs on Apple Silicon only. Linux
+  x86_64 and aarch64 (static musl) and macOS aarch64 remain. It was the
+  slowest build in every release for a platform no longer sold.
+
 ## 0.16.1 - 2026-08-28
 
 A patch: no wire, storage or API change. Both fixes are in the embedding
