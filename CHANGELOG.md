@@ -14,6 +14,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Bulk ingest no longer embeds every document twice.** The node a client
+  wrote to embedded each document immediately while the collection's
+  rendezvous owner, whose deferral grace expired on everything the writer had
+  not reached yet, embedded it all again — 570 provider calls for 361
+  documents inserted in one batch. Ownership now decides on the streaming
+  path too: the owner embeds every write it sees the moment its stream
+  delivers it, and a non-owner embeds nothing on the stream, including its
+  own writes. A non-owner's deferral is re-armed while the owner is alive and
+  taken over only when ownership has moved, so an owner leaving mid-backlog
+  is still covered (ADR-077, amended). A write made on a non-owner gets its
+  vectors after one replication round instead of immediately.
 - **The embedding provider reuses one HTTP client.** Every `embed` call built
   a new `reqwest::Client`, so each document cost a fresh DNS lookup and TCP +
   TLS handshake, and a drain of deferred documents issued those in a burst —

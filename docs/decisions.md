@@ -3672,6 +3672,27 @@ everything without a special case. Dropping a non-owner's deferral is safe for
 the same reason every member deferred it in the first place: the owner holds
 its own copy of the same re-check.
 
+**Amended 2026-08-28 — the origin-node rule is retired.** Keeping "whoever
+wrote a document embeds it immediately" on the streaming path left the two
+rules able to disagree: under a bulk load the writer works through its backlog
+sequentially, the owner's deferral grace expires on everything the writer has
+not reached, its re-check finds the vectors still stale, and from then on two
+nodes embed the same backlog side by side. Measured on a three-member cluster:
+570 provider calls for 361 documents inserted in one batch, exactly the cost
+class this record was written to close. Ownership now decides on every path.
+The owner embeds each write the moment its stream delivers it — its own
+writes and replicated ones alike, from the entry's image — and a non-owner
+embeds nothing on the stream, including what it wrote itself. A non-owner's
+deferral is a re-check of one question, *am I the owner now?*: ownership is a
+function of the live member set, so it moves only when the owner has left,
+and then the survivor that inherited the collection embeds what the old owner
+left undone. While the owner lives the deferral is re-armed, not dropped, so
+an owner's death mid-backlog is covered; after ten minutes it is let go, so a
+healthy cluster's history is not pinned in every non-owner's queue. The trade
+is latency: a write made on a non-owner gets its vectors after one round of
+replication rather than immediately, which is the same trade this record
+already made for backfill.
+
 ## ADR-078 — Role mappings reach the environment as one JSON document
 
 **Decision.** `auth.oidc.role_mappings` can be set through
