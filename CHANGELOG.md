@@ -10,7 +10,14 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.16.1 - 2026-08-28
+
+A patch: no wire, storage or API change. Both fixes are in the embedding
+worker and were found by loading 361 documents into a three-member cluster in
+one batch. Rolling member-at-a-time is fine, and there is nothing to migrate.
+One behaviour an operator may notice: a write made on a member that does not
+own the collection now gets its vectors after one replication round instead
+of immediately, because the owner embeds it rather than the writer.
 
 ### Fixed
 
