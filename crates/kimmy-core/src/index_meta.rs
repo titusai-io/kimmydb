@@ -53,7 +53,7 @@ pub struct IndexMeta {
     /// JSON in the collection metadata and BSON in the replicated
     /// [`crate::IndexCreate`] — and BSON cannot hold a `u64` above `i64::MAX`.
     /// Letting the encoder decide has cost this project a replication outage
-    /// twice (ADR-031 and the `NodeId` note in [Handoff](../../../docs/handoff.md)),
+    /// twice (ADR-031, and the `NodeId` BSON encoding defect fixed in 0.10.0 — #128),
     /// so the representation is chosen here rather than inherited. Validated
     /// positive where an index is created.
     ///

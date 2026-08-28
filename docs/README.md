@@ -28,8 +28,7 @@ Generating a client? Start from [`openapi.yaml`](openapi.yaml).
 planned and why, [Decisions](decisions.md) for what's already settled,
 [Testing](testing.md) for the invariants that must not break, and
 **[Deviations](deviations.md)** for where the implementation differs from what
-was asked for — the debts, in one place. **[Handoff](handoff.md)** is the
-shortest path back into the work: where it stands and what is next.
+was asked for — the debts, in one place.
 
 ---
 
@@ -65,7 +64,6 @@ graph TD
     DEV --> DEC["Decisions<br/>what was chosen and why"]
     DEV --> TST["Testing<br/>invariants and how they are checked"]
     DEV --> DEV2["Deviations<br/>drifts and deferrals, in one place"]
-    DEV --> HO["Handoff<br/>current state · what's next"]
 ```
 
 | Document | What it covers |
@@ -96,7 +94,6 @@ graph TD
 | [Benchmarks](benchmarks.md) | What has been measured, and which guessed constants it replaced |
 | [Testing](testing.md) | Testing philosophy and the invariants that carry the weight |
 | [Deviations](deviations.md) | Where the build differs from the plan, why, and what would close it |
-| [Handoff](handoff.md) | Current state, what's next, and what needs a decision |
 
 ---
 

@@ -1062,7 +1062,7 @@ mod tests {
     async fn a_locally_written_document_is_counted_when_embedded() {
         // The streaming path — a document this node wrote, embedded from its
         // own entry — is the common case on an owner, and it shipped in 0.5.0
-        // with no counter on it: on a test cluster the owner's vectors
+        // with no counter on it: on a production cluster the owner's vectors
         // landed within ten seconds of every insert while
         // `kimmy_embed_documents_total` read 1 from a rescan and never moved.
         // The tests that asserted the counters moved all went through
