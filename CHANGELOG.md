@@ -10,6 +10,24 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The embedding provider reuses one HTTP client.** Every `embed` call built
+  a new `reqwest::Client`, so each document cost a fresh DNS lookup and TCP +
+  TLS handshake, and a drain of deferred documents issued those in a burst —
+  seen on a three-member cluster as 31 `error sending request` failures in
+  seven seconds against a provider that answered every sequential probe. The
+  client is now built once per provider with connect (10 s) and request
+  (60 s) timeouts, a 30 s pool idle limit and TCP keepalive; a transport
+  failure is retried once inside the call before the worker's own 5 s retry.
+- **Transport failures say what failed.** The error carries its kind —
+  `connect`, `timeout`, `reset`, `other` — and the full cause chain rather
+  than reqwest's outer message, and `/metrics` gains
+  `kimmy_embed_provider_errors_total{kind}` alongside
+  `kimmy_embed_failures_total`.
+
 ## 0.16.0 - 2026-08-28
 
 The first release under Titus AI LLC and the first to declare a licence. A

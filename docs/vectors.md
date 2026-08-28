@@ -145,7 +145,9 @@ provider's per-input limit:
 Overlap stays in characters. Existing configurations without the field keep
 the character rule alone, exactly as before. A document that still cannot be
 embedded is skipped and named — database, collection and `_id` are on the
-`WARN`, and `kimmy_embed_failures_total` counts it — rather than stalling the
+`WARN`, and `kimmy_embed_failures_total` counts it (with
+`kimmy_embed_provider_errors_total{kind}` naming what failed to connect,
+time out or reset) — rather than stalling the
 rest of the collection.
 
 ---

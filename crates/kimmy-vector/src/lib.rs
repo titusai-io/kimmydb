@@ -19,7 +19,7 @@ pub mod search;
 pub mod worker;
 
 pub use cache::{Access, IndexCache};
-pub use error::{Result, VectorError};
+pub use error::{Result, TransportKind, VectorError};
 
 /// Whether this build can embed in-process.
 ///

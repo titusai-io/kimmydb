@@ -26,7 +26,7 @@ use kimmy_core::{Hlc, OpKind, VectorConfig, VectorRecord, path};
 use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
 use tracing::{debug, info, warn};
 
-use crate::error::{Result, VectorError};
+use crate::error::{Result, TransportKind, VectorError};
 use crate::provider::{self, EmbeddingProvider};
 
 /// Name under which the worker records its oplog position.
@@ -135,12 +135,33 @@ pub struct WorkerCounters {
     /// number climbing while `documents_embedded` does not move is the
     /// "provider is down" signature.
     pub failures: AtomicU64,
+    /// The transport failures among `failures`, by what failed — connect,
+    /// timeout, reset, other — in [`TransportKind::ALL`] order. Splitting
+    /// them is what lets an operator tell a DNS or firewall problem from a
+    /// slow provider from a load balancer closing idle connections without
+    /// reading logs.
+    pub transport: [AtomicU64; 4],
 }
 
 impl WorkerCounters {
     fn embedded(&self, chunks: usize) {
         self.documents_embedded.fetch_add(1, Ordering::Relaxed);
         self.chunks_embedded.fetch_add(chunks as u64, Ordering::Relaxed);
+    }
+
+    /// Count a failed provider call, and its transport kind when it has one.
+    fn failed(&self, error: &VectorError) {
+        self.failures.fetch_add(1, Ordering::Relaxed);
+        if let VectorError::Transport { kind, .. } = error {
+            let i = TransportKind::ALL.iter().position(|k| k == kind).unwrap_or(3);
+            self.transport[i].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// Transport failures of one kind.
+    pub fn transport_failures(&self, kind: TransportKind) -> u64 {
+        let i = TransportKind::ALL.iter().position(|k| *k == kind).unwrap_or(3);
+        self.transport[i].load(Ordering::Relaxed)
     }
 }
 
@@ -591,9 +612,7 @@ impl EmbeddingWorker {
         // `kimmy_embed_{documents,chunks,failures}_total` stayed at zero while
         // the vectors demonstrably landed, which is the one thing a spend
         // counter must never do.
-        let vectors = provider.embed(&chunks).await.inspect_err(|_| {
-            self.counters.failures.fetch_add(1, Ordering::Relaxed);
-        })?;
+        let vectors = provider.embed(&chunks).await.inspect_err(|e| self.counters.failed(e))?;
 
         // The provider call is the long part, and the document can move while
         // it runs. Embedding from the entry's own image is what makes this
@@ -822,9 +841,7 @@ impl EmbeddingWorker {
         // Counted at the only line a provider outage can produce — including
         // the retries, so a sustained outage reads as a climbing counter
         // rather than one flat increment.
-        let vectors = provider.embed(&chunks).await.inspect_err(|_| {
-            self.counters.failures.fetch_add(1, Ordering::Relaxed);
-        })?;
+        let vectors = provider.embed(&chunks).await.inspect_err(|e| self.counters.failed(e))?;
         let chunk_count = chunks.len();
         let records: Vec<VectorRecord> = chunks
             .into_iter()
@@ -1002,7 +1019,11 @@ mod tests {
             }
             if self.fail_times.load(Ordering::SeqCst) > 0 {
                 self.fail_times.fetch_sub(1, Ordering::SeqCst);
-                return Err(VectorError::Transport { provider: "fake", detail: "injected".into() });
+                return Err(VectorError::Transport {
+                    provider: "fake",
+                    kind: TransportKind::Reset,
+                    detail: "injected".into(),
+                });
             }
             // Encode the text length so different text yields different vectors.
             Ok(texts
@@ -1336,7 +1357,14 @@ mod tests {
     #[test]
     fn only_temporary_failures_are_retryable() {
         // Retrying a permanent failure would stall every document behind it.
-        assert!(VectorError::Transport { provider: "x", detail: String::new() }.is_retryable());
+        assert!(
+            VectorError::Transport {
+                provider: "x",
+                kind: TransportKind::Connect,
+                detail: String::new()
+            }
+            .is_retryable()
+        );
         assert!(
             VectorError::ProviderRejected { provider: "x", status: 503, detail: String::new() }
                 .is_retryable()

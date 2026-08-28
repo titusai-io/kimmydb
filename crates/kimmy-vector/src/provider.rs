@@ -5,10 +5,69 @@
 //! part that can be slow, fail intermittently, or cost money — which is why
 //! embedding runs off the write path entirely.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use kimmy_core::ProviderConfig;
 
-use crate::error::{Result, VectorError};
+use crate::error::{Result, TransportKind, VectorError};
+
+/// How long a connection attempt may take before it counts as failed.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// The whole request, connect included. A hung provider must not hold the
+/// worker's position forever; the worker's own retry takes it from here.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a pooled connection may sit idle before the client drops it.
+/// Shorter than the typical load-balancer idle limit, so the client never
+/// reuses a connection the far side has already closed.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Pause before the one in-client retry of a transport failure.
+const RETRY_PAUSE: Duration = Duration::from_millis(250);
+
+/// One HTTP client per provider, built once and reused for every call.
+///
+/// Built once because that is what makes it a client at all: `reqwest` pools
+/// connections per `Client`, so a new one per call is a fresh DNS lookup and
+/// TCP + TLS handshake for every document — measured on a three-member cluster on
+/// 2026-08-28 as bursts of handshakes during a deferral drain, with 31
+/// `error sending request` failures in seven seconds against a provider that
+/// answered 40 of 40 sequential probes in the same minute.
+fn http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+        .tcp_keepalive(Duration::from_secs(30))
+        .user_agent(concat!("kimmyd/", env!("CARGO_PKG_VERSION")))
+        .build()
+        // The builder only fails when a TLS backend cannot initialise, which
+        // is a broken build rather than a runtime condition.
+        .expect("HTTP client")
+}
+
+/// Turn a reqwest error into what an operator needs to read: which stage
+/// failed, and the whole cause chain rather than reqwest's outer message —
+/// `error sending request for url (...)` on its own says nothing about
+/// whether DNS, the handshake or the far end's reset was the problem.
+fn describe(e: &reqwest::Error) -> (TransportKind, String) {
+    let kind = if e.is_connect() {
+        TransportKind::Connect
+    } else if e.is_timeout() {
+        TransportKind::Timeout
+    } else if e.is_request() || e.is_body() || e.is_decode() {
+        TransportKind::Reset
+    } else {
+        TransportKind::Other
+    };
+    let mut detail = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    (kind, detail)
+}
 
 /// Turns text into vectors.
 ///
@@ -134,6 +193,8 @@ pub struct HttpProvider {
     dialect: Dialect,
     auth: Auth,
     dim: usize,
+    /// Shared across every call this provider makes; see [`http_client`].
+    client: reqwest::Client,
 }
 
 impl HttpProvider {
@@ -144,6 +205,7 @@ impl HttpProvider {
             dialect: Dialect::OpenAi,
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
+            client: http_client(),
         })
     }
 
@@ -154,6 +216,7 @@ impl HttpProvider {
             dialect: Dialect::Ollama,
             auth: Auth::None,
             dim,
+            client: http_client(),
         }
     }
 
@@ -162,7 +225,14 @@ impl HttpProvider {
             Some(var) => Auth::Bearer(read_key(&var)?),
             None => Auth::None,
         };
-        Ok(Self { endpoint, model: String::new(), dialect: Dialect::Custom, auth, dim })
+        Ok(Self {
+            endpoint,
+            model: String::new(),
+            dialect: Dialect::Custom,
+            auth,
+            dim,
+            client: http_client(),
+        })
     }
 
     fn cohere(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
@@ -172,6 +242,7 @@ impl HttpProvider {
             dialect: Dialect::Cohere,
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
+            client: http_client(),
         })
     }
 
@@ -195,6 +266,7 @@ impl HttpProvider {
             // Gemini reads the key from a header, not a bearer token.
             auth: Auth::Header("x-goog-api-key", key),
             dim,
+            client: http_client(),
         }
     }
 
@@ -317,21 +389,48 @@ impl EmbeddingProvider for HttpProvider {
             _ => vec![texts],
         };
 
-        let client = reqwest::Client::new();
         let mut out = Vec::with_capacity(texts.len());
 
         for batch in batches {
-            let mut request = client.post(&self.endpoint).json(&self.request_body(batch));
-            request = match &self.auth {
-                Auth::None => request,
-                Auth::Bearer(key) => request.bearer_auth(key),
-                Auth::Header(name, key) => request.header(*name, key),
+            let body = self.request_body(batch);
+            // One retry, inside the client, for a transport failure only: the
+            // common case is a pooled connection the far side closed, which
+            // the next attempt simply does not reuse. A rejected request (4xx,
+            // 5xx) is returned as is; the worker decides whether to retry
+            // those, on its own longer clock.
+            let mut attempt = 0;
+            let response = loop {
+                attempt += 1;
+                let mut request = self.client.post(&self.endpoint).json(&body);
+                request = match &self.auth {
+                    Auth::None => request,
+                    Auth::Bearer(key) => request.bearer_auth(key),
+                    Auth::Header(name, key) => request.header(*name, key),
+                };
+                match request.send().await {
+                    Ok(response) => break response,
+                    Err(e) => {
+                        let (kind, detail) = describe(&e);
+                        if attempt >= 2 {
+                            return Err(VectorError::Transport {
+                                provider: self.name(),
+                                kind,
+                                detail,
+                            });
+                        }
+                        tracing::debug!(provider = self.name(), %kind, %detail, "provider request failed; retrying once");
+                        // A little jitter so a drain of deferred documents does
+                        // not retry in lockstep.
+                        let jitter = Duration::from_millis(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| u64::from(d.subsec_millis() % 250))
+                                .unwrap_or(0),
+                        );
+                        tokio::time::sleep(RETRY_PAUSE + jitter).await;
+                    }
+                }
             };
-
-            let response = request.send().await.map_err(|e| VectorError::Transport {
-                provider: self.name(),
-                detail: e.to_string(),
-            })?;
 
             let status = response.status();
             if !status.is_success() {
@@ -386,6 +485,54 @@ mod tests {
             dialect,
             auth: Auth::None,
             dim,
+            client: http_client(),
+        }
+    }
+
+    /// The far side closing a connection before answering is the failure a
+    /// pooled client meets after an idle period. One retry inside `embed`
+    /// covers it; a second failure is reported with its kind and cause.
+    #[tokio::test]
+    async fn a_reset_connection_is_retried_once_and_the_cause_is_named() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Connection 1: dropped unanswered. Connection 2: a real response.
+        tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            drop(first);
+            let (mut second, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = second.read(&mut buf).await;
+            let body = r#"{"embeddings":[[1.0,2.0]]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            second.write_all(response.as_bytes()).await.unwrap();
+        });
+        let p = HttpProvider {
+            endpoint: format!("http://{addr}/embed"),
+            model: String::new(),
+            dialect: Dialect::Custom,
+            auth: Auth::None,
+            dim: 2,
+            client: http_client(),
+        };
+        let out = p.embed(&["a".to_string()]).await.unwrap();
+        assert_eq!(out, vec![vec![1.0, 2.0]]);
+
+        // Nothing listening: both attempts fail, and the error says why.
+        let dead = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead.local_addr().unwrap();
+        drop(dead);
+        let p = HttpProvider { endpoint: format!("http://{dead_addr}/embed"), ..p };
+        match p.embed(&["a".to_string()]).await {
+            Err(VectorError::Transport { kind, detail, .. }) => {
+                assert_eq!(kind, TransportKind::Connect, "{detail}");
+                assert!(detail.contains("refused") || detail.contains("connect"), "{detail}");
+            }
+            other => panic!("expected a transport error, got {other:?}"),
         }
     }
 

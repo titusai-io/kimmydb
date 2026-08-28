@@ -4,6 +4,49 @@ use thiserror::Error;
 
 pub type Result<T, E = VectorError> = std::result::Result<T, E>;
 
+/// What part of reaching a provider failed.
+///
+/// A connect failure, a timeout and a reset on an open connection are three
+/// different operational problems (DNS or firewall, a slow or overloaded
+/// provider, a load balancer closing idle connections), and the log line
+/// that reports the failure is the only place an operator can tell them
+/// apart. Also the label on `kimmy_embed_provider_errors_total`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// The connection could not be established: DNS, TCP or TLS.
+    Connect,
+    /// The client's own deadline passed before a response arrived.
+    Timeout,
+    /// The connection was established and then failed mid-request.
+    Reset,
+    /// Anything reqwest does not classify.
+    Other,
+}
+
+impl TransportKind {
+    pub const ALL: [TransportKind; 4] = [
+        TransportKind::Connect,
+        TransportKind::Timeout,
+        TransportKind::Reset,
+        TransportKind::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TransportKind::Connect => "connect",
+            TransportKind::Timeout => "timeout",
+            TransportKind::Reset => "reset",
+            TransportKind::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum VectorError {
     #[error(
@@ -21,8 +64,8 @@ pub enum VectorError {
     #[error("environment variable {var} is not set, so the provider has no API key")]
     MissingApiKey { var: String },
 
-    #[error("could not reach the {provider} embedding provider: {detail}")]
-    Transport { provider: &'static str, detail: String },
+    #[error("could not reach the {provider} embedding provider ({kind}): {detail}")]
+    Transport { provider: &'static str, kind: TransportKind, detail: String },
 
     #[error("the {provider} embedding provider returned {status}: {detail}")]
     ProviderRejected { provider: &'static str, status: u16, detail: String },
