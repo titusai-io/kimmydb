@@ -944,7 +944,7 @@ impl Engine {
     }
 
     fn create_collection_unchecked(&self, db: &str, name: &str) -> Result<CollectionMeta> {
-        self.create_collection_inner(db, name, true)
+        self.create_collection_inner(db, name, true, None)
     }
 
     /// `log = false` when applying a replicated creation. See
@@ -954,6 +954,7 @@ impl Engine {
         db: &str,
         name: &str,
         log: bool,
+        origin: Option<Hlc>,
     ) -> Result<CollectionMeta> {
         let stamp = self.next_stamp();
         let txn = self.begin_write()?;
@@ -1008,7 +1009,13 @@ impl Engine {
                 )));
             }
 
-            let meta = CollectionMeta::new(id, db, name, stamp.hlc, incarnation_floor);
+            // `created` is the stamp of the create that produced this
+            // incarnation *at its origin* — for a replicated create, the
+            // entry's stamp rather than this node's clock at apply time. A
+            // replayed drop is judged against it, and a local clock would
+            // misjudge a legitimate drop stamped just before a late apply.
+            let meta =
+                CollectionMeta::new(id, db, name, origin.unwrap_or(stamp.hlc), incarnation_floor);
             collections.insert((db, name), serde_json::to_vec(&meta)?.as_slice())?;
             meta
         };

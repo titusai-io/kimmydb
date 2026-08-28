@@ -14,6 +14,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A replayed `DropCollection` no longer empties a recreated collection.**
+  A collection recreated under the same name derives the same id, and peers
+  re-deliver overlapping ranges as a matter of course — so a drop from the
+  previous incarnation could arrive again after the recreation, resolve to
+  the current collection, and delete its documents, indexes and vectors on
+  that member, with replication lag still reading 0. Seen on a three-member
+  cluster: one member left with 211 of 361 documents and every member
+  missing vectors. A replicated drop is now applied only to the incarnation
+  it was aimed at — ignored if it predates the create that produced the
+  current one, or is at or before the drop that create followed. A
+  replicated create now records the entry's own stamp as `created` rather
+  than the applying node's clock, which is what makes that comparison safe.
 - **Storage commits no longer stall the async runtime.** Every write
   transaction — the wait for redb's single writer lock and the fsync at
   commit — ran inline on a tokio worker thread. A few concurrent writers
