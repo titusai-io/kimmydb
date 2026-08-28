@@ -4038,7 +4038,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
     // happens. The values themselves are pinned by the unit-level golden test
     // in `metrics.rs`.
     //
-    // **Deployed clusters scrape this endpoint.** If this fails
+    // **Production clusters scrape this endpoint.** If this fails
     // because you meant to change the output, treat the diff as a release
     // note (ADR-070).
     let server = Server::start().await;

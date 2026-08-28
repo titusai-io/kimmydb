@@ -530,7 +530,7 @@ scalar-only majority both bounds back.
 | 5 | ✅ **Ranges on descending fields** | The swap: a descending component's inverted bytes reverse order, so the value-space lower bound caps the key-space top. Encoded-key planner tests, engine equivalence + selectivity tests (including ascending-prefix + descending-range compounds), and the original equivalence property test began exercising the path the moment the planner stopped refusing it |
 | 6 | ✅ **`$in` uses the index** | `IndexPlan` generalized to a list of ranges: one per distinct `$in` value (deduplicated on the encoded key), each carrying the equality prefix. Candidates unioned and deduplicated by document key. Equality probes are sound on multikey indexes, so no flag interaction. `explain` reports `indexUnion` with a probe count |
 | 7 | ✅ **Mutation testing** | `cargo-mutants` (now installed; the hand-rolled harness era is over): full runs on `plan.rs` (29 mutants) and `keyenc.rs` (21), plus a diff-scoped run over everything M7 changed (81). **Ten escapes, nine killed with new tests, one proven equivalent** — see [Testing](testing.md) for the account |
-| 8 | ✅ **Docs** | [Indexes](indexes.md) rewritten where behaviour changed; the 🔴 and both 🟡 planner entries in [Deviations](deviations.md) moved to 🟢; [Handoff](handoff.md) replaced |
+| 8 | ✅ **Docs** | [Indexes](indexes.md) rewritten where behaviour changed; the 🔴 and both 🟡 planner entries in [Deviations](deviations.md) moved to 🟢; Handoff replaced |
 
 ### Deliberately out of scope
 
@@ -670,7 +670,7 @@ with reasoning, not architectural choices with alternatives.
 **Two things M9 deliberately did not build**, both recorded with reasons:
 arbitrary sort keys for cursors, and array/variable-binding/type-conversion
 expression operators. The first needs index-ordered scans, which is the largest
-known outstanding performance item — see [Handoff](handoff.md).
+known outstanding performance item.
 
 ### Deferred questions — one settled, one still open
 

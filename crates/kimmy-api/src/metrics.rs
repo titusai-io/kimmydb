@@ -567,7 +567,7 @@ mod tests {
         m
     }
 
-    /// **Deployed clusters scrape this endpoint. Any diff is a
+    /// **Production clusters scrape this endpoint. Any diff is a
     /// regression** — a renamed series is a dashboard that goes blank and an
     /// alert that stops firing, and neither announces itself.
     ///

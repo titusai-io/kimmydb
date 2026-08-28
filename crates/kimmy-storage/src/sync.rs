@@ -556,7 +556,7 @@ mod tests {
 
     #[test]
     fn a_stamp_that_never_ships_cannot_pin_a_peer_behind_a_full_batch() {
-        // The test-cluster livelock (ADR-082), at its smallest.
+        // The production livelock (ADR-082), at its smallest.
         //
         // A's newest own stamp is a unique-violation entry: locally stamped,
         // advertised in A's vector, and never shipped (ADR-029). *Before* it,

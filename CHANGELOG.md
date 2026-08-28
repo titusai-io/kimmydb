@@ -280,7 +280,7 @@ rolling one.
   vectors demonstrably landed, and a provider outage on the live path was
   invisible to the one signature (`failures` climbing while
   `documents_embedded` does not) the counters were added for. Seen on the
-  test cluster, where an owner's `documents_embedded` read 1 from a rescan
+  production cluster, where an owner's `documents_embedded` read 1 from a rescan
   and never moved as inserts were embedded within seconds. Failures are
   counted per attempt, retries included, on both paths.
 
@@ -295,7 +295,7 @@ rolling one.
   `watch` refused it, and the worker returned the error — one `embedding
   worker stopped` warning, then a node with **no embedding worker at all**
   until the next restart hit the same position and stopped again. A stream
-  invalidated mid-run ended the worker the same way. Seen on a test
+  invalidated mid-run ended the worker the same way. Seen on a production
   cluster after a member spent ten hours unable to sync: it came back owning
   a collection and embedded nothing from then on. The worker now recovers:
   it opens a fresh stream from the oldest retained entry, then rescans every
@@ -318,7 +318,7 @@ rolling one.
   caught up. The same defect was fixed for oplog entries in ADR-031; the
   snapshot types kept the raw integer, and the in-process snapshot tests
   never serialised a page. Both fields are now `CollectionId`, which
-  encodes as reinterpreted signed bits. Found on a test cluster, where
+  encodes as reinterpreted signed bits. Found on a production cluster, where
   every pair went dark 24 h after birth once retention passed the pinned
   floors described below.
 

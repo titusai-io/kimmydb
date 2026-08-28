@@ -2354,7 +2354,7 @@ mod tests {
     #[test]
     fn only_an_actually_empty_grants_array_is_zero_grant() {
         // The exact shape a federated token with no mappings resolves to —
-        // proven live against a test cluster on 2026-08-24, where the
+        // proven live against a production cluster on 2026-08-24, where the
         // cluster owner's own account saw it.
         assert!(is_zero_grant(&json!({ "federated": true, "grants": [] })));
         assert!(!is_zero_grant(&json!({ "grants": [{ "db": "*", "actions": ["read"] }] })));

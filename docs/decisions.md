@@ -3842,7 +3842,7 @@ pinned floor — inevitable on any member that writes rarely and replicates
 much — every round re-serves the same window, every entry in it superseded,
 and the round is never short again.
 
-**Observed** on a three-member test cluster, 2026-08-26, at 0.7.0 with
+**Observed** on a three-member production cluster, 2026-08-26, at 0.7.0 with
 one member's storage and cluster targets at debug: 94 of 95 batches pulled
 from one peer over 25 minutes read `applied=0, superseded=1021`; the peer
 summary reported `ddl=3` from the same peer, and 1021 + 3 is `MAX_BATCH`. Two
@@ -4024,13 +4024,13 @@ defaults (24 h and 24 h) never had it, and nothing legitimate needs it.
 **Why name rather than refuse the rejoiner.** Refusing a merge is a policy
 decision with a real cost: a cluster that quarantines a member on its own
 authority is one an operator has to reason about mid-incident, and the
-observed case on the test cluster (2026-08-26) was not a partitioned member
-but every member at once, each behind the others' horizon after ten hours
-dark — a refusal would have left the cluster refusing itself. The warning
-and the topology field give the operator the fact and the recommended
-action (stop the peer, reset its data directory, let anti-entropy refill
-it) at the moment they matter; had they existed, the outage would have been
-named in the first sync round after the horizon passed rather than found by
+observed case in production (2026-08-26) was not a partitioned member but every
+member at once, each behind the others' horizon after ten hours dark — a
+refusal would have left the cluster refusing itself. The warning and the
+topology field give the operator the fact and the recommended action (stop
+the peer, reset its data directory, let anti-entropy refill it) at the
+moment they matter; had they existed, the outage would have been named
+in the first sync round after the horizon passed rather than found by
 reading storage sizes diverge.
 
 **Why the measure is per origin and ignores unseen origins.** "Behind by
