@@ -339,6 +339,7 @@ port.
 |---|---|
 | `kimmy_up` | Always 1; presence means the node is serving |
 | `kimmy_uptime_seconds` | Since this process started |
+| `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
 | `kimmy_requests_total` | HTTP requests handled |
