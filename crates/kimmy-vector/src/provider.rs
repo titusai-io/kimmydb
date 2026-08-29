@@ -5,7 +5,42 @@
 //! part that can be slow, fail intermittently, or cost money — which is why
 //! embedding runs off the write path entirely.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+
+/// Provider calls that returned a usable response, process-wide.
+static PROVIDER_REQUESTS: AtomicU64 = AtomicU64::new(0);
+/// Input tokens the provider reported billing for, process-wide. Zero for
+/// dialects that report none.
+static PROVIDER_TOKENS: AtomicU64 = AtomicU64::new(0);
+
+/// `(requests, input tokens)` every HTTP provider in this process has been
+/// answered for since start — documents embedded by the worker and queries
+/// embedded for a search alike. Process-wide rather than per worker because
+/// the API's query path builds its own provider, and the question this
+/// answers ("what did this node send the provider, and what was it billed
+/// for?") is about the node. Rendered as `kimmy_embed_provider_requests_total`
+/// and `kimmy_embed_provider_tokens_total`.
+pub fn provider_totals() -> (u64, u64) {
+    (PROVIDER_REQUESTS.load(Ordering::Relaxed), PROVIDER_TOKENS.load(Ordering::Relaxed))
+}
+
+/// The input-token count a response carries, if its dialect reports one.
+///
+/// OpenAI-compatible APIs (OpenAI, DeepInfra, llama.cpp, Voyage) put it at
+/// `usage.prompt_tokens`; Cohere v2 at `meta.billed_units.input_tokens`;
+/// Ollama at `prompt_eval_count`. Gemini's batch endpoint reports nothing.
+/// Absent is zero, not an error: billing detail is never worth failing a
+/// batch over.
+fn billed_tokens(dialect: Dialect, body: &serde_json::Value) -> u64 {
+    let n = match dialect {
+        Dialect::OpenAi | Dialect::Custom => body.pointer("/usage/prompt_tokens"),
+        Dialect::Cohere => body.pointer("/meta/billed_units/input_tokens"),
+        Dialect::Ollama => body.get("prompt_eval_count"),
+        Dialect::Gemini => None,
+    };
+    n.and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64))).unwrap_or(0)
+}
 
 use async_trait::async_trait;
 use kimmy_core::ProviderConfig;
@@ -448,6 +483,8 @@ impl EmbeddingProvider for HttpProvider {
                 VectorError::MalformedResponse { provider: self.name(), detail: e.to_string() }
             })?;
             out.extend(self.parse_response(&body)?);
+            PROVIDER_REQUESTS.fetch_add(1, Ordering::Relaxed);
+            PROVIDER_TOKENS.fetch_add(billed_tokens(self.dialect, &body), Ordering::Relaxed);
         }
 
         if out.len() != texts.len() {
@@ -534,6 +571,19 @@ mod tests {
             }
             other => panic!("expected a transport error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn billed_tokens_are_read_per_dialect_and_absent_is_zero() {
+        let openai =
+            serde_json::json!({ "data": [], "usage": { "prompt_tokens": 17, "total_tokens": 17 } });
+        assert_eq!(billed_tokens(Dialect::OpenAi, &openai), 17);
+        let cohere = serde_json::json!({ "meta": { "billed_units": { "input_tokens": 23 } } });
+        assert_eq!(billed_tokens(Dialect::Cohere, &cohere), 23);
+        let ollama = serde_json::json!({ "embedding": [], "prompt_eval_count": 5 });
+        assert_eq!(billed_tokens(Dialect::Ollama, &ollama), 5);
+        assert_eq!(billed_tokens(Dialect::OpenAi, &serde_json::json!({ "data": [] })), 0);
+        assert_eq!(billed_tokens(Dialect::Gemini, &openai), 0);
     }
 
     #[test]

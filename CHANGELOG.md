@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **`/metrics` reports what the embedding provider was asked and billed for.**
+  `kimmy_embed_provider_requests_total` counts provider calls answered, and
+  `kimmy_embed_provider_tokens_total` sums the input tokens the provider
+  reported (`usage.prompt_tokens` for OpenAI-compatible APIs, Cohere's
+  `billed_units.input_tokens`, Ollama's `prompt_eval_count`). Both count
+  documents embedded by the worker and queries embedded for a search, so a
+  delta across a load is the number a metered provider's invoice is made of
+  — per node, per run, without the provider's dashboard.
+
 ## 0.16.2 - 2026-08-28
 
 A patch: no wire, storage-format or API change; rolling upgrade. Two

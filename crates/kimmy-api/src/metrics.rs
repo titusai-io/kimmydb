@@ -74,6 +74,9 @@ pub struct MetricsSnapshot {
     /// Transport failures among `embed_failures`, in the order connect,
     /// timeout, reset, other.
     pub embed_transport: [u64; 4],
+    /// Provider calls answered and input tokens billed, process-wide.
+    pub embed_provider_requests: u64,
+    pub embed_provider_tokens: u64,
     /// Requests observed by the latency histogram — health and metrics routes
     /// excluded, so this is smaller than `requests` on any real node.
     pub latency_count: u64,
@@ -382,6 +385,8 @@ impl Metrics {
                 .vector_counters
                 .get()
                 .map_or(0, |c| c.failures.load(Ordering::Relaxed)),
+            embed_provider_requests: kimmy_vector::provider_totals().0,
+            embed_provider_tokens: kimmy_vector::provider_totals().1,
             embed_transport: self.vector_counters.get().map_or([0; 4], |c| {
                 kimmy_vector::TransportKind::ALL.map(|k| c.transport_failures(k))
             }),
@@ -491,7 +496,15 @@ impl Metrics {
              kimmy_embed_provider_errors_total{{kind=\"connect\"}} {t_connect}\n\
              kimmy_embed_provider_errors_total{{kind=\"timeout\"}} {t_timeout}\n\
              kimmy_embed_provider_errors_total{{kind=\"reset\"}} {t_reset}\n\
-             kimmy_embed_provider_errors_total{{kind=\"other\"}} {t_other}\n",
+             kimmy_embed_provider_errors_total{{kind=\"other\"}} {t_other}\n\
+             # HELP kimmy_embed_provider_requests_total Embedding provider calls answered, documents and search queries alike - compare with the provider's own request count.\n\
+             # TYPE kimmy_embed_provider_requests_total counter\n\
+             kimmy_embed_provider_requests_total {p_requests}\n\
+             # HELP kimmy_embed_provider_tokens_total Input tokens the embedding provider reported billing for - the number a metered provider's invoice is made of. Zero for providers that report none.\n\
+             # TYPE kimmy_embed_provider_tokens_total counter\n\
+             kimmy_embed_provider_tokens_total {p_tokens}\n",
+            p_requests = kimmy_vector::provider_totals().0,
+            p_tokens = kimmy_vector::provider_totals().1,
             uptime = self.uptime_secs(),
             stall = self.take_runtime_stall_secs(),
             requests = self.get(&self.requests),
@@ -704,6 +717,12 @@ kimmy_embed_provider_errors_total{kind=\"connect\"} 0
 kimmy_embed_provider_errors_total{kind=\"timeout\"} 0
 kimmy_embed_provider_errors_total{kind=\"reset\"} 0
 kimmy_embed_provider_errors_total{kind=\"other\"} 0
+# HELP kimmy_embed_provider_requests_total Embedding provider calls answered, documents and search queries alike - compare with the provider's own request count.
+# TYPE kimmy_embed_provider_requests_total counter
+kimmy_embed_provider_requests_total 0
+# HELP kimmy_embed_provider_tokens_total Input tokens the embedding provider reported billing for - the number a metered provider's invoice is made of. Zero for providers that report none.
+# TYPE kimmy_embed_provider_tokens_total counter
+kimmy_embed_provider_tokens_total 0
 # HELP kimmy_request_duration_seconds End-to-end request latency. Health and metrics routes are excluded, so scrapes do not crowd the buckets the real traffic lands in.
 # TYPE kimmy_request_duration_seconds histogram
 kimmy_request_duration_seconds_bucket{le=\"0.0001\"} 1
@@ -782,6 +801,8 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_embed_deferred_total {}\n", s.embed_deferred));
         expect(&format!("kimmy_embed_skipped_not_owned_total {}\n", s.embed_skipped_not_owned));
         expect(&format!("kimmy_embed_failures_total {}\n", s.embed_failures));
+        expect(&format!("kimmy_embed_provider_requests_total {}\n", s.embed_provider_requests));
+        expect(&format!("kimmy_embed_provider_tokens_total {}\n", s.embed_provider_tokens));
         for (kind, n) in ["connect", "timeout", "reset", "other"].iter().zip(s.embed_transport) {
             expect(&format!("kimmy_embed_provider_errors_total{{kind=\"{kind}\"}} {n}\n"));
         }
@@ -835,8 +856,8 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 28 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 48, "expected one sample per series: {out}");
+        // 30 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 50, "expected one sample per series: {out}");
     }
 
     #[test]
