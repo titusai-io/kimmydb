@@ -1162,6 +1162,7 @@ async fn every_documented_operation_answers_as_the_specification_says() {
     c.check("DELETE", "/v1/users/{name}", "/v1/users/clerk", Some(&root), None, 200).await;
     c.check("DELETE", "/v1/db/{db}/coll/{coll}", "/v1/db/shop/coll/orders", Some(&root), None, 200)
         .await;
+    c.check("DELETE", "/v1/db/{db}", "/v1/db/shop", Some(&root), None, 200).await;
 
     // -- the gate ----------------------------------------------------------
     let documented = documented_operations();

@@ -356,9 +356,15 @@ curl localhost:7878/v1/databases -H "$A"
 curl localhost:7878/v1/db/shop/collections -H "$A"
 curl -XPOST localhost:7878/v1/db/shop/collections -H "$A" -d '{"name":"orders"}'
 curl -XDELETE localhost:7878/v1/db/shop/coll/orders -H "$A"
+curl -XDELETE localhost:7878/v1/db/shop -H "$A"           # every collection in it
 ```
 
-Databases are created implicitly by their first collection. Listing responses
+Databases are created implicitly by their first collection and removed
+implicitly with their last: dropping the last collection takes the database
+out of listings on every member, because the drop replicates and the
+decision is made where it is applied. `DELETE /v1/db/{db}` drops each
+collection in turn (`ddl` over the database); system databases (`__…`) are
+refused. Listing responses
 are **filtered by what the caller may read**, so they cannot be used to discover
 objects you have no access to.
 

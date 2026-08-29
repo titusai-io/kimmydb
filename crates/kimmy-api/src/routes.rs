@@ -97,6 +97,7 @@ fn routes(state: SharedState) -> Router {
         .route("/v1/roles/{name}/grants", post(crate::roles::set_role_grants))
         .route("/v1/databases", get(list_databases))
         .route("/v1/db/{db}/collections", get(list_collections).post(create_collection))
+        .route("/v1/db/{db}", delete(drop_database))
         .route("/v1/db/{db}/coll/{coll}", delete(drop_collection))
         .route("/v1/db/{db}/coll/{coll}/docs", post(insert_doc).get(find_docs))
         .route("/v1/db/{db}/coll/{coll}/bulk", post(bulk_insert_docs))
@@ -634,6 +635,14 @@ async fn drop_collection(
     Path((db, coll)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::drop_collection(&state, &auth, &db, &coll)?))
+}
+
+async fn drop_database(
+    State(state): State<SharedState>,
+    auth: Auth,
+    Path(db): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(exec::drop_database(&state, &auth, &db)?))
 }
 
 // ---------------------------------------------------------------------------

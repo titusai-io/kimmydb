@@ -417,6 +417,36 @@ async fn documents_round_trip_through_the_api() {
 }
 
 #[tokio::test]
+async fn a_database_is_listed_while_it_has_collections_and_can_be_dropped_whole() {
+    // Creation is implicit in the first collection; removal is implicit in
+    // the last, so an emptied database does not linger in listings — and
+    // DELETE /v1/db/{db} drops everything in one call.
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"items"})).await;
+    let res = server.get("/v1/databases", Some(&token)).await;
+    assert!(res.body["databases"].as_array().unwrap().contains(&json!("shop")));
+
+    let res = server.delete("/v1/db/shop/coll/orders", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/databases", Some(&token)).await;
+    assert!(res.body["databases"].as_array().unwrap().contains(&json!("shop")), "one left");
+
+    let res = server.delete("/v1/db/shop", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["dropped"], true);
+    let res = server.get("/v1/databases", Some(&token)).await;
+    assert!(!res.body["databases"].as_array().unwrap().contains(&json!("shop")));
+    let res = server.get("/v1/db/shop/collections", Some(&token)).await;
+    assert_eq!(res.status, 404, "listing a missing database is a 404: {:?}", res.body);
+
+    let res = server.delete("/v1/db/__kimmy", Some(&token)).await;
+    assert_eq!(res.status, 400, "system databases are refused: {:?}", res.body);
+}
+
+#[tokio::test]
 async fn replacing_by_id_reports_counts_and_needs_upsert_to_create() {
     // Two things nothing covered until the protocol was specified, both
     // client-visible:

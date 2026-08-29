@@ -1082,6 +1082,38 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
 
+  /v1/db/{db}:
+    parameters:
+      - $ref: "#/components/parameters/Db"
+    delete:
+      tags: [collections]
+      operationId: dropDatabase
+      summary: Drop every collection in a database.
+      description: >-
+        Each collection is dropped in turn as its own replicated change; the
+        last drop removes the database from listings on every member.
+        Databases are otherwise implicit — created by their first collection,
+        removed with their last. System databases (`__…`) are refused.
+      x-kimmy-action: ddl
+      responses:
+        "200":
+          description: Dropped, or there was nothing to drop.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [dropped]
+                properties:
+                  dropped:
+                    type: boolean
+        "400":
+          description: A system database.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+
   /v1/db/{db}/coll/{coll}:
     parameters:
       - $ref: "#/components/parameters/Db"
