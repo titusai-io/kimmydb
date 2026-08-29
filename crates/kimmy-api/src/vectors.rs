@@ -458,7 +458,13 @@ async fn resolve_query_vector(
     }
 
     let provider = kimmy_vector::build(&config.provider, config.dim).map_err(vector_error)?;
-    let mut vectors = provider.embed(std::slice::from_ref(text)).await.map_err(vector_error)?;
+    // The query prefix is applied here and nowhere else: a caller-supplied
+    // vector was embedded by the caller, prefix and all, or not at all.
+    let text = match &config.query_prefix {
+        Some(prefix) => format!("{prefix}{text}"),
+        None => text.clone(),
+    };
+    let mut vectors = provider.embed(std::slice::from_ref(&text)).await.map_err(vector_error)?;
     vectors.pop().ok_or_else(|| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,

@@ -460,6 +460,8 @@ async fn listings_omit_internals_but_tools_still_reach_them_by_name() {
                 provider: kimmy_core::vector_meta::ProviderConfig::Byo,
                 dim: 4,
                 metric: Default::default(),
+                document_prefix: None,
+                query_prefix: None,
                 chunk: Default::default(),
             },
         )

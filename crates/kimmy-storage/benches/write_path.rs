@@ -271,6 +271,8 @@ fn vector_writes(c: &mut Criterion) {
                         provider: ProviderConfig::Byo,
                         dim: 384,
                         metric: Metric::Cosine,
+                        document_prefix: None,
+                        query_prefix: None,
                         chunk: ChunkConfig::default(),
                     },
                 )

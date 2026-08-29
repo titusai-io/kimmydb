@@ -64,6 +64,8 @@ fn config(dim: usize) -> VectorConfig {
         provider: ProviderConfig::Byo,
         dim,
         metric: Metric::Cosine,
+        document_prefix: None,
+        query_prefix: None,
         chunk: ChunkConfig::default(),
     }
 }

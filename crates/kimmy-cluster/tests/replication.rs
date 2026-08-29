@@ -666,6 +666,8 @@ fn vector_config() -> kimmy_core::VectorConfig {
         provider: kimmy_core::ProviderConfig::Byo,
         dim: 8,
         metric: kimmy_core::Metric::Cosine,
+        document_prefix: None,
+        query_prefix: None,
         chunk: Default::default(),
     }
 }
