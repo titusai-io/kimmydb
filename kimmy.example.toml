@@ -154,6 +154,11 @@ tombstone_retention_secs = 86400
 # disconnected change-stream client can be away and still resume, and how far
 # behind a peer can fall and still catch up incrementally.
 oplog_retention_secs = 86400
+# Bound on the storage engine's page cache — most of the node's resident
+# memory. redb fills it and evicts only for room, never on a timer, so a node
+# sits at whatever its busiest period filled. 256 MiB by default; raise it on a
+# node whose database file is much larger and whose reads are latency-bound.
+cache_bytes = 268435456
 
 # How often to collect records past the two windows above.
 #

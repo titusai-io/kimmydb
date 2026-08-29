@@ -14,6 +14,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`storage.cache_bytes`** bounds redb's page cache, which is most of a
+  node's resident memory. It was redb's fixed 1 GiB default; it is 256 MiB
+  now. The cache fills with reads and evicts only for room, never on a timer,
+  so a node's RSS settles at its busiest period's level — three members
+  measured at 460–590 MiB with every collection dropped — and this is the
+  setting that decides where that level is.
 - **`dimensions` on the `open_ai` provider.** Sent as the OpenAI request
   field of that name, so Matryoshka-trained models return a narrower
   vector than their native width; `dim` must equal it. Until now every model

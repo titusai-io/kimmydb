@@ -229,6 +229,16 @@ pub struct StorageConfig {
     /// How much oplog history to keep for change-stream resumption and peer
     /// catch-up. A subscriber that lags past this gets an `invalidate`.
     pub oplog_retention_secs: u64,
+    /// Bound on the storage engine's page cache, in bytes.
+    ///
+    /// This is most of a node's resident memory. redb keeps up to this many
+    /// bytes of database pages and evicts only when it needs the room — never
+    /// on a timer — so a node settles at whatever its busiest period filled
+    /// and stays there. 256 MiB by default: comfortably more than the working
+    /// set of the deployments this project serves today, a quarter of redb's
+    /// own 1 GiB default, and the number to raise on a node whose database
+    /// file is much larger than that and whose reads are latency-sensitive.
+    pub cache_bytes: u64,
     /// How often to collect records that are past their retention.
     ///
     /// Separate from the retention windows themselves: retention says what is
@@ -855,6 +865,7 @@ impl Default for StorageConfig {
             data_dir: PathBuf::from("/var/lib/kimmy"),
             tombstone_retention_secs: 24 * 60 * 60,
             oplog_retention_secs: 24 * 60 * 60,
+            cache_bytes: 256 * 1024 * 1024,
             // Frequent enough that disk use tracks retention rather than
             // sawtoothing, rare enough that the scan is not a background load.
             gc_interval_secs: 10 * 60,
@@ -1034,6 +1045,9 @@ impl Config {
         // log that silently records nothing.
         kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
 
+        if self.storage.cache_bytes < 8 * 1024 * 1024 {
+            anyhow::bail!("storage.cache_bytes must be at least 8 MiB (8388608)");
+        }
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
         }

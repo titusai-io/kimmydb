@@ -63,7 +63,8 @@ pub async fn run(config: Config) -> Result<()> {
     // node that forgets it becomes a stranger to its own prior writes.
     let path = config.storage.data_dir.join(DATABASE_FILE);
     let engine = Arc::new(
-        Engine::open(&path).with_context(|| format!("opening database {}", path.display()))?,
+        Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize))
+            .with_context(|| format!("opening database {}", path.display()))?,
     );
     engine.set_multi_chunk_docs(config.storage.multi_chunk_docs);
     // Validation already refused anything else; the fallback is only so a
