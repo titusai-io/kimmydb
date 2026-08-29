@@ -144,9 +144,15 @@ pub fn build(config: &ProviderConfig, dim: usize) -> Result<Box<dyn EmbeddingPro
     match config {
         ProviderConfig::Byo => Err(VectorError::NoProvider),
 
-        ProviderConfig::OpenAi { model, endpoint, api_key_env } => {
+        ProviderConfig::OpenAi { model, endpoint, api_key_env, dimensions } => {
             let base = endpoint.clone().unwrap_or_else(|| "https://api.openai.com".into());
-            Ok(Box::new(HttpProvider::openai(base, model.clone(), api_key_env.clone(), dim)?))
+            Ok(Box::new(HttpProvider::openai(
+                base,
+                model.clone(),
+                api_key_env.clone(),
+                dim,
+                *dimensions,
+            )?))
         }
         ProviderConfig::Ollama { model, endpoint } => {
             Ok(Box::new(HttpProvider::ollama(endpoint.clone(), model.clone(), dim)))
@@ -246,10 +252,19 @@ pub struct HttpProvider {
     dim: usize,
     /// Shared across every call this provider makes; see [`http_client`].
     client: reqwest::Client,
+    /// The OpenAI `dimensions` request field, when the configuration asks
+    /// for a width other than the model's native one.
+    dimensions: Option<usize>,
 }
 
 impl HttpProvider {
-    fn openai(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
+    fn openai(
+        base: String,
+        model: String,
+        key_env: String,
+        dim: usize,
+        dimensions: Option<usize>,
+    ) -> Result<Self> {
         Ok(Self {
             endpoint: openai_url(&base),
             model,
@@ -257,6 +272,7 @@ impl HttpProvider {
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
             client: http_client(),
+            dimensions,
         })
     }
 
@@ -268,6 +284,7 @@ impl HttpProvider {
             auth: Auth::None,
             dim,
             client: http_client(),
+            dimensions: None,
         }
     }
 
@@ -283,6 +300,7 @@ impl HttpProvider {
             auth,
             dim,
             client: http_client(),
+            dimensions: None,
         })
     }
 
@@ -294,6 +312,7 @@ impl HttpProvider {
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
             client: http_client(),
+            dimensions: None,
         })
     }
 
@@ -318,13 +337,20 @@ impl HttpProvider {
             auth: Auth::Header("x-goog-api-key", key),
             dim,
             client: http_client(),
+            dimensions: None,
         }
     }
 
     /// The request body for a batch, in this provider's dialect.
     fn request_body(&self, texts: &[String]) -> serde_json::Value {
         match self.dialect {
-            Dialect::OpenAi => serde_json::json!({ "input": texts, "model": self.model }),
+            Dialect::OpenAi => {
+                let mut body = serde_json::json!({ "input": texts, "model": self.model });
+                if let Some(d) = self.dimensions {
+                    body["dimensions"] = serde_json::json!(d);
+                }
+                body
+            }
             // Ollama embeds one text per call, so a batch is sent as separate
             // requests; this builds the body for a single one.
             Dialect::Ollama => {
@@ -539,6 +565,7 @@ mod tests {
             auth: Auth::None,
             dim,
             client: http_client(),
+            dimensions: None,
         }
     }
 
@@ -571,6 +598,7 @@ mod tests {
             auth: Auth::None,
             dim: 2,
             client: http_client(),
+            dimensions: None,
         };
         let out = p.embed(&["a".to_string()]).await.unwrap();
         assert_eq!(out, vec![vec![1.0, 2.0]]);
@@ -633,6 +661,10 @@ mod tests {
         let openai = provider(Dialect::OpenAi, 2).request_body(&texts);
         assert_eq!(openai["input"], serde_json::json!(["a", "b"]));
         assert_eq!(openai["model"], "m");
+        assert!(openai.get("dimensions").is_none(), "absent unless configured");
+        let mut narrow = provider(Dialect::OpenAi, 2);
+        narrow.dimensions = Some(256);
+        assert_eq!(narrow.request_body(&texts)["dimensions"], 256);
 
         // Ollama takes a single prompt per request.
         let ollama = provider(Dialect::Ollama, 2).request_body(&texts[..1]);
@@ -711,6 +743,7 @@ mod tests {
             model: "voyage-3".into(),
             endpoint: Some("https://api.voyageai.com".into()),
             api_key_env: "VOYAGE_API_KEY".into(),
+            dimensions: None,
         };
         assert_eq!(config.name(), "openai", "voyage is configured as the openai provider");
 
@@ -783,6 +816,7 @@ mod tests {
             model: "text-embedding-3-small".into(),
             endpoint: None,
             api_key_env: "KIMMY_TEST_KEY_DEFINITELY_UNSET".into(),
+            dimensions: None,
         };
         let Err(err) = build(&config, 1536) else {
             panic!("an unset key variable should not build a provider");
