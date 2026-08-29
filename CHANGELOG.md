@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **An `open_ai` endpoint that already names the embeddings route is used as
+  is.** The dialect appended `/v1/embeddings` to whatever `endpoint` said, so
+  a provider that mounts the OpenAI-compatible API under a prefix —
+  DeepInfra's documented `…/v1/openai/embeddings`, Azure's
+  `…/openai/deployments/<name>/embeddings?api-version=…`, a gateway under a
+  path — answered 404 on every call with no way round it. A setting ending in
+  `/embeddings` (query string allowed) is now the full URL; a bare base still
+  gets the standard suffix.
+
 ## 0.16.3 - 2026-08-28
 
 A patch: one additive pair of `/metrics` series, nothing else.

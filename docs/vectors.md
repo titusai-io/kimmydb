@@ -87,11 +87,18 @@ POST /v1/db/{db}/coll/{coll}/vector
 |---|---|---|
 | `byo` | nothing | **The default.** The client supplies vectors through [the ingest route](#supplying-your-own-vectors); the server never embeds |
 | `open_ai` | an API key | Any OpenAI-compatible `/v1/embeddings` endpoint. **Voyage is this** — `{"kind":"open_ai","model":"voyage-3","endpoint":"https://api.voyageai.com","api_key_env":"VOYAGE_API_KEY"}` |
+
 | `ollama` | a reachable Ollama | Local or remote |
 | `cohere` | an API key | Cohere `/v2/embed`. Sends `input_type: search_document`; accepts both v1 and v2 response shapes ([ADR-047](decisions.md)) |
 | `gemini` | an API key | Google `:batchEmbedContents`. Key goes in the `x-goog-api-key` header ([ADR-047](decisions.md)) |
 | `custom_http` | an endpoint | Accepts `{"input": [...]}`, returns `{"embeddings": [[...]]}`. The escape hatch for anything the named dialects miss |
 | `local` | `--features local-embeddings` | In-process ONNX. **Not in the default build** — see below |
+
+For `open_ai`, `endpoint` is a base URL and `/v1/embeddings` is appended —
+unless the setting already names the embeddings route, in which case it is
+used verbatim. That is how providers that mount the compatible API under a
+prefix are reached: `"endpoint": "https://api.deepinfra.com/v1/openai/embeddings"`
+or Azure's `…/openai/deployments/<name>/embeddings?api-version=…`.
 
 Default key variables: `OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`;
 override with `api_key_env`. The dialects were audited against each provider's

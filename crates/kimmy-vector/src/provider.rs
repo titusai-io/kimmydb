@@ -80,6 +80,22 @@ fn http_client() -> reqwest::Client {
         .expect("HTTP client")
 }
 
+/// The URL an OpenAI-dialect endpoint setting resolves to.
+///
+/// A bare base (`https://api.openai.com`, `http://llama-embed:5301`) gets the
+/// standard `/v1/embeddings` appended. A setting that already names the
+/// embeddings route is used verbatim, query string and all: providers that
+/// mount the OpenAI-compatible API under a prefix — DeepInfra's documented
+/// `…/v1/openai/embeddings`, Azure's `…/openai/deployments/<name>/embeddings
+/// ?api-version=…`, any gateway under a path — would otherwise be unreachable
+/// with this dialect, and the only sign would be a 404 on every call. Found
+/// on 2026-08-28: DeepInfra happened to answer on `/v1/embeddings` too, which
+/// is the only reason the appended form worked.
+fn openai_url(base: &str) -> String {
+    let path = base.split_once('?').map_or(base, |(p, _)| p).trim_end_matches('/');
+    if path.ends_with("/embeddings") { base.to_string() } else { format!("{path}/v1/embeddings") }
+}
+
 /// Turn a reqwest error into what an operator needs to read: which stage
 /// failed, and the whole cause chain rather than reqwest's outer message —
 /// `error sending request for url (...)` on its own says nothing about
@@ -235,7 +251,7 @@ pub struct HttpProvider {
 impl HttpProvider {
     fn openai(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
         Ok(Self {
-            endpoint: format!("{}/v1/embeddings", base.trim_end_matches('/')),
+            endpoint: openai_url(&base),
             model,
             dialect: Dialect::OpenAi,
             auth: Auth::Bearer(read_key(&key_env)?),
@@ -584,6 +600,24 @@ mod tests {
         assert_eq!(billed_tokens(Dialect::Ollama, &ollama), 5);
         assert_eq!(billed_tokens(Dialect::OpenAi, &serde_json::json!({ "data": [] })), 0);
         assert_eq!(billed_tokens(Dialect::Gemini, &openai), 0);
+    }
+
+    #[test]
+    fn an_openai_endpoint_that_names_the_route_is_used_verbatim() {
+        assert_eq!(openai_url("https://api.openai.com"), "https://api.openai.com/v1/embeddings");
+        assert_eq!(openai_url("http://llama-embed:5301/"), "http://llama-embed:5301/v1/embeddings");
+        assert_eq!(
+            openai_url("https://api.deepinfra.com/v1/openai/embeddings"),
+            "https://api.deepinfra.com/v1/openai/embeddings"
+        );
+        assert_eq!(
+            openai_url(
+                "https://x.openai.azure.com/openai/deployments/e/embeddings?api-version=2024-02-01"
+            ),
+            "https://x.openai.azure.com/openai/deployments/e/embeddings?api-version=2024-02-01"
+        );
+        // A trailing slash after the route is still the route.
+        assert_eq!(openai_url("https://h/v1/embeddings/"), "https://h/v1/embeddings/");
     }
 
     #[test]
