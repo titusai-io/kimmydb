@@ -10,7 +10,13 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.16.4 - 2026-08-29
+
+A patch: no wire, storage-format or API break; rolling upgrade. Four
+additions that fell out of the embedding-model evaluation — two of them the
+provider-generality gaps it exposed — and three fixes, one of which changes a
+default: redb's page cache is bounded at 256 MiB now instead of 1 GiB, which
+is where a node's resident memory was going.
 
 ### Added
 
