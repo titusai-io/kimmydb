@@ -220,7 +220,22 @@ impl Engine {
     /// copying or restoring the file carries the identity with it. Identity
     /// must survive restarts: it is the tiebreak half of every write's stamp.
     pub fn open(path: &Path) -> Result<Self> {
-        let db = Database::create(path)?;
+        Self::open_with_cache(path, None)
+    }
+
+    /// Open with a bound on redb's page cache.
+    ///
+    /// The cache is where a node's resident memory goes: redb keeps up to
+    /// this many bytes of pages and evicts only for room, never on a timer,
+    /// so after a burst of reads a node sits at whatever the burst filled —
+    /// measured on a three-member cluster at 460–590 MiB per member with
+    /// every collection dropped and nothing to do. `None` is redb's own
+    /// default (1 GiB). The daemon sets this from `storage.cache_bytes`.
+    pub fn open_with_cache(path: &Path, cache_bytes: Option<usize>) -> Result<Self> {
+        let db = match cache_bytes {
+            Some(bytes) => Database::builder().set_cache_size(bytes).create(path)?,
+            None => Database::create(path)?,
+        };
 
         // Ensure every table exists up front so that read transactions never
         // have to handle a missing table.
@@ -1415,6 +1430,16 @@ mod tests {
         assert!(engine.list_collections("shop").unwrap().is_empty());
         assert!(!engine.database_exists("shop").unwrap());
         assert!(!engine.drop_database("shop").unwrap(), "already gone");
+    }
+
+    #[test]
+    fn opens_with_a_bounded_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine =
+            super::Engine::open_with_cache(&dir.path().join("k.redb"), Some(8 << 20)).unwrap();
+        let coll = engine.create_collection("app", "docs").unwrap();
+        engine.insert(&coll, bson::doc! { "_id": 1 }).unwrap();
+        assert_eq!(engine.count(&coll).unwrap(), 1);
     }
 
     use super::*;
