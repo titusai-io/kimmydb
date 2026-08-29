@@ -14,6 +14,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`dimensions` on the `open_ai` provider.** Sent as the OpenAI request
+  field of that name, so Matryoshka-trained models return a narrower
+  vector than their native width; `dim` must equal it. Until now every model
+  was stored at native width with no way to ask for less — and width is the
+  real cost of a strong model (a 4096-wide one is four times the vector
+  bytes of a 1024-wide one, and several times that on disk).
 - **`DELETE /v1/db/{db}`** drops every collection in a database (`ddl` over
   the database; system databases refused).
 

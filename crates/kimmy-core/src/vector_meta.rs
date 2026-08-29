@@ -57,6 +57,16 @@ impl VectorConfig {
             return Err(format!("vector.dim {} exceeds the maximum of {MAX_DIM}", self.dim));
         }
         self.chunk.validate()?;
+        // A requested width that disagrees with the pinned one would store
+        // vectors of one shape under a config that promises another.
+        if let ProviderConfig::OpenAi { dimensions: Some(requested), .. } = &self.provider
+            && *requested != self.dim
+        {
+            return Err(format!(
+                "vector.provider.dimensions ({requested}) must equal vector.dim ({})",
+                self.dim
+            ));
+        }
         self.provider.validate()
     }
 }
@@ -82,6 +92,15 @@ pub enum ProviderConfig {
         /// never stored in collection metadata.
         #[serde(default = "default_openai_key_env")]
         api_key_env: String,
+        /// Ask the provider for this width — the OpenAI `dimensions` field,
+        /// honoured by Matryoshka-trained models (OpenAI `text-embedding-3-*`,
+        /// Nemotron-3-Embed, Qwen3-Embedding, EmbeddingGemma, Voyage). Must
+        /// equal `dim`; absent means the model's native width. A provider
+        /// that ignores the field returns its native width and fails the
+        /// dimension check on the first embed rather than storing the wrong
+        /// shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dimensions: Option<usize>,
     },
     /// A local or remote Ollama server.
     Ollama { model: String, endpoint: String },
@@ -158,6 +177,9 @@ impl ProviderConfig {
             Self::Byo => Ok(()),
             Self::OpenAi { model, .. } if model.is_empty() => {
                 Err("openai provider needs a model".into())
+            }
+            Self::OpenAi { dimensions: Some(0), .. } => {
+                Err("openai provider dimensions must be greater than zero".into())
             }
             Self::Ollama { model, endpoint } => {
                 if model.is_empty() {
@@ -362,6 +384,7 @@ mod tests {
                 model: "m".into(),
                 endpoint: None,
                 api_key_env: default_openai_key_env(),
+                dimensions: None,
             },
             ProviderConfig::Ollama { model: "m".into(), endpoint: "http://x".into() },
             ProviderConfig::Cohere {
@@ -635,5 +658,26 @@ mod tests {
         assert!(!json.contains("max_tokens"), "{json}");
         let decoded: ChunkConfig = serde_json::from_str(r#"{"max_chars":50,"overlap":5}"#).unwrap();
         assert_eq!(decoded.max_tokens, None);
+    }
+
+    #[test]
+    fn requested_dimensions_must_equal_dim() {
+        let mut config: VectorConfig = serde_json::from_value(serde_json::json!({
+            "fields": ["text"], "dim": 1024,
+            "provider": { "kind": "open_ai", "model": "m", "dimensions": 1024 }
+        }))
+        .unwrap();
+        assert!(config.validate().is_ok());
+        config.dim = 2048;
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("dimensions (1024)") && err.contains("dim (2048)"), "{err}");
+        // Round-trips, and is omitted when absent so older metadata is unchanged.
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["provider"]["dimensions"], 1024);
+        let plain: VectorConfig = serde_json::from_value(serde_json::json!({
+            "fields": ["text"], "dim": 8, "provider": { "kind": "open_ai", "model": "m" }
+        }))
+        .unwrap();
+        assert!(serde_json::to_value(&plain).unwrap()["provider"].get("dimensions").is_none());
     }
 }

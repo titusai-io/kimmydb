@@ -100,6 +100,14 @@ used verbatim. That is how providers that mount the compatible API under a
 prefix are reached: `"endpoint": "https://api.deepinfra.com/v1/openai/embeddings"`
 or Azure's `…/openai/deployments/<name>/embeddings?api-version=…`.
 
+`open_ai` also takes an optional `dimensions`, sent as the request field of
+that name for Matryoshka-trained models (OpenAI `text-embedding-3-*`,
+Nemotron-3-Embed, Qwen3-Embedding, EmbeddingGemma, Voyage): the provider
+returns that width instead of the model's native one, and `dim` must equal
+it. Left out, the model's native width is what comes back and `dim` must
+match that. A provider that ignores the field fails the dimension check on
+the first embed rather than storing the wrong shape.
+
 Default key variables: `OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`;
 override with `api_key_env`. The dialects were audited against each provider's
 documented API shape and pinned with fixture tests ([ADR-047](decisions.md)),
