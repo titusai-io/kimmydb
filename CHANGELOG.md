@@ -12,6 +12,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`DELETE /v1/db/{db}`** drops every collection in a database (`ddl` over
+  the database; system databases refused).
+
 ### Fixed
 
 - **An `open_ai` endpoint that already names the embeddings route is used as
@@ -22,6 +27,12 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   path — answered 404 on every call with no way round it. A setting ending in
   `/embeddings` (query string allowed) is now the full URL; a bare base still
   gets the standard suffix.
+- **An emptied database no longer lingers in listings.** Creation was
+  implicit in the first collection but removal was not implicit in the last,
+  so a database whose collections had all been dropped stayed listed on every
+  member forever. The last drop now removes it — decided inside the
+  replicated drop, so peers converge without a database-drop entry of their
+  own.
 
 ## 0.16.3 - 2026-08-28
 

@@ -142,6 +142,21 @@ pub fn create_collection(
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 
+/// Drop every collection in a database. Each drop is a replicated entry and
+/// the last one takes the database with it on every member, so this needs
+/// no replication of its own. System databases are refused: the node keeps
+/// its own bookkeeping there.
+pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value, ApiError> {
+    let _span = op_span("drop_database", db, None).entered();
+    if db.starts_with("__") {
+        return Err(ApiError::bad_request(format!(
+            "{db} is a system database and cannot be dropped"
+        )));
+    }
+    auth.require(Action::Ddl, db, None)?;
+    Ok(json!({ "dropped": state.engine.drop_database(db)? }))
+}
+
 pub fn drop_collection(
     state: &SharedState,
     auth: &Auth,

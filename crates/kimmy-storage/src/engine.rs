@@ -903,17 +903,30 @@ impl Engine {
     }
 
     /// Drop a database and every collection in it.
+    /// Drop every collection in a database. Each drop is its own replicated
+    /// entry, and the last one removes the database row on every member.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
+        // Answer "did it exist" up front: dropping the last collection removes
+        // the row, so the removal below finds nothing on the common path.
+        let existed = self.database_exists(name)?;
         let collections = self.list_collections(name)?;
         for collection in &collections {
+            // Shadows go with their parents; a shadow reached after its
+            // parent is already gone, which `drop_collection` reports as
+            // `false` rather than an error.
+            if vector_meta::is_shadow(&collection.name) {
+                continue;
+            }
             self.drop_collection(name, &collection.name)?;
         }
 
+        // A database with no collections (the row exists, nothing else) still
+        // has a row to remove.
         let txn = self.begin_write()?;
-        let existed = {
+        {
             let mut dbs = txn.open_table(tables::DATABASES)?;
-            dbs.remove(name)?.is_some()
-        };
+            dbs.remove(name)?;
+        }
         txn.commit()?;
         Ok(existed)
     }
@@ -1121,12 +1134,23 @@ impl Engine {
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
         let txn = self.begin_write()?;
-        {
+        let database_emptied = {
             let mut collections = txn.open_table(tables::COLLECTIONS)?;
             collections.remove((db, name))?;
             if let Some(shadow) = &shadow {
                 collections.remove((db, shadow.name.as_str()))?;
             }
+            collections.range((db, "")..=(db, "\u{10FFFF}"))?.next().is_none()
+        };
+        // A database exists while it has collections — creation is implicit
+        // in the first one, so removal is implicit in the last. Decided here,
+        // inside the drop, because drops replicate and database rows do not:
+        // every member applies the same last drop and reaches the same
+        // answer, where a separate "drop database" step would leave the empty
+        // name listed on every peer that never heard it.
+        if database_emptied {
+            let mut dbs = txn.open_table(tables::DATABASES)?;
+            dbs.remove(db)?;
         }
         {
             // Range-retain rather than collecting keys: a large collection
@@ -1355,6 +1379,44 @@ pub fn physical_now_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dropping_the_last_collection_removes_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::Engine::open(&dir.path().join("k.redb")).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        engine.create_collection("shop", "items").unwrap();
+        let names = |e: &super::Engine| -> Vec<String> {
+            e.list_databases().unwrap().into_iter().map(|d| d.name).collect()
+        };
+        assert!(names(&engine).contains(&"shop".to_string()));
+
+        engine.drop_collection("shop", "orders").unwrap();
+        assert!(names(&engine).contains(&"shop".to_string()), "one collection left");
+
+        engine.drop_collection("shop", "items").unwrap();
+        assert!(
+            !names(&engine).contains(&"shop".to_string()),
+            "the last drop removes the database"
+        );
+        assert!(!engine.database_exists("shop").unwrap());
+
+        // And it comes back with its next collection, as any database does.
+        engine.create_collection("shop", "again").unwrap();
+        assert!(names(&engine).contains(&"shop".to_string()));
+    }
+
+    #[test]
+    fn drop_database_drops_every_collection_and_the_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::Engine::open(&dir.path().join("k.redb")).unwrap();
+        engine.create_collection("shop", "orders").unwrap();
+        engine.create_collection("shop", "items").unwrap();
+        assert!(engine.drop_database("shop").unwrap());
+        assert!(engine.list_collections("shop").unwrap().is_empty());
+        assert!(!engine.database_exists("shop").unwrap());
+        assert!(!engine.drop_database("shop").unwrap(), "already gone");
+    }
+
     use super::*;
 
     fn engine() -> (Engine, tempfile::TempDir) {
