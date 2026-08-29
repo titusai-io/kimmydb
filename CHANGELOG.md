@@ -14,6 +14,16 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Added
 
+- **`document_prefix` and `query_prefix` on a vector configuration.** Many
+  embedding models are trained to see a task marker in the text — `passage:`
+  / `query:` for E5 and BGE, `title: none | text:` for EmbeddingGemma, an
+  instruction line for Nemotron and Qwen3 — and rank markedly worse without
+  it: on the 2026-08-29 evaluation the two instruction-trained models called
+  with bare text were the worst of eight (Nemotron-1B recall 0.40, e5-large
+  unable to separate answers from nonsense). The worker now prepends
+  `document_prefix` to every chunk it sends and the search path prepends
+  `query_prefix` to `query` text; neither is stored or returned, and
+  changing either reindexes like any configuration change.
 - **`storage.cache_bytes`** bounds redb's page cache, which is most of a
   node's resident memory. It was redb's fixed 1 GiB default; it is 256 MiB
   now. The cache fills with reads and evicts only for room, never on a timer,

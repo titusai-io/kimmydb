@@ -662,7 +662,8 @@ impl EmbeddingWorker {
         // `kimmy_embed_{documents,chunks,failures}_total` stayed at zero while
         // the vectors demonstrably landed, which is the one thing a spend
         // counter must never do.
-        let vectors = provider.embed(&chunks).await.inspect_err(|e| self.counters.failed(e))?;
+        let inputs = prefixed(&config, &chunks);
+        let vectors = provider.embed(&inputs).await.inspect_err(|e| self.counters.failed(e))?;
 
         // The provider call is the long part, and the document can move while
         // it runs. Embedding from the entry's own image is what makes this
@@ -891,7 +892,8 @@ impl EmbeddingWorker {
         // Counted at the only line a provider outage can produce — including
         // the retries, so a sustained outage reads as a climbing counter
         // rather than one flat increment.
-        let vectors = provider.embed(&chunks).await.inspect_err(|e| self.counters.failed(e))?;
+        let inputs = prefixed(config, &chunks);
+        let vectors = provider.embed(&inputs).await.inspect_err(|e| self.counters.failed(e))?;
         let chunk_count = chunks.len();
         let records: Vec<VectorRecord> = chunks
             .into_iter()
@@ -981,6 +983,16 @@ fn config_fingerprint(config: &VectorConfig) -> u64 {
 ///
 /// Fields are joined with a blank line so that a chunk boundary falling
 /// between two fields does not glue unrelated sentences together.
+/// What the provider is sent for each chunk: the chunk, behind the
+/// collection's document prefix when it has one. The stored chunk text stays
+/// bare — the prefix is the model's business, not the caller's.
+fn prefixed(config: &VectorConfig, chunks: &[String]) -> Vec<String> {
+    match &config.document_prefix {
+        Some(prefix) => chunks.iter().map(|c| format!("{prefix}{c}")).collect(),
+        None => chunks.to_vec(),
+    }
+}
+
 fn extract_text(document: &bson::Document, config: &VectorConfig) -> String {
     let mut parts = Vec::new();
     for field in &config.fields {
@@ -1041,6 +1053,8 @@ mod tests {
         /// other half of the classification.
         permanent: std::sync::atomic::AtomicBool,
         calls: std::sync::atomic::AtomicUsize,
+        /// Every input text the provider was asked to embed, in order.
+        inputs: std::sync::Mutex<Vec<String>>,
     }
 
     impl FakeProvider {
@@ -1050,6 +1064,7 @@ mod tests {
                 fail_times: Default::default(),
                 permanent: Default::default(),
                 calls: Default::default(),
+                inputs: Default::default(),
             })
         }
     }
@@ -1059,6 +1074,7 @@ mod tests {
         async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
             use std::sync::atomic::Ordering;
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.inputs.lock().unwrap().extend(texts.iter().cloned());
             if self.permanent.load(Ordering::SeqCst) {
                 // A 400 is the canonical "retrying will not help".
                 return Err(VectorError::ProviderRejected {
@@ -1106,6 +1122,8 @@ mod tests {
             },
             dim: 4,
             metric: Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
             chunk: ChunkConfig { max_chars: 20, overlap: 5, max_tokens: None },
         }
     }
@@ -1651,6 +1669,8 @@ mod tests {
             provider: ProviderConfig::Byo,
             dim: 4,
             metric: Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
             chunk: ChunkConfig::default(),
         };
 
@@ -1909,6 +1929,30 @@ mod tests {
         assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
         assert_eq!(fake.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(worker.deferred.is_empty(), "the owner has nothing to re-check");
+    }
+
+    #[tokio::test]
+    async fn the_document_prefix_reaches_the_provider_but_not_the_stored_chunk() {
+        // Models trained on `passage: …` rank badly without it (measured:
+        // e5-large's separation 0.04, Nemotron-1B's recall 0.40 on the
+        // 2026-08-29 evaluation). The prefix is for the model; a hit's text
+        // stays what the document said.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let mut prefixed_config = config(&["title"]);
+        prefixed_config.document_prefix = Some("passage: ".into());
+        engine.configure_vectors("app", "docs", prefixed_config).unwrap();
+
+        engine.insert(&coll, bson::doc! { "_id": "a", "title": "hello world" }).unwrap();
+        let entry = last_entry(&engine);
+        assert!(matches!(worker.process(&entry).await.unwrap(), Outcome::Embedded { .. }));
+
+        assert_eq!(fake.inputs.lock().unwrap().as_slice(), ["passage: hello world"]);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let stored = engine.get_vectors(&shadow, &kimmy_core::DocId::String("a".into())).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].text, "hello world", "the prefix is never stored");
     }
 
     #[tokio::test]

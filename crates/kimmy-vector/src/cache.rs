@@ -345,6 +345,8 @@ mod tests {
                     provider: ProviderConfig::Byo,
                     dim: 4,
                     metric: Metric::Cosine,
+                    document_prefix: None,
+                    query_prefix: None,
                     chunk: ChunkConfig::default(),
                 },
             )

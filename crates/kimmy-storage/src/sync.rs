@@ -1441,6 +1441,8 @@ mod tests {
             provider: kimmy_core::ProviderConfig::Byo,
             dim: 4,
             metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
             chunk: Default::default(),
         }
     }

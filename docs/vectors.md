@@ -77,6 +77,8 @@ POST /v1/db/{db}/coll/{coll}/vector
 | `dim` | Vector width. Pinned here; changing it requires reconfiguring |
 | `metric` | `cosine`, `euclidean`, or `dot` |
 | `chunk` | How long documents are split |
+| `document_prefix` | Text put in front of every chunk before the provider sees it — the task marker many models are trained on (`passage: ` for E5 and BGE, `title: none \| text: ` for EmbeddingGemma, an instruction line for Nemotron). Never stored, never returned in a hit; changing it reindexes |
+| `query_prefix` | The same for `query` text on a search (`query: `, `task: search result \| query: `). Not applied to a caller-supplied `vector` |
 
 `GET` returns the current configuration; `DELETE` disables embedding, with
 `?drop_vectors=true` to discard the stored vectors as well as the config.

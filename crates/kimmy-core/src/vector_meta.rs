@@ -38,6 +38,19 @@ pub struct VectorConfig {
     pub metric: Metric,
     #[serde(default)]
     pub chunk: ChunkConfig,
+    /// Text put in front of every chunk before it is sent to the provider.
+    /// Many models are trained to see a task marker in the input —
+    /// `passage: ` (E5, BGE), `title: none | text: ` (EmbeddingGemma), an
+    /// instruction line (Nemotron, Qwen3-Embedding) — and rank noticeably
+    /// worse without it. Never stored with the chunk and never returned in a
+    /// hit; changing it is a reconfigure, and so a reindex.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub document_prefix: Option<String>,
+    /// The same for search queries embedded by the server (`query: `,
+    /// `task: search result | query: `, …). Applied to `query` text only;
+    /// a caller-supplied `vector` is used as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_prefix: Option<String>,
 }
 
 impl VectorConfig {
@@ -367,6 +380,8 @@ mod tests {
             provider: ProviderConfig::Byo,
             dim: 384,
             metric: Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
             chunk: ChunkConfig::default(),
         }
     }

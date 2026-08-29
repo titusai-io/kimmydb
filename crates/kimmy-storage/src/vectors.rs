@@ -461,6 +461,8 @@ mod tests {
             provider: ProviderConfig::Byo,
             dim,
             metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
             chunk: Default::default(),
         }
     }

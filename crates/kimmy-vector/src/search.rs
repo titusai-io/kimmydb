@@ -189,6 +189,8 @@ mod tests {
             provider: ProviderConfig::Byo,
             dim: 2,
             metric: Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
             chunk: ChunkConfig::default(),
         }
     }
