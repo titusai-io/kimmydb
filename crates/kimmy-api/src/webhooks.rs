@@ -170,7 +170,7 @@ pub fn register(
     auth.require(Action::Webhook, db, Some(coll))?;
     // The collection has to exist. Registering against a name that does not
     // would otherwise sit silently, delivering nothing, until someone noticed.
-    let _ = state.engine.get_collection(db, coll)?;
+    let _ = crate::exec::collection(state, db, coll)?;
 
     // Checked here so a bad URL fails while the person who typed it is
     // watching. It is checked again before every delivery, because a name that

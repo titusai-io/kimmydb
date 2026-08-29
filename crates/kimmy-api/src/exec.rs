@@ -93,7 +93,30 @@ pub fn authorize(
     coll: &str,
 ) -> Result<CollectionMeta, ApiError> {
     auth.require(action, db, Some(coll))?;
-    Ok(state.engine.get_collection(db, coll)?)
+    collection(state, db, coll)
+}
+
+/// Resolve a collection, with a retry hint that is true for a cluster.
+///
+/// A collection created through a load balancer lands on one member and
+/// reaches the others a sync round later (measured at ~4.5 s on a
+/// three-member cluster); a request that arrives on another member in
+/// between is a `404` here. Answering `retry: "no"` to that told a client
+/// which had just created the collection to give up. On a node with peers
+/// the honest hint is `elsewhere`: another member has it, and this one will
+/// shortly. A node with no peers keeps `no` — there is nowhere else.
+pub fn collection(state: &SharedState, db: &str, coll: &str) -> Result<CollectionMeta, ApiError> {
+    match state.engine.get_collection(db, coll) {
+        Ok(meta) => Ok(meta),
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) if state.members().is_some_and(|m| !m.is_empty()) => Err(ApiError::not_found(format!(
+            "collection \"{db}\".\"{coll}\" not found on this member; if it was just \
+                 created, another member has it and this one will within a sync round"
+        ))
+        .with_retry(crate::error::Retry::Elsewhere)),
+        Err(e) => Err(e.into()),
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -42,7 +42,7 @@ pub async fn get_vector_config(
     Path((db, coll)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Read, &db, Some(&coll))?;
-    let meta = state.engine.get_collection(&db, &coll)?;
+    let meta = crate::exec::collection(&state, &db, &coll)?;
     Ok(Json(json!({ "vector": meta.vector })))
 }
 
@@ -368,7 +368,7 @@ fn prepare(
     // alone. See docs/security.md.
     auth.require(Action::Search, db, Some(coll))?;
 
-    let meta = state.engine.get_collection(db, coll)?;
+    let meta = crate::exec::collection(state, db, coll)?;
     let Some(config) = meta.vector.clone() else {
         return Err(ApiError::bad_request(format!(
             "collection {coll:?} has no vector configuration; POST to \
@@ -485,7 +485,7 @@ fn allowed_ids(
     auth.require(Action::Read, db, Some(coll))?;
 
     let parsed = kimmy_query::filter::parse(&json_to_document(filter)?)?;
-    let source = state.engine.get_collection(db, coll)?;
+    let source = crate::exec::collection(state, db, coll)?;
 
     let mut ids = HashSet::new();
     state.engine.for_each_doc(&source, |id, doc| {

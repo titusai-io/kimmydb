@@ -185,11 +185,27 @@ pub struct ApiError {
     /// 429 cannot be returned without one: a refusal that does not say when to
     /// come back leaves a client to guess, and clients guess badly.
     pub retry_after_secs: Option<u64>,
+    /// A retry hint that differs from the code's usual one. The one case so
+    /// far: a collection this node does not have on a node that has peers,
+    /// where "elsewhere" is the truth and "no" would tell a client that just
+    /// created it to give up.
+    pub retry_override: Option<Retry>,
 }
 
 impl ApiError {
     pub fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), retry_after_secs: None }
+        Self { status, code, message: message.into(), retry_after_secs: None, retry_override: None }
+    }
+
+    /// The same error with a different retry hint.
+    pub fn with_retry(mut self, retry: Retry) -> Self {
+        self.retry_override = Some(retry);
+        self
+    }
+
+    /// The retry hint a client will see.
+    pub fn retry(&self) -> Retry {
+        self.retry_override.unwrap_or_else(|| self.code.retry())
     }
 
     /// Over a rate limit.
@@ -266,7 +282,7 @@ impl IntoResponse for ApiError {
         let body = json!({
             "error": self.code.as_str(),
             "message": self.message,
-            "retry": self.code.retry().as_str(),
+            "retry": self.retry().as_str(),
         });
         let mut response = (self.status, Json(body)).into_response();
         if let Some(secs) = self.retry_after_secs {
