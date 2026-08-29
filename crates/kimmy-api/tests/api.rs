@@ -447,6 +447,27 @@ async fn a_database_is_listed_while_it_has_collections_and_can_be_dropped_whole(
 }
 
 #[tokio::test]
+async fn a_missing_collection_says_elsewhere_only_when_the_node_has_peers() {
+    // Through a round-robin front a create lands on one member and the next
+    // request on another; "no" told that client to give up. With peers the
+    // hint is "elsewhere"; alone it stays "no" — there is nowhere else.
+    let server = Server::start().await;
+    let token = server.root().await;
+    let res = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(res.status, 404, "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no");
+
+    let members = kimmy_cluster::Members::default();
+    members
+        .insert_for_test("10.0.0.2:7900".parse().unwrap(), kimmy_core::NodeId::from_bytes([7; 16]));
+    server.state.set_members(members);
+    let res = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(res.status, 404, "{:?}", res.body);
+    assert_eq!(res.body["retry"], "elsewhere", "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap().contains("another member"));
+}
+
+#[tokio::test]
 async fn replacing_by_id_reports_counts_and_needs_upsert_to_create() {
     // Two things nothing covered until the protocol was specified, both
     // client-visible:

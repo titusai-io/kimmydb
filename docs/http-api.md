@@ -742,7 +742,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
-| 404 | `not_found` | no | Document, collection, or user absent |
+| 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |
 | 409 | `conflict` | no | Collection exists; last user; self-deletion |
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |

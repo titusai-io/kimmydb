@@ -41,7 +41,7 @@ pub async fn watch_collection(
     // connection it can hold, and refusing after the handshake is both harder
     // to report and easy to get wrong.
     auth.require(Action::Watch, &db, Some(&coll))?;
-    let meta = state.engine.get_collection(&db, &coll)?;
+    let meta = crate::exec::collection(&state, &db, &coll)?;
 
     let options = WatchOptions {
         resume_after: match &q.resume_after {

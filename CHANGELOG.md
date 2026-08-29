@@ -45,6 +45,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   member forever. The last drop now removes it — decided inside the
   replicated drop, so peers converge without a database-drop entry of their
   own.
+- **A collection missing on a clustered node says `retry: "elsewhere"`.**
+  Created through a per-request load balancer, a collection lands on one
+  member and reaches the others a sync round later; a request that arrived
+  on another member in between got `404` with `retry: "no"`, which told the
+  client that had just created it to give up. A node with peers now answers
+  `elsewhere` (another member has it, this one will shortly); a node with no
+  peers keeps `no`.
 
 ## 0.16.3 - 2026-08-28
 
