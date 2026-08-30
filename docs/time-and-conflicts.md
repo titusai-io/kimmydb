@@ -226,6 +226,16 @@ it, reset its data directory, and let anti-entropy refill it from members
 that never left; merging it as-is can bring back what the cluster deleted
 while it was away.
 
+The span alone is not the verdict ([ADR-097](decisions.md)). It is measured
+between the peer's coverage of an origin and this node's, and an origin that
+wrote nothing for longer than retention and then wrote once leaves every peer
+trailing it by the whole silence until their next round — which is what a
+member does when it re-registers itself after a restart. The verdict therefore
+also requires that the gap hold something retention has already removed here
+(the per-origin record the collector keeps, `oplog_collected`). A peer that can
+still be served every entry it lacks has nothing to resurrect, and is not
+named.
+
 ---
 
 ## Clock resumption

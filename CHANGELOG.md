@@ -10,6 +10,48 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. Two fixes to
+what a converged cluster says and does during a member-at-a-time restart,
+both from one cause — the retention horizon was one stamp across every
+origin, and is now judged per origin (ADR-097).
+
+### Fixed
+
+- **A restarted member no longer names its converged peers stale on its
+  first round.** On a roll, half a second after a member came back, its
+  first sync round logged `peer trails this node by more than tombstone
+  retention … a stale rejoiner should be reset, not merged` for *both*
+  peers, `behind_secs` reading the time since the previous roll, and
+  withdrew it five seconds later. The peers were converged and had never
+  been away; the member had just written its topology record after 36
+  hours of writing nothing, and the span between that write and the
+  previous one is what the measure read. The verdict now also requires that
+  the peer lack something retention has removed here at that origin — a
+  peer that can still be served every entry it lacks has nothing to
+  resurrect. A genuinely stale peer is still named, on the first round that
+  sees it, with the same `behind_secs` and the same `staleSince` /
+  `behindSecs` on `GET /v1/topology`. If you alert on that line, a roll no
+  longer trips it.
+- **A restarted member no longer answers `BeyondHorizon` to its first
+  puller.** Each time a member came back, the first peer to pull from it
+  logged `behind the peer's retention horizon; falling back to a snapshot`
+  and transferred the whole store to learn one entry. The puller asked from
+  its coverage of the member's origin — the member's previous write, from
+  before the silence, collected long ago along with everything around it —
+  and by a single horizon stamp that is beyond it. The puller now sends its
+  vector with the request, and the member serves it when nothing it lacks
+  has been collected, snapshot otherwise. On a large store this was the
+  real cost of a routine restart.
+
+Both fixes take full effect from the *second* roll onto this build: a
+database an earlier build collected from has no per-origin record of what
+was removed, so it is seeded with the old horizon and stays coarse below
+it until each member has written and been collected once more. A member
+running this build interoperates with one that does not, in either
+direction, at the previous behaviour.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

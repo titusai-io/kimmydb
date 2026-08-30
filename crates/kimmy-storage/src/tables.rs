@@ -122,4 +122,24 @@ pub const META_NEXT_COLLECTION_ID: &str = "next_collection_id";
 /// entry cannot stand in for it: on a node that has never collected anything,
 /// that is simply the first write ever made, and a peer asking from before it
 /// would be sent a full snapshot it does not need.
+///
+/// One stamp across every origin, which is why it is coarse: a peer whose
+/// coverage of *one* origin sits below it is beyond it, even when nothing of
+/// that origin was collected. [`OPLOG_COLLECTED`] is the same fact per origin.
 pub const META_OPLOG_COLLECTED_THROUGH: &str = "oplog_collected_through";
+
+/// `node id (16 bytes) -> highest Hlc retention has removed from that origin`.
+///
+/// [`META_OPLOG_COLLECTED_THROUGH`] split by origin. It answers the question
+/// the single stamp cannot: *does this peer lack anything I have collected?*
+/// A peer trails an origin below the coarse horizon whenever that origin
+/// wrote nothing for longer than retention and then wrote once — a member
+/// that idles between rolling restarts does exactly that — and the coarse
+/// answer is a snapshot, or a stale-rejoiner verdict, for a gap that holds
+/// one servable entry. Per origin, the gap is seen to hold nothing collected.
+///
+/// Maintained by the retention pass in the same transaction as the removal.
+/// A database an earlier build collected from has no record here of what
+/// that build removed, so `Engine::open` seeds every origin it holds with the
+/// coarse horizon: coarse below that point, exact above it (ADR-097).
+pub const OPLOG_COLLECTED: TableDefinition<&[u8], &[u8]> = TableDefinition::new("oplog_collected");

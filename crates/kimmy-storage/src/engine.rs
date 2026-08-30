@@ -252,6 +252,7 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_VERSIONS)?;
             let _ = txn.open_table(tables::OPLOG_WITNESSED)?;
             let _ = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let _ = txn.open_table(tables::OPLOG_COLLECTED)?;
         }
         txn.commit()?;
 
@@ -266,6 +267,7 @@ impl Engine {
         // determine.
         Self::rebuild_arrival_index_if_stale(&db)?;
         Self::rebuild_version_vector_if_stale(&db)?;
+        Self::seed_collected_if_untracked(&db)?;
 
         let node_id = Self::load_or_create_node_id(&db)?;
         let resumed = Self::last_oplog_hlc(&db)?;
@@ -628,12 +630,83 @@ impl Engine {
     /// naturally: every peer is at or above it, so every peer can be served
     /// incrementally.
     pub fn oplog_collected_through(&self) -> Result<Hlc> {
-        let txn = self.db.begin_read()?;
+        Self::read_collected_through(&self.db)
+    }
+
+    fn read_collected_through(db: &Database) -> Result<Hlc> {
+        let txn = db.begin_read()?;
         let meta = txn.open_table(tables::META)?;
         match meta.get(tables::META_OPLOG_COLLECTED_THROUGH)? {
             Some(raw) => Ok(codec::decode_oplog_key(raw.value())?.hlc),
             None => Ok(Hlc::ZERO),
         }
+    }
+
+    /// Per origin, the highest `Hlc` retention has removed from the oplog.
+    ///
+    /// [`Self::oplog_collected_through`] split by origin, and the record a
+    /// peer's coverage is compared against to decide whether it lacks
+    /// anything this node can no longer serve: `theirs.get(origin)` below
+    /// this vector's entry for that origin means at least one collected
+    /// entry is missing there; at or above it, nothing of that origin has
+    /// been removed that the peer does not hold. An origin absent from the
+    /// vector has had nothing collected — which reads as [`Hlc::ZERO`], the
+    /// same way an empty version vector does.
+    pub fn oplog_collected(&self) -> Result<kimmy_core::VersionVector> {
+        Self::read_versions(&self.db, tables::OPLOG_COLLECTED)
+    }
+
+    /// Give every held origin the coarse horizon when the per-origin record
+    /// cannot vouch for what was collected.
+    ///
+    /// The per-origin table is written by the same retention pass that moves
+    /// the coarse horizon, so on a database only this build has collected
+    /// from, the highest entry in the table *is* the horizon. A horizon above
+    /// the table — a database an earlier build collected from, or one an
+    /// earlier build ran against between two runs of this one — means
+    /// entries were removed that the table never saw, from origins it cannot
+    /// name. Every origin the node holds is raised to the horizon then, which
+    /// is exactly the coarse answer the horizon alone gave: a peer whose
+    /// coverage of any origin sits below it is told it is beyond it. Above
+    /// that point the record is exact, so the seeding costs nothing that was
+    /// not already being paid, and the cost ends once every origin has
+    /// written again and been collected once more.
+    ///
+    /// Only raises, like every other movement of a version table. Origins
+    /// the node learns of later need no seeding: nothing of theirs was held
+    /// here to collect before they were known.
+    pub(crate) fn seed_collected_if_untracked(db: &Database) -> Result<()> {
+        let horizon = Self::read_collected_through(db)?;
+        if horizon == Hlc::ZERO {
+            return Ok(());
+        }
+        let collected = Self::read_versions(db, tables::OPLOG_COLLECTED)?;
+        if collected.iter().map(|(_, hlc)| hlc).max().is_some_and(|max| max >= horizon) {
+            return Ok(());
+        }
+
+        let held = Self::read_versions(db, tables::OPLOG_VERSIONS)?;
+        let txn = db.begin_write()?;
+        let mut seeded = 0usize;
+        {
+            let mut table = txn.open_table(tables::OPLOG_COLLECTED)?;
+            for (node, _) in held.iter() {
+                if collected.get(node) < horizon {
+                    table.insert(node.to_bytes().as_slice(), horizon.to_bytes().as_slice())?;
+                    seeded += 1;
+                }
+            }
+        }
+        txn.commit()?;
+
+        if seeded > 0 {
+            info!(
+                origins = seeded,
+                horizon = %horizon,
+                "seeded the per-origin retention record from the coarse horizon"
+            );
+        }
+        Ok(())
     }
 
     /// The oldest stamp still in the oplog, if any.
@@ -1285,7 +1358,7 @@ fn decode_node(bytes: &[u8]) -> Result<NodeId> {
 /// Shared by both vectors, so they cannot drift in how they compare — and so a
 /// vector can only ever move forward, which is the invariant that keeps a
 /// rebuild from granting coverage the oplog never held.
-fn raise_version(
+pub(crate) fn raise_version(
     txn: &redb::WriteTransaction,
     table: redb::TableDefinition<&'static [u8], &'static [u8]>,
     stamp: &Stamp,
