@@ -10,6 +10,29 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. One addition,
+for operators: the local signing secret can now be rotated without ending
+every session at once.
+
+### Added
+
+- **`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`,
+  `--jwt-previous-secret`): a two-key window for rotating `jwt_secret`.**
+  Tokens are always signed with `jwt_secret`; a token is accepted if either
+  secret verifies it, the current one tried first. Rotate by moving the old
+  value to `jwt_previous_secret`, putting the new one in `jwt_secret`, rolling
+  every node, waiting one `token_ttl_secs`, and removing the previous secret.
+  The node logs an `info` at startup naming that deadline and one `warn` when
+  it passes (counted from process start; not persisted across restarts). The
+  previous secret is held to the same length floor as the current one, must
+  differ from it, and both refusals are `check-config`'s; the startup summary
+  says `jwt_previous_secret=set` and never the value. Rotation does not revoke
+  — the token version still does that, identically for a token the previous
+  secret verified — and `cluster_secret` is not covered. ADR-101; procedure in
+  `docs/security.md`.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

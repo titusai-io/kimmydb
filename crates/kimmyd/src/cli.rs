@@ -86,6 +86,12 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_JWT_SECRET", hide_env_values = true)]
     pub jwt_secret: Option<String>,
 
+    /// The JWT signing secret being retired. Tokens it signed stay valid while
+    /// it is set; new tokens are signed with --jwt-secret. Remove it one token
+    /// lifetime after the rotation.
+    #[arg(long, env = "KIMMY_JWT_PREVIOUS_SECRET", hide_env_values = true)]
+    pub jwt_previous_secret: Option<String>,
+
     /// Run with authentication disabled. Only permitted on a loopback bind.
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
@@ -250,6 +256,9 @@ impl Overrides {
         }
         if let Some(secret) = &self.jwt_secret {
             cfg.auth.jwt_secret = Some(secret.clone());
+        }
+        if let Some(previous) = &self.jwt_previous_secret {
+            cfg.auth.jwt_previous_secret = Some(previous.clone());
         }
         if let Some(issuer) = &self.oidc_issuer {
             cfg.auth.oidc.issuer = Some(issuer.clone());
@@ -505,6 +514,48 @@ mod tests {
         let err = cli.overrides.apply(&mut cfg).unwrap_err().to_string();
         assert!(err.contains("KIMMY_OIDC_ROLE_MAPPINGS"), "must name the variable: {err}");
         assert!(err.contains("claim_value"), "must show the expected shape: {err}");
+    }
+
+    #[test]
+    fn a_previous_jwt_secret_arrives_by_flag_and_reaches_validate() {
+        // The flag lands in the same field the file uses, and an absent flag
+        // leaves the file's value alone.
+        let cli = parse(&["--jwt-previous-secret", "the-signing-key-being-retired"]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.jwt_previous_secret.as_deref(), Some("the-signing-key-being-retired"));
+
+        let mut cfg = Config::default();
+        cfg.auth.jwt_previous_secret = Some("from-the-file-and-long-enough".into());
+        parse(&[]).overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.jwt_previous_secret.as_deref(), Some("from-the-file-and-long-enough"));
+
+        // The environment name is part of the documented interface.
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "jwt_previous_secret")
+            .expect("the flag exists");
+        assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some("KIMMY_JWT_PREVIOUS_SECRET"));
+
+        // And validate is where the refusals live, however the value arrived:
+        // a previous secret equal to the current one is not a rotation.
+        let cli = parse(&[
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--jwt-previous-secret",
+            "a-signing-key-of-adequate-length",
+        ]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("hunter2".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("jwt_previous_secret"), "unhelpful error: {err}");
     }
 
     #[test]

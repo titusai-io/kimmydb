@@ -217,6 +217,14 @@ root_user = "root"
 # KIMMY_ROOT_PASSWORD in the environment.
 # jwt_secret = "generate-me-with-openssl-rand-base64-32"
 
+# The signing key being retired, during a rotation only. Tokens it signed are
+# still accepted while it is set; new tokens are signed with `jwt_secret` alone.
+# To rotate: move the old value here, put the new one in `jwt_secret`, roll
+# every node, wait one `token_ttl_secs`, then remove this and roll again. Same
+# length floor as `jwt_secret`, and it must differ from it. Prefer
+# KIMMY_JWT_PREVIOUS_SECRET over writing it down, for the same reason as above.
+# jwt_previous_secret = "the-value-jwt-secret-had-before-the-rotation"
+
 token_ttl_secs = 3600
 
 # ---------------------------------------------------------------------------

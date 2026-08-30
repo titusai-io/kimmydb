@@ -57,7 +57,8 @@ fails fast on a bad volume mount.
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
-| `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
+| `auth.jwt_previous_secret` | `KIMMY_JWT_PREVIOUS_SECRET` | — | The secret being retired, accepted for verification only while a rotation is in progress; tokens are never signed with it. Same length floor; must differ from `jwt_secret`. Remove it one `token_ttl_secs` after the roll — see [Rotating the signing secret](security.md#rotating-the-signing-secret) |
+| `auth.token_ttl_secs` | — | `3600` | Also the revocation delay, and how long a previous secret has to stay configured after a rotation |
 | `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only. Refused together with `auth.oidc` |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | — | Federate with one external OIDC provider. `https` only — the signing keys come down this URL. Setting it obliges `audience` |
 | `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
@@ -88,6 +89,7 @@ runtime confusion:
 | No root password, no `insecure_no_auth` | Nothing could authenticate |
 | Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster — and in a cluster the *same* value everywhere, or a token issued by one node is rejected by the next |
 | A `jwt_secret` shorter than 16 bytes | The whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would |
+| A `jwt_previous_secret` shorter than 16 bytes, or equal to `jwt_secret` | It still verifies tokens while it is set, so it is held to the same floor; and the same value twice is not a rotation, it is a configuration edited halfway |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
 | `oplog_retention_secs = 0` | Change streams could never resume |

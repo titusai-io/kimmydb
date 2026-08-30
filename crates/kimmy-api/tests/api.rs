@@ -21,7 +21,9 @@ struct Server {
     /// request cannot reach — the live member set, which only exists once a
     /// cluster has started.
     state: kimmy_api::SharedState,
-    _dir: tempfile::TempDir,
+    /// Shared, so a server "restarted" over the same database keeps the
+    /// directory alive for as long as either handle does.
+    _dir: Arc<tempfile::TempDir>,
 }
 
 /// A tiny HTTP client, so the tests do not pull in a dependency purely to make
@@ -218,6 +220,25 @@ impl Server {
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
         let state =
             kimmy_api::state(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
+        Self::serve(state, Arc::new(dir)).await
+    }
+
+    /// The same database served again under a different token issuer — a node
+    /// restarted with a new signing configuration (ADR-101).
+    ///
+    /// The engine handle is shared rather than the file reopened: the first
+    /// listener is still alive and holds the file, and what a restart preserves
+    /// is the stored state — users and their token versions — which is exactly
+    /// what sharing the engine preserves. Everything in memory is rebuilt, the
+    /// session cache included, as it would be across a real restart.
+    async fn restart_with_issuer(&self, tokens: TokenIssuer) -> Self {
+        let engine = Arc::clone(&self.state.engine);
+        let state =
+            kimmy_api::state(engine, tokens, false, kimmy_api::RateLimits::disabled()).unwrap();
+        Self::serve(state, Arc::clone(&self._dir)).await
+    }
+
+    async fn serve(state: kimmy_api::SharedState, dir: Arc<tempfile::TempDir>) -> Self {
         let app = kimmy_api::router(Arc::clone(&state));
 
         // Port 0: let the OS pick, so parallel tests never collide.
@@ -1531,6 +1552,90 @@ async fn an_expired_token_cannot_be_refreshed() {
     let res = server.post("/v1/auth/refresh", Some(&stale), json!({})).await;
     assert_eq!(res.status, 401, "{:?}", res.body);
     assert_eq!(res.body["error"], "unauthorized");
+}
+
+/// The secret a rotation retires (ADR-101). `SECRET` is the one being retired
+/// in these tests; this is the one taking over.
+const NEXT_SECRET: &str = "the-secret-being-rotated-into-use!";
+
+#[tokio::test]
+async fn rotating_the_signing_secret_keeps_outstanding_tokens_working() {
+    // The reason operators did not rotate: changing the secret ended every
+    // session at once. With the old secret named as the previous one, a token
+    // from before the rotation keeps working, while everything new is signed
+    // with the new secret alone — so the window closes by itself one token
+    // lifetime later.
+    let before = Server::start().await;
+    let root = before.root().await;
+    before.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let old_token = before.login("ada", "ada-password").await;
+    assert_eq!(before.get("/v1/auth/whoami", Some(&old_token)).await.status, 200);
+
+    // The rotation: the same database, restarted with the new secret current
+    // and the old one previous.
+    let rotating = before
+        .restart_with_issuer(TokenIssuer::with_previous(NEXT_SECRET, Some(SECRET), 3600).unwrap())
+        .await;
+    let res = rotating.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(res.status, 200, "a token from before the rotation must still work: {:?}", res.body);
+    assert_eq!(res.body["user"], "ada");
+
+    // A new login is signed with the new secret, and only the new secret: a
+    // verifier holding just the retiring one refuses it.
+    let new_token = rotating.login("ada", "ada-password").await;
+    assert!(TokenIssuer::new(NEXT_SECRET, 3600).unwrap().verify(&new_token).is_ok());
+    assert!(
+        matches!(
+            TokenIssuer::new(SECRET, 3600).unwrap().verify(&new_token),
+            Err(kimmy_auth::AuthError::InvalidToken)
+        ),
+        "a token issued during the window must not be signed with the retiring secret"
+    );
+
+    // The window closed: the previous secret removed, the old token is refused
+    // with the same 401 as any other bad token, and the new one is unaffected.
+    let after = before.restart_with_issuer(TokenIssuer::new(NEXT_SECRET, 3600).unwrap()).await;
+    let res = after.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    assert_eq!(res.body["error"], "unauthorized");
+    assert_eq!(after.get("/v1/auth/whoami", Some(&new_token)).await.status, 200);
+}
+
+#[tokio::test]
+async fn revocation_applies_to_a_token_verified_by_the_previous_secret() {
+    // Rotation does not revoke, and revocation does not care which key verified
+    // the signature: the ADR-052 version check runs after either one, so a
+    // session opened before the rotation ends the moment its user's version
+    // moves, exactly as it would have without a rotation in progress.
+    let before = Server::start().await;
+    let root = before.root().await;
+    before.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let old_token = before.login("ada", "ada-password").await;
+
+    let rotating = before
+        .restart_with_issuer(TokenIssuer::with_previous(NEXT_SECRET, Some(SECRET), 3600).unwrap())
+        .await;
+    assert_eq!(rotating.get("/v1/auth/whoami", Some(&old_token)).await.status, 200);
+
+    // Root's token is from before the rotation too, and administers through
+    // the window like any other outstanding session.
+    let res = rotating
+        .post("/v1/users/ada/password", Some(&root), json!({"password":"a-new-password"}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = rotating.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(
+        res.status, 401,
+        "a bumped version must end a previous-secret session: {:?}",
+        res.body
+    );
+
+    // And the account itself is fine: a fresh login under the new password
+    // opens a session signed with the current secret.
+    let fresh = rotating.login("ada", "a-new-password").await;
+    assert_eq!(rotating.get("/v1/auth/whoami", Some(&fresh)).await.status, 200);
+    assert!(TokenIssuer::new(NEXT_SECRET, 3600).unwrap().verify(&fresh).is_ok());
 }
 
 #[tokio::test]

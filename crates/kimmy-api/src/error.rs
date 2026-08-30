@@ -416,6 +416,7 @@ impl From<AuthError> for ApiError {
             // matched loosely so that adding a variant stays a compile error
             // here instead of silently becoming a 400.
             AuthError::WeakSecret { .. }
+            | AuthError::PreviousSecretIsCurrent
             | AuthError::AdminNotFederatable { .. }
             | AuthError::EmptyRoleMapping { .. }
             | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),

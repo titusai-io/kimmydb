@@ -166,6 +166,7 @@ The settings worth knowing before you deploy:
 |---|---|---|
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | Required unless `--insecure-no-auth`. Bootstrap superuser, created on first start only. |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | **Required whenever auth is on**, single node or cluster — the node refuses to start without one rather than sign tokens with a built-in constant. 16 bytes minimum, and **identical on every node**, or a token issued by one node is rejected by the next. |
+| `auth.jwt_previous_secret` | `KIMMY_JWT_PREVIOUS_SECRET` | Optional, during a rotation only: the secret being retired. Tokens it signed stay valid while it is set; new tokens are signed with `jwt_secret`. Remove it one `token_ttl_secs` after rolling the new secret out. See [Rotating the signing secret](docs/security.md#rotating-the-signing-secret). |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | Optional. Federate with an external OIDC provider alongside local users; obliges `auth.oidc.audience`, and `https` only. `admin` cannot be granted through it; `ddl` can. See [Security](docs/security.md). |
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |

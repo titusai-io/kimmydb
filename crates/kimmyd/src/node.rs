@@ -45,6 +45,40 @@ fn signing_key(auth: &AuthConfig) -> Result<String> {
     }
 }
 
+/// Say, once at startup and once when it is due, that a previous signing
+/// secret is configured and when it can go.
+///
+/// The window (ADR-101) is meant to close: a previous secret verifies tokens
+/// for as long as it is configured, and the moment it stops being useful is one
+/// token lifetime after the rotation — every token it signed has expired by
+/// then. This node cannot know when the rotation happened, only when *it*
+/// started with the previous secret in place, so it counts from its own start.
+/// That is exact for the common case (the rotation is the restart that brought
+/// the new pair in) and conservative otherwise: a node restarted later in the
+/// window warns later, never earlier. Nothing is persisted across restarts; the
+/// reminder exists to be noticed, not to be relied on.
+///
+/// Two lines, deliberately: an `info` naming the deadline, so the operator who
+/// just performed the rotation has a time to write down, and one `warn` when it
+/// passes. Not repeated — a log that nags on a timer is a log that gets
+/// filtered, and the summary line already says `jwt_previous_secret=set` on
+/// every start.
+fn remind_to_remove_previous_secret(ttl_secs: u64) {
+    info!(
+        remove_after_secs = ttl_secs,
+        "a previous JWT signing secret is configured; every token it signed will have expired \
+         one token lifetime from now, so remove KIMMY_JWT_PREVIOUS_SECRET after that"
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
+        warn!(
+            configured_for_secs = ttl_secs,
+            "the previous JWT signing secret has outlived every token it signed; it still \
+             verifies tokens while it is set, so remove KIMMY_JWT_PREVIOUS_SECRET and restart"
+        );
+    });
+}
+
 /// How often the certificate files are checked for a change.
 ///
 /// A constant rather than configuration: a renewal lands weeks before expiry,
@@ -91,8 +125,18 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let secret = signing_key(&config.auth)?;
-    let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
+    // The previous secret only means anything while tokens are verified; with
+    // auth off nothing is, and validation did not look at it either.
+    let previous = if config.auth.insecure_no_auth {
+        None
+    } else {
+        config.auth.jwt_previous_secret.as_deref()
+    };
+    let tokens = TokenIssuer::with_previous(&secret, previous, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
+    if tokens.has_previous_secret() {
+        remind_to_remove_previous_secret(config.auth.token_ttl_secs);
+    }
 
     // With auth off there is no login to brute-force and every request is a
     // superuser anyway, so a limiter would only be an obstacle to the local
