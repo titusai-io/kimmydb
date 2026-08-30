@@ -10,6 +10,49 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. Three limits
+an operator can set on the authenticated routes, so a principal that is
+compromised or a client with a broken retry loop cannot hold a node hostage.
+Each defaults to what the server already did — the body ceiling is the one
+axum always applied, the deadline is far above any measured latency, and the
+per-principal limit is off — so a node that sets none of them behaves exactly
+as before (ADR-099).
+
+### Added
+
+- **`server.request_timeout_secs`** (default `30`, `KIMMY_REQUEST_TIMEOUT_SECS`).
+  A deadline on every REST route that answers with a document. A request
+  still *waiting* at the deadline — for the rest of its body, or for an
+  embedding provider — is abandoned and answered **`503`** with the new error
+  code **`timeout`** (`retry: wait`). It does not cut short storage work
+  already running: a scan, a bulk insert, an index backfill or a database drop
+  completes and is answered with its result, so it is not a query timeout and
+  none of those needed an exemption. The change-stream upgrade
+  (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with a connection and
+  carry no deadline.
+- **`server.max_body_bytes`** (default `2097152`, `KIMMY_MAX_BODY_BYTES`). The
+  request body ceiling, previously axum's fixed 2 MiB, as a setting. Over it,
+  `413 payload_too_large` as before. `/mcp` keeps rmcp's own 4 MiB limit.
+- **`server.rate_limit.per_principal`** and **`per_principal_window_secs`**
+  (defaults `0` — off — and `60`; `KIMMY_RATE_LIMIT_PER_PRINCIPAL`,
+  `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS`). A second token bucket, keyed
+  on the authenticated principal — a local user by name, a federated identity
+  by issuer and subject — checked after the token is verified on every route
+  that takes one, REST, `/mcp` and change streams alike. Over it, `429` with
+  `Retry-After`, the same response the login limiter gives; a client should
+  now treat a `429` as possible on any authenticated call. The key map shares
+  `max_tracked_keys` with the login limiters. The documentation offers `3000`
+  over `60` seconds as a starting point and says what it is relative to.
+- **`kimmy_rate_limited_principal_total`** on `/metrics` (and
+  `kimmy.rate_limited.principal` over OTLP): the part of
+  `kimmy_rate_limited_total` refused by the per-principal limit. A sibling
+  series rather than a label, so the existing series is byte-for-byte what it
+  was.
+- `check-config` refuses `request_timeout_secs = 0`, `max_body_bytes = 0`, and
+  a per-principal window of `0` with a non-zero burst, by name.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

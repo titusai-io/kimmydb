@@ -90,6 +90,23 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
 
+    /// Seconds a request may spend waiting — for its body, or for an embedding
+    /// provider — before this node abandons it with 503.
+    #[arg(long, env = "KIMMY_REQUEST_TIMEOUT_SECS")]
+    pub request_timeout_secs: Option<u64>,
+
+    /// Largest request body the API will read, in bytes. Over it, 413.
+    #[arg(long, env = "KIMMY_MAX_BODY_BYTES")]
+    pub max_body_bytes: Option<usize>,
+
+    /// Requests allowed per authenticated principal per window. 0 disables it.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL")]
+    pub rate_limit_per_principal: Option<u32>,
+
+    /// The window, in seconds, for --rate-limit-per-principal.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS")]
+    pub rate_limit_per_principal_window_secs: Option<u64>,
+
     /// Do not run the automatic embedding worker on this node.
     ///
     /// Vectors still replicate in from nodes that do run workers, and vector
@@ -272,6 +289,18 @@ impl Overrides {
         if let Some(key) = &self.tls_key {
             cfg.server.tls.key_file = Some(key.clone());
         }
+        if let Some(secs) = self.request_timeout_secs {
+            cfg.server.request_timeout_secs = secs;
+        }
+        if let Some(bytes) = self.max_body_bytes {
+            cfg.server.max_body_bytes = bytes;
+        }
+        if let Some(burst) = self.rate_limit_per_principal {
+            cfg.server.rate_limit.per_principal = burst;
+        }
+        if let Some(secs) = self.rate_limit_per_principal_window_secs {
+            cfg.server.rate_limit.per_principal_window_secs = secs;
+        }
         // Boolean flags are one-way: passing `--insecure-no-auth` turns the
         // setting on, but omitting it must not silently turn off what the
         // config file asked for.
@@ -448,6 +477,76 @@ mod tests {
         let mut cfg = Config::default();
         cli.overrides.apply(&mut cfg).unwrap();
         assert!(cfg.telemetry.include_names);
+    }
+
+    #[test]
+    fn request_limit_flags_override_the_file_and_absent_ones_do_not() {
+        // Each flag also reads a KIMMY_* variable; clap resolves both into the
+        // same field, so what is asserted here is the field reaching the
+        // configuration (ADR-099).
+        let cli = parse(&[
+            "--request-timeout-secs",
+            "90",
+            "--max-body-bytes",
+            "4194304",
+            "--rate-limit-per-principal",
+            "3000",
+            "--rate-limit-per-principal-window-secs",
+            "60",
+        ]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 90);
+        assert_eq!(cfg.server.max_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.server.rate_limit.per_principal, 3000);
+        assert_eq!(cfg.server.rate_limit.per_principal_window_secs, 60);
+
+        // A file that set them keeps them when the flags are absent.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.server.request_timeout_secs = 7;
+        cfg.server.max_body_bytes = 512;
+        cfg.server.rate_limit.per_principal = 5;
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 7);
+        assert_eq!(cfg.server.max_body_bytes, 512);
+        assert_eq!(cfg.server.rate_limit.per_principal, 5);
+    }
+
+    #[test]
+    fn check_config_refuses_an_invalid_request_limit() {
+        // `check-config` runs the same `resolve` the server does, so a bad
+        // value arriving by flag or variable is refused there, by name, rather
+        // than at boot.
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--request-timeout-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("server.request_timeout_secs"), "must name the setting: {err}");
+
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--rate-limit-per-principal",
+            "10",
+            "--rate-limit-per-principal-window-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("per_principal_window_secs"), "must name the setting: {err}");
     }
 
     #[test]

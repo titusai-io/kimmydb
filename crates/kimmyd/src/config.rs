@@ -110,6 +110,53 @@ pub struct ServerConfig {
     /// With a concrete bind it defaults to that address, with the scheme
     /// following whether this node terminates TLS.
     pub advertise: Option<String>,
+    /// How long a request may take before this node abandons it, in seconds
+    /// (ADR-099). Answered with `503 timeout`.
+    ///
+    /// What it bounds is the time a request spends *waiting* — for the rest
+    /// of its body to arrive, or for an embedding provider to answer — which
+    /// is where an authenticated client can hold a connection open at no cost
+    /// to itself. It does not cut short storage work already running: a scan,
+    /// a bulk commit or an index backfill runs to completion and is answered
+    /// with its result however long it took, so a long query is not turned
+    /// into a refusal after the work was done. Change-stream upgrades and
+    /// `/mcp` carry no deadline.
+    pub request_timeout_secs: u64,
+    /// Largest request body the API will read, in bytes (ADR-099). Over it,
+    /// `413 payload_too_large`.
+    ///
+    /// The default is the ceiling every release has enforced, so nothing moves
+    /// unless this is set. `/mcp` reads its bodies under rmcp's own limit.
+    pub max_body_bytes: usize,
+}
+
+impl ServerConfig {
+    /// The deadline and ceiling the router applies.
+    pub fn request_limits(&self) -> kimmy_api::RequestLimits {
+        kimmy_api::RequestLimits {
+            request_timeout: std::time::Duration::from_secs(self.request_timeout_secs),
+            max_body_bytes: self.max_body_bytes,
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.request_timeout_secs == 0 {
+            anyhow::bail!(
+                "server.request_timeout_secs must be greater than zero; a deadline of zero \
+                 would abandon every request that has to wait for its own body. The default \
+                 is {}",
+                kimmy_api::limits::DEFAULT_REQUEST_TIMEOUT.as_secs()
+            );
+        }
+        if self.max_body_bytes == 0 {
+            anyhow::bail!(
+                "server.max_body_bytes must be greater than zero; a ceiling of zero refuses \
+                 every request that carries a body, login included. The default is {}",
+                kimmy_api::limits::DEFAULT_MAX_BODY_BYTES
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Native TLS termination for the HTTP, WebSocket and MCP listener.
@@ -176,12 +223,14 @@ impl TlsConfig {
 
 /// Request rate limiting.
 ///
-/// Only `/v1/auth/login` is limited today, because that is the one route where
+/// `/v1/auth/login` is limited by default, because that is the one route where
 /// a limit is a *security* control rather than a capacity control: it is
 /// unauthenticated by necessity, passwords are guessable at network speed, and
 /// every attempt runs a full Argon2id verification whether or not the user
-/// exists. Capacity limits on the authenticated routes want measurements behind
-/// them, which is what M5's benchmarks are for.
+/// exists. The authenticated routes have a limit too (`per_principal`,
+/// ADR-099), and it is off by default for the reason the login one is on: a
+/// capacity number wants a measurement behind it, and the operator is the one
+/// holding the measurement.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RateLimitConfig {
@@ -213,6 +262,24 @@ pub struct RateLimitConfig {
     /// arrive from — so this is what keeps the defence from becoming a denial
     /// of service itself. Buckets that have refilled are dropped first.
     pub max_tracked_keys: usize,
+    /// Requests allowed per authenticated principal per window, on every
+    /// route that takes a token — REST, `/mcp` and the change-stream upgrade
+    /// alike (ADR-099). Zero disables it, **which is the default**.
+    ///
+    /// Keyed on who the caller is rather than where the request came from: a
+    /// local user by name, a federated identity by issuer and subject. A
+    /// principal spread across many addresses draws on one budget, and two
+    /// principals behind one address do not share one. Checked after the
+    /// token is verified, so a bad token is a 401 and never spends anything.
+    /// Over the limit the answer is `429` with `Retry-After`, and the refusals
+    /// are counted in `kimmy_rate_limited_principal_total`.
+    ///
+    /// A starting point, if you want one before measuring: `3000` over a
+    /// `60`-second window is fifty requests a second sustained per principal
+    /// — well above what one well-behaved client produces, and comfortably
+    /// below what a single node serves.
+    pub per_principal: u32,
+    pub per_principal_window_secs: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,6 +901,11 @@ impl Default for ServerConfig {
             rate_limit: RateLimitConfig::default(),
             tls: TlsConfig::default(),
             advertise: None,
+            // Both taken from the API crate rather than repeated here, so the
+            // number the router falls back to and the number the config
+            // documents cannot drift apart (ADR-099).
+            request_timeout_secs: kimmy_api::limits::DEFAULT_REQUEST_TIMEOUT.as_secs(),
+            max_body_bytes: kimmy_api::limits::DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -855,6 +927,10 @@ impl Default for RateLimitConfig {
             // few megabytes — cheap enough not to need tuning, small enough
             // to bound.
             max_tracked_keys: 100_000,
+            // Off. See the field documentation: the operator holds the
+            // measurement a capacity number needs.
+            per_principal: 0,
+            per_principal_window_secs: 60,
         }
     }
 }
@@ -1038,6 +1114,7 @@ impl Config {
             );
         }
 
+        self.server.validate()?;
         self.server.rate_limit.validate()?;
         self.server.tls.validate()?;
         self.telemetry.validate()?;
@@ -1134,8 +1211,8 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} scheme={} data_dir={} auth={} oidc={} mcp={} gc={} ratelimit=[{}] audit={} \
-             cluster={} seeds=[{}] log={}/{:?} otel={}",
+            "bind={} scheme={} data_dir={} auth={} oidc={} mcp={} gc={} ratelimit=[{}] \
+             limits=[timeout={}s body={}B] audit={} cluster={} seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
@@ -1144,6 +1221,8 @@ impl Config {
             if self.server.mcp { "enabled" } else { "off" },
             gc,
             self.server.rate_limit.describe(),
+            self.server.request_timeout_secs,
+            self.server.max_body_bytes,
             self.audit.mode,
             if self.cluster.enabled { "enabled" } else { "single-node" },
             seeds,
@@ -1170,6 +1249,12 @@ impl RateLimitConfig {
             anyhow::bail!(
                 "server.rate_limit.login_per_user_window_secs must be greater than zero when \
                  login_per_user is set; to disable the limit, set login_per_user = 0"
+            );
+        }
+        if self.per_principal > 0 && self.per_principal_window_secs == 0 {
+            anyhow::bail!(
+                "server.rate_limit.per_principal_window_secs must be greater than zero when \
+                 per_principal is set; to disable the limit, set per_principal = 0"
             );
         }
         if self.max_tracked_keys == 0 {
@@ -1208,6 +1293,17 @@ impl RateLimitConfig {
                 ),
                 self.max_tracked_keys,
             ),
+            // The same cap as the login limiters. A principal name is
+            // attacker-controlled in the same sense an address is — it is
+            // whatever a valid token says — and the eviction policy that keeps
+            // the address map bounded keeps this one bounded too.
+            per_principal: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(
+                    self.per_principal,
+                    Duration::from_secs(self.per_principal_window_secs),
+                ),
+                self.max_tracked_keys,
+            ),
             // Lowercased because `http::HeaderMap` lookups are case-sensitive
             // over its canonical lowercase form, so `X-Forwarded-For` written
             // in a config file would otherwise silently never match.
@@ -1227,7 +1323,12 @@ impl RateLimitConfig {
         } else {
             format!("{}/{}s", self.login_per_user, self.login_per_user_window_secs)
         };
-        format!("login_ip={ip} login_user={user}")
+        let principal = if self.per_principal == 0 {
+            "off".to_string()
+        } else {
+            format!("{}/{}s", self.per_principal, self.per_principal_window_secs)
+        };
+        format!("login_ip={ip} login_user={user} principal={principal}")
     }
 }
 
@@ -1920,5 +2021,91 @@ mod tests {
         let summary = cfg.summary();
         assert!(!summary.contains("hunter2"));
         assert!(!summary.contains("super-secret"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Request limits (ADR-099)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn request_limits_default_to_what_the_server_always_enforced() {
+        // The settings are new; the behaviour is not. A node that never sets
+        // them must get the 2 MiB ceiling axum applied on its own and a
+        // deadline no documented workload reaches — and no per-principal
+        // limit at all.
+        let cfg = Config::default();
+        assert_eq!(cfg.server.request_timeout_secs, 30);
+        assert_eq!(cfg.server.max_body_bytes, 2 * 1024 * 1024);
+        assert_eq!(cfg.server.request_limits(), kimmy_api::RequestLimits::default());
+        assert_eq!(cfg.server.rate_limit.per_principal, 0, "off unless an operator says so");
+        assert!(cfg.server.rate_limit.build().per_principal.limit().is_disabled());
+    }
+
+    #[test]
+    fn a_zero_request_timeout_is_refused() {
+        let mut cfg = valid();
+        cfg.server.request_timeout_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("server.request_timeout_secs"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_zero_body_ceiling_is_refused() {
+        let mut cfg = valid();
+        cfg.server.max_body_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("server.max_body_bytes"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_per_principal_window_of_zero_is_refused_only_when_the_limit_is_on() {
+        // The same rule as the login limiters: a zero window would make the
+        // limit decorative, and the way to turn a limiter off is its burst.
+        let mut cfg = valid();
+        cfg.server.rate_limit.per_principal = 100;
+        cfg.server.rate_limit.per_principal_window_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("per_principal_window_secs"), "unhelpful error: {err}");
+
+        cfg.server.rate_limit.per_principal = 0;
+        cfg.validate().expect("a zero window on a disabled limiter is not a configuration");
+    }
+
+    #[test]
+    fn the_per_principal_limit_builds_from_its_settings() {
+        let mut cfg = valid();
+        cfg.server.rate_limit.per_principal = 3000;
+        cfg.server.rate_limit.per_principal_window_secs = 60;
+        let limits = cfg.server.rate_limit.build();
+        assert_eq!(
+            limits.per_principal.limit(),
+            kimmy_api::RateLimit::new(3000, std::time::Duration::from_secs(60))
+        );
+        assert!(cfg.summary().contains("principal=3000/60s"), "{}", cfg.summary());
+        assert!(cfg.summary().contains("limits=[timeout=30s body=2097152B]"), "{}", cfg.summary());
+    }
+
+    #[test]
+    fn request_limit_settings_read_back_from_toml_as_written() {
+        let cfg: Config = toml::from_str(
+            "[server]\n\
+             request_timeout_secs = 120\n\
+             max_body_bytes = 8388608\n\
+             [server.rate_limit]\n\
+             per_principal = 600\n\
+             per_principal_window_secs = 30\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 120);
+        assert_eq!(cfg.server.max_body_bytes, 8 * 1024 * 1024);
+        assert_eq!(cfg.server.rate_limit.per_principal, 600);
+        assert_eq!(cfg.server.rate_limit.per_principal_window_secs, 30);
+        assert_eq!(
+            cfg.server.request_limits(),
+            kimmy_api::RequestLimits {
+                request_timeout: std::time::Duration::from_secs(120),
+                max_body_bytes: 8 * 1024 * 1024,
+            }
+        );
     }
 }

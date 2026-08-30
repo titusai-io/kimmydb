@@ -49,6 +49,9 @@ pub enum ErrorCode {
     /// A conditional write found the document at a different version than
     /// the caller's `if_stamp`, or found no document where one was expected.
     Stale,
+    /// The request ran past `server.request_timeout_secs` and this node gave
+    /// up on it (ADR-099).
+    Timeout,
 }
 
 /// What a client may do about a failure.
@@ -82,7 +85,7 @@ impl Retry {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 18] = [
+    pub const ALL: [ErrorCode; 19] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -101,6 +104,7 @@ impl ErrorCode {
         Self::NotImplemented,
         Self::ProviderError,
         Self::Stale,
+        Self::Timeout,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -124,6 +128,7 @@ impl ErrorCode {
             Self::NotImplemented => "not_implemented",
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -165,6 +170,13 @@ impl ErrorCode {
             // An upstream embedding provider failed. Every node calls the same
             // provider, so moving does not help; waiting might.
             Self::ProviderError => Retry::Wait,
+            // `wait`, not `elsewhere`, deliberately. The deadline is only ever
+            // reached while the request is *waiting* — for the rest of its
+            // body, or for an upstream provider — and neither improves by
+            // moving: a slow upload is slow to every node, and every node
+            // calls the same provider. `elsewhere` would send the same slow
+            // upload round the whole cluster (ADR-099).
+            Self::Timeout => Retry::Wait,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -222,6 +234,30 @@ impl ApiError {
                 "too many requests; retry later",
             )
         }
+    }
+
+    /// The request outlived the server's deadline for it (ADR-099).
+    ///
+    /// 503 rather than 408 or 504. RFC 9110 §15.5.9 makes 408 a statement
+    /// about an idle connection — "the server did not receive a complete
+    /// request message within the time that it was prepared to wait" — and
+    /// tells a client it may simply repeat the request, which browsers and
+    /// several HTTP libraries do silently; that is the wrong instruction for a
+    /// request this node may have partly acted on. 504 is a gateway's answer
+    /// about an upstream, and this node is the origin. 503 says what is true:
+    /// this server did not handle this request, and the envelope's `retry`
+    /// says what to do about it. No `Retry-After`, because the server has no
+    /// idea when a slower client or a slower provider will be faster.
+    pub fn timeout(after: std::time::Duration) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Timeout,
+            format!(
+                "the request was not completed within {} seconds (server.request_timeout_secs) \
+                 and was abandoned",
+                after.as_secs()
+            ),
+        )
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
