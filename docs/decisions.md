@@ -4413,3 +4413,62 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
+
+**Decision.** `{$expr: <expression>}` is a filter clause. It parses through
+`Expr::parse`, evaluates through `Expr::eval` against the whole document, and
+matches when the result is truthy under the expression language's rule. It is
+accepted at the top level and inside `$and` / `$or` / `$nor` like any clause,
+which puts it in every place a filter is taken — `find`, `count`, `update`,
+`delete`, `find_and_modify`, `$match`, the vector pre-filter and the MCP tools
+— by construction, because they share one parser. The planner never reads it.
+
+**Why.** Every other filter operator compares a field with a constant. "Which
+accounts have spent more than their budget" has no spelling in that language:
+the value on the right-hand side is a field, and the only way to ask it was an
+aggregation — `$addFields` a difference, `$match` on its sign — for a question
+that is plainly a filter. That is a scan-side gap with no substitute short of
+the pipeline, and the pipeline's expression evaluator already knows how to
+read a field, compare two values and do arithmetic. `$expr` is what MongoDB
+calls the same bridge, and clients written against MongoDB write it.
+
+Delegating rather than reimplementing means the operator set inside `$expr` is
+the expression set — all of it, arithmetic and `$cond` included — and stays so
+as that set grows. It also means `$expr` inherits the evaluator's judgements
+without a second copy of them: a missing field is null, null propagates, a
+type violation refuses rather than yielding null.
+
+**Alternatives.** *A field-reference syntax inside the existing operators* —
+`{spent: {$gt: "$budget"}}`, say — was rejected. It changes the meaning of a
+string that starts with `$` on the right-hand side of a filter comparison,
+which is a legal constant today and stored in real documents; making it a
+reference is a silent reinterpretation of existing queries, which the filter
+parser has refused to do everywhere else (mixing operators and plain fields,
+`$options` without `$regex`). It would also cover only the two-field
+comparison and not the arithmetic beside it, so the pipeline would still be
+needed for `qty × price > 100`. *A `Result`-returning `matches`* so an
+evaluation error could fail the request, as MongoDB does, was deferred: it
+touches every caller for a data-dependent case the regex arm already resolves
+as "no match", and the register records it as the way to close the gap.
+
+**Cost.** Two, both made visible in `docs/query-language.md` rather than
+smoothed over.
+
+*Never indexable.* An expression names no field the planner can bound, so a
+filter that is only `$expr` is a full scan, and `explain` says so. An indexable
+clause beside it still plans, with the expression applied to each candidate;
+the planner treats `Filter::Expr` exactly as it treats a disjunction —
+contributes nothing, never narrows. A partial index likewise cannot be proven
+usable by an `$expr`.
+
+*Two comparison semantics in one filter document.* `$gt` inside `$expr` is the
+expression `$gt`: the canonical cross-type order, whole-array comparison, no
+type bracketing. `$gt` outside it is the filter `$gt`: within a type group,
+element-wise over arrays. The pairs disagree on precisely the inputs
+`docs/query-language.md` already calls out as surprising — a missing field is
+*less than* zero inside `$expr` and incomparable outside it — and the page
+puts the two readings side by side with the rule of thumb that resolves them:
+a constant on the right means the ordinary operator; a field or a computation
+on the right means `$expr`.
+
+---

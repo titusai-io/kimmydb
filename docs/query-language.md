@@ -46,6 +46,7 @@ graph LR
 |---|---|
 | `$and` `$or` `$nor` | Top-level, take arrays of filter documents |
 | `$not` | Applied to a **field's** operators, not at the top level |
+| `$expr` | Top-level, takes an [aggregation expression](aggregation.md#expressions); matches when it is truthy |
 
 ```javascript
 { "$or": [ { "qty": { "$lt": 5 } }, { "status": "urgent" } ] }
@@ -69,6 +70,51 @@ Top-level fields are implicitly `$and`-ed.
 | `$all` | Array contains every listed value |
 | `$size` | Array has exactly this length |
 | `$elemMatch` | **One** element satisfies all the conditions |
+
+### `$expr` — comparing fields of the same document
+
+Every operator above compares a field with a **constant**. `$expr` takes an
+expression from the [aggregation language](aggregation.md#expressions) instead,
+evaluates it against the whole document, and matches when the result is truthy
+— `false`, `null`, `0` and a missing field are false, everything else is true.
+That makes it the one clause that can put two fields on either side of a
+comparison:
+
+```javascript
+{ "$expr": { "$gt": ["$spent", "$budget"] } }                          // over budget
+{ "$expr": { "$gt": [ { "$multiply": ["$qty", "$price"] }, 100 ] } }   // line total over 100
+{ "status": "open", "$expr": { "$gt": ["$spent", "$budget"] } }        // beside ordinary clauses
+```
+
+It goes anywhere a filter clause goes: top level, inside `$and` / `$or` /
+`$nor`, and in `$match`. Negation is the expression's own `$not`; the filter
+`$not` applies to a field's operators and has nothing to wrap here.
+
+> **Two comparison semantics in one document.** `$gt` inside `$expr` is the
+> *expression* `$gt`, not the filter one, and the two disagree in exactly the
+> places [rule 3](#3-comparisons-do-not-cross-type-groups) below describes:
+>
+> - it compares in the **canonical cross-type order** — null below numbers
+>   below strings below documents below arrays — so `{$expr: {$lt: ["$a", 0]}}`
+>   matches a document with **no** `a`, where `{a: {$lt: 0}}` does not;
+> - it compares an array **as a whole**, never element by element, so
+>   `{$expr: {$eq: ["$tags", "b"]}}` does not find `"b"` inside `["a", "b"]`,
+>   where `{tags: "b"}` does.
+>
+> The rule of thumb: write `{field: {$op: constant}}` whenever you can, and
+> reach for `$expr` when the right-hand side is itself a field or a
+> computation.
+
+**Never indexed.** An expression names no field the planner can put bounds on,
+so a filter that is only `$expr` is a collection scan. An equality or range
+beside it — `{account: "acme", $expr: …}` — still uses the index on `account`,
+and the expression is applied to each candidate. `explain` shows which.
+
+**An evaluation error is "no match".** A type violation inside the expression
+— `{$add: ["$name", 1]}` where `name` is a string — makes that document fail
+the filter rather than failing the request, the same way an unusable `$regex`
+matches nothing. MongoDB fails the query; the difference is recorded in
+[Deviations](deviations.md).
 
 ---
 

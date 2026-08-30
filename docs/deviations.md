@@ -17,6 +17,41 @@ Status meanings:
 
 ---
 
+## 🟡 `$expr` treats an evaluation error as no match, and is accepted under `$elemMatch`
+
+**Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106).**
+Two places where the filter's `$expr` is looser than MongoDB's, both by
+design and both small.
+
+**A type violation inside the expression is a document that does not match,
+not a failed request.** `{$expr: {$gt: [{$add: ["$name", 1]}, 0]}}` over a
+collection where one document's `name` is a string: MongoDB fails the whole
+query on reaching that document; here the document is skipped and the rest of
+the result is returned. `filter::matches` answers a `bool` for every caller —
+the scan, `$elemMatch`, the executor's residual re-check after an index probe
+— and the regex arm already resolves the same tension the same way: an
+unusable pattern matches nothing rather than taking down the request. Parse-
+time errors (an unknown operator, a wrong arity, `$$ROOT`) are still a `400`,
+so the leniency is confined to failures that depend on the data. A pipeline's
+`$addFields` with the same expression still refuses, as it did before; the
+difference is that a filter *selects* and a stage *derives*, and a
+derivation that cannot be computed has no honest value to write.
+
+**`$expr` is accepted inside a document-form `$elemMatch`.** MongoDB refuses
+`{lines: {$elemMatch: {$expr: …}}}` outright. Here the element is a document
+and `$elemMatch`'s body is an ordinary filter over it, so the expression reads
+the element's fields — `{$elemMatch: {$expr: {$gt: ["$qty", "$min"]}}}`
+compares two fields of one element, which MongoDB needs `$map` and
+`$anyElementTrue` for and this database does not have. A strict superset: a
+filter MongoDB accepts means the same thing here.
+
+**To close:** thread a `Result` through `filter::matches` and its callers so
+an evaluation error can surface as a `400`, at which point the first item
+becomes a choice rather than a constraint. The second is a feature, and would
+only be withdrawn if the operator set gained the pipeline-side spelling.
+
+---
+
 ## 🟡 `modified` counts documents written, not documents changed
 
 **Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
