@@ -343,6 +343,11 @@ paths:
         is what stops timing from revealing whether one does (ADR-038).
 
         Only failed attempts count against the limit.
+
+        Where this route answers at all is `auth.local.login` (ADR-100):
+        `always` (the default), `loopback_only`, or `disabled`. The mode
+        governs the *minting* of local tokens — a token already issued keeps
+        verifying under every mode, and federated tokens are unaffected.
       security: []
       requestBody:
         required: true
@@ -367,6 +372,24 @@ paths:
           description: |
             Wrong password, or no such user. The two are indistinguishable by
             design — body and status are identical.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: |
+            `auth.local.login` is `loopback_only` and the connection's TCP peer
+            is not a loopback address. The `forbidden` code; the message names
+            the setting. Judged on the socket peer, never on a forwarded
+            header, so a reverse proxy on the node's own host looks local. Log
+            in from the host, or through the identity provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: |
+            `auth.local.login` is `disabled`: this node mints no local tokens
+            for anyone, and only its identity provider can authenticate a
+            caller. Not retryable from elsewhere.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -460,6 +483,10 @@ paths:
 
         Not rate-limited: there is no password verification here, which is what
         the login limiter exists to bound.
+
+        Bound by `auth.local.login` exactly as `/v1/auth/login` is, because
+        this mints a local token too (ADR-100). The mode is checked before the
+        token, so under `disabled` every caller sees the 404.
       responses:
         "200":
           description: A fresh token, with the same authority the account has now.
@@ -475,6 +502,23 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            `auth.local.login` is `loopback_only` and the connection's TCP peer
+            is not a loopback address. The `forbidden` code. The presented
+            token is still valid everywhere; only its renewal is confined to
+            the host.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: |
+            `auth.local.login` is `disabled`: this node mints no local tokens.
+            Answered before the token is examined, so a missing or expired
+            token gets this rather than a 401.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/topology:
     get:
@@ -538,10 +582,25 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [user, grants, authenticated, federated]
+                required: [user, display, grants, authenticated, federated]
                 properties:
                   user:
                     type: string
+                    description: |
+                      The identity: a local user name, or a federated token's
+                      `sub`. Everything the server decides is decided on this.
+                  display:
+                    type: string
+                    description: |
+                      A readable name beside the identity, never instead of it
+                      (ADR-100). For a federated caller, the string value of
+                      the claim `auth.oidc.subject_claim` names —
+                      `preferred_username`, `email`, `upn` — falling back to
+                      `user` when the claim is unset, absent from the token,
+                      or not a string. For a local caller, always `user`.
+                      Presentation only: an email is mutable and not unique
+                      across providers, so nothing keys on it, and a client
+                      should not either.
                   grants:
                     type: array
                     items: { $ref: "#/components/schemas/Grant" }

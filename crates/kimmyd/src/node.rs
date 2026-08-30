@@ -128,6 +128,25 @@ pub async fn run(config: Config) -> Result<()> {
     )
     .context("building the API state")?;
 
+    // Where a local token may be minted from (ADR-100). Validation already
+    // refused an unknown name and `disabled` without a provider; this is the
+    // line that makes the mode true, said out loud whenever it is not the
+    // default, because the failure it produces — a 403 or 404 from login — is
+    // one an operator will otherwise go looking for in the wrong place.
+    let local_login = config.auth.local.login_mode()?;
+    state.set_local_login(local_login);
+    match local_login {
+        kimmy_api::LocalLogin::Always => {}
+        kimmy_api::LocalLogin::LoopbackOnly => info!(
+            "local login answers loopback connections only; a token already issued keeps \
+             working, and a reverse proxy on this host will look like loopback"
+        ),
+        kimmy_api::LocalLogin::Disabled => warn!(
+            "local login is DISABLED; only the identity provider can authenticate a caller, \
+             and a token already issued keeps working until it expires"
+        ),
+    }
+
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state
     // and this state needs a database, which does not exist when the
@@ -1710,6 +1729,7 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
+            subject_claim: None,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);

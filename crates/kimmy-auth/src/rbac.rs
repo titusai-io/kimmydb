@@ -165,6 +165,21 @@ pub struct Principal {
     /// It is kept afterwards for the audit record, which reports the roles
     /// *held*.
     pub roles: Vec<String>,
+    /// A readable name for this principal, when the identity provider supplied
+    /// one (ADR-100).
+    ///
+    /// Only ever set on the federated path, from the claim
+    /// `auth.oidc.subject_claim` names — `preferred_username`, `email`, `upn`.
+    /// A provider's `sub` is stable and opaque, which makes it a good identity
+    /// and a bad thing to read in an audit line; this is the thing to read.
+    ///
+    /// **It is display, never identity.** `can` does not consult it, role
+    /// resolution does not key on it, the rate limiter never sees it, and no
+    /// two principals are ever compared by it. An email is mutable and not
+    /// unique across providers, so anything decided on it would be decided on
+    /// a name that can change under the decision. `None` means "no better name
+    /// than `user`", which is what every local principal has.
+    pub display: Option<String>,
 }
 
 impl Principal {
@@ -176,6 +191,7 @@ impl Principal {
             federated: false,
             token_version: 0,
             roles: Vec::new(),
+            display: None,
         }
     }
 
@@ -192,6 +208,7 @@ impl Principal {
             federated: true,
             token_version: 0,
             roles: Vec::new(),
+            display: None,
         }
     }
 
@@ -210,6 +227,25 @@ impl Principal {
     pub fn with_roles(mut self, roles: Vec<String>) -> Self {
         self.roles = roles;
         self
+    }
+
+    /// The same principal, with a readable name beside its identity.
+    ///
+    /// A builder for the same reason `with_roles` is, and with the same
+    /// promise: nothing about who this principal *is* changes. `None` is a
+    /// legitimate value and means the identity is the best name there is.
+    pub fn with_display(mut self, display: Option<String>) -> Self {
+        self.display = display;
+        self
+    }
+
+    /// The name to show a person: the display name when the provider supplied
+    /// one, otherwise the identity.
+    ///
+    /// For presentation — `whoami`, the audit record — and for nothing that
+    /// decides anything. Code that needs to know *who* reads `user`.
+    pub fn display_name(&self) -> &str {
+        self.display.as_deref().unwrap_or(&self.user)
     }
 
     /// Add resolved grants, and forget nothing about where they came from.
@@ -237,6 +273,7 @@ impl Principal {
             grants: vec![Grant::superuser()],
             unauthenticated: true,
             federated: false,
+            display: None,
             token_version: 0,
             roles: Vec::new(),
         }

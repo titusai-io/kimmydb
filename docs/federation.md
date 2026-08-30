@@ -4,7 +4,10 @@ KimmyDB can delegate authentication to any standards-conformant OAuth 2.0 /
 OpenID Connect provider — Entra ID, Okta, Keycloak, Auth0, or a self-hosted
 service — while authorization stays local: your provider says
 **who** the caller is, and this database's role mappings say what they may do.
-Local user accounts keep working alongside it, unchanged.
+Local user accounts keep working alongside it, unchanged — and
+`auth.local.login` decides from where they may still log in, so the
+break-glass root can stay a host-only door
+([Security](security.md#local-login-is-a-mode)).
 
 The mechanics live in [Security](security.md#two-ways-in-one-decision). This
 page is the task-oriented version: how to wire a provider up, per-provider
@@ -152,6 +155,40 @@ Rules worth internalizing:
   grants, which presents as silently empty listings and bare 403s — the CLI
   announces that case since 0.6.0, but prevention beats diagnosis.
 
+## A readable subject: `subject_claim`
+
+A provider's `sub` is stable and opaque — a GUID, an `00u…` string — which is
+what makes it a good identity and a bad thing to read in an audit line.
+`subject_claim` names a claim whose string value rides beside the identity as
+a **display** name:
+
+```sh
+export KIMMY_OIDC_SUBJECT_CLAIM=preferred_username   # or email, upn
+```
+
+`kimmy whoami` then shows both, and an audit record gains `display=…` when it
+differs from `user`:
+
+```json
+{ "user": "3f2a9c1e-…", "display": "ada@example.com", "federated": true, "grants": [ … ] }
+```
+
+**Display only.** Role mappings, grants, rate limiting and every comparison
+the node makes still key on `sub`; a user whose email changes at the provider
+keeps exactly the roles they had. That is deliberate and not negotiable
+through configuration: an email is mutable, is not unique across providers,
+and at some providers is user-editable, so making it the principal would let
+a rename merge or split identities silently
+([Security](security.md#a-readable-name-that-is-never-an-identity),
+[ADR-100](decisions.md)). A token whose claim is missing or not a string is
+not refused — `display` simply falls back to `sub`.
+
+Per provider: Entra ID and Keycloak put a login name in `preferred_username`
+and an address in `email` (Entra also offers `upn`); Okta uses `email` and
+`preferred_username`; Auth0 puts `email` in ID tokens by default and needs an
+action to copy it into an access token. Check a real access token — not an ID
+token — before choosing, since the claim has to be in the token the node sees.
+
 ## Troubleshooting
 
 Work down this list; each step is observable from outside the node.
@@ -185,6 +222,12 @@ Work down this list; each step is observable from outside the node.
 7. **A federated user needs `/v1/auth/refresh`.** It will keep refusing — that
    is the anti-laundering rule above. Re-authenticate; shorten lifetimes so
    that is cheap.
+8. **`kimmy login root` answers 403 or 404.** The node's `auth.local.login`
+   is `loopback_only` or `disabled`; the CLI says so under the error. Log in
+   from the node's own host (an SSH session, a sidecar), or use the federated
+   `kimmy login`. Existing local tokens keep working either way — the mode
+   restricts minting, not verifying
+   ([Security](security.md#local-login-is-a-mode)).
 
 ---
 
@@ -196,4 +239,5 @@ Work down this list; each step is observable from outside the node.
 - [Operations](operations.md) — running nodes in containers, health, metrics
 - [Decisions](decisions.md) — ADR-064 (verifier routing), ADR-066 (inline
   mappings), ADR-071 (audience = resource identifier), ADR-073 (stored roles),
-  ADR-074 (federatable admin), ADR-078 (mappings through the environment)
+  ADR-074 (federatable admin), ADR-078 (mappings through the environment),
+  ADR-100 (local login modes and the display name)

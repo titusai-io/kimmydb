@@ -62,7 +62,7 @@ grants any other client is.
 | `kimmy token` | The token again: prints the cached one while it is fresh, else one fresh flow |
 | `KIMMY_TOKEN=…` | A script or a service: a token minted elsewhere, e.g. a personal access token. The CLI never mints a machine credential (ADR-089) |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
-| `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
+| `kimmy whoami` | How the node sees you: `user` (the identity), `display` (a readable name — the configured claim for a federated caller, else the same as `user`), local or federated, and your grants |
 | `kimmy roles list` `show` `create` | Stored roles ([Security](security.md)). Create: repeat `--grant 'db:collection:actions'` |
 | `kimmy roles grant` `revoke` | Add or remove actions on one of a role's grants — live, no restart |
 | `kimmy roles delete <name>` | Principals lose its grants on their next request |
@@ -257,6 +257,14 @@ Local accounts still work on a federated node, and `kimmy login <user>` is how
 you reach the break-glass administrator: `admin` cannot be granted through an
 IdP claim ([ADR-067](decisions.md)). Creating collections and indexes is `ddl`,
 which can ([ADR-090](decisions.md)).
+
+A node may confine that door to its own host: with `auth.local.login =
+"loopback_only"` the login route answers only connections from loopback, and
+with `"disabled"` it answers nobody. `kimmy login <user>` then reports the 403
+or 404 with a line saying so — log in from the node's host, or use the
+federated `kimmy login`. A token already issued keeps working; the mode
+restricts minting, not verifying
+([Security](security.md#local-login-is-a-mode)).
 
 ### A settings file: `~/.config/kimmydb/.kimmy`
 

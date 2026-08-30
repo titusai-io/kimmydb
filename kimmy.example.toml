@@ -219,6 +219,30 @@ root_user = "root"
 
 token_ttl_secs = 3600
 
+[auth.local]
+# Where the password login route answers (ADR-100). Also KIMMY_LOCAL_LOGIN.
+#
+#   always        -- every caller. The default, and exactly what shipped.
+#   loopback_only -- only a connection whose TCP peer address is loopback;
+#                    anyone else gets 403 `forbidden`. This keeps the break-glass
+#                    root reachable from the node's own host (SSH, a sidecar, a
+#                    tunnel) and unreachable from the network an identity
+#                    provider fronts.
+#   disabled      -- the route answers 404. Refused at startup unless
+#                    [auth.oidc] is configured, because a node with neither
+#                    could authenticate nobody.
+#
+# It governs MINTING only. A local token already issued keeps verifying under
+# every mode until it expires or is revoked, and federated tokens are
+# untouched. /v1/auth/refresh follows the same rule, because it mints too.
+#
+# `loopback_only` judges the TCP peer and deliberately ignores
+# server.rate_limit.trusted_proxy_header: a forwarded header is something the
+# client writes. A reverse proxy or TLS terminator on the SAME HOST therefore
+# makes every caller look local, and the mode restricts nothing — put the proxy
+# elsewhere, or restrict the path at the proxy.
+login = "always"
+
 # ---------------------------------------------------------------------------
 # Federating with an external OpenID Connect provider.
 #
@@ -306,6 +330,21 @@ token_ttl_secs = 3600
 # depth. With an opaque audience it is the only check of its kind.
 # require_at_jwt = false
 
+# A claim whose string value is carried as a federated principal's DISPLAY
+# name — in `kimmy whoami` and in the audit record (as `display`, when it
+# differs from the subject). A provider's `sub` is stable and opaque (a GUID,
+# an `00u…` string), which makes it a good identity and a bad thing to read in
+# a log; `preferred_username`, `email` or `upn` is what a person recognises.
+#
+# Display ONLY. Role mappings, grants, rate limiting and every comparison the
+# node makes still key on `sub`, and that is not configurable: an email is
+# mutable, is not unique across providers, and at some providers is
+# user-editable, so making it the principal would let a rename merge or split
+# identities silently (ADR-100). A token whose claim is missing or not a string
+# is not refused — the display simply falls back to `sub`. Check a real ACCESS
+# token carries the claim before choosing it; ID tokens often carry more.
+# subject_claim = "preferred_username"
+
 # What a claim value is worth here. Repeat the block per role.
 #
 # Written inline rather than stored in the database on purpose (ADR-066):
@@ -364,7 +403,8 @@ token_ttl_secs = 3600
 # allow_federated_admin = false
 
 # Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
-# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_REFRESH_INTERVAL_SECS.
+# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_SUBJECT_CLAIM,
+# KIMMY_OIDC_REFRESH_INTERVAL_SECS.
 #
 # The mappings are file-only in the sense that there are still no per-mapping
 # flags — a grant is a structure, and a command line is where structures go to

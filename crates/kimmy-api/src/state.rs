@@ -58,6 +58,13 @@ pub struct AppState {
     /// than tombstone retention (ADR-085), for `/v1/topology`.
     pub(crate) stale_peers:
         parking_lot::Mutex<std::collections::BTreeMap<kimmy_core::NodeId, StalePeer>>,
+    /// Where a local token may be minted from (ADR-100).
+    ///
+    /// A `OnceLock` like `federation`, and for the same reason: there is one
+    /// answer for the life of the process, and a mode that could be flipped
+    /// while serving would be one more thing a request could race. Unset reads
+    /// as [`LocalLogin::Always`], which is exactly the behaviour that shipped.
+    pub(crate) local_login: std::sync::OnceLock<crate::local_login::LocalLogin>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -120,6 +127,17 @@ impl AppState {
     /// The external identity provider, if this node federates with one.
     pub fn federation(&self) -> Option<&Arc<crate::federation::Federation>> {
         self.federation.get()
+    }
+
+    /// Say where a local token may be minted from. Called once, at startup; a
+    /// second call is ignored.
+    pub fn set_local_login(&self, mode: crate::local_login::LocalLogin) {
+        let _ = self.local_login.set(mode);
+    }
+
+    /// Where a local token may be minted from. `Always` until told otherwise.
+    pub fn local_login(&self) -> crate::local_login::LocalLogin {
+        self.local_login.get().copied().unwrap_or_default()
     }
 }
 

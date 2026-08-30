@@ -107,6 +107,8 @@ Refused at startup, each because of what it would otherwise break:
 | A mapping naming `admin` | See below |
 | A mapping naming an unknown action | Caught while the file is parsed — the error names the bad value and lists the valid ones |
 | `auth.oidc` together with `--insecure-no-auth` | Every request is already a superuser, so the mappings would enforce nothing while appearing to |
+| `auth.local.login = "disabled"` with no `auth.oidc` | Nobody could authenticate — see [Local login is a mode](#local-login-is-a-mode) |
+| An empty `auth.oidc.subject_claim` | A claim with no name can never resolve; omit the setting to keep the subject as the display name |
 
 ### Naming this node: the audience is the resource identifier
 
@@ -341,6 +343,39 @@ user=ada@example.com unauthenticated=false federated=true action=Read db=sales c
 A name cannot do this job: nothing stops a provider from asserting a subject
 called `root`. `/v1/auth/whoami` reports the same flag.
 
+### A readable name that is never an identity
+
+A federated principal's name is the token's `sub`, and from a real provider
+that is an opaque identifier — a GUID from Entra ID, a `00u…` string from
+Okta. An audit line reading `user=3f2a…` tells the person reading it nothing
+until they open the provider's console. `auth.oidc.subject_claim`
+(`KIMMY_OIDC_SUBJECT_CLAIM`) names a claim whose string value is carried
+**beside** the identity as its display name:
+
+```toml
+[auth.oidc]
+subject_claim = "preferred_username"    # or "email", "upn"; unset keeps sub
+```
+
+```
+user=3f2a… display=ada@example.com federated=true action=Read db=sales collection=orders decision=allow
+```
+
+`/v1/auth/whoami` reports `display` too — the claim's value, or `user` itself
+when the claim is absent, is not a string, or was never configured. A local
+principal's `display` is always its user name.
+
+**Display only, and the reason is that an email is not an identity.** It is
+mutable — a rename at the provider would silently turn one person into two
+principals, or two people into one — it is not unique across providers, and
+some providers let a user set it themselves. `sub` is the one claim OpenID
+Connect makes stable and provider-scoped. So the display name is consulted by
+nothing that decides anything: authorization, role resolution, rate limiting,
+the `federated` flag and every comparison the server makes still use `sub`. A
+subject whose email changes keeps its roles, and a test holds that. A token
+whose claim is missing or malformed is not refused; it simply has no better
+name than its subject ([ADR-100](decisions.md)).
+
 ### Getting a token
 
 When the node names itself as a resource, the client id is the only thing the
@@ -404,6 +439,55 @@ The refresh token is where the line is drawn, and not arbitrarily: an access
 token is short-lived and audience-restricted to one node, while a refresh token
 outlives the session and mints more. Caching the first has a worst case that
 expires on its own.
+
+---
+
+## Local login is a mode
+
+`POST /v1/auth/login` is the one unauthenticated route that accepts a guess
+from anywhere and spends Argon2 work on each one. A node whose people all
+arrive through an identity provider has no reason to leave it open to the
+network — and every reason to keep it open to the host, because the
+break-glass root that [`admin` is reserved to](#admin-is-not-federatable) has
+to be able to log in from somewhere. `auth.local.login` is that choice:
+
+```toml
+[auth.local]
+login = "always"    # always | loopback_only | disabled
+```
+
+Also `KIMMY_LOCAL_LOGIN` and `--local-login`.
+
+| Mode | `POST /v1/auth/login` and `POST /v1/auth/refresh` |
+|---|---|
+| `always` | Answer every caller. The default, and exactly what shipped |
+| `loopback_only` | Answer only a connection whose **TCP peer address** is loopback. Anyone else gets `403` with the `forbidden` code and a message naming the setting |
+| `disabled` | Answer `404` to everyone. Refused at startup unless `auth.oidc` is configured, because a node with neither could authenticate nobody |
+
+**The mode governs minting, not verifying.** A local token already issued
+keeps verifying under every mode, on every node of the cluster, until it
+expires or is revoked; federated tokens are untouched. Switching to
+`loopback_only` or `disabled` does not end anyone's session — change the
+password or the grants for that ([Revoking a token](#revoking-a-token)).
+`refresh` follows the same rule as `login` because it mints a local token too:
+under `disabled` a local session cannot be extended, and under `loopback_only`
+it can be extended only from where it could have been opened.
+
+**`loopback_only` is about the TCP peer, not `X-Forwarded-For`.** The check
+reads the address the connection was accepted from and deliberately ignores
+`server.rate_limit.trusted_proxy_header`: the setting is about who can reach
+the process, and a header is something a client writes. Two consequences
+follow. A reverse proxy or TLS terminator **on the same host** connects from
+loopback, so every caller behind it looks local and the mode restricts
+nothing — put the proxy elsewhere, or restrict the path at the proxy. And a
+request the server cannot attribute to a peer at all (a router served without
+connect info, which `kimmyd` never does) is refused, because failing open
+would be the wrong direction for a setting whose only purpose is to close.
+
+The startup summary prints `local_login=<mode>`, `check-config` says the same
+in words, and `kimmy login <user>` explains a 403 or 404 from this route
+rather than printing it bare. The full reasoning, including why the refusal
+is a 403 rather than a 404, is [ADR-100](decisions.md).
 
 ---
 
@@ -1114,6 +1198,7 @@ graph TB
     D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]
     F --> G["Never expose --insecure-no-auth beyond loopback"]
+    G --> H["Behind an IdP? set auth.local.login = loopback_only<br/>so root stays a host-only door"]
 ```
 
 ---

@@ -21,6 +21,7 @@ use jsonwebtoken::jwk::{Jwk, JwkSet};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tracing::debug;
 
 use crate::error::{AuthError, Result};
 use crate::rbac::{Action, Grant, Principal};
@@ -150,6 +151,19 @@ pub struct OidcSettings {
     /// time. The second check cannot be moved to startup — a role is editable
     /// while the process runs.
     pub allow_federated_admin: bool,
+    /// A claim whose string value becomes the principal's **display** name
+    /// (ADR-100): `preferred_username`, `email`, `upn`.
+    ///
+    /// `sub` stays the identity. A provider's subject is stable and opaque,
+    /// which is exactly what an identity should be and exactly what nobody
+    /// wants to read in an audit line; this names the claim a person would
+    /// recognise instead, and it is carried beside `sub` rather than in place
+    /// of it. Missing or not a string, the token is still accepted and the
+    /// display falls back to the subject — a provider that forgot to include a
+    /// claim has not said anything false about who the caller is.
+    ///
+    /// `None`, the default, means the subject is the display name too.
+    pub subject_claim: Option<String>,
 }
 
 impl OidcSettings {
@@ -340,8 +354,14 @@ impl OidcVerifier {
         // because resolving them needs the storage engine and this function has
         // no I/O. They ride on the principal so that whoever holds the engine
         // can finish the job — see `Principal::with_roles`.
+        //
+        // The display name is read *after* everything that decides anything
+        // has been read from `sub`, and is handed to a builder that touches
+        // nothing else — the shape of the code is the promise that it is
+        // display only (ADR-100).
         Ok(Principal::federated(subject, self.grants_for(&claims))
-            .with_roles(self.roles_for(&claims)))
+            .with_roles(self.roles_for(&claims))
+            .with_display(self.display_for(&claims)))
     }
 
     /// The key a token's `kid` names.
@@ -394,6 +414,24 @@ impl OidcVerifier {
     fn matching<'a>(&'a self, claims: &'a Value) -> impl Iterator<Item = &'a RoleMapping> + 'a {
         let held = roles(claims, &self.settings.roles_claim);
         self.settings.role_mappings.iter().filter(move |m| held.iter().any(|r| r == &m.claim_value))
+    }
+
+    /// The readable name the configured claim carries, if it carries one.
+    ///
+    /// `None` for a claim that is not configured, not present, not a string,
+    /// or empty — all of which mean the same thing to the caller: show the
+    /// subject. Deliberately lenient where everything else in this file is
+    /// strict, because nothing is decided on the answer; a provider that left
+    /// the claim out has not said anything false about who the caller is, and
+    /// refusing the token would turn a cosmetic gap into an outage.
+    fn display_for(&self, claims: &Value) -> Option<String> {
+        let claim = self.settings.subject_claim.as_deref()?;
+        let value = claims.get(claim)?.as_str()?.trim();
+        if value.is_empty() {
+            debug!(claim, "the subject claim is empty; the display name falls back to `sub`");
+            return None;
+        }
+        Some(value.to_string())
     }
 }
 
@@ -547,6 +585,7 @@ mod tests {
             // exercises the configuration an operator gets without asking for
             // anything, which is the one that has to keep working.
             require_at_jwt: false,
+            subject_claim: None,
         }
     }
 
@@ -1030,6 +1069,100 @@ mod tests {
         assert!(principal.can(Action::Read, "sales", Some("orders")));
         assert!(principal.can(Action::Write, "hr", Some("people")));
         assert!(!principal.can(Action::Write, "sales", Some("orders")));
+    }
+
+    // -----------------------------------------------------------------------
+    // The display name (ADR-100)
+    // -----------------------------------------------------------------------
+
+    /// A verifier whose provider names its people by `email`, with a subject
+    /// shaped like a real provider's: opaque, and nothing a person would
+    /// recognise.
+    fn display_verifier() -> OidcVerifier {
+        let settings = OidcSettings { subject_claim: Some("email".into()), ..settings() };
+        OidcVerifier::new(settings).unwrap().with_keys(jwks(Algorithm::RS256, KID))
+    }
+
+    fn opaque_claims(extra: Value) -> Value {
+        let mut claims = claims(json!(["kimmydb-analyst"]));
+        claims["sub"] = json!("3f2a9c1e-7b4d-4e0a-9c1e-0f1e2d3c4b5a");
+        if let Some(extra) = extra.as_object() {
+            for (k, v) in extra {
+                claims[k] = v.clone();
+            }
+        }
+        claims
+    }
+
+    #[test]
+    fn the_display_name_comes_from_the_configured_claim_and_the_identity_does_not() {
+        let token =
+            sign(Algorithm::RS256, Some(KID), opaque_claims(json!({ "email": "ada@example.com" })));
+        let principal = display_verifier().verify(&token).unwrap();
+
+        assert_eq!(principal.display.as_deref(), Some("ada@example.com"));
+        assert_eq!(principal.display_name(), "ada@example.com");
+        // The identity is untouched: `user` is still the subject, and it is
+        // the subject an audit reader would have to reconcile with the
+        // provider's console — which is why the display exists at all.
+        assert_eq!(principal.user, "3f2a9c1e-7b4d-4e0a-9c1e-0f1e2d3c4b5a");
+    }
+
+    #[test]
+    fn a_missing_or_malformed_subject_claim_falls_back_to_the_subject_without_refusing() {
+        // Nothing is decided on the display, so nothing about it may cost the
+        // caller their login. Three shapes a real provider produces: the claim
+        // absent, the claim present but not a string, and the claim blank.
+        for extra in [json!({}), json!({ "email": ["ada@example.com"] }), json!({ "email": " " })] {
+            let token = sign(Algorithm::RS256, Some(KID), opaque_claims(extra.clone()));
+            let principal = display_verifier()
+                .verify(&token)
+                .unwrap_or_else(|e| panic!("{extra} must not refuse the token: {e}"));
+            assert_eq!(principal.display, None, "{extra}");
+            assert_eq!(principal.display_name(), principal.user, "{extra}");
+            assert!(principal.can(Action::Read, "sales", Some("orders")), "{extra}");
+        }
+    }
+
+    #[test]
+    fn with_no_subject_claim_configured_the_display_is_the_subject() {
+        // The shipped default: a token carrying an email is not read for it
+        // unless the operator named the claim, so nothing changes for a node
+        // that did not ask.
+        let token =
+            sign(Algorithm::RS256, Some(KID), opaque_claims(json!({ "email": "ada@example.com" })));
+        let principal = verifier(Algorithm::RS256).verify(&token).unwrap();
+        assert_eq!(principal.display, None);
+        assert_eq!(principal.display_name(), principal.user);
+    }
+
+    #[test]
+    fn a_changed_email_keeps_the_same_roles_because_roles_never_depended_on_it() {
+        // The property the whole decision rests on (ADR-100). Two tokens for
+        // one subject, minted before and after a rename at the provider, must
+        // be the same principal for every purpose but presentation.
+        let before =
+            sign(Algorithm::RS256, Some(KID), opaque_claims(json!({ "email": "ada@example.com" })));
+        let after = sign(
+            Algorithm::RS256,
+            Some(KID),
+            opaque_claims(json!({ "email": "ada.lovelace@example.com" })),
+        );
+        let verifier = display_verifier();
+        let before = verifier.verify(&before).unwrap();
+        let after = verifier.verify(&after).unwrap();
+
+        assert_eq!(before.user, after.user, "the identity is the subject, which did not change");
+        assert_eq!(before.grants, after.grants);
+        assert_eq!(before.roles, after.roles);
+        assert!(after.can(Action::Read, "sales", Some("orders")));
+        assert_ne!(before.display, after.display, "only the presentation moved");
+
+        // And an equality that ignores the display is what "same principal"
+        // means downstream: everything a decision reads is identical.
+        let mut renamed = after.clone();
+        renamed.display = before.display.clone();
+        assert_eq!(before, renamed);
     }
 
     // -----------------------------------------------------------------------

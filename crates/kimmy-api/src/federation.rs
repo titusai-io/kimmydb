@@ -210,6 +210,7 @@ mod tests {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
+            subject_claim: None,
         }
     }
 

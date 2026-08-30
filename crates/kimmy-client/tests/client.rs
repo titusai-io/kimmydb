@@ -806,6 +806,7 @@ async fn a_federated_token_cannot_be_refreshed_by_the_node_that_accepted_it() {
             role_mappings: Vec::new(),
             require_at_jwt: false,
             allow_federated_admin: false,
+            subject_claim: None,
         })
         .unwrap(),
     );

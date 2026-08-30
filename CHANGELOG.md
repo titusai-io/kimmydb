@@ -10,6 +10,39 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. Two additions
+to the security model, both off by default, recorded as ADR-100. A node that
+sets neither behaves exactly as 0.16.4 did. The one thing to know before
+turning either on: `auth.local.login = "loopback_only"` judges the TCP peer,
+so a reverse proxy on the same host makes every caller look local.
+
+### Added
+
+- **`auth.local.login`** (`KIMMY_LOCAL_LOGIN`, `--local-login`): `always`,
+  `loopback_only` or `disabled`. Under `loopback_only`, `POST /v1/auth/login`
+  and `POST /v1/auth/refresh` answer only a connection whose peer address is
+  loopback and refuse everyone else with a 403 carrying the `forbidden` code;
+  under `disabled` both answer 404. The mode governs the *minting* of local
+  tokens: a local token already issued keeps verifying under every mode,
+  federated tokens are untouched, and the break-glass root stays reachable
+  from the node's own host under `loopback_only`. Startup refuses `disabled`
+  unless `auth.oidc` is configured, because a node with neither could
+  authenticate nobody. The startup summary and `check-config` name the mode;
+  `kimmy login <user>` explains a 403 or 404 from the login route rather than
+  printing it bare.
+- **`auth.oidc.subject_claim`** (`KIMMY_OIDC_SUBJECT_CLAIM`,
+  `--oidc-subject-claim`): a claim — `preferred_username`, `email`, `upn` —
+  whose string value is carried as a federated principal's *display* name.
+  `GET /v1/auth/whoami` gains a required `display` field (the claim's value,
+  or the subject when the claim is absent, not a string, or not configured),
+  and an audit record gains a `display` field when the value differs from
+  `user`. Display only: `sub` remains the identity for authorization, role
+  resolution, rate limiting and every comparison the server makes, because
+  an email is mutable and not unique across providers. A subject whose email
+  changes keeps its roles.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

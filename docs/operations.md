@@ -59,9 +59,11 @@ fails fast on a bad volume mount.
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
 | `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
 | `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only. Refused together with `auth.oidc` |
+| `auth.local.login` | `KIMMY_LOCAL_LOGIN` | `always` | `always`, `loopback_only` or `disabled`. Where `/v1/auth/login` and `/v1/auth/refresh` answer; `loopback_only` judges the **TCP peer**, never a forwarded header, so a same-host proxy makes everyone look local. Governs minting only — issued tokens keep verifying. `disabled` needs `auth.oidc` — see [Security](security.md#local-login-is-a-mode) |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | — | Federate with one external OIDC provider. `https` only — the signing keys come down this URL. Setting it obliges `audience` |
 | `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
 | `auth.oidc.roles_claim` | `KIMMY_OIDC_ROLES_CLAIM` | `roles` | `groups` for Entra ID. Getting it wrong is quiet — every federated caller arrives with no grants |
+| `auth.oidc.subject_claim` | `KIMMY_OIDC_SUBJECT_CLAIM` | — | A claim (`preferred_username`, `email`, `upn`) carried as a federated principal's **display** name in `whoami` and the audit record. Display only: `sub` stays the identity for everything that decides anything. Unset keeps `sub` — see [Federation](federation.md#a-readable-subject-subject_claim) |
 | `auth.oidc.refresh_interval_secs` | `KIMMY_OIDC_REFRESH_INTERVAL_SECS` | `300` | How often the provider's JWKS is re-fetched. An unknown `kid` triggers one rate-limited refetch besides |
 | `auth.oidc.role_mappings` | — | `[]` | File-only. A claim value and the grants it is worth. **`admin` is refused** — see [Security](security.md) |
 | `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
@@ -86,6 +88,8 @@ runtime confusion:
 |---|---|
 | `insecure_no_auth` + non-loopback bind | Would expose an unauthenticated database to the network |
 | No root password, no `insecure_no_auth` | Nothing could authenticate |
+| `auth.local.login = "disabled"` with no `auth.oidc` | The same: no password door and no identity provider leaves nobody who can log in |
+| An unknown `auth.local.login`, or an empty `auth.oidc.subject_claim` | A typo in either would silently mean "the default", which for the first is the most permissive mode |
 | Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster — and in a cluster the *same* value everywhere, or a token issued by one node is rejected by the next |
 | A `jwt_secret` shorter than 16 bytes | The whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
@@ -495,9 +499,14 @@ separately from the application log:
 KIMMY_LOG_FORMAT=json KIMMY_LOG_LEVEL='warn,kimmy::audit=info' kimmyd run
 ```
 
-Each record carries `user`, `action`, `db`, `collection`, `decision`, and
-`unauthenticated` — the last distinguishing "root did this" from "the server was
-started with authentication disabled".
+Each record carries `user`, `action`, `db`, `collection`, `decision`,
+`roles`, `federated` and `unauthenticated` — the last two distinguishing "root
+did this" from "somebody the identity provider called root did this" from
+"the server was started with authentication disabled". A federated record
+also carries `display` when `auth.oidc.subject_claim` resolved to something
+other than the subject — a readable name for the person reading the log,
+never the identity anything was decided on
+([Security](security.md#a-readable-name-that-is-never-an-identity)).
 
 Emitted from the single authorization point rather than from each route, so a new
 route is audited by virtue of being authorized at all ([ADR-042](decisions.md)).

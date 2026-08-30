@@ -128,6 +128,13 @@ a `Retry-After` header; a successful login spends nothing, so a client that
 re-authenticates on a short TTL is never throttled for succeeding. Tunable under
 `[server.rate_limit]` — see [Security](security.md#login-rate-limiting).
 
+**Login may be restricted to the host.** Under `auth.local.login =
+"loopback_only"`, `/v1/auth/login` and `/v1/auth/refresh` answer `403
+forbidden` to any connection whose TCP peer is not loopback; under `"disabled"`
+both answer `404`. A token already issued keeps working under either — the
+setting restricts minting, not verifying — and federated tokens are unaffected.
+See [Security](security.md#local-login-is-a-mode).
+
 ---
 
 ## Documents
