@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 const SPEC_SOURCE: &str = include_str!("../../../docs/openapi.yaml");
 const ROUTER_SOURCE: &str = include_str!("../src/routes.rs");
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 /// HTTP methods an OpenAPI path item may carry.

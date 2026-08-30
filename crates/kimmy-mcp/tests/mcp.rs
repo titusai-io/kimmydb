@@ -15,7 +15,7 @@ use kimmy_auth::{Action, Grant, TokenIssuer, UserStore};
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 
 struct Server {
     base: String,

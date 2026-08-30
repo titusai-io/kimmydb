@@ -10,6 +10,56 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch. Nothing changes on the wire, on disk or
+in the `/v1` API, members of this version and 0.16.x replicate to each other,
+and the upgrade is an ordinary rolling one — but two configurations that
+started under 0.16.x are refused now, and the pre-1.0 policy puts a refusal
+of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
+`jwt_secret` of 16 to 31 bytes must be replaced with one of 32 or more
+(rotating it ends every session once, on every node at the same time), and a
+node reachable from the network must not be running on one of this
+repository's own example secrets. `kimmyd check-config` against the new
+binary answers both without starting anything.
+
+### Changed
+
+- **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
+  §3.2 asks for a key no shorter than the hash's output, 256 bits, and a
+  short key shared by every node of a cluster is the one weakness a single
+  captured token is enough to attack offline. `TokenIssuer` and
+  `check-config` refuse the same values, and the error names the floor.
+  A secret of 16–31 bytes has to be rotated before the upgrade; the docs,
+  the example configuration and the quick starts say 32 now (ADR-093).
+- **Placeholder secrets are refused off loopback.** A node whose HTTP
+  listener — or, with clustering on, whose cluster listener — binds anything
+  other than a loopback address refuses to start when `auth.root_password`,
+  `auth.jwt_secret` or `cluster.cluster_secret` is one of the values this
+  repository's own examples use: `changeme`, `change-me`, `hunter2`, the
+  defaults the compose file used to fall back to, the commented-out lines in
+  `kimmy.example.toml`, and the obvious words (`password`, `secret`, `root`,
+  …; the full list is `PLACEHOLDER_SECRETS` in `kimmyd`). The error names
+  the setting and never the value. On `127.0.0.1` the same values are
+  accepted, so local development and the examples still run unchanged
+  (ADR-093).
+- **`docker-compose.yml` no longer supplies default secrets.** Its
+  `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` and `KIMMY_CLUSTER_SECRET` were
+  placeholders, and inside a container the node listens on every interface,
+  so the file would now start nothing. Compose stops at `up` and names the
+  missing variable; a `.env` beside the file (gitignored) or the environment
+  supplies them, and the file says how to generate each.
+- **Quick starts generate their secrets.** The README and the operations
+  guide ran the container with `change-me` and a 20-byte signing key; both
+  would be refused now, so the commands generate a root password and a key
+  with `openssl rand` and the login line reads the password back from the
+  environment.
+- **The security guide states what a local token is**: a signed,
+  unencrypted, readable grant list. Anyone holding one can read its user,
+  grants, roles and expiry without the secret; the secret provides integrity,
+  and confidentiality comes from TLS and from handling the token as a
+  credential.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four
