@@ -71,6 +71,10 @@ fails fast on a bad volume mount.
 | `webhooks.allowed_hosts` | — | `[]` | Hosts a webhook may target beyond the public internet. Empty means public addresses only |
 | `webhooks.max_concurrent_deliveries` | — | `8` | Deliveries in flight at once. A bound, and what stops one dead endpoint delaying the others |
 | `webhooks.max_payload_bytes` | — | `1048576` | Largest request body. Batches are trimmed; a single oversized document is sent without `fullDocument` |
+| `vector.worker_enabled` | `KIMMY_DISABLE_VECTOR_WORKER` (inverse) | `true` | Run the embedding worker on this node. Off makes the node a consumer of embeddings by replication rather than a producer of provider calls; search is unaffected |
+| `vector.batch.max_chunks` | — | `32` | The most chunks one embedding provider call carries ([ADR-095](decisions.md)). Below every hosted provider's per-request input cap |
+| `vector.batch.max_tokens` | — | `32768` | The most *estimated* tokens one call carries, by the estimate a collection's `chunk.max_tokens` uses (one token per two bytes). 32 default-sized chunks, about 64 KiB of text. A single document over this goes alone |
+| `vector.batch.max_wait_ms` | — | `100` | How long a partial batch waits for more documents once the stream is idle. A backlog fills batches without waiting; a quiet collection's document is delayed by at most this. `0` sends whatever has queued; refused above `10000` |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
@@ -341,7 +345,7 @@ port.
 | `kimmy_up` | Always 1; presence means the node is serving |
 | `kimmy_uptime_seconds` | Since this process started |
 | `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
-| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count |
+| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count. One call carries many documents ([ADR-095](decisions.md)), so `kimmy_embed_chunks_total` over this is the batch size the worker is achieving; there is no separate batch-size series |
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
@@ -423,7 +427,7 @@ the numbers are in [Benchmarks](benchmarks.md).
 | `find`, `insert`, `update`, `aggregate`, … | One per executor operation, so REST and MCP produce the same spans — they call the same functions |
 | `storage.commit` | The fsync. redb has a single writer and every commit is one, so this is what a write *cost* |
 | `cluster.sync` | One per peer per anti-entropy round, with `applied`, `ddl` and `lag_ms` |
-| `vector.process`, `vector.embed` | The embedding worker, with the chunk count — a remote provider is a round trip per chunk |
+| `vector.process`, `vector.embed` | The embedding worker: one `vector.process` per oplog entry, one `vector.embed` per provider call with its `documents` and `chunks` — a remote provider is a round trip per batch, and this span is that round trip |
 | `webhook.deliver` | One per batch, and it **injects `traceparent`** so a receiver can continue the trace |
 | `oidc.jwks_refresh` | The signing-key fetch |
 
@@ -620,6 +624,7 @@ partially read.
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
+| Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
 | Resident memory | Roughly `storage.cache_bytes` plus indexes (HNSW graphs are held in memory per vector collection) plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, and freed heap is rarely returned to the OS. A restart is the reset |
