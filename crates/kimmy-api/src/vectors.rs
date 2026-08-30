@@ -256,6 +256,63 @@ pub struct SearchRequest {
     pub k: Option<usize>,
     /// Chunks per document allowed into the results.
     pub per_document: Option<usize>,
+    /// How much each half of `hybrid_search` counts in fusion (ADR-094).
+    /// Ignored by `vector_search`, which has one half.
+    pub weights: Option<FusionWeights>,
+    /// Distinct query terms a chunk must share with the query to count as
+    /// lexical evidence in `hybrid_search` (ADR-094). Ignored by
+    /// `vector_search`.
+    pub min_overlap: Option<usize>,
+}
+
+/// The authority each half of a hybrid search carries in fusion.
+///
+/// Applied as `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`.
+/// Only the ratio matters to the resulting order. The default is equal
+/// weights — plain reciprocal rank fusion, which is what every request got
+/// before the field existed.
+#[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
+#[serde(default)]
+pub struct FusionWeights {
+    pub dense: f64,
+    pub lexical: f64,
+}
+
+impl Default for FusionWeights {
+    fn default() -> Self {
+        Self { dense: 1.0, lexical: 1.0 }
+    }
+}
+
+/// Read the fusion controls off a request and refuse the ones that cannot
+/// mean anything.
+///
+/// A negative weight would *subtract* a half's evidence, both weights at zero
+/// leaves nothing to rank by, and a `min_overlap` of zero would admit chunks
+/// that share no term with the query as lexical evidence. None of these is a
+/// setting anyone wants; each is a mistake worth naming.
+fn fusion_controls(body: &SearchRequest) -> Result<(FusionWeights, usize), ApiError> {
+    let weights = body.weights.unwrap_or_default();
+    for (name, weight) in [("dense", weights.dense), ("lexical", weights.lexical)] {
+        if !weight.is_finite() || weight < 0.0 {
+            return Err(ApiError::bad_request(format!(
+                "weights.{name} must be a finite number of at least 0, got {weight}"
+            )));
+        }
+    }
+    if weights.dense == 0.0 && weights.lexical == 0.0 {
+        return Err(ApiError::bad_request(
+            "weights.dense and weights.lexical cannot both be 0; that leaves nothing to rank by",
+        ));
+    }
+    let min_overlap = body.min_overlap.unwrap_or(1);
+    if min_overlap == 0 {
+        return Err(ApiError::bad_request(
+            "min_overlap must be at least 1: a chunk sharing no term with the query is not \
+             lexical evidence",
+        ));
+    }
+    Ok((weights, min_overlap))
 }
 
 const DEFAULT_K: usize = 10;
@@ -338,6 +395,8 @@ pub async fn run_hybrid_search(
         ));
     };
 
+    let (weights, min_overlap) = fusion_controls(body)?;
+
     let query = resolve_query_vector(&config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
@@ -346,10 +405,16 @@ pub async fn run_hybrid_search(
     // first by only one.
     let wide = SearchOptions { k: (options.k * 4).min(MAX_K), ..options.clone() };
     let dense = knn(state, &shadow, &config, &query, &wide, allowed.as_ref())?;
-    let lexical =
-        search::keyword_search(&state.engine, &shadow, &text, &wide).map_err(vector_error)?;
+    // The overlap gate applies to the lexical half only. A document it drops
+    // here is still in `dense` if the dense half ranked it, and keeps that
+    // contribution: the gate removes lexical evidence, not documents.
+    let lexical = search::keyword_search(&state.engine, &shadow, &text, &wide, min_overlap)
+        .map_err(vector_error)?;
 
-    let fused = search::reciprocal_rank_fusion(&[dense, lexical], options.k);
+    let fused = search::weighted_reciprocal_rank_fusion(
+        &[(dense.as_slice(), weights.dense as f32), (lexical.as_slice(), weights.lexical as f32)],
+        options.k,
+    );
     Ok(render(&only_live(state, &source, fused)?))
 }
 
@@ -553,5 +618,57 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         V::Snapshot(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(weights: Option<(f64, f64)>, min_overlap: Option<usize>) -> SearchRequest {
+        SearchRequest {
+            weights: weights.map(|(dense, lexical)| FusionWeights { dense, lexical }),
+            min_overlap,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn absent_fusion_controls_are_equal_weights_and_a_gate_of_one() {
+        // The whole promise of ADR-094: a request that does not ask ranks
+        // exactly as it did before the fields existed.
+        let (weights, min_overlap) = fusion_controls(&request(None, None)).unwrap();
+        assert_eq!(weights, FusionWeights { dense: 1.0, lexical: 1.0 });
+        assert_eq!(min_overlap, 1);
+    }
+
+    #[test]
+    fn a_missing_weight_defaults_to_one() {
+        let body: SearchRequest =
+            serde_json::from_value(json!({ "weights": { "lexical": 0.25 } })).unwrap();
+        let (weights, _) = fusion_controls(&body).unwrap();
+        assert_eq!(weights, FusionWeights { dense: 1.0, lexical: 0.25 });
+    }
+
+    #[test]
+    fn meaningless_fusion_controls_are_refused_by_name() {
+        for (body, expected) in [
+            (request(Some((-1.0, 1.0)), None), "weights.dense"),
+            (request(Some((1.0, -0.5)), None), "weights.lexical"),
+            (request(Some((0.0, 0.0)), None), "both be 0"),
+            (request(None, Some(0)), "min_overlap"),
+        ] {
+            let error = fusion_controls(&body).expect_err(expected);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert!(error.message.contains(expected), "{expected} not named in: {}", error.message);
+        }
+    }
+
+    #[test]
+    fn a_zero_weight_on_one_half_is_allowed() {
+        // Switching a half off is a legitimate way to see what the other one
+        // contributes; only switching *both* off is meaningless.
+        assert!(fusion_controls(&request(Some((1.0, 0.0)), None)).is_ok());
+        assert!(fusion_controls(&request(Some((0.0, 1.0)), None)).is_ok());
     }
 }

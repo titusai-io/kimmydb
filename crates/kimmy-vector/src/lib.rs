@@ -33,5 +33,8 @@ pub fn local_embeddings_available() -> bool {
 
 pub use index::HnswIndex;
 pub use provider::{EmbeddingProvider, build, provider_totals};
-pub use search::{Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search};
+pub use search::{
+    Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search,
+    weighted_reciprocal_rank_fusion,
+};
 pub use worker::{EmbeddingWorker, Outcome, WorkerCounters};

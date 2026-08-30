@@ -10,6 +10,30 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. One addition,
+two optional fields on `hybrid_search` that tune how its two halves are fused.
+Their defaults reproduce the current ranking exactly, so nothing moves for a
+request that does not ask.
+
+### Added
+
+- **`weights` and `min_overlap` on `hybrid_search`.** Measured on a corpus of
+  short conversational documents, hybrid search recalled roughly a third less
+  than plain vector search on the same queries, for every one of eight
+  embedding models. The lexical half ranks by term overlap, and on documents
+  of a sentence or two nearly every candidate shares a word with the query,
+  so that ranking is close to random — and equal-weight reciprocal rank
+  fusion gave it the same say as the dense rank. `weights`
+  (`{ "dense": w, "lexical": w }`, both `>= 0`, not both zero) scales each
+  half's contribution; `min_overlap` (`>= 1`) is the number of distinct query
+  terms a chunk must contain before it counts as lexical evidence, and a
+  document it removes from the lexical half keeps whatever the dense half
+  gave it. Defaults are `{1, 1}` and `1`: plain RRF, as before. The MCP
+  `hybrid_search` tool and `kimmy hybrid-search` (`--dense-weight`,
+  `--lexical-weight`, `--min-overlap`) take the same controls. ADR-094.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four
