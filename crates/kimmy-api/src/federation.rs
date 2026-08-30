@@ -194,7 +194,7 @@ fn metadata_url_for(resource: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kimmy_auth::{Action, Grant, OidcSettings, RoleMapping};
+    use kimmy_auth::{Action, DEFAULT_MAX_TOKEN_LIFETIME_SECS, Grant, OidcSettings, RoleMapping};
 
     use super::*;
 
@@ -210,6 +210,7 @@ mod tests {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
+            max_token_lifetime_secs: DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         }
     }
 

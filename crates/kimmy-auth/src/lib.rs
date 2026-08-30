@@ -27,7 +27,8 @@ pub use error::{AuthError, Result};
 /// they hold is this crate's key material, not a third party's type.
 pub use jsonwebtoken::jwk::{Jwk, JwkSet};
 pub use oidc::{
-    OIDC_LEEWAY_SECS, OidcSettings, OidcVerifier, PROTECTED_RESOURCE_METADATA_PATH, RoleMapping,
+    DEFAULT_MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_LIFETIME_CEILING_SECS, OIDC_LEEWAY_SECS,
+    OidcSettings, OidcVerifier, PROTECTED_RESOURCE_METADATA_PATH, RoleMapping,
 };
 pub use rbac::{Action, Grant, Principal, Role};
 pub use roles::{ROLES_COLLECTION, RoleStore};

@@ -219,12 +219,22 @@ fn add_challenge(
 
     let error = match response.status() {
         axum::http::StatusCode::UNAUTHORIZED if offered_credentials => {
-            Some((r#"error="invalid_token""#, "the access token is expired, revoked or malformed"))
+            // A refusal may say more precisely why, through an extension
+            // rather than by setting the header itself, so that a specific
+            // description never costs the `resource_metadata` pointer below.
+            // A federated token refused for its lifetime is the one case
+            // (ADR-096); everything else stays deliberately generic.
+            let description = response
+                .extensions()
+                .get::<crate::error::ChallengeDescription>()
+                .map(|d| quoted_string(&d.0))
+                .unwrap_or_else(|| "the access token is expired, revoked or malformed".to_string());
+            Some((r#"error="invalid_token""#, description))
         }
         axum::http::StatusCode::UNAUTHORIZED => None,
         axum::http::StatusCode::FORBIDDEN => Some((
             r#"error="insufficient_scope""#,
-            "the authenticated principal holds no grant covering this operation",
+            "the authenticated principal holds no grant covering this operation".to_string(),
         )),
         _ => return,
     };
@@ -257,6 +267,22 @@ fn add_challenge(
         // the error path, and the refusal itself is unaffected.
         Err(e) => warn!(error = %e, "could not encode the WWW-Authenticate challenge"),
     }
+}
+
+/// A description made safe to carry as an RFC 6750 §3 quoted-string.
+///
+/// The grammar admits printable ASCII without `"` or `\`. Every description
+/// this node writes already satisfies it, so this is a guard rather than a
+/// transformation — but the header is assembled by string formatting, and a
+/// stray quote in a message would otherwise end the parameter early.
+fn quoted_string(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' => '\'',
+            ' '..='~' => c,
+            _ => '?',
+        })
+        .collect()
 }
 
 /// The span for one HTTP request, parented to whatever sent the request.

@@ -10,6 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch: nothing changes on the wire, on disk or in
+`/v1`, but a federated token that 0.16.x accepted may be refused now, and the
+entry below says what to check before upgrading. One addition.
+
+### Added
+
+- **`auth.oidc.max_token_lifetime_secs`** (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`),
+  default `900`: a federated token whose own `exp − iat` exceeds it is refused,
+  as is one with no `iat`. A federated principal's role membership is frozen in
+  its access token, so a revocation at the provider was honoured only when the
+  token expired — for however long the provider had chosen (ADR-073). This
+  bounds that window from this side. The refusal is a 401 whose
+  `WWW-Authenticate` challenge names the limit in seconds and nothing about the
+  token. **Before upgrading, check the access-token lifetime your provider
+  mints for this resource:** at or below 900 seconds nothing changes; above it,
+  shorten it at the provider or raise the limit knowingly. Refused outside
+  1–86400; a raised limit is printed in the startup summary. ADR-096.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four
