@@ -1024,7 +1024,7 @@ pub fn find_and_modify(
         let mut seed = Document::new();
         implied_equalities(&filter, &mut seed);
         if let Some(update) = &update {
-            update::apply(update, &mut seed, now)?;
+            update::apply_on_insert(update, &mut seed, now)?;
         }
         Some(seed)
     } else {
