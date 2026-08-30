@@ -2254,6 +2254,38 @@ Both dissolved once the broadcast became a wake-up rather than a data path —
 
 ---
 
+## 🟢 Reads are bounded by what they return, not by what they scan (ADR-098)
+
+**Was.** Three read paths held something proportional to the collection.
+`count` collected every matching document and took the vector's length — over
+a `__vectors` shadow, every vector and its text. An index-backed `find`
+gathered every candidate key in the range, sorted and deduplicated, before
+rechecking the first, so an unselective equality with `limit: 1` held the whole
+range and a `$in` union added a set on top. A sorted `find` collected every
+match as a `(stamp, document)` pair to sort it, and `skip` was unbounded. Each
+was the likeliest way for one ordinary request to take a small host over its
+memory.
+
+**Now.** One visitor behind `find` and `count`. A count counts. Index
+candidates stream out of one read transaction and are rechecked as they
+arrive — an exact probe as one run already in `_id` order, a `$in` as a merge
+of such runs, a range in `_id` order by keeping the `skip + limit` smallest
+keys of a pass. A sorted `find` keeps a heap of the `skip + limit` least, with
+`_id` ascending as the final key so the page is the one the stable sort gave,
+and that window may not exceed 10,000: refused with `400`, not clamped.
+`explain` reports `indexEntriesRead` beside `documentsExamined`, so an exact
+probe stopped early and a range read in full can be told apart.
+
+**What still scans.** `count` is O(n) in time and O(1) in memory. A range plan
+in `_id` order still reads its whole range; it no longer holds it. `update` and
+`delete` with `multi` use the engine's own in-transaction scan, which gathers
+keys per chunk and is unchanged here.
+
+**The behaviour change** is the sort window, recorded in
+[ADR-098](decisions.md) and in [Compatibility](compatibility.md).
+
+---
+
 ## How to use this document
 
 When something here is closed, move it to 🟢 with a note on what changed —

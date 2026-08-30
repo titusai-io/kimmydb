@@ -10,6 +10,48 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor, not a patch: one refusal is new. A sorted `find` whose `skip + limit`
+exceeds 10,000 is now a `400` — that is what the server holds while it sorts,
+and it stops at the number `limit` already stops at — where before it was
+accepted and held every match. Everything else here is a memory fix that
+changes no answer: `count`, index-backed reads and sorted reads are bounded by
+what they return rather than by what they scan (ADR-098).
+
+### Changed
+
+- **A sorted `find` holds at most 10,000 documents: `skip + limit`.** Beyond
+  that it is refused with `400` and a message saying how to page instead —
+  sort by `_id` and follow `nextCursor`, or narrow the filter on the sort
+  field to where the last page ended. An unsorted `find`, or one sorted by
+  `{"_id": 1}`, holds only its page and keeps its unbounded `skip`. Refused
+  rather than clamped because a clamped `skip` would return a different page
+  and say nothing.
+- **`explain` reports `indexEntriesRead`** when an index answered a read: how
+  much of the index the query touched, as distinct from `documentsExamined`.
+  Additive; absent for a scan, an `idLookup`, and for filtered writes.
+
+### Fixed
+
+- **`count` no longer decodes every match into memory.** It took the length
+  of a collected vector, which over a large collection — or a `__vectors`
+  shadow, where every document is a vector with its text — cost the memory
+  of the collection per request. It now counts as it goes and holds nothing.
+- **An index-backed `find` no longer gathers every candidate key before
+  reading the first document.** The range's keys were collected, sorted and
+  deduplicated up front, so an unselective equality with `limit: 1` held the
+  whole range and a `$in` union added a set on top. Candidates now stream out
+  of one read transaction and are rechecked as they arrive: an equality on a
+  complete key is one run already in `_id` order and stops where the page
+  does; a `$in` is a merge of such runs; a range needing `_id` order keeps the
+  `skip + limit` smallest keys of a pass. Results and their order are
+  unchanged.
+- **A sorted `find` no longer collects every match to sort it.** It keeps a
+  heap of the `skip + limit` least under the sort, with `_id` ascending as
+  the final key — the order a stable sort over an `_id`-ordered scan
+  produced, so every page is the page it was.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

@@ -102,7 +102,8 @@ pub struct FindArgs {
     /// Maximum documents to return. Defaults to 100.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Documents to skip, for paging.
+    /// Documents to skip, for paging. With a sort other than `{"_id": 1}`,
+    /// `skip + limit` may not exceed 10,000.
     #[serde(default)]
     pub skip: Option<usize>,
     /// Also report whether an index was used and how many documents were
