@@ -648,6 +648,61 @@ a shorter `gc_interval_secs` keeps each pass small.
 
 ---
 
+## Verifying a release
+
+Every release attaches a `.sha256` beside each archive, written by the same
+build; the container image is pushed by digest and then tagged. Two levels of
+checking are available, and the second is the one worth knowing about.
+
+**The checksum** proves that the file you have is the file that was attached
+to the release, and no more than that: it sits beside the archive, and whoever
+could replace one could replace both.
+
+```bash
+V=0.16.4; A=kimmy-aarch64-apple-darwin.tar.xz
+curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
+curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
+shasum -a 256 -c "$A.sha256"
+```
+
+**The provenance attestation** proves who built it and from what
+([ADR-108](decisions.md)): a [SLSA](https://slsa.dev) provenance statement,
+signed keylessly through Sigstore under the release workflow run's own
+identity, recorded by GitHub against the artifact's digest. Verifying it
+establishes that the archive or image was built by this repository's release
+workflow, at a named commit and tag, on GitHub's runners — not on a
+maintainer's machine, not by a fork, and not by anyone holding a copied
+signing key, because there is none to copy. `gh` performs the check:
+
+```bash
+# A release archive
+gh attestation verify kimmy-aarch64-apple-darwin.tar.xz -R titusai-io/kimmydb
+
+# The container image, by tag or by digest
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.16.4 -R titusai-io/kimmydb
+```
+
+A successful verification prints the workflow that produced the artifact and
+the commit it ran at: expect `.github/workflows/release.yml` and the tag you
+asked for. `-R` scopes the check to attestations this repository produced;
+without it, a valid attestation from any repository would satisfy the
+command, which is not the question being asked.
+
+> **From which release.** GitHub generates attestations for a private
+> repository only on an Enterprise Cloud plan. No release made while this
+> repository was private carries one, and `gh attestation verify` on such a
+> release reports that no attestations were found — an honest answer, not a
+> failed check. The image's attestation step is in place and conditional on
+> the repository being public; the archives' is switched on in
+> `dist-workspace.toml` at the same time. Every release from then on carries
+> both.
+
+Homebrew has its own check built in: the formula pins each archive's SHA-256,
+so `brew install titusai-io/tap/kimmy` refuses a download that does not match
+what the release workflow published.
+
+---
+
 ## Upgrades
 
 The on-disk **schema version** is checked on open, and the two directions are

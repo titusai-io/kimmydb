@@ -47,6 +47,20 @@ aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
 x86_64-unknown-linux-musl = "ubuntu-24.04"
 
 # Pushing a multi-arch image needs more than the release workflow's
-# `contents: write`.
+# `contents: write`. `id-token` and `attestations` are for the build
+# provenance attestation on the image manifest (ADR-108): a called workflow's
+# job can hold no permission its caller did not grant, and dist writes the
+# caller, so the grant has to be made here.
 [dist.github-custom-job-permissions]
-publish-ghcr = { packages = "write", contents = "read" }
+publish-ghcr = { packages = "write", contents = "read", id-token = "write", attestations = "write" }
+
+# Build provenance for the release archives — dist's `github-attestations`
+# adds an `actions/attest` step to `build-local-artifacts` over everything it
+# built — stays OFF until the repository is public. GitHub generates
+# attestations for a private repository only on an Enterprise Cloud plan; on
+# any other plan the step fails, and dist emits it with no condition, so
+# enabling it now would fail every release at the attest step. The container
+# image's attestation (publish-ghcr.yml) is conditional on visibility and
+# needs no such care. At go-public: uncomment, run `dist generate`, commit
+# the regenerated release.yml, and the next tag's archives are attested.
+# github-attestations = true

@@ -125,6 +125,12 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       packages: write
+      # For the provenance attestation at the end of this job: `id-token` to
+      # obtain the workflow's OIDC identity that signs it, `attestations` to
+      # store it. Granted to this job by dist-workspace.toml's
+      # `github-custom-job-permissions`, since the caller sets the ceiling.
+      id-token: write
+      attestations: write
     steps:
       - name: Download digests
         uses: actions/download-artifact@v8
@@ -173,3 +179,35 @@ jobs:
 
       - name: Inspect the result
         run: docker buildx imagetools inspect "$IMAGE:${{ steps.meta.outputs.version }}"
+
+      # The digest of the multi-arch index just created. That is the subject
+      # of the attestation, rather than either per-architecture image beneath
+      # it, because it is what `docker pull kimmydb:<tag>` resolves to and so
+      # what an operator will hand to `gh attestation verify`.
+      - name: Resolve manifest digest
+        id: manifest
+        run: |
+          digest=$(docker buildx imagetools inspect \
+            "$IMAGE:${{ steps.meta.outputs.version }}" --format '{{.Manifest.Digest}}')
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      # Build provenance (ADR-108): a SLSA provenance statement naming this
+      # repository, this workflow and the commit it ran at, signed keylessly
+      # through Sigstore by the run's own OIDC identity — no key to keep, so
+      # none to leak — stored by GitHub and pushed to GHCR beside the image.
+      # Verify with
+      #   gh attestation verify oci://ghcr.io/titusai-io/kimmydb:<tag> -R titusai-io/kimmydb
+      #
+      # Conditional on the repository being public. GitHub generates
+      # attestations for a private repository only on an Enterprise Cloud
+      # plan and fails the step otherwise, so while the repository is private
+      # this step is skipped, visibly, in the run log. The condition reads
+      # the event's own repository record, so the first release after the
+      # repository is made public attests its image with no change here.
+      - name: Attest build provenance
+        if: ${{ !github.event.repository.private }}
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.manifest.outputs.digest }}
+          push-to-registry: true

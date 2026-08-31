@@ -1104,6 +1104,62 @@ delivery. Treat an inbound `traceparent` as a hint, never as evidence.
 
 ---
 
+## Supply chain
+
+What the project does about the code it ships that it did not write, and
+about proving that what you download is what the release workflow built
+([ADR-108](decisions.md)).
+
+**The dependency graph has a written policy**, `deny.toml` at the repository
+root, checked by `cargo deny` on every change to a Cargo manifest or the
+lockfile and once a week against an unchanged one — the weekly run exists
+because advisories are published against crates that are already in the
+lockfile. A known vulnerability anywhere in the graph fails the check.
+Licenses are an allowlist of exactly what the graph carries, with the
+workspace's own AGPL permitted for the server crates by name and no
+GPL-family license permitted at all: `kimmy-client` is Apache-2.0
+([LICENSING.md](../LICENSING.md)), and one allowlist over one lockfile cannot
+permit a license for some crates' dependents and not others, so it permits it
+for none. OpenSSL, `native-tls` and `aws-lc-rs` are banned outright — the
+build has one TLS and crypto stack, rustls on `ring` ([ADR-039](decisions.md)),
+and a second one arriving as somebody's feature default is how "we use
+rustls" quietly stops being true. Crates come from crates.io only. Where an
+advisory is ignored, the reason is written beside it in the file; read it
+there rather than here, so that the file and the reasoning cannot drift.
+
+The policy covers the **default feature set**, the build that ships.
+`local-embeddings` knowingly pulls ONNX Runtime and OpenSSL, and is outside
+the ban for the same reason it is outside `scripts/check-native-deps.sh`.
+
+**The licensing line is checked, not assumed.** The allowlist cannot say
+that the Apache-2.0 client must not *depend* on an AGPL crate;
+`scripts/check-license-boundary.sh` says it, in the same workflow, by
+resolving the client's shipped graph and failing if a server crate is in it.
+
+**Updates arrive weekly, grouped.** Dependabot proposes minor and patch
+updates for the workspace, the GitHub Actions the workflows use, the Go
+client and the Python client as one pull request per ecosystem, majors on
+their own, each held for seven days after publication so that a release
+which is going to be yanked has had its week. Every one of those pull
+requests runs the policy check above and the full CI run.
+
+**Releases carry provenance.** The release workflow attests what it built: a
+[SLSA](https://slsa.dev) provenance statement for the container image's
+manifest and for each release archive, signed keylessly through Sigstore
+under the workflow run's own OIDC identity and recorded by GitHub against the
+artifact's digest. There is no signing key — nothing to keep, rotate or leak
+— and the statement names the repository, the workflow file, the commit and
+the tag, which is what `gh attestation verify` checks. How to run it, and
+from which release the attestations begin, is in
+[Operations → Verifying a release](operations.md#verifying-a-release).
+
+What none of this covers, stated so it is not assumed: GitHub's runners, the
+crates.io index and the Sigstore infrastructure are trusted. A compromise of
+any of them is a compromise of every project that builds this way, and the
+answer to it does not live in this repository.
+
+---
+
 ## Deployment checklist
 
 ```mermaid

@@ -4413,3 +4413,88 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+
+## ADR-108 — The project ships an OSS security baseline: dependency policy, automated updates, signed provenance
+
+**Decision.** Three things, none of which touches the server. *One*: the
+dependency graph has a written policy, `deny.toml`, enforced by `cargo deny`
+in its own workflow (`.github/workflows/deny.yml`). A known vulnerability
+fails; licenses are an allowlist of exactly what the graph carries, the
+workspace's AGPL permitted by crate name for the server crates and no
+GPL-family license permitted at all; OpenSSL, `native-tls` and `aws-lc-rs`
+are banned; crates.io is the only source. The check runs when a manifest,
+the lockfile or the policy changes, and weekly. Its scope is the default
+feature set — the build that ships, as for `check-native-deps.sh`. Beside it,
+`scripts/check-license-boundary.sh` asserts the one rule a single-lockfile
+allowlist cannot state: the Apache-2.0 `kimmy-client` depends on no AGPL
+crate in its shipped graph. *Two*: Dependabot proposes updates weekly for
+Cargo, GitHub Actions, the Go module and the Python project, minor and patch
+grouped into one pull request per ecosystem, majors alone, each held for
+seven days after publication. *Three*: releases are attested. Build
+provenance — SLSA, signed keylessly through Sigstore under the workflow run's
+OIDC identity, stored by GitHub — for the container image's manifest digest
+now, conditional on the repository being public, and for every release
+archive through dist's `github-attestations` once it is. Verification is
+`gh attestation verify`, documented in the operations guide. `SECURITY.md`
+says what is supported, where to report, what to expect, and what is in and
+out of scope.
+
+**Why.** Being open source means being depended on by people who cannot
+audit the build. Three questions they are entitled to have answered without
+asking: what is in the dependency graph and who decided it could be there;
+how quickly a known problem in it is noticed and fixed; and whether the file
+they downloaded is the one the release workflow built. Each was answered by
+prose or by habit before this — the `Cargo.toml` comments explain why rustls,
+and ADR-016's correction records how long a prose claim went unchecked — and
+the lesson of ADR-016 is exactly that a claim nothing checks stops being true
+without anyone noticing. The policy is the checkable form of what the
+comments already say. Advisories in particular are published against crates
+that are already in the lockfile, which is why the weekly run exists: a
+path-filtered check on pull requests alone would first notice a new advisory
+on the next unrelated change to `Cargo.lock`, whenever that happened to be.
+
+Provenance is the piece an operator can act on alone. A checksum beside the
+archive proves the download matched the upload; an attestation proves the
+upload was produced by this repository's workflow from this commit, with an
+identity that cannot be copied off a laptop because it never existed on one.
+
+**Alternatives.** *cosign with a maintainer-held key* — rejected. A
+long-lived private key is the thing that gets leaked, and a key rotation is
+a thing nobody rehearses; keyless signing under GitHub's OIDC identity has no
+key, and the verification question becomes "was this built by that
+workflow", which is the question an operator actually has. It also keeps
+`cosign` off the verifying side: `gh` is enough. *Renovate* — rejected for
+now. More configurable than Dependabot and better at grouping, but a
+third-party application with write access to the repository, for a workload
+of four ecosystems that Dependabot's grouping and cooldown already contain.
+Revisit if the pull-request noise outgrows them. *`cargo audit` in CI* —
+subsumed; `cargo deny` reads the same advisory database and adds the three
+checks `cargo audit` does not have. *The deny job inside `ci.yml`* —
+rejected because a path filter is a property of a workflow, not of a job,
+and this check has nothing to say about a change that touches no manifest.
+*Enabling dist's `github-attestations` now* — deferred on a fact rather than
+a preference: GitHub generates attestations for a private repository only on
+an Enterprise Cloud plan, dist emits the attest step with no condition, and
+a release that fails at its attest step is a worse outcome than a release
+without attestations. The image step carries its own visibility condition
+and needs no such wait.
+
+**Cost.** CI minutes: about a minute per run of `deny`, only on changes to a
+manifest, the lockfile or the policy, plus one run a week; nothing is added
+to the pull-request path for an ordinary change. Dependabot: up to fourteen
+open pull requests across the four ecosystems by the configured limits, in
+practice one or two a week, each running the full CI; the grouping and the
+cooldown are what hold that number down. Two advisories are ignored in
+`deny.toml` today, each with its reason beside it — one unfixable upstream
+(`rsa`, RUSTSEC-2023-0071: a private-key timing channel the server never
+exercises, since it verifies RSA signatures and signs nothing with RSA) and
+one fixed by a lockfile bump that is a separate change (`h2`,
+RUSTSEC-2026-0258); the second line comes out with that bump, and the
+unused-ignore warning is what says so. An ignored advisory is a debt the
+file makes visible rather than one it hides. Two follow-ups at go-public,
+neither in this repository's code: enable private vulnerability reporting in
+the repository settings, which GitHub offers only for public repositories,
+and uncomment `github-attestations` in `dist-workspace.toml`, run
+`dist generate`, and commit the regenerated `release.yml`.
+
+---

@@ -10,6 +10,33 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. Nothing in
+the server changes. What changes is around the release: the dependency graph
+now has a written and enforced policy, dependency updates arrive weekly and
+grouped, and the release workflow attests what it built, so a download can
+be checked against the workflow that produced it rather than only against a
+checksum that sat beside it.
+
+### Added
+
+- **Build provenance for the container image, verifiable with `gh`.** The
+  release workflow records a signed SLSA provenance attestation against the
+  image manifest's digest — keyless, through Sigstore, under the workflow
+  run's own identity — so that
+  `gh attestation verify oci://ghcr.io/titusai-io/kimmydb:<version> -R titusai-io/kimmydb`
+  proves the image was built by this repository's release workflow at the
+  tagged commit. One caveat, stated plainly: GitHub issues attestations for a
+  private repository only on an Enterprise Cloud plan, so the step is
+  conditional on the repository being public, no release made before that
+  carries one, and the release archives are switched on at the same moment
+  (`dist-workspace.toml`). The commands, and what a successful verification
+  shows, are in [Verifying a release](docs/operations.md#verifying-a-release).
+  The dependency policy (`deny.toml`), the update cadence, and the licensing
+  boundary check are described under
+  [Supply chain](docs/security.md#supply-chain); ADR-108 records the decision.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four
