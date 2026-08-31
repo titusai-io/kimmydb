@@ -210,6 +210,22 @@ whose defaults are meant to be left alone, and documentation corrections.
   implemented and is refused with a message naming the replacement; ADR-104
   and `docs/deviations.md` say why.
 
+- **Build provenance for the container image, verifiable with `gh`.** The
+  release workflow records a signed SLSA provenance attestation against the
+  image manifest's digest — keyless, through Sigstore, under the workflow
+  run's own identity — so that
+  `gh attestation verify oci://ghcr.io/titusai-io/kimmydb:<version> -R titusai-io/kimmydb`
+  proves the image was built by this repository's release workflow at the
+  tagged commit. One caveat, stated plainly: GitHub issues attestations for a
+  private repository only on an Enterprise Cloud plan, so the step is
+  conditional on the repository being public, no release made before that
+  carries one, and the release archives are switched on at the same moment
+  (`dist-workspace.toml`). The commands, and what a successful verification
+  shows, are in [Verifying a release](docs/operations.md#verifying-a-release).
+  The dependency policy (`deny.toml`), the update cadence, and the licensing
+  boundary check are described under
+  [Supply chain](docs/security.md#supply-chain); ADR-108 records the decision.
+
 ### Changed
 
 - **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
