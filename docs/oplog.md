@@ -330,6 +330,26 @@ is no longer derived from the oplog: coverage can be granted by a snapshot for
 entries this node will never hold, so opening only ever *raises* the vector to
 cover the log. See [ADR-036](decisions.md).
 
+**The horizon is judged per origin.** `oplog_collected_through` is one stamp
+across every origin, and the threshold a peer asks from is its own coverage of
+whichever origin it trails *most* — so an origin that wrote nothing for longer
+than retention and then wrote once puts every peer below the horizon at the
+next round, for a gap that holds exactly one servable entry. A member
+re-registering itself after a restart does this to the whole cluster. The
+retention pass therefore also records the highest stamp it removed **per
+origin** (`oplog_collected`), and a peer sends its witnessed vector with
+`AskEntries` (`held`). The sender then asks the precise question: at any origin
+the peer trails, does it lack something collected? If not, it is served from
+the threshold, however far below the coarse horizon that is — everything under
+it is the peer's own coverage. If so, `BeyondHorizon` as before. A peer that
+sends no vector is judged by the threshold, exactly as before, so the two
+builds interoperate in either direction ([ADR-097](decisions.md)).
+
+The same per-origin record refines the stale-rejoiner verdict ([ADR-085](decisions.md)):
+a peer trailing this node by more than tombstone retention is named only at an
+origin where it also lacks something collected here. A peer that can still be
+served every entry it lacks has nothing to resurrect, whatever the span says.
+
 ---
 
 ## Replication

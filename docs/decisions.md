@@ -4709,6 +4709,105 @@ number of seconds.
 
 ---
 
+## ADR-097 — The retention horizon is judged per origin
+
+**Decision.** The retention pass records, beside the single
+`oplog_collected_through` stamp, the highest stamp it removed **per origin**
+(`oplog_collected`, one entry per node id, written in the same transaction as
+the removal). Two decisions read it. A peer sends its witnessed vector with
+`AskEntries` (`held`, optional on the wire), and the sender answers
+`BeyondHorizon` only when, at an origin the peer trails, the peer's coverage
+sits below what was collected of that origin — otherwise it is served from
+the threshold it asked from, however far below the coarse horizon that is. And
+the stale-rejoiner verdict of ADR-085 requires, besides trailing this node by
+more than tombstone retention at an origin, that the peer also lack something
+collected at that origin; the reported span is unchanged. A database an
+earlier build collected from has no per-origin record, so `Engine::open` seeds
+every origin it holds with the coarse horizon: coarse below that point, exact
+above it.
+
+**What was observed.** A member-at-a-time roll of a three-member cluster that
+had been converged for 36 hours. Half a second after A came back, its first
+round named *both* peers stale — `behind_secs=129091`, within minutes of the
+time since the previous roll — with the message that tells an operator to
+reset them; five seconds later both were back within retention. And each time
+a member came back, the first peer to pull from it was told it was beyond the
+horizon and pulled a full snapshot of a store it held in full but for one
+entry. Data converged; the signals were false and the snapshots were cost.
+
+**Why.** Both come from one write and one measure. A member re-registers
+itself in the client topology when its build or endpoint changed, which a roll
+that upgrades does on every member. A member that clients do not write
+through has, until then, written nothing since the previous roll — so its own
+origin's previous stamp is 36 hours old, collected on every peer along with
+everything around it. The version vector summarises an origin by its newest
+stamp, so at the next round every peer trails that origin by the whole
+silence: `lag_behind_ms` with its roles swapped reads 36 hours, above
+retention, and names the peer. In the other direction, `VersionVector::behind`
+reduces "what am I missing" to one threshold — the peer's own coverage of the
+origin it trails most — and that threshold is the 36-hour-old stamp, below
+the single horizon stamp; the sender cannot tell that everything under the
+horizon is the peer's own coverage, and the snapshot is the only safe answer
+it has. Both are the same blindness: one stamp across all origins cannot say
+*which* origin's history is gone. Recorded per origin, the question each side
+needs is exact. Does the peer lack anything collected of the origin it trails?
+In the roll, no: the gap held one entry, seconds old, servable, and pulled on
+the next round. A peer that can still be served everything it lacks is not
+beyond the horizon and has nothing to resurrect.
+
+**Why not gate the verdict on the first round, or on two consecutive rounds.**
+The restart is where it was seen, not what causes it: any origin that writes
+after a silence longer than retention does the same to every peer, restart or
+not, and a peer that is a round or two late to pull — a larger cluster's
+fanout makes that routine — would be named on the third. A count is a guess at
+the cause; the record is the cause.
+
+**Why not treat the horizon as unknown just after start.** The horizon was
+not wrong; it is persisted and correct. The threshold was below it for a
+reason that the horizon alone cannot see.
+
+**Why the peer sends its vector rather than the sender sending its record.**
+The sender has both halves once the vector arrives — its own coverage, its
+own record — and decides without another round trip. Sending the record the
+other way would need a second request to say "serve me anyway", and the
+requester already had to derive the threshold from the vector it now sends.
+BSON is self-describing and `Message` derives serde without
+`deny_unknown_fields`, so a field with a default crosses a version boundary
+in both directions: an older sender ignores it and judges by the threshold, a
+newer sender given none does the same. Nothing either build did before is
+lost, and the round-trip test in `protocol.rs` pins both halves.
+
+**Why the seeding.** The per-origin record and the coarse horizon are written
+together, so on a database only this build has collected from, the highest
+entry in the record *is* the horizon. A horizon above the record means an
+earlier build removed entries the record never saw, from origins it cannot
+name. Every held origin is raised to the horizon then — which is exactly the
+coarse answer the horizon alone gave, so nothing is claimed that was not
+claimed before. The record is exact from that point on, and the cost ends once
+each origin has written again and been collected once more: for a cluster
+rolled onto this build, the roll *after* this one is the first quiet one. An
+origin the node learns of later needs no seeding, because nothing of it was
+held here to collect before it was known.
+
+**Alternatives.** Scan the oplog for the oldest entry of the origin above the
+peer's coverage: it has been collected, which is the point. Persist per-peer
+"last caught up" times: lost on restart, which is when this matters. Exclude a
+node's own origin from the verdict: a cluster with one writing member would
+then never name a stale peer. Suppress the topology re-registration: the write
+is legitimate and the same shape arrives from any idle origin's next write.
+
+**Cost.** One redb table with one 26-byte row per origin, raised in the same
+transaction as the retention pass already commits; one map-sized field on
+`AskEntries`; one read of the record per sync round. `behind_ms` and
+`behindSecs` mean what they meant, at fewer peers. What the record does not
+make exact: with `tombstone_retention_secs` longer than
+`oplog_retention_secs`, "collected" is judged at the shorter window, and a
+peer trailing by more than the longer one whose gap holds only entries aged
+between the two is still named — the conservative side, and the same side
+ADR-085 was on.
+
+---
+
 ## ADR-099 — Authenticated routes carry a request timeout, an explicit body ceiling and a per-principal rate limit
 
 **Decision.** Three settings, each with a default chosen so that a node which
@@ -4886,6 +4985,8 @@ element-wise over arrays. The pairs disagree on precisely the inputs
 puts the two readings side by side with the rule of thumb that resolves them:
 a constant on the right means the ordinary operator; a field or a computation
 on the right means `$expr`.
+
+---
 
 ---
 
