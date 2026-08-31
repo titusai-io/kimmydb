@@ -28,11 +28,23 @@ x-kimmy-common: &kimmy-common
   restart: unless-stopped
   environment: &kimmy-env
     KIMMY_ROOT_USER: root
-    KIMMY_ROOT_PASSWORD: ${KIMMY_ROOT_PASSWORD:-changeme}
+    # The three secrets have no defaults, deliberately. Inside a container the
+    # HTTP listener binds 0.0.0.0, and off loopback the node refuses to start
+    # with any of the placeholder values this repository's examples use
+    # (ADR-093) — the ones this file used to fall back to included. Compose
+    # stops at `up` instead, naming the variable. Put real values in a `.env`
+    # beside this file (it is gitignored) or in the environment:
+    #
+    #   KIMMY_ROOT_PASSWORD=$(openssl rand -base64 18)
+    #   KIMMY_JWT_SECRET=$(openssl rand -base64 32)
+    #   KIMMY_CLUSTER_SECRET=$(openssl rand -base64 32)
+    #
     # Every node must sign tokens with the same key, or a token minted by one
-    # node is rejected by the next request that lands elsewhere.
-    KIMMY_JWT_SECRET: ${KIMMY_JWT_SECRET:-dev-jwt-secret-not-for-production}
-    KIMMY_CLUSTER_SECRET: ${KIMMY_CLUSTER_SECRET:-dev-cluster-secret}
+    # node is rejected by the next request that lands elsewhere — which is why
+    # all three services share this one block.
+    KIMMY_ROOT_PASSWORD: ${KIMMY_ROOT_PASSWORD:?set KIMMY_ROOT_PASSWORD (a .env file beside docker-compose.yml works)}
+    KIMMY_JWT_SECRET: ${KIMMY_JWT_SECRET:?set KIMMY_JWT_SECRET to 32+ random bytes, e.g. openssl rand -base64 32}
+    KIMMY_CLUSTER_SECRET: ${KIMMY_CLUSTER_SECRET:?set KIMMY_CLUSTER_SECRET to random bytes, e.g. openssl rand -base64 32}
     KIMMY_SEEDS: dns:kimmy:7900
     KIMMY_LOG_LEVEL: ${KIMMY_LOG_LEVEL:-info}
   stop_grace_period: 30s

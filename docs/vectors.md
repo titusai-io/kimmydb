@@ -167,6 +167,50 @@ embedded is skipped and named — database, collection and `_id` are on the
 time out or reset) — rather than stalling the
 rest of the collection.
 
+### Batching
+
+The worker does not call the provider once per document. It gathers the
+chunks of consecutive documents from the same collection into one call,
+bounded three ways ([ADR-095](decisions.md)): at most `vector.batch.max_chunks`
+chunks (32), at most `vector.batch.max_tokens` estimated tokens (32 768, by
+the same estimate `max_tokens` above cuts on), and at most
+`vector.batch.max_wait_ms` (100 ms) of waiting for company once the stream is
+idle. On a backlog the next document is already there, so a batch fills
+without waiting; on a quiet collection one document waits out the timer and
+goes alone. A backfill has no timer — the set is known — and sends each batch
+as it fills.
+
+Why it matters is arithmetic. Measured against a llama.cpp CPU server with
+~43-character inputs, 32 calls of one input took 394 ms and one call of 32
+inputs took 18 ms: a round trip, tokenisation and the server's own
+scheduling are paid per *call*, and a one-chunk document was a call of one.
+That put a floor of one round trip under every document, and a stream of
+writes arriving slightly faster than the floor allows grows its backlog
+without bound — Little's law, and what a live ingest showed. Batching removes
+the floor.
+
+What batching does not change: the storage write is still per document.
+`put_vectors` replaces one document's chunks, staleness is one document's
+HLC, and the oplog position is recorded once the batch has landed, so a crash
+replays rather than skips exactly as before. A document's chunks always share
+one call, so a document larger than the token bound goes alone rather than
+being split. Only one collection's documents share a call, because the
+collection names the provider, the model and the prefix. A batch that fails
+*permanently* — a `400` for one input the model cannot take, which the
+provider does not name — is taken apart and each document sent alone, so the
+one at fault is skipped and named and the rest land; a *retryable* failure
+retries the whole batch, as one document retried before.
+
+`kimmy_embed_documents_total` and `kimmy_embed_chunks_total` still count
+documents and chunks. `kimmy_embed_provider_requests_total` counts calls, so
+it now climbs more slowly than chunks, and chunks over requests is the batch
+size the worker is achieving. The settings are the node's (`[vector.batch]`
+in `kimmy.toml`, see [Operations](operations.md#settings)), not the
+collection's, because they describe the round trip this node makes. One
+caveat: the `ollama` provider sends one request per input, because its
+embeddings endpoint takes one, so batching saves it nothing on the wire;
+every other provider takes the batch whole.
+
 ---
 
 ## Supplying your own vectors
@@ -244,6 +288,29 @@ key — does not, because retrying it would stall every document queued behind i
 
 ---
 
+## Throughput, and why more nodes do not embed one collection faster
+
+A collection is embedded by exactly one node at a time: the member its
+`"{db}/{collection}"` key assigns by rendezvous hash, the same function that
+assigns webhook delivery and TTL expiry ([ADR-077](decisions.md)). Every
+member sees every write, but only the owner calls the provider for it; the
+others hold the write against the owner leaving and otherwise let replication
+bring them the vectors. That is what keeps a three-member cluster's provider
+bill at one times the corpus instead of three.
+
+The consequence for sizing is structural. **Adding members does not raise the
+rate at which one collection is embedded.** Its owner's worker is the whole
+pipeline — one batch in flight at a time, against one provider — and the
+provider is the bound. What more members buy is more *collections* embedding
+at once, because ownership spreads them across the member set. A deployment
+whose load is one large collection should size the provider for that
+collection's arrival rate and, if the provider is local, give it the cores;
+a deployment with many collections can spread them by adding members, or pin
+embedding to designated members with `[vector] worker_enabled = false`
+everywhere else.
+
+---
+
 ## Search
 
 ```http
@@ -296,6 +363,62 @@ moderately by both can beat one ranked first by only one.
 The lexical half is **term overlap, not BM25**. Since RRF only consumes the
 ordering, the absolute scores need not be principled — but a real BM25 would
 rank better on its own. Recorded in [Deviations](deviations.md).
+
+#### Tuning the fusion
+
+Two optional request fields adjust how the halves are combined. Both default
+to exactly what the paragraphs above describe, so a request that omits them
+ranks as it always has.
+
+```json
+{
+  "query": "how do I rotate a token",
+  "k": 10,
+  "weights": { "dense": 0.7, "lexical": 0.3 },
+  "min_overlap": 2
+}
+```
+
+`weights` scales each half's contribution before the sum:
+
+```
+score(d) = w_dense / (60 + rank_dense(d))  +  w_lexical / (60 + rank_lexical(d))
+```
+
+Both weights must be `>= 0` and they must not both be zero; anything else is a
+`400`. Only their ratio matters — `0.7/0.3` and `7/3` rank identically — since
+the scores are compared with each other and never against a threshold. The
+default is `{ "dense": 1.0, "lexical": 1.0 }`, which is plain RRF. A weight of
+`0` switches a half off entirely, which is a convenient way to see what the
+other one is contributing.
+
+`min_overlap` is the number of **distinct query terms** a chunk must contain
+before it counts as lexical evidence at all. A chunk sharing fewer terms than
+that with the query is dropped from the lexical ranking before fusion; if the
+query itself has fewer distinct terms than `min_overlap`, the query's count is
+used instead, so a one-word query is never gated to nothing. Must be `>= 1`
+(a `400` otherwise); the default is `1`, which admits any chunk sharing a
+single term, as before.
+
+The gate removes *evidence*, not documents: a document dropped from the lexical
+half that the dense half ranked still receives its full dense contribution and
+still appears in the result. Only the lexical term of its score is gone.
+
+**Why the defaults are what they are.** Measured on a corpus of short
+conversational documents, across eight embedding models and forty graded
+queries, `hybrid_search` recalled roughly a third less than `vector_search` on
+the same queries — for every model, with the gap narrowing as the dense model
+got stronger. The mechanism is the lexical half above. On documents of a
+sentence or two, nearly every candidate in the 4×k lexical window shares one
+or two common words with the query, so ordering by term overlap is close to
+random among them; and RRF gives that near-random rank the same authority as
+the dense rank. `min_overlap` is the practical fix for such a corpus: raising
+it to `2` keeps only chunks that agree with the query on more than one word,
+which is what an exact-term match actually looks like, and lets the dense half
+decide the rest. `weights` is the more general knob for a corpus where the
+lexical half is informative but weaker. The defaults stay equal-weight RRF so
+that nothing about an existing deployment's ranking moves until the change has
+been measured there — see [ADR-094](decisions.md).
 
 ### There is no minimum score
 
@@ -415,6 +538,7 @@ The exact path is the oracle for everything approximate:
 | Re-embedding is idempotent | Replaying an oplog entry after vectors exist at that HLC is a no-op |
 | A crash does not lose embeddings | The recorded position always trails completed work |
 | Retry does not stall the queue | Retryable and terminal provider failures are distinguished and tested apart |
+| Batching changes the calls, not the writes | 100 one-chunk documents backfill in at most four provider calls and write 100 documents; a poisoned document in a batch of five is skipped alone while four land; at every observation of a streamed backlog, the recorded position has never passed an entry whose vectors are not on disk |
 
 See [Testing](testing.md) for the philosophy behind measuring rather than
 assuming.

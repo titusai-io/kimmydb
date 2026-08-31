@@ -12,15 +12,190 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-A minor, not a patch: one refusal is new. A sorted `find` whose `skip + limit`
-exceeds 10,000 is now a `400` — that is what the server holds while it sorts,
-and it stops at the number `limit` already stops at — where before it was
-accepted and held every match. Everything else here is a memory fix that
-changes no answer: `count`, index-backed reads and sorted reads are bounded by
-what they return rather than by what they scan (ADR-098).
+A minor when it ships, not a patch. Nothing changes on the wire, on disk or
+in the `/v1` API, members of this version and 0.16.x replicate to each other,
+and the upgrade is an ordinary rolling one — but two configurations that
+started under 0.16.x are refused now, and the pre-1.0 policy puts a refusal
+of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
+`jwt_secret` of 16 to 31 bytes must be replaced with one of 32 or more
+(rotating it ends every session once, on every node at the same time), and a
+node reachable from the network must not be running on one of this
+repository's own example secrets. `kimmyd check-config` against the new
+binary answers both without starting anything. Nothing else in the release
+asks anything of an operator: the rest is additive query, search and
+configuration surface — the entries below say what — along with settings
+whose defaults are meant to be left alone, and documentation corrections.
+
+### Added
+
+- **`$setOnInsert`.** Fields written only to the document an upsert creates,
+  and left alone on a match — the created-at idiom `{$setOnInsert: {created:
+  t}, $inc: {n: 1}}` on `find_and_modify` with `upsert: true`. The inserted
+  document is the filter's equalities, then `$setOnInsert`, then the other
+  operators. A `$setOnInsert` path that another operator in the same update
+  also writes — the same path, a prefix or an extension of it, or a
+  `$rename`'s destination — is refused with a `400`, as MongoDB refuses it.
+  Other operator pairs are still applied in order rather than checked; the
+  reason that stays a non-change is in `docs/deviations.md`.
+- **`$push` modifiers `$position`, `$sort` and `$slice`** alongside `$each`,
+  applied in that order: insert at an index (negative from the end), order
+  whole elements by `1` / `-1` or document elements by a `{field: direction}`
+  specification using the engine's canonical comparison, then keep the first
+  `n` or last `-n`. `{$each: [x], $sort: {t: 1}, $slice: -100}` is a capped,
+  ordered history in one write. A modifier without `$each`, or a clause
+  `$push` does not know, is an error rather than a value pushed literally.
+  `$addToSet` takes `$each` and refuses the other three, which have no
+  meaning on a set.
+- **`[vector.batch]`** — `max_chunks` (32), `max_tokens` (32768, estimated)
+  and `max_wait_ms` (100) bound one embedding provider call. Process-level
+  rather than per collection, because they describe the round trip this
+  node makes and not the collection; documented in `kimmy.example.toml` and
+  [docs/operations.md](docs/operations.md#settings).
+- **`$expr` in filters.** `{$expr: <aggregation expression>}` is a filter
+  clause everywhere a filter is taken — `find`, `count`, `update`, `delete`,
+  `find_and_modify`, `$match`, the vector pre-filter and the MCP tools. The
+  expression is evaluated against the whole document and the clause matches
+  when the result is truthy, so `{$expr: {$gt: ["$spent", "$budget"]}}` is
+  the over-budget query that previously needed an aggregation, and `{$expr:
+  {$gt: [{$multiply: ["$qty", "$price"]}, 100]}}` computes on the way. The
+  whole expression operator set is available. Comparison operators inside
+  `$expr` are the *expression* ones — canonical cross-type order, arrays
+  compared whole — which differ from the filter operators in the cases
+  `docs/query-language.md` sets side by side. `$expr` is never indexable; an
+  indexable clause beside it still plans, and `explain` reports which. An
+  expression that cannot be evaluated for a particular document (a type
+  violation) makes that document a non-match rather than failing the request;
+  that and one deliberate leniency are recorded in `docs/deviations.md`.
+  ADR-106.
+- **`weights` and `min_overlap` on `hybrid_search`.** Measured on a corpus of
+  short conversational documents, hybrid search recalled roughly a third less
+  than plain vector search on the same queries, for every one of eight
+  embedding models. The lexical half ranks by term overlap, and on documents
+  of a sentence or two nearly every candidate shares a word with the query,
+  so that ranking is close to random — and equal-weight reciprocal rank
+  fusion gave it the same say as the dense rank. `weights`
+  (`{ "dense": w, "lexical": w }`, both `>= 0`, not both zero) scales each
+  half's contribution; `min_overlap` (`>= 1`) is the number of distinct query
+  terms a chunk must contain before it counts as lexical evidence, and a
+  document it removes from the lexical half keeps whatever the dense half
+  gave it. Defaults are `{1, 1}` and `1`: plain RRF, as before. The MCP
+  `hybrid_search` tool and `kimmy hybrid-search` (`--dense-weight`,
+  `--lexical-weight`, `--min-overlap`) take the same controls. ADR-094.
+- **`auth.oidc.max_token_lifetime_secs`** (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`),
+  default `900`: a federated token whose own `exp − iat` exceeds it is refused,
+  as is one with no `iat`. A federated principal's role membership is frozen in
+  its access token, so a revocation at the provider was honoured only when the
+  token expired — for however long the provider had chosen (ADR-073). This
+  bounds that window from this side. The refusal is a 401 whose
+  `WWW-Authenticate` challenge names the limit in seconds and nothing about the
+  token. **Before upgrading, check the access-token lifetime your provider
+  mints for this resource:** at or below 900 seconds nothing changes; above it,
+  shorten it at the provider or raise the limit knowingly. Refused outside
+  1–86400; a raised limit is printed in the startup summary. ADR-096.
+- **`server.request_timeout_secs`** (default `30`, `KIMMY_REQUEST_TIMEOUT_SECS`).
+  A deadline on every REST route that answers with a document. A request
+  still *waiting* at the deadline — for the rest of its body, or for an
+  embedding provider — is abandoned and answered **`503`** with the new error
+  code **`timeout`** (`retry: wait`). It does not cut short storage work
+  already running: a scan, a bulk insert, an index backfill or a database drop
+  completes and is answered with its result, so it is not a query timeout and
+  none of those needed an exemption. The change-stream upgrade
+  (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with a connection and
+  carry no deadline.
+- **`server.max_body_bytes`** (default `2097152`, `KIMMY_MAX_BODY_BYTES`). The
+  request body ceiling, previously axum's fixed 2 MiB, as a setting. Over it,
+  `413 payload_too_large` as before. `/mcp` keeps rmcp's own 4 MiB limit.
+- **`server.rate_limit.per_principal`** and **`per_principal_window_secs`**
+  (defaults `0` — off — and `60`; `KIMMY_RATE_LIMIT_PER_PRINCIPAL`,
+  `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS`). A second token bucket, keyed
+  on the authenticated principal — a local user by name, a federated identity
+  by issuer and subject — checked after the token is verified on every route
+  that takes one, REST, `/mcp` and change streams alike. Over it, `429` with
+  `Retry-After`, the same response the login limiter gives; a client should
+  now treat a `429` as possible on any authenticated call. The key map shares
+  `max_tracked_keys` with the login limiters. The documentation offers `3000`
+  over `60` seconds as a starting point and says what it is relative to.
+- **`kimmy_rate_limited_principal_total`** on `/metrics` (and
+  `kimmy.rate_limited.principal` over OTLP): the part of
+  `kimmy_rate_limited_total` refused by the per-principal limit. A sibling
+  series rather than a label, so the existing series is byte-for-byte what it
+  was.
+- `check-config` refuses `request_timeout_secs = 0`, `max_body_bytes = 0`, and
+  a per-principal window of `0` with a non-zero burst, by name.
+- **`auth.local.login`** (`KIMMY_LOCAL_LOGIN`, `--local-login`): `always`,
+  `loopback_only` or `disabled`. Under `loopback_only`, `POST /v1/auth/login`
+  and `POST /v1/auth/refresh` answer only a connection whose peer address is
+  loopback and refuse everyone else with a 403 carrying the `forbidden` code;
+  under `disabled` both answer 404. The mode governs the *minting* of local
+  tokens: a local token already issued keeps verifying under every mode,
+  federated tokens are untouched, and the break-glass root stays reachable
+  from the node's own host under `loopback_only`. Startup refuses `disabled`
+  unless `auth.oidc` is configured, because a node with neither could
+  authenticate nobody. The startup summary and `check-config` name the mode;
+  `kimmy login <user>` explains a 403 or 404 from the login route rather than
+  printing it bare.
+- **`auth.oidc.subject_claim`** (`KIMMY_OIDC_SUBJECT_CLAIM`,
+  `--oidc-subject-claim`): a claim — `preferred_username`, `email`, `upn` —
+  whose string value is carried as a federated principal's *display* name.
+  `GET /v1/auth/whoami` gains a required `display` field (the claim's value,
+  or the subject when the claim is absent, not a string, or not configured),
+  and an audit record gains a `display` field when the value differs from
+  `user`. Display only: `sub` remains the identity for authorization, role
+  resolution, rate limiting and every comparison the server makes, because
+  an email is mutable and not unique across providers. A subject whose email
+  changes keeps its roles.
 
 ### Changed
 
+- **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
+  §3.2 asks for a key no shorter than the hash's output, 256 bits, and a
+  short key shared by every node of a cluster is the one weakness a single
+  captured token is enough to attack offline. `TokenIssuer` and
+  `check-config` refuse the same values, and the error names the floor.
+  A secret of 16–31 bytes has to be rotated before the upgrade; the docs,
+  the example configuration and the quick starts say 32 now (ADR-093).
+- **Placeholder secrets are refused off loopback.** A node whose HTTP
+  listener — or, with clustering on, whose cluster listener — binds anything
+  other than a loopback address refuses to start when `auth.root_password`,
+  `auth.jwt_secret` or `cluster.cluster_secret` is one of the values this
+  repository's own examples use: `changeme`, `change-me`, `hunter2`, the
+  defaults the compose file used to fall back to, the commented-out lines in
+  `kimmy.example.toml`, and the obvious words (`password`, `secret`, `root`,
+  …; the full list is `PLACEHOLDER_SECRETS` in `kimmyd`). The error names
+  the setting and never the value. On `127.0.0.1` the same values are
+  accepted, so local development and the examples still run unchanged
+  (ADR-093).
+- **`docker-compose.yml` no longer supplies default secrets.** Its
+  `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` and `KIMMY_CLUSTER_SECRET` were
+  placeholders, and inside a container the node listens on every interface,
+  so the file would now start nothing. Compose stops at `up` and names the
+  missing variable; a `.env` beside the file (gitignored) or the environment
+  supplies them, and the file says how to generate each.
+- **Quick starts generate their secrets.** The README and the operations
+  guide ran the container with `change-me` and a 20-byte signing key; both
+  would be refused now, so the commands generate a root password and a key
+  with `openssl rand` and the login line reads the password back from the
+  environment.
+- **The security guide states what a local token is**: a signed,
+  unencrypted, readable grant list. Anyone holding one can read its user,
+  grants, roles and expiry without the secret; the secret provides integrity,
+  and confidentiality comes from TLS and from handling the token as a
+  credential.
+- **The embedding worker batches provider calls across documents**
+  ([ADR-095](docs/decisions.md)). It used to send one document's chunks per
+  call, so a document short enough to be one chunk paid a whole round trip
+  by itself: measured against a CPU llama.cpp server, 32 calls of one short
+  input took 394 ms and one call of 32 took 18 ms, and a live ingest arriving
+  a little faster than that per-document floor grew its backlog without
+  bound. The worker now fills a call from consecutive documents of the same
+  collection, on the streaming path and in a backfill alike, up to the
+  bounds above. The storage write is still one per document, the oplog
+  position is still recorded after the work, and a batch that fails
+  permanently is taken apart so the one document at fault is skipped and
+  named while the rest land. `kimmy_embed_documents_total` and
+  `kimmy_embed_chunks_total` count what they always did;
+  `kimmy_embed_provider_requests_total` now climbs more slowly than chunks,
+  and chunks over requests is the batch size achieved.
 - **A sorted `find` holds at most 10,000 documents: `skip + limit`.** Beyond
   that it is refused with `400` and a message saying how to page instead —
   sort by `_id` and follow `nextCursor`, or narrow the filter on the sort
@@ -34,6 +209,41 @@ what they return rather than by what they scan (ADR-098).
 
 ### Fixed
 
+- **`docs/query-language.md` no longer lists the aggregation pipeline and
+  index-backed `$in` as planned.** Both have shipped — the pipeline has its own
+  page — and the "Not implemented" table had not been updated to say so.
+- **A restarted member no longer names its converged peers stale on its
+  first round.** On a roll, half a second after a member came back, its
+  first sync round logged `peer trails this node by more than tombstone
+  retention … a stale rejoiner should be reset, not merged` for *both*
+  peers, `behind_secs` reading the time since the previous roll, and
+  withdrew it five seconds later. The peers were converged and had never
+  been away; the member had just written its topology record after 36
+  hours of writing nothing, and the span between that write and the
+  previous one is what the measure read. The verdict now also requires that
+  the peer lack something retention has removed here at that origin — a
+  peer that can still be served every entry it lacks has nothing to
+  resurrect. A genuinely stale peer is still named, on the first round that
+  sees it, with the same `behind_secs` and the same `staleSince` /
+  `behindSecs` on `GET /v1/topology`. If you alert on that line, a roll no
+  longer trips it.
+- **A restarted member no longer answers `BeyondHorizon` to its first
+  puller.** Each time a member came back, the first peer to pull from it
+  logged `behind the peer's retention horizon; falling back to a snapshot`
+  and transferred the whole store to learn one entry. The puller asked from
+  its coverage of the member's origin — the member's previous write, from
+  before the silence, collected long ago along with everything around it —
+  and by a single horizon stamp that is beyond it. The puller now sends its
+  vector with the request, and the member serves it when nothing it lacks
+  has been collected, snapshot otherwise. On a large store this was the
+  real cost of a routine restart.
+
+Both fixes take full effect from the *second* roll onto this build: a
+database an earlier build collected from has no per-origin record of what
+was removed, so it is seeded with the old horizon and stays coarse below
+it until each member has written and been collected once more. A member
+running this build interoperates with one that does not, in either
+direction, at the previous behaviour.
 - **`count` no longer decodes every match into memory.** It took the length
   of a collected vector, which over a large collection — or a `__vectors`
   shadow, where every document is a vector with its text — cost the memory

@@ -38,6 +38,16 @@
 //! Applying it to another route is a `Limiter` in [`RateLimits`], a knob in the
 //! config, and a `check_at` call — either in the handler, when the key depends
 //! on the body, or in a `tower` layer when the key is just the caller.
+//!
+//! The second limiter, [`RateLimits::per_principal`], is the capacity control
+//! the paragraph above said login was not (ADR-099). It is keyed on the
+//! authenticated principal rather than the address, so it lives in the `Auth`
+//! extractor — the one place every authenticated surface passes through and
+//! the first place the key exists — and it uses [`Limiter::acquire`], which
+//! checks and spends in one step, because here every request counts rather
+//! than only the failures. It is off by default: a capacity number still wants
+//! a measurement behind it, and the operator is the one holding the
+//! measurement.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -193,6 +203,47 @@ impl Limiter {
             .insert(key.to_string(), Bucket { tokens: full - 1.0, updated_ms: now_ms });
     }
 
+    /// Check and, if allowed, spend one token, under one lock.
+    ///
+    /// For a limit where every request counts. `check` followed by `record`
+    /// would do the same in two steps, but between them a second request on
+    /// the same key could be admitted against the token this one is about to
+    /// spend — a whole round of concurrency past the burst rather than the one
+    /// request `check_at`'s note allows for. An absent key is admitted and
+    /// tracked from this call, because unlike a failed login there is nothing
+    /// later to record: admission *is* the event.
+    pub fn acquire(&self, key: &str) -> Decision {
+        self.acquire_at(now_ms(), key)
+    }
+
+    /// [`Limiter::acquire`] against a supplied clock.
+    pub fn acquire_at(&self, now_ms: u64, key: &str) -> Decision {
+        if self.limit.is_disabled() {
+            return Decision::Allowed;
+        }
+
+        // Scoped for the same reason as in `record_at`: eviction takes the
+        // same, non-reentrant lock.
+        {
+            let mut buckets = self.buckets.lock();
+            if let Some(bucket) = buckets.get_mut(key) {
+                self.refill(bucket, now_ms);
+                if bucket.tokens >= 1.0 {
+                    bucket.tokens -= 1.0;
+                    return Decision::Allowed;
+                }
+                return Decision::Limited { retry_after: self.wait_for_one_token(bucket.tokens) };
+            }
+        }
+
+        self.evict_if_full(now_ms);
+        let full = f64::from(self.limit.burst);
+        self.buckets
+            .lock()
+            .insert(key.to_string(), Bucket { tokens: full - 1.0, updated_ms: now_ms });
+        Decision::Allowed
+    }
+
     /// Number of keys currently tracked. Exposed for tests and for a future
     /// metric; the count is the thing that tells an operator an attack is on.
     pub fn tracked_keys(&self) -> usize {
@@ -277,6 +328,16 @@ pub struct RateLimits {
     /// another, which is an operator's call to make knowingly rather than a
     /// default to inherit.
     pub login_user: Limiter,
+    /// Every authenticated request, per principal (ADR-099).
+    ///
+    /// Off by default. Keyed on *who* rather than *where from*, so a principal
+    /// spread across many addresses still draws on one budget and two
+    /// principals behind one address do not share one. Checked in the `Auth`
+    /// extractor after the token is verified and the session confirmed, so a
+    /// refused token is a 401 and never a 429, and every surface that takes a
+    /// principal — REST, `/mcp`, the change-stream upgrade — is covered by
+    /// construction rather than by a layer each route has to remember.
+    pub per_principal: Limiter,
     /// Header naming the real client when the server sits behind a proxy.
     ///
     /// Empty means "use the socket peer address". This is opt-in because a
@@ -292,7 +353,12 @@ impl RateLimits {
     /// unit tests, and `--insecure-no-auth`, which has no login to protect.
     pub fn disabled() -> Self {
         let off = || Limiter::new(RateLimit::new(0, Duration::from_secs(1)), 1);
-        Self { login_ip: off(), login_user: off(), trusted_proxy_header: None }
+        Self {
+            login_ip: off(),
+            login_user: off(),
+            per_principal: off(),
+            trusted_proxy_header: None,
+        }
     }
 }
 
@@ -429,6 +495,45 @@ mod tests {
             Decision::Limited { retry_after } => assert!(retry_after >= Duration::from_secs(1)),
             Decision::Allowed => panic!("expected to be limited"),
         }
+    }
+
+    #[test]
+    fn acquire_spends_the_burst_and_then_refuses_with_a_retry_after() {
+        // The per-principal limit counts every request, so admission and
+        // spending are one step: three acquisitions on a burst of three are
+        // allowed, the fourth is refused, and the refusal says when a token
+        // returns rather than leaving the caller to guess.
+        let limiter = limiter(3, 60);
+        for attempt in 0..3 {
+            assert!(limiter.acquire_at(T0, "ada").is_allowed(), "attempt {attempt} is in budget");
+        }
+        match limiter.acquire_at(T0, "ada") {
+            Decision::Limited { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(20), "one token of three over 60s")
+            }
+            Decision::Allowed => panic!("the fourth acquisition is past a burst of three"),
+        }
+        assert_eq!(limiter.tracked_keys(), 1, "acquiring tracks the key it admitted");
+
+        // A third of the window later, one token is back — and is spent.
+        assert!(limiter.acquire_at(T0 + 20_000, "ada").is_allowed());
+        assert!(!limiter.acquire_at(T0 + 20_000, "ada").is_allowed());
+    }
+
+    #[test]
+    fn acquire_keeps_keys_apart_and_honours_the_cap() {
+        // Two principals do not share a budget, and a key space the caller
+        // controls — a principal name is whatever a token says — is still
+        // bounded, by the same eviction `record_at` uses.
+        let limiter = Limiter::new(RateLimit::new(1, Duration::from_secs(600)), 16);
+        assert!(limiter.acquire_at(T0, "ada").is_allowed());
+        assert!(!limiter.acquire_at(T0, "ada").is_allowed());
+        assert!(limiter.acquire_at(T0, "grace").is_allowed(), "another key has its own budget");
+
+        for i in 0..1_000 {
+            limiter.acquire_at(T0, &format!("principal-{i}"));
+        }
+        assert!(limiter.tracked_keys() <= 16, "found {} keys", limiter.tracked_keys());
     }
 
     #[test]

@@ -251,7 +251,8 @@ fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
                 }
             }
         }
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue => {}
+        // An expression proves nothing the partial-filter vocabulary can state.
+        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
     }
 }
 
@@ -302,8 +303,11 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
                 }
             }
         }
-        // A disjunction constrains nothing that must universally hold.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue => {}
+        // A disjunction constrains nothing that must universally hold, and an
+        // `$expr` names no field it puts bounds on: `{$gt: ["$a", "$b"]}` is
+        // a relation between two values that an index on either cannot see.
+        // It is always the scan's, or the residual re-check's, to answer.
+        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
     }
 }
 
@@ -711,6 +715,36 @@ mod tests {
         // matches.
         let idx = [index(0, vec![IndexField::ascending("a")])];
         assert!(plan(doc! { "$or": [ { "a": 1 }, { "b": 2 } ] }, &idx).is_none());
+    }
+
+    #[test]
+    fn an_expr_alone_selects_no_index() {
+        let idx = [
+            index(1, vec![IndexField::ascending("spent")]),
+            index(2, vec![IndexField::ascending("budget")]),
+        ];
+        assert!(plan(doc! { "$expr": { "$gt": ["$spent", "$budget"] } }, &idx).is_none());
+        // Even when the expression is a constant comparison on one indexed
+        // field: the planner does not read into expressions.
+        assert!(plan(doc! { "$expr": { "$gt": ["$spent", 100] } }, &idx).is_none());
+        // Nor does it pin a primary key.
+        assert!(pk(doc! { "$expr": { "$eq": ["$_id", 5] } }).is_none());
+    }
+
+    #[test]
+    fn a_conjunction_containing_an_expr_still_uses_the_indexable_conjunct() {
+        let idx = [index(1, vec![IndexField::ascending("account")])];
+        let p = plan(doc! { "account": "acme", "$expr": { "$gt": ["$spent", "$budget"] } }, &idx)
+            .expect("the equality on account should plan");
+        assert_eq!(p.index_id, 1);
+        assert_eq!(p.fields_used, 1);
+        // The same through an explicit `$and`.
+        let p = plan(
+            doc! { "$and": [ { "account": "acme" }, { "$expr": { "$gt": ["$spent", "$budget"] } } ] },
+            &idx,
+        )
+        .expect("the equality on account should plan");
+        assert_eq!(p.index_id, 1);
     }
 
     #[test]

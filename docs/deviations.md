@@ -17,6 +17,83 @@ Status meanings:
 
 ---
 
+## 🟡 `$expr` treats an evaluation error as no match, and is accepted under `$elemMatch`
+
+**Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106).**
+Two places where the filter's `$expr` is looser than MongoDB's, both by
+design and both small.
+
+**A type violation inside the expression is a document that does not match,
+not a failed request.** `{$expr: {$gt: [{$add: ["$name", 1]}, 0]}}` over a
+collection where one document's `name` is a string: MongoDB fails the whole
+query on reaching that document; here the document is skipped and the rest of
+the result is returned. `filter::matches` answers a `bool` for every caller —
+the scan, `$elemMatch`, the executor's residual re-check after an index probe
+— and the regex arm already resolves the same tension the same way: an
+unusable pattern matches nothing rather than taking down the request. Parse-
+time errors (an unknown operator, a wrong arity, `$$ROOT`) are still a `400`,
+so the leniency is confined to failures that depend on the data. A pipeline's
+`$addFields` with the same expression still refuses, as it did before; the
+difference is that a filter *selects* and a stage *derives*, and a
+derivation that cannot be computed has no honest value to write.
+
+**`$expr` is accepted inside a document-form `$elemMatch`.** MongoDB refuses
+`{lines: {$elemMatch: {$expr: …}}}` outright. Here the element is a document
+and `$elemMatch`'s body is an ordinary filter over it, so the expression reads
+the element's fields — `{$elemMatch: {$expr: {$gt: ["$qty", "$min"]}}}`
+compares two fields of one element, which MongoDB needs `$map` and
+`$anyElementTrue` for and this database does not have. A strict superset: a
+filter MongoDB accepts means the same thing here.
+
+**To close:** thread a `Result` through `filter::matches` and its callers so
+an evaluation error can surface as a `400`, at which point the first item
+becomes a choice rather than a constraint. The second is a feature, and would
+only be withdrawn if the operator set gained the pipeline-side spelling.
+
+---
+
+## 🟡 Update operators are not checked for conflicting paths, except `$setOnInsert`
+
+**Raised 2026-08-30, while adding `$setOnInsert` and the `$push` modifiers.**
+MongoDB rejects any update in which two operators write the same path, or one
+writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails with *"Updating
+the path 'a' would create a conflict at 'a'"*. Here the operators apply in the
+order written and the last one wins, which is what the parser has done since
+the update language existed and what its tests pin.
+
+**`$setOnInsert` is the exception, and it is checked.** An update that sets a
+path on insert and also `$set`s, `$inc`s, `$unset`s or `$rename`s onto it (or a
+prefix or extension of it) means one thing when it inserts and another when it
+matches, and which of the two ran would depend on operator order in a document
+whose key order is an accident of the client's JSON encoder. That case is
+refused at parse time with the same shape of message as MongoDB's. The check is
+confined to pairs involving `$setOnInsert` because extending it to every pair
+would turn an update that works today into a `400` on upgrade — a behaviour
+break, which a patch release does not carry.
+
+**Closing it** is a one-line widening of `reject_set_on_insert_conflicts` to
+all operator pairs, plus the tests that pin ordered application today, and it
+belongs in a `0.MINOR` bump that says so in the changelog. Until then an update
+that names one path twice is applied in order, not refused, and a client that
+relies on MongoDB refusing it will not be told.
+
+Two smaller choices from the same change, recorded here so they are visible
+rather than because either is a debt:
+
+- **`$push`'s `$sort` on elements that are not documents.** With a
+  `{field: direction}` sort, an element that is not a document sorts as though
+  every named field were missing — `null`, at the low end — rather than being
+  an error. MongoDB does the same. A whole-element sort (`1` / `-1`) uses the
+  canonical cross-type order, so mixed arrays sort by type group first.
+- **A document argument to `$push` with any `$`-prefixed key is modifiers.**
+  MongoDB decides by the *first* key. Deciding by *any* key means
+  `{"$each": [1], "x": 2}` and `{"x": 2, "$each": [1]}` are both refused as an
+  unrecognized clause, where MongoDB would push the second literally. Nothing
+  that starts with `$` is a value anyone meant to store, so the stricter
+  reading only ever turns a silent misfiling into an error.
+
+---
+
 ## 🟡 `modified` counts documents written, not documents changed
 
 **Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
@@ -2210,7 +2287,12 @@ long-running agent must re-authenticate.
 
 **Keyword search is term overlap, not BM25.** It exists to give hybrid search a
 lexical signal, and RRF only uses the *ordering*, so absolute scores need not
-be principled. A real BM25 would rank better on its own.
+be principled. A real BM25 would rank better on its own. On short documents
+the ordering it produces is close to random — nearly every candidate shares a
+word or two with the query — and equal-weight fusion then costs hybrid search
+recall against plain vector search. The per-request `weights` and
+`min_overlap` fields on `hybrid_search` are the mitigation ([ADR-094](decisions.md),
+[Vectors](vectors.md)); a BM25 half is deferred until those have been measured.
 
 **Chunking counts characters, not tokens.** A token count depends on the
 model's tokenizer, which the storage layer has no business knowing. The default
