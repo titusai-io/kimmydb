@@ -830,6 +830,34 @@ measurement.
 
 ---
 
+## What a release contains
+
+A tag `vX.Y.Z` produces, on the GitHub Release page, for each of the three
+targets (`aarch64-apple-darwin`, `aarch64-unknown-linux-musl`,
+`x86_64-unknown-linux-musl`):
+
+| File | |
+|---|---|
+| `kimmyd-<target>.tar.xz`, `kimmy-cli-<target>.tar.xz` | The server and the CLI, each with a `.sha256` beside it and listed in `sha256.sum` |
+| `kimmyd-<target>.cdx.json`, `kimmy-cli-<target>.cdx.json` | The CycloneDX software bill of materials for that binary — every crate compiled into it, with versions, licences and package hashes — each with its own `.sha256` |
+
+Plus `source.tar.gz`, the Homebrew formula `kimmy.rb`, and the multi-arch
+image at `ghcr.io/titusai-io/kimmydb` built from the same tag.
+
+Before an upgrade, the two checks worth the thirty seconds:
+
+```bash
+sha256sum -c kimmyd-x86_64-unknown-linux-musl.tar.xz.sha256
+grype sbom:kimmyd-x86_64-unknown-linux-musl.cdx.json    # or osv-scanner --sbom …
+```
+
+The bill is generated from `Cargo.lock` at the release commit, inside the
+release workflow, by `scripts/sbom.sh`; it describes the build, not the running
+node. How to read and consume it, and what it does not prove, is in
+[Security › Software bill of materials](security.md#software-bill-of-materials).
+
+---
+
 ## Troubleshooting
 
 | Symptom | Cause |

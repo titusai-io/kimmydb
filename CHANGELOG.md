@@ -237,6 +237,25 @@ whose defaults are meant to be left alone, and documentation corrections.
   memory. `/metrics` gains `kimmy_vector_index_cache_bytes`, the resident
   total by the same estimate (ADR-103).
 
+
+- **A CycloneDX SBOM per binary per target, on every release.** Beside each
+  `kimmyd-<target>.tar.xz` and `kimmy-cli-<target>.tar.xz` on the Release
+  page is a `<name>.cdx.json` (CycloneDX 1.5) listing every crate compiled
+  into that binary — versions, licences, package hashes and the dependency
+  graph — with a `.sha256` beside it. Feed it to whatever already scans your
+  dependencies (`grype sbom:…`, `osv-scanner --sbom …`, Dependency-Track)
+  without pulling the image or building from source. Generated from
+  `Cargo.lock` at the release commit by `scripts/sbom.sh` inside the release
+  workflow (ADR-110); [Security › Software bill of materials](docs/security.md#software-bill-of-materials)
+  says how to verify and consume one.
+- **A written threat model**, [`docs/threat-model.md`](docs/threat-model.md):
+  the assets, every trust boundary with its threats and the control in place
+  for each — naming the file the control lives in — what is explicitly not
+  defended against, and the operational assumptions the controls rest on.
+  Nothing in it is new behaviour; it is the security model written down in
+  one place and checked against the code. The FIPS position is stated there
+  too: `aws-lc-rs` has a validated mode, this build uses `ring`, and no FIPS
+  claim is made.
 ### Changed
 
 - **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518

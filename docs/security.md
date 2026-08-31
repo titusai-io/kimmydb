@@ -973,7 +973,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
 | **No encryption at rest** | Not planned | Use an encrypted volume |
 | **`/metrics` is unauthenticated on the main listener** | By design | Counts only, never names. Restrict it at the network or a proxy — see [The metrics endpoint](#the-metrics-endpoint) |
-| **No inter-node auth yet** | 📋 M4 | `cluster_secret` is validated at config time but nothing transports data yet |
+| **Inter-node authentication** | ✅ Built | A mutual HMAC challenge over `cluster_secret`, bound to the TLS session — see [TLS between nodes](#tls-between-nodes). Membership datagrams are authenticated the same way but are readable and replayable; the [threat model](threat-model.md) says what that means. *(This row said "nothing transports data yet" until it was checked against the code; it had been wrong since ADR-040.)* |
 | **Grants are not validated against reality** | By design | A grant may name a database that does not exist |
 
 ### How far authorization goes
@@ -1465,8 +1465,72 @@ graph TB
 
 ---
 
+## Software bill of materials
+
+What a release consists of, and how to check what is in it. The threats this
+answers — and the ones it does not — are in the
+[threat model](threat-model.md).
+
+**Every release carries a software bill of materials.** Beside each archive on
+the Release page is a CycloneDX 1.5 JSON document naming every crate compiled
+into that binary for that target: versions, SPDX licence expressions, the
+SHA-256 of each crate's registry package, and the dependency graph.
+
+```
+kimmyd-x86_64-unknown-linux-musl.tar.xz            the binary
+kimmyd-x86_64-unknown-linux-musl.tar.xz.sha256     its checksum
+kimmyd-x86_64-unknown-linux-musl.cdx.json          what is compiled into it
+kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256
+```
+
+One per binary per target rather than one for the workspace: the dependency
+graph is not the same on every platform, and a bill that listed the Windows
+crates against a Linux image would have a scanner reporting advisories for
+code that is not there. Six per release — `kimmyd` and `kimmy-cli` on each of
+the three targets. The container image ships the musl `kimmyd`, so its bill is
+the one for that target.
+
+The bills are generated from `Cargo.lock` at the release commit by
+`scripts/sbom.sh`, which runs `cargo cyclonedx` at a version pinned in the
+script, inside the release workflow (`[[dist.extra-artifacts]]` in
+`dist-workspace.toml`; [ADR-110](decisions.md)). A bill describes the
+*resolved build*, build-time dependencies included; it never describes a
+running node, which does not read its own.
+
+### Verifying and consuming one
+
+```bash
+# The download is what the release workflow uploaded
+sha256sum -c kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256
+
+# What it describes, and how much
+jq '.metadata.component | {name, version}' kimmyd-x86_64-unknown-linux-musl.cdx.json
+jq '.components | length'                    kimmyd-x86_64-unknown-linux-musl.cdx.json
+
+# Advisories, without pulling an image or building from source
+grype sbom:kimmyd-x86_64-unknown-linux-musl.cdx.json
+osv-scanner --sbom kimmyd-x86_64-unknown-linux-musl.cdx.json
+
+# Licences in the binary, by count
+jq -r '.components[].licenses[]?.expression' kimmyd-x86_64-unknown-linux-musl.cdx.json \
+  | sort | uniq -c | sort -rn
+```
+
+Any CycloneDX consumer reads it — Dependency-Track, Trivy (`trivy sbom`),
+OSV-Scanner, grype. Each component's `purl` names the crate on crates.io,
+which is what advisory matching keys on; `metadata.component.version` is the
+release.
+
+**What the bill does not tell you** is whether the binary beside it was built
+from that lock file. The checksum proves the download is the file the release
+workflow uploaded, not how the workflow built it; that is what a build
+attestation is for, and it is a separate control.
+
+---
+
 ## Next
 
+- [Threat model](threat-model.md) — the same controls arranged by boundary and adversary, with what is out of scope and what the deployment must provide
 - [Federation](federation.md) — provider-by-provider recipes for the machinery above
 - [HTTP API](http-api.md) — the endpoints these rules protect
 - [Operations](operations.md) — configuration and deployment
