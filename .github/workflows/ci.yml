@@ -46,7 +46,7 @@ jobs:
     name: fmt, clippy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -86,7 +86,7 @@ jobs:
     name: test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -143,7 +143,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -168,7 +168,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -202,7 +202,7 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -217,7 +217,7 @@ jobs:
           cargo build --release --bin kimmyd
           cargo build --release --example conformance -p kimmy-client
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: kimmyd
           path: |
@@ -231,19 +231,19 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The Python tests drive a real `kimmyd`, the same way the Rust client's
       # do. A mocked server would only assert what the client already
       # believes, which is the half that was never in doubt. The binary lands
       # where the tests already look; artifacts do not keep the execute bit.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: kimmyd
           path: target/release
       - run: chmod +x target/release/kimmyd
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
       - name: Test
         working-directory: clients/python
@@ -254,17 +254,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # Same reasoning as the Python job: the tests drive a real `kimmyd`,
       # because a mocked server asserts only what the client already believes.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: kimmyd
           path: target/release
       - run: chmod +x target/release/kimmyd
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: clients/go/go.sum
@@ -286,17 +286,17 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: kimmyd
           path: target/release
       - run: chmod +x target/release/kimmyd target/release/examples/conformance
 
-      - uses: astral-sh/setup-uv@v5
+      - uses: astral-sh/setup-uv@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: clients/go/go.sum
@@ -323,7 +323,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: build
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       # The Dockerfile's `prebuilt` stage takes this binary instead of
       # compiling inside BuildKit, which was the single slowest step in CI:
@@ -332,16 +332,16 @@ jobs:
       # uses the same stage, fed with the binary from the release archive for
       # each architecture (publish-ghcr.yml), so this job also exercises the
       # path a release takes.
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: kimmyd
           path: .prebuilt
       - run: chmod +x .prebuilt/kimmyd
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: false
