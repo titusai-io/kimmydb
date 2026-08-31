@@ -27,7 +27,7 @@ futures.workspace = true
 # WebSocket framing only. TLS is supplied by this crate rather than selected by
 # a feature, so the connector is the ring-backed one the workspace already
 # vets — a feature-chosen provider is how `aws-lc-rs` gets in (ADR-050).
-tokio-tungstenite = { version = "0.29", default-features = false, features = ["handshake"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-rustls.workspace = true
 webpki-roots = "1"
 
