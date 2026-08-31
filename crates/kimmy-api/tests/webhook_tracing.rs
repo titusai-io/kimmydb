@@ -28,7 +28,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tracing_subscriber::prelude::*;
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const WEBHOOK_SECRET: &str = "test-webhook-secret";
 
 /// What a delivery looked like from the receiving end.

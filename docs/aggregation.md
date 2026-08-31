@@ -19,7 +19,7 @@ costs: **put `$match` first**, so every later stage sees less.
 
 | Stage | Notes |
 |---|---|
-| `$match` | The same filter language as `find` — all 17 operators |
+| `$match` | The same filter language as `find` — all 18 operators, `$expr` included |
 | `$project` | The same projection language as `find`, **plus computed fields** |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |

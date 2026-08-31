@@ -158,6 +158,13 @@ impl TelemetryGuard {
             "Requests refused by a rate limit.",
             rate_limited
         );
+        observe!(
+            u64_observable_counter,
+            "kimmy.rate_limited.principal",
+            "{request}",
+            "Authenticated requests refused by the per-principal rate limit.",
+            rate_limited_principal
+        );
         observe!(u64_observable_counter, "kimmy.backups", "{backup}", "Backups served.", backups);
         observe!(
             u64_observable_counter,
