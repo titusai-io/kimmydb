@@ -32,6 +32,24 @@ fn main() -> Result<()> {
             println!("{}", toml::to_string_pretty(&config)?);
             eprintln!("configuration is valid");
 
+            // Said in words as well as printed as TOML above, because this is
+            // the setting whose effect — a 403 or 404 from the login route —
+            // is met somewhere other than where it was configured. Only when
+            // it is not the default: a default printed every time is a
+            // default nobody reads.
+            match config.auth.local.login_mode()? {
+                kimmy_api::LocalLogin::Always => {}
+                kimmy_api::LocalLogin::LoopbackOnly => eprintln!(
+                    "local login is restricted to loopback connections: `kimmy login <user>` \
+                     works from this host only, judged by the TCP peer (a reverse proxy on \
+                     this host will look like loopback). Tokens already issued keep working."
+                ),
+                kimmy_api::LocalLogin::Disabled => eprintln!(
+                    "local login is disabled: /v1/auth/login answers 404 and only the identity \
+                     provider can authenticate a caller. Tokens already issued keep working."
+                ),
+            }
+
             // The one check that needs the network, and the only place it is
             // ever fatal. The server retries instead of refusing, because a
             // briefly unreachable identity provider must not stop a database

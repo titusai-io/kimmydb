@@ -94,6 +94,54 @@ impl From<Method> for reqwest::Method {
     }
 }
 pub use page::{Pages, Query};
+
+/// Options for [`Client::update_with`].
+#[derive(Clone, Debug, Default)]
+pub struct UpdateOptions {
+    multi: bool,
+    if_stamp: Option<String>,
+    array_filters: Vec<Value>,
+}
+
+impl UpdateOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Update every match rather than only the first.
+    pub fn multi(mut self, multi: bool) -> Self {
+        self.multi = multi;
+        self
+    }
+
+    /// Write only if the matched document is at this stamp; see
+    /// [`Client::update_if`]. Cannot be combined with `multi`.
+    pub fn if_stamp(mut self, stamp: impl Into<String>) -> Self {
+        self.if_stamp = Some(stamp.into());
+        self
+    }
+
+    /// Filters for the `$[<identifier>]` segments in the update's paths, one
+    /// document per identifier: `[{"line.sku": "b"}]` selects the elements
+    /// `items.$[line].shipped` writes to. Every identifier a path uses needs
+    /// one, and every filter must be used; `$[]` addresses every element and
+    /// needs none.
+    pub fn array_filters(mut self, filters: Vec<Value>) -> Self {
+        self.array_filters = filters;
+        self
+    }
+
+    fn body(&self, filter: &Value, update: &Value) -> Value {
+        let mut body = json!({ "filter": filter, "update": update, "multi": self.multi });
+        if let Some(stamp) = &self.if_stamp {
+            body["if_stamp"] = json!(stamp);
+        }
+        if !self.array_filters.is_empty() {
+            body["arrayFilters"] = json!(self.array_filters);
+        }
+        body
+    }
+}
 pub use watch::{ChangeEvent, ChangeStream, WatchOptions};
 
 /// How long before a token expires the client renews it.
@@ -373,6 +421,28 @@ impl Client {
         .await
     }
 
+    /// [`Client::update`] with every option the route takes.
+    ///
+    /// `update` and `update_if` cover the two common shapes; this is for a
+    /// request that needs [`UpdateOptions::array_filters`], or more than one
+    /// option at once. Not retried, for the reason `update` is not.
+    pub async fn update_with(
+        &self,
+        db: &str,
+        collection: &str,
+        filter: &Value,
+        update: &Value,
+        options: &UpdateOptions,
+    ) -> Result<Value> {
+        self.send(
+            reqwest::Method::POST,
+            &format!("/v1/db/{db}/coll/{collection}/update"),
+            Some(options.body(filter, update)),
+            Safety::Unsafe,
+        )
+        .await
+    }
+
     /// [`Client::update`] for one document, conditional on its version.
     ///
     /// `if_stamp` is a stamp from an earlier write's response, a `find` with
@@ -440,10 +510,14 @@ impl Client {
 
     /// Search by meaning and by keyword at once, fused by rank.
     ///
-    /// Same body as [`Self::vector_search`]. The server runs a dense and a
-    /// lexical search and combines them with Reciprocal Rank Fusion, so the
-    /// scores are fusion scores and are not comparable with the similarity
-    /// scores `vector_search` returns.
+    /// Same body as [`Self::vector_search`], plus two optional fields that tune
+    /// the fusion: `weights` (`{ "dense": w, "lexical": w }`) scales each
+    /// half's rank, and `min_overlap` is how many distinct query terms a chunk
+    /// must share to count as keyword evidence. Left out, both are the plain
+    /// reciprocal rank fusion the route has always done. The server runs a
+    /// dense and a lexical search and combines them with Reciprocal Rank
+    /// Fusion, so the scores are fusion scores and are not comparable with the
+    /// similarity scores `vector_search` returns.
     pub async fn hybrid_search(&self, db: &str, collection: &str, body: &Value) -> Result<Value> {
         self.send(
             reqwest::Method::POST,

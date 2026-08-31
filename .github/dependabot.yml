@@ -1,0 +1,80 @@
+# Automated dependency updates (ADR-108). Four ecosystems, each weekly on the
+# same morning, each grouped so that a week's routine bumps arrive as one
+# pull request per ecosystem rather than one per crate — every PR runs CI,
+# and CI minutes are the budget this file is written against.
+#
+# Grouping is by semver class, not by name: minor and patch updates share a
+# PR because they are the ones that should be safe to take together, and a
+# major update comes on its own because it is the one that needs reading.
+# The `deny` workflow runs on every one of these, since each touches a
+# lockfile or a manifest; the full CI run is what decides whether it merges.
+#
+# `cooldown` holds a new release back for seven days before it is proposed.
+# A compromised or broken release is usually yanked within days of
+# publication; waiting a week means the update that lands here is the one
+# that survived its first week in the wild. The cost is a week's latency on
+# routine updates, which nothing here is waiting on.
+version: 2
+
+updates:
+  # The Rust workspace: one lockfile at the root covers every crate.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 5
+
+  # The actions the workflows use. Where an action is pinned to a commit with
+  # a `# vX.Y.Z` comment beside it, Dependabot moves the commit and the
+  # comment together.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ["*"]
+    open-pull-requests-limit: 3
+
+  # The Go client, its own module under clients/go.
+  - package-ecosystem: gomod
+    directory: /clients/go
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      go-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 3
+
+  # The Python client, managed by uv: pyproject.toml and uv.lock.
+  - package-ecosystem: uv
+    directory: /clients/python
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    cooldown:
+      default-days: 7
+    groups:
+      python-minor-and-patch:
+        update-types: [minor, patch]
+    open-pull-requests-limit: 3

@@ -82,6 +82,50 @@ func TestDocumentsRoundTrip(t *testing.T) {
 	}
 }
 
+// UpdateWith is the one wrapper with a body the others do not send, so the
+// request must be seen to carry it: an arrayFilters the client dropped would
+// surface as a 400 for an identifier without a filter.
+func TestUpdateWithCarriesArrayFilters(t *testing.T) {
+	_, db := connected(t)
+	seed(t, db, 0)
+	ctx := testContext(t)
+
+	items := []any{
+		map[string]any{"sku": "a", "shipped": false},
+		map[string]any{"sku": "b", "shipped": false},
+	}
+	if _, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": 1, "items": items}); err != nil {
+		t.Fatalf("insert: %v", err)
+	}
+
+	filter := map[string]any{"_id": 1}
+	update := map[string]any{"$set": map[string]any{"items.$[line].shipped": true}}
+	updated, err := db.UpdateWith(ctx, "shop", "orders", filter, update, kimmydb.UpdateOptions{
+		ArrayFilters: []map[string]any{{"line.sku": "b"}},
+	})
+	if err != nil {
+		t.Fatalf("update with array filters: %v", err)
+	}
+	if updated["modified"] != float64(1) {
+		t.Fatalf("expected one document modified, got %v", updated)
+	}
+
+	document, err := db.Get(ctx, "shop", "orders", 1)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	lines := document["items"].([]any)
+	if lines[0].(map[string]any)["shipped"] != false || lines[1].(map[string]any)["shipped"] != true {
+		t.Fatalf("only the selected line should be shipped, got %v", document)
+	}
+
+	_, err = db.UpdateWith(ctx, "shop", "orders", filter, update, kimmydb.UpdateOptions{})
+	var apiErr *kimmydb.APIError
+	if !errors.As(err, &apiErr) || apiErr.Code != "bad_request" {
+		t.Fatalf("an identifier without a filter must be refused as bad_request, got %v", err)
+	}
+}
+
 func TestPagingWalksTheWholeCollection(t *testing.T) {
 	// The reason the client exists rather than a Find call: an unlimited find
 	// returns 100 documents and says nothing about the rest.

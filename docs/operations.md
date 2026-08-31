@@ -52,17 +52,26 @@ fails fast on a bad volume mount.
 | `server.rate_limit.login_per_user` | — | `0` | Failed logins per username across all addresses. Off by default — it is a real defence and a real lockout, see [Security](security.md#login-rate-limiting) |
 | `server.rate_limit.login_per_user_window_secs` | — | `300` | |
 | `server.rate_limit.trusted_proxy_header` | — | — | Unset means use the socket peer. **Only set it if a proxy you control rewrites the header** |
-| `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiter's own memory; the key space is attacker-controlled |
+| `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiters' own memory; the key space is attacker-controlled |
+| `server.rate_limit.per_principal` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL` | `0` | Requests per authenticated principal per window, on every route that takes a token. `0` disables — the default. See [Security](security.md#limits-on-authenticated-requests) |
+| `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
+| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body or for an embedding provider; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams and `/mcp` are exempt |
+| `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
+| `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
-| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
-| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
-| `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
+| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth`. Off loopback, an example's value (`changeme`, `hunter2`, …) is refused |
+| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥32 bytes (was 16 up to 0.16.x), and **identical on every node** of a cluster |
+| `auth.jwt_previous_secret` | `KIMMY_JWT_PREVIOUS_SECRET` | — | The secret being retired, accepted for verification only while a rotation is in progress; tokens are never signed with it. Same length floor and the same placeholder refusal; must differ from `jwt_secret`. Remove it one `token_ttl_secs` after the roll — see [Rotating the signing secret](security.md#rotating-the-signing-secret) |
+| `auth.token_ttl_secs` | — | `3600` | Also the revocation delay, and how long a previous secret has to stay configured after a rotation |
 | `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only. Refused together with `auth.oidc` |
+| `auth.local.login` | `KIMMY_LOCAL_LOGIN` | `always` | `always`, `loopback_only` or `disabled`. Where `/v1/auth/login` and `/v1/auth/refresh` answer; `loopback_only` judges the **TCP peer**, never a forwarded header, so a same-host proxy makes everyone look local. Governs minting only — issued tokens keep verifying. `disabled` needs `auth.oidc` — see [Security](security.md#local-login-is-a-mode) |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | — | Federate with one external OIDC provider. `https` only — the signing keys come down this URL. Setting it obliges `audience` |
 | `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
 | `auth.oidc.roles_claim` | `KIMMY_OIDC_ROLES_CLAIM` | `roles` | `groups` for Entra ID. Getting it wrong is quiet — every federated caller arrives with no grants |
+| `auth.oidc.subject_claim` | `KIMMY_OIDC_SUBJECT_CLAIM` | — | A claim (`preferred_username`, `email`, `upn`) carried as a federated principal's **display** name in `whoami` and the audit record. Display only: `sub` stays the identity for everything that decides anything. Unset keeps `sub` — see [Federation](federation.md#a-readable-subject-subject_claim) |
 | `auth.oidc.refresh_interval_secs` | `KIMMY_OIDC_REFRESH_INTERVAL_SECS` | `300` | How often the provider's JWKS is re-fetched. An unknown `kid` triggers one rate-limited refetch besides |
+| `auth.oidc.max_token_lifetime_secs` | `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` | `900` | The longest a federated token may be valid for, by its own `exp − iat`. It bounds how long a revocation at the provider goes unhonoured here (ADR-073); a token over it is a 401 whose challenge names the limit, and one with no `iat` is refused too. 1–86400 — see [Security](security.md#the-lifetime-limit-and-why-it-is-900-seconds) |
 | `auth.oidc.role_mappings` | — | `[]` | File-only. A claim value and the grants it is worth. **`admin` is refused** — see [Security](security.md) |
 | `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
@@ -71,11 +80,33 @@ fails fast on a bad volume mount.
 | `webhooks.allowed_hosts` | — | `[]` | Hosts a webhook may target beyond the public internet. Empty means public addresses only |
 | `webhooks.max_concurrent_deliveries` | — | `8` | Deliveries in flight at once. A bound, and what stops one dead endpoint delaying the others |
 | `webhooks.max_payload_bytes` | — | `1048576` | Largest request body. Batches are trimmed; a single oversized document is sent without `fullDocument` |
+| `vector.worker_enabled` | `KIMMY_DISABLE_VECTOR_WORKER` (inverse) | `true` | Run the embedding worker on this node. Off makes the node a consumer of embeddings by replication rather than a producer of provider calls; search is unaffected |
+| `vector.batch.max_chunks` | — | `32` | The most chunks one embedding provider call carries ([ADR-095](decisions.md)). Below every hosted provider's per-request input cap |
+| `vector.batch.max_tokens` | — | `32768` | The most *estimated* tokens one call carries, by the estimate a collection's `chunk.max_tokens` uses (one token per two bytes). 32 default-sized chunks, about 64 KiB of text. A single document over this goes alone |
+| `vector.batch.max_wait_ms` | — | `100` | How long a partial batch waits for more documents once the stream is idle. A backlog fills batches without waiting; a quiet collection's document is delayed by at most this. `0` sends whatever has queued; refused above `10000` |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
 
 [`kimmy.example.toml`](../kimmy.example.toml) documents every setting inline.
+
+### Limits on a request
+
+Three of the settings above bound what one authenticated caller can cost the
+node ([ADR-099](decisions.md)), and each defaults to what the server already
+did. `request_timeout_secs` is a deadline on *waiting*: a request whose body
+is still trickling in, or whose embedding-provider call has stalled, is
+abandoned with `503 timeout` at 30 s. It does not cut short storage work — a
+scan, a bulk commit or an index backfill runs to completion and is answered
+normally — so raising it is about slow clients and slow providers, never about
+slow queries. `max_body_bytes` is the ceiling axum always applied, now yours to
+move; `/mcp` reads its bodies under rmcp's own 4 MiB limit. `per_principal` is
+off until you set it; when you do, `kimmy_rate_limited_principal_total` is the
+series that tells you whether the number is right, and `3000` over `60`
+seconds (fifty a second, sustained, per principal) is a defensible place to
+start. Two principals behind one address are limited separately; one principal
+across many addresses is limited once. Details and the reasoning are in
+[Security](security.md#limits-on-authenticated-requests).
 
 ### Refused at startup
 
@@ -86,8 +117,12 @@ runtime confusion:
 |---|---|
 | `insecure_no_auth` + non-loopback bind | Would expose an unauthenticated database to the network |
 | No root password, no `insecure_no_auth` | Nothing could authenticate |
+| `auth.local.login = "disabled"` with no `auth.oidc` | The same: no password door and no identity provider leaves nobody who can log in |
+| An unknown `auth.local.login`, or an empty `auth.oidc.subject_claim` | A typo in either would silently mean "the default", which for the first is the most permissive mode |
 | Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster — and in a cluster the *same* value everywhere, or a token issued by one node is rejected by the next |
-| A `jwt_secret` shorter than 16 bytes | The whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would |
+| A `jwt_secret` shorter than 32 bytes | The HS256 key floor RFC 7518 §3.2 sets, and the whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would. Was 16 up to 0.16.x (ADR-093) |
+| A `jwt_previous_secret` shorter than 32 bytes, or equal to `jwt_secret` | It still verifies tokens while it is set, so it is held to the same floor; and the same value twice is not a rotation, it is a configuration edited halfway |
+| A placeholder secret on a non-loopback bind | `root_password`, `jwt_secret`, `jwt_previous_secret` or `cluster_secret` equal to a value this repository's own examples use — `changeme`, `change-me`, `hunter2`, the compose file's former defaults, `password`, `secret`, and the rest of `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`. A value every reader of the repository holds is not a secret. Loopback binds accept them, so the examples stay runnable; the error names the setting, not the value (ADR-093) |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
 | `oplog_retention_secs = 0` | Change streams could never resume |
@@ -98,9 +133,12 @@ runtime confusion:
 | An unknown `audit.mode` | A typo would produce a server recording nothing, which looks exactly like a server nobody has attacked |
 | A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |
 | `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
+| `request_timeout_secs = 0` | A deadline of zero would abandon every request that has to wait for its own body |
+| `max_body_bytes = 0` | A ceiling of zero refuses every request that carries a body, login included |
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
+| `auth.oidc.max_token_lifetime_secs` outside 1–86400 | Zero would refuse every federated token; more than a day is the setting being used to switch itself off, which is a decision to make at the provider rather than by adding a zero here (ADR-096) |
 
 Boolean flags are one-way: passing `--insecure-no-auth` turns it on, but
 omitting it does **not** turn off what the config file asked for.
@@ -110,8 +148,10 @@ omitting it does **not** turn off what the config file asked for.
 ## Running
 
 ```bash
-# From source
-KIMMY_ROOT_PASSWORD=change-me KIMMY_JWT_SECRET=$(openssl rand -base64 32) \
+# From source. The signing key is 32 bytes minimum; an example's value for
+# either secret is refused off loopback, so pick your own.
+export KIMMY_ROOT_PASSWORD=$(openssl rand -base64 18)
+KIMMY_JWT_SECRET=$(openssl rand -base64 32) \
   cargo run --bin kimmyd -- --bind 127.0.0.1:7878 --data-dir ./data
 
 # Local development, no auth (loopback only)
@@ -123,8 +163,8 @@ cargo run --bin kimmyd -- --insecure-no-auth --bind 127.0.0.1:7878 --data-dir ./
 ```bash
 docker build -t kimmydb .
 docker run -d --name kimmy -p 7878:7878 \
-  -e KIMMY_ROOT_PASSWORD=change-me \
-  -e KIMMY_JWT_SECRET=a-long-random-secret \
+  -e KIMMY_ROOT_PASSWORD \
+  -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
   -v kimmy-data:/var/lib/kimmy \
   kimmydb
 ```
@@ -341,15 +381,17 @@ port.
 | `kimmy_up` | Always 1; presence means the node is serving |
 | `kimmy_uptime_seconds` | Since this process started |
 | `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
-| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count |
+| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count. One call carries many documents ([ADR-095](decisions.md)), so `kimmy_embed_chunks_total` over this is the batch size the worker is achieving; there is no separate batch-size series |
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
+| `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
 | `kimmy_requests_total` | HTTP requests handled |
 | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
 | `kimmy_authz_denied_total` | Refused by RBAC |
 | `kimmy_auth_failures_total` | Rejected credentials and tokens |
-| `kimmy_rate_limited_total` | Refused by a rate limit |
+| `kimmy_rate_limited_total` | Refused by a rate limit — the login limiters and the per-principal one together |
+| `kimmy_rate_limited_principal_total` | The part of that total refused by `server.rate_limit.per_principal`; the difference is the login limiters. Zero until the limit is set. A legitimate client appearing here is the measurement the number was waiting for ([ADR-099](decisions.md)) |
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
 | `kimmy_commits` | Durable write transactions committed. redb has a single writer and every commit is an fsync, so this over `kimmy_requests_total` is what a write *costs* — a client-visible write that takes two commits costs twice one that takes one, and no latency figure tells you which is happening. This is the number that explained the daemon-versus-engine write gap; see [Benchmarks](benchmarks.md) |
 | `kimmy_backups_total` | Backups served |
@@ -423,7 +465,7 @@ the numbers are in [Benchmarks](benchmarks.md).
 | `find`, `insert`, `update`, `aggregate`, … | One per executor operation, so REST and MCP produce the same spans — they call the same functions |
 | `storage.commit` | The fsync. redb has a single writer and every commit is one, so this is what a write *cost* |
 | `cluster.sync` | One per peer per anti-entropy round, with `applied`, `ddl` and `lag_ms` |
-| `vector.process`, `vector.embed` | The embedding worker, with the chunk count — a remote provider is a round trip per chunk |
+| `vector.process`, `vector.embed` | The embedding worker: one `vector.process` per oplog entry, one `vector.embed` per provider call with its `documents` and `chunks` — a remote provider is a round trip per batch, and this span is that round trip |
 | `webhook.deliver` | One per batch, and it **injects `traceparent`** so a receiver can continue the trace |
 | `oidc.jwks_refresh` | The signing-key fetch |
 
@@ -495,9 +537,14 @@ separately from the application log:
 KIMMY_LOG_FORMAT=json KIMMY_LOG_LEVEL='warn,kimmy::audit=info' kimmyd run
 ```
 
-Each record carries `user`, `action`, `db`, `collection`, `decision`, and
-`unauthenticated` — the last distinguishing "root did this" from "the server was
-started with authentication disabled".
+Each record carries `user`, `action`, `db`, `collection`, `decision`,
+`roles`, `federated` and `unauthenticated` — the last two distinguishing "root
+did this" from "somebody the identity provider called root did this" from
+"the server was started with authentication disabled". A federated record
+also carries `display` when `auth.oidc.subject_claim` resolved to something
+other than the subject — a readable name for the person reading the log,
+never the identity anything was decided on
+([Security](security.md#a-readable-name-that-is-never-an-identity)).
 
 Emitted from the single authorization point rather than from each route, so a new
 route is audited by virtue of being authorized at all ([ADR-042](decisions.md)).
@@ -620,14 +667,30 @@ partially read.
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
+| Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
-| Resident memory | Roughly `storage.cache_bytes` plus indexes (HNSW graphs are held in memory per vector collection) plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, and freed heap is rarely returned to the OS. A restart is the reset |
+| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and freed heap is rarely returned to the OS. A restart is the reset |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly
 860 MB/day. Retention caps that at one window's worth, so provision for the data
 plus roughly `oplog_retention_secs` of log.
+
+**Vector collections and the graph budget.** A collection that is searched
+keeps its HNSW graph resident, at about `dim × 4 + 5,000` bytes per chunk —
+6.5 KB at 384 dimensions, 11 KB at 1,536; the 5,000 is the graph's own
+bookkeeping and does not shrink with narrower vectors. **The chunks of every
+collection that is searched routinely, times that per-chunk cost, must fit
+`vector.index_cache.max_bytes`**, or searches on evicted collections pay a
+rebuild: 4 s at 4,000 chunks of 384 dimensions, O(n log n) beyond, during
+which that collection's searches wait (other collections' do not). A rebuild
+also needs roughly one extra copy of the collection's vectors while it runs,
+on top of the graph. With snapshots on — the default for `kimmyd` — an
+evicted graph comes back by reloading its file rather than rebuilding, which
+is cheaper but still a full read. `kimmy_vector_index_cache_bytes` sitting at
+the bound while vector searches are slow is the signature of churn; raise the
+bound or drop graphs that are not earning their place.
 
 **A collection pass temporarily grows the file before it shrinks it.** redb is
 copy-on-write, so the transaction that removes records allocates new pages
@@ -645,6 +708,61 @@ during collection, not before it. **Keep free space at least equal to the
 volume a single pass will collect.** A first pass on a database that has never
 been collected is the largest one, which is exactly when headroom is tightest;
 a shorter `gc_interval_secs` keeps each pass small.
+
+---
+
+## Verifying a release
+
+Every release attaches a `.sha256` beside each archive, written by the same
+build; the container image is pushed by digest and then tagged. Two levels of
+checking are available, and the second is the one worth knowing about.
+
+**The checksum** proves that the file you have is the file that was attached
+to the release, and no more than that: it sits beside the archive, and whoever
+could replace one could replace both.
+
+```bash
+V=0.16.4; A=kimmy-aarch64-apple-darwin.tar.xz
+curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A"
+curl -LO "https://github.com/titusai-io/kimmydb/releases/download/v$V/$A.sha256"
+shasum -a 256 -c "$A.sha256"
+```
+
+**The provenance attestation** proves who built it and from what
+([ADR-108](decisions.md)): a [SLSA](https://slsa.dev) provenance statement,
+signed keylessly through Sigstore under the release workflow run's own
+identity, recorded by GitHub against the artifact's digest. Verifying it
+establishes that the archive or image was built by this repository's release
+workflow, at a named commit and tag, on GitHub's runners — not on a
+maintainer's machine, not by a fork, and not by anyone holding a copied
+signing key, because there is none to copy. `gh` performs the check:
+
+```bash
+# A release archive
+gh attestation verify kimmy-aarch64-apple-darwin.tar.xz -R titusai-io/kimmydb
+
+# The container image, by tag or by digest
+gh attestation verify oci://ghcr.io/titusai-io/kimmydb:0.16.4 -R titusai-io/kimmydb
+```
+
+A successful verification prints the workflow that produced the artifact and
+the commit it ran at: expect `.github/workflows/release.yml` and the tag you
+asked for. `-R` scopes the check to attestations this repository produced;
+without it, a valid attestation from any repository would satisfy the
+command, which is not the question being asked.
+
+> **From which release.** GitHub generates attestations for a private
+> repository only on an Enterprise Cloud plan. No release made while this
+> repository was private carries one, and `gh attestation verify` on such a
+> release reports that no attestations were found — an honest answer, not a
+> failed check. The image's attestation step is in place and conditional on
+> the repository being public; the archives' is switched on in
+> `dist-workspace.toml` at the same time. Every release from then on carries
+> both.
+
+Homebrew has its own check built in: the formula pins each archive's SHA-256,
+so `brew install titusai-io/tap/kimmy` refuses a download that does not match
+what the release workflow published.
 
 ---
 
@@ -709,6 +827,34 @@ index was incomplete.
 present, by its own embedding. If exact search finds it and vector search does
 not, the index was one of the bad ones. `docs/deviations.md` has the full
 measurement.
+
+---
+
+## What a release contains
+
+A tag `vX.Y.Z` produces, on the GitHub Release page, for each of the three
+targets (`aarch64-apple-darwin`, `aarch64-unknown-linux-musl`,
+`x86_64-unknown-linux-musl`):
+
+| File | |
+|---|---|
+| `kimmyd-<target>.tar.xz`, `kimmy-cli-<target>.tar.xz` | The server and the CLI, each with a `.sha256` beside it and listed in `sha256.sum` |
+| `kimmyd-<target>.cdx.json`, `kimmy-cli-<target>.cdx.json` | The CycloneDX software bill of materials for that binary — every crate compiled into it, with versions, licences and package hashes — each with its own `.sha256` |
+
+Plus `source.tar.gz`, the Homebrew formula `kimmy.rb`, and the multi-arch
+image at `ghcr.io/titusai-io/kimmydb` built from the same tag.
+
+Before an upgrade, the two checks worth the thirty seconds:
+
+```bash
+sha256sum -c kimmyd-x86_64-unknown-linux-musl.tar.xz.sha256
+grype sbom:kimmyd-x86_64-unknown-linux-musl.cdx.json    # or osv-scanner --sbom …
+```
+
+The bill is generated from `Cargo.lock` at the release commit, inside the
+release workflow, by `scripts/sbom.sh`; it describes the build, not the running
+node. How to read and consume it, and what it does not prove, is in
+[Security › Software bill of materials](security.md#software-bill-of-materials).
 
 ---
 

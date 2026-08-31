@@ -45,6 +45,40 @@ fn signing_key(auth: &AuthConfig) -> Result<String> {
     }
 }
 
+/// Say, once at startup and once when it is due, that a previous signing
+/// secret is configured and when it can go.
+///
+/// The window (ADR-101) is meant to close: a previous secret verifies tokens
+/// for as long as it is configured, and the moment it stops being useful is one
+/// token lifetime after the rotation — every token it signed has expired by
+/// then. This node cannot know when the rotation happened, only when *it*
+/// started with the previous secret in place, so it counts from its own start.
+/// That is exact for the common case (the rotation is the restart that brought
+/// the new pair in) and conservative otherwise: a node restarted later in the
+/// window warns later, never earlier. Nothing is persisted across restarts; the
+/// reminder exists to be noticed, not to be relied on.
+///
+/// Two lines, deliberately: an `info` naming the deadline, so the operator who
+/// just performed the rotation has a time to write down, and one `warn` when it
+/// passes. Not repeated — a log that nags on a timer is a log that gets
+/// filtered, and the summary line already says `jwt_previous_secret=set` on
+/// every start.
+fn remind_to_remove_previous_secret(ttl_secs: u64) {
+    info!(
+        remove_after_secs = ttl_secs,
+        "a previous JWT signing secret is configured; every token it signed will have expired \
+         one token lifetime from now, so remove KIMMY_JWT_PREVIOUS_SECRET after that"
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(ttl_secs)).await;
+        warn!(
+            configured_for_secs = ttl_secs,
+            "the previous JWT signing secret has outlived every token it signed; it still \
+             verifies tokens while it is set, so remove KIMMY_JWT_PREVIOUS_SECRET and restart"
+        );
+    });
+}
+
 /// How often the certificate files are checked for a change.
 ///
 /// A constant rather than configuration: a renewal lands weeks before expiry,
@@ -91,8 +125,18 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     let secret = signing_key(&config.auth)?;
-    let tokens = TokenIssuer::new(&secret, config.auth.token_ttl_secs)
+    // The previous secret only means anything while tokens are verified; with
+    // auth off nothing is, and validation did not look at it either.
+    let previous = if config.auth.insecure_no_auth {
+        None
+    } else {
+        config.auth.jwt_previous_secret.as_deref()
+    };
+    let tokens = TokenIssuer::with_previous(&secret, previous, config.auth.token_ttl_secs)
         .context("configuring the token issuer")?;
+    if tokens.has_previous_secret() {
+        remind_to_remove_previous_secret(config.auth.token_ttl_secs);
+    }
 
     // With auth off there is no login to brute-force and every request is a
     // superuser anyway, so a limiter would only be an obstacle to the local
@@ -128,6 +172,31 @@ pub async fn run(config: Config) -> Result<()> {
     )
     .context("building the API state")?;
 
+    // Where a local token may be minted from (ADR-100). Validation already
+    // refused an unknown name and `disabled` without a provider; this is the
+    // line that makes the mode true, said out loud whenever it is not the
+    // default, because the failure it produces — a 403 or 404 from login — is
+    // one an operator will otherwise go looking for in the wrong place.
+    let local_login = config.auth.local.login_mode()?;
+    state.set_local_login(local_login);
+    match local_login {
+        kimmy_api::LocalLogin::Always => {}
+        kimmy_api::LocalLogin::LoopbackOnly => info!(
+            "local login answers loopback connections only; a token already issued keeps \
+             working, and a reverse proxy on this host will look like loopback"
+        ),
+        kimmy_api::LocalLogin::Disabled => warn!(
+            "local login is DISABLED; only the identity provider can authenticate a caller, \
+             and a token already issued keeps working until it expires"
+        ),
+    }
+
+    // How much memory resident HNSW graphs may take between them. Set on the
+    // built state rather than passed into the constructor every test shares:
+    // like the audit mode above it is a property of the deployment, and the
+    // cache's default is the same value the config's default carries.
+    state.vectors.set_max_bytes(config.vector.index_cache.max_bytes);
+
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state
     // and this state needs a database, which does not exist when the
@@ -147,7 +216,11 @@ pub async fn run(config: Config) -> Result<()> {
         kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
     });
     let serving_mcp = mcp.is_some();
-    let app = kimmy_api::router_with(Arc::clone(&state), mcp);
+    // The request deadline and body ceiling ride in with the router rather
+    // than the state: they are parameters of the middleware stack, fixed when
+    // the table is built (ADR-099).
+    let app =
+        kimmy_api::router_with_limits(Arc::clone(&state), mcp, config.server.request_limits());
     if serving_mcp {
         info!("serving MCP at /mcp");
     }
@@ -318,10 +391,12 @@ pub async fn run(config: Config) -> Result<()> {
         let worker_members = cluster.members.clone();
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
+        let batching = config.vector.batch.settings();
         Some(tokio::spawn({
             let engine = Arc::clone(&engine);
             async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+                worker.set_batching(batching);
                 worker.set_owner_check(Box::new(move |key| match &worker_members {
                     // No clustering: the candidate set is just this node,
                     // which owns everything.
@@ -1710,6 +1785,8 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);

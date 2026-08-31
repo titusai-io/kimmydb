@@ -1,10 +1,12 @@
 # syntax=docker/dockerfile:1
 
 # Where the kimmyd binary comes from. `build` (the default) compiles it in the
-# stage below, which is what a laptop `docker build` and the multi-arch
-# release publish do. CI passes `prebuilt` to take the binary its `build` job
-# already compiled once for every other job, from `.prebuilt/kimmyd` in the
-# context, instead of compiling it a second time from cold inside BuildKit.
+# stage below, which is what a laptop `docker build` does. CI and the release
+# publish pass `prebuilt` to take a binary from `.prebuilt/kimmyd` in the
+# context instead of compiling one a second time from cold inside BuildKit:
+# CI the one its `build` job compiled for every other job, the release the
+# one from the release archive for that architecture (ADR-107), so the image
+# ships the file the Release page does.
 ARG KIMMYD_SOURCE=build
 
 # ---- build ----------------------------------------------------------------

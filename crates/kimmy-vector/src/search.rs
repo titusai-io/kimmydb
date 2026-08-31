@@ -276,15 +276,40 @@ impl TopK {
 /// their distributions that do not hold in general.
 ///
 /// score(d) = Σ 1 / (k + rank(d))
+///
+/// This is [`weighted_reciprocal_rank_fusion`] with every weight at 1.
 pub fn reciprocal_rank_fusion(rankings: &[Vec<Hit>], limit: usize) -> Vec<Hit> {
+    let equal: Vec<(&[Hit], f32)> = rankings.iter().map(|r| (r.as_slice(), 1.0)).collect();
+    weighted_reciprocal_rank_fusion(&equal, limit)
+}
+
+/// Reciprocal Rank Fusion with a weight per ranking.
+///
+/// score(d) = Σ w_i / (k + rank_i(d))
+///
+/// The weights say how much authority each ranking's *position* carries, which
+/// is the one thing plain RRF fixes by fiat: it treats a rank of 3 in a
+/// near-random ordering as exactly as informative as a rank of 3 in a good
+/// one. Only the ratio between weights matters to the resulting order, since
+/// scores are compared with each other and never with a threshold.
+///
+/// A ranking weighted zero contributes nothing and is skipped outright rather
+/// than admitting its documents at score zero — so `(dense, 1), (lexical, 0)`
+/// is the dense ranking, not the dense ranking followed by lexical stragglers.
+/// Rejecting negative weights is the caller's job; here they would simply
+/// subtract.
+pub fn weighted_reciprocal_rank_fusion(rankings: &[(&[Hit], f32)], limit: usize) -> Vec<Hit> {
     /// Dampens the contribution of low-ranked results. 60 is the value from
     /// the original RRF paper and the common default.
     const RRF_K: f32 = 60.0;
 
     let mut fused: HashMap<String, (Hit, f32)> = HashMap::new();
-    for ranking in rankings {
+    for (ranking, weight) in rankings {
+        if *weight == 0.0 {
+            continue;
+        }
         for (position, hit) in ranking.iter().enumerate() {
-            let contribution = 1.0 / (RRF_K + position as f32 + 1.0);
+            let contribution = weight / (RRF_K + position as f32 + 1.0);
             fused
                 .entry(hit.id.to_string())
                 .and_modify(|(_, score)| *score += contribution)
@@ -302,16 +327,30 @@ pub fn reciprocal_rank_fusion(rankings: &[Vec<Hit>], limit: usize) -> Vec<Hit> {
 /// A deliberately simple term-overlap score, not BM25. It exists so hybrid
 /// search has a lexical signal to fuse; RRF only uses the *ordering*, so the
 /// absolute values do not need to be principled.
+///
+/// `min_overlap` is how many *distinct* query terms a chunk must contain to be
+/// ranked at all. At `1` any chunk sharing a word with the query is a
+/// candidate, which on short documents makes almost everything a candidate and
+/// the ordering among them close to random. Raising it keeps only the chunks
+/// that agree with the query on several words — what an exact-term match
+/// actually looks like — and leaves the rest to the dense half. A query with
+/// fewer distinct terms than `min_overlap` is held to its own count, so a
+/// one-word query is never gated to nothing; `0` is treated as `1`.
 pub fn keyword_search(
     engine: &Engine,
     shadow: &CollectionMeta,
     query: &str,
     options: &SearchOptions,
+    min_overlap: usize,
 ) -> Result<Vec<Hit>> {
     let terms: Vec<String> = tokenize(query);
     if terms.is_empty() {
         return Ok(Vec::new());
     }
+    let mut distinct: Vec<&str> = terms.iter().map(String::as_str).collect();
+    distinct.sort_unstable();
+    distinct.dedup();
+    let required = min_overlap.clamp(1, distinct.len());
 
     let mut top = TopK::new(options);
     engine.for_each_vector(shadow, |record: VectorRecord| {
@@ -319,12 +358,19 @@ pub fn keyword_search(
         if haystack.is_empty() {
             return Ok(true);
         }
-        let matched = terms.iter().filter(|t| haystack.contains(t)).count();
-        if matched > 0 {
-            // Normalized by length so a long chunk does not win on size alone.
-            let score = matched as f32 / haystack.len() as f32;
-            top.offer(Hit { score, id: record.source, chunk: record.chunk, text: record.text });
+        // `required` is at least 1, so clearing this gate is also what the
+        // scoring below needs to be non-zero — no separate `matched > 0` check.
+        let overlap = distinct.iter().filter(|t| haystack.iter().any(|h| h == *t)).count();
+        if overlap < required {
+            return Ok(true);
         }
+        // The score counts query terms as written — a repeated term counts
+        // twice — which is what it has always done; the gate above is the
+        // only place distinctness matters.
+        let matched = terms.iter().filter(|t| haystack.contains(t)).count();
+        // Normalized by length so a long chunk does not win on size alone.
+        let score = matched as f32 / haystack.len() as f32;
+        top.offer(Hit { score, id: record.source, chunk: record.chunk, text: record.text });
         Ok(true)
     })?;
 
@@ -494,7 +540,7 @@ mod tests {
             (2, 0, [0.0, 1.0], "a slow green turtle"),
         ]);
         let hits =
-            keyword_search(&engine, &shadow, "quick fox", &SearchOptions::default()).unwrap();
+            keyword_search(&engine, &shadow, "quick fox", &SearchOptions::default(), 1).unwrap();
         assert_eq!(ids(&hits), vec![1]);
     }
 
@@ -502,11 +548,13 @@ mod tests {
     fn keyword_search_ignores_punctuation_and_empty_queries() {
         let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "hello, world!")]);
         assert_eq!(
-            ids(&keyword_search(&engine, &shadow, "world", &SearchOptions::default()).unwrap()),
+            ids(&keyword_search(&engine, &shadow, "world", &SearchOptions::default(), 1).unwrap()),
             vec![1]
         );
         assert!(
-            keyword_search(&engine, &shadow, "   ", &SearchOptions::default()).unwrap().is_empty()
+            keyword_search(&engine, &shadow, "   ", &SearchOptions::default(), 1)
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -761,6 +809,89 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn keyword_search_min_overlap_requires_that_many_distinct_terms() {
+        // Doc 1 shares one term with the query, doc 2 shares two. At the
+        // default gate both are candidates; at two, only the second is. On a
+        // corpus of short documents this is the difference between a lexical
+        // ranking that is noise and one that means "this really matches".
+        let (engine, shadow, _dir) =
+            setup(&[(1, 0, [1.0, 0.0], "the red apple"), (2, 0, [0.0, 1.0], "red and blue paint")]);
+        let options = SearchOptions::default();
+        let mut loose = ids(&keyword_search(&engine, &shadow, "red blue", &options, 1).unwrap());
+        loose.sort_unstable();
+        assert_eq!(loose, vec![1, 2]);
+
+        let strict = keyword_search(&engine, &shadow, "red blue", &options, 2).unwrap();
+        assert_eq!(ids(&strict), vec![2], "one shared term is no longer enough");
+    }
+
+    #[test]
+    fn keyword_search_min_overlap_counts_distinct_terms_and_is_capped_by_the_query() {
+        let (engine, shadow, _dir) = setup(&[(1, 0, [1.0, 0.0], "red red red")]);
+        let options = SearchOptions::default();
+
+        // "red red" has one distinct term. A gate of 2 is held to that one, so
+        // the single-word query is not gated to nothing...
+        let capped = keyword_search(&engine, &shadow, "red red", &options, 2).unwrap();
+        assert_eq!(ids(&capped), vec![1]);
+        // ...and a chunk repeating one query term does not count it twice.
+        assert!(
+            keyword_search(&engine, &shadow, "red blue", &options, 2).unwrap().is_empty(),
+            "three occurrences of one term are one distinct term"
+        );
+        // Zero is not a meaningful gate and behaves as one.
+        let zero = keyword_search(&engine, &shadow, "red blue", &options, 0).unwrap();
+        assert_eq!(ids(&zero), vec![1]);
+    }
+
+    #[test]
+    fn weighted_fusion_lets_the_dense_rank_outvote_the_lexical_one() {
+        // Doc 1: first by the dense half, twentieth by the lexical. Doc 2:
+        // tenth by the dense half, third by the lexical. Under equal weights
+        // the lexical half decides it; under 0.7/0.3 the dense half does.
+        //
+        //   equal:   doc 1 = 1/61 + 1/80 = 0.02889   doc 2 = 1/70 + 1/63 = 0.03016
+        //   0.7/0.3: doc 1 = 0.7/61 + 0.3/80 = 0.01523   doc 2 = 0.7/70 + 0.3/63 = 0.01476
+        let hit = |id: i64| Hit { id: DocId::Int64(id), score: 0.0, chunk: 0, text: String::new() };
+        let filler = |from: i64, n: i64| -> Vec<Hit> { (from..from + n).map(hit).collect() };
+
+        let mut dense = vec![hit(1)];
+        dense.extend(filler(100, 8));
+        dense.push(hit(2));
+        assert_eq!(dense.len(), 10);
+
+        let mut lexical = filler(200, 2);
+        lexical.push(hit(2));
+        lexical.extend(filler(300, 16));
+        lexical.push(hit(1));
+        assert_eq!(lexical.len(), 20);
+
+        let equal = weighted_reciprocal_rank_fusion(&[(&dense, 1.0), (&lexical, 1.0)], 2);
+        assert_eq!(ids(&equal), vec![2, 1], "plain RRF: the lexical rank carries the day");
+        // And plain RRF is exactly the equal-weight case, not merely close.
+        let plain = reciprocal_rank_fusion(&[dense.clone(), lexical.clone()], 2);
+        assert_eq!(plain, equal);
+
+        let tilted = weighted_reciprocal_rank_fusion(&[(&dense, 0.7), (&lexical, 0.3)], 2);
+        assert_eq!(ids(&tilted), vec![1, 2], "0.7/0.3: the dense rank does");
+
+        // Only the ratio matters to the order.
+        let scaled = weighted_reciprocal_rank_fusion(&[(&dense, 7.0), (&lexical, 3.0)], 2);
+        assert_eq!(ids(&scaled), ids(&tilted));
+    }
+
+    #[test]
+    fn a_zero_weight_switches_a_half_off_rather_than_admitting_it_at_zero() {
+        let hit = |id: i64| Hit { id: DocId::Int64(id), score: 0.0, chunk: 0, text: String::new() };
+        let dense = vec![hit(1), hit(2)];
+        let lexical = vec![hit(3), hit(2)];
+
+        let fused = weighted_reciprocal_rank_fusion(&[(&dense, 1.0), (&lexical, 0.0)], 10);
+        assert_eq!(ids(&fused), vec![1, 2], "doc 3 was only ever lexical evidence");
+        assert!((fused[0].score - 1.0 / 61.0).abs() < 1e-6, "and doc 2 got no lexical share");
     }
 
     #[test]

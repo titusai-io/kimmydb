@@ -188,13 +188,19 @@ where
                     engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Versions(versions)).await?;
             }
-            Message::AskEntries { from, limit } => {
+            Message::AskEntries { from, limit, held } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
-                // never learn what had been collected.
-                let servable = engine
-                    .can_serve_from_oplog(from)
-                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                // never learn what had been collected. Judged per origin when
+                // the peer said what it holds — a threshold below the horizon
+                // is not a gap if everything under it is the peer's own
+                // coverage — and by the threshold alone for a peer that did
+                // not (ADR-097).
+                let servable = match &held {
+                    Some(held) => engine.can_serve_peer_holding(held),
+                    None => engine.can_serve_from_oplog(from),
+                }
+                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 if !servable {
                     write_frame(&mut stream, &Message::BeyondHorizon {}).await?;
                     continue;
@@ -343,7 +349,7 @@ pub async fn sync_once(
             // away longer than tombstone retention.
             return Ok(SyncOutcome {
                 peer: Some(their_node),
-                behind_ms: kimmy_storage::lag_behind_ms(&theirs, &mine),
+                behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
                 ..SyncOutcome::default()
             });
         };
@@ -353,8 +359,12 @@ pub async fn sync_once(
         // rather than a refusal. The limit actually settled on is what
         // `apply_peer_batch` is told below, so a batch shorter than it still means
         // "the peer's whole tail" and the coverage rules are untouched.
+        //
+        // The vector `from` came from travels with it, so the peer can judge
+        // its horizon per origin rather than by the threshold alone.
         let mut limit = MAX_BATCH;
-        write_frame(&mut stream, &Message::AskEntries { from, limit }).await?;
+        let held = Some(mine.clone());
+        write_frame(&mut stream, &Message::AskEntries { from, limit, held: held.clone() }).await?;
         let mut answer = read_frame(&mut stream).await?;
 
         if let Message::BatchTooLarge { fits } = answer {
@@ -368,7 +378,7 @@ pub async fn sync_once(
             }
             limit = fits;
             warn!(%peer, %limit, "peer cannot fit a full batch; asking for what it offered");
-            write_frame(&mut stream, &Message::AskEntries { from, limit }).await?;
+            write_frame(&mut stream, &Message::AskEntries { from, limit, held }).await?;
             answer = read_frame(&mut stream).await?;
         }
 
@@ -407,7 +417,7 @@ pub async fn sync_once(
         // holding documents this node has deleted and already collected the
         // tombstones for — the resurrection case (ADR-085). Reported, not
         // acted on: the loop decides what to say about it.
-        outcome.behind_ms = kimmy_storage::lag_behind_ms(&theirs, &mine);
+        outcome.behind_ms = behind_beyond_horizon(engine, &theirs, &mine)?;
         outcome.peer = Some(their_node);
         Ok(outcome)
     };
@@ -415,6 +425,28 @@ pub async fn sync_once(
     tokio::time::timeout(REQUEST_TIMEOUT, round)
         .await
         .map_err(|_| ProtocolError::Malformed("sync round timed out".into()))?
+}
+
+/// How far the peer trails this node where it can no longer catch up
+/// incrementally — the measure a stale-rejoiner verdict is made on.
+///
+/// Not the bare span between the two vectors: an origin that wrote nothing
+/// for longer than tombstone retention and then wrote once leaves every peer
+/// trailing it by the whole silence until their next round, and a restarted
+/// member does exactly that when it re-registers itself. Measured on a
+/// converged three-member cluster: the first round after a member came back
+/// named *both* peers stale — behind by the time since the previous restart
+/// — and withdrew it five seconds later. The retention record says whether
+/// the gap holds anything the peer cannot be served, and only then does the
+/// span mean what the verdict says it means (ADR-097).
+fn behind_beyond_horizon(
+    engine: &Engine,
+    theirs: &kimmy_core::VersionVector,
+    mine: &kimmy_core::VersionVector,
+) -> Result<u64, ProtocolError> {
+    let collected =
+        engine.oplog_collected().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+    Ok(kimmy_storage::lag_beyond_horizon_ms(theirs, mine, &collected))
 }
 
 /// Pull a full snapshot, page by page, until the peer says it is complete.

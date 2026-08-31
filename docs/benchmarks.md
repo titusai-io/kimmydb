@@ -87,6 +87,42 @@ without decoding text and metadata would move the exact path by an order of
 magnitude and change where every line above sits. Not done — recorded because
 the measurement is what makes it visible.
 
+### What a resident graph costs, and what parallel insertion would buy
+
+Measured on 2026-08-30 for [ADR-103](decisions.md), with a scratch harness
+around `hnsw_rs` 0.3.4 alone — pseudo-random vectors, the graph parameters
+`index.rs` uses, a counting global allocator — on a ten-core host in the
+release profile. Three rounds each; the ranges are the spread.
+
+| Vectors × dim | Sequential build | `parallel_insert`, 4 threads | `parallel_insert`, all cores | Bytes per node |
+|---:|---:|---:|---:|---:|
+| 4,000 × 384 | 4.3–7.0 s | 1.4–2.2 s | 1.1–2.1 s | 6,491–6,591 |
+| 20,000 × 384 | 40–53 s | 12.5–15 s | 9–14 s | 6,477–6,518 |
+| 20,000 × 64 | 11.6–13.5 s | 7.6–10.9 s | 5.8–9.8 s | 5,280–5,346 |
+
+Two things fall out. **The per-node cost barely depends on width**: take the
+vector out (1,536 bytes at 384 dimensions, 256 at 64) and about 5,000 bytes
+remain either way — `hnsw_rs`'s neighbour lists and per-layer tables. That is
+the `dim × 4 + 5,000` the index cache budgets by, and it means a
+384-dimensional chunk costs 6.5 KB resident, twice what the vector alone
+suggests. **Parallel insertion is a 3–4× win that saturates at four
+threads**: contention inside the graph means ten cores buy little over four.
+Recall@10 against a brute-force scan and the 128-probe reachability score were
+indistinguishable between the three variants at every size. It is not adopted
+— the reasoning is beside the insertion loop in `index.rs` — and the numbers
+are here so that decision can be reopened with a rebuild backlog in hand
+rather than re-measured.
+
+The recall figures themselves — 0.72–0.81 at 4,000 and 0.50–0.58 at 20,000
+*uniform random* 384-dimensional vectors, at the `ef = 50` a `k = 10` search
+uses — are a property of uniform random data at that width, where distances
+concentrate, not of real embeddings, which cluster; the recall tests in
+`index.rs` hold ≥ 0.90 on the fixtures they define. They are recorded because
+they were seen, and because at 20,000 such vectors the reachability score ran
+7–14 against a threshold of 8, so a synthetic load test at that scale would
+see some builds discarded and rebuilt. Real data has not shown this; if a
+synthetic one looks slow, that is where to look first.
+
 ---
 
 ## What changed
@@ -140,6 +176,7 @@ differed.
 | Dimensions other than 384 | 768 and 1536 are both common, and the crossover depends on width |
 | Larger-than-memory collections | Every figure here fits in page cache |
 | A cluster under load | These are single-node numbers; replication's cost to the write path is unmeasured |
+| Peak memory of a read against collection size | `count`, an index-backed `find` with a small `limit`, and a sorted `find` are bounded by what they return rather than by what they scan ([ADR-098](decisions.md)). The bound is argued from the code and tested for what is held; resident memory under those requests has not been measured |
 
 **Recall was the gap, and it is now closed.** Lowering the threshold routes more
 collections through the graph, so the ≥ 90% recall claim covers more traffic

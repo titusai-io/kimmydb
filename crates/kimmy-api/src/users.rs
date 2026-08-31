@@ -186,6 +186,11 @@ pub async fn set_disabled(
 pub async fn whoami(auth: Auth) -> Json<Value> {
     Json(json!({
         "user": auth.principal().user,
+        // A readable name beside the identity, never instead of it: for a
+        // federated caller the claim `auth.oidc.subject_claim` named, for
+        // everyone else the same string as `user`. Nothing the server decides
+        // reads it (ADR-100), and a client should not either.
+        "display": auth.principal().display_name(),
         "grants": auth.principal().grants,
         "authenticated": !auth.principal().unauthenticated,
         // Reported because a name does not answer it: an identity provider is
