@@ -825,6 +825,378 @@ impl crate::Engine {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Streaming candidates
+// ---------------------------------------------------------------------------
+
+/// One index scan, as the planner describes it.
+///
+/// Encoded byte ranges rather than a query type, as [`crate::Candidates`]
+/// does, so the crate boundary stays where it is.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexScan<'a> {
+    pub index_id: u32,
+    /// Inclusive `(lower, upper)` key ranges, in key order and disjoint: one
+    /// for a plain plan, one per probe for a `$in` union.
+    pub ranges: &'a [(Vec<u8>, Vec<u8>)],
+    /// Whether the ranges intersect both ends of a range — sound only while
+    /// the index is not multikey, so the flag is re-read in the scanning
+    /// snapshot and the scan refused if it has flipped.
+    pub both_bounds: bool,
+    /// Whether every range pins one complete index key, so its entries are
+    /// already in document-key order and hold each document once. What the
+    /// planner reports as `IndexPlan::exact`.
+    pub exact: bool,
+}
+
+/// The order an index scan delivers its candidates in.
+#[derive(Clone, Copy, Debug)]
+pub enum CandidateOrder<'a> {
+    /// Index order — whatever order the entries are stored in. The cheapest
+    /// delivery: one pass, nothing held back. For a caller that does not care
+    /// about order, which is a `count` or a query that sorts afterwards.
+    Any,
+    /// Ascending document key, strictly after `after`. The order a cursor
+    /// pages in.
+    ///
+    /// `want` is how many candidates the caller expects to accept before it
+    /// stops. It sizes the work an inexact range does per pass and bounds
+    /// what the scan holds; `None` means every candidate, in order.
+    ById { after: Option<&'a [u8]>, want: Option<usize> },
+}
+
+/// What an index scan did.
+///
+/// `entries` is the honest measure of how much of the index a query touched,
+/// as distinct from how many documents it went on to examine: an exact probe
+/// stopped after one match reads one entry however many the key holds, and a
+/// range that had to be put in `_id` order reads all of its entries however
+/// few documents it returns.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct IndexScanOutcome {
+    /// Index entries read.
+    pub entries: usize,
+    /// Passes over the ranges. One, except for an inexact range delivered in
+    /// `_id` order whose first pass did not yield enough documents past the
+    /// recheck, which goes back for more.
+    pub passes: usize,
+}
+
+/// The tables one scan reads from, and the visitor it feeds.
+///
+/// Documents are fetched from the **same snapshot** as the index entries —
+/// one read transaction per query — where the older candidate list opened a
+/// new transaction per document.
+struct Walk<'t, F> {
+    coll: CollectionId,
+    index: &'t IndexMeta,
+    entries: &'t redb::ReadOnlyTable<tables::IndexKey<'static>, ()>,
+    docs: &'t redb::ReadOnlyTable<(u64, &'static [u8]), &'static [u8]>,
+    ranges: &'t [(Vec<u8>, Vec<u8>)],
+    outcome: IndexScanOutcome,
+    visit: F,
+}
+
+impl<F> Walk<'_, F>
+where
+    F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+{
+    /// The live document under a key, or `None` for a tombstone or a gap.
+    ///
+    /// A gap is an ordinary miss, not an error: index entries are removed
+    /// lazily after a drop, and a candidate whose document is gone is simply
+    /// not a candidate.
+    fn load(&self, key: &[u8]) -> Result<Option<(kimmy_core::Stamp, Document)>> {
+        match self.docs.get((self.coll.0, key))? {
+            Some(raw) => {
+                let record = crate::codec::decode_doc_record(raw.value())?;
+                Ok(record.document()?.map(|doc| (record.stamp, doc)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Hand one candidate to the visitor. `Ok(false)` means stop.
+    fn offer(&mut self, key: &[u8]) -> Result<bool> {
+        match self.load(key)? {
+            Some((stamp, doc)) => (self.visit)(key, stamp, doc),
+            None => Ok(true),
+        }
+    }
+
+    /// Whether `key` is the first entry in these ranges that names `doc`.
+    ///
+    /// A multikey index holds a document under every key its arrays
+    /// contribute, so a range that covers two of them meets the document
+    /// twice. Rather than remember every document seen — a set that grows
+    /// with the range — this recomputes the document's keys and accepts it
+    /// only at the smallest one the scan covers. The scan visits the ranges
+    /// in key order, so that is exactly the entry it met first.
+    fn first_entry_for(&self, doc: &Document, key: &[u8]) -> Result<bool> {
+        // `index_keys` returns them sorted, so the first in range is the least.
+        let keys = index_keys(self.index, doc)?;
+        let first = keys.iter().find(|k| {
+            self.ranges.iter().any(|(lower, upper)| {
+                k.as_slice() >= lower.as_slice() && k.as_slice() <= upper.as_slice()
+            })
+        });
+        Ok(first.is_some_and(|k| k.as_slice() == key))
+    }
+
+    /// Every entry of every range, in index order.
+    fn in_index_order(&mut self) -> Result<()> {
+        use std::ops::Bound;
+        self.outcome.passes = 1;
+        let multikey = self.index.multikey;
+        for (lower, upper) in self.ranges {
+            let start =
+                Bound::Included((self.coll.0, self.index.id, lower.as_slice(), [].as_slice()));
+            for entry in self.entries.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))? {
+                let (found, _) = entry?;
+                let (c, i, k, doc_key) = found.value();
+                if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
+                    break;
+                }
+                self.outcome.entries += 1;
+                let Some((stamp, doc)) = self.load(doc_key)? else {
+                    continue;
+                };
+                if multikey && !self.first_entry_for(&doc, k)? {
+                    continue;
+                }
+                if !(self.visit)(doc_key, stamp, doc)? {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// One exact probe: a single run of entries under one key, already in
+    /// document-key order and holding each document once. The bound is a
+    /// seek, so resuming costs nothing, and the visitor stopping stops the
+    /// read — a `limit: 1` reads one entry.
+    fn one_run(&mut self, after: Option<&[u8]>) -> Result<()> {
+        use std::ops::Bound;
+        self.outcome.passes = 1;
+        let (lower, upper) = &self.ranges[0];
+        let start = match after {
+            Some(bound) => Bound::Excluded((self.coll.0, self.index.id, lower.as_slice(), bound)),
+            None => Bound::Included((self.coll.0, self.index.id, lower.as_slice(), [].as_slice())),
+        };
+        for entry in self.entries.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))? {
+            let (found, _) = entry?;
+            let (c, i, k, doc_key) = found.value();
+            if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
+                break;
+            }
+            self.outcome.entries += 1;
+            if !self.offer(doc_key)? {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Several exact probes: one sorted run each, merged by their heads.
+    ///
+    /// A `$in` used to gather every probe's candidates into one set and walk
+    /// it, which held the union of the probes whatever the caller wanted
+    /// from it. The merge holds one head per probe. A document under two
+    /// probes — an array holding two of the listed values — surfaces as the
+    /// same key twice in a row, and the second is dropped.
+    fn merged_runs(&mut self, after: Option<&[u8]>) -> Result<()> {
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
+        use std::ops::Bound;
+
+        self.outcome.passes = 1;
+        let (coll, index_id) = (self.coll.0, self.index.id);
+        let mut runs = Vec::with_capacity(self.ranges.len());
+        for (lower, _) in self.ranges {
+            let start = match after {
+                Some(bound) => Bound::Excluded((coll, index_id, lower.as_slice(), bound)),
+                None => Bound::Included((coll, index_id, lower.as_slice(), [].as_slice())),
+            };
+            runs.push(self.entries.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))?);
+        }
+
+        // The next document key of run `i`, or `None` once it has left its
+        // probe's range. Counted here, since this is where entries are read.
+        let ranges = self.ranges;
+        let mut next = |i: usize, entries: &mut usize| -> Result<Option<Vec<u8>>> {
+            let upper = ranges[i].1.as_slice();
+            match runs[i].next() {
+                Some(entry) => {
+                    let (found, _) = entry?;
+                    let (c, ix, k, doc_key) = found.value();
+                    if c != coll || ix != index_id || k > upper {
+                        return Ok(None);
+                    }
+                    *entries += 1;
+                    Ok(Some(doc_key.to_vec()))
+                }
+                None => Ok(None),
+            }
+        };
+
+        let mut heads = BinaryHeap::new();
+        for i in 0..ranges.len() {
+            if let Some(key) = next(i, &mut self.outcome.entries)? {
+                heads.push(Reverse((key, i)));
+            }
+        }
+
+        let mut last: Option<Vec<u8>> = None;
+        while let Some(Reverse((key, i))) = heads.pop() {
+            if let Some(following) = next(i, &mut self.outcome.entries)? {
+                heads.push(Reverse((following, i)));
+            }
+            if last.as_deref() == Some(key.as_slice()) {
+                continue;
+            }
+            if !self.offer(&key)? {
+                return Ok(());
+            }
+            last = Some(key);
+        }
+        Ok(())
+    }
+
+    /// An inexact range, in document-key order, holding at most `want` keys.
+    ///
+    /// Entries under a range of keys are ordered by key first, so their
+    /// document keys interleave and no seek finds "the next `_id`". The scan
+    /// used to collect the whole range and sort it. This reads the range and
+    /// keeps only the `want` smallest document keys past `after` — a bounded
+    /// set, the work of one pass, and the same keys the sort would have put
+    /// first. They are offered in order; if the recheck rejects enough of
+    /// them that the visitor is still going when they run out, the next pass
+    /// resumes after the last key seen and asks for twice as many, so the
+    /// number of passes is logarithmic in what the filter rejected rather
+    /// than linear in it.
+    fn in_key_order(&mut self, after: Option<&[u8]>, want: Option<usize>) -> Result<()> {
+        use std::collections::BTreeSet;
+        use std::ops::Bound;
+
+        let mut after: Option<Vec<u8>> = after.map(<[u8]>::to_vec);
+        let mut batch = want.unwrap_or(usize::MAX).max(1);
+        loop {
+            self.outcome.passes += 1;
+            let mut best: BTreeSet<Vec<u8>> = BTreeSet::new();
+            for (lower, upper) in self.ranges {
+                let start =
+                    Bound::Included((self.coll.0, self.index.id, lower.as_slice(), [].as_slice()));
+                for entry in
+                    self.entries.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))?
+                {
+                    let (found, _) = entry?;
+                    let (c, i, k, doc_key) = found.value();
+                    if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
+                        break;
+                    }
+                    self.outcome.entries += 1;
+                    if after.as_deref().is_some_and(|bound| doc_key <= bound) {
+                        continue;
+                    }
+                    if best.len() < batch {
+                        best.insert(doc_key.to_vec());
+                    } else if best.last().is_some_and(|max| doc_key < max.as_slice())
+                        && best.insert(doc_key.to_vec())
+                    {
+                        // Grew past the bound with a smaller key: the largest
+                        // is no longer among the `batch` smallest. (A repeat
+                        // of a key already held does not grow the set.)
+                        best.pop_last();
+                    }
+                }
+            }
+            // Fewer than asked for means the ranges hold nothing more past
+            // `after`: this pass is the last whatever the visitor says.
+            let exhausted = best.len() < batch;
+            let mut last = None;
+            for key in best {
+                if !self.offer(&key)? {
+                    return Ok(());
+                }
+                last = Some(key);
+            }
+            if exhausted {
+                return Ok(());
+            }
+            after = last;
+            batch = batch.saturating_mul(2);
+        }
+    }
+}
+
+impl crate::Engine {
+    /// Stream the documents an index scan points at, rechecked by the caller.
+    ///
+    /// These are **candidates**: an index says which documents *might*
+    /// match, and the visitor must apply the full filter before counting one.
+    /// The visitor returns whether to continue, and stopping stops the read —
+    /// what makes a `limit` bound the work rather than only the result.
+    ///
+    /// Nothing proportional to the range is held. An exact probe is one run
+    /// read in place; a union is a merge holding one head per probe; an
+    /// inexact range in `_id` order holds at most `want` keys per pass. See
+    /// [`CandidateOrder`] for what each delivery promises.
+    ///
+    /// `None` means the scan was refused and the caller must re-plan — the
+    /// same rule as [`Engine::index_candidates_unless_multikey`]: a plan that
+    /// intersected both bounds is only sound while the index is not multikey,
+    /// and the flag is re-read here in the same snapshot as the entries. An
+    /// index that no longer exists is refused too; a collection that no
+    /// longer exists yields nothing, which in this snapshot is the truth.
+    pub fn visit_index_candidates<F>(
+        &self,
+        coll: &crate::CollectionMeta,
+        scan: &IndexScan<'_>,
+        order: CandidateOrder<'_>,
+        visit: F,
+    ) -> Result<Option<IndexScanOutcome>>
+    where
+        F: FnMut(&[u8], kimmy_core::Stamp, Document) -> Result<bool>,
+    {
+        let txn = self.db().begin_read()?;
+        let index = {
+            let collections = txn.open_table(tables::COLLECTIONS)?;
+            let fresh: crate::CollectionMeta =
+                match collections.get((coll.db.as_str(), coll.name.as_str()))? {
+                    Some(raw) => serde_json::from_slice(raw.value())?,
+                    None => return Ok(Some(IndexScanOutcome::default())),
+                };
+            match fresh.index_by_id(scan.index_id) {
+                Some(index) if !(scan.both_bounds && index.multikey) => index.clone(),
+                _ => return Ok(None),
+            }
+        };
+        let entries = txn.open_table(tables::INDEX_ENTRIES)?;
+        let docs = txn.open_table(tables::DOCS)?;
+        let mut walk = Walk {
+            coll: coll.id,
+            index: &index,
+            entries: &entries,
+            docs: &docs,
+            ranges: scan.ranges,
+            outcome: IndexScanOutcome::default(),
+            visit,
+        };
+        if !scan.ranges.is_empty() {
+            match order {
+                CandidateOrder::Any => walk.in_index_order()?,
+                CandidateOrder::ById { after, .. } if scan.exact && scan.ranges.len() == 1 => {
+                    walk.one_run(after)?;
+                }
+                CandidateOrder::ById { after, .. } if scan.exact => walk.merged_runs(after)?,
+                CandidateOrder::ById { after, want } => walk.in_key_order(after, want)?,
+            }
+        }
+        Ok(Some(walk.outcome))
+    }
+}
+
 /// Key range covering every entry belonging to one index.
 fn index_id_range(
     coll: CollectionId,
@@ -1578,6 +1950,232 @@ mod tests {
             )
             .unwrap();
         assert_eq!(checked, None, "a flipped flag must force a re-plan, not a narrow scan");
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming candidates — bounded by what the caller takes, not the range
+    // -----------------------------------------------------------------------
+
+    /// The plan `exec` would run for a filter, with the planner's own flags.
+    fn plan_for(coll: &CollectionMeta, query: &Document) -> kimmy_query::plan::IndexPlan {
+        let filter = kimmy_query::filter::parse(query).unwrap();
+        kimmy_query::plan::choose(&filter, &coll.indexes).expect("the index should apply")
+    }
+
+    /// Walk a plan in the given order, taking every candidate until `stop`
+    /// says otherwise; the ids in arrival order, plus what the scan did.
+    fn walk(
+        engine: &Engine,
+        coll: &CollectionMeta,
+        plan: &kimmy_query::plan::IndexPlan,
+        order: CandidateOrder<'_>,
+        mut accept: impl FnMut(i64) -> bool,
+        stop_after: usize,
+    ) -> (Vec<i64>, IndexScanOutcome) {
+        let scan = IndexScan {
+            index_id: plan.index_id,
+            ranges: &plan.ranges,
+            both_bounds: plan.both_bounds,
+            exact: plan.exact,
+        };
+        let mut ids = Vec::new();
+        let outcome = engine
+            .visit_index_candidates(coll, &scan, order, |_, _, doc| {
+                let id = doc.get_i64("_id").unwrap();
+                if accept(id) {
+                    ids.push(id);
+                }
+                Ok(ids.len() < stop_after)
+            })
+            .unwrap()
+            .expect("the scan should not be refused");
+        (ids, outcome)
+    }
+
+    #[test]
+    fn an_exact_probe_stopped_after_one_reads_one_entry() {
+        // The shape that used to cost the most for the least: an unselective
+        // equality with `limit: 1` gathered every candidate key under the
+        // value, sorted them, and read the first. Now the first entry is the
+        // first document and the read stops there.
+        let (engine, coll, _dir) = engine();
+        for i in 0..200i64 {
+            engine.insert(&coll, doc! { "_id": i, "k": 1 }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::ascending("k")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let plan = plan_for(&coll, &doc! { "k": 1 });
+        assert!(plan.exact);
+
+        let by_id = CandidateOrder::ById { after: None, want: Some(1) };
+        let (ids, outcome) = walk(&engine, &coll, &plan, by_id, |_| true, 1);
+        assert_eq!(ids, vec![0], "the least _id, not an arbitrary one");
+        assert_eq!(outcome.entries, 1, "one wanted, one read");
+        assert_eq!(outcome.passes, 1);
+
+        // Resuming is a seek, not a skip: the entries before the bound are
+        // never read.
+        let bound = doc_key_for(&DocId::Int64(150)).unwrap();
+        let resumed = CandidateOrder::ById { after: Some(&bound), want: Some(2) };
+        let (ids, outcome) = walk(&engine, &coll, &plan, resumed, |_| true, 2);
+        assert_eq!(ids, vec![151, 152]);
+        assert_eq!(outcome.entries, 2);
+
+        // Taking everything reads everything, once.
+        let all = CandidateOrder::ById { after: None, want: None };
+        let (ids, outcome) = walk(&engine, &coll, &plan, all, |_| true, usize::MAX);
+        assert_eq!(ids, (0..200).collect::<Vec<_>>());
+        assert_eq!(outcome.entries, 200);
+    }
+
+    #[test]
+    fn a_union_of_probes_names_each_document_once_in_id_order() {
+        // An array holding two of the listed values files the document under
+        // two probes. The merge must surface it once, and in `_id` order
+        // across the probes — the order a cursor resumes in.
+        let (engine, coll, _dir) = engine();
+        for (id, tags) in [
+            (1i64, vec!["a", "b"]),
+            (2, vec!["b"]),
+            (3, vec!["a"]),
+            (4, vec!["c"]),
+            (5, vec!["b", "a"]),
+            (6, vec!["a", "c"]),
+        ] {
+            engine.insert(&coll, doc! { "_id": id, "tags": tags }).unwrap();
+        }
+        engine
+            .create_index("app", "docs", vec![IndexField::ascending("tags")], false, None)
+            .unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let plan = plan_for(&coll, &doc! { "tags": { "$in": ["b", "a"] } });
+        assert_eq!(plan.ranges.len(), 2);
+        assert!(plan.exact);
+
+        let by_id = CandidateOrder::ById { after: None, want: None };
+        let (ids, _) = walk(&engine, &coll, &plan, by_id, |_| true, usize::MAX);
+        assert_eq!(ids, vec![1, 2, 3, 5, 6], "once each, ascending, across both probes");
+
+        // Index order has no order to promise, but it must still name each
+        // document once — here by recomputing its keys rather than by
+        // remembering every document seen.
+        let (mut any, _) = walk(&engine, &coll, &plan, CandidateOrder::Any, |_| true, usize::MAX);
+        any.sort_unstable();
+        assert_eq!(any, vec![1, 2, 3, 5, 6]);
+
+        // A page resumed from the middle picks up exactly where it stopped.
+        let bound = doc_key_for(&DocId::Int64(2)).unwrap();
+        let resumed = CandidateOrder::ById { after: Some(&bound), want: Some(2) };
+        let (ids, _) = walk(&engine, &coll, &plan, resumed, |_| true, 2);
+        assert_eq!(ids, vec![3, 5]);
+    }
+
+    #[test]
+    fn an_inexact_range_arrives_in_id_order_and_holds_only_the_window() {
+        // Entries under a range of keys are in key order, so their document
+        // keys interleave: `_id` order has to be recovered. The old scan
+        // sorted the whole range; this keeps the `want` smallest per pass.
+        let (engine, coll, _dir) = engine();
+        for i in 0..60i64 {
+            // Chosen so the index order is nothing like the `_id` order.
+            engine.insert(&coll, doc! { "_id": i, "n": (i * 37) % 60 }).unwrap();
+        }
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let query = doc! { "n": { "$gte": 20 } };
+        let plan = plan_for(&coll, &query);
+        assert!(!plan.exact);
+        let expected = by_scan(&engine, &coll, &query);
+        assert_eq!(expected.len(), 40);
+
+        // Everything wanted, in order, in one pass.
+        let all = CandidateOrder::ById { after: None, want: None };
+        let (ids, outcome) = walk(&engine, &coll, &plan, all, |_| true, usize::MAX);
+        assert_eq!(ids, expected);
+        assert_eq!(outcome.passes, 1);
+        assert_eq!(outcome.entries, 40, "one pass reads the range once");
+
+        // Three wanted: the three least, in one pass — the range is read but
+        // only three keys are ever held.
+        let three = CandidateOrder::ById { after: None, want: Some(3) };
+        let (ids, outcome) = walk(&engine, &coll, &plan, three, |_| true, 3);
+        assert_eq!(ids, expected[..3]);
+        assert_eq!(outcome.passes, 1);
+
+        // A recheck that rejects most of what the first pass offers: the
+        // scan goes back for more, doubling, and the order still holds.
+        let picky = CandidateOrder::ById { after: None, want: Some(2) };
+        let (ids, outcome) = walk(&engine, &coll, &plan, picky, |id| id % 10 == 0, usize::MAX);
+        let wanted: Vec<i64> = expected.iter().copied().filter(|id| id % 10 == 0).collect();
+        assert_eq!(ids, wanted);
+        assert!(outcome.passes > 1, "the first pass of two cannot have satisfied {wanted:?}");
+
+        // Resuming after a key delivers strictly what follows it.
+        let bound = doc_key_for(&DocId::Int64(expected[10])).unwrap();
+        let resumed = CandidateOrder::ById { after: Some(&bound), want: Some(5) };
+        let (ids, _) = walk(&engine, &coll, &plan, resumed, |_| true, 5);
+        assert_eq!(ids, expected[11..16]);
+    }
+
+    #[test]
+    fn a_multikey_range_in_index_order_names_each_document_once() {
+        // A range covering two of one document's array values meets the
+        // document at both. Index order carries no dedup set; the document
+        // is taken at the first of its keys the range covers and skipped at
+        // the rest.
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 1i64, "n": [3, 7, 9] }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2i64, "n": 5 }).unwrap();
+        engine.insert(&coll, doc! { "_id": 3i64, "n": [1, 8] }).unwrap();
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        assert!(coll.indexes[0].multikey);
+
+        let query = doc! { "n": { "$gte": 4 } };
+        let plan = plan_for(&coll, &query);
+        let (mut any, outcome) =
+            walk(&engine, &coll, &plan, CandidateOrder::Any, |_| true, usize::MAX);
+        any.sort_unstable();
+        assert_eq!(any, vec![1, 2, 3]);
+        // Each element is an entry, and so is the whole array — which, being an
+        // array, sorts above every number and so falls inside an open-topped
+        // range too. Six entries name three documents.
+        assert_eq!(outcome.entries, 6, "7, 9, [3,7,9] for _id 1; 5 for _id 2; 8, [1,8] for _id 3");
+
+        // And the ordered delivery agrees, with the range's keys interleaved.
+        let by_id = CandidateOrder::ById { after: None, want: None };
+        let (ids, _) = walk(&engine, &coll, &plan, by_id, |_| true, usize::MAX);
+        assert_eq!(ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn a_streamed_scan_refuses_an_index_that_went_multikey() {
+        // The same rule the candidate list follows, on the path `find` now
+        // takes: a both-bounds plan is refused — before the visitor sees
+        // anything — once the index is multikey in the scanning snapshot.
+        let (engine, _coll, _dir) = engine();
+        engine.create_index("app", "docs", vec![IndexField::ascending("n")], false, None).unwrap();
+        let stale = engine.get_collection("app", "docs").unwrap();
+        let plan = plan_for(&stale, &doc! { "n": { "$gte": 1, "$lte": 5 } });
+        assert!(plan.both_bounds);
+
+        engine.insert(&stale, doc! { "_id": 1i64, "n": [9, 0] }).unwrap();
+
+        let scan = IndexScan {
+            index_id: plan.index_id,
+            ranges: &plan.ranges,
+            both_bounds: true,
+            exact: plan.exact,
+        };
+        let mut visited = 0;
+        let refused = engine
+            .visit_index_candidates(&stale, &scan, CandidateOrder::Any, |_, _, _| {
+                visited += 1;
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(refused, None, "a flipped flag must force a re-plan");
+        assert_eq!(visited, 0, "and nothing may have been handed out first");
     }
 
     // -----------------------------------------------------------------------

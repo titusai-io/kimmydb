@@ -10,6 +10,7 @@ use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
+use crate::expr::{self, Expr};
 use crate::path;
 
 /// A parsed filter.
@@ -25,6 +26,14 @@ pub enum Filter {
         path: String,
         conditions: Vec<Condition>,
     },
+    /// `{$expr: <expression>}` — an aggregation expression evaluated against
+    /// the whole document, matching when the result is truthy.
+    ///
+    /// This is the one clause that can compare two fields of the same
+    /// document, and it borrows the expression language wholesale rather than
+    /// growing a field-reference syntax of its own (ADR-106). The planner
+    /// never reads it: an expression names no field it could put bounds on.
+    Expr(Box<Expr>),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -99,6 +108,11 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
         "and" => Filter::And(branches(value)?),
         "or" => Filter::Or(branches(value)?),
         "nor" => Filter::Nor(branches(value)?),
+        // The expression parser reports its own errors — an unknown operator,
+        // a wrong arity — in the same error type as the rest of this module,
+        // so a caller sees one kind of `400` whichever half of the filter was
+        // malformed.
+        "expr" => Filter::Expr(Box::new(Expr::parse(value)?)),
         // `$not` is only meaningful applied to a field's operators; at the top
         // level Mongo rejects it too, and the clearer error is worth it.
         "not" => {
@@ -152,10 +166,15 @@ fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
 /// *scalar* elements directly — the operators apply to the element itself, not
 /// to any field of it — which an ordinary parse would misread as a top-level
 /// logical operator and reject.
+///
+/// `$expr` is on the document side of that split: it reads the element's
+/// fields, so `{$elemMatch: {$expr: {$gt: ["$qty", "$min"]}}}` compares two
+/// fields of one element. MongoDB refuses `$expr` under `$elemMatch` outright;
+/// accepting it here is a strict superset, noted in `docs/deviations.md`.
 fn parse_elem_match(doc: &Document) -> Result<Filter> {
-    const LOGICAL: [&str; 3] = ["$and", "$or", "$nor"];
-    let scalar_form =
-        !doc.is_empty() && doc.keys().all(|k| k.starts_with('$') && !LOGICAL.contains(&k.as_str()));
+    const DOCUMENT_LEVEL: [&str; 4] = ["$and", "$or", "$nor", "$expr"];
+    let scalar_form = !doc.is_empty()
+        && doc.keys().all(|k| k.starts_with('$') && !DOCUMENT_LEVEL.contains(&k.as_str()));
 
     if scalar_form {
         // The empty path is the marker that these conditions target the
@@ -329,7 +348,27 @@ pub fn matches(filter: &Filter, doc: &Document) -> bool {
             let values = path::resolve(doc, path);
             conditions.iter().all(|c| condition_matches(c, &values))
         }
+        Filter::Expr(e) => expr_matches(e, doc),
     }
+}
+
+/// Evaluate an `$expr` clause against a document.
+///
+/// Truthiness is the expression language's — `false`, `null`, `0` and a
+/// missing field are false, everything else including `""` and `[]` is true —
+/// because the value came out of that language and `$cond` already reads it
+/// this way.
+///
+/// **A type violation is "no match", not an error.** `{$expr: {$gt: [{$add:
+/// ["$name", 1]}, 0]}}` on a document whose `name` is a string is a
+/// document-dependent failure that only shows up mid-scan, and this function
+/// answers a `bool` for every caller — the scan, `$elemMatch`, the executor's
+/// residual check. Failing the whole request from here would have to thread a
+/// `Result` through all of them for a case the regex arm already resolves the
+/// other way: an unusable pattern matches nothing. Recorded in
+/// `docs/deviations.md`, because MongoDB does fail the query.
+fn expr_matches(e: &Expr, doc: &Document) -> bool {
+    e.eval(doc).is_ok_and(|v| expr::truthy(&v))
 }
 
 /// Evaluate one condition against the values found at a path.
@@ -462,6 +501,8 @@ fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> bool {
             }
             conditions.iter().all(|c| condition_matches(c, &[scalar]))
         }
+        // An expression reads fields, and a scalar has none to read.
+        Filter::Expr(_) => false,
     }
 }
 
@@ -765,5 +806,148 @@ mod tests {
         assert!(hits(doc! { "a.b": 1 }, doc! { "a": { "b": 1 } }));
         assert!(hits(doc! { "a.b": 2 }, doc! { "a": [ { "b": 1 }, { "b": 2 } ] }));
         assert!(hits(doc! { "a.0": 10 }, doc! { "a": [10, 20] }));
+    }
+
+    // -----------------------------------------------------------------------
+    // $expr
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expr_compares_two_fields_of_the_same_document() {
+        // The case no other filter operator can express: the right-hand side
+        // is a field, not a constant.
+        let q = doc! { "$expr": { "$gt": ["$spent", "$budget"] } };
+        assert!(hits(q.clone(), doc! { "spent": 120, "budget": 100 }));
+        assert!(!hits(q.clone(), doc! { "spent": 80, "budget": 100 }));
+        assert!(!hits(q, doc! { "spent": 100, "budget": 100 }));
+    }
+
+    #[test]
+    fn expr_evaluates_arithmetic() {
+        let q = doc! { "$expr": { "$gt": [ { "$multiply": ["$qty", "$price"] }, 100 ] } };
+        assert!(hits(q.clone(), doc! { "qty": 3, "price": 40 }));
+        assert!(!hits(q.clone(), doc! { "qty": 2, "price": 40 }));
+        // Integer times double is a double, and 2.5 * 50 is over the line.
+        assert!(hits(q, doc! { "qty": 2.5, "price": 50 }));
+    }
+
+    #[test]
+    fn expr_reads_a_missing_field_as_null() {
+        // Null is what the expression language makes of absence, so the same
+        // null rules apply: it equals null, and arithmetic on it is null,
+        // which is not greater than anything.
+        assert!(hits(doc! { "$expr": { "$eq": ["$a", Bson::Null] } }, doc! { "b": 1 }));
+        assert!(hits(doc! { "$expr": { "$eq": ["$a", Bson::Null] } }, doc! { "a": Bson::Null }));
+        assert!(!hits(doc! { "$expr": { "$eq": ["$a", Bson::Null] } }, doc! { "a": 1 }));
+        assert!(!hits(doc! { "$expr": { "$gt": [ { "$add": ["$a", 1] }, 0 ] } }, doc! { "b": 1 }));
+        // Two missing fields are equal to each other.
+        assert!(hits(doc! { "$expr": { "$eq": ["$a", "$b"] } }, doc! { "c": 1 }));
+    }
+
+    #[test]
+    fn expr_comparisons_use_the_canonical_order_not_type_groups() {
+        // The one place a filter document compares across type groups: the
+        // expression language ranks null below numbers below strings, so a
+        // missing field is *less than* zero here. `{a: {$lt: 0}}` would not
+        // match either document — and that contrast is documented.
+        assert!(hits(doc! { "$expr": { "$lt": ["$a", 0] } }, doc! { "b": 1 }));
+        assert!(hits(doc! { "$expr": { "$gt": ["$a", 1] } }, doc! { "a": "text" }));
+        assert!(!hits(doc! { "a": { "$gt": 1 } }, doc! { "a": "text" }));
+    }
+
+    #[test]
+    fn expr_does_not_match_array_elements() {
+        // A filter comparison looks inside an array; an expression compares
+        // the array itself. `{n: 5}` finds the element, `$expr` does not.
+        assert!(hits(doc! { "n": 5 }, doc! { "n": [1, 5, 9] }));
+        assert!(!hits(doc! { "$expr": { "$eq": ["$n", 5] } }, doc! { "n": [1, 5, 9] }));
+        // And the array as a whole ranks *above* every number in the
+        // canonical order, so the two readings can disagree in either
+        // direction: the filter finds 1 below 100, the expression does not.
+        assert!(hits(doc! { "n": { "$lt": 100 } }, doc! { "n": [1, 5, 9] }));
+        assert!(!hits(doc! { "$expr": { "$lt": ["$n", 100] } }, doc! { "n": [1, 5, 9] }));
+        // Whole-array equality is element by element, in order.
+        assert!(hits(doc! { "$expr": { "$eq": ["$n", [1, 5, 9]] } }, doc! { "n": [1, 5, 9] }));
+        assert!(!hits(doc! { "$expr": { "$eq": ["$n", [9, 5, 1]] } }, doc! { "n": [1, 5, 9] }));
+    }
+
+    #[test]
+    fn expr_applies_truthiness_to_a_bare_field_reference() {
+        let q = doc! { "$expr": "$active" };
+        assert!(hits(q.clone(), doc! { "active": true }));
+        assert!(hits(q.clone(), doc! { "active": 1 }));
+        assert!(hits(q.clone(), doc! { "active": "yes" }));
+        // The empty string and the empty array are truthy, as in MongoDB.
+        assert!(hits(q.clone(), doc! { "active": "" }));
+        assert!(hits(q.clone(), doc! { "active": [] }));
+        assert!(!hits(q.clone(), doc! { "active": false }));
+        assert!(!hits(q.clone(), doc! { "active": 0 }));
+        assert!(!hits(q.clone(), doc! { "active": 0.0 }));
+        assert!(!hits(q.clone(), doc! { "active": Bson::Null }));
+        assert!(!hits(q, doc! { "other": 1 }));
+    }
+
+    #[test]
+    fn expr_accepts_a_literal() {
+        assert!(hits(doc! { "$expr": true }, doc! {}));
+        assert!(!hits(doc! { "$expr": false }, doc! { "a": 1 }));
+    }
+
+    #[test]
+    fn expr_nests_inside_logical_operators_and_beside_fields() {
+        let d = doc! { "spent": 120, "budget": 100, "status": "open" };
+        let q = doc! { "$or": [ { "status": "closed" }, { "$expr": { "$gt": ["$spent", "$budget"] } } ] };
+        assert!(hits(q.clone(), d.clone()));
+        assert!(!hits(q, doc! { "spent": 80, "budget": 100, "status": "open" }));
+
+        // Top-level siblings are implicitly `$and`-ed, `$expr` included.
+        let q = doc! { "status": "open", "$expr": { "$gt": ["$spent", "$budget"] } };
+        assert!(hits(q.clone(), d.clone()));
+        assert!(!hits(q, doc! { "spent": 120, "budget": 100, "status": "closed" }));
+
+        let q = doc! { "$nor": [ { "$expr": { "$gt": ["$spent", "$budget"] } } ] };
+        assert!(!hits(q.clone(), d));
+        assert!(hits(q, doc! { "spent": 80, "budget": 100 }));
+
+        // Negation is the expression language's own `$not`.
+        let q = doc! { "$expr": { "$not": [ { "$gt": ["$spent", "$budget"] } ] } };
+        assert!(hits(q, doc! { "spent": 80, "budget": 100 }));
+    }
+
+    #[test]
+    fn expr_inside_elem_match_sees_the_element() {
+        // The document form of `$elemMatch` is an ordinary filter over each
+        // element, so an expression there reads the element's fields.
+        let q = doc! { "lines": { "$elemMatch": { "$expr": { "$gt": ["$qty", "$min"] } } } };
+        assert!(hits(
+            q.clone(),
+            doc! { "lines": [ { "qty": 1, "min": 5 }, { "qty": 9, "min": 5 } ] }
+        ));
+        assert!(!hits(q.clone(), doc! { "lines": [ { "qty": 1, "min": 5 } ] }));
+        // A scalar element has no fields for the expression to read.
+        assert!(!hits(q, doc! { "lines": [1, 2, 3] }));
+    }
+
+    #[test]
+    fn expr_treats_a_type_violation_as_no_match() {
+        // Adding to a string is an error in a pipeline; here it is a document
+        // that does not match, the same way an unusable regex matches nothing.
+        let q = doc! { "$expr": { "$gt": [ { "$add": ["$name", 1] }, 0 ] } };
+        assert!(!hits(q.clone(), doc! { "name": "text" }));
+        assert!(hits(q, doc! { "name": 1 }));
+    }
+
+    #[test]
+    fn expr_parse_errors_are_the_filter_parsers_errors() {
+        // An unknown expression operator and a wrong arity both surface as the
+        // filter parser's own error variants, not as a distinct kind.
+        assert!(matches!(
+            parse(&doc! { "$expr": { "$nope": 1 } }),
+            Err(Error::UnsupportedOperator(_))
+        ));
+        assert!(matches!(parse(&doc! { "$expr": { "$gt": ["$a"] } }), Err(Error::InvalidQuery(_))));
+        assert!(matches!(parse(&doc! { "$expr": "$$ROOT" }), Err(Error::UnsupportedOperator(_))));
+        // `$expr` is not a field operator.
+        assert!(parse(&doc! { "a": { "$expr": { "$gt": ["$a", 1] } } }).is_err());
     }
 }

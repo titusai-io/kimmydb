@@ -172,6 +172,25 @@ pub async fn run(config: Config) -> Result<()> {
     )
     .context("building the API state")?;
 
+    // Where a local token may be minted from (ADR-100). Validation already
+    // refused an unknown name and `disabled` without a provider; this is the
+    // line that makes the mode true, said out loud whenever it is not the
+    // default, because the failure it produces — a 403 or 404 from login — is
+    // one an operator will otherwise go looking for in the wrong place.
+    let local_login = config.auth.local.login_mode()?;
+    state.set_local_login(local_login);
+    match local_login {
+        kimmy_api::LocalLogin::Always => {}
+        kimmy_api::LocalLogin::LoopbackOnly => info!(
+            "local login answers loopback connections only; a token already issued keeps \
+             working, and a reverse proxy on this host will look like loopback"
+        ),
+        kimmy_api::LocalLogin::Disabled => warn!(
+            "local login is DISABLED; only the identity provider can authenticate a caller, \
+             and a token already issued keeps working until it expires"
+        ),
+    }
+
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state
     // and this state needs a database, which does not exist when the
@@ -191,7 +210,11 @@ pub async fn run(config: Config) -> Result<()> {
         kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
     });
     let serving_mcp = mcp.is_some();
-    let app = kimmy_api::router_with(Arc::clone(&state), mcp);
+    // The request deadline and body ceiling ride in with the router rather
+    // than the state: they are parameters of the middleware stack, fixed when
+    // the table is built (ADR-099).
+    let app =
+        kimmy_api::router_with_limits(Arc::clone(&state), mcp, config.server.request_limits());
     if serving_mcp {
         info!("serving MCP at /mcp");
     }
@@ -362,10 +385,12 @@ pub async fn run(config: Config) -> Result<()> {
         let worker_members = cluster.members.clone();
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
+        let batching = config.vector.batch.settings();
         Some(tokio::spawn({
             let engine = Arc::clone(&engine);
             async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+                worker.set_batching(batching);
                 worker.set_owner_check(Box::new(move |key| match &worker_members {
                     // No clustering: the candidate set is just this node,
                     // which owns everything.
@@ -1754,6 +1779,8 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);

@@ -47,10 +47,14 @@ Releases are cut by tag. The server ships as a container image, the CLI ships
 everywhere.
 
 ```bash
-# The server — multi-arch (amd64 + arm64) image on GHCR
+# The server — multi-arch (amd64 + arm64) image on GHCR. Pick a root password
+# and generate the signing key (32 bytes minimum): a container listens on
+# every interface, and off loopback the node refuses an example's value for
+# either secret rather than start with one everybody knows.
+export KIMMY_ROOT_PASSWORD=$(openssl rand -base64 18)
 docker run --rm -p 7878:7878 \
-  -e KIMMY_ROOT_PASSWORD=change-me \
-  -e KIMMY_JWT_SECRET=a-long-random-secret \
+  -e KIMMY_ROOT_PASSWORD \
+  -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
   -v kimmy-data:/var/lib/kimmy \
   ghcr.io/titusai-io/kimmydb:latest
 
@@ -68,15 +72,19 @@ break things and the [changelog](CHANGELOG.md) says so; a patch never does.
 ## Quick start
 
 ```bash
+# Pick a root password once; both variants below and the login after them
+# read it from the environment.
+export KIMMY_ROOT_PASSWORD=$(openssl rand -base64 18)
+
 # From source
-KIMMY_ROOT_PASSWORD=change-me KIMMY_JWT_SECRET=a-long-random-secret \
+KIMMY_JWT_SECRET=$(openssl rand -base64 32) \
   cargo run --bin kimmyd -- --bind 127.0.0.1:7878 --data-dir ./data
 
 # Docker
 docker build -t kimmydb .
 docker run --rm -p 7878:7878 \
-  -e KIMMY_ROOT_PASSWORD=change-me \
-  -e KIMMY_JWT_SECRET=a-long-random-secret \
+  -e KIMMY_ROOT_PASSWORD \
+  -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
   -v kimmy-data:/var/lib/kimmy \
   kimmydb
 ```
@@ -86,7 +94,7 @@ Then drive it:
 ```bash
 TOKEN=$(curl -s -XPOST localhost:7878/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"user":"root","password":"change-me"}' | jq -r .token)
+  -d "{\"user\":\"root\",\"password\":\"$KIMMY_ROOT_PASSWORD\"}" | jq -r .token)
 A="Authorization: Bearer $TOKEN"
 
 curl -s -XPOST localhost:7878/v1/db/shop/collections -H "$A" -d '{"name":"orders"}'
@@ -164,9 +172,9 @@ The settings worth knowing before you deploy:
 
 | Setting | Env var | Why it matters |
 |---|---|---|
-| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | Required unless `--insecure-no-auth`. Bootstrap superuser, created on first start only. |
-| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | **Required whenever auth is on**, single node or cluster — the node refuses to start without one rather than sign tokens with a built-in constant. 16 bytes minimum, and **identical on every node**, or a token issued by one node is rejected by the next. |
-| `auth.jwt_previous_secret` | `KIMMY_JWT_PREVIOUS_SECRET` | Optional, during a rotation only: the secret being retired. Tokens it signed stay valid while it is set; new tokens are signed with `jwt_secret`. Remove it one `token_ttl_secs` after rolling the new secret out. See [Rotating the signing secret](docs/security.md#rotating-the-signing-secret). |
+| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | Required unless `--insecure-no-auth`. Bootstrap superuser, created on first start only. Off loopback, a value from this repository's examples (`changeme`, `hunter2`, …) is refused. |
+| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | **Required whenever auth is on**, single node or cluster — the node refuses to start without one rather than sign tokens with a built-in constant. 32 bytes minimum, and **identical on every node**, or a token issued by one node is rejected by the next. |
+| `auth.jwt_previous_secret` | `KIMMY_JWT_PREVIOUS_SECRET` | Optional, during a rotation only: the secret being retired. Tokens it signed stay valid while it is set; new tokens are signed with `jwt_secret`. Held to the same minimum and the same placeholder refusal. Remove it one `token_ttl_secs` after rolling the new secret out. See [Rotating the signing secret](docs/security.md#rotating-the-signing-secret). |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | Optional. Federate with an external OIDC provider alongside local users; obliges `auth.oidc.audience`, and `https` only. `admin` cannot be granted through it; `ddl` can. See [Security](docs/security.md). |
 | `cluster.seeds` | `KIMMY_SEEDS` | Where to look for peers. `k8s:<headless-svc>`, `dns:<name>`, `dns-srv:<name>`, `static:<host:port,...>`, or a bare `host:port`. |
 | `cluster.cluster_secret` | `KIMMY_CLUSTER_SECRET` | Authenticates node-to-node traffic. Required when clustering. |
