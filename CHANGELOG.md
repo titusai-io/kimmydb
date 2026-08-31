@@ -333,6 +333,34 @@ whose defaults are meant to be left alone, and documentation corrections.
   window under writes and up to three times when a build was discarded. It
   now reads only keys and vectors, frees each vector as the graph takes it,
   and probes with a 128-vector sample copied out first.
+- **A search `filter` uses secondary indexes, and a selective one is joined
+  the other way round.** `vector_search` and `hybrid_search` evaluated
+  `filter` by scanning the source collection and keeping every matching id,
+  whatever indexes existed. The filter now runs through the query planner —
+  primary key, secondary index or scan, with the same recheck `find`
+  applies — and keeps only the ids, a page at a time. When it admits at most
+  1,000 documents the search reads those documents' chunks by key and scores
+  them exactly, instead of searching everything and discarding what the
+  filter excluded; above that it searches as before and discards. The hits
+  are the same either way, and for a selective filter they are now exact
+  where the graph walk could previously come back with fewer than `k`.
+  [docs/vectors.md](docs/vectors.md#search) describes the rule; ADR-102 the
+  reasoning.
+- **The exact and lexical search paths hold only the top `k`.** The exact
+  vector path — collections under 500 chunks, the `dot` metric, a failed
+  graph build — and the lexical half of `hybrid_search` built a hit, text
+  included, for every chunk they scored and sorted the lot. Both now keep a
+  bounded set of the best `k` as chunks arrive, with the per-document cap
+  applied on the way in, so a search over a large shadow collection costs
+  memory proportional to `k`. Ties on score are ordered by chunk key rather
+  than by scan order: stable either way, but a different order for exact
+  ties.
+- **Reading one document's vectors no longer scans the shadow collection.**
+  A document's chunks are one contiguous run under its id, and
+  `GET .../docs/{id}/vectors`, the write of a document's vectors and the
+  embedding worker's staleness check now read that run rather than every
+  record in the shadow. Same results; the cost is the document's chunk count
+  instead of the collection's.
 
 ### Fixed
 

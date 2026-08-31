@@ -6924,3 +6924,101 @@ async fn an_opaque_audience_still_challenges_but_names_no_metadata() {
     assert!(challenge.starts_with("Bearer "), "{challenge}");
     assert!(!challenge.contains("resource_metadata="), "there is no document to name: {challenge}");
 }
+
+#[tokio::test]
+async fn a_search_filter_uses_the_index_and_returns_the_filtered_top_k() {
+    // The filter is planned like a `find` — here through an index on `tag` —
+    // and, admitting a small set, is joined by reading those documents'
+    // chunks. The result must be the filtered nearest neighbours in order,
+    // text included, for vector and hybrid search alike; and `find` with
+    // `explain` on the same filter shows the strategy the search got.
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/docs/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "tag" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+
+    // Nearest to the query first: a, b, c, d, e. Only b, d and e carry the tag.
+    let docs = [
+        ("a", "other", [1.0, 0.0, 0.0]),
+        ("b", "wanted", [0.9, 0.1, 0.0]),
+        ("c", "other", [0.8, 0.2, 0.0]),
+        ("d", "wanted", [0.7, 0.3, 0.0]),
+        ("e", "wanted", [0.0, 1.0, 0.0]),
+    ];
+    for (id, tag, vector) in docs {
+        server
+            .post(
+                "/v1/db/shop/coll/docs/docs",
+                Some(&token),
+                json!({ "_id": id, "tag": tag, "text": format!("text of {id}") }),
+            )
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": format!("text of {id}") }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+
+    let explained = server
+        .post(
+            "/v1/db/shop/coll/docs/find",
+            Some(&token),
+            json!({ "filter": { "tag": "wanted" }, "explain": true }),
+        )
+        .await;
+    assert_eq!(explained.body["explain"]["strategy"], "index", "{:?}", explained.body);
+
+    let found = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2, "filter": { "tag": "wanted" } }),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{:?}", found.body);
+    let matches = found.body["matches"].as_array().unwrap();
+    let ids: Vec<&str> = matches.iter().map(|m| m["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["b", "d"], "the two nearest *tagged* documents: {:?}", found.body);
+    assert_eq!(matches[0]["text"], "text of b", "the text travels with the hit");
+    assert!(matches[0]["score"].as_f64().unwrap() > matches[1]["score"].as_f64().unwrap());
+
+    // A filter admitting nothing returns nothing rather than failing.
+    let none = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2, "filter": { "tag": "absent" } }),
+        )
+        .await;
+    assert_eq!(none.status, 200, "{:?}", none.body);
+    assert_eq!(none.body["count"], 0);
+
+    // Hybrid's dense half is filtered the same way; "e" is the keyword and
+    // is tagged, so it fuses in, while "a" and "c" cannot appear.
+    let hybrid = server
+        .post(
+            "/v1/db/shop/coll/docs/hybrid_search",
+            Some(&token),
+            json!({ "query": "e", "vector": [1.0, 0.0, 0.0], "k": 3, "filter": { "tag": "wanted" } }),
+        )
+        .await;
+    assert_eq!(hybrid.status, 200, "{:?}", hybrid.body);
+    let ids: Vec<&str> = hybrid.body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"b") && ids.contains(&"e"), "{:?}", hybrid.body);
+    assert!(!ids.contains(&"a") && !ids.contains(&"c"), "{:?}", hybrid.body);
+}

@@ -341,6 +341,35 @@ ingestion never happened.
 ids restrict the search — which is what lets semantic search compose with
 structured querying instead of being a separate world.
 
+It is planned the way a `find` is: a filter that pins `_id` is a primary-key
+read, a filter on an indexed field uses the index, anything else scans the
+collection — every candidate rechecked against the full filter either way —
+and only the ids are kept, a page at a time. An index on a field that searches
+filter by speeds the search up exactly as it speeds up `find`, and `find` with
+`explain: true` on the same filter shows which strategy the search will get
+([Indexes](indexes.md#did-it-get-used)).
+
+What happens next depends on how many documents the filter admitted:
+
+- **At most 1,000**: the search reads those documents' chunks from the shadow
+  collection by key — a document's chunks are one contiguous run under its id —
+  and scores them exactly. The cost is the size of the admitted set, not the
+  collection, and the answer is exact whichever path the collection would
+  otherwise take.
+- **More than 1,000**: the search runs as it would without a filter, exact
+  scan or graph walk, and discards hits outside the set. The graph is asked for
+  eight times the candidates when a filter is present so that discarding still
+  leaves `k`; an unselective filter discards little, which is what makes this
+  the right direction for it.
+
+The boundary is a count rather than a fraction of the collection because the
+first direction's cost does not depend on the collection: a thousand
+documents' chunks read by key is the same work over a million documents as
+over two thousand. Below it the join is bounded and exact; above it the set is
+large enough that a graph walk finds mostly admitted candidates. A filter that
+admits nothing returns nothing without touching a vector. The rule and its
+alternatives are [ADR-102](decisions.md).
+
 `per_document` caps how many chunks of one document may occupy result slots.
 Without it, a single long document can fill every slot with its own chunks.
 
@@ -450,7 +479,11 @@ graph TD
 
 The exact path scores every stored vector — O(n), no recall loss, no index to
 keep consistent. It is both the path small collections take and the **oracle**
-the approximate path is tested against.
+the approximate path is tested against. It holds only the best `k` while it
+scans: a bounded set with the per-document cap applied as chunks arrive, so
+its memory is the size of the answer rather than of the collection. The
+lexical half of hybrid search is ranked the same way. Ties on score are broken
+by the chunk's key, so equal scores come back in a stable order.
 
 The approximate path walks an HNSW graph. Crucially, the graph only supplies
 *candidates*: every candidate is then re-scored from the vector currently in

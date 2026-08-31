@@ -5175,6 +5175,94 @@ and its rotation remains what it was.
 
 ---
 
+## ADR-102 — Vector-search filters use the planner, and the exact and lexical paths hold only the top k
+
+**Decision.** The `filter` of `vector_search` and `hybrid_search` is evaluated
+by the executor's planner-backed read — the primary key when it pins `_id`, a
+secondary index when one applies, a collection scan otherwise, every candidate
+rechecked against the full filter — and only the matching ids are kept, a
+page at a time. The join with the shadow collection then runs in whichever
+direction is cheaper: when the filter admits at most 1,000 documents, their
+chunks are read by key and scored exactly; above that, the search runs as it
+would unfiltered and hits outside the set are discarded. Separately, the exact
+vector path and the lexical half of hybrid search rank through a bounded set
+that holds the best `k` chunks — the per-document cap applied as chunks
+arrive, ties broken by chunk key — rather than collecting a hit per chunk and
+sorting.
+
+**Why.** Both paths held memory in proportion to the collection for a request
+whose answer is `k` hits. The filter was a `for_each_doc` over the source
+collection with no planner at all, building a set of every matching id, so an
+index on the filtered field bought nothing and a filter that admitted three
+documents still decoded a million. The exact path (every collection under 500
+chunks, every `dot`-metric collection, and the fallback for a failed graph
+build) and the lexical path (every hybrid search, at four times `k`) pushed a
+hit — text included — for every chunk they scored and sorted the vector.
+ADR-098 states the rule these break: a read may hold what it returns, not what
+it walks. Routing the filter through `exec` is also what makes the answer
+consistent with `find`: the same plan, the same recheck, the same primary-key
+short cut, and `explain` on a `find` with the same filter tells an operator
+what the search will get.
+
+**Why the join has two directions and a fixed boundary.** With the allowed set
+in hand, reading the admitted documents' chunks by key costs the size of the
+set and is exact; scanning or walking the graph and discarding costs the size
+of the collection, and for the graph is approximate twice over — the walk is
+widened eightfold when a filter is present and still returns fewer than `k`
+when the set is small. So the keyed join wins whenever the set is small, and
+the discard join wins when the set is most of the collection, because then the
+graph's candidates are mostly admitted anyway. The boundary is a count rather
+than a fraction because the keyed join's cost does not depend on the
+collection: a thousand documents' chunks read by key is the same work over a
+million documents as over two thousand, and a thousand is comfortably past the
+widest window any request can ask for (`MAX_K` is 1,000, and hybrid's halves
+run at `4k`). A fraction would need the collection's size, which is a scan to
+learn. A document's chunks are one contiguous run under its id because chunk
+keys are `{source}#{chunk}` and string keys encode in `_id` order, so the keyed
+read is a bounded range, not a probe per chunk number; the same run now serves
+the single-document reads (`get_vectors`, the worker's staleness check), which
+were each a scan of the shadow.
+
+**Why a bounded set with the cap inside it.** The per-document cap is what
+stops a long document filling every slot, and it cannot be applied after a
+heap of size `k` without making the heap unbounded — a document with ten
+thousand chunks better than everything else would need all ten thousand held
+to find the other nine documents. Applied on insertion it is exact: a chunk
+of a document already holding its allowance has to displace that document's
+own worst or it is out regardless of where it stands globally, and a chunk
+that cannot beat the set's worst is out regardless of its document. Ties are
+broken by the chunk's key so that equal scores rank the same way on every
+run and on both join directions; the old stable sort ordered them by scan
+position, which the keyed join does not have.
+
+**Alternatives.** *Filtered traversal inside the graph* — passing the allowed
+set to the walk so it never visits an excluded node — is the right long-term
+answer for the middle ground, a filter that admits ten thousand of a million,
+where the keyed join reads too much and the discard join finds too little. It
+needs a graph that exposes its traversal, which the current one does not, and
+is deferred. *A per-collection inverted index for the lexical half* would make
+keyword search a posting-list merge rather than a scan and tokenisation of
+every chunk; it needs term statistics maintained under replicated writes, and
+the hybrid fusion-controls change (#181) already defers a BM25 lexical half
+on the same ground. The bounded set makes the scan's memory acceptable
+meanwhile; its time is still linear. *A proportion of the collection as the
+boundary* was rejected above. *Reading the matched documents in one call*
+rather than in pages was rejected because an unselective filter would then
+hold every matching document at once — the failure ADR-098 names — where the
+paged read holds a page and the ids.
+
+**Cost.** A filter admitting between a few hundred and a thousand documents
+on a small collection reads by key what a scan would have read in sequence:
+the same records, a seek apiece. The tie order among equal scores changed
+from scan position to chunk key; it was never specified. The paged read of the
+filter re-plans once per page, which on an index plan today gathers the range's
+candidate keys per page; the executor's streaming visitor makes that a seek,
+and the filter's read is written to become one call to it. Hybrid search's
+lexical half still ignores `filter` — a pre-existing gap this change neither
+widens nor closes.
+
+---
+
 ## ADR-103 — HNSW graphs are built off the lock and live under a budget
 
 **Decision.** `IndexCache` takes its cache-wide lock only to look an entry up
