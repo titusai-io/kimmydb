@@ -358,6 +358,41 @@ func (c *Client) Update(ctx context.Context, db, collection string, filter, upda
 		map[string]any{"filter": filter, "update": update, "multi": multi}, unsafeToRetry)
 }
 
+// UpdateOptions is everything the update route takes, for UpdateWith.
+type UpdateOptions struct {
+	// Multi updates every match rather than only the first.
+	Multi bool
+	// IfStamp makes a single-document update conditional on its version; see
+	// UpdateIf. Cannot be combined with Multi.
+	IfStamp string
+	// ArrayFilters selects the elements the update's `$[<identifier>]` path
+	// segments address, one document per identifier:
+	// []map[string]any{{"line.sku": "b"}} for
+	// {"$set": {"items.$[line].shipped": true}}. Every identifier a path uses
+	// needs one and every filter must be used; `$[]` addresses every element
+	// and needs none.
+	ArrayFilters []map[string]any
+}
+
+func (o UpdateOptions) body(filter, update map[string]any) map[string]any {
+	body := map[string]any{"filter": filter, "update": update, "multi": o.Multi}
+	if o.IfStamp != "" {
+		body["if_stamp"] = o.IfStamp
+	}
+	if len(o.ArrayFilters) > 0 {
+		body["arrayFilters"] = o.ArrayFilters
+	}
+	return body
+}
+
+// UpdateWith is Update with every option the route takes. Update and UpdateIf
+// cover the two common shapes; this is for ArrayFilters, or more than one
+// option at once.
+func (c *Client) UpdateWith(ctx context.Context, db, collection string, filter, update map[string]any, options UpdateOptions) (map[string]any, error) {
+	return c.request(ctx, http.MethodPost, path(db, collection, "update"),
+		options.body(filter, update), unsafeToRetry)
+}
+
 // Delete removes matching documents.
 func (c *Client) Delete(ctx context.Context, db, collection string, filter map[string]any, multi bool) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "delete"),

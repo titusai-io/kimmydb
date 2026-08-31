@@ -201,6 +201,7 @@ both — mixing them is rejected rather than guessed at.
 | `$pull` `$pop` | Remove matching elements / one end |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
+| `$[]` / `$[<identifier>]` in a path | Address array elements — see [Positional updates](#positional-updates) |
 
 ```javascript
 { "$inc": { "qty": -1 }, "$push": { "history": "shipped" } }
@@ -252,6 +253,67 @@ the same path, or one inside the other, counting a `$rename`'s destination — i
 **rejected at parse time**, as MongoDB rejects it: the two would disagree about
 the inserted document. Other operator pairs are not checked against each other
 and apply in the order written (see [Deviations](deviations.md)).
+
+### Positional updates
+
+A path may address the elements of an array, not only the array itself or a
+numeric index into it. `$[]` names every element; `$[<identifier>]` names the
+elements an `arrayFilters` entry on the request selects. This is how one line
+item is changed without replacing the order — and without losing whatever a
+concurrent update did to the order's other fields:
+
+```javascript
+// POST /v1/db/shop/coll/orders/update — mark one line shipped, touch nothing else
+{
+  "filter": { "_id": 42 },
+  "update": { "$set": { "items.$[line].shipped": true } },
+  "arrayFilters": [ { "line.sku": "gasket" } ]
+}
+
+// Every element
+{ "$inc": { "items.$[].qty": 1 } }
+
+// Nested: one order's one line, with one filter per identifier
+{ "$set": { "orders.$[o].items.$[i].qty": 0 } }      // arrayFilters: [ { "o.id": 2 }, { "i.sku": "b" } ]
+```
+
+The rules, which are MongoDB's:
+
+- **One identifier per filter document.** Every top-level field of an
+  `arrayFilters` entry starts with the same identifier, and the filter is
+  evaluated against each element with that prefix removed: `{"line.qty":
+  {"$gt": 5}}` tests `{"qty": {"$gt": 5}}` against each element. Any filter
+  operator works, and several fields test the same element, as `$elemMatch`
+  would. A bare `{"line": {"$gte": 80}}` tests the element itself, which is
+  how an array of scalars is addressed. `$and`, `$or` and `$nor` may group
+  conditions on the identifier.
+- **Every identifier used needs exactly one filter, and every filter must be
+  used.** An identifier without a filter, a filter no path uses, or two filters
+  for one identifier is a `400`. A filter nothing refers to is almost always a
+  misspelt identifier, and applying the update regardless would change
+  elements the caller never selected.
+- **Identifiers** start with a lowercase letter and contain only letters and
+  digits.
+- **There must be an array to select from.** A positional segment where the
+  field is missing, or holds something other than an array, is an error for
+  that document and the request fails. It does not create an array or treat a
+  scalar as a one-element one.
+- **No element selected is not an error.** The operator has nothing to do; the
+  document is written back as it was, and `modified` counts it, as it counts
+  [every write](#modified-counts-writes-not-changes).
+- **Every operator that takes a path accepts one**, except `$rename`, whose
+  source and destination are fixed places. `$unset` of an element leaves
+  `null` in its position rather than closing the gap, so the other elements
+  keep their indices — the same rule as `$unset` of `items.1`.
+
+**`$` — MongoDB's "the element the query matched" — is not implemented.** It
+depends on the filter reporting *which* element satisfied it, which the
+matcher does not track, and `$[<identifier>]` says the same thing without
+depending on the query: `{"items.sku": "gasket"}` with `items.$.shipped` is
+`items.$[line].shipped` with `[{"line.sku": "gasket"}]` — and the second form
+reaches every gasket line rather than only the first. An update that uses `$`
+is refused with a message that says so. Recorded in
+[Deviations](deviations.md); the reasoning is ADR-104.
 
 ### Integers stay integral
 
@@ -417,7 +479,8 @@ bad pattern in an `$or` should not take down the whole request.
 | Feature | Status |
 |---|---|
 | `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not an [aggregation](aggregation.md) stage |
-| `$pullAll`, `$bit`, and the positional update paths `$`, `$[]`, `$[<id>]` | 📋 Planned — the next tier of update-operator compatibility |
+| `$pullAll` and `$bit` | 📋 Planned — the next tier of update-operator compatibility |
+| `$` positional update operator (`items.$.qty`) | ⛔ Not planned — the matcher does not report which element a filter matched, and `$[<identifier>]` with `arrayFilters` expresses the same thing without depending on the query; see [Positional updates](#positional-updates) |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |

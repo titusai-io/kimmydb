@@ -228,6 +228,12 @@ pub struct UpdateArgs {
     /// Update every match rather than only the first.
     #[serde(default)]
     pub multi: bool,
+    /// Filters for the `$[<identifier>]` segments in update paths, one
+    /// document per identifier, for example `[{"line.sku": "b"}]` with
+    /// `{"$set": {"items.$[line].shipped": true}}`. `$[]` addresses every
+    /// element and needs no filter.
+    #[serde(default, rename = "arrayFilters")]
+    pub array_filters: Vec<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -494,7 +500,10 @@ impl KimmyMcp {
     #[tool(description = "Apply update operators ($set, $unset, $inc, $mul, $min, $max, \
                        $rename, $currentDate, $push, $pull, $addToSet, $pop) to \
                        documents matching a filter. Only the first match is updated \
-                       unless `multi` is true.")]
+                       unless `multi` is true. A path may address array elements: \
+                       `items.$[].qty` for every element, or `items.$[line].qty` for \
+                       the elements an `arrayFilters` entry such as \
+                       `{\"line.sku\": \"b\"}` selects.")]
     async fn update(
         &self,
         Parameters(args): Parameters<UpdateArgs>,
@@ -509,6 +518,7 @@ impl KimmyMcp {
             multi: args.multi,
             explain: false,
             if_stamp: None,
+            array_filters: args.array_filters,
         };
         render(exec::update(
             &self.state,
@@ -534,6 +544,7 @@ impl KimmyMcp {
             multi: args.multi,
             explain: false,
             if_stamp: None,
+            array_filters: Vec::new(),
         };
         render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
     }

@@ -17,6 +17,42 @@ Status meanings:
 
 ---
 
+## 🟡 The `$` positional operator is not implemented; `$[<identifier>]` and `$[]` are
+
+**Raised 2026-08-30, with ADR-104.** MongoDB has three ways to address array
+elements in an update path: `$[<identifier>]` (the elements an `arrayFilters`
+entry selects), `$[]` (every element) and `$` (the first element the *query*
+matched). The first two are implemented; `$` is refused at parse time with a
+message that points at the first.
+
+**Why not `$`.** Its meaning depends on which element satisfied the filter,
+and the matcher answers a `bool`: `filter::matches` tests a path's values with
+*any* semantics and never records the index it stopped at. Reporting one would
+mean threading a position out of every comparison, a rule for which position
+wins when several clauses touch arrays (MongoDB's own rule — the last array
+field in the query — is a documented source of surprise), and carrying the
+value from the match into the update inside the write transaction.
+`$[<identifier>]` needs none of that, because its filter is evaluated per
+element at apply time, and it says the same thing more precisely:
+`{"items.sku": "gasket"}` with `items.$.shipped` is `items.$[line].shipped`
+with `[{"line.sku": "gasket"}]`, and the second reaches every gasket line
+rather than the first.
+
+**What differs for a caller.** An update ported from MongoDB that uses `$` is
+a `400` rather than a write; the message names the replacement. Two smaller
+points, both on the strict side: a filter document that names no identifier —
+`{"$and": []}` — is refused rather than read as always-true, and only field
+conditions and `$and`/`$or`/`$nor` are accepted at the top of a filter
+document. A positional update that selects no element writes the document
+back unchanged, so it counts in `modified` exactly as the entry below says a
+no-op `$set` does.
+
+**Closing it** means a second evaluation mode for `Filter::Field` that
+returns the matching element's index, plumbed from `ModifySpec::matches` into
+`update::apply`. Not scheduled: nothing `$` can express is out of reach.
+
+---
+
 ## 🟢 The violations report over-stated after a rewrite (was a documented limit in ADR-087)
 
 **Was.** `GET …/violations` derived "still standing" from "every named
@@ -149,10 +185,20 @@ compares two fields of one element, which MongoDB needs `$map` and
 `$anyElementTrue` for and this database does not have. A strict superset: a
 filter MongoDB accepts means the same thing here.
 
+**`$expr` is *not* accepted in an `arrayFilters` entry, where MongoDB takes
+it.** An entry takes field conditions on its identifier and `$and`/`$or`/`$nor`
+to group them, and refuses every other `$`-operator — the rule predates `$expr`
+joining the filter language (ADR-106 landed after ADR-104) and was left alone
+rather than widened as a side effect of the two meeting. `{"line.qty": {"$gt":
+5}}` covers what an array filter is usually for; comparing two fields *of the
+same element* is what it cannot express.
+
 **To close:** thread a `Result` through `filter::matches` and its callers so
 an evaluation error can surface as a `400`, at which point the first item
 becomes a choice rather than a constraint. The second is a feature, and would
-only be withdrawn if the operator set gained the pipeline-side spelling.
+only be withdrawn if the operator set gained the pipeline-side spelling. The
+third is `update::strip_identifier` letting `$expr` through to the filter
+parser: `filter::matches_element` already answers one, against the element.
 
 ---
 

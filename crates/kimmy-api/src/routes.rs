@@ -960,6 +960,9 @@ struct FindAndModifyRequest {
     /// Write only if the chosen document is at this stamp.
     #[serde(default)]
     if_stamp: Option<String>,
+    /// Which array elements the update's `$[<identifier>]` segments address.
+    #[serde(default, rename = "arrayFilters")]
+    array_filters: Vec<Value>,
 }
 
 async fn find_and_modify(
@@ -987,6 +990,7 @@ async fn find_and_modify(
         return_document,
         projection: body.projection,
         if_stamp: body.if_stamp,
+        array_filters: body.array_filters,
     };
     Ok(Json(exec::find_and_modify(&state, &auth, &db, &coll, spec)?))
 }
@@ -1004,6 +1008,9 @@ struct UpdateRequest {
     /// Write only if the matched document is at this stamp.
     #[serde(default)]
     if_stamp: Option<String>,
+    /// Which array elements the update's `$[<identifier>]` segments address.
+    #[serde(default, rename = "arrayFilters")]
+    array_filters: Vec<Value>,
 }
 
 async fn update_docs(
@@ -1017,6 +1024,7 @@ async fn update_docs(
         multi: body.multi,
         explain: body.explain,
         if_stamp: body.if_stamp,
+        array_filters: body.array_filters,
     };
     Ok(Json(exec::update(&state, &auth, &db, &coll, &body.update, params)?))
 }
@@ -1046,6 +1054,7 @@ async fn delete_docs(
         multi: body.multi,
         explain: body.explain,
         if_stamp: body.if_stamp,
+        array_filters: Vec::new(),
     };
     Ok(Json(exec::delete(&state, &auth, &db, &coll, params)?))
 }

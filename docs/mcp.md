@@ -181,7 +181,7 @@ Both require the collection to have embeddings configured — see
 |---|---|
 | `insert` | One document |
 | `insert_many` | Up to 1000 documents in one commit, all or nothing |
-| `update` | Update operators against a filter |
+| `update` | Update operators against a filter; `arrayFilters` for `$[<identifier>]` paths |
 | `delete` | Delete against a filter |
 | `create_collection` | Required before inserting; a write to a missing collection fails rather than creating it. Needs `ddl` |
 | `create_index` | Secondary index. Needs `ddl` |

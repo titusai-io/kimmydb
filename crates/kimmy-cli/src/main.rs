@@ -34,7 +34,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand};
-use kimmy_client::{Client, ErrorCode, Method, Query, Safety};
+use kimmy_client::{Client, ErrorCode, Method, Query, Safety, UpdateOptions};
 use serde_json::{Value, json};
 
 #[derive(Parser)]
@@ -231,6 +231,11 @@ enum Command {
         update: String,
         #[arg(long)]
         multi: bool,
+        /// A JSON array of filters for the `$[<identifier>]` segments in the
+        /// update's paths, one document per identifier, for example
+        /// `'[{"line.sku": "b"}]'` with `'{"$set": {"items.$[line].shipped": true}}'`.
+        #[arg(long, value_name = "JSON")]
+        array_filters: Option<String>,
     },
     /// Delete matching documents.
     Delete {
@@ -674,11 +679,18 @@ async fn run() -> Result<()> {
             };
             emit(&cli, &client.insert_many(db, coll, documents).await?);
         }
-        Command::Update { target, filter, update, multi } => {
+        Command::Update { target, filter, update, multi, array_filters } => {
             let (db, coll) = split_target(target)?;
             let filter = parse_json("filter", filter)?;
             let update = parse_json("update", update)?;
-            emit(&cli, &client.update(db, coll, &filter, &update, *multi).await?);
+            let mut options = UpdateOptions::new().multi(*multi);
+            if let Some(raw) = array_filters {
+                let Value::Array(filters) = parse_json("array-filters", raw)? else {
+                    bail!("--array-filters must be a JSON array of filter documents");
+                };
+                options = options.array_filters(filters);
+            }
+            emit(&cli, &client.update_with(db, coll, &filter, &update, &options).await?);
         }
         Command::Delete { target, filter, multi } => {
             let (db, coll) = split_target(target)?;

@@ -8,7 +8,9 @@ use bson::{Bson, Document};
 use kimmy_core::cmp::canonical_cmp;
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 
+use crate::filter::{self, Filter};
 use crate::path;
 use crate::shape::{self, SortKey};
 
@@ -25,6 +27,21 @@ pub enum Update {
 pub struct Operation {
     pub path: String,
     pub kind: OpKind,
+    /// The `arrayFilters` entries this path's `$[<identifier>]` segments name,
+    /// resolved at parse time so that applying the operation needs nothing
+    /// but the document. Empty for a path with no named positional segment.
+    pub array_filters: Vec<ArrayFilter>,
+}
+
+/// One entry of a request's `arrayFilters`: the identifier that `$[<identifier>]`
+/// segments refer to it by, and what an array element must satisfy to be
+/// addressed through it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ArrayFilter {
+    pub identifier: String,
+    /// The filter with its identifier prefix removed, evaluated per element by
+    /// [`filter::matches_element`].
+    pub filter: Filter,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -130,6 +147,22 @@ const ID_FIELD: &str = "_id";
 // ---------------------------------------------------------------------------
 
 pub fn parse(doc: &Document) -> Result<Update> {
+    parse_with_filters(doc, &[])
+}
+
+/// Parse an update together with the request's `arrayFilters`.
+///
+/// A path may contain `$[]` (every element) and `$[<identifier>]` (the
+/// elements a filter selects) segments. Each filter document names exactly
+/// one identifier — every top-level field starts with it — and is evaluated
+/// against each element with that prefix removed: `{"line.qty": {$gt: 5}}`
+/// tests `{qty: {$gt: 5}}` against each element, and a bare `{"line": {$gt:
+/// 5}}` tests the element itself, which is how an array of scalars is
+/// addressed. Every identifier a path uses must have a filter, and every
+/// filter must be used by some path: a filter nothing refers to is nearly
+/// always a misspelt identifier, and applying the update regardless would
+/// change elements the caller never selected.
+pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<Update> {
     let has_operators = doc.keys().any(|k| k.starts_with('$'));
     let has_plain = doc.keys().any(|k| !k.starts_with('$'));
 
@@ -139,8 +172,16 @@ pub fn parse(doc: &Document) -> Result<Update> {
         ));
     }
     if !has_operators {
+        if !array_filters.is_empty() {
+            return Err(Error::InvalidUpdate(
+                "arrayFilters apply to update operators, not to a replacement document".into(),
+            ));
+        }
         return Ok(Update::Replace(doc.clone()));
     }
+
+    let filters = parse_array_filters(array_filters)?;
+    let mut used = BTreeSet::new();
 
     let mut operations = Vec::new();
     for (key, value) in doc {
@@ -152,12 +193,170 @@ pub fn parse(doc: &Document) -> Result<Update> {
             if target_path == ID_FIELD {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
-            operations.push(Operation { path: target_path.clone(), kind: parse_op(op, arg)? });
+            let kind = parse_op(op, arg)?;
+            let identifiers = positional_identifiers(target_path)?;
+            if let OpKind::Rename(target) = &kind
+                && (has_positional(target_path) || has_positional(target))
+            {
+                // A rename names two fixed places; "wherever the filter
+                // matches" is not a place a value can be moved from or to.
+                return Err(Error::InvalidUpdate(
+                    "$rename cannot use positional segments in its source or destination".into(),
+                ));
+            }
+            let mut op_filters = Vec::new();
+            for identifier in identifiers {
+                let Some(found) = filters.iter().find(|f| f.identifier == identifier) else {
+                    return Err(Error::InvalidUpdate(format!(
+                        "the update path {target_path:?} uses identifier {identifier:?}, but \
+                         arrayFilters has no filter for it"
+                    )));
+                };
+                used.insert(identifier);
+                op_filters.push(found.clone());
+            }
+            operations.push(Operation {
+                path: target_path.clone(),
+                kind,
+                array_filters: op_filters,
+            });
         }
+    }
+
+    if let Some(unused) = filters.iter().find(|f| !used.contains(&f.identifier)) {
+        return Err(Error::InvalidUpdate(format!(
+            "arrayFilters names identifier {:?}, which no update path uses",
+            unused.identifier
+        )));
     }
 
     reject_set_on_insert_conflicts(&operations)?;
     Ok(Update::Operators(operations))
+}
+
+/// Whether a path has any `$[...]` segment.
+fn has_positional(path: &str) -> bool {
+    path::segments(path).iter().any(|segment| segment.starts_with("$["))
+}
+
+/// Check a path's positional segments and return the identifiers they name,
+/// in order of first use and without repeats. `$[]` names none.
+fn positional_identifiers(path: &str) -> Result<Vec<String>> {
+    let mut identifiers: Vec<String> = Vec::new();
+    for (position, segment) in path::segments(path).iter().enumerate() {
+        if *segment == "$" {
+            return Err(Error::InvalidUpdate(format!(
+                "the `$` positional operator is not supported (in path {path:?}); use \
+                 `$[<identifier>]` with arrayFilters, or `$[]` for every element"
+            )));
+        }
+        let Some(inner) = segment.strip_prefix("$[") else {
+            continue;
+        };
+        let Some(identifier) = inner.strip_suffix(']') else {
+            return Err(Error::InvalidUpdate(format!(
+                "malformed positional segment {segment:?} in path {path:?}"
+            )));
+        };
+        if position == 0 {
+            return Err(Error::InvalidUpdate(format!(
+                "path {path:?} begins with a positional segment, but a document is not an array"
+            )));
+        }
+        if identifier.is_empty() {
+            continue;
+        }
+        check_identifier(identifier)?;
+        if !identifiers.iter().any(|known| known == identifier) {
+            identifiers.push(identifier.to_string());
+        }
+    }
+    Ok(identifiers)
+}
+
+/// MongoDB's rule for an identifier: a lowercase letter, then letters and
+/// digits. Kept so that a filter written for MongoDB is accepted unchanged and
+/// one written here is accepted there.
+fn check_identifier(identifier: &str) -> Result<()> {
+    let mut chars = identifier.chars();
+    let well_formed = chars.next().is_some_and(|c| c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric());
+    if well_formed {
+        Ok(())
+    } else {
+        Err(Error::InvalidUpdate(format!(
+            "array filter identifier {identifier:?} must start with a lowercase letter and \
+             contain only letters and digits"
+        )))
+    }
+}
+
+/// Parse the request's `arrayFilters` documents.
+fn parse_array_filters(docs: &[Document]) -> Result<Vec<ArrayFilter>> {
+    let mut out: Vec<ArrayFilter> = Vec::new();
+    for doc in docs {
+        let mut identifier = None;
+        let stripped = strip_identifier(doc, &mut identifier)?;
+        let Some(identifier) = identifier else {
+            return Err(Error::InvalidUpdate(format!(
+                "an arrayFilters entry must name an identifier in every field, as in \
+                 {{\"line.qty\": ...}}; got {doc}"
+            )));
+        };
+        check_identifier(&identifier)?;
+        if out.iter().any(|f| f.identifier == identifier) {
+            return Err(Error::InvalidUpdate(format!(
+                "arrayFilters has more than one filter for identifier {identifier:?}"
+            )));
+        }
+        let filter = filter::parse(&stripped)?;
+        out.push(ArrayFilter { identifier, filter });
+    }
+    Ok(out)
+}
+
+/// Rewrite a filter document with the identifier prefix removed from every
+/// field, recording the identifier and refusing a second one. `{"line.qty":
+/// 1}` becomes `{"qty": 1}`; a bare `{"line": 1}` becomes `{"": 1}`, the empty
+/// path that [`filter::matches_element`] reads as the element itself.
+/// `$and`/`$or`/`$nor` are rewritten through; no other `$`-operator has a
+/// meaning at the top of an array filter.
+fn strip_identifier(doc: &Document, identifier: &mut Option<String>) -> Result<Document> {
+    let mut out = Document::new();
+    for (key, value) in doc {
+        if let Some(op) = key.strip_prefix('$') {
+            if !matches!(op, "and" | "or" | "nor") {
+                return Err(Error::InvalidUpdate(format!(
+                    "an arrayFilters entry takes field conditions and $and/$or/$nor, not ${op}"
+                )));
+            }
+            let Bson::Array(branches) = value else {
+                return Err(Error::InvalidUpdate(format!("${op} requires an array")));
+            };
+            let mut rewritten = Vec::with_capacity(branches.len());
+            for branch in branches {
+                let Bson::Document(branch) = branch else {
+                    return Err(Error::InvalidUpdate(format!("${op} requires documents")));
+                };
+                rewritten.push(Bson::Document(strip_identifier(branch, identifier)?));
+            }
+            out.insert(key.clone(), Bson::Array(rewritten));
+            continue;
+        }
+        let (prefix, rest) = key.split_once('.').unwrap_or((key.as_str(), ""));
+        match identifier {
+            Some(seen) if seen != prefix => {
+                return Err(Error::InvalidUpdate(format!(
+                    "an arrayFilters entry names one identifier, but this one names both \
+                     {seen:?} and {prefix:?}"
+                )));
+            }
+            Some(_) => {}
+            None => *identifier = Some(prefix.to_string()),
+        }
+        out.insert(rest, value.clone());
+    }
+    Ok(out)
 }
 
 /// Refuse a `$setOnInsert` that shares a path — or a prefix of one — with any
@@ -380,15 +579,112 @@ fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) ->
         Update::Operators(ops) => ops,
     };
 
+    // `$setOnInsert` first and only for an inserted document, then everything
+    // else — each through `apply_expanded`, so a positional path is expanded
+    // whichever of the two passes carries it.
     let on_insert = |op: &&Operation| matches!(op.kind, OpKind::SetOnInsert(_));
     if target == Target::Inserted {
         for op in operations.iter().filter(on_insert) {
-            apply_one(op, doc, now_ms)?;
+            apply_expanded(op, doc, now_ms)?;
         }
     }
     for op in operations.iter().filter(|op| !on_insert(op)) {
-        apply_one(op, doc, now_ms)?;
+        apply_expanded(op, doc, now_ms)?;
     }
+    Ok(())
+}
+
+/// One operation, applied through however many concrete paths its positional
+/// segments name.
+///
+/// The segments are resolved against the document as it is before the
+/// operation touches it, and each concrete index path is then applied in turn.
+/// Positions stay valid across those applications because `$unset` leaves a
+/// null hole rather than shifting the elements after it.
+fn apply_expanded(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
+    if !has_positional(&op.path) {
+        return apply_one(op, doc, now_ms);
+    }
+    for concrete in expand_positional(&op.path, &op.array_filters, doc)? {
+        let at = Operation { path: concrete, kind: op.kind.clone(), array_filters: Vec::new() };
+        apply_one(&at, doc, now_ms)?;
+    }
+    Ok(())
+}
+
+/// The concrete index paths a positional path names in `doc`, in element
+/// order: `items.$[line].qty` over a document whose second and fourth line
+/// items satisfy `line` becomes `["items.1.qty", "items.3.qty"]`. An empty
+/// result means no element was selected, and the operation leaves the
+/// document as it found it.
+fn expand_positional(path: &str, filters: &[ArrayFilter], doc: &Document) -> Result<Vec<String>> {
+    let segments = path::segments(path);
+    let (head, rest) = segments.split_first().expect("non-empty path");
+    let mut prefix = vec![(*head).to_string()];
+    let mut out = Vec::new();
+    expand_into(doc.get(*head), rest, filters, path, &mut prefix, &mut out)?;
+    Ok(out)
+}
+
+fn expand_into(
+    value: Option<&Bson>,
+    segments: &[&str],
+    filters: &[ArrayFilter],
+    path: &str,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    let Some((head, rest)) = segments.split_first() else {
+        out.push(prefix.join("."));
+        return Ok(());
+    };
+
+    if let Some(identifier) = head.strip_prefix("$[").and_then(|s| s.strip_suffix(']')) {
+        // A positional segment has nothing to select from unless there is an
+        // array here. Creating one, or treating a scalar as a one-element
+        // array, would write somewhere the caller did not point at.
+        let Some(Bson::Array(items)) = value else {
+            let at = prefix.join(".");
+            return Err(Error::InvalidUpdate(match value {
+                None => format!("the path {at:?} must exist to apply {head:?} in {path:?}"),
+                Some(_) => {
+                    format!("the path {at:?} must be an array to apply {head:?} in {path:?}")
+                }
+            }));
+        };
+        let selector = match identifier {
+            "" => None,
+            named => Some(
+                &filters
+                    .iter()
+                    .find(|f| f.identifier == named)
+                    .ok_or_else(|| {
+                        Error::InvalidUpdate(format!("no array filter for identifier {named:?}"))
+                    })?
+                    .filter,
+            ),
+        };
+        for (index, item) in items.iter().enumerate() {
+            if selector.is_none_or(|f| filter::matches_element(f, item)) {
+                prefix.push(index.to_string());
+                expand_into(Some(item), rest, filters, path, prefix, out)?;
+                prefix.pop();
+            }
+        }
+        return Ok(());
+    }
+
+    // A plain segment descends when it can; when it cannot, the remaining
+    // segments are carried along as they are, and the operator decides what
+    // an absent path means (`$set` creates it, `$pull` ignores it).
+    let next = match value {
+        Some(Bson::Document(child)) => child.get(*head),
+        Some(Bson::Array(items)) => head.parse::<usize>().ok().and_then(|i| items.get(i)),
+        _ => None,
+    };
+    prefix.push((*head).to_string());
+    expand_into(next, rest, filters, path, prefix, out)?;
+    prefix.pop();
     Ok(())
 }
 
@@ -971,6 +1267,401 @@ mod tests {
     #[test]
     fn operators_require_a_document_argument() {
         assert!(parse(&doc! { "$set": 1 }).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // Positional paths: `$[]` and `$[<identifier>]` with arrayFilters
+    // -----------------------------------------------------------------------
+
+    fn applied_with(update: Document, filters: Vec<Document>, mut doc: Document) -> Document {
+        let parsed =
+            parse_with_filters(&update, &filters).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        apply(&parsed, &mut doc, NOW).unwrap_or_else(|e| panic!("apply failed: {e}"));
+        doc
+    }
+
+    fn apply_err_with(update: Document, filters: Vec<Document>, mut doc: Document) -> String {
+        let parsed = match parse_with_filters(&update, &filters) {
+            Ok(p) => p,
+            Err(e) => return e.to_string(),
+        };
+        apply(&parsed, &mut doc, NOW).unwrap_err().to_string()
+    }
+
+    fn order() -> Document {
+        doc! {
+            "_id": 1,
+            "items": [
+                { "sku": "a", "qty": 1, "shipped": false },
+                { "sku": "b", "qty": 5, "shipped": false },
+                { "sku": "c", "qty": 9, "shipped": false },
+            ]
+        }
+    }
+
+    /// The `shipped` flag of each line item, in order.
+    fn shipped(order: &Document) -> Vec<bool> {
+        order
+            .get_array("items")
+            .unwrap()
+            .iter()
+            .map(|line| line.as_document().unwrap().get_bool("shipped").unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_filtered_identifier_reaches_one_element() {
+        // The line-item case the feature exists for: mark one line shipped
+        // without rewriting the document.
+        let out = applied_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.sku": "b" }],
+            order(),
+        );
+        assert_eq!(shipped(&out), vec![false, true, false]);
+    }
+
+    #[test]
+    fn every_matching_element_is_updated() {
+        let out = applied_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.qty": { "$gt": 2 } }],
+            order(),
+        );
+        assert_eq!(shipped(&out), vec![false, true, true]);
+    }
+
+    #[test]
+    fn a_filter_may_combine_several_conditions_on_the_element() {
+        // Two fields of the same element, as `$elemMatch` would test them.
+        let out = applied_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.qty": { "$gt": 2 }, "line.sku": "c" }],
+            order(),
+        );
+        assert_eq!(shipped(&out), vec![false, false, true]);
+
+        // And through `$or`, which is rewritten branch by branch.
+        let out = applied_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "$or": [ { "line.sku": "a" }, { "line.qty": 9 } ] }],
+            order(),
+        );
+        assert_eq!(shipped(&out), vec![true, false, true]);
+    }
+
+    #[test]
+    fn a_bare_identifier_addresses_scalar_elements() {
+        assert_eq!(
+            applied_with(
+                doc! { "$inc": { "grades.$[g]": 10 } },
+                vec![doc! { "g": { "$gte": 80 } }],
+                doc! { "grades": [70, 80, 90] },
+            ),
+            doc! { "grades": [70, 90i64, 100i64] }
+        );
+        // Equality against the element itself.
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "tags.$[t]": "B" } },
+                vec![doc! { "t": "b" }],
+                doc! { "tags": ["a", "b", "b"] },
+            ),
+            doc! { "tags": ["a", "B", "B"] }
+        );
+    }
+
+    #[test]
+    fn all_positional_updates_every_element() {
+        assert_eq!(
+            applied_with(
+                doc! { "$inc": { "grades.$[]": 5 } },
+                vec![],
+                doc! { "grades": [1, 2, 3] },
+            ),
+            doc! { "grades": [6i64, 7i64, 8i64] }
+        );
+        let out = applied_with(doc! { "$set": { "items.$[].shipped": true } }, vec![], order());
+        assert_eq!(shipped(&out), vec![true, true, true]);
+    }
+
+    #[test]
+    fn no_matching_element_leaves_the_document_alone() {
+        // Not an error: "ship the lines with sku z" on an order without one
+        // is a legitimate no-op. The write still counts as `modified`, which
+        // is the register's documented meaning of that field.
+        let out = applied_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.sku": "z" }],
+            order(),
+        );
+        assert_eq!(out, order());
+    }
+
+    #[test]
+    fn nested_identifiers_address_inner_arrays() {
+        let doc = doc! {
+            "orders": [
+                { "id": 1, "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 2 } ] },
+                { "id": 2, "items": [ { "sku": "a", "qty": 3 }, { "sku": "b", "qty": 4 } ] },
+            ]
+        };
+        let out = applied_with(
+            doc! { "$set": { "orders.$[o].items.$[i].qty": 0 } },
+            vec![doc! { "o.id": 2 }, doc! { "i.sku": "b" }],
+            doc,
+        );
+        assert_eq!(
+            out,
+            doc! {
+                "orders": [
+                    { "id": 1, "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 2 } ] },
+                    { "id": 2, "items": [ { "sku": "a", "qty": 3 }, { "sku": "b", "qty": 0 } ] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn inc_mul_min_max_and_current_date_work_through_a_positional_path() {
+        let out = applied_with(
+            doc! {
+                "$inc": { "items.$[line].qty": 1 },
+                "$mul": { "items.$[line].price": 2 },
+                "$max": { "items.$[line].seen": 7 },
+                "$currentDate": { "items.$[line].at": true },
+            },
+            vec![doc! { "line.sku": "b" }],
+            doc! { "items": [ { "sku": "a", "qty": 1 }, { "sku": "b", "qty": 5, "price": 3 } ] },
+        );
+        let line = out.get_array("items").unwrap()[1].as_document().unwrap();
+        assert_eq!(line.get_i64("qty").unwrap(), 6);
+        assert_eq!(line.get_i64("price").unwrap(), 6);
+        assert_eq!(line.get_i32("seen").unwrap(), 7);
+        assert_eq!(line.get_datetime("at").unwrap().timestamp_millis(), NOW);
+        // The unselected line is exactly as it was.
+        assert_eq!(
+            out.get_array("items").unwrap()[0],
+            Bson::Document(doc! { "sku": "a", "qty": 1 })
+        );
+    }
+
+    #[test]
+    fn unset_of_a_matched_element_leaves_a_null_hole() {
+        // Compacting would renumber the elements after it, so an element that
+        // is unset becomes null, as in MongoDB.
+        assert_eq!(
+            applied_with(
+                doc! { "$unset": { "grades.$[g]": "" } },
+                vec![doc! { "g": { "$lt": 60 } }],
+                doc! { "grades": [90, 50, 70] },
+            ),
+            doc! { "grades": [90, Bson::Null, 70] }
+        );
+        // Unsetting a field *of* a matched element removes the field.
+        let out = applied_with(
+            doc! { "$unset": { "items.$[line].shipped": "" } },
+            vec![doc! { "line.sku": "a" }],
+            order(),
+        );
+        assert_eq!(
+            out.get_array("items").unwrap()[0],
+            Bson::Document(doc! { "sku": "a", "qty": 1 })
+        );
+    }
+
+    #[test]
+    fn array_operators_apply_inside_a_matched_subdocument() {
+        let doc = doc! {
+            "items": [
+                { "sku": "a", "tags": ["x", "y"] },
+                { "sku": "b", "tags": ["x", "z"] },
+            ]
+        };
+        let out = applied_with(
+            doc! {
+                "$pull": { "items.$[line].tags": "x" },
+                "$push": { "items.$[line].tags": "w" },
+                "$addToSet": { "items.$[line].tags": "z" },
+            },
+            vec![doc! { "line.sku": "b" }],
+            doc,
+        );
+        assert_eq!(
+            out,
+            doc! {
+                "items": [
+                    { "sku": "a", "tags": ["x", "y"] },
+                    { "sku": "b", "tags": ["z", "w"] },
+                ]
+            }
+        );
+        // `$pop` and `$push` with `$each` go through the same path.
+        let out = applied_with(
+            doc! { "$pop": { "items.$[].tags": -1 } },
+            vec![],
+            doc! { "items": [ { "tags": [1, 2] }, { "tags": [3, 4] } ] },
+        );
+        assert_eq!(out, doc! { "items": [ { "tags": [2] }, { "tags": [4] } ] });
+    }
+
+    #[test]
+    fn a_positional_segment_needs_an_array_to_select_from() {
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.sku": "a" }],
+            doc! { "items": "not an array" },
+        );
+        assert!(err.contains("must be an array"), "unhelpful error: {err}");
+
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[].shipped": true } },
+            vec![],
+            doc! { "other": 1 },
+        );
+        assert!(err.contains("must exist"), "unhelpful error: {err}");
+
+        // The same rule one level down: an element without the inner array.
+        let err = apply_err_with(
+            doc! { "$set": { "orders.$[].items.$[].qty": 0 } },
+            vec![],
+            doc! { "orders": [ { "items": [ { "qty": 1 } ] }, { "id": 2 } ] },
+        );
+        assert!(err.contains("\"orders.1.items\" must exist"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn an_identifier_without_a_filter_is_rejected() {
+        let err =
+            apply_err_with(doc! { "$set": { "items.$[line].shipped": true } }, vec![], order());
+        assert!(err.contains("no filter for it"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_filter_without_an_identifier_is_rejected() {
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "line.sku": "a" }, doc! { "other.sku": "b" }],
+            order(),
+        );
+        assert!(err.contains("no update path uses"), "unhelpful error: {err}");
+        // Including on a path without positional segments at all.
+        let err = apply_err_with(doc! { "$set": { "n": 1 } }, vec![doc! { "x.y": 1 }], order());
+        assert!(err.contains("no update path uses"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_filter_document_names_exactly_one_identifier() {
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[a].shipped": true, "items.$[b].shipped": true } },
+            vec![doc! { "a.sku": "a", "b.sku": "b" }],
+            order(),
+        );
+        assert!(err.contains("names both"), "unhelpful error: {err}");
+
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[a].shipped": true } },
+            vec![doc! { "a.sku": "a" }, doc! { "a.sku": "b" }],
+            order(),
+        );
+        assert!(err.contains("more than one filter"), "unhelpful error: {err}");
+
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[a].shipped": true } },
+            vec![doc! { "$and": [] }],
+            order(),
+        );
+        assert!(err.contains("must name an identifier"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn identifiers_follow_the_naming_rule() {
+        for bad in ["Line", "1st", "a-b"] {
+            let path = format!("items.$[{bad}].shipped");
+            let err = apply_err_with(doc! { "$set": { path: true } }, vec![], order());
+            assert!(err.contains("lowercase letter"), "{bad:?}: unhelpful error: {err}");
+        }
+        let err = apply_err_with(doc! { "$set": { "items.$[line": true } }, vec![], order());
+        assert!(err.contains("malformed"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_path_cannot_begin_with_a_positional_segment() {
+        let err = apply_err_with(doc! { "$set": { "$[].x": 1 } }, vec![], order());
+        assert!(err.contains("not an array"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn the_dollar_positional_operator_is_refused_with_a_pointer() {
+        let err = apply_err_with(doc! { "$set": { "items.$.shipped": true } }, vec![], order());
+        assert!(err.contains("$[<identifier>]"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn rename_refuses_positional_paths() {
+        let err = apply_err_with(doc! { "$rename": { "items.$[].sku": "code" } }, vec![], order());
+        assert!(err.contains("$rename"), "unhelpful error: {err}");
+        let err = apply_err_with(doc! { "$rename": { "a": "items.$[].a" } }, vec![], order());
+        assert!(err.contains("$rename"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn array_filters_do_not_apply_to_a_replacement() {
+        let err = apply_err_with(doc! { "x": 1 }, vec![doc! { "a.b": 1 }], order());
+        assert!(err.contains("replacement"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn only_logical_operators_are_accepted_at_the_top_of_a_filter() {
+        let err = apply_err_with(
+            doc! { "$set": { "items.$[line].shipped": true } },
+            vec![doc! { "$where": "1" }],
+            order(),
+        );
+        assert!(err.contains("$where"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn a_dotted_condition_on_a_scalar_element_sees_an_absent_field() {
+        // `{"e.x": {$exists: false}}` selects scalars, which have no `x`;
+        // `{"e.x": {$gt: 0}}` selects nothing among them.
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "mixed.$[e]": 0 } },
+                vec![doc! { "e.x": { "$exists": false } }],
+                doc! { "mixed": [ 7, { "x": 1 } ] },
+            ),
+            doc! { "mixed": [ 0, { "x": 1 } ] }
+        );
+        assert_eq!(
+            applied_with(
+                doc! { "$set": { "mixed.$[e]": 0 } },
+                vec![doc! { "e.x": { "$gt": 0 } }],
+                doc! { "mixed": [ 7, { "x": 1 } ] },
+            ),
+            doc! { "mixed": [ 7, 0 ] }
+        );
+    }
+
+    /// `$expr` reached the filter language (ADR-106) after array filters were
+    /// written, so it is worth saying which of the two won: an arrayFilters
+    /// entry still takes field conditions and `$and`/`$or`/`$nor` and nothing
+    /// else, at the top or inside a branch. MongoDB allows `$expr` here; that
+    /// is recorded in `docs/deviations.md` rather than quietly half-supported.
+    #[test]
+    fn an_array_filter_does_not_take_expr() {
+        let update = doc! { "$set": { "items.$[line].qty": 0 } };
+        let err = parse_with_filters(&update, &[doc! { "$expr": { "$gt": ["$line.qty", 5] } }])
+            .expect_err("$expr is not an array-filter condition");
+        assert!(err.to_string().contains("$expr"), "the error should name it: {err}");
+        assert!(
+            parse_with_filters(
+                &update,
+                &[doc! { "$or": [ { "$expr": { "$gt": ["$line.qty", 5] } } ] }]
+            )
+            .is_err(),
+            "a branch is not a way around the restriction"
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -5175,6 +5175,60 @@ and its rotation remains what it was.
 
 ---
 
+## ADR-104 — Array elements are addressed by filtered identifiers, not by query position
+
+**Decision.** An update path may contain `$[]` and `$[<identifier>]`
+segments, with the identifiers defined by an `arrayFilters` field on the
+`update` and `find_and_modify` requests — camel-cased like `returnDocument`,
+because it is MongoDB's name for MongoDB's feature. A filter document names
+one identifier and is evaluated against each element with that prefix
+removed; every identifier a path uses needs exactly one filter, and every
+filter must be used. Inside the write transaction the positional segments are
+expanded against the document into concrete index paths, and the existing
+operators apply to those, so every operator that takes a path gains the
+feature without being taught about elements. `$rename` is the exception,
+refused as MongoDB refuses it. MongoDB's `$` — "the element the query
+matched" — is refused with a message that names the replacement.
+
+**Why.** Before this, one line item in an order could only be changed by
+numeric index or by replacing the whole document, and the replacement loses
+every concurrent update to the order's other fields. That was the largest
+functional gap in the update language, and the one that pushed callers back
+to read-modify-write over a database whose write path exists to make that
+unnecessary (ADR-083). Of MongoDB's three forms, `$[<identifier>]` is the
+general one: it does not depend on the query, it reaches every matching
+element rather than the first, and it nests. `$` depends on the matcher
+reporting which element satisfied the filter, which `filter::matches` does
+not track — it answers *any* over a path's values — and adding that means a
+position threaded through every comparison, a rule for which array wins when
+several clauses touch arrays, and a value carried from the match into the
+update. All of that to express what `$[<identifier>]` already expresses with
+the condition written next to the path it governs. Expanding to index paths
+rather than teaching each operator about elements keeps every operator
+single-destination, which is the invariant `path::set` was built on, and it
+makes `$unset` of an element leave a null hole for the reason `a.1` does:
+later indices must keep meaning what they meant.
+
+**Alternatives.** Implementing `$` first, because it is the older form:
+rejected for the reasons above, and because it is the form MongoDB's own
+documentation steers callers away from for anything beyond the simplest case.
+A syntax of this project's own (`items[sku=gasket].shipped`): rejected because
+an update written for MongoDB should run unchanged, and a filter document is
+already the language for "which elements". Accepting an unused filter
+silently: rejected because it is nearly always a misspelt identifier, and the
+update would then change nothing while reporting `modified`. Carrying the
+filters inside the update document (`{"$set": ..., "$arrayFilters": ...}`):
+rejected because the update document is a set of operators and nothing else,
+and every client that models the request would have to unpack it.
+
+**Cost.** One more request field on two routes, modelled in every client and
+covered by one conformance scenario. The expansion walks the array once per
+positional operation, on the write path, for the documents that use the
+feature only. A ported update that uses `$` is a `400` rather than a write,
+which the register records.
+
+---
+
 ## ADR-105 — Expressions evaluate in a lexical scope
 
 **Decision.** `Expr::eval` runs in a `Scope`: the root document plus a chain of
