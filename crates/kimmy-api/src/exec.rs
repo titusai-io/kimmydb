@@ -1531,7 +1531,8 @@ mod tests {
         let engine = std::sync::Arc::new(
             kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
         );
-        let tokens = kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret", 3600).unwrap();
+        let tokens =
+            kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret-for-hs256", 3600).unwrap();
         crate::state_with_egress(
             engine,
             tokens,

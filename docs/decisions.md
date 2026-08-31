@@ -4413,3 +4413,72 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+## ADR-093 — Placeholder secrets are refused off loopback, and the HS256 floor is 32 bytes
+
+**Decision.** Two rules, both enforced in `Config::validate` so that
+`check-config` refuses exactly what the server refuses. First, a node whose
+HTTP listener binds anything other than a loopback address — or, with
+clustering on, whose cluster listener does — refuses to start when
+`auth.root_password`, `auth.jwt_secret` or `cluster.cluster_secret` is one of
+the values this repository's own files put where a secret goes. The list is
+`PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`: the compose file's former
+defaults, the commented-out lines in `kimmy.example.toml`, the quick starts'
+former values, the example programs' passwords, and the words anyone types
+when they mean to come back later (`password`, `secret`, `changeme`, `root`,
+…). Matching is exact apart from case and surrounding whitespace. The error
+names the setting and the environment variable and never the value. Second,
+`kimmy_auth::MIN_SECRET_LEN` is 32 bytes, not 16. Only the local HS256 path
+has a shared secret, so only it has a floor; the OIDC verifier's parallel
+rule (`OidcSettings::validate`) polices the audience and is unaffected.
+
+**Why.** A value that appears in a public repository is held by everyone who
+has read it, so it is not a secret in any sense that matters; and a copied
+quick start is the single most likely way a database ends up on a routable
+address with one. With the signing key anyone can mint a root token; with
+the cluster secret anyone who can reach the gossip port can inject writes;
+the bootstrap password is the first thing tried against a fresh node. The
+existing rule for `--insecure-no-auth` already draws the line at loopback,
+and this is the same line for the same reason: on the host's own interfaces
+nothing off the host can reach the node, so a convenience value costs
+nothing, and off them it costs everything.
+
+The floor moves because RFC 7518 §3.2 says a key for HS256 should be no
+shorter than the hash's output, 256 bits. A 16-byte key is not broken, but it
+is half the entropy of the MAC it feeds, one captured token is all the
+material an offline search needs, and the value is shared by every node of
+the cluster. Sixteen was chosen when the number had to be *something*; it
+should be the number the specification gives.
+
+**Why not an absolute refusal.** ADR-067 refused federated `admin` outright,
+for good reasons, and ADR-074 had to open it behind a flag because the
+absolute form made a legitimate deployment impossible rather than merely
+awkward. A flag whose purpose is to remove a security rule is the outcome to
+avoid, and the way to avoid it is to scope the rule to the condition that
+makes the value dangerous instead of to the value. An absolute refusal of
+placeholders would break exactly the case it is not aimed at — a developer
+on a laptop running an example as written — and the examples are how the
+project is evaluated; an example that has to be edited before it runs is one
+that gets edited into something worse, or into a flag. So loopback keeps
+working with every placeholder, anything reachable refuses them all, and
+there is no switch. A denylist is admittedly the weak form of a rule — a
+value absent from it is not thereby good — which is why the length floor
+still applies on top, and why the list is short and made of things that have
+actually shipped rather than an attempt at a dictionary.
+
+**Why not warn.** A warning at startup is read once, by the person who
+already knows, and never by the person who inherits the deployment. The
+`--insecure-no-auth` precedent is a refusal for the same reason.
+
+**Cost.** Two configurations that ran under 0.16.x do not run under this
+version, which is why the release carrying it is a minor rather than a patch
+(`docs/compatibility.md`). A `jwt_secret` of 16–31 bytes must be rotated
+before upgrading, and rotating it ends every session once, on every node at
+the same time. A node that was running on a placeholder off loopback must be
+given real values, which is the point. The compose file no longer supplies
+defaults, so `docker compose up` needs three variables in a `.env` or the
+environment; it says so, and names them. The list has to be maintained: a
+new example value added anywhere in the repository belongs on it, and a test
+pins the ones that have shipped so far.
+
+---
+
