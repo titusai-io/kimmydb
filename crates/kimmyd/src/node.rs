@@ -191,6 +191,12 @@ pub async fn run(config: Config) -> Result<()> {
         ),
     }
 
+    // How much memory resident HNSW graphs may take between them. Set on the
+    // built state rather than passed into the constructor every test shares:
+    // like the audit mode above it is a property of the deployment, and the
+    // cache's default is the same value the config's default carries.
+    state.vectors.set_max_bytes(config.vector.index_cache.max_bytes);
+
     // The OTLP counters, reading the same atomics `/metrics` renders. Here
     // rather than in `logging::init` because the counters live in this state
     // and this state needs a database, which does not exist when the

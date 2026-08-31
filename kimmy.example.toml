@@ -713,3 +713,18 @@ max_tokens = 32768
 # at most this much, less than the remote round trip it saves. 0 sends
 # whatever has queued the moment the stream is idle. Refused above 10000.
 max_wait_ms = 100
+
+# Bound on the HNSW graphs held in memory across every vector collection this
+# node serves. A graph costs about dim x 4 + 5,000 bytes per chunk -- 6.5 KB at
+# 384 dimensions, 11 KB at 1,536 -- and is kept once its collection has been
+# searched. Past this bound the least recently searched graphs are dropped and
+# their collections pay a snapshot reload, or a rebuild, on their next search;
+# a single graph larger than the whole bound is held anyway, with a warning,
+# because a search is never refused over memory. 512 MiB by default: a ceiling
+# rather than an allocation, and larger than the page cache because an eviction
+# here costs seconds of rebuild where one there costs microseconds. Size it so
+# the routinely searched collections fit -- the sum of their chunks times the
+# per-chunk bytes -- and watch kimmy_vector_index_cache_bytes. Zero lifts the
+# bound, which is the behaviour before it existed (ADR-103).
+[vector.index_cache]
+max_bytes = 536870912

@@ -468,10 +468,64 @@ every request rather than being rebuilt per query.
 | Staleness detection | a per-collection generation counter | Counting vectors would be O(n) per query, and a count cannot see a delete-then-add that leaves the total unchanged. A counter is exact and free |
 | Rebuild interval | 30 s | Rebuilding per write would rebuild continuously under load, and each rebuild is O(n log n) |
 | Build failure | fall back to exact | An optimisation that cannot be built must not fail a query |
+| Memory budget | 512 MiB across collections | `vector.index_cache.max_bytes`. Least recently searched graphs are evicted first when a new one would exceed it; a graph larger than the whole budget is held anyway, once, with a warning |
 
 The "too small" verdict is cached under the same rule as the graph. The count
 behind it is O(n), so recomputing it per query would make the check that exists
 to *avoid* a full scan perform one.
+
+### What a build costs, and where it runs
+
+A build reads only each chunk's key and vector — never its text — and lets
+each vector go as the graph copies it in, so its peak is one copy of the
+vectors plus the graph's own bookkeeping, and a sample of 128 vectors kept
+back for the reachability probe. Earlier it materialised every record whole
+and held the lot until the probe had run, which made a rebuild's peak the
+graph plus the entire shadow collection, every staleness window under writes.
+
+It runs **off the cache lock**. The lock every collection's entry lives in is
+taken to look and to install, and the build itself — 4.3 s at 4,000 vectors
+of 384 dimensions, minutes at tens of thousands ([Benchmarks](benchmarks.md))
+— runs under a per-collection lock, on a thread the async runtime has been
+told about, as a storage commit's fsync does. So a rebuild delays searches on
+that one collection, and only those with nothing older to serve: a second
+search arriving mid-build takes the graph that already exists, under the
+staleness rule above, or, when there is none, waits for that one build rather
+than starting a duplicate. Before this the build held the lock, and a rebuild
+of one collection was a stall for vector and hybrid search on every collection
+the node serves.
+
+`hnsw_rs` can insert in parallel, and it was measured — 3–4× faster on a
+ten-core host, saturating at four threads, with recall and reachability
+unchanged — and not adopted: four threads is every core of a small host, and
+the reachability thresholds were sized over sequential builds. The numbers are
+in [Benchmarks](benchmarks.md); the reasoning is beside the loop in `index.rs`.
+
+### What a resident graph costs, and the budget it lives under
+
+A graph costs, approximately,
+
+```text
+bytes ≈ chunks × (dim × 4 + 5,000) + Σ (key length + 24)
+```
+
+— the vectors the graph copies in, about 5 KB of `hnsw_rs` bookkeeping per
+node (neighbour lists and per-layer tables; **measured** under a counting
+allocator at 64 and 384 dimensions, and the same at both — it does not vary
+with width), and the key table that names each node. That is **6.5 KB per
+chunk at 384 dimensions and 11 KB at 1,536** — roughly twice what the vector
+alone suggests, which is why a budget was needed at all.
+
+`vector.index_cache.max_bytes` (default 512 MiB; `0` lifts the bound) bounds
+the total across collections. When installing a graph would exceed it, the
+least recently *searched* graphs are evicted first; a collection's rebuild is
+charged its new size, not both. A single graph larger than the whole budget
+is still installed, once every other graph has gone, and warned about once —
+**a search is never refused over a memory policy**, and refusing would only
+turn that collection's searches into exact scans. An evicted collection's next
+search comes back through its snapshot when there is one, and rebuilds
+otherwise. `kimmy_vector_index_cache_bytes` reports the resident total by the
+same estimate ([ADR-103](decisions.md)).
 
 ### Why a stale vector index is safe when a stale secondary index is not
 
@@ -535,6 +589,8 @@ The exact path is the oracle for everything approximate:
 |---|---|
 | The graph finds what a scan finds | Recall measured, not assumed: ≥ 90% at k=10, and the nearest neighbour agrees with an exact scan exactly |
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |
+| A rebuild stalls no other collection | A build of one collection is parked and a search on another is asserted served meanwhile; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph |
+| The budget evicts least recently searched first, and never refuses | Three graphs under a budget for two: the untouched one goes, and comes back rebuilt on its next search; a graph larger than the whole budget still loads; a rebuild is charged once; `0` evicts nothing |
 | Re-embedding is idempotent | Replaying an oplog entry after vectors exist at that HLC is a no-op |
 | A crash does not lose embeddings | The recorded position always trails completed work |
 | Retry does not stall the queue | Retryable and terminal provider failures are distinguished and tested apart |
