@@ -279,6 +279,7 @@ class Client:
         *,
         multi: bool = False,
         if_stamp: Optional[str] = None,
+        array_filters: Optional[Sequence[Mapping[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """Update matching documents.
 
@@ -288,10 +289,18 @@ class Client:
         :class:`KimmyError` whose :attr:`~KimmyError.is_stale` is true and
         writes nothing; re-read and decide again. Cannot be combined with
         ``multi``.
+
+        ``array_filters`` selects the elements the update's ``$[<identifier>]``
+        path segments address, one document per identifier:
+        ``[{"line.sku": "b"}]`` for ``{"$set": {"items.$[line].shipped":
+        True}}``. Every identifier a path uses needs one and every filter must
+        be used; ``$[]`` addresses every element and needs none.
         """
         body: Dict[str, Any] = {"filter": filter, "update": update, "multi": multi}
         if if_stamp is not None:
             body["if_stamp"] = if_stamp
+        if array_filters is not None:
+            body["arrayFilters"] = list(array_filters)
         return self.request("POST", f"/v1/db/{db}/coll/{collection}/update", json=body)
 
     def delete(

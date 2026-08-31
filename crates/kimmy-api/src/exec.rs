@@ -727,6 +727,10 @@ pub struct WriteParams {
     /// Write only if the matched document is at this stamp (ADR-084).
     /// Single-document only: a version names one document.
     pub if_stamp: Option<String>,
+    /// The request's `arrayFilters`: which elements the update's
+    /// `$[<identifier>]` segments address (ADR-104). Meaningful to `update`
+    /// only; a delete has no paths.
+    pub array_filters: Vec<Value>,
 }
 
 impl WriteParams {
@@ -755,7 +759,7 @@ pub fn update(
     let (multi, explain) = (params.multi, params.explain);
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
-    let update = update::parse(&json_to_document(update_json)?)?;
+    let update = parse_update(update_json, &params.array_filters)?;
     let expected = params.expected()?;
 
     // Match and write in one transaction. This used to collect the targets
@@ -788,6 +792,14 @@ pub fn update(
         body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
+}
+
+/// An update body and the request's `arrayFilters`, parsed together: the
+/// identifiers the paths use and the filters that define them are checked
+/// against each other, so neither is meaningful alone.
+fn parse_update(update_json: &Value, array_filters: &[Value]) -> Result<update::Update, ApiError> {
+    let filters = array_filters.iter().map(json_to_document).collect::<Result<Vec<_>, _>>()?;
+    Ok(update::parse_with_filters(&json_to_document(update_json)?, &filters)?)
 }
 
 /// The stamp a filtered write produced, when there is exactly one to report.
@@ -905,6 +917,8 @@ pub struct FindAndModifySpec {
     pub projection: Option<Value>,
     /// Write only if the chosen document is at this stamp (ADR-084).
     pub if_stamp: Option<String>,
+    /// The request's `arrayFilters`, as on `update` (ADR-104).
+    pub array_filters: Vec<Value>,
 }
 
 /// The caller's half of [`kimmy_storage::ModifySpec`] — pure functions over
@@ -1012,7 +1026,7 @@ pub fn find_and_modify(
         None => None,
     };
     let update = match &spec.update {
-        Some(value) => Some(update::parse(&json_to_document(value)?)?),
+        Some(value) => Some(parse_update(value, &spec.array_filters)?),
         None => None,
     };
 

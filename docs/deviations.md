@@ -17,6 +17,42 @@ Status meanings:
 
 ---
 
+## 🟡 The `$` positional operator is not implemented; `$[<identifier>]` and `$[]` are
+
+**Raised 2026-08-30, with ADR-104.** MongoDB has three ways to address array
+elements in an update path: `$[<identifier>]` (the elements an `arrayFilters`
+entry selects), `$[]` (every element) and `$` (the first element the *query*
+matched). The first two are implemented; `$` is refused at parse time with a
+message that points at the first.
+
+**Why not `$`.** Its meaning depends on which element satisfied the filter,
+and the matcher answers a `bool`: `filter::matches` tests a path's values with
+*any* semantics and never records the index it stopped at. Reporting one would
+mean threading a position out of every comparison, a rule for which position
+wins when several clauses touch arrays (MongoDB's own rule — the last array
+field in the query — is a documented source of surprise), and carrying the
+value from the match into the update inside the write transaction.
+`$[<identifier>]` needs none of that, because its filter is evaluated per
+element at apply time, and it says the same thing more precisely:
+`{"items.sku": "gasket"}` with `items.$.shipped` is `items.$[line].shipped`
+with `[{"line.sku": "gasket"}]`, and the second reaches every gasket line
+rather than the first.
+
+**What differs for a caller.** An update ported from MongoDB that uses `$` is
+a `400` rather than a write; the message names the replacement. Two smaller
+points, both on the strict side: a filter document that names no identifier —
+`{"$and": []}` — is refused rather than read as always-true, and only field
+conditions and `$and`/`$or`/`$nor` are accepted at the top of a filter
+document. A positional update that selects no element writes the document
+back unchanged, so it counts in `modified` exactly as the entry below says a
+no-op `$set` does.
+
+**Closing it** means a second evaluation mode for `Filter::Field` that
+returns the matching element's index, plumbed from `ModifySpec::matches` into
+`update::apply`. Not scheduled: nothing `$` can express is out of reach.
+
+---
+
 ## 🟡 `modified` counts documents written, not documents changed
 
 **Raised 2026-08-21, found by sweeping the CLI against a running cluster.**

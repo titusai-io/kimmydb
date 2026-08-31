@@ -738,6 +738,129 @@ async fn a_no_op_update_still_counts_as_modified() {
     assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
 }
 
+/// `$[<identifier>]` with `arrayFilters` and `$[]` address array elements
+/// through the request, on `update` and on `find_and_modify` (ADR-104). The
+/// refusals are `400`s: an identifier without a filter, a filter without an
+/// identifier, the `$` positional operator, and a positional segment where
+/// there is no array.
+#[tokio::test]
+async fn positional_updates_address_array_elements() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 1, "items": [
+                {"sku": "a", "qty": 1, "shipped": false, "tags": ["x", "y"]},
+                {"sku": "b", "qty": 5, "shipped": false, "tags": ["x", "z"]},
+            ]}),
+        )
+        .await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 2, "items": "no"})).await;
+
+    // Mark one line item shipped, and nothing else.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"items.$[line].shipped": true}},
+                "arrayFilters": [{"line.sku": "b"}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["items"][0]["shipped"], false, "{doc}");
+    assert_eq!(doc["items"][1]["shipped"], true, "{doc}");
+
+    // `$[]` reaches every element; `$inc` through it keeps integers integral.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$inc": {"items.$[].qty": 1}} }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["items"][0]["qty"], 2, "{doc}");
+    assert_eq!(doc["items"][1]["qty"], 6, "{doc}");
+
+    // No element selected: the document is written back unchanged, and
+    // `modified` counts the write, as the register says it does.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"items.$[line].shipped": "never"}},
+                "arrayFilters": [{"line.sku": "z"}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["modified"], 1, "modified counts writes, not changes");
+    let after = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(after, doc, "nothing selected, nothing changed");
+
+    // `find_and_modify` takes the same field and returns the new document;
+    // a `$pull` inside the selected element's own array goes through too.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$pull": {"items.$[line].tags": "x"}},
+                "arrayFilters": [{"line.qty": {"$gt": 3}}],
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = &res.body["document"];
+    assert_eq!(doc["items"][0]["tags"], json!(["x", "y"]), "{doc}");
+    assert_eq!(doc["items"][1]["tags"], json!(["z"]), "{doc}");
+
+    // The refusals.
+    let refused = |update: Value, filters: Option<Value>, id: i64| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let mut body = json!({ "filter": {"_id": id}, "update": update });
+            if let Some(filters) = filters {
+                body["arrayFilters"] = filters;
+            }
+            let res = server.post("/v1/db/shop/coll/c/update", Some(token), body).await;
+            assert_eq!(res.status, 400, "{:?}", res.body);
+            res.body["message"].as_str().unwrap_or_default().to_string()
+        }
+    };
+    let msg = refused(json!({"$set": {"items.$[line].shipped": true}}), None, 1).await;
+    assert!(msg.contains("no filter"), "{msg}");
+    let msg = refused(
+        json!({"$set": {"items.$[line].shipped": true}}),
+        Some(json!([{"line.sku": "a"}, {"other.sku": "b"}])),
+        1,
+    )
+    .await;
+    assert!(msg.contains("no update path uses"), "{msg}");
+    let msg = refused(json!({"$set": {"items.$.shipped": true}}), None, 1).await;
+    assert!(msg.contains("$[<identifier>]"), "{msg}");
+    let msg = refused(json!({"$set": {"items.$[].shipped": true}}), None, 2).await;
+    assert!(msg.contains("must be an array"), "{msg}");
+    // A refused update writes nothing.
+    let untouched = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
+    assert_eq!(untouched["items"], "no");
+}
+
 /// A `multi: true` request lands in chunks of `storage.multi_chunk_docs`
 /// (the engine default here, 1,000) and says how many (ADR-086).
 #[tokio::test]

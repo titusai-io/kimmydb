@@ -45,6 +45,7 @@ var scenarios = []string{
 	"recreated_collection_serves_its_own_history",
 	"stale_resume_token_is_refused",
 	"stale_write_is_typed",
+	"array_filters_address_one_element",
 }
 
 func password() string {
@@ -504,6 +505,50 @@ func run(ctx context.Context, scenario, base, dead string) (map[string]any, erro
 			"code":           apiErr.Code,
 			"retry":          string(apiErr.Retry),
 			"status":         apiErr.Status,
+		}, nil
+
+	case "array_filters_address_one_element":
+		db, err := connect(ctx, base)
+		if err != nil {
+			return nil, err
+		}
+		if err := seed(ctx, db, 0); err != nil {
+			return nil, err
+		}
+		items := []any{
+			map[string]any{"sku": "a", "shipped": false},
+			map[string]any{"sku": "b", "shipped": false},
+		}
+		if _, err := db.Insert(ctx, "shop", "orders", map[string]any{"_id": 0, "items": items}); err != nil {
+			return nil, err
+		}
+		filter := map[string]any{"_id": 0}
+		update := map[string]any{"$set": map[string]any{"items.$[line].shipped": true}}
+		updated, err := db.UpdateWith(ctx, "shop", "orders", filter, update, kimmydb.UpdateOptions{
+			ArrayFilters: []map[string]any{{"line.sku": "b"}},
+		})
+		if err != nil {
+			return nil, err
+		}
+		document, err := db.Get(ctx, "shop", "orders", 0)
+		if err != nil {
+			return nil, err
+		}
+		lines, _ := document["items"].([]any)
+		shipped := make([]any, 0, len(lines))
+		for _, line := range lines {
+			shipped = append(shipped, line.(map[string]any)["shipped"])
+		}
+		_, err = db.UpdateWith(ctx, "shop", "orders", filter, update, kimmydb.UpdateOptions{})
+		var apiErr *kimmydb.APIError
+		if !errors.As(err, &apiErr) {
+			return nil, fmt.Errorf("an identifier without a filter must be refused, got %v", err)
+		}
+		return map[string]any{
+			"modified":              updated["modified"],
+			"shipped":               shipped,
+			"missing_filter_code":   apiErr.Code,
+			"missing_filter_status": apiErr.Status,
 		}, nil
 
 	case "stale_resume_token_is_refused":

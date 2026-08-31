@@ -80,7 +80,7 @@ grants any other client is.
 | `kimmy count <db.coll> [filter]` | |
 | `kimmy insert <db.coll> [document]` | Reads stdin when the document is omitted |
 | `kimmy bulk-insert <db.coll> [documents]` | A JSON array, in one commit, all or nothing. Reads stdin when omitted; at most 1000 |
-| `kimmy update <db.coll> <filter> <update>` | `--multi` |
+| `kimmy update <db.coll> <filter> <update>` | `--multi --array-filters` (a JSON array, one filter per `$[<identifier>]` in the update's paths) |
 | `kimmy delete <db.coll> <filter>` | `--multi` |
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |
 | `kimmy describe <db.coll>` | Inferred schema. `--sample` |

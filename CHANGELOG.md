@@ -10,6 +10,32 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. One additive
+piece of MongoDB update syntax, which closes the largest functional gap in the
+update language: changing one element of an array of subdocuments without
+replacing the document.
+
+### Added
+
+- **Positional update paths and `arrayFilters`.** An update path may contain
+  `$[]` (every element) and `$[<identifier>]` (the elements an `arrayFilters`
+  entry on the request selects): `{"$set": {"items.$[line].shipped": true}}`
+  with `"arrayFilters": [{"line.sku": "gasket"}]` marks one line item shipped
+  and touches nothing else, so a concurrent update to another field survives
+  where a whole-document replacement would have lost it. A filter takes any
+  filter operator, tests several fields of the same element, addresses scalar
+  elements through a bare identifier, and nests
+  (`orders.$[o].items.$[i].qty`). Every operator that takes a path accepts
+  one except `$rename`; `$unset` of an element leaves `null` in its place.
+  The field is `arrayFilters` on `update` and `find_and_modify`, on the MCP
+  `update` tool, `kimmy update --array-filters`, `UpdateOptions` in the Rust
+  and Go clients and `array_filters=` in Python; the conformance suite gains a
+  scenario for it. MongoDB's `$` — the element the query matched — is not
+  implemented and is refused with a message naming the replacement; ADR-104
+  and `docs/deviations.md` say why.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

@@ -447,6 +447,34 @@ fn same_type_group(a: &Bson, b: &Bson) -> bool {
     group(a) == group(b)
 }
 
+/// Test one array element against a filter, for the update language's
+/// `$[<identifier>]` segments (`update::parse_with_filters`).
+///
+/// The filter arrives with the identifier prefix already removed, so a
+/// condition on the empty path is a condition on the element itself —
+/// `{"line": {$gt: 5}}` became `{"": {$gt: 5}}` — and a condition on any other
+/// path reads a field of a document element. A scalar element has no fields,
+/// so a dotted condition sees an absent path there, exactly as a document
+/// without the field would: `$exists: false` holds, `$gt` does not.
+pub fn matches_element(filter: &Filter, element: &Bson) -> bool {
+    match filter {
+        Filter::AlwaysTrue => true,
+        Filter::And(branches) => branches.iter().all(|f| matches_element(f, element)),
+        Filter::Or(branches) => branches.iter().any(|f| matches_element(f, element)),
+        Filter::Nor(branches) => !branches.iter().any(|f| matches_element(f, element)),
+        Filter::Field { path, conditions } => {
+            if path.is_empty() {
+                return conditions.iter().all(|c| condition_matches(c, &[element]));
+            }
+            let values = match element {
+                Bson::Document(doc) => path::resolve(doc, path),
+                _ => Vec::new(),
+            };
+            conditions.iter().all(|c| condition_matches(c, &values))
+        }
+    }
+}
+
 /// Evaluate a filter whose conditions target the element itself, used by
 /// `$elemMatch` over an array of scalars.
 fn matches_scalar_against(filter: &Filter, scalar: &Bson) -> bool {

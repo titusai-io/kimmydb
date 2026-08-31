@@ -317,6 +317,22 @@ matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
 names one document.
 
+An update path may address array elements — `items.$[].qty` for every
+element, `items.$[line].qty` for the elements an `arrayFilters` entry
+selects — which is how one line item is changed without replacing the order:
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
+  "filter": { "_id": 42 },
+  "update": { "$set": { "items.$[line].shipped": true } },
+  "arrayFilters": [ { "line.sku": "gasket" } ]
+}'
+```
+
+`find_and_modify` takes the same field. The rules — one identifier per filter
+document, every identifier filtered and every filter used, `$` not
+implemented — are in [Query language](query-language.md#positional-updates).
+
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request: a failure in a later chunk leaves the earlier chunks committed and
 > answers with an error. Nothing is visited twice and the oplog reflects

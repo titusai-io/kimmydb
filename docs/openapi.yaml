@@ -1417,6 +1417,10 @@ paths:
         With `if_stamp`, the write happens only if the matched document is
         at that version; otherwise `409 stale` and nothing is written
         (ADR-084). Single-document only: a stamp names one document.
+
+        An update path may address array elements: `items.$[].qty` reaches
+        every element, and `items.$[line].qty` reaches the elements the
+        `arrayFilters` entry for `line` selects (ADR-104).
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1441,6 +1445,8 @@ paths:
                   description: |
                     Write only if the matched document is at this stamp.
                     Cannot be combined with `multi`.
+                arrayFilters:
+                  $ref: "#/components/schemas/ArrayFilters"
       responses:
         "200":
           description: What changed.
@@ -1536,6 +1542,8 @@ paths:
                   description: |
                     Change the chosen document only if it is at this stamp;
                     otherwise `409 stale`. Cannot be combined with `upsert`.
+                arrayFilters:
+                  $ref: "#/components/schemas/ArrayFilters"
       responses:
         "200":
           description: |
@@ -2720,6 +2728,24 @@ components:
         the store is schemaless by design, and a schema inferred from a sample
         would make perfectly valid documents unrepresentable (ADR-055).
       additionalProperties: true
+
+    ArrayFilters:
+      type: array
+      description: |
+        Which array elements the update's `$[<identifier>]` path segments
+        address (ADR-104). One filter document per identifier: every
+        top-level field of the document starts with the identifier, and the
+        filter is evaluated against each element with that prefix removed —
+        `{"line.qty": {"$gt": 5}}` tests `{"qty": {"$gt": 5}}` against each
+        element, a bare `{"line": {"$gt": 5}}` tests the element itself.
+        Every identifier a path uses needs exactly one filter and every
+        filter must be used by some path; either mismatch is a `400`. `$[]`
+        addresses every element and needs no filter. Identifiers start with a
+        lowercase letter and contain only letters and digits. `$and`, `$or`
+        and `$nor` may group conditions on the same identifier.
+      items: { $ref: "#/components/schemas/Document" }
+      example:
+        - { "line.sku": "gasket" }
 
     Grant:
       type: object
