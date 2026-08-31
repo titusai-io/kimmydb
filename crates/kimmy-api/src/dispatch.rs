@@ -490,10 +490,10 @@ pub fn event_id(entry: &OplogEntry) -> String {
 /// replayed later with a fresh one — signing the body alone would leave the
 /// timestamp free to change.
 pub fn sign(secret: &str, timestamp_ms: u64, body: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
     mac.update(timestamp_ms.to_string().as_bytes());
     mac.update(b".");
@@ -900,6 +900,20 @@ mod tests {
     use kimmy_core::{DocId, NodeId, Stamp};
 
     use super::*;
+
+    /// The signature a receiver validates. Recorded from the implementation
+    /// that first produced it, because a change here is not a failing build
+    /// but a fleet of webhook receivers rejecting deliveries they should
+    /// accept — and the signature is over `timestamp || "." || body`, so the
+    /// framing matters as much as the HMAC. RFC 4231 covers the primitive in
+    /// `kimmy-cluster`'s `protocol.rs`.
+    #[test]
+    fn a_webhook_signature_is_what_it_has_always_been() {
+        assert_eq!(
+            sign("webhook-secret", 1_725_000_000_000, "{\"a\":1}"),
+            "681e8c00c9729c98988c22dfd6baeba0507b96d7f87ae2d4a0e3466439a84fc7"
+        );
+    }
 
     fn entry(kind: OpKind, collection: u64, ms: u64) -> OplogEntry {
         OplogEntry {

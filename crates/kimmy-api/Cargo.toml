@@ -28,8 +28,8 @@ tracing.workspace = true
 parking_lot.workspace = true
 uuid.workspace = true
 reqwest.workspace = true
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 # The OTel **API** only, never the SDK. This crate extracts an inbound
 # `traceparent` and injects an outbound one; which exporter (if any) is behind
 # the global propagator is `kimmyd`'s decision, and a library that could make
