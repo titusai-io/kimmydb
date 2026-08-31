@@ -104,9 +104,10 @@ Authorization: Bearer <jwt>
 ```
 
 ```bash
+# KIMMY_ROOT_PASSWORD is whatever the node was bootstrapped with.
 TOKEN=$(curl -s -XPOST localhost:7878/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"user":"root","password":"change-me"}' | jq -r .token)
+  -d "{\"user\":\"root\",\"password\":\"$KIMMY_ROOT_PASSWORD\"}" | jq -r .token)
 ```
 
 ```json
@@ -127,6 +128,17 @@ streams become `wss://` on that node. See
 a `Retry-After` header; a successful login spends nothing, so a client that
 re-authenticates on a short TTL is never throttled for succeeding. Tunable under
 `[server.rate_limit]` — see [Security](security.md#login-rate-limiting).
+
+**Authenticated requests carry three limits** ([ADR-099](decisions.md)), each
+defaulting to what the server always did: a body ceiling
+(`server.max_body_bytes`, 2 MiB; over it `413 payload_too_large`), a deadline
+for a request still waiting on its body or on an embedding provider
+(`server.request_timeout_secs`, 30 s; past it `503 timeout`), and — off unless
+an operator sets it — a per-principal request budget
+(`server.rate_limit.per_principal`; over it `429` with `Retry-After`, on any
+route that takes a token). A client should treat a `429` as possible on every
+authenticated call, not only on login. See
+[Security](security.md#limits-on-authenticated-requests).
 
 ---
 
@@ -184,9 +196,10 @@ published. Documents in the batch are checked against each other as well as
 against stored state, so two documents sharing an `_id` — or colliding on a
 unique index — fail the batch even though neither was there when it started.
 
-Two ceilings, whichever binds first: **1000 documents**, and the **2 MB
-request body limit** (`413`, `"error": "payload_too_large"`), which is the
-lower of the two for documents over about 2 KB. Over the document cap is
+Two ceilings, whichever binds first: **1000 documents**, and the **request
+body limit** (`server.max_body_bytes`, 2 MiB by default; `413`,
+`"error": "payload_too_large"`), which is the lower of the two for documents
+over about 2 KB. Over the document cap is
 **400**; a body that is not an array is **422**. An empty array is a no-op
 that inserts nothing and commits nothing.
 
@@ -563,6 +576,14 @@ challenge reveals nothing the body does not: it is byte-identical whether the
 target exists or not, which is the same property the uniform 403 has always
 had.
 
+The `error_description` on a 401 is deliberately generic — `the access token
+is expired, revoked or malformed` — with one exception. A federated token
+refused because its own `exp − iat` exceeds `auth.oidc.max_token_lifetime_secs`
+says so, naming the limit in seconds and nothing about the token: the ordinary
+advice to refresh would have the provider mint the same token again, and the
+fix is on the provider's side or in the node's configuration
+([ADR-096](decisions.md)).
+
 `POST /v1/auth/login` is exempt. It is where a token comes from, not a
 bearer-protected resource, and challenging there would tell a client to come
 back with the thing it is asking for.
@@ -747,12 +768,13 @@ failure cannot appear without its retry class being decided in the same commit.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `no_vectors` | no | A search against a collection whose vectors were never ingested. A refusal rather than an empty result, which would be indistinguishable from "nothing matched" |
-| 413 | `payload_too_large` | no | Request body over 2 MB |
+| 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |
-| 429 | `rate_limited` | wait | Too many failed logins from this caller. Carries `Retry-After` in seconds |
+| 429 | `rate_limited` | wait | Too many failed logins from this caller, or an authenticated principal over its request budget (`server.rate_limit.per_principal`). Carries `Retry-After` in seconds |
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
+| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)) |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs, such as an API key its vector configuration names |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

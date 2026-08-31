@@ -320,6 +320,19 @@ enum Command {
         filter: Option<String>,
         #[arg(long)]
         per_document: Option<usize>,
+        /// Weight of the dense (vector) half in fusion. At least 0; the
+        /// server's default is 1. Only the ratio to --lexical-weight matters.
+        #[arg(long)]
+        dense_weight: Option<f64>,
+        /// Weight of the lexical (keyword) half in fusion. At least 0; the
+        /// server's default is 1. Zero switches the keyword half off.
+        #[arg(long)]
+        lexical_weight: Option<f64>,
+        /// Distinct query terms a chunk must share with the query to count as
+        /// keyword evidence. At least 1; the server's default is 1. Use 2 on a
+        /// collection of short documents.
+        #[arg(long)]
+        min_overlap: Option<usize>,
     },
     /// The nodes this cluster is made of, and which are live.
     Topology,
@@ -548,7 +561,17 @@ async fn run() -> Result<()> {
             )?;
             emit(&cli, &client.vector_search(db, coll, &body).await?);
         }
-        Command::HybridSearch { target, query, vector, k, filter, per_document } => {
+        Command::HybridSearch {
+            target,
+            query,
+            vector,
+            k,
+            filter,
+            per_document,
+            dense_weight,
+            lexical_weight,
+            min_overlap,
+        } => {
             let (db, coll) = split_target(target)?;
             let body = search_body(
                 query.as_deref(),
@@ -557,6 +580,7 @@ async fn run() -> Result<()> {
                 filter.as_deref(),
                 *per_document,
             )?;
+            let body = with_fusion_controls(body, *dense_weight, *lexical_weight, *min_overlap);
             emit(&cli, &client.hybrid_search(db, coll, &body).await?);
         }
         Command::Topology => emit(&cli, &client.topology().await?),
@@ -752,6 +776,34 @@ fn search_body(
         body["per_document"] = json!(per_document);
     }
     Ok(body)
+}
+
+/// Add the hybrid-only fusion controls to a search body.
+///
+/// Each is sent only when given, and a weight that was not given is left out
+/// of `weights` rather than sent as 1: the server owns the defaults, and a
+/// body that spells them out would pin them here the day they change there.
+/// Range checks are the server's too — its message names the field.
+fn with_fusion_controls(
+    mut body: Value,
+    dense_weight: Option<f64>,
+    lexical_weight: Option<f64>,
+    min_overlap: Option<usize>,
+) -> Value {
+    if dense_weight.is_some() || lexical_weight.is_some() {
+        let mut weights = json!({});
+        if let Some(dense) = dense_weight {
+            weights["dense"] = json!(dense);
+        }
+        if let Some(lexical) = lexical_weight {
+            weights["lexical"] = json!(lexical);
+        }
+        body["weights"] = weights;
+    }
+    if let Some(min_overlap) = min_overlap {
+        body["min_overlap"] = json!(min_overlap);
+    }
+    body
 }
 
 /// `db.collection` → `("db", "collection")`.
@@ -3159,5 +3211,21 @@ mod tests {
         let bare = search_body(Some("q"), None, 3, None, None).unwrap();
         assert!(bare.get("filter").is_none(), "an absent filter must not be sent as null");
         assert!(bare.get("per_document").is_none());
+    }
+
+    #[test]
+    fn fusion_controls_are_sent_only_when_given() {
+        let base = search_body(Some("q"), None, 3, None, None).unwrap();
+
+        let bare = with_fusion_controls(base.clone(), None, None, None);
+        assert_eq!(bare, base, "a bare hybrid-search must send exactly what it always has");
+
+        let tilted = with_fusion_controls(base.clone(), Some(0.7), None, Some(2));
+        assert_eq!(tilted["weights"], json!({ "dense": 0.7 }), "the other weight is the server's");
+        assert_eq!(tilted["min_overlap"], 2);
+
+        let lexical_off = with_fusion_controls(base, None, Some(0.0), None);
+        assert_eq!(lexical_off["weights"], json!({ "lexical": 0.0 }));
+        assert!(lexical_off.get("min_overlap").is_none());
     }
 }
