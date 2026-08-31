@@ -256,6 +256,25 @@ whose defaults are meant to be left alone, and documentation corrections.
   one place and checked against the code. The FIPS position is stated there
   too: `aws-lc-rs` has a validated mode, this build uses `ring`, and no FIPS
   claim is made.
+- **Type conversion expressions.** `$convert: {input, to, onError?, onNull?}`
+  with `to` as a type name or numeric BSON code, and the shorthands
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`, `$toDate` and
+  `$toObjectId`. Null or missing input is null (or `onNull`); a value with no
+  conversion is a `400` naming both types (or `onError`); integers are refused
+  out of range rather than wrapped; strings are parsed strictly; a date
+  converts to and from epoch milliseconds and to and from ISO 8601 text. The
+  two shapes it exists for: a `$lookup` whose keys differ in type across
+  collections, and a `$group` by a date that was stored as a string. `decimal`
+  is refused, because `Decimal128` has no exact key encoding here (ADR-005).
+- **`$mod` in filters.** `{field: {$mod: [divisor, remainder]}}`, with
+  MongoDB's rules: numeric values only, doubles truncated toward zero, the
+  remainder keeping the dividend's sign, arrays matched element-wise, a zero
+  divisor refused at parse. Never index-eligible; an equality or range beside
+  it still plans.
+- **`$pullAll`.** Removes every element equal to any value in the given list,
+  by the same canonical equality `$pull` uses. A missing field is a no-op; a
+  non-array field is a `400`.
+
 ### Changed
 
 - **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
@@ -361,6 +380,17 @@ whose defaults are meant to be left alone, and documentation corrections.
   embedding worker's staleness check now read that run rather than every
   record in the shadow. Same results; the cost is the document's chunk count
   instead of the collection's.
+- **A pipeline's leading `$match` uses indexes, and the ceiling is measured
+  after it.** `aggregate` now reads its source through the same planner-backed
+  scan `find` uses, with the first `$match` stage — or the first several,
+  merged — as the scan's filter. An indexed equality, range or `$in` there
+  reads its candidates rather than the whole collection, and the
+  100,000-document limit applies to what the `$match` admits, so a pipeline
+  over a larger collection runs when its leading `$match` is selective enough.
+  Only the leading `$match` is pushed down; a `$match` after any other stage
+  runs where it was written, on what that stage produced, so results are
+  unchanged with or without an index (ADR-109). The refusal for an oversized
+  source names the leading `$match` when there is one.
 
 ### Fixed
 

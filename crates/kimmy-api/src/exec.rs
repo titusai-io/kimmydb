@@ -1532,23 +1532,51 @@ pub fn aggregate(
     coll: &str,
     pipeline: &Value,
 ) -> Result<Value, ApiError> {
+    aggregate_with_limits(state, auth, db, coll, pipeline, aggregate::Limits::default())
+}
+
+/// [`aggregate`] under an explicit ceiling.
+///
+/// Split out so the source ceiling can be exercised without inserting a
+/// hundred thousand documents; every caller outside a test goes through
+/// [`aggregate`] and the default.
+pub fn aggregate_with_limits(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    pipeline: &Value,
+    limits: aggregate::Limits,
+) -> Result<Value, ApiError> {
     let _span = op_span("aggregate", db, Some(coll)).entered();
     let meta = authorize(state, auth, Action::Read, db, coll)?;
 
     let stages = parse_pipeline(pipeline)?;
-    let limits = aggregate::Limits::default();
 
-    // The whole collection is the pipeline's input, bounded by the same cap
-    // every stage is held to, so a pipeline over an oversized collection fails
-    // at the source rather than after allocating it.
-    let mut docs: Vec<bson::Document> = Vec::new();
-    state.engine.for_each_doc(&meta, |_id, doc| {
-        docs.push(doc);
-        Ok(true)
-    })?;
-    aggregate::check_limit("the source collection", docs.len(), &limits)?;
+    // The source. A pipeline that begins with `$match` is read the way `find`
+    // reads: the leading filter goes through `collect_matching`, so an indexed
+    // equality or range fetches its candidates rather than the whole
+    // collection, and the ceiling applies to what the filter *admits* rather
+    // than to what the collection holds. Only the leading run of `$match`
+    // stages is taken — `aggregate::leading_match` says why — and every later
+    // stage runs exactly as it did, on exactly the input it had. A pipeline
+    // with no leading `$match` is the collection, through the same scan.
+    let (filter, consumed, what) = match aggregate::leading_match(&stages) {
+        Some((filter, consumed)) => (filter, consumed, "the leading $match"),
+        None => (filter::Filter::AlwaysTrue, 0, "the source collection"),
+    };
+    // One past the ceiling: the scan stops as soon as it is over, rather than
+    // materialising everything the filter admits in order to refuse it.
+    let (docs, _stats) = collect_matching(state, &meta, &filter, Some(limits.max_documents + 1))?;
+    if docs.len() > limits.max_documents {
+        return Err(ApiError::bad_request(format!(
+            "{what} admits more than {} documents, the pipeline limit. Narrow it with a more \
+             selective $match, or raise server.aggregate.max_documents",
+            limits.max_documents
+        )));
+    }
 
-    let docs = run_stages(state, auth, db, &stages, docs, &limits, &[])?;
+    let docs = run_stages(state, auth, db, &stages[consumed..], docs, &limits, &[])?;
 
     let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
     Ok(json!({ "documents": documents, "count": documents.len() }))
@@ -1891,6 +1919,37 @@ mod tests {
         assert_eq!(ids, vec![1, 2], "the straddling document must not be lost to a stale plan");
         assert!(stats.index.is_none(), "the fallback is a collection scan, and explain says so");
     }
+
+    // -----------------------------------------------------------------------
+    // aggregate — the leading $match reads through the planner
+    // -----------------------------------------------------------------------
+
+    fn superuser() -> Auth {
+        Auth(kimmy_auth::Principal::superuser("test"))
+    }
+
+    /// `count` documents `{_id: i, n: i % 5, k: i}` in `app.<coll>`, indexed
+    /// on `n` when asked.
+    fn seed_pipeline_source(state: &SharedState, coll: &str, count: i64, indexed: bool) {
+        state.engine.create_collection("app", coll).unwrap();
+        if indexed {
+            state
+                .engine
+                .create_index(
+                    "app",
+                    coll,
+                    vec![kimmy_storage::IndexField::ascending("n")],
+                    false,
+                    None,
+                )
+                .unwrap();
+        }
+        let meta = state.engine.get_collection("app", coll).unwrap();
+        for i in 0..count {
+            state.engine.insert(&meta, bson::doc! { "_id": i, "n": i % 5, "k": i }).unwrap();
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Bounded reads (ADR-098)
     // -----------------------------------------------------------------------
@@ -1991,6 +2050,87 @@ mod tests {
                     .collect();
                 assert_eq!(got, expected, "sort {spec:?}, skip {skip}, limit {limit}");
             }
+        }
+    }
+
+    #[test]
+    fn a_leading_match_is_held_to_the_ceiling_not_the_collection() {
+        // Thirty documents under a ceiling of ten. Without a leading `$match`
+        // the source is the collection and is refused; with one that admits
+        // six, the pipeline runs. The same shape at scale is a collection
+        // past 100,000 documents with an indexed `$match` in front.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_pipeline_source(&state, "docs", 30, true);
+        let limits = aggregate::Limits { max_documents: 10 };
+        let auth = superuser();
+
+        let whole = json!([{ "$count": "c" }]);
+        let err = aggregate_with_limits(&state, &auth, "app", "docs", &whole, limits)
+            .expect_err("the whole collection is over the ceiling");
+        assert!(format!("{err:?}").contains("source collection"), "{err:?}");
+
+        let narrowed = json!([{ "$match": { "n": 3 } }, { "$count": "c" }]);
+        let out = aggregate_with_limits(&state, &auth, "app", "docs", &narrowed, limits).unwrap();
+        assert_eq!(out["documents"][0]["c"], 6);
+
+        // A leading `$match` that admits too many is refused too, and the
+        // refusal names it rather than the collection.
+        let wide = json!([{ "$match": { "n": { "$gte": 0 } } }, { "$count": "c" }]);
+        let err = aggregate_with_limits(&state, &auth, "app", "docs", &wide, limits)
+            .expect_err("the match admits thirty");
+        assert!(format!("{err:?}").contains("leading $match"), "{err:?}");
+    }
+
+    #[test]
+    fn a_match_after_another_stage_is_not_pushed_down() {
+        // `$project` then `$match` must mean what it says: the filter reads
+        // the projected document, and the source is still the collection —
+        // so under the ceiling it is refused exactly as before.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_pipeline_source(&state, "docs", 30, true);
+        let limits = aggregate::Limits { max_documents: 10 };
+
+        let pipeline = json!([{ "$project": { "n": 1 } }, { "$match": { "n": 3 } }]);
+        let err = aggregate_with_limits(&state, &superuser(), "app", "docs", &pipeline, limits)
+            .expect_err("the source is the whole collection");
+        assert!(format!("{err:?}").contains("source collection"), "{err:?}");
+
+        // And with room to run, the projection is what the match sees:
+        // `k` is gone, so a match on it finds nothing.
+        let roomy = aggregate::Limits::default();
+        let on_projected_away = json!([{ "$project": { "n": 1 } }, { "$match": { "k": 3 } }]);
+        let out =
+            aggregate_with_limits(&state, &superuser(), "app", "docs", &on_projected_away, roomy)
+                .unwrap();
+        assert_eq!(out["count"], 0);
+    }
+
+    #[test]
+    fn an_indexed_and_an_unindexed_source_give_the_same_answer() {
+        // The index only narrows the candidates; the filter decides. The
+        // two access paths must agree document for document, including on a
+        // range and on consecutive leading matches merged into one.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        seed_pipeline_source(&state, "indexed", 40, true);
+        seed_pipeline_source(&state, "plain", 40, false);
+        let auth = superuser();
+
+        for pipeline in [
+            json!([{ "$match": { "n": 2 } }, { "$sort": { "_id": 1 } }]),
+            json!([{ "$match": { "n": { "$gte": 3 } } }, { "$sort": { "_id": 1 } }]),
+            json!([
+                { "$match": { "n": 1 } },
+                { "$match": { "k": { "$gt": 10 } } },
+                { "$group": { "_id": Value::Null, "total": { "$sum": "$k" } } }
+            ]),
+        ] {
+            let indexed = aggregate(&state, &auth, "app", "indexed", &pipeline).unwrap();
+            let plain = aggregate(&state, &auth, "app", "plain", &pipeline).unwrap();
+            assert_eq!(indexed, plain, "{pipeline}");
+            assert!(indexed["count"].as_u64().unwrap() > 0, "the pipeline must find something");
         }
     }
 

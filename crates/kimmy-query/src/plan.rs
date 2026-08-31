@@ -771,6 +771,18 @@ mod tests {
     }
 
     #[test]
+    fn mod_is_residual_and_leaves_a_sibling_equality_planned() {
+        // `$mod` describes a remainder, not a range, so it never narrows;
+        // beside an equality the index is still used and `$mod` is left to
+        // the re-check every candidate goes through.
+        let idx = [index(0, vec![IndexField::ascending("a")])];
+        assert!(plan(doc! { "a": { "$mod": [4, 0] } }, &idx).is_none());
+        assert!(pk(doc! { "_id": { "$mod": [4, 0] } }).is_none());
+        let p = plan(doc! { "a": 8, "b": { "$mod": [4, 0] } }, &idx).expect("the equality plans");
+        assert_eq!(p.fields_used, 1);
+    }
+
+    #[test]
     fn a_descending_range_swaps_which_end_each_bound_narrows() {
         // Descending encoding inverts bytes, reversing order — so the
         // value-space lower bound must cap the key-space *top*. The proof is

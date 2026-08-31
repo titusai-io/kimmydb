@@ -220,6 +220,7 @@ re-applied regardless.
 | `$or` / `$nor` branches | Their branches need not all hold; narrowing on one would drop what the other matches |
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
+| `$mod` | A remainder is not a range — every fourth key is not a contiguous run of them |
 
 `$in` **is planned**, as a union of point probes — one per distinct value,
 deduplicated on the encoded key so `[5, 5.0]` probes once, each probe carrying

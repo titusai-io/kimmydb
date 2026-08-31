@@ -5662,6 +5662,58 @@ and uncomment `github-attestations` in `dist-workspace.toml`, run
 
 ---
 
+## ADR-109 — A pipeline's leading `$match` is planned like `find`; nothing else is reordered
+
+**Decision.** `aggregate` reads its source through `collect_matching`, the
+same planner-backed path `find`, `count`, `update` and `delete` use. When the
+pipeline begins with `$match` — one stage, or several consecutive ones merged
+into a conjunction — that filter is the scan's filter, so an indexed equality,
+range or `$in` fetches its candidates and a primary-key equality fetches one
+document. The 100,000-document ceiling is measured against what that filter
+admits. Every stage after the leading run executes exactly as before, on
+exactly the input it had. A `$match` anywhere else in the pipeline is not
+moved.
+
+**Why.** Before this, `aggregate` loaded the whole collection and then ran
+the stages, so a pipeline over a collection past the ceiling was refused no
+matter how selective its `$match` was — the one case where "narrow the
+pipeline with an earlier `$match`", which the refusal recommended, could not
+help. Reading through the planner fixes that without a second planner: the
+filter language is shared, `Stage::Match` already holds a `Filter`, and
+`collect_matching` already re-checks every candidate against the full filter,
+so an index can only narrow the candidate set and never change the answer.
+The scan is asked to stop one past the ceiling, so a `$match` that admits too
+much is refused without materialising everything it admits.
+
+Only the *leading* run is safe to push down, and the reason is what the
+documents look like when the stage runs. A leading `$match` sees documents as
+stored, so its filter is a filter over the collection. A `$match` after
+`$project` reads the projected shape; after `$unwind`, one element per
+document; after `$group`, the buckets. Moving any of those to the source would
+change what they match. The conservative rule — plan the prefix, run the rest
+— is the one MongoDB's optimizer follows too, and it keeps a pipeline's
+meaning independent of which indexes happen to exist.
+
+**Alternatives.** *A general stage reorderer* that hoists a `$match` past
+stages it provably does not depend on (`$sort`, `$skip`/`$limit` under some
+conditions, `$addFields` on other fields). It is real value and a real
+analysis — field dependence through computed expressions, `$unwind` changing
+cardinality — and nothing here needs it yet; when it comes it composes with
+this rather than replacing it. *Planning every `$match` independently* is not
+possible: only the source is indexed. *Applying the ceiling to the collection
+as before and only using the index for speed* would have kept the refusal
+that motivated the change.
+
+**Cost.** A pipeline with no leading `$match` behaves as it did, through the
+same scan. `aggregate` has no `explain`, so the access path a leading `$match`
+gets is visible only by sending the same filter to `find` with `explain` — the
+same planner, so the same answer; the docs say so. The refusal for an
+oversized source now names the leading `$match` when there is one, and says
+"more than" the ceiling rather than an exact count, because the scan stopped
+counting there.
+
+---
+
 ## ADR-110 — A written threat model and a per-release SBOM
 
 **Decision.** Two documents: one written once and kept, one generated per
