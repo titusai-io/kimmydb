@@ -56,6 +56,11 @@ curl -XPOST .../orders/find -H "$A" -d '{"filter":{"qty":7},"explain":true}'
 `documentsExamined` fall while `documentsMatched` stays the same is the whole
 point of an index.
 
+The `filter` of `vector_search` and `hybrid_search` is planned the same way, so
+an index on a field that searches filter by is used there too; `explain` on a
+`find` with the same filter shows the strategy the search gets
+([Vectors](vectors.md#search)).
+
 ## `_id` needs no index
 
 **A filter that pins `_id` is answered through the primary key**, reported as

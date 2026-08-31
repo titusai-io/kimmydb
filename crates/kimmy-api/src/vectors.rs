@@ -5,13 +5,14 @@ use std::collections::HashSet;
 use axum::extract::{Path, State};
 use axum::{Json, http::StatusCode};
 use kimmy_auth::Action;
-use kimmy_core::VectorConfig;
+use kimmy_core::{DocId, VectorConfig};
 use kimmy_vector::Access;
 use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::{ApiError, ErrorCode};
+use crate::exec::QueryStats;
 use crate::json::{JsonBody, json_to_document};
 use crate::state::{Auth, SharedState};
 
@@ -261,6 +262,34 @@ pub struct SearchRequest {
 const DEFAULT_K: usize = 10;
 const MAX_K: usize = 1_000;
 
+/// The largest admitted set for which a filtered search reads the admitted
+/// documents' chunks by key rather than searching everything and discarding.
+///
+/// The keyed join costs the size of the set and is exact; the discarding join
+/// costs the size of the collection and, on the graph, is approximate twice
+/// over — widened eightfold for a filter and still short of `k` when the set
+/// is small. So the keyed join wins whenever the set is small, and the
+/// discarding join when the set is most of the collection, because then the
+/// graph's candidates are mostly admitted anyway. A count rather than a
+/// fraction, because the keyed join's cost does not depend on the collection
+/// — a thousand documents' chunks read by key is the same work over a
+/// million documents as over two thousand — and because a fraction would need
+/// the collection's size, which is a scan to learn. A thousand is past the
+/// widest window a request can ask for (`MAX_K`, and hybrid's halves at
+/// `4k`), so an admitted set at or under it is at most a few reads per hit
+/// returned. ADR-102.
+const SELECTIVE_JOIN_MAX: usize = 1_000;
+
+/// Matches taken per planner call while a filter's ids are collected.
+///
+/// The executor returns the documents it matched, and an unselective filter
+/// over a large collection would otherwise hold every one of them at once —
+/// the failure ADR-098 names. Paging by encoded key, as a cursor does, holds
+/// one page and the ids. Wide, because on an index plan today each page
+/// gathers the range's candidate keys again; the executor's streaming visitor
+/// makes a page a seek, and `filter_ids` is written to become one call to it.
+const FILTER_PAGE: usize = 10_000;
+
 pub async fn vector_search(
     State(state): State<SharedState>,
     auth: Auth,
@@ -290,21 +319,41 @@ pub async fn run_vector_search(
     Ok(render(&only_live(state, &source, hits)?))
 }
 
-/// k-NN by whichever path the index cache selects.
+/// k-NN by whichever path the index cache selects, joined with the filter's
+/// admitted set in whichever direction its size warrants.
 ///
-/// The two paths return the same shape and score the same way — the exact scan
-/// is exhaustive, the graph walk is approximate — so callers do not branch.
+/// The paths return the same shape and score the same way — the exact scan
+/// and the keyed join are exhaustive, the graph walk is approximate — so
+/// callers do not branch.
 fn knn(
     state: &SharedState,
     shadow: &kimmy_storage::CollectionMeta,
     config: &VectorConfig,
     query: &[f32],
     options: &SearchOptions,
-    allowed: Option<&HashSet<String>>,
+    allowed: Option<&Allowed>,
 ) -> Result<Vec<Hit>, ApiError> {
+    knn_joined(state, shadow, config, query, options, allowed.map(|a| (a, a.join())))
+}
+
+/// [`knn`] with the join direction chosen by the caller, so a test can run
+/// both over one fixture and hold them to the same answer.
+fn knn_joined(
+    state: &SharedState,
+    shadow: &kimmy_storage::CollectionMeta,
+    config: &VectorConfig,
+    query: &[f32],
+    options: &SearchOptions,
+    allowed: Option<(&Allowed, Join)>,
+) -> Result<Vec<Hit>, ApiError> {
+    if let Some((allowed, Join::Keyed)) = allowed {
+        return search::vector_search_among(&state.engine, shadow, query, options, &allowed.ids)
+            .map_err(vector_error);
+    }
+    let set = allowed.map(|(a, _)| &a.set);
     match state.vectors.access(&state.engine, shadow, config.metric, config.dim) {
-        Access::Approximate(index) => index.search(&state.engine, shadow, query, options, allowed),
-        Access::Exact => search::vector_search(&state.engine, shadow, query, options, allowed),
+        Access::Approximate(index) => index.search(&state.engine, shadow, query, options, set),
+        Access::Exact => search::vector_search(&state.engine, shadow, query, options, set),
     }
     .map_err(vector_error)
 }
@@ -474,6 +523,40 @@ async fn resolve_query_vector(
     })
 }
 
+/// The documents a `filter` admitted, in the two shapes the join needs.
+struct Allowed {
+    /// Every admitted id, for the join that reads their chunks by key.
+    ids: Vec<DocId>,
+    /// The same ids as the strings a chunk's `source` renders to, for the
+    /// join that searches everything and discards.
+    set: HashSet<String>,
+    /// How the filter was answered — which access path, how much it examined
+    /// — so a test can hold the planner to having run. Summed across pages.
+    stats: QueryStats,
+}
+
+/// The direction a filtered search joins the admitted set with the chunks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Join {
+    /// Read the admitted documents' chunks by key and score exactly those.
+    Keyed,
+    /// Search as if unfiltered and discard hits outside the set.
+    Discard,
+}
+
+impl Allowed {
+    /// Which way round to join, by the size of the set alone.
+    fn join(&self) -> Join {
+        join_for(self.ids.len())
+    }
+}
+
+/// The join direction for a set of `admitted` documents. See
+/// [`SELECTIVE_JOIN_MAX`].
+fn join_for(admitted: usize) -> Join {
+    if admitted <= SELECTIVE_JOIN_MAX { Join::Keyed } else { Join::Discard }
+}
+
 /// Run the filter, if any, and collect the ids it matched.
 ///
 /// This is what lets vector search compose with the ordinary query language.
@@ -483,7 +566,7 @@ fn allowed_ids(
     db: &str,
     coll: &str,
     filter: Option<&Value>,
-) -> Result<Option<HashSet<String>>, ApiError> {
+) -> Result<Option<Allowed>, ApiError> {
     let Some(filter) = filter else {
         return Ok(None);
     };
@@ -492,15 +575,68 @@ fn allowed_ids(
 
     let parsed = kimmy_query::filter::parse(&json_to_document(filter)?)?;
     let source = crate::exec::collection(state, db, coll)?;
+    Ok(Some(filter_ids(state, &source, &parsed, FILTER_PAGE)?))
+}
 
-    let mut ids = HashSet::new();
-    state.engine.for_each_doc(&source, |id, doc| {
-        if kimmy_query::filter::matches(&parsed, &doc) {
-            ids.insert(id.to_string());
+/// The ids a filter matches, through the executor's planner-backed read.
+///
+/// `collect_matching_after` is the path `find` takes: the primary key when the
+/// filter pins `_id`, a secondary index when one applies, a collection scan
+/// otherwise — every candidate rechecked against the full filter, whichever
+/// it was. So an index on the filtered field serves a search exactly as it
+/// serves a `find`, and `explain` on a `find` with the same filter says what
+/// the search will get.
+///
+/// Only the ids are kept. The executor hands back documents, so they are
+/// taken a page at a time by encoded key — the way a cursor resumes, and
+/// sound for the same reason: every access path delivers `_id` order — and
+/// let go once their ids are recorded. When the executor offers its streaming
+/// visitor this becomes one call that never holds a document; the loop and
+/// the page size go with it.
+fn filter_ids(
+    state: &SharedState,
+    source: &kimmy_storage::CollectionMeta,
+    filter: &kimmy_query::filter::Filter,
+    page: usize,
+) -> Result<Allowed, ApiError> {
+    let mut ids = Vec::new();
+    let mut set = HashSet::new();
+    let mut stats: Option<QueryStats> = None;
+    let mut after: Option<Vec<u8>> = None;
+    loop {
+        let (docs, page_stats) = crate::exec::collect_matching_after(
+            state,
+            source,
+            filter,
+            Some(page),
+            after.as_deref(),
+        )?;
+        let more = docs.len() >= page;
+        let mut last = None;
+        for doc in docs {
+            let Some(raw) = doc.get(kimmy_storage::ID_FIELD) else {
+                continue;
+            };
+            let id = DocId::try_from_bson(raw)?;
+            last = Some(kimmy_core::keyenc::encode(&id.to_bson())?);
+            set.insert(id.to_string());
+            ids.push(id);
         }
-        Ok(true)
-    })?;
-    Ok(Some(ids))
+        match stats.as_mut() {
+            // The plan is the same on every page; the counts add up.
+            Some(total) => {
+                total.examined += page_stats.examined;
+                total.matched += page_stats.matched;
+            }
+            None => stats = Some(page_stats),
+        }
+        match last {
+            Some(key) if more => after = Some(key),
+            _ => break,
+        }
+    }
+    let stats = stats.expect("the loop runs at least once");
+    Ok(Allowed { ids, set, stats })
 }
 
 /// Drop a collection's cached graph.
@@ -552,6 +688,257 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         // because a match that must be total should not guess.
         V::Snapshot(_) => {
             ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Snapshot, e.to_string())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use kimmy_core::{ChunkConfig, Metric, ProviderConfig, VectorRecord, similarity};
+
+    use super::*;
+
+    fn live_state(dir: &tempfile::TempDir) -> SharedState {
+        let engine = std::sync::Arc::new(
+            kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
+        );
+        let tokens = kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret", 3600).unwrap();
+        crate::state_with_egress(
+            engine,
+            tokens,
+            false,
+            crate::RateLimits::disabled(),
+            crate::egress::EgressPolicy::default(),
+        )
+        .unwrap()
+    }
+
+    fn config() -> VectorConfig {
+        VectorConfig {
+            fields: vec!["text".into()],
+            provider: ProviderConfig::Byo,
+            dim: 2,
+            metric: Metric::Cosine,
+            document_prefix: None,
+            query_prefix: None,
+            chunk: ChunkConfig::default(),
+        }
+    }
+
+    /// `n` documents `{_id: i, tag: i % 3, text}` with two chunks each,
+    /// vectors spread around the unit circle so no two chunks tie.
+    fn fixture(
+        state: &SharedState,
+        n: i64,
+    ) -> (kimmy_storage::CollectionMeta, kimmy_storage::CollectionMeta) {
+        state.engine.create_collection("app", "docs").unwrap();
+        state.engine.configure_vectors("app", "docs", config()).unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let shadow = state.engine.vector_collection("app", "docs").unwrap().unwrap();
+        for i in 0..n {
+            state
+                .engine
+                .insert(&source, bson::doc! { "_id": i, "tag": i % 3, "text": format!("d{i}") })
+                .unwrap();
+            let records: Vec<VectorRecord> = (0..2u32)
+                .map(|chunk| {
+                    let angle = (i as f32) * 0.37 + (chunk as f32) * 0.11;
+                    VectorRecord {
+                        source: DocId::Int64(i),
+                        chunk,
+                        source_hlc: kimmy_core::Hlc::new(1, 0),
+                        vector: vec![angle.cos(), angle.sin()],
+                        text: format!("d{i}c{chunk}"),
+                    }
+                })
+                .collect();
+            state.engine.put_vectors(&shadow, &DocId::Int64(i), &records).unwrap();
+        }
+        (source, shadow)
+    }
+
+    fn parse(filter: bson::Document) -> kimmy_query::filter::Filter {
+        kimmy_query::filter::parse(&filter).unwrap()
+    }
+
+    fn sorted_ids(allowed: &Allowed) -> Vec<i64> {
+        let mut out: Vec<i64> = allowed
+            .ids
+            .iter()
+            .map(|id| match id {
+                DocId::Int64(n) => *n,
+                other => panic!("unexpected id {other:?}"),
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    #[test]
+    fn a_filter_on_an_indexed_field_goes_through_the_index() {
+        // The whole point of routing the filter through the executor: an
+        // index on the filtered field is used, and the planner says so. The
+        // same filter without the index scans, and finds the same documents.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, _shadow) = fixture(&state, 30);
+
+        let scanned = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), 1_000).unwrap();
+        assert!(scanned.stats.index.is_none(), "no index exists yet");
+        assert_eq!(scanned.stats.examined, 30, "a scan examines everything");
+        assert_eq!(sorted_ids(&scanned), (0..30).filter(|i| i % 3 == 1).collect::<Vec<_>>());
+
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("tag")],
+                false,
+                None,
+            )
+            .unwrap();
+        let source = state.engine.get_collection("app", "docs").unwrap();
+        let indexed = filter_ids(&state, &source, &parse(bson::doc! { "tag": 1 }), 1_000).unwrap();
+        assert!(indexed.stats.index.is_some(), "the index must be planned");
+        assert_eq!(indexed.stats.examined, 10, "and only its candidates examined");
+        assert_eq!(sorted_ids(&indexed), sorted_ids(&scanned));
+        assert_eq!(indexed.set, scanned.set);
+
+        // A filter that pins `_id` is a primary-key read, as it is for `find`.
+        let by_id =
+            filter_ids(&state, &source, &parse(bson::doc! { "_id": { "$in": [3, 4, 99] } }), 1_000)
+                .unwrap();
+        assert!(by_id.stats.id_lookup);
+        assert_eq!(sorted_ids(&by_id), vec![3, 4]);
+    }
+
+    #[test]
+    fn a_filters_ids_are_gathered_across_pages() {
+        // Paging by key must see every match once, in `_id` order, and add
+        // the pages' counts up — including when the last page is exactly
+        // full, which is the case that would loop or lose a page if the
+        // resume bound were wrong.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, _shadow) = fixture(&state, 30);
+
+        for page in [1, 3, 4, 7, 10, 30, 1_000] {
+            let all = filter_ids(&state, &source, &parse(bson::doc! {}), page).unwrap();
+            let ids: Vec<i64> = all
+                .ids
+                .iter()
+                .map(|id| match id {
+                    DocId::Int64(n) => *n,
+                    other => panic!("{other:?}"),
+                })
+                .collect();
+            assert_eq!(ids, (0..30).collect::<Vec<_>>(), "page size {page}");
+            assert_eq!(all.set.len(), 30);
+            assert_eq!(all.stats.matched, 30, "page size {page}");
+            assert_eq!(all.stats.examined, 30, "page size {page}");
+        }
+
+        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 9 }), 4).unwrap();
+        assert!(none.ids.is_empty());
+        assert_eq!(none.stats.matched, 0);
+    }
+
+    #[test]
+    fn the_join_direction_turns_on_the_set_size() {
+        assert_eq!(join_for(0), Join::Keyed, "an empty set reads nothing");
+        assert_eq!(join_for(1), Join::Keyed);
+        assert_eq!(join_for(SELECTIVE_JOIN_MAX), Join::Keyed, "the boundary is inclusive");
+        assert_eq!(join_for(SELECTIVE_JOIN_MAX + 1), Join::Discard);
+
+        // And the set consults the same rule.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, _shadow) = fixture(&state, 3);
+        let small = filter_ids(&state, &source, &parse(bson::doc! {}), 1_000).unwrap();
+        assert_eq!(small.join(), Join::Keyed);
+    }
+
+    /// Every chunk of every admitted document scored by hand, sorted by score
+    /// then key, capped per document, cut to `k`.
+    fn brute_force(
+        state: &SharedState,
+        shadow: &kimmy_storage::CollectionMeta,
+        query: &[f32],
+        options: &SearchOptions,
+        allowed: &HashSet<String>,
+    ) -> Vec<(String, u32, f32, String)> {
+        let mut all = Vec::new();
+        state
+            .engine
+            .for_each_vector(shadow, |r| {
+                if allowed.contains(&r.source.to_string()) {
+                    let score = similarity(query, &r.vector, options.metric);
+                    all.push((r.source.to_string(), r.chunk, score, r.text));
+                }
+                Ok(true)
+            })
+            .unwrap();
+        all.sort_by(|a, b| {
+            b.2.total_cmp(&a.2).then_with(|| a.0.cmp(&b.0)).then_with(|| a.1.cmp(&b.1))
+        });
+        let mut per_doc: HashMap<String, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for row in all {
+            let seen = per_doc.entry(row.0.clone()).or_insert(0);
+            if *seen >= options.per_document {
+                continue;
+            }
+            *seen += 1;
+            out.push(row);
+            if out.len() >= options.k {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn both_join_directions_return_the_filtered_top_k() {
+        // The keyed join and the discarding join over the same admitted set
+        // must both equal brute force — ids, chunks, scores and text — and so
+        // each other. The collection is under the graph threshold, so the
+        // discarding join is the exact scan and the comparison is exact.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        let (source, shadow) = fixture(&state, 40);
+        let config = config();
+        let query = [0.2f32, -0.98];
+
+        let allowed =
+            filter_ids(&state, &source, &parse(bson::doc! { "tag": { "$in": [0, 2] } }), 1_000)
+                .unwrap();
+        assert_eq!(allowed.ids.len(), 27);
+
+        for (k, per_document) in [(1, 1), (5, 1), (5, 2), (10, 2), (200, 2)] {
+            let options = SearchOptions { k, metric: config.metric, per_document };
+            let expected = brute_force(&state, &shadow, &query, &options, &allowed.set);
+            for join in [Join::Keyed, Join::Discard] {
+                let hits =
+                    knn_joined(&state, &shadow, &config, &query, &options, Some((&allowed, join)))
+                        .unwrap();
+                let got: Vec<(String, u32, f32, String)> = hits
+                    .into_iter()
+                    .map(|h| (h.id.to_string(), h.chunk, h.score, h.text))
+                    .collect();
+                assert_eq!(got, expected, "{join:?}, k {k}, per_document {per_document}");
+            }
+        }
+
+        // An empty admitted set: nothing, by either direction.
+        let none = filter_ids(&state, &source, &parse(bson::doc! { "tag": 7 }), 1_000).unwrap();
+        for join in [Join::Keyed, Join::Discard] {
+            let options = SearchOptions { k: 5, metric: config.metric, per_document: 1 };
+            let hits = knn_joined(&state, &shadow, &config, &query, &options, Some((&none, join)))
+                .unwrap();
+            assert!(hits.is_empty(), "{join:?}");
         }
     }
 }

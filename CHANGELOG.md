@@ -10,6 +10,44 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. Two vector
+search paths that held memory in proportion to the collection now hold it in
+proportion to the answer, and a search `filter` is planned the way a `find`
+is, so it can use an index.
+
+### Changed
+
+- **A search `filter` uses secondary indexes, and a selective one is joined
+  the other way round.** `vector_search` and `hybrid_search` evaluated
+  `filter` by scanning the source collection and keeping every matching id,
+  whatever indexes existed. The filter now runs through the query planner —
+  primary key, secondary index or scan, with the same recheck `find`
+  applies — and keeps only the ids, a page at a time. When it admits at most
+  1,000 documents the search reads those documents' chunks by key and scores
+  them exactly, instead of searching everything and discarding what the
+  filter excluded; above that it searches as before and discards. The hits
+  are the same either way, and for a selective filter they are now exact
+  where the graph walk could previously come back with fewer than `k`.
+  [docs/vectors.md](docs/vectors.md#search) describes the rule; ADR-102 the
+  reasoning.
+- **The exact and lexical search paths hold only the top `k`.** The exact
+  vector path — collections under 500 chunks, the `dot` metric, a failed
+  graph build — and the lexical half of `hybrid_search` built a hit, text
+  included, for every chunk they scored and sorted the lot. Both now keep a
+  bounded set of the best `k` as chunks arrive, with the per-document cap
+  applied on the way in, so a search over a large shadow collection costs
+  memory proportional to `k`. Ties on score are ordered by chunk key rather
+  than by scan order: stable either way, but a different order for exact
+  ties.
+- **Reading one document's vectors no longer scans the shadow collection.**
+  A document's chunks are one contiguous run under its id, and
+  `GET .../docs/{id}/vectors`, the write of a document's vectors and the
+  embedding worker's staleness check now read that run rather than every
+  record in the shadow. Same results; the cost is the document's chunk count
+  instead of the collection's.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

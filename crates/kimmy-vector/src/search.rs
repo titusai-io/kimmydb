@@ -1,14 +1,16 @@
 //! Vector and hybrid search.
 //!
 //! What is in this module is the **exact** path: every stored vector is scored
-//! and the best `k` are kept. That is O(n) per query but has no recall loss and
-//! no index to keep consistent, which makes it both the path small collections
-//! take and the oracle the approximate one is measured against.
+//! and the best `k` are kept. That is O(n) time per query but has no recall
+//! loss and no index to keep consistent, which makes it both the path small
+//! collections take and the oracle the approximate one is measured against.
+//! Its memory is O(k): [`TopK`] holds the answer so far and nothing else.
 //!
 //! Choosing between the two lives in `crate::cache`, not here — this module is
 //! deliberately unaware that an index exists. See `docs/vectors.md`.
 
-use std::collections::HashMap;
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use kimmy_core::{DocId, Metric, VectorRecord, similarity};
 use kimmy_storage::{CollectionMeta, Engine};
@@ -57,7 +59,7 @@ pub fn vector_search(
     options: &SearchOptions,
     allowed: Option<&std::collections::HashSet<String>>,
 ) -> Result<Vec<Hit>> {
-    let mut scored: Vec<Hit> = Vec::new();
+    let mut top = TopK::new(options);
 
     engine.for_each_vector(shadow, |record: VectorRecord| {
         // A dimension mismatch means this vector was written under a different
@@ -71,7 +73,7 @@ pub fn vector_search(
         {
             return Ok(true);
         }
-        scored.push(Hit {
+        top.offer(Hit {
             score: similarity(query, &record.vector, options.metric),
             id: record.source,
             chunk: record.chunk,
@@ -80,29 +82,190 @@ pub fn vector_search(
         Ok(true)
     })?;
 
-    Ok(rank_hits(scored, options))
+    Ok(top.into_hits())
+}
+
+/// Exact search over the chunks of the named documents only.
+///
+/// The other direction of the join `allowed` performs: instead of scanning
+/// every stored vector and discarding those outside the set, each named
+/// document's chunks are read by key and only those are scored. Same scores,
+/// same order, same per-document cap as [`vector_search`] with `allowed` set
+/// to these ids — the difference is that the cost is the size of the set, not
+/// of the collection, and the answer is exact where the graph walk over a
+/// small allowed set is not. Choosing the direction is the caller's job; see
+/// `docs/vectors.md`.
+pub fn vector_search_among(
+    engine: &Engine,
+    shadow: &CollectionMeta,
+    query: &[f32],
+    options: &SearchOptions,
+    sources: &[DocId],
+) -> Result<Vec<Hit>> {
+    let mut top = TopK::new(options);
+    for source in sources {
+        engine.for_each_vector_of(shadow, source, |record: VectorRecord| {
+            if record.vector.len() != query.len() {
+                return Ok(true);
+            }
+            top.offer(Hit {
+                score: similarity(query, &record.vector, options.metric),
+                id: record.source,
+                chunk: record.chunk,
+                text: record.text,
+            });
+            Ok(true)
+        })?;
+    }
+    Ok(top.into_hits())
 }
 
 /// Keep the best hits, capped per document, then truncated to `k`.
-pub(crate) fn rank_hits(mut hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
-    // Descending by score. `total_cmp` rather than `partial_cmp`: a NaN would
-    // otherwise make the comparator inconsistent and the sort order undefined.
-    hits.sort_by(|a, b| b.score.total_cmp(&a.score));
-
-    let mut per_doc: HashMap<String, usize> = HashMap::new();
-    let mut out = Vec::with_capacity(options.k);
+///
+/// The same rule [`TopK`] applies as hits arrive, for a caller that already
+/// holds a bounded list — the graph walk's candidates.
+pub(crate) fn rank_hits(hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
+    let mut top = TopK::new(options);
     for hit in hits {
-        let seen = per_doc.entry(hit.id.to_string()).or_insert(0);
-        if *seen >= options.per_document {
-            continue;
-        }
-        *seen += 1;
-        out.push(hit);
-        if out.len() >= options.k {
-            break;
+        top.offer(hit);
+    }
+    top.into_hits()
+}
+
+/// Where a hit stands relative to the others: score first, then the chunk's
+/// key, so equal scores rank the same way on every run and on every path.
+///
+/// Ordered so that the *worst* standing is the least — the one a full set
+/// evicts — and the best is the greatest. `total_cmp` rather than
+/// `partial_cmp`: a NaN would otherwise make the order inconsistent.
+#[derive(Clone, Debug)]
+struct Standing {
+    score: f32,
+    doc: String,
+    chunk: u32,
+}
+
+impl Ord for Standing {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // A lower score is worse. Among equal scores the larger key is worse,
+        // so that the best-first order reads smallest key first.
+        self.score
+            .total_cmp(&other.score)
+            .then_with(|| other.doc.cmp(&self.doc))
+            .then_with(|| other.chunk.cmp(&self.chunk))
+    }
+}
+
+impl PartialOrd for Standing {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Standing {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for Standing {}
+
+/// The best `k` hits seen so far, with the per-document cap applied as they
+/// arrive.
+///
+/// A scan offers every chunk it scores; this keeps at most `k` of them, so a
+/// search's memory is the size of its answer rather than of the collection,
+/// and the text of a chunk that will not be returned is dropped as soon as it
+/// has been judged (ADR-102).
+///
+/// The cap is enforced on the way in rather than after ranking, because a
+/// heap of size `k` capped afterwards is not bounded: a document with ten
+/// thousand chunks better than everything else would need all of them held
+/// to find the other documents. On the way in it is exact — a chunk of a
+/// document already holding its allowance has to displace that document's
+/// own worst, or it is out regardless of where it stands globally; and a
+/// chunk that cannot beat the set's worst is out regardless of its document.
+pub(crate) struct TopK {
+    k: usize,
+    per_document: usize,
+    /// Every held hit, keyed by its standing; the first entry is the worst.
+    ranked: BTreeMap<Standing, Hit>,
+    /// The standings held per document, so a document's own worst is found
+    /// without walking the set. Mirrors `ranked`, so it is bounded by `k`.
+    per_doc: HashMap<String, BTreeSet<Standing>>,
+}
+
+impl TopK {
+    pub(crate) fn new(options: &SearchOptions) -> Self {
+        Self {
+            k: options.k,
+            per_document: options.per_document.max(1),
+            ranked: BTreeMap::new(),
+            per_doc: HashMap::new(),
         }
     }
-    out
+
+    /// Consider one hit. It is kept only if it belongs in the answer so far.
+    pub(crate) fn offer(&mut self, hit: Hit) {
+        if self.k == 0 {
+            return;
+        }
+        // The cheap rejection first, before the key is even rendered: a full
+        // set whose worst member outscores this one outright.
+        if self.ranked.len() >= self.k
+            && let Some((worst, _)) = self.ranked.first_key_value()
+            && hit.score < worst.score
+        {
+            return;
+        }
+
+        let standing = Standing { score: hit.score, doc: hit.id.to_string(), chunk: hit.chunk };
+
+        if let Some(mine) = self.per_doc.get(&standing.doc)
+            && mine.len() >= self.per_document
+        {
+            // The document already holds its allowance; the new chunk has to
+            // displace the document's own worst or it is out.
+            let own_worst = mine.first().cloned().expect("a non-empty set has a first");
+            if standing <= own_worst {
+                return;
+            }
+            self.remove(&own_worst);
+            self.insert(standing, hit);
+            return;
+        }
+
+        if self.ranked.len() >= self.k {
+            let worst = self.ranked.first_key_value().map(|(s, _)| s.clone()).expect("full");
+            if standing <= worst {
+                return;
+            }
+            self.remove(&worst);
+        }
+        self.insert(standing, hit);
+    }
+
+    /// Best first.
+    pub(crate) fn into_hits(self) -> Vec<Hit> {
+        self.ranked.into_values().rev().collect()
+    }
+
+    fn insert(&mut self, standing: Standing, hit: Hit) {
+        self.per_doc.entry(standing.doc.clone()).or_default().insert(standing.clone());
+        self.ranked.insert(standing, hit);
+    }
+
+    fn remove(&mut self, standing: &Standing) {
+        self.ranked.remove(standing);
+        if let Some(mine) = self.per_doc.get_mut(&standing.doc) {
+            mine.remove(standing);
+            // Dropped when empty, so the map tracks documents in the answer
+            // rather than every document ever seen.
+            if mine.is_empty() {
+                self.per_doc.remove(&standing.doc);
+            }
+        }
+    }
 }
 
 /// Combine two rankings by Reciprocal Rank Fusion.
@@ -150,7 +313,7 @@ pub fn keyword_search(
         return Ok(Vec::new());
     }
 
-    let mut scored = Vec::new();
+    let mut top = TopK::new(options);
     engine.for_each_vector(shadow, |record: VectorRecord| {
         let haystack = tokenize(&record.text);
         if haystack.is_empty() {
@@ -160,12 +323,12 @@ pub fn keyword_search(
         if matched > 0 {
             // Normalized by length so a long chunk does not win on size alone.
             let score = matched as f32 / haystack.len() as f32;
-            scored.push(Hit { score, id: record.source, chunk: record.chunk, text: record.text });
+            top.offer(Hit { score, id: record.source, chunk: record.chunk, text: record.text });
         }
         Ok(true)
     })?;
 
-    Ok(rank_hits(scored, options))
+    Ok(top.into_hits())
 }
 
 fn tokenize(text: &str) -> Vec<String> {
@@ -389,6 +552,215 @@ mod tests {
         let hit = |id: i64| Hit { id: DocId::Int64(id), score: 1.0, chunk: 0, text: String::new() };
         let ranking: Vec<Hit> = (1..=10).map(hit).collect();
         assert_eq!(reciprocal_rank_fusion(&[ranking], 3).len(), 3);
+    }
+
+    // -----------------------------------------------------------------------
+    // The bounded top-k
+    // -----------------------------------------------------------------------
+
+    /// The rule the bounded set must reproduce, written the slow way: sort
+    /// every hit by score then key, apply the per-document cap, take `k`.
+    fn reference_rank(mut hits: Vec<Hit>, options: &SearchOptions) -> Vec<Hit> {
+        hits.sort_by(|a, b| {
+            b.score
+                .total_cmp(&a.score)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+                .then_with(|| a.chunk.cmp(&b.chunk))
+        });
+        let mut per_doc: HashMap<String, usize> = HashMap::new();
+        let mut out = Vec::new();
+        for hit in hits {
+            let seen = per_doc.entry(hit.id.to_string()).or_insert(0);
+            if *seen >= options.per_document.max(1) {
+                continue;
+            }
+            *seen += 1;
+            out.push(hit);
+            if out.len() >= options.k {
+                break;
+            }
+        }
+        out
+    }
+
+    /// A small deterministic generator, so a failure names its seed.
+    fn lcg(seed: &mut u64) -> u64 {
+        *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        *seed >> 33
+    }
+
+    /// Random hits over a few documents with many chunks each, scores drawn
+    /// from a handful of values so ties are the rule rather than the
+    /// exception.
+    fn random_hits(seed: u64, n: usize) -> Vec<Hit> {
+        let mut state = seed;
+        (0..n)
+            .map(|_| {
+                let doc = (lcg(&mut state) % 7) as i64;
+                let chunk = (lcg(&mut state) % 40) as u32;
+                let score = (lcg(&mut state) % 5) as f32 / 4.0;
+                Hit { id: DocId::Int64(doc), score, chunk, text: format!("{doc}/{chunk}") }
+            })
+            // One chunk of one document can only be offered once.
+            .fold(Vec::<Hit>::new(), |mut acc, hit| {
+                if !acc.iter().any(|h| h.id == hit.id && h.chunk == hit.chunk) {
+                    acc.push(hit);
+                }
+                acc
+            })
+    }
+
+    #[test]
+    fn the_bounded_set_reproduces_the_full_sort() {
+        // Ties on score, many chunks per document, every combination of a
+        // small k and cap, and arrival in a random order: the streamed answer
+        // must be the sorted-and-capped one, hit for hit, text included.
+        for seed in 1..=25u64 {
+            let hits = random_hits(seed, 120);
+            for k in [1, 2, 3, 5, 10, 200] {
+                for per_document in [1, 2, 3, 100] {
+                    let options = SearchOptions { k, per_document, ..Default::default() };
+                    let expected = reference_rank(hits.clone(), &options);
+                    let got = rank_hits(hits.clone(), &options);
+                    assert_eq!(got, expected, "seed {seed}, k {k}, per_document {per_document}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn k_larger_than_the_candidates_returns_them_all() {
+        let hits = random_hits(3, 30);
+        let options = SearchOptions { k: 1_000, per_document: 100, ..Default::default() };
+        let got = rank_hits(hits.clone(), &options);
+        assert_eq!(got.len(), hits.len());
+        assert_eq!(got, reference_rank(hits, &options));
+    }
+
+    #[test]
+    fn the_bounded_set_holds_only_k_hits_while_scanning() {
+        // The point of the structure: however many chunks are offered, the
+        // set — and the per-document map that mirrors it — stays at `k`.
+        let options = SearchOptions { k: 3, per_document: 1, ..Default::default() };
+        let mut top = TopK::new(&options);
+        for hit in random_hits(9, 500) {
+            top.offer(hit);
+            assert!(top.ranked.len() <= 3);
+            assert!(top.per_doc.values().map(BTreeSet::len).sum::<usize>() <= 3);
+        }
+        assert_eq!(top.into_hits().len(), 3);
+    }
+
+    #[test]
+    fn a_documents_better_chunk_displaces_its_own_worst_not_another_document() {
+        // Document 1 holds its one slot with score 0.5; its 0.9 chunk must
+        // replace that entry rather than push document 2 out.
+        let options = SearchOptions { k: 2, per_document: 1, ..Default::default() };
+        let mut top = TopK::new(&options);
+        let hit = |id: i64, chunk: u32, score: f32| Hit {
+            id: DocId::Int64(id),
+            score,
+            chunk,
+            text: String::new(),
+        };
+        top.offer(hit(1, 0, 0.5));
+        top.offer(hit(2, 0, 0.4));
+        top.offer(hit(1, 1, 0.9));
+        let out = top.into_hits();
+        assert_eq!(ids(&out), vec![1, 2]);
+        assert_eq!(out[0].chunk, 1, "the document's better chunk is the one kept");
+    }
+
+    #[test]
+    fn ties_are_broken_by_key_whatever_the_arrival_order() {
+        let hit = |id: i64, chunk: u32| Hit {
+            id: DocId::Int64(id),
+            score: 1.0,
+            chunk,
+            text: String::new(),
+        };
+        let options = SearchOptions { k: 3, per_document: 2, ..Default::default() };
+        let forwards = rank_hits(vec![hit(1, 0), hit(1, 1), hit(2, 0), hit(3, 0)], &options);
+        let backwards = rank_hits(vec![hit(3, 0), hit(2, 0), hit(1, 1), hit(1, 0)], &options);
+        assert_eq!(forwards, backwards);
+        assert_eq!(ids(&forwards), vec![1, 1, 2]);
+        assert_eq!(forwards[0].chunk, 0);
+    }
+
+    #[test]
+    fn the_exact_scan_returns_the_text_of_the_final_hits() {
+        // The text is dropped for chunks that will not be returned; it must
+        // still be present, and right, for those that are.
+        let (engine, shadow, _dir) = setup(&[
+            (1, 0, [1.0, 0.0], "closest"),
+            (2, 0, [0.7, 0.7], "middle"),
+            (3, 0, [0.0, 1.0], "farthest"),
+        ]);
+        let options = SearchOptions { k: 2, ..Default::default() };
+        let hits = vector_search(&engine, &shadow, &[1.0, 0.0], &options, None).unwrap();
+        let texts: Vec<&str> = hits.iter().map(|h| h.text.as_str()).collect();
+        assert_eq!(texts, vec!["closest", "middle"]);
+    }
+
+    // -----------------------------------------------------------------------
+    // The keyed join
+    // -----------------------------------------------------------------------
+
+    /// A wider fixture: twelve documents, three chunks each, vectors spread
+    /// around the unit circle so no two chunks score alike against a query.
+    fn wide_fixture() -> (Engine, CollectionMeta, tempfile::TempDir) {
+        let mut rows: Vec<(i64, u32, [f32; 2], String)> = Vec::new();
+        for doc in 1..=12i64 {
+            for chunk in 0..3u32 {
+                let angle = (doc as f32) * 0.5 + (chunk as f32) * 0.17;
+                rows.push((doc, chunk, [angle.cos(), angle.sin()], format!("d{doc}c{chunk}")));
+            }
+        }
+        let borrowed: Vec<(i64, u32, [f32; 2], &str)> =
+            rows.iter().map(|(d, c, v, t)| (*d, *c, *v, t.as_str())).collect();
+        setup(&borrowed)
+    }
+
+    #[test]
+    fn the_keyed_join_agrees_with_the_filtered_scan() {
+        // Both directions of the join must give the same answer: same ids,
+        // same chunks, same scores, same text, same order — for a per-document
+        // cap of one and of several, and for a k past the candidate count.
+        let (engine, shadow, _dir) = wide_fixture();
+        let sources: Vec<DocId> = [2i64, 5, 7, 11].into_iter().map(DocId::Int64).collect();
+        let allowed: HashSet<String> = sources.iter().map(ToString::to_string).collect();
+        let query = [0.3f32, -0.95];
+
+        for (k, per_document) in [(3, 1), (5, 2), (100, 3), (1, 1)] {
+            let options = SearchOptions { k, per_document, ..Default::default() };
+            let scanned =
+                vector_search(&engine, &shadow, &query, &options, Some(&allowed)).unwrap();
+            let keyed = vector_search_among(&engine, &shadow, &query, &options, &sources).unwrap();
+            assert_eq!(keyed, scanned, "k {k}, per_document {per_document}");
+            assert!(!keyed.is_empty());
+            assert!(keyed.iter().all(|h| allowed.contains(&h.id.to_string())));
+        }
+    }
+
+    #[test]
+    fn the_keyed_join_reads_only_the_named_documents() {
+        let (engine, shadow, _dir) = wide_fixture();
+        let options = SearchOptions { k: 100, per_document: 10, ..Default::default() };
+        let hits = vector_search_among(&engine, &shadow, &[1.0, 0.0], &options, &[DocId::Int64(4)])
+            .unwrap();
+        assert_eq!(hits.len(), 3, "every chunk of the one document, nothing else");
+        assert!(hits.iter().all(|h| h.id == DocId::Int64(4)));
+
+        // No documents named: nothing read, nothing returned.
+        assert!(
+            vector_search_among(&engine, &shadow, &[1.0, 0.0], &options, &[]).unwrap().is_empty()
+        );
+        // A document with no chunks contributes nothing rather than failing.
+        assert!(
+            vector_search_among(&engine, &shadow, &[1.0, 0.0], &options, &[DocId::Int64(99)])
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
