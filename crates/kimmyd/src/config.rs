@@ -423,6 +423,15 @@ pub struct AuthConfig {
     /// tokens issued by one node will be rejected by another.
     #[serde(serialize_with = "redact")]
     pub jwt_secret: Option<String>,
+    /// The signing secret before `jwt_secret`, accepted for verification only
+    /// while a rotation is in progress (ADR-101).
+    ///
+    /// Tokens are never signed with it. Set it to the old value when changing
+    /// `jwt_secret`, roll every node, wait one `token_ttl_secs`, and remove it.
+    /// Held to the same length floor as the current secret, and refused when
+    /// it equals the current one.
+    #[serde(serialize_with = "redact")]
+    pub jwt_previous_secret: Option<String>,
     pub token_ttl_secs: u64,
     /// Where the password login answers (ADR-100).
     pub local: LocalConfig,
@@ -1137,6 +1146,7 @@ impl Default for AuthConfig {
             root_user: "root".to_string(),
             root_password: None,
             jwt_secret: None,
+            jwt_previous_secret: None,
             token_ttl_secs: 60 * 60,
             local: LocalConfig::default(),
             oidc: OidcConfig::default(),
@@ -1223,6 +1233,34 @@ impl Config {
                 ),
                 Some(_) => {}
             }
+
+            // The previous secret still verifies tokens for as long as it is
+            // configured, so it is held to the same floor: a short one is as
+            // forgeable as a short current one. And it must differ from the
+            // current secret — the same value twice is not a rotation, it is a
+            // configuration edited halfway, and a node that started under it
+            // would report a rotation in progress when nothing had changed.
+            // Checked here as well as in `TokenIssuer::with_previous` for the
+            // same reason as above: `check-config` must give the answer the
+            // server would.
+            if let Some(previous) = &self.auth.jwt_previous_secret {
+                if previous.len() < min {
+                    anyhow::bail!(
+                        "auth.jwt_previous_secret is {} bytes; {min} or more are required, \
+                         because it still verifies tokens for as long as it is configured and \
+                         a short one is as forgeable as a short auth.jwt_secret.",
+                        previous.len()
+                    );
+                }
+                if Some(previous) == self.auth.jwt_secret.as_ref() {
+                    anyhow::bail!(
+                        "auth.jwt_previous_secret is the same as auth.jwt_secret, so nothing is \
+                         being rotated. Set KIMMY_JWT_SECRET to the new value and \
+                         KIMMY_JWT_PREVIOUS_SECRET to the old one, or unset \
+                         KIMMY_JWT_PREVIOUS_SECRET."
+                    );
+                }
+            }
         }
 
         // A value copied from this repository's own examples is a secret every
@@ -1247,6 +1285,15 @@ impl Config {
                     "auth.jwt_secret",
                     "KIMMY_JWT_SECRET",
                     self.auth.jwt_secret.as_deref().filter(|_| auth_on),
+                ),
+                // Held to the same rule as the current secret and for the same
+                // reason: while it is configured it verifies tokens, so a
+                // placeholder here mints root just as surely as a placeholder
+                // in `jwt_secret`. A rotation is no excuse to relax it.
+                (
+                    "auth.jwt_previous_secret",
+                    "KIMMY_JWT_PREVIOUS_SECRET",
+                    self.auth.jwt_previous_secret.as_deref().filter(|_| auth_on),
                 ),
                 (
                     "cluster.cluster_secret",
@@ -1441,9 +1488,9 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} scheme={} data_dir={} auth={} local_login={} oidc={} mcp={} gc={} \
-             ratelimit=[{}] limits=[timeout={}s body={}B] audit={} cluster={} \
-             seeds=[{}] log={}/{:?} otel={}",
+            "bind={} scheme={} data_dir={} auth={} local_login={} jwt_previous_secret={} \
+             oidc={} mcp={} gc={} ratelimit=[{}] limits=[timeout={}s body={}B] audit={} \
+             cluster={} seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
@@ -1452,6 +1499,11 @@ impl Config {
             // after validation, so the two agree, and printing the string
             // means a summary never claims a mode `validate` would refuse.
             self.auth.local.login,
+            // Whether a rotation window is open, never the value: an operator
+            // reading a startup log or a `check-config` transcript should be
+            // able to tell that a previous secret is still configured, because
+            // the whole point of the window is that it closes.
+            if self.auth.jwt_previous_secret.is_some() { "set" } else { "none" },
             self.auth.oidc.describe(),
             if self.server.mcp { "enabled" } else { "off" },
             gc,
@@ -1665,10 +1717,12 @@ mod tests {
         // CI output, or pasted into a bug report. `jwt_secret` signs every local
         // token the cluster issues, so printing it hands over the ability to
         // mint any principal, `root` included.
-        let cfg = valid();
+        let mut cfg = valid();
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
         let secrets = [
             cfg.auth.root_password.clone().expect("the fixture sets a root password"),
             cfg.auth.jwt_secret.clone().expect("the fixture sets a signing key"),
+            cfg.auth.jwt_previous_secret.clone().expect("the fixture sets a previous key"),
         ];
 
         let text = toml::to_string(&cfg).unwrap();
@@ -1679,6 +1733,72 @@ mod tests {
         // Set-ness survives, because that is the question check-config answers.
         assert!(text.contains("root_password"), "the field vanished entirely:\n{text}");
         assert!(text.contains("jwt_secret"), "the field vanished entirely:\n{text}");
+        assert!(text.contains("jwt_previous_secret"), "the field vanished entirely:\n{text}");
+    }
+
+    /// The rotation window (ADR-101): a previous secret is optional, is held to
+    /// the current secret's floor, and must differ from the current secret.
+    #[test]
+    fn a_previous_jwt_secret_is_validated_like_the_current_one() {
+        let mut cfg = valid();
+        cfg.auth.jwt_previous_secret = None;
+        cfg.validate().expect("no previous secret is the ordinary case");
+
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
+        cfg.validate().expect("a distinct previous secret of adequate length opens the window");
+
+        // Too short: it still verifies tokens, so the floor is the same.
+        cfg.auth.jwt_previous_secret = Some("short".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("jwt_previous_secret"), "unhelpful error: {err}");
+        assert!(err.contains("5 bytes"), "the error should name the length: {err}");
+        assert!(
+            kimmy_auth::TokenIssuer::with_previous(
+                "a-signing-key-of-adequate-length",
+                Some("short"),
+                3600
+            )
+            .is_err(),
+            "validate must agree with the issuer about what is too short"
+        );
+
+        // The same value twice is not a rotation.
+        cfg.auth.jwt_previous_secret = cfg.auth.jwt_secret.clone();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("jwt_previous_secret"), "unhelpful error: {err}");
+        assert!(err.contains("same"), "the error should say what is wrong: {err}");
+        assert!(
+            !err.contains("a-signing-key-of-adequate-length"),
+            "the error must not echo the secret: {err}"
+        );
+        assert!(
+            kimmy_auth::TokenIssuer::with_previous(
+                "a-signing-key-of-adequate-length",
+                Some("a-signing-key-of-adequate-length"),
+                3600
+            )
+            .is_err(),
+            "validate must agree with the issuer"
+        );
+
+        // With auth off no token is verified, so the previous secret is as
+        // irrelevant as the current one and is not checked.
+        let mut off = Config::default();
+        off.auth.insecure_no_auth = true;
+        off.auth.jwt_previous_secret = Some("short".into());
+        off.server.bind = "127.0.0.1:7878".parse().unwrap();
+        off.validate().unwrap();
+    }
+
+    #[test]
+    fn the_summary_says_whether_a_previous_secret_is_set_and_never_what_it_is() {
+        let mut cfg = valid();
+        assert!(cfg.summary().contains("jwt_previous_secret=none"), "{}", cfg.summary());
+
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
+        let summary = cfg.summary();
+        assert!(summary.contains("jwt_previous_secret=set"), "{summary}");
+        assert!(!summary.contains("being-retired"), "the value leaked: {summary}");
     }
 
     #[test]

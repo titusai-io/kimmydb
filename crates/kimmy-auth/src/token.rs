@@ -67,23 +67,60 @@ pub struct Claims {
 }
 
 /// Signs and verifies tokens.
+///
+/// Holds one signing key and, during a rotation, one more verifying key
+/// (ADR-101). Every token this issuer mints is signed with the current secret;
+/// a token is accepted if either secret verifies it. That is what lets an
+/// operator change `KIMMY_JWT_SECRET` without ending every session at once:
+/// the old secret rides along as the previous one for a token lifetime, and is
+/// then removed.
 #[derive(Clone)]
 pub struct TokenIssuer {
     encoding: EncodingKey,
     decoding: DecodingKey,
+    /// The secret before the current one, kept only for verification.
+    previous: Option<DecodingKey>,
     ttl_secs: u64,
 }
 
 impl TokenIssuer {
     pub fn new(secret: &str, ttl_secs: u64) -> Result<Self> {
+        Self::with_previous(secret, None, ttl_secs)
+    }
+
+    /// An issuer that signs with `secret` and also accepts tokens signed with
+    /// `previous`.
+    ///
+    /// The previous secret is held to the same floor as the current one: it
+    /// still verifies tokens, so a weak one is exactly as forgeable as a weak
+    /// current key. It must also differ from the current one — the same value
+    /// twice is not a rotation, it is a configuration that was edited halfway,
+    /// and starting under it would let an operator believe a rotation happened
+    /// when nothing changed.
+    pub fn with_previous(secret: &str, previous: Option<&str>, ttl_secs: u64) -> Result<Self> {
         if secret.len() < MIN_SECRET_LEN {
             return Err(AuthError::WeakSecret { min: MIN_SECRET_LEN });
         }
+        let previous = match previous {
+            None => None,
+            Some(prev) if prev.len() < MIN_SECRET_LEN => {
+                return Err(AuthError::WeakSecret { min: MIN_SECRET_LEN });
+            }
+            Some(prev) if prev == secret => return Err(AuthError::PreviousSecretIsCurrent),
+            Some(prev) => Some(DecodingKey::from_secret(prev.as_bytes())),
+        };
         Ok(Self {
             encoding: EncodingKey::from_secret(secret.as_bytes()),
             decoding: DecodingKey::from_secret(secret.as_bytes()),
+            previous,
             ttl_secs,
         })
+    }
+
+    /// Whether a previous secret is configured — that is, whether a rotation
+    /// window is open. Never the value.
+    pub fn has_previous_secret(&self) -> bool {
+        self.previous.is_some()
     }
 
     /// How long an issued token lasts.
@@ -123,24 +160,38 @@ impl TokenIssuer {
     /// carries the token version it claims, and **checking that against the
     /// user's current version is the caller's job** — it needs storage, and
     /// this crate has none. See ADR-052.
+    ///
+    /// The current secret is tried first and the previous one only if the
+    /// current one finds the signature wrong. An expired token is reported as
+    /// expired by whichever key verified its signature — that answer is final,
+    /// because a token the current key signed was never signed by the previous
+    /// one. A token neither key accepts is simply invalid, with nothing said
+    /// about which keys were tried: a caller holding a token from a secret
+    /// this cluster has retired is a caller with a bad token.
     pub fn verify(&self, token: &str) -> Result<Principal> {
-        let mut validation = Validation::new(Algorithm::HS256);
-        validation.validate_exp = true;
-        // No clock skew allowance: nodes in a cluster are expected to be
-        // roughly in sync, and the HLC already tolerates skew for ordering.
-        validation.leeway = 0;
+        let claims = match (decode_with(&self.decoding, token), &self.previous) {
+            (Err(AuthError::InvalidToken), Some(previous)) => decode_with(previous, token)?,
+            (outcome, _) => outcome?,
+        };
 
-        let data = jsonwebtoken::decode::<Claims>(token, &self.decoding, &validation).map_err(
-            |e| match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
-                _ => AuthError::InvalidToken,
-            },
-        )?;
-
-        Ok(Principal::new(data.claims.sub, data.claims.grants)
-            .at_version(data.claims.tv)
-            .with_roles(data.claims.roles))
+        Ok(Principal::new(claims.sub, claims.grants).at_version(claims.tv).with_roles(claims.roles))
     }
+}
+
+/// Decode and validate a token against one key.
+fn decode_with(key: &DecodingKey, token: &str) -> Result<Claims> {
+    let mut validation = Validation::new(Algorithm::HS256);
+    validation.validate_exp = true;
+    // No clock skew allowance: nodes in a cluster are expected to be
+    // roughly in sync, and the HLC already tolerates skew for ordering.
+    validation.leeway = 0;
+
+    jsonwebtoken::decode::<Claims>(token, key, &validation).map(|data| data.claims).map_err(|e| {
+        match e.kind() {
+            jsonwebtoken::errors::ErrorKind::ExpiredSignature => AuthError::TokenExpired,
+            _ => AuthError::InvalidToken,
+        }
+    })
 }
 
 fn now_secs() -> u64 {
@@ -287,6 +338,86 @@ mod tests {
             Err(AuthError::WeakSecret { .. })
         ));
         assert!(TokenIssuer::new("0123456789abcdef0123456789abcdef", 3600).is_ok());
+    }
+
+    const OLD: &str = "the-secret-being-rotated-out-of-use";
+    const NEW: &str = "the-secret-being-rotated-into-use!";
+
+    /// The rotation window (ADR-101): a token signed with the secret an
+    /// operator is retiring keeps working on a node that names it as the
+    /// previous one, and only there.
+    #[test]
+    fn a_token_signed_with_the_previous_secret_still_verifies() {
+        let before = TokenIssuer::new(OLD, 3600).unwrap();
+        let token = before.issue(&analyst()).unwrap();
+
+        let rotating = TokenIssuer::with_previous(NEW, Some(OLD), 3600).unwrap();
+        assert!(rotating.has_previous_secret());
+        let recovered = rotating.verify(&token).expect("the previous secret must still verify");
+        assert_eq!(recovered.user, "analyst");
+        assert!(recovered.can(Action::Read, "sales", Some("orders")));
+
+        // The same node without the previous secret is the situation after the
+        // window closes: the token is just invalid.
+        let rotated = TokenIssuer::new(NEW, 3600).unwrap();
+        assert!(!rotated.has_previous_secret());
+        assert!(matches!(rotated.verify(&token), Err(AuthError::InvalidToken)));
+    }
+
+    #[test]
+    fn a_rotating_issuer_signs_with_the_current_secret_only() {
+        // Signing with the current key is what makes the window close: once
+        // every token the old key signed has expired, nothing depends on it.
+        let rotating = TokenIssuer::with_previous(NEW, Some(OLD), 3600).unwrap();
+        let token = rotating.issue(&analyst()).unwrap();
+
+        assert!(TokenIssuer::new(NEW, 3600).unwrap().verify(&token).is_ok());
+        assert!(matches!(
+            TokenIssuer::new(OLD, 3600).unwrap().verify(&token),
+            Err(AuthError::InvalidToken)
+        ));
+    }
+
+    #[test]
+    fn a_token_signed_with_neither_secret_is_invalid_during_a_rotation() {
+        // Two accepted keys are not "any key": a third secret is refused with
+        // the same error as before, and nothing says which keys were tried.
+        const STRANGER: &str = "a-secret-this-cluster-never-held";
+
+        let token = TokenIssuer::new(STRANGER, 3600).unwrap().issue(&analyst()).unwrap();
+        let rotating = TokenIssuer::with_previous(NEW, Some(OLD), 3600).unwrap();
+        assert!(matches!(rotating.verify(&token), Err(AuthError::InvalidToken)));
+    }
+
+    #[test]
+    fn an_expired_token_is_expired_under_whichever_secret_signed_it() {
+        // Expiry is judged by the key that verified the signature, and the
+        // answer is not softened into "invalid" by trying the other key.
+        let rotating = TokenIssuer::with_previous(NEW, Some(OLD), 3600).unwrap();
+        let stale_old =
+            TokenIssuer::new(OLD, 3600).unwrap().issue_at(&analyst(), now_secs() - 7200).unwrap();
+        assert!(matches!(rotating.verify(&stale_old), Err(AuthError::TokenExpired)));
+        let stale_new = rotating.issue_at(&analyst(), now_secs() - 7200).unwrap();
+        assert!(matches!(rotating.verify(&stale_new), Err(AuthError::TokenExpired)));
+    }
+
+    #[test]
+    fn a_previous_secret_equal_to_the_current_one_is_refused() {
+        // Not a rotation: nothing changed, and a node that started would let
+        // the operator believe otherwise.
+        assert!(matches!(
+            TokenIssuer::with_previous(SECRET, Some(SECRET), 3600),
+            Err(AuthError::PreviousSecretIsCurrent)
+        ));
+    }
+
+    #[test]
+    fn a_short_previous_secret_is_refused() {
+        // It still verifies tokens, so it is held to the same floor.
+        assert!(matches!(
+            TokenIssuer::with_previous(SECRET, Some("short"), 3600),
+            Err(AuthError::WeakSecret { .. })
+        ));
     }
 
     #[test]

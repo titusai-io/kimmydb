@@ -145,6 +145,22 @@ whose defaults are meant to be left alone, and documentation corrections.
   an email is mutable and not unique across providers. A subject whose email
   changes keeps its roles.
 
+- **`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`,
+  `--jwt-previous-secret`): a two-key window for rotating `jwt_secret`.**
+  Tokens are always signed with `jwt_secret`; a token is accepted if either
+  secret verifies it, the current one tried first. Rotate by moving the old
+  value to `jwt_previous_secret`, putting the new one in `jwt_secret`, rolling
+  every node, waiting one `token_ttl_secs`, and removing the previous secret.
+  The node logs an `info` at startup naming that deadline and one `warn` when
+  it passes (counted from process start; not persisted across restarts). The
+  previous secret is held to the same length floor as the current one and to
+  the same placeholder refusal off loopback, must
+  differ from it, and every refusal is `check-config`'s too; the startup summary
+  says `jwt_previous_secret=set` and never the value. Rotation does not revoke
+  — the token version still does that, identically for a token the previous
+  secret verified — and `cluster_secret` is not covered. ADR-101; procedure in
+  `docs/security.md`.
+
 ### Changed
 
 - **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
@@ -157,7 +173,8 @@ whose defaults are meant to be left alone, and documentation corrections.
 - **Placeholder secrets are refused off loopback.** A node whose HTTP
   listener — or, with clustering on, whose cluster listener — binds anything
   other than a loopback address refuses to start when `auth.root_password`,
-  `auth.jwt_secret` or `cluster.cluster_secret` is one of the values this
+  `auth.jwt_secret`, `auth.jwt_previous_secret` or `cluster.cluster_secret`
+  is one of the values this
   repository's own examples use: `changeme`, `change-me`, `hunter2`, the
   defaults the compose file used to fall back to, the commented-out lines in
   `kimmy.example.toml`, and the obvious words (`password`, `secret`, `root`,

@@ -637,14 +637,60 @@ other within about two seconds. Refusals are **not** distinguished — deleted,
 disabled and logged-out all return the same 401, because telling them apart
 reports on an account to whoever is holding a stale token for it.
 
-Rotating `KIMMY_JWT_SECRET` still works and is still the bigger hammer: it
-invalidates every token for every user at once.
+Rotating `KIMMY_JWT_SECRET` on its own is still the bigger hammer: without a
+previous secret configured it invalidates every token for every user at once.
+That is not how to end a session — the rows above are — and it is not how to
+rotate either; see the next section.
 
 Minimum secret length is 32 bytes, enforced at construction and again by
 `check-config` — the 256-bit floor RFC 7518 §3.2 sets for HS256, and the whole
 cluster shares this value, so a weak one is a cluster-wide weakness. (It was
 16 bytes up to 0.16.x; a secret of 16–31 bytes has to be replaced before
 upgrading, which logs every user out once — [ADR-093](decisions.md).)
+
+### Rotating the signing secret
+
+A secret that is never rotated is a secret whose exposure is never recovered
+from, and the reason this one was not rotated is that changing it used to log
+everyone out at once. So the node holds **two** secrets during a rotation
+([ADR-101](decisions.md)): every token is *signed* with `KIMMY_JWT_SECRET`,
+and a token is *accepted* if either `KIMMY_JWT_SECRET` or
+`KIMMY_JWT_PREVIOUS_SECRET` verifies it. The current one is tried first. A
+token neither verifies gets the same 401 as any other bad token.
+
+The procedure:
+
+1. Generate the new secret: `openssl rand -base64 32`.
+2. On every node, set `KIMMY_JWT_PREVIOUS_SECRET` to the **old** value and
+   `KIMMY_JWT_SECRET` to the **new** one. `kimmyd check-config` confirms the
+   pair: the previous secret must meet the same length floor and must differ
+   from the current one, and the summary line says `jwt_previous_secret=set`
+   (never the value).
+3. Restart or roll every node. Sessions opened before the roll keep working on
+   every node, whichever secret signed them; sessions opened after it are
+   signed with the new secret only. In a cluster, roll *all* nodes before
+   considering the rotation done — a node still on the old pair signs tokens
+   the others accept, but a node on the new secret alone does not accept
+   tokens the stragglers sign.
+4. Wait one `token_ttl_secs` (an hour by default). Every token the old secret
+   signed has expired by then. The node says so: it logs an `info` at startup
+   naming the deadline and one `warn` when it passes. The clock starts at
+   process start, not at the moment of the rotation, and is not persisted
+   across restarts — restarting a node restarts its count.
+5. Remove `KIMMY_JWT_PREVIOUS_SECRET` from every node and roll again. Until it
+   is removed, the old secret still verifies tokens, so anyone who has it can
+   still mint one.
+
+**Rotation does not revoke.** A token signed with the old secret is as good as
+one signed with the new one for as long as the window is open. Ending a
+particular user's sessions is the token version's job, above, and it applies
+identically to a token the previous secret verified: the version check runs
+after the signature check, whichever key passed it.
+
+**`KIMMY_CLUSTER_SECRET` is not covered.** It authenticates node-to-node
+traffic, not tokens, and has no previous-value window; rotating it is a
+stop-the-cluster operation, described in the note on rotating `cluster_secret`
+in [operations.md](operations.md).
 
 Attacks covered by tests: `alg=none` unsigned tokens, payload tampering to
 escalate grants, wrong-secret signatures, expired tokens, and malformed input.

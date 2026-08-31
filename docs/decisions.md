@@ -5089,6 +5089,59 @@ keyed on the exact field set has one more optional field to know about.
 
 ---
 
+## ADR-101 — Local signing secrets rotate through a two-key window
+
+**Decision.** `auth.jwt_secret` gains an optional companion,
+`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`). Every local token is
+signed with the current secret; verification tries the current secret first and
+the previous one only if the current one finds the signature wrong. A token
+neither verifies is refused with the unchanged invalid-token error. The previous
+secret is held to `MIN_SECRET_LEN` and must differ from the current one, and
+`check-config` refuses both faults exactly as the node does. Rotation is the
+documented procedure: previous = old, current = new, roll every node, wait one
+`token_ttl_secs`, remove the previous secret, roll again. The node logs an
+`info` at startup naming that deadline and one `warn` when it passes, counted
+from process start and not persisted.
+
+**Why.** The secret was not being rotated, and the reason was mechanical:
+changing it invalidated every outstanding token on every node at once, so a
+rotation was an outage for every client holding a session. A
+control that costs an outage is a control that is not exercised, and a secret
+that is never rotated is one whose exposure is never recovered from. The
+standard remedy for a symmetric key is a window in which two keys verify and
+one signs; because tokens carry their own expiry and the issuer only ever signs
+with the new key, the window closes by itself one lifetime later. The check
+order matters in one respect only — an expired token is reported as expired by
+whichever key verified its signature, and that answer is final, because a token
+the current key signed was never signed by the previous one. The token version
+check (ADR-052) runs after the signature check in `Auth`, whichever key passed
+it, so rotation and revocation stay separate: rotating does not revoke, and
+revoking does not need a rotation.
+
+**Alternatives.** *A `kid` header and a key ring* — the general form, where
+each token names its key and the verifier holds any number. Deferred: HS256 with
+two keys covers what an operator needs (one rotation at a time, closing on its
+own), and a new header claim would be a wire change that every existing token
+lacks, so the verifier would need the two-key fallback anyway for the first
+rotation. *JWKS-style key ids for local tokens* — publishing local keys the way
+a provider publishes its own. Rejected for now: local tokens are symmetric and
+verified only by the nodes that hold the secret, so there is nobody to publish
+to, and a key set implies an asymmetric scheme this database has not chosen.
+*Persisting when the previous secret was first seen*, so the reminder survives
+a restart. Not done: a node's data file is the wrong place for a fact about its
+environment, the reminder exists to be noticed rather than relied on, and
+counting from process start is exact in the common case (the rotation *is* the
+restart) and only ever conservative otherwise.
+
+**Cost.** A stolen previous secret stays valid until it is removed — the window
+is a deliberate extension of exposure, bounded by the operator following the
+procedure, which is why the docs say to remove it after one lifetime and the
+node says so twice. The reminder is per process and forgets on restart. The
+cluster secret is not covered; it is a different key for a different channel,
+and its rotation remains what it was.
+
+---
+
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
 
 **Decision.** `{$expr: <expression>}` is a filter clause. It parses through
@@ -5148,6 +5201,3 @@ a constant on the right means the ordinary operator; a field or a computation
 on the right means `$expr`.
 
 ---
-
----
-

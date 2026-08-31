@@ -56,6 +56,19 @@ pub enum AuthError {
     #[error("the JWT secret must be at least {min} bytes")]
     WeakSecret { min: usize },
 
+    /// The previous signing secret is the current one.
+    ///
+    /// Refused rather than ignored: the two-key window (ADR-101) exists so an
+    /// operator can retire a secret, and a configuration naming the same value
+    /// twice is a rotation that was edited halfway. Starting under it would
+    /// report a rotation in progress when nothing had changed.
+    #[error(
+        "the previous JWT secret is the same as the current one, so nothing is being rotated; \
+         set auth.jwt_secret to the new value and auth.jwt_previous_secret to the old one, or \
+         remove auth.jwt_previous_secret"
+    )]
+    PreviousSecretIsCurrent,
+
     /// The token names a signing key this node has not fetched.
     ///
     /// Separate from [`AuthError::InvalidToken`] because the caller can act on
