@@ -11,7 +11,7 @@ use kimmy_auth::TokenIssuer;
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
@@ -21,7 +21,9 @@ struct Server {
     /// request cannot reach — the live member set, which only exists once a
     /// cluster has started.
     state: kimmy_api::SharedState,
-    _dir: tempfile::TempDir,
+    /// Shared, so a server "restarted" over the same database keeps the
+    /// directory alive for as long as either handle does.
+    _dir: Arc<tempfile::TempDir>,
 }
 
 /// A tiny HTTP client, so the tests do not pull in a dependency purely to make
@@ -143,6 +145,28 @@ impl Server {
         Self::build(false, limits).await
     }
 
+    /// Every authenticated request per principal, `burst` per minute
+    /// (ADR-099).
+    fn principal_limits(burst: u32) -> kimmy_api::RateLimits {
+        kimmy_api::RateLimits {
+            per_principal: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(burst, std::time::Duration::from_secs(60)),
+                1024,
+            ),
+            ..kimmy_api::RateLimits::disabled()
+        }
+    }
+
+    /// A server whose authenticated routes carry a per-principal budget.
+    async fn start_principal_rate_limited(burst: u32) -> Self {
+        Self::build(false, Self::principal_limits(burst)).await
+    }
+
+    /// A server with a chosen request deadline and body ceiling (ADR-099).
+    async fn start_with_limits(request_limits: kimmy_api::RequestLimits) -> Self {
+        Self::build_with(false, kimmy_api::RateLimits::disabled(), request_limits).await
+    }
+
     /// A server that also federates with the stub identity provider below.
     ///
     /// The provider is a fixed key pair rather than a live IdP: the subject is
@@ -155,7 +179,27 @@ impl Server {
     /// The same, with the audience chosen — which is what decides whether this
     /// node names itself as an OAuth 2.0 protected resource (ADR-071).
     async fn start_federated_for(audience: &str) -> Self {
-        let server = Self::build(false, kimmy_api::RateLimits::disabled()).await;
+        Self::start_federated_with(audience, None, kimmy_api::RateLimits::disabled()).await
+    }
+
+    /// A federated server whose provider names its people by `claim` (ADR-100).
+    async fn start_federated_with_subject_claim(claim: &str) -> Self {
+        Self::start_federated_with(
+            oidc::AUDIENCE,
+            Some(claim.to_string()),
+            kimmy_api::RateLimits::disabled(),
+        )
+        .await
+    }
+
+    /// The same, with the limiters chosen — for the per-principal limit, whose
+    /// key has to tell a federated subject from a local user (ADR-099).
+    async fn start_federated_with(
+        audience: &str,
+        subject_claim: Option<String>,
+        limits: kimmy_api::RateLimits,
+    ) -> Self {
+        let server = Self::build(false, limits).await;
         let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
             issuer: oidc::ISSUER.into(),
             audience: audience.into(),
@@ -171,6 +215,8 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -198,6 +244,8 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -207,6 +255,14 @@ impl Server {
     }
 
     async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
+        Self::build_with(insecure_no_auth, limits, kimmy_api::RequestLimits::default()).await
+    }
+
+    async fn build_with(
+        insecure_no_auth: bool,
+        limits: kimmy_api::RateLimits,
+        request_limits: kimmy_api::RequestLimits,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
 
@@ -218,7 +274,30 @@ impl Server {
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
         let state =
             kimmy_api::state(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
-        let app = kimmy_api::router(Arc::clone(&state));
+        Self::serve(state, Arc::new(dir), request_limits).await
+    }
+
+    /// The same database served again under a different token issuer — a node
+    /// restarted with a new signing configuration (ADR-101).
+    ///
+    /// The engine handle is shared rather than the file reopened: the first
+    /// listener is still alive and holds the file, and what a restart preserves
+    /// is the stored state — users and their token versions — which is exactly
+    /// what sharing the engine preserves. Everything in memory is rebuilt, the
+    /// session cache included, as it would be across a real restart.
+    async fn restart_with_issuer(&self, tokens: TokenIssuer) -> Self {
+        let engine = Arc::clone(&self.state.engine);
+        let state =
+            kimmy_api::state(engine, tokens, false, kimmy_api::RateLimits::disabled()).unwrap();
+        Self::serve(state, Arc::clone(&self._dir), kimmy_api::RequestLimits::default()).await
+    }
+
+    async fn serve(
+        state: kimmy_api::SharedState,
+        dir: Arc<tempfile::TempDir>,
+        request_limits: kimmy_api::RequestLimits,
+    ) -> Self {
+        let app = kimmy_api::router_with_limits(Arc::clone(&state), None, request_limits);
 
         // Port 0: let the OS pick, so parallel tests never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -260,6 +339,45 @@ impl Server {
 
     async fn root(&self) -> String {
         self.login("root", ROOT_PASSWORD).await
+    }
+
+    /// Drive one request through the router as though it arrived from `peer`.
+    ///
+    /// The real socket in `build` can only ever produce a loopback peer, which
+    /// is exactly the case `auth.local.login = "loopback_only"` admits. To
+    /// exercise the refusal, the request is handed to the router directly with
+    /// the connect-info extension a listener would have attached — the same
+    /// extension `ClientAddr` and `LocalMinting` read, set by hand.
+    async fn request_from(
+        &self,
+        peer: &str,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> Res {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let peer: SocketAddr = peer.parse().expect("a socket address");
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let payload = body.map(|b| b.to_string()).unwrap_or_default();
+        let mut request = request.body(axum::body::Body::from(payload)).expect("a request");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+
+        let response =
+            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let status = response.status().as_u16();
+        let head = format!("{:?}", response.headers());
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Res { status, body, head }
     }
 
     /// Write a peer's record into the node registry directly.
@@ -393,6 +511,254 @@ async fn limiting_by_username_is_off_unless_configured() {
         429,
         "when it is switched on it must actually limit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated-route limits (ADR-099)
+// ---------------------------------------------------------------------------
+
+/// Open a request and send only part of its declared body, then wait for
+/// whatever the server says about it.
+///
+/// This is the shape of a client that holds a connection open at no cost to
+/// itself — the case the request deadline exists for — and it is also the one
+/// place a request to this server is genuinely *pending*, which is the only
+/// state a deadline can interrupt. Bounded by its own five-second wait, so a
+/// deadline that never fires is a failed test rather than a hung one.
+async fn dribble(base: &str, path: &str, token: &str) -> (u16, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base.strip_prefix("http://").expect("http url");
+    let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: 64\r\n\
+         Authorization: Bearer {token}\r\n\r\n{{\"pad\":\""
+    );
+    stream.write_all(head.as_bytes()).await.expect("write");
+    // The rest of the 64 bytes never comes.
+
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = stream.read_to_end(&mut raw).await;
+    })
+    .await;
+    assert!(read.is_ok(), "no response within five seconds: the deadline did not fire");
+
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, serde_json::from_str(body.trim()).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_request_still_waiting_for_its_body_at_the_deadline_is_abandoned() {
+    // The route is real and authenticated: the token is checked from the
+    // headers before the body is awaited, so what the deadline interrupts is
+    // exactly the wait an authenticated caller can impose for free.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(300),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let (status, body) = dribble(&server.base, "/v1/db/shop/coll/c/docs", &token).await;
+    assert_eq!(status, 503, "a request past its deadline is refused: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["retry"], "wait");
+
+    // The node is fine; only that request was abandoned.
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+/// A real WebSocket handshake that keeps the socket, so a test can watch what
+/// arrives on it later.
+async fn open_watch(base: &str, path: &str, token: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base.strip_prefix("http://").expect("http url");
+    let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Authorization: Bearer {token}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    assert!(head.starts_with("HTTP/1.1 101"), "the watch route must upgrade: {head}");
+    stream
+}
+
+/// Read one unmasked text frame, as a server sends them.
+async fn read_text_frame(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.expect("frame header");
+    assert_eq!(header[0] & 0x0f, 1, "expected a text frame, got opcode {}", header[0] & 0x0f);
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        stream.read_exact(&mut ext).await.expect("extended length");
+        len = u64::from(u16::from_be_bytes(ext));
+    } else if len == 127 {
+        let mut ext = [0u8; 8];
+        stream.read_exact(&mut ext).await.expect("extended length");
+        len = u64::from_be_bytes(ext);
+    }
+    let mut payload = vec![0u8; len as usize];
+    stream.read_exact(&mut payload).await.expect("payload");
+    String::from_utf8_lossy(&payload).into_owned()
+}
+
+#[tokio::test]
+async fn the_deadline_does_not_apply_to_a_change_stream() {
+    // A change stream's response is a connection, not a document, and it is
+    // meant to outlive any deadline a document request could sensibly have.
+    // Opened, left idle for longer than the deadline, and then shown to still
+    // deliver.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(200),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let mut socket = open_watch(&server.base, "/v1/db/shop/coll/orders/watch", &token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 7})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let frame =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_text_frame(&mut socket))
+            .await
+            .expect("an event should arrive on a stream older than the deadline");
+    let event: Value = serde_json::from_str(&frame).expect("a JSON event");
+    assert_eq!(event["operationType"], "insert", "{event}");
+    assert_eq!(event["documentKey"]["_id"], 7, "{event}");
+}
+
+#[tokio::test]
+async fn a_body_at_the_ceiling_is_accepted_and_one_byte_over_is_refused() {
+    // `{"pad":"…"}` is ten bytes of punctuation around the padding, so the
+    // padding is what sets the body to exactly the ceiling.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let at_limit = json!({ "pad": "x".repeat(1014) });
+    assert_eq!(at_limit.to_string().len(), 1024);
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), at_limit).await;
+    assert_eq!(res.status, 200, "exactly the ceiling must be accepted: {:?}", res.body);
+
+    let over = json!({ "pad": "x".repeat(1015) });
+    assert_eq!(over.to_string().len(), 1025);
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), over).await;
+    assert_eq!(res.status, 413, "one byte over must be refused: {:?}", res.body);
+    assert_eq!(res.body["error"], "payload_too_large");
+    assert_eq!(res.body["retry"], "no");
+}
+
+#[tokio::test]
+async fn a_principal_over_its_budget_is_refused_while_another_on_the_same_address_is_not() {
+    // Both callers arrive from loopback. Keying on the address would refuse
+    // them together; keying on the principal refuses only the one that spent
+    // its budget — which is the whole reason the second limiter exists.
+    let server = Server::start_principal_rate_limited(3).await;
+    let root = server.root().await;
+
+    // Login is unauthenticated and spends nothing; creating the second user
+    // is root's first request.
+    let created = server
+        .post("/v1/users", Some(&root), json!({"user":"other","password":"other-password"}))
+        .await;
+    assert!(created.status / 100 == 2, "{} {:?}", created.status, created.body);
+    for attempt in 2..=3 {
+        let res = server.get("/v1/databases", Some(&root)).await;
+        assert_eq!(res.status, 200, "request {attempt} of 3 is within the burst: {:?}", res.body);
+    }
+
+    let refused = server.get("/v1/databases", Some(&root)).await;
+    assert_eq!(refused.status, 429, "the fourth request is past a burst of 3: {:?}", refused.body);
+    assert_eq!(refused.body["error"], "rate_limited");
+    assert_eq!(refused.body["retry"], "wait");
+    let retry = refused.header("retry-after").expect("a 429 must carry Retry-After");
+    assert!(retry.parse::<u64>().is_ok_and(|s| s > 0), "Retry-After should be seconds: {retry}");
+
+    let other = server.login("other", "other-password").await;
+    let res = server.get("/v1/databases", Some(&other)).await;
+    assert_eq!(res.status, 200, "another principal on the same address is unaffected");
+
+    // Still refused: the other principal's request did not refill root.
+    assert_eq!(server.get("/v1/databases", Some(&root)).await.status, 429);
+
+    // Counted under its own series, and inside the total.
+    let metrics = server.state.metrics.render();
+    assert!(metrics.contains("kimmy_rate_limited_principal_total 2"), "{metrics}");
+    assert!(metrics.contains("kimmy_rate_limited_total 2"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_bad_token_is_refused_before_it_can_spend_a_budget() {
+    // The limiter counts principals, not guesses: a token that fails
+    // verification is a 401 and touches no bucket, so it cannot be used to
+    // exhaust a real user's budget from outside.
+    let server = Server::start_principal_rate_limited(1).await;
+    let root = server.root().await;
+
+    for _ in 0..3 {
+        assert_eq!(server.get("/v1/databases", Some("not-a-token")).await.status, 401);
+    }
+    assert_eq!(
+        server.get("/v1/databases", Some(&root)).await.status,
+        200,
+        "root's single token must still be there after three refused guesses"
+    );
+    assert!(server.state.metrics.render().contains("kimmy_rate_limited_principal_total 0"));
+}
+
+#[tokio::test]
+async fn a_federated_subject_named_like_a_local_user_has_its_own_budget() {
+    // Whoever controls the name `root` at the identity provider must not be
+    // able to spend the local root's budget, nor be charged for it.
+    let server =
+        Server::start_federated_with(oidc::AUDIENCE, None, Server::principal_limits(1)).await;
+    let local = server.root().await;
+    let federated = oidc::token(oidc::claims("root", json!(["kimmydb-analyst"])));
+
+    assert_eq!(server.get("/v1/databases", Some(&local)).await.status, 200);
+    assert_eq!(server.get("/v1/databases", Some(&local)).await.status, 429, "local root is spent");
+
+    assert_eq!(
+        server.get("/v1/databases", Some(&federated)).await.status,
+        200,
+        "the provider's `root` has a budget of its own"
+    );
+    assert_eq!(server.get("/v1/databases", Some(&federated)).await.status, 429);
 }
 
 #[tokio::test]
@@ -682,6 +1048,114 @@ async fn queries_filter_sort_and_project() {
     assert_eq!(res.body["documents"][1], json!({ "item": "widget" }));
 }
 
+/// `$expr` is parsed by the one filter parser every endpoint shares, so proving
+/// it on `find`, `count`, `$match` and `update` is proving the parser once and
+/// the plumbing four times. The predicate compares two fields of the same
+/// document, which no other filter operator can write.
+#[tokio::test]
+async fn expr_compares_fields_of_the_same_document_everywhere_a_filter_is_taken() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"accounts"})).await;
+
+    for (id, account, spent, budget) in
+        [(1, "acme", 120, 100), (2, "acme", 80, 100), (3, "globex", 500, 100), (4, "globex", 0, 0)]
+    {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/accounts/docs",
+                Some(&token),
+                json!({"_id": id, "account": account, "spent": spent, "budget": budget}),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let over_budget = json!({"$expr": {"$gt": ["$spent", "$budget"]}});
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": over_budget, "sort": {"_id": 1}, "projection": {"_id": 1}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1}, {"_id": 3}]));
+
+    let res = server
+        .post("/v1/db/shop/coll/accounts/count", Some(&token), json!({"filter": over_budget}))
+        .await;
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+
+    // `$expr` is never index-eligible on its own, but an equality beside it
+    // still plans, and the expression is re-applied to every candidate.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "account"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": over_budget, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "collectionScan", "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({
+                "filter": {"account": "acme", "$expr": {"$gt": ["$spent", "$budget"]}},
+                "projection": {"_id": 1},
+                "explain": true
+            }),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1}]));
+
+    // `$match` takes the same filter, and an expression there can lean on
+    // arithmetic just as it does in `$addFields`.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"$expr": {"$gte": [{"$subtract": ["$spent", "$budget"]}, 400]}}},
+                {"$project": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 3}]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/update",
+            Some(&token),
+            json!({"filter": over_budget, "update": {"$set": {"flag": "over"}}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 2, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/accounts/docs/2", Some(&token)).await;
+    assert!(res.body.get("flag").is_none(), "an in-budget account was flagged: {:?}", res.body);
+
+    // A malformed expression is the filter parser's ordinary 400.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": {"$expr": {"$nope": ["$spent", 1]}}}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
 #[tokio::test]
 async fn updates_apply_operators() {
     let server = Server::start().await;
@@ -736,6 +1210,129 @@ async fn a_no_op_update_still_counts_as_modified() {
         )
         .await;
     assert_eq!(res.body["modified"], 2, "modified counts writes, not changes");
+}
+
+/// `$[<identifier>]` with `arrayFilters` and `$[]` address array elements
+/// through the request, on `update` and on `find_and_modify` (ADR-104). The
+/// refusals are `400`s: an identifier without a filter, a filter without an
+/// identifier, the `$` positional operator, and a positional segment where
+/// there is no array.
+#[tokio::test]
+async fn positional_updates_address_array_elements() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/c/docs",
+            Some(&token),
+            json!({"_id": 1, "items": [
+                {"sku": "a", "qty": 1, "shipped": false, "tags": ["x", "y"]},
+                {"sku": "b", "qty": 5, "shipped": false, "tags": ["x", "z"]},
+            ]}),
+        )
+        .await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 2, "items": "no"})).await;
+
+    // Mark one line item shipped, and nothing else.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"items.$[line].shipped": true}},
+                "arrayFilters": [{"line.sku": "b"}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 1);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["items"][0]["shipped"], false, "{doc}");
+    assert_eq!(doc["items"][1]["shipped"], true, "{doc}");
+
+    // `$[]` reaches every element; `$inc` through it keeps integers integral.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$inc": {"items.$[].qty": 1}} }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(doc["items"][0]["qty"], 2, "{doc}");
+    assert_eq!(doc["items"][1]["qty"], 6, "{doc}");
+
+    // No element selected: the document is written back unchanged, and
+    // `modified` counts the write, as the register says it does.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$set": {"items.$[line].shipped": "never"}},
+                "arrayFilters": [{"line.sku": "z"}],
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["modified"], 1, "modified counts writes, not changes");
+    let after = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await.body;
+    assert_eq!(after, doc, "nothing selected, nothing changed");
+
+    // `find_and_modify` takes the same field and returns the new document;
+    // a `$pull` inside the selected element's own array goes through too.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": 1},
+                "update": {"$pull": {"items.$[line].tags": "x"}},
+                "arrayFilters": [{"line.qty": {"$gt": 3}}],
+                "returnDocument": "after",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = &res.body["document"];
+    assert_eq!(doc["items"][0]["tags"], json!(["x", "y"]), "{doc}");
+    assert_eq!(doc["items"][1]["tags"], json!(["z"]), "{doc}");
+
+    // The refusals.
+    let refused = |update: Value, filters: Option<Value>, id: i64| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let mut body = json!({ "filter": {"_id": id}, "update": update });
+            if let Some(filters) = filters {
+                body["arrayFilters"] = filters;
+            }
+            let res = server.post("/v1/db/shop/coll/c/update", Some(token), body).await;
+            assert_eq!(res.status, 400, "{:?}", res.body);
+            res.body["message"].as_str().unwrap_or_default().to_string()
+        }
+    };
+    let msg = refused(json!({"$set": {"items.$[line].shipped": true}}), None, 1).await;
+    assert!(msg.contains("no filter"), "{msg}");
+    let msg = refused(
+        json!({"$set": {"items.$[line].shipped": true}}),
+        Some(json!([{"line.sku": "a"}, {"other.sku": "b"}])),
+        1,
+    )
+    .await;
+    assert!(msg.contains("no update path uses"), "{msg}");
+    let msg = refused(json!({"$set": {"items.$.shipped": true}}), None, 1).await;
+    assert!(msg.contains("$[<identifier>]"), "{msg}");
+    let msg = refused(json!({"$set": {"items.$[].shipped": true}}), None, 2).await;
+    assert!(msg.contains("must be an array"), "{msg}");
+    // A refused update writes nothing.
+    let untouched = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await.body;
+    assert_eq!(untouched["items"], "no");
 }
 
 /// A `multi: true` request lands in chunks of `storage.multi_chunk_docs`
@@ -870,6 +1467,244 @@ async fn standing_unique_violations_are_reported_until_resolved() {
     // Read is enough to look; a principal without it is refused.
     let res = server.get("/v1/db/shop/coll/users/violations", None).await;
     assert_eq!(res.status, 401);
+}
+
+/// Rewriting a colliding value resolves a violation as surely as deleting the
+/// document, and the report says so (ADR-087, amended).
+///
+/// Three documents share one email: one local, two merged from peers, so the
+/// oplog holds a two-member record and then a three-member one, as it does in
+/// production. The report is checked after each kind of resolution the
+/// recipe offers — an unrelated rewrite (nothing changes), a rewrite of the
+/// colliding value (the member leaves its group), and a delete of a member of
+/// a three-way group (the other two still stand).
+#[tokio::test]
+async fn a_rewritten_member_leaves_its_violation_group() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    server
+        .post(
+            "/v1/db/shop/coll/users/docs",
+            Some(&token),
+            json!({"_id": "a", "email": "clash@x", "name": "first"}),
+        )
+        .await;
+
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    for (id, hlc) in [("b", 9_000), ("c", 9_001)] {
+        let remote = kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(
+                kimmy_core::Hlc::new(hlc, 0),
+                kimmy_core::NodeId::generate(),
+            ),
+            kind: kimmy_core::OpKind::Insert,
+            collection: meta.id,
+            doc_id: Some(kimmy_core::DocId::String(id.into())),
+            body: Some(
+                bson::serialize_to_vec(&bson::doc! { "_id": id, "email": "clash@x" }).unwrap(),
+            ),
+        };
+        server.state.engine.apply_remote(&meta, &remote).unwrap();
+    }
+
+    let groups = |body: &Value| -> Vec<Vec<String>> {
+        body["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let mut ids: Vec<String> = g["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect()
+    };
+    let by_index = "/v1/db/shop/coll/users/violations?index=email_1";
+
+    let res = server.get(by_index, Some(&token)).await;
+    let all_three = vec!["a".to_string(), "b".into(), "c".into()];
+    assert!(
+        groups(&res.body).contains(&all_three),
+        "the three-way collision stands: {:?}",
+        res.body
+    );
+
+    // A local rewrite that keeps the colliding value is refused, as any local
+    // write into an occupied key is — the existing rule, which is what makes
+    // "rewrite the value" the only local way out short of a delete — and the
+    // group stands as it was.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "a"}, "update": {"$set": {"name": "renamed"}} }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let res = server.get(by_index, Some(&token)).await;
+    assert!(groups(&res.body).contains(&all_three), "still colliding: {:?}", res.body);
+    let group = res.body["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["ids"].as_array().unwrap().len() == 3)
+        .unwrap();
+    assert_eq!(group["documents"].as_array().unwrap().len(), 3, "documents follow ids");
+
+    // Rewriting c's email takes c out of the collision. What remains is one
+    // group of a and b: the three-member record shrinks to that pair, and the
+    // two-member record already names it, so they are reported once.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "c"}, "update": {"$set": {"email": "c@x"}} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let res = server.get(by_index, Some(&token)).await;
+    assert_eq!(groups(&res.body), vec![vec!["a".to_string(), "b".into()]], "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+    let group = &res.body["groups"][0];
+    assert_eq!(group["documents"].as_array().unwrap().len(), 2, "c's document is not listed");
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 1, "indexes": [{ "name": "email_1", "count": 1 }] }));
+
+    // Rewriting b's email too leaves a alone under the key: nothing stands.
+    server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "b"}, "update": {"$set": {"email": "b@x"}} }),
+        )
+        .await;
+    let res = server.get(by_index, Some(&token)).await;
+    assert_eq!(res.body["count"], 0, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
+
+    // Rewriting back into the collision is refused locally, as it always was,
+    // so the report cannot be re-populated by this node's own writes.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "b"}, "update": {"$set": {"email": "clash@x"}} }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+}
+
+/// Deleting one member of a three-way collision leaves the other two standing.
+///
+/// Under the original definition — every named document still exists — the
+/// three-member record dropped out whole; with keys re-evaluated, the two
+/// survivors still share the key and are still reported as a group.
+#[tokio::test]
+async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_standing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    server
+        .post("/v1/db/shop/coll/users/docs", Some(&token), json!({"_id": "a", "email": "clash@x"}))
+        .await;
+
+    // Two merges from one peer: the oplog records {a, b} and then {a, b, c}.
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let entry =
+        |hlc: u64, kind: kimmy_core::OpKind, id: &str, email: &str| kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(hlc, 0), origin),
+            kind,
+            collection: meta.id,
+            doc_id: Some(kimmy_core::DocId::String(id.into())),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id, "email": email }).unwrap()),
+        };
+    server
+        .state
+        .engine
+        .apply_remote(&meta, &entry(9_000, kimmy_core::OpKind::Insert, "b", "clash@x"))
+        .unwrap();
+    server
+        .state
+        .engine
+        .apply_remote(&meta, &entry(9_001, kimmy_core::OpKind::Insert, "c", "clash@x"))
+        .unwrap();
+
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert!(
+        res.body["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["ids"].as_array().unwrap().len() == 3),
+        "{:?}",
+        res.body
+    );
+
+    // Deleting c shrinks the three-member record to {a, b}, the same group the
+    // two-member record names, so one group is reported rather than none.
+    server.delete("/v1/db/shop/coll/users/docs/c", Some(&token)).await;
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    let mut ids: Vec<String> = res.body["groups"][0]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"], "the survivors still collide");
+
+    // The index itself going away takes the constraint with it.
+    server.delete("/v1/db/shop/coll/users/indexes/email_1", Some(&token)).await;
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
+}
+
+/// `describe` carries the node's durability class, as `/v1/version` does
+/// (ADR-088, amended): the same value from the same source, named for what it
+/// is — a fact about the node, not the collection.
+#[tokio::test]
+async fn describe_reports_the_node_durability_class() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let described = server.get("/v1/db/shop/coll/c/describe", Some(&token)).await;
+    let version = server.get("/v1/version", None).await;
+    assert_eq!(described.body["nodeDurability"], "durable", "{:?}", described.body);
+    assert_eq!(described.body["nodeDurability"], version.body["durability"]);
+
+    server.state.engine.set_durability(
+        kimmy_storage::DurabilityClass::Coalesced,
+        std::time::Duration::from_millis(5),
+    );
+    let described = server.get("/v1/db/shop/coll/c/describe", Some(&token)).await;
+    let version = server.get("/v1/version", None).await;
+    assert_eq!(described.body["nodeDurability"], "coalesced");
+    assert_eq!(version.body["durability"], "coalesced", "one fact, two routes");
 }
 
 /// Concurrent `$inc`s on one document must all land.
@@ -1531,6 +2366,90 @@ async fn an_expired_token_cannot_be_refreshed() {
     let res = server.post("/v1/auth/refresh", Some(&stale), json!({})).await;
     assert_eq!(res.status, 401, "{:?}", res.body);
     assert_eq!(res.body["error"], "unauthorized");
+}
+
+/// The secret a rotation retires (ADR-101). `SECRET` is the one being retired
+/// in these tests; this is the one taking over.
+const NEXT_SECRET: &str = "the-secret-being-rotated-into-use!";
+
+#[tokio::test]
+async fn rotating_the_signing_secret_keeps_outstanding_tokens_working() {
+    // The reason operators did not rotate: changing the secret ended every
+    // session at once. With the old secret named as the previous one, a token
+    // from before the rotation keeps working, while everything new is signed
+    // with the new secret alone — so the window closes by itself one token
+    // lifetime later.
+    let before = Server::start().await;
+    let root = before.root().await;
+    before.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let old_token = before.login("ada", "ada-password").await;
+    assert_eq!(before.get("/v1/auth/whoami", Some(&old_token)).await.status, 200);
+
+    // The rotation: the same database, restarted with the new secret current
+    // and the old one previous.
+    let rotating = before
+        .restart_with_issuer(TokenIssuer::with_previous(NEXT_SECRET, Some(SECRET), 3600).unwrap())
+        .await;
+    let res = rotating.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(res.status, 200, "a token from before the rotation must still work: {:?}", res.body);
+    assert_eq!(res.body["user"], "ada");
+
+    // A new login is signed with the new secret, and only the new secret: a
+    // verifier holding just the retiring one refuses it.
+    let new_token = rotating.login("ada", "ada-password").await;
+    assert!(TokenIssuer::new(NEXT_SECRET, 3600).unwrap().verify(&new_token).is_ok());
+    assert!(
+        matches!(
+            TokenIssuer::new(SECRET, 3600).unwrap().verify(&new_token),
+            Err(kimmy_auth::AuthError::InvalidToken)
+        ),
+        "a token issued during the window must not be signed with the retiring secret"
+    );
+
+    // The window closed: the previous secret removed, the old token is refused
+    // with the same 401 as any other bad token, and the new one is unaffected.
+    let after = before.restart_with_issuer(TokenIssuer::new(NEXT_SECRET, 3600).unwrap()).await;
+    let res = after.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    assert_eq!(res.body["error"], "unauthorized");
+    assert_eq!(after.get("/v1/auth/whoami", Some(&new_token)).await.status, 200);
+}
+
+#[tokio::test]
+async fn revocation_applies_to_a_token_verified_by_the_previous_secret() {
+    // Rotation does not revoke, and revocation does not care which key verified
+    // the signature: the ADR-052 version check runs after either one, so a
+    // session opened before the rotation ends the moment its user's version
+    // moves, exactly as it would have without a rotation in progress.
+    let before = Server::start().await;
+    let root = before.root().await;
+    before.post("/v1/users", Some(&root), json!({"user":"ada","password":"ada-password"})).await;
+    let old_token = before.login("ada", "ada-password").await;
+
+    let rotating = before
+        .restart_with_issuer(TokenIssuer::with_previous(NEXT_SECRET, Some(SECRET), 3600).unwrap())
+        .await;
+    assert_eq!(rotating.get("/v1/auth/whoami", Some(&old_token)).await.status, 200);
+
+    // Root's token is from before the rotation too, and administers through
+    // the window like any other outstanding session.
+    let res = rotating
+        .post("/v1/users/ada/password", Some(&root), json!({"password":"a-new-password"}))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = rotating.get("/v1/auth/whoami", Some(&old_token)).await;
+    assert_eq!(
+        res.status, 401,
+        "a bumped version must end a previous-secret session: {:?}",
+        res.body
+    );
+
+    // And the account itself is fine: a fresh login under the new password
+    // opens a session signed with the current secret.
+    let fresh = rotating.login("ada", "a-new-password").await;
+    assert_eq!(rotating.get("/v1/auth/whoami", Some(&fresh)).await.status, 200);
+    assert!(TokenIssuer::new(NEXT_SECRET, 3600).unwrap().verify(&fresh).is_ok());
 }
 
 #[tokio::test]
@@ -2494,6 +3413,192 @@ async fn a_deleted_document_does_not_surface_from_search() {
     assert_eq!(ids, vec!["b"], "nor from hybrid search: {:?}", hybrid.body);
 }
 
+/// Three documents that separate the two halves of a hybrid search for the
+/// query `"red blue"` with vector `[1, 0, 0]`:
+///
+/// - `x` is the nearest vector and shares no term with the query, so it is
+///   dense-only evidence;
+/// - `z` is second nearest and shares both terms;
+/// - `y` is farthest and shares one term — the candidate `min_overlap` gates.
+async fn fusion_fixture(server: &Server) -> String {
+    let token = byo_collection(server).await;
+    for (id, vector, text) in [
+        ("x", [1.0, 0.0, 0.0], "green paint"),
+        ("y", [0.0, 1.0, 0.0], "red apple"),
+        ("z", [0.6, 0.0, 0.8], "red blue"),
+    ] {
+        server
+            .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": text }))
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": text }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    token
+}
+
+/// `(_id, score)` in result order.
+fn ranked(body: &Value) -> Vec<(String, f64)> {
+    body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["_id"].as_str().unwrap().to_string(), m["score"].as_f64().unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+async fn hybrid_fusion_controls_default_to_the_previous_ranking() {
+    // ADR-094: the fields exist, and a request that sends their defaults gets
+    // byte-for-byte what a request that omits them gets — same order, same
+    // scores, same response shape.
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+    let base = json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5 });
+
+    let implicit = server.post(path, Some(&token), base.clone()).await;
+    assert_eq!(implicit.status, 200, "{:?}", implicit.body);
+
+    let mut explicit_body = base.clone();
+    explicit_body["weights"] = json!({ "dense": 1.0, "lexical": 1.0 });
+    explicit_body["min_overlap"] = json!(1);
+    let explicit = server.post(path, Some(&token), explicit_body).await;
+    assert_eq!(explicit.status, 200, "{:?}", explicit.body);
+
+    assert_eq!(implicit.body, explicit.body, "the defaults must be the old behaviour exactly");
+    let ranking = ranked(&implicit.body);
+    let order: Vec<&str> = ranking.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(order, vec!["z", "y", "x"], "{:?}", implicit.body);
+
+    // The response shape is the one every client already parses.
+    assert_eq!(explicit.body["count"], 3);
+    for m in explicit.body["matches"].as_array().unwrap() {
+        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["_id", "chunk", "score", "text"], "response shape changed: {m}");
+    }
+}
+
+#[tokio::test]
+async fn min_overlap_removes_lexical_evidence_but_never_a_dense_hit() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+
+    let loose = server
+        .post(path, Some(&token), json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5 }))
+        .await;
+    let strict = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5, "min_overlap": 2 }),
+        )
+        .await;
+    assert_eq!(strict.status, 200, "{:?}", strict.body);
+
+    let loose = ranked(&loose.body);
+    let strict = ranked(&strict.body);
+    let order: Vec<&str> = strict.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(order, vec!["z", "x", "y"], "{strict:?}");
+
+    let score = |ranking: &[(String, f64)], id: &str| {
+        ranking.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap()
+    };
+    // `y` shared one term: gated out of the lexical half, it keeps its dense
+    // contribution — it is still in the result — and loses only the lexical one.
+    assert!(score(&strict, "y") < score(&loose, "y"), "y must lose its lexical share");
+    assert_eq!(strict.len(), 3, "gating lexical evidence must not drop a dense hit");
+    // `x` never had lexical evidence, so the gate cannot touch it...
+    assert_eq!(score(&strict, "x"), score(&loose, "x"));
+    // ...and `z` shares both terms, so it passes the gate unchanged.
+    assert_eq!(score(&strict, "z"), score(&loose, "z"));
+}
+
+#[tokio::test]
+async fn weights_scale_each_half_and_zero_switches_one_off() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+    let search = |weights: Value| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            let res = server
+                .post(
+                    path,
+                    Some(&token),
+                    json!({
+                        "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5,
+                        "weights": weights,
+                    }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            ranked(&res.body)
+        }
+    };
+    let ids = |ranking: &[(String, f64)]| -> Vec<String> {
+        ranking.iter().map(|(id, _)| id.clone()).collect()
+    };
+
+    // Dense only: nearest vector first, and every dense hit present.
+    assert_eq!(ids(&search(json!({ "dense": 1.0, "lexical": 0.0 })).await), ["x", "z", "y"]);
+    // Lexical only: `x` shares no term, so it is not in the result at all.
+    assert_eq!(ids(&search(json!({ "dense": 0.0, "lexical": 1.0 })).await), ["z", "y"]);
+
+    // The weights are applied as stated: halving both halves the score of
+    // every document and moves nothing, because only the ratio orders.
+    let equal = search(json!({ "dense": 1.0, "lexical": 1.0 })).await;
+    let halved = search(json!({ "dense": 0.5, "lexical": 0.5 })).await;
+    assert_eq!(ids(&equal), ids(&halved));
+    for ((id, full), (_, half)) in equal.iter().zip(&halved) {
+        assert!((half - full / 2.0).abs() < 1e-6, "{id}: {half} is not half of {full}");
+    }
+}
+
+#[tokio::test]
+async fn meaningless_fusion_controls_are_a_400() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+
+    for (extra, names) in [
+        (json!({ "weights": { "dense": -1.0 } }), "weights.dense"),
+        (
+            json!({ "weights": { "dense": 0.0, "lexical": 0.0 } }),
+            "weights.dense and weights.lexical",
+        ),
+        (json!({ "min_overlap": 0 }), "min_overlap"),
+    ] {
+        let mut body = json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0] });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{extra}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{extra}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains(names), "{extra}: the message must name the field: {message}");
+    }
+
+    // `vector_search` has one half and ignores the controls rather than
+    // refusing them, as the specification says.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "weights": { "dense": 0.0, "lexical": 0.0 } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
 #[tokio::test]
 async fn client_supplied_vectors_become_searchable() {
     let server = Server::start().await;
@@ -2815,6 +3920,247 @@ async fn an_unlimited_find_returns_a_page_and_not_the_collection() {
         .await;
     assert_eq!(over.status, 200, "over the cap is not an error: {:?}", over.body);
     assert_eq!(over.body["count"], 150, "everything there was, and no complaint about the ask");
+}
+
+// ---------------------------------------------------------------------------
+// Reads bounded by what they return (ADR-098)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn count_agrees_on_every_access_path_and_says_which_it_took() {
+    // `count` no longer materialises its matches, on any of the three
+    // routes. The number must be what it was — with and without an index,
+    // with a residual filter the index cannot answer alone, over a `$in`
+    // union, and through the primary key — and `explain` still describes it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+    let count = |body: Value| async {
+        let res = server.post("/v1/db/shop/coll/indexed/count", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body
+    };
+
+    let plain = json!({ "filter": { "qty": 3 }, "explain": true });
+    let residual = json!({ "filter": { "qty": 3, "item": "w1" }, "explain": true });
+    let union = json!({ "filter": { "qty": { "$in": [1, 2] } }, "explain": true });
+
+    let scanned =
+        (count(plain.clone()).await, count(residual.clone()).await, count(union.clone()).await);
+    assert_eq!(scanned.0["explain"]["strategy"], "collectionScan");
+    assert_eq!(scanned.0["count"], 9, "qty == 3 for i in 1..=60");
+    assert_eq!(scanned.0["explain"]["documentsExamined"], 60);
+    assert_eq!(scanned.0["explain"]["documentsMatched"], 9);
+
+    server
+        .post(
+            "/v1/db/shop/coll/indexed/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "qty" }] }),
+        )
+        .await;
+
+    let indexed = (count(plain).await, count(residual).await, count(union).await);
+    assert_eq!(indexed.0["explain"]["strategy"], "index");
+    assert_eq!(indexed.1["explain"]["strategy"], "index");
+    assert_eq!(indexed.2["explain"]["strategy"], "indexUnion");
+    for (before, after) in
+        [(&scanned.0, &indexed.0), (&scanned.1, &indexed.1), (&scanned.2, &indexed.2)]
+    {
+        assert_eq!(after["count"], before["count"], "{after} vs {before}");
+        assert_eq!(after["explain"]["documentsMatched"], before["explain"]["documentsMatched"]);
+    }
+    // The index narrowed the work, and the count says how far into it went.
+    assert_eq!(indexed.0["explain"]["documentsExamined"], 9);
+    assert_eq!(indexed.0["explain"]["indexEntriesRead"], 9);
+    assert!(scanned.0["explain"].get("indexEntriesRead").is_none(), "a scan read no index");
+
+    let by_id =
+        count(json!({ "filter": { "_id": { "$in": [1, 2, 3, 999] } }, "explain": true })).await;
+    assert_eq!(by_id["count"], 3);
+    assert_eq!(by_id["explain"]["strategy"], "idLookup");
+}
+
+#[tokio::test]
+async fn a_sorted_page_is_the_page_the_full_sort_gives() {
+    // A sorted `find` holds `skip + limit` documents instead of every match.
+    // Every window must be the same slice of the same order as one request
+    // for everything, ties — `qty` repeats every seven documents — included,
+    // and the same again when asked twice.
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+    let find = |body: Value| async {
+        let res = server.post("/v1/db/shop/coll/control/find", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for sort in [json!({ "qty": -1 }), json!({ "qty": 1, "item": -1 }), json!({ "item": 1 })] {
+        let full = find(json!({ "sort": sort, "limit": 100 })).await;
+        assert_eq!(full.len(), 60);
+        for (skip, limit) in [(0usize, 10usize), (7, 5), (55, 10), (60, 5), (0, 1)] {
+            let page = find(json!({ "sort": sort, "skip": skip, "limit": limit })).await;
+            let expected: Vec<i64> = full.iter().copied().skip(skip).take(limit).collect();
+            assert_eq!(page, expected, "sort {sort}, skip {skip}, limit {limit}");
+        }
+        assert_eq!(find(json!({ "sort": sort, "limit": 100 })).await, full, "deterministic");
+    }
+
+    // Ties are broken by `_id` ascending: within one `qty`, ids climb.
+    let by_qty = find(json!({ "sort": { "qty": -1 }, "limit": 100 })).await;
+    for pair in by_qty.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a % 7 == b % 7 {
+            assert!(a < b, "tie between {a} and {b} broken the wrong way");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sorted_window_past_the_cap_is_refused_and_says_what_to_do_instead() {
+    // The one behaviour change in ADR-098. `skip + limit` on a sorted find
+    // is what the server holds while it sorts, and it stops at the same
+    // 10,000 `limit` stops at — refused rather than clamped, because a
+    // clamped skip would quietly return the wrong page.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 20).await;
+    let find = |body: Value| async {
+        server.post("/v1/db/shop/coll/orders/find", Some(&token), body).await
+    };
+
+    let over = find(json!({ "sort": { "parity": 1 }, "skip": 9_950, "limit": 100 })).await;
+    assert_eq!(over.status, 400, "{:?}", over.body);
+    assert_eq!(over.body["error"], "bad_request");
+    let message = over.body["message"].as_str().unwrap();
+    assert!(message.contains("10000"), "the ceiling is named: {message}");
+    assert!(message.contains("nextCursor"), "and the way past it: {message}");
+
+    // Exactly at the ceiling is fine; the collection is just short.
+    let at = find(json!({ "sort": { "parity": 1 }, "skip": 9_900, "limit": 100 })).await;
+    assert_eq!(at.status, 200, "{:?}", at.body);
+    assert_eq!(at.body["count"], 0);
+
+    // The ceiling is about what a sort holds. An unsorted find holds only
+    // its page, and `_id` ascending is the order the scan already delivers,
+    // so neither has one.
+    for body in [
+        json!({ "skip": 20_000, "limit": 100 }),
+        json!({ "sort": { "_id": 1 }, "skip": 20_000, "limit": 100 }),
+    ] {
+        let res = find(body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(res.body["count"], 0);
+    }
+    // And a deep unsorted skip still lands on the right page.
+    let deep = find(json!({ "skip": 15, "limit": 100 })).await;
+    let ids: Vec<i64> = deep.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![15, 16, 17, 18, 19]);
+}
+
+#[tokio::test]
+async fn an_in_over_overlapping_probes_pages_each_document_once_in_id_order() {
+    // A document whose array holds two of the listed values is under two
+    // probes. Streamed as a merge rather than gathered into a set, it must
+    // still appear once, in `_id` order, and a cursor walk across the union
+    // must neither skip nor repeat it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "tagged" })).await;
+    let batch: Vec<Value> = (0..40i64)
+        .map(|i| {
+            let mut tags = Vec::new();
+            if i % 2 == 0 {
+                tags.push("a");
+            }
+            if i % 3 == 0 {
+                tags.push("b");
+            }
+            if i % 5 == 0 {
+                tags.push("c");
+            }
+            json!({ "_id": i, "tags": tags })
+        })
+        .collect();
+    server.post("/v1/db/shop/coll/tagged/bulk", Some(&token), json!(batch)).await;
+    server
+        .post(
+            "/v1/db/shop/coll/tagged/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "tags" }] }),
+        )
+        .await;
+
+    let filter = json!({ "tags": { "$in": ["a", "b"] } });
+    let expected: Vec<i64> = (0..40).filter(|i| i % 2 == 0 || i % 3 == 0).collect();
+
+    let explained = server
+        .post(
+            "/v1/db/shop/coll/tagged/find",
+            Some(&token),
+            json!({ "filter": filter, "limit": 100, "explain": true }),
+        )
+        .await;
+    assert_eq!(explained.body["explain"]["strategy"], "indexUnion", "{}", explained.body);
+    let ids: Vec<i64> = explained.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, expected, "once each, ascending");
+    assert_eq!(explained.body["explain"]["documentsExamined"], expected.len());
+
+    let walked = walk(&server, &token, "tagged", json!({ "filter": filter, "limit": 3 })).await;
+    assert_eq!(walked, expected, "a cursor walk over the union sees each once");
+}
+
+#[tokio::test]
+async fn an_indexed_find_with_limit_one_reads_one_entry() {
+    // The unselective-equality case: 300 documents under one key. The old
+    // path gathered all 300 candidate keys before reading the first
+    // document; now it reads one entry, one document, and stops.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "same" })).await;
+    let batch: Vec<Value> = (0..300i64).map(|i| json!({ "_id": i, "k": 1 })).collect();
+    server.post("/v1/db/shop/coll/same/bulk", Some(&token), json!(batch)).await;
+    server
+        .post("/v1/db/shop/coll/same/indexes", Some(&token), json!({ "fields": [{ "path": "k" }] }))
+        .await;
+
+    let one = server
+        .post(
+            "/v1/db/shop/coll/same/find",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "limit": 1, "explain": true }),
+        )
+        .await;
+    assert_eq!(one.body["explain"]["strategy"], "index", "{}", one.body);
+    assert_eq!(one.body["documents"][0]["_id"], 0, "the least _id");
+    assert_eq!(one.body["explain"]["documentsExamined"], 1);
+    assert_eq!(one.body["explain"]["indexEntriesRead"], 1);
+
+    // The count reads them all — it has to — and says so.
+    let all = server
+        .post(
+            "/v1/db/shop/coll/same/count",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(all.body["count"], 300);
+    assert_eq!(all.body["explain"]["indexEntriesRead"], 300);
 }
 
 #[tokio::test]
@@ -3641,6 +4987,65 @@ async fn upsert_seeds_the_filters_equalities() {
 }
 
 #[tokio::test]
+async fn set_on_insert_applies_to_the_upsert_and_not_to_the_match() {
+    // The created-at idiom: stamp the document once, when the upsert makes
+    // it, and never touch the stamp again however many times it is hit.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"counters"})).await;
+
+    let request = json!({
+        "filter": {"_id": "hits"},
+        "update": {"$setOnInsert": {"created_at": 100, "meta.origin": "upsert"}, "$inc": {"n": 1}},
+        "upsert": true,
+        "returnDocument": "after",
+    });
+    let res = server
+        .post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request.clone())
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 0);
+    assert_eq!(res.body["document"]["created_at"], 100);
+    assert_eq!(res.body["document"]["meta"]["origin"], "upsert");
+    assert_eq!(res.body["document"]["n"], 1);
+
+    // Change what the insert would have set, then match: it stays as stored.
+    server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({"filter": {"_id": "hits"}, "update": {"$set": {"created_at": 7}}}),
+        )
+        .await;
+    let res = server.post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["document"]["created_at"], 7);
+    assert_eq!(res.body["document"]["n"], 2);
+
+    // The same path in $setOnInsert and another operator is refused up front,
+    // whether or not the request would have inserted.
+    let res = server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": "hits"},
+                "update": {"$setOnInsert": {"n": 0}, "$inc": {"n": 1}},
+                "upsert": true,
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("conflicts"),
+        "{:?}",
+        res.body
+    );
+}
+
+#[tokio::test]
 async fn contradictory_find_and_modify_requests_are_refused() {
     let server = Server::start().await;
     let token = jobs(&server).await;
@@ -3967,6 +5372,153 @@ async fn lookup_is_authorized_against_the_collection_it_joins() {
 }
 
 #[tokio::test]
+async fn array_operators_and_variables_work_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({"_id": 1, "min": 2, "items": [
+                {"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}, {"sku": "c", "qty": 5}
+            ]}),
+        )
+        .await;
+    // No items at all: the null path, end to end.
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 2})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$project": {
+                    "_id": 1,
+                    "n": {"$size": "$items"},
+                    "last": {"$last": "$items"},
+                    "second": {"$arrayElemAt": [
+                        {"$map": {"input": "$items", "in": "$$this.sku"}}, 1]},
+                    "big": {"$filter": {"input": "$items", "as": "it",
+                                        "cond": {"$gte": ["$$it.qty", "$min"]}}},
+                    "skus": {"$map": {"input": "$items", "in": "$$this.sku"}},
+                    "total": {"$reduce": {"input": "$items", "initialValue": 0,
+                                          "in": {"$add": ["$$value", "$$this.qty"]}}},
+                    "self": "$$ROOT._id",
+                    "taxed": {"$let": {"vars": {"rate": 0.5},
+                                       "in": {"$multiply": ["$min", "$$rate"]}}},
+                }},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2);
+    let d = &docs[0];
+    assert_eq!(d["n"], 3);
+    assert_eq!(d["last"], json!({"sku": "c", "qty": 5}));
+    assert_eq!(d["second"], "b");
+    assert_eq!(d["big"], json!([{"sku": "b", "qty": 2}, {"sku": "c", "qty": 5}]));
+    assert_eq!(d["skus"], json!(["a", "b", "c"]));
+    assert_eq!(d["total"], 8);
+    assert_eq!(d["self"], 1);
+    assert_eq!(d["taxed"], 1.0);
+    // Null in, null out — not an error and not an empty array.
+    let empty = &docs[1];
+    assert_eq!(empty["n"], serde_json::Value::Null);
+    assert_eq!(empty["big"], serde_json::Value::Null);
+    assert_eq!(empty["total"], serde_json::Value::Null);
+
+    // An unbound variable is a 400 naming it, before any document is read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$project": {"x": "$$nothing"}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(format!("{:?}", res.body).contains("$$nothing"), "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn lookup_pipeline_form_binds_let_per_document_and_is_authorized() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"lines"})).await;
+    for (id, min) in [(1, 5), (2, 1)] {
+        server
+            .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": id, "min": min}))
+            .await;
+    }
+    for (id, order, qty, kind) in
+        [(10, 1, 3, "line"), (11, 1, 9, "line"), (12, 2, 9, "line"), (13, 1, 9, "note")]
+    {
+        server
+            .post(
+                "/v1/db/shop/coll/lines/docs",
+                Some(&token),
+                json!({"_id": id, "order": order, "qty": qty, "kind": kind}),
+            )
+            .await;
+    }
+
+    // The correlation is written with the variable in a computed field; a
+    // leading `$match` narrows the foreign side once for every input document.
+    let pipeline = json!({"pipeline": [
+        {"$lookup": {
+            "from": "lines",
+            "let": {"oid": "$_id", "min": "$min"},
+            "pipeline": [
+                {"$match": {"kind": "line"}},
+                {"$addFields": {"mine": {"$eq": ["$order", "$$oid"]},
+                                "over": {"$gte": ["$qty", "$$min"]}}},
+                {"$match": {"mine": true}},
+                {"$project": {"_id": 1, "over": 1}},
+                {"$sort": {"_id": 1}}
+            ],
+            "as": "lines"
+        }},
+        {"$sort": {"_id": 1}}
+    ]});
+    let res =
+        server.post("/v1/db/shop/coll/orders/aggregate", Some(&token), pipeline.clone()).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs[0]["lines"], json!([{"_id": 10, "over": false}, {"_id": 11, "over": true}]));
+    assert_eq!(docs[1]["lines"], json!([{"_id": 12, "over": true}]));
+
+    // Same boundary as the equality form: read on `orders` alone is refused.
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user":"limited","password":"limited-password",
+                   "grants":[{"db":"shop","collection":"orders","actions":["read"]}]}),
+        )
+        .await;
+    let limited = server.login("limited", "limited-password").await;
+    let res = server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), pipeline).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+
+    // Mixing the two forms is a 400.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$lookup": {
+                "from": "lines", "localField": "_id", "foreignField": "order",
+                "pipeline": [], "as": "lines"
+            }}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn an_unknown_pipeline_stage_is_a_bad_request() {
     let server = Server::start().await;
     let token = server.root().await;
@@ -4242,6 +5794,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_fsyncs",
             "kimmy_commits_grouped_total",
             "kimmy_storage_bytes",
+            "kimmy_vector_index_cache_bytes",
             "kimmy_up",
             "kimmy_uptime_seconds",
             "kimmy_runtime_stall_seconds",
@@ -4252,6 +5805,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_authz_denied_total",
             "kimmy_auth_failures_total",
             "kimmy_rate_limited_total",
+            "kimmy_rate_limited_principal_total",
             "kimmy_backups_total",
             "kimmy_ttl_expired_total",
             "kimmy_ttl_skipped_total",
@@ -4563,13 +6117,18 @@ mod oidc {
             .unwrap_or(0)
     }
 
+    /// The lifetime the stub provider mints. Ten minutes: inside the shipped
+    /// limit, so every federated test also runs the default lifetime check.
+    pub const LIFETIME_SECS: u64 = 600;
+
     pub fn claims(subject: &str, roles: Value) -> Value {
+        let issued = now();
         json!({
             "sub": subject,
             "iss": ISSUER,
             "aud": AUDIENCE,
-            "exp": now() + 3600,
-            "iat": now(),
+            "exp": issued + LIFETIME_SECS,
+            "iat": issued,
             "roles": roles,
         })
     }
@@ -5007,6 +6566,293 @@ async fn a_node_without_federation_configured_treats_every_token_as_local() {
     assert_eq!(who.body["federated"], false);
 }
 
+#[tokio::test]
+async fn a_federated_token_that_lives_too_long_is_refused_and_the_challenge_names_the_limit() {
+    // The window ADR-073 describes is the token's own lifetime, and this is
+    // where it is bounded (ADR-096). A provider minting hour-long tokens
+    // against a node at the default gets a 401 whose challenge says which
+    // limit and how long, so the fix — shorten the provider's lifetime, or
+    // raise the limit knowingly — is discoverable from the response. The
+    // token's own lifetime is not echoed, and the `resource_metadata` pointer
+    // survives the more specific description.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims["aud"] = json!(RESOURCE);
+    claims["exp"] = json!(claims["iat"].as_u64().unwrap() + 3600);
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    assert_eq!(res.body["error"], "unauthorized");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("900 seconds"), "the body names the limit: {message}");
+
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
+    assert!(
+        challenge.contains(
+            r#"error_description="the access token is valid for longer than the 900 seconds"#
+        ),
+        "the challenge names the limit: {challenge}"
+    );
+    assert!(challenge.contains("max_token_lifetime_secs"), "and the setting: {challenge}");
+    assert!(!challenge.contains("3600"), "the token's own lifetime is not echoed: {challenge}");
+    assert!(
+        challenge.contains(&format!(
+            r#"resource_metadata="{RESOURCE}/.well-known/oauth-protected-resource""#
+        )),
+        "the pointer must survive a specific description: {challenge}"
+    );
+
+    // The same token at the stub provider's ordinary lifetime is accepted, so
+    // the refusal above was the limit and nothing else about the token.
+    let mut ordinary = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    ordinary["aud"] = json!(RESOURCE);
+    let ok = server.get("/v1/auth/whoami", Some(&oidc::token(ordinary))).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+}
+
+#[tokio::test]
+async fn a_federated_token_with_no_iat_is_refused_because_its_lifetime_is_unbounded() {
+    // RFC 9068 §2.2 requires `iat` in an access token; without it the limit
+    // could not be applied, so the token is refused rather than waved
+    // through, and the challenge says why.
+    let server = Server::start_federated().await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims.as_object_mut().unwrap().remove("iat");
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
+    assert!(challenge.contains("carries no iat"), "{challenge}");
+    assert!(challenge.contains("900 seconds"), "{challenge}");
+}
+
+// ---------------------------------------------------------------------------
+// The display name (ADR-100)
+// ---------------------------------------------------------------------------
+
+/// A subject shaped like a real provider's: opaque, and nothing a person
+/// would recognise in an audit line.
+const OPAQUE_SUBJECT: &str = "3f2a9c1e-7b4d-4e0a-9c1e-0f1e2d3c4b5a";
+
+fn opaque_claims(email: Option<&str>) -> Value {
+    let mut claims = oidc::claims(OPAQUE_SUBJECT, json!(["kimmydb-analyst"]));
+    if let Some(email) = email {
+        claims["email"] = json!(email);
+    }
+    claims
+}
+
+#[tokio::test]
+async fn whoami_reports_the_display_name_beside_the_identity() {
+    let server = Server::start_federated_with_subject_claim("email").await;
+
+    let token = oidc::token(opaque_claims(Some("ada@example.com")));
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    // Both, and in that order of importance: `user` is what every decision
+    // was made on, `display` is what a person reads.
+    assert_eq!(who.body["user"], OPAQUE_SUBJECT);
+    assert_eq!(who.body["display"], "ada@example.com");
+    assert_eq!(who.body["federated"], true);
+
+    // A token the provider minted without the claim is not refused; it just
+    // has no better name than its subject.
+    let who = server.get("/v1/auth/whoami", Some(&oidc::token(opaque_claims(None)))).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["display"], OPAQUE_SUBJECT);
+
+    // A local caller's display is its user name, always.
+    let who = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
+    assert_eq!(who.body["user"], "root");
+    assert_eq!(who.body["display"], "root");
+}
+
+#[tokio::test]
+async fn without_a_subject_claim_the_display_is_the_subject_even_when_the_token_carries_one() {
+    // The shipped default. A node that did not ask reads nothing extra out of
+    // the token, so nothing about adding the setting changes what it shows.
+    let server = Server::start_federated().await;
+    let who = server
+        .get("/v1/auth/whoami", Some(&oidc::token(opaque_claims(Some("ada@example.com")))))
+        .await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["display"], OPAQUE_SUBJECT);
+}
+
+#[tokio::test]
+async fn a_renamed_email_keeps_the_same_grants_because_the_identity_is_the_subject() {
+    // The property the whole decision rests on (ADR-100). Two tokens for one
+    // subject, minted before and after a rename at the provider, are the same
+    // principal for every purpose but presentation — the display is never an
+    // input to authorization.
+    let server = Server::start_federated_with_subject_claim("email").await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+
+    let before = oidc::token(opaque_claims(Some("ada@example.com")));
+    let after = oidc::token(opaque_claims(Some("ada.lovelace@example.com")));
+
+    for token in [&before, &after] {
+        assert_eq!(server.get("/v1/db/sales/coll/orders/docs", Some(token)).await.status, 200);
+    }
+    let was = server.get("/v1/auth/whoami", Some(&before)).await.body;
+    let now = server.get("/v1/auth/whoami", Some(&after)).await.body;
+    assert_eq!(was["user"], now["user"], "one subject, one identity");
+    assert_eq!(was["grants"], now["grants"], "and one set of grants");
+    assert_ne!(was["display"], now["display"], "only the presentation moved");
+}
+
+// ---------------------------------------------------------------------------
+// Local login modes (ADR-100)
+// ---------------------------------------------------------------------------
+
+/// A peer that is on some network and not on this host.
+const OFF_HOST: &str = "203.0.113.9:4000";
+
+fn credentials() -> Value {
+    json!({ "user": "root", "password": ROOT_PASSWORD })
+}
+
+#[tokio::test]
+async fn local_login_answers_every_peer_by_default() {
+    // Nothing about adding the mode may change what a node that did not set
+    // it does: the socket peer (loopback) and a peer off the host both log in.
+    let server = Server::start().await;
+    assert_eq!(server.state.local_login(), kimmy_api::LocalLogin::Always);
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 200);
+    let res =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body["token"].is_string());
+}
+
+#[tokio::test]
+async fn loopback_only_admits_the_host_and_refuses_the_network_with_a_403() {
+    let server = Server::start().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+
+    // The host, both families.
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 200);
+    let v6 = server
+        .request_from("[::1]:4000", "POST", "/v1/auth/login", None, Some(credentials()))
+        .await;
+    assert_eq!(v6.status, 200, "{:?}", v6.body);
+
+    // The network: refused before the password is looked at, in the API's own
+    // envelope, with the setting named so the caller knows it is policy and
+    // not a wrong password.
+    let res =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+    assert_eq!(res.body["error"], "forbidden");
+    assert_eq!(res.body["retry"], "no");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auth.local.login"), "{message}");
+
+    // A private address is still not the host.
+    let lan = server
+        .request_from("10.0.0.5:4000", "POST", "/v1/auth/login", None, Some(credentials()))
+        .await;
+    assert_eq!(lan.status, 403, "{:?}", lan.body);
+}
+
+#[tokio::test]
+async fn loopback_only_governs_minting_and_not_verifying() {
+    // The property an operator relies on when flipping the mode on a live
+    // node: nobody's session ends, and a token minted from the host works
+    // from anywhere. Only *renewing* it is confined to the host, because
+    // refresh mints too.
+    let server = Server::start().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+    let token = server.root().await;
+
+    let who = server.request_from(OFF_HOST, "GET", "/v1/auth/whoami", Some(&token), None).await;
+    assert_eq!(who.status, 200, "a token already issued verifies off the host: {:?}", who.body);
+    assert_eq!(who.body["user"], "root");
+
+    let refreshed =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/refresh", Some(&token), None).await;
+    assert_eq!(refreshed.status, 403, "{:?}", refreshed.body);
+    assert_eq!(refreshed.body["error"], "forbidden");
+    // Not an RBAC refusal, so not an `insufficient_scope` challenge: a header
+    // saying the principal lacks a grant would describe a refusal that did
+    // not happen.
+    assert!(
+        !refreshed.head.to_ascii_lowercase().contains("www-authenticate"),
+        "a refusal by mode is not a bearer challenge: {}",
+        refreshed.head
+    );
+
+    let refreshed = server.post("/v1/auth/refresh", Some(&token), json!({})).await;
+    assert_eq!(refreshed.status, 200, "from the host, refresh still works: {:?}", refreshed.body);
+    assert!(refreshed.body["token"].is_string());
+}
+
+#[tokio::test]
+async fn disabled_answers_404_from_everywhere_and_issued_tokens_keep_working() {
+    let server = Server::start().await;
+    // Minted before the door closes: the mode is fixed for the life of a
+    // process, so this is the order a real deployment sees across a restart
+    // with a still-valid token in hand.
+    let token = server.root().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::Disabled);
+
+    for res in [
+        server.post("/v1/auth/login", None, credentials()).await,
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await,
+    ] {
+        assert_eq!(res.status, 404, "{:?}", res.body);
+        assert_eq!(res.body["error"], "not_found");
+        assert!(res.body["message"].as_str().unwrap_or_default().contains("disabled"));
+    }
+
+    // Refresh is a 404 too, and the mode is checked *before* the token — a
+    // caller with none is not told to go and fetch one by a route that does
+    // not exist for them.
+    assert_eq!(server.post("/v1/auth/refresh", Some(&token), json!({})).await.status, 404);
+    let bare = server.post("/v1/auth/refresh", None, json!({})).await;
+    assert_eq!(bare.status, 404, "{:?}", bare.body);
+
+    // The token itself is untouched.
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["user"], "root");
+}
+
+#[tokio::test]
+async fn disabling_local_login_leaves_the_identity_provider_as_the_way_in() {
+    // The configuration `disabled` exists for, and the one startup allows it
+    // in: a federated caller is unaffected, because nothing about the mode
+    // touches the verifier a federated token is offered to.
+    let server = Server::start_federated().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::Disabled);
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["federated"], true);
+
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 404);
+}
+
+#[tokio::test]
+async fn a_refusal_by_mode_is_not_a_failed_login_for_the_limiter() {
+    // A refusal by policy costs no Argon2 work and reveals nothing about a
+    // password, so it must not spend the caller's failure budget: an operator
+    // who later reopens the route would otherwise find the host's neighbours
+    // pre-throttled by requests that were never attempts.
+    let server = Server::start_rate_limited(1).await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+    for _ in 0..3 {
+        let res = server
+            .request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials()))
+            .await;
+        assert_eq!(res.status, 403, "never 429: {:?}", res.body);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resource identity: RFC 9728 metadata and RFC 6750 challenges (ADR-071)
 // ---------------------------------------------------------------------------
@@ -5194,4 +7040,102 @@ async fn an_opaque_audience_still_challenges_but_names_no_metadata() {
     let challenge = res.header("www-authenticate").expect("still a MUST");
     assert!(challenge.starts_with("Bearer "), "{challenge}");
     assert!(!challenge.contains("resource_metadata="), "there is no document to name: {challenge}");
+}
+
+#[tokio::test]
+async fn a_search_filter_uses_the_index_and_returns_the_filtered_top_k() {
+    // The filter is planned like a `find` — here through an index on `tag` —
+    // and, admitting a small set, is joined by reading those documents'
+    // chunks. The result must be the filtered nearest neighbours in order,
+    // text included, for vector and hybrid search alike; and `find` with
+    // `explain` on the same filter shows the strategy the search got.
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/docs/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "tag" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+
+    // Nearest to the query first: a, b, c, d, e. Only b, d and e carry the tag.
+    let docs = [
+        ("a", "other", [1.0, 0.0, 0.0]),
+        ("b", "wanted", [0.9, 0.1, 0.0]),
+        ("c", "other", [0.8, 0.2, 0.0]),
+        ("d", "wanted", [0.7, 0.3, 0.0]),
+        ("e", "wanted", [0.0, 1.0, 0.0]),
+    ];
+    for (id, tag, vector) in docs {
+        server
+            .post(
+                "/v1/db/shop/coll/docs/docs",
+                Some(&token),
+                json!({ "_id": id, "tag": tag, "text": format!("text of {id}") }),
+            )
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": format!("text of {id}") }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+
+    let explained = server
+        .post(
+            "/v1/db/shop/coll/docs/find",
+            Some(&token),
+            json!({ "filter": { "tag": "wanted" }, "explain": true }),
+        )
+        .await;
+    assert_eq!(explained.body["explain"]["strategy"], "index", "{:?}", explained.body);
+
+    let found = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2, "filter": { "tag": "wanted" } }),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{:?}", found.body);
+    let matches = found.body["matches"].as_array().unwrap();
+    let ids: Vec<&str> = matches.iter().map(|m| m["_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec!["b", "d"], "the two nearest *tagged* documents: {:?}", found.body);
+    assert_eq!(matches[0]["text"], "text of b", "the text travels with the hit");
+    assert!(matches[0]["score"].as_f64().unwrap() > matches[1]["score"].as_f64().unwrap());
+
+    // A filter admitting nothing returns nothing rather than failing.
+    let none = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "k": 2, "filter": { "tag": "absent" } }),
+        )
+        .await;
+    assert_eq!(none.status, 200, "{:?}", none.body);
+    assert_eq!(none.body["count"], 0);
+
+    // Hybrid's dense half is filtered the same way; "e" is the keyword and
+    // is tagged, so it fuses in, while "a" and "c" cannot appear.
+    let hybrid = server
+        .post(
+            "/v1/db/shop/coll/docs/hybrid_search",
+            Some(&token),
+            json!({ "query": "e", "vector": [1.0, 0.0, 0.0], "k": 3, "filter": { "tag": "wanted" } }),
+        )
+        .await;
+    assert_eq!(hybrid.status, 200, "{:?}", hybrid.body);
+    let ids: Vec<&str> = hybrid.body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["_id"].as_str().unwrap())
+        .collect();
+    assert!(ids.contains(&"b") && ids.contains(&"e"), "{:?}", hybrid.body);
+    assert!(!ids.contains(&"a") && !ids.contains(&"c"), "{:?}", hybrid.body);
 }

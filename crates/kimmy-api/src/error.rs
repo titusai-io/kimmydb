@@ -49,6 +49,9 @@ pub enum ErrorCode {
     /// A conditional write found the document at a different version than
     /// the caller's `if_stamp`, or found no document where one was expected.
     Stale,
+    /// The request ran past `server.request_timeout_secs` and this node gave
+    /// up on it (ADR-099).
+    Timeout,
 }
 
 /// What a client may do about a failure.
@@ -82,7 +85,7 @@ impl Retry {
 
 impl ErrorCode {
     /// Every variant, for the tests that hold the specification to this set.
-    pub const ALL: [ErrorCode; 18] = [
+    pub const ALL: [ErrorCode; 19] = [
         Self::BadRequest,
         Self::PayloadTooLarge,
         Self::UnsupportedMediaType,
@@ -101,6 +104,7 @@ impl ErrorCode {
         Self::NotImplemented,
         Self::ProviderError,
         Self::Stale,
+        Self::Timeout,
     ];
 
     /// The string on the wire. Stable: clients branch on it.
@@ -124,6 +128,7 @@ impl ErrorCode {
             Self::NotImplemented => "not_implemented",
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
+            Self::Timeout => "timeout",
         }
     }
 
@@ -165,6 +170,13 @@ impl ErrorCode {
             // An upstream embedding provider failed. Every node calls the same
             // provider, so moving does not help; waiting might.
             Self::ProviderError => Retry::Wait,
+            // `wait`, not `elsewhere`, deliberately. The deadline is only ever
+            // reached while the request is *waiting* — for the rest of its
+            // body, or for an upstream provider — and neither improves by
+            // moving: a slow upload is slow to every node, and every node
+            // calls the same provider. `elsewhere` would send the same slow
+            // upload round the whole cluster (ADR-099).
+            Self::Timeout => Retry::Wait,
 
             // Local to this node, and replication means a peer can answer.
             // A storage failure here says nothing about the peer's disk, and
@@ -190,11 +202,40 @@ pub struct ApiError {
     /// where "elsewhere" is the truth and "no" would tell a client that just
     /// created it to give up.
     pub retry_override: Option<Retry>,
+    /// A more specific `error_description` for the `WWW-Authenticate`
+    /// challenge than the generic one every 401 carries.
+    ///
+    /// Carried here and handed to the challenge layer as a response extension
+    /// rather than written into the header directly, because that layer is
+    /// the one place that also knows the `resource_metadata` pointer — an
+    /// error that set the header itself would win the description and lose
+    /// the pointer. The one case today is a federated token refused for its
+    /// lifetime (ADR-096), where "invalid token" would send a client to
+    /// refresh a token the provider will mint identically.
+    pub challenge_description: Option<String>,
 }
+
+/// The `error_description` a refusal asked for, riding on the response so the
+/// challenge layer can use it. See [`ApiError::challenge_description`].
+#[derive(Clone, Debug)]
+pub struct ChallengeDescription(pub String);
 
 impl ApiError {
     pub fn new(status: StatusCode, code: ErrorCode, message: impl Into<String>) -> Self {
-        Self { status, code, message: message.into(), retry_after_secs: None, retry_override: None }
+        Self {
+            status,
+            code,
+            message: message.into(),
+            retry_after_secs: None,
+            retry_override: None,
+            challenge_description: None,
+        }
+    }
+
+    /// The same error, with a specific `error_description` in its challenge.
+    pub fn with_challenge_description(mut self, description: impl Into<String>) -> Self {
+        self.challenge_description = Some(description.into());
+        self
     }
 
     /// The same error with a different retry hint.
@@ -222,6 +263,30 @@ impl ApiError {
                 "too many requests; retry later",
             )
         }
+    }
+
+    /// The request outlived the server's deadline for it (ADR-099).
+    ///
+    /// 503 rather than 408 or 504. RFC 9110 §15.5.9 makes 408 a statement
+    /// about an idle connection — "the server did not receive a complete
+    /// request message within the time that it was prepared to wait" — and
+    /// tells a client it may simply repeat the request, which browsers and
+    /// several HTTP libraries do silently; that is the wrong instruction for a
+    /// request this node may have partly acted on. 504 is a gateway's answer
+    /// about an upstream, and this node is the origin. 503 says what is true:
+    /// this server did not handle this request, and the envelope's `retry`
+    /// says what to do about it. No `Retry-After`, because the server has no
+    /// idea when a slower client or a slower provider will be faster.
+    pub fn timeout(after: std::time::Duration) -> Self {
+        Self::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            ErrorCode::Timeout,
+            format!(
+                "the request was not completed within {} seconds (server.request_timeout_secs) \
+                 and was abandoned",
+                after.as_secs()
+            ),
+        )
     }
 
     pub fn bad_request(message: impl Into<String>) -> Self {
@@ -285,6 +350,9 @@ impl IntoResponse for ApiError {
             "retry": self.retry().as_str(),
         });
         let mut response = (self.status, Json(body)).into_response();
+        if let Some(description) = self.challenge_description {
+            response.extensions_mut().insert(ChallengeDescription(description));
+        }
         if let Some(secs) = self.retry_after_secs {
             match axum::http::HeaderValue::from_str(&secs.to_string()) {
                 Ok(value) => {
@@ -396,6 +464,15 @@ impl From<AuthError> for ApiError {
             AuthError::InvalidToken | AuthError::TokenExpired => {
                 ApiError::unauthorized(e.to_string())
             }
+            // The refusal names this node's limit and nothing about the token,
+            // and it reaches the challenge as well as the body: a client told
+            // only `invalid_token` would refresh, and the provider would mint
+            // the same token again. The fix is on the provider's side or in
+            // this node's configuration, and the description says so
+            // (ADR-096).
+            AuthError::TokenLifetimeExceeded { .. } | AuthError::TokenLifetimeUnbounded { .. } => {
+                ApiError::unauthorized(e.to_string()).with_challenge_description(e.to_string())
+            }
             // Reported to the caller as an ordinary invalid token, with the
             // key id kept out of the message. Which signing keys this node
             // has fetched is not something an unauthenticated caller should
@@ -416,9 +493,11 @@ impl From<AuthError> for ApiError {
             // matched loosely so that adding a variant stays a compile error
             // here instead of silently becoming a 400.
             AuthError::WeakSecret { .. }
+            | AuthError::PreviousSecretIsCurrent
             | AuthError::AdminNotFederatable { .. }
             | AuthError::EmptyRoleMapping { .. }
-            | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
+            | AuthError::InvalidResourceIdentifier { .. }
+            | AuthError::InvalidTokenLifetimeLimit { .. } => ApiError::bad_request(e.to_string()),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");
                 ApiError::internal("authentication failure")
@@ -504,6 +583,28 @@ mod tests {
         let e: ApiError = AuthError::InvalidCredentials.into();
         assert_eq!(e.status, StatusCode::UNAUTHORIZED);
         assert!(!e.message.to_lowercase().contains("user not found"));
+    }
+
+    #[test]
+    fn a_lifetime_refusal_is_a_401_whose_challenge_names_the_limit() {
+        // Both the body and the challenge say which limit and how long, so the
+        // fix is discoverable from the response; neither says anything about
+        // the token itself (ADR-096).
+        for e in [
+            AuthError::TokenLifetimeExceeded { max_secs: 900 },
+            AuthError::TokenLifetimeUnbounded { max_secs: 900 },
+        ] {
+            let e: ApiError = e.into();
+            assert_eq!(e.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(e.code, ErrorCode::Unauthorized);
+            assert!(e.message.contains("900 seconds"), "{}", e.message);
+            let description = e.challenge_description.as_deref().expect("a specific description");
+            assert!(description.contains("900 seconds"), "{description}");
+            assert!(description.contains("max_token_lifetime_secs"), "{description}");
+        }
+        // The ordinary refusals keep the generic challenge.
+        let plain: ApiError = AuthError::TokenExpired.into();
+        assert!(plain.challenge_description.is_none());
     }
 
     #[test]

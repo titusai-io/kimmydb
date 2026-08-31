@@ -62,7 +62,7 @@ grants any other client is.
 | `kimmy token` | The token again: prints the cached one while it is fresh, else one fresh flow |
 | `KIMMY_TOKEN=…` | A script or a service: a token minted elsewhere, e.g. a personal access token. The CLI never mints a machine credential (ADR-089) |
 | `kimmy ping` | Health, readiness and the node's version and capabilities. Needs no token |
-| `kimmy whoami` | How the node sees you: principal, local or federated, and your grants |
+| `kimmy whoami` | How the node sees you: `user` (the identity), `display` (a readable name — the configured claim for a federated caller, else the same as `user`), local or federated, and your grants |
 | `kimmy roles list` `show` `create` | Stored roles ([Security](security.md)). Create: repeat `--grant 'db:collection:actions'` |
 | `kimmy roles grant` `revoke` | Add or remove actions on one of a role's grants — live, no restart |
 | `kimmy roles delete <name>` | Principals lose its grants on their next request |
@@ -80,7 +80,7 @@ grants any other client is.
 | `kimmy count <db.coll> [filter]` | |
 | `kimmy insert <db.coll> [document]` | Reads stdin when the document is omitted |
 | `kimmy bulk-insert <db.coll> [documents]` | A JSON array, in one commit, all or nothing. Reads stdin when omitted; at most 1000 |
-| `kimmy update <db.coll> <filter> <update>` | `--multi` |
+| `kimmy update <db.coll> <filter> <update>` | `--multi --array-filters` (a JSON array, one filter per `$[<identifier>]` in the update's paths) |
 | `kimmy delete <db.coll> <filter>` | `--multi` |
 | `kimmy aggregate <db.coll> [pipeline]` | Reads stdin when the pipeline is omitted |
 | `kimmy describe <db.coll>` | Inferred schema. `--sample` |
@@ -128,6 +128,13 @@ document may fill result slots, so a single long document cannot take every one.
 fusing them with Reciprocal Rank Fusion. **Its scores are fusion scores** — much
 smaller numbers, and not comparable with the similarity scores `vector-search`
 returns. Compare rankings between them, never scores.
+
+Three further flags tune the fusion and are sent only when given, so a bare
+`hybrid-search` ranks exactly as it did before they existed: `--dense-weight`
+and `--lexical-weight` scale the two halves (the server's `weights` field; only
+the ratio matters), and `--min-overlap` sets how many distinct query terms a
+chunk must share before it counts as lexical evidence (`min_overlap`). The
+[Vectors](vectors.md) page explains when each helps.
 
 Two refusals are worth expecting rather than reading as bugs:
 
@@ -257,6 +264,14 @@ Local accounts still work on a federated node, and `kimmy login <user>` is how
 you reach the break-glass administrator: `admin` cannot be granted through an
 IdP claim ([ADR-067](decisions.md)). Creating collections and indexes is `ddl`,
 which can ([ADR-090](decisions.md)).
+
+A node may confine that door to its own host: with `auth.local.login =
+"loopback_only"` the login route answers only connections from loopback, and
+with `"disabled"` it answers nobody. `kimmy login <user>` then reports the 403
+or 404 with a line saying so — log in from the node's host, or use the
+federated `kimmy login`. A token already issued keeps working; the mode
+restricts minting, not verifying
+([Security](security.md#local-login-is-a-mode)).
 
 ### A settings file: `~/.config/kimmydb/.kimmy`
 

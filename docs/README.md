@@ -22,7 +22,9 @@ the one structural idea everything else follows from.
 [Vectors](vectors.md), and — if you are wiring up an agent — [MCP](mcp.md).
 Generating a client? Start from [`openapi.yaml`](openapi.yaml).
 
-**Running it?** [Operations](operations.md), then [Security](security.md).
+**Running it?** [Operations](operations.md), then [Security](security.md), and
+the [Threat model](threat-model.md) for what is and is not defended against and
+what the deployment is expected to provide.
 
 **Building on it or continuing development?** [Roadmap](roadmap.md) for what's
 planned and why, [Decisions](decisions.md) for what's already settled,
@@ -57,7 +59,8 @@ graph TD
     INT --> VEC["Vectors<br/>embeddings · chunking · HNSW"]
 
     OPS --> OP["Operations<br/>config · deploy · observability"]
-    OPS --> SEC["Security<br/>auth · RBAC · threat model"]
+    OPS --> SEC["Security<br/>auth · RBAC · TLS · supply chain"]
+    OPS --> TM["Threat model<br/>assets · boundaries · what is not defended"]
     OPS --> FED["Federation<br/>OAuth2/OIDC identity providers"]
 
     DEV --> RM["Roadmap<br/>milestones and planned design"]
@@ -83,7 +86,8 @@ graph TD
 | [Clients](clients.md) | The first-party client libraries, and what they do for you |
 | [`examples/`](../examples/README.md) | One application, written three times — documents, paging, aggregation, vector search and a change stream |
 | [Compatibility](compatibility.md) | What `/v1` promises, what counts as additive, what forces `/v2` |
-| [Security](security.md) | Authentication, RBAC, what is and is not defended against |
+| [Security](security.md) | Authentication, RBAC, TLS, the supply chain, what is and is not defended against |
+| [Threat model](threat-model.md) | The assets, each trust boundary with its threats and the control in place, what is out of scope, and the operational assumptions the controls rest on |
 | [Federation](federation.md) | Wiring an external OAuth2/OIDC identity provider: recipes, provider notes, troubleshooting |
 | [Operations](operations.md) | Configuration, Docker, Kubernetes, health, metrics, backup |
 | [Roadmap](roadmap.md) | Milestone status and the planned design for what remains |

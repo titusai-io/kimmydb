@@ -49,7 +49,9 @@ impl Query {
 
     /// Offset. Costs work proportional to what it skips, and cannot be combined
     /// with paging — [`Client::pages`] refuses a query carrying one rather than
-    /// letting the server refuse it on the second page.
+    /// letting the server refuse it on the second page. With a sort other than
+    /// `_id` ascending, `skip + limit` may not exceed 10,000; the server
+    /// refuses a larger window rather than clamping it.
     pub fn skip(mut self, skip: usize) -> Self {
         self.skip = Some(skip);
         self

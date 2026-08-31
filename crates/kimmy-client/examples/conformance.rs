@@ -19,13 +19,13 @@
 
 use std::process::ExitCode;
 
-use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, WatchOptions};
+use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, UpdateOptions, WatchOptions};
 use serde_json::{Value, json};
 
 /// Every scenario this driver implements. The runner checks this against the
 /// declared list, so a client that quietly stops covering one is a failure
 /// rather than a silence.
-const SCENARIOS: [&str; 17] = [
+const SCENARIOS: [&str; 18] = [
     "capabilities",
     "documents_round_trip",
     "unlimited_find_is_a_page",
@@ -43,6 +43,7 @@ const SCENARIOS: [&str; 17] = [
     "recreated_collection_serves_its_own_history",
     "stale_resume_token_is_refused",
     "stale_write_is_typed",
+    "array_filters_address_one_element",
 ];
 
 #[tokio::main]
@@ -406,6 +407,48 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
                 "code": error.code().map(|c| c.to_string()),
                 "retry": retry_name(error.retry()),
                 "status": error.status(),
+            }))
+        }
+
+        "array_filters_address_one_element" => {
+            let client = connect(base).await?;
+            seeded(&client, 0).await?;
+            client
+                .insert(
+                    "shop",
+                    "orders",
+                    &json!({ "_id": 0, "items": [ { "sku": "a", "shipped": false },
+                                                    { "sku": "b", "shipped": false } ] }),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+            let filter = json!({ "_id": 0 });
+            let update = json!({ "$set": { "items.$[line].shipped": true } });
+            let options = UpdateOptions::new().array_filters(vec![json!({ "line.sku": "b" })]);
+            let updated = client
+                .update_with("shop", "orders", &filter, &update, &options)
+                .await
+                .map_err(|e| e.to_string())?;
+            let document = client
+                .get_document("shop", "orders", "0")
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("the updated document must be readable")?;
+            let shipped: Vec<Value> = document["items"]
+                .as_array()
+                .ok_or("items must be an array")?
+                .iter()
+                .map(|line| line["shipped"].clone())
+                .collect();
+            let error = client
+                .update_with("shop", "orders", &filter, &update, &UpdateOptions::new())
+                .await
+                .expect_err("an identifier without a filter must be refused");
+            Ok(json!({
+                "modified": updated["modified"],
+                "shipped": shipped,
+                "missing_filter_code": error.code().map(|c| c.to_string()),
+                "missing_filter_status": error.status(),
             }))
         }
 

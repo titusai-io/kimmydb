@@ -47,6 +47,9 @@ pub struct MetricsSnapshot {
     pub authz_denied: u64,
     pub auth_failures: u64,
     pub rate_limited: u64,
+    /// The subset of `rate_limited` refused by the per-principal limit
+    /// (ADR-099); the rest were login attempts.
+    pub rate_limited_principal: u64,
     pub backups: u64,
     pub ttl_expired: u64,
     pub ttl_skipped: u64,
@@ -101,6 +104,10 @@ pub struct Metrics {
     authz_denied: AtomicU64,
     auth_failures: AtomicU64,
     rate_limited: AtomicU64,
+    /// Bumped by the `Auth` extractor rather than derived from the status,
+    /// unlike `rate_limited`: a 429 no longer has exactly one source, and the
+    /// question this series answers is *which* limit an operator is hitting.
+    rate_limited_principal: AtomicU64,
     backups: AtomicU64,
     webhook_delivered: AtomicU64,
     webhook_failed: AtomicU64,
@@ -138,6 +145,7 @@ impl Default for Metrics {
             authz_denied: AtomicU64::new(0),
             auth_failures: AtomicU64::new(0),
             rate_limited: AtomicU64::new(0),
+            rate_limited_principal: AtomicU64::new(0),
             backups: AtomicU64::new(0),
             webhook_delivered: AtomicU64::new(0),
             webhook_failed: AtomicU64::new(0),
@@ -170,11 +178,13 @@ impl Metrics {
     /// The three specific counters are derived from the status rather than
     /// incremented where the refusal happens, because each of those statuses
     /// has exactly one source: 401 from token or credential rejection, 403 from
-    /// `ApiError::forbidden` (RBAC and nothing else), 429 from the rate
+    /// `ApiError::forbidden` (RBAC and nothing else), 429 from a rate
     /// limiter. Deriving them here keeps the counting in one place instead of
     /// threading a metrics handle into the authorization path — and a counter
     /// that lives beside the check is a counter someone forgets to bump when
-    /// they add a route.
+    /// they add a route. The one exception is
+    /// [`Metrics::record_principal_rate_limited`], which splits the 429s by
+    /// *which* limiter refused, a fact the status does not carry.
     pub fn record_request(&self, status: u16) {
         self.requests.fetch_add(1, Ordering::Relaxed);
         match status {
@@ -193,6 +203,17 @@ impl Metrics {
             429 => self.rate_limited.fetch_add(1, Ordering::Relaxed),
             _ => 0,
         };
+    }
+
+    /// One authenticated request refused by the per-principal limit
+    /// (ADR-099).
+    ///
+    /// The response is a 429, so `record_request` counts it in
+    /// `rate_limited_total` as well; this series is the part of that total an
+    /// operator tuning `server.rate_limit.per_principal` is looking for, kept
+    /// apart from the login limiter's refusals, which mean something else.
+    pub fn record_principal_rate_limited(&self) {
+        self.rate_limited_principal.fetch_add(1, Ordering::Relaxed);
     }
 
     /// One delivery attempt, and how many events it carried.
@@ -347,6 +368,7 @@ impl Metrics {
             authz_denied: self.get(&self.authz_denied),
             auth_failures: self.get(&self.auth_failures),
             rate_limited: self.get(&self.rate_limited),
+            rate_limited_principal: self.get(&self.rate_limited_principal),
             backups: self.get(&self.backups),
             ttl_expired: self.get(&self.ttl_expired),
             ttl_skipped: self.get(&self.ttl_skipped),
@@ -439,6 +461,9 @@ impl Metrics {
              # HELP kimmy_rate_limited_total Requests refused by a rate limit.\n\
              # TYPE kimmy_rate_limited_total counter\n\
              kimmy_rate_limited_total {limited}\n\
+             # HELP kimmy_rate_limited_principal_total Authenticated requests refused by the per-principal rate limit. Also counted in kimmy_rate_limited_total; the difference is the login limiter.\n\
+             # TYPE kimmy_rate_limited_principal_total counter\n\
+             kimmy_rate_limited_principal_total {limited_principal}\n\
              # HELP kimmy_backups_total Backups served.\n\
              # TYPE kimmy_backups_total counter\n\
              kimmy_backups_total {backups}\n\
@@ -514,6 +539,7 @@ impl Metrics {
             denied = self.get(&self.authz_denied),
             auth = self.get(&self.auth_failures),
             limited = self.get(&self.rate_limited),
+            limited_principal = self.get(&self.rate_limited_principal),
             backups = self.get(&self.backups),
             wh_ok = self.get(&self.webhook_delivered),
             wh_fail = self.get(&self.webhook_failed),
@@ -594,6 +620,13 @@ mod tests {
         }
         m.record_request(304);
 
+        // Five refusals by the per-principal limit. Not paired with five 429s
+        // above on purpose: the two series are recorded from different places,
+        // and a render that printed one for the other must not match.
+        for _ in 0..5 {
+            m.record_principal_rate_limited();
+        }
+
         m.record_backup();
         m.record_expiry(11, 12);
         m.record_webhook_delivery(true, 13);
@@ -659,6 +692,9 @@ kimmy_auth_failures_total 1
 # HELP kimmy_rate_limited_total Requests refused by a rate limit.
 # TYPE kimmy_rate_limited_total counter
 kimmy_rate_limited_total 1
+# HELP kimmy_rate_limited_principal_total Authenticated requests refused by the per-principal rate limit. Also counted in kimmy_rate_limited_total; the difference is the login limiter.
+# TYPE kimmy_rate_limited_principal_total counter
+kimmy_rate_limited_principal_total 5
 # HELP kimmy_backups_total Backups served.
 # TYPE kimmy_backups_total counter
 kimmy_backups_total 1
@@ -766,6 +802,7 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_authz_denied_total {}\n", s.authz_denied));
         expect(&format!("kimmy_auth_failures_total {}\n", s.auth_failures));
         expect(&format!("kimmy_rate_limited_total {}\n", s.rate_limited));
+        expect(&format!("kimmy_rate_limited_principal_total {}\n", s.rate_limited_principal));
         expect(&format!("kimmy_backups_total {}\n", s.backups));
         expect(&format!("kimmy_ttl_expired_total {}\n", s.ttl_expired));
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
@@ -856,8 +893,8 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 30 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 50, "expected one sample per series: {out}");
+        // 31 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
+        assert_eq!(samples, 51, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -912,6 +949,23 @@ kimmy_request_duration_seconds_count 3
         let out = Metrics::default().render();
         assert!(out.contains("kimmy_authz_denied_total 0"), "{out}");
         assert!(out.contains("kimmy_rate_limited_total 0"), "{out}");
+        assert!(out.contains("kimmy_rate_limited_principal_total 0"), "{out}");
+    }
+
+    #[test]
+    fn a_principal_refusal_is_its_own_series_and_part_of_the_total() {
+        // The two are recorded from different places — the total from the
+        // status, the split from the extractor — so the relationship an
+        // operator relies on (split ≤ total) is one the two call sites have
+        // to keep, and this is what holds them to it.
+        let m = Metrics::default();
+        m.record_principal_rate_limited();
+        m.record_request(429);
+        m.record_request(429);
+
+        let out = m.render();
+        assert!(out.contains("kimmy_rate_limited_total 2"), "{out}");
+        assert!(out.contains("kimmy_rate_limited_principal_total 1"), "{out}");
     }
 
     #[test]

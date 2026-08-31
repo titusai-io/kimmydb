@@ -105,6 +105,15 @@ collection — and `drop_collection` removes both in the same transaction.
 non-unique index can then hold many documents under one value without needing a
 multimap, and deleting one entry requires no read-modify-write.
 
+**Reads consume index entries as a stream.** The key is `(collection, index,
+key, document key)`, so the entries under one complete key are already in
+document order, and a read that pins one — an equality, a `$in` probe — is a
+seek and a walk that stops when the caller does. Entries under a range of keys
+are in key order, and a read that wants `_id` order across them keeps the
+`skip + limit` smallest document keys of one pass rather than the whole range
+sorted. Documents are fetched in the same read transaction as the entries, so
+a query is one snapshot ([ADR-098](decisions.md)).
+
 **The oplog key is a flat 26-byte slice, not a tuple.** `hlc(10) || node(16)`
 already sorts by `memcmp` in exactly the total write order, so no structure is
 needed.
@@ -268,7 +277,9 @@ pub fn next_index_id(&self) -> u32 {
 ### Durability classes
 
 How a commit reaches the disk is `storage.durability` ([ADR-088](decisions.md)),
-and it is queryable: `GET /v1/version` reports it as `durability`.
+and it is queryable: `GET /v1/version` reports it as `durability`, and a
+collection's `describe` repeats it as `nodeDurability` — per node, whichever
+collection is asked about.
 
 | Class | Mechanism | Durable when the response returns? | What a crash can lose | Cost |
 |---|---|---|---|---|

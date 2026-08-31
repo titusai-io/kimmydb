@@ -84,6 +84,11 @@
       "expect": { "first_write_ok": true, "code": "stale", "retry": "no", "status": 409 }
     },
     {
+      "id": "array_filters_address_one_element",
+      "why": "An update path with `$[line]` and an `arrayFilters` entry changes the selected element and nothing else; the same path without its filter is refused as `bad_request`. A client that drops the field would pass every other scenario.",
+      "expect": { "modified": 1, "shipped": [false, true], "missing_filter_code": "bad_request", "missing_filter_status": 400 }
+    },
+    {
       "id": "stale_resume_token_is_refused",
       "why": "A token from before a drop names a position in a collection that no longer exists. Refused rather than moved forward silently, because the gap is real.",
       "expect": { "code": "resume_token_expired" }
