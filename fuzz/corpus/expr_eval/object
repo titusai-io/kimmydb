@@ -1,0 +1,1 @@
+{ "city": "$address.city", "n": { "$strLenCP": "$status" }, "lit": { "$literal": { "$qty": 1 } } }

@@ -1,0 +1,93 @@
+[package]
+name = "kimmy-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "libFuzzer entry points for KimmyDB; the harness bodies live in crates/kimmy-fuzz-harness"
+
+[package.metadata]
+cargo-fuzz = true
+
+# A root of its own, deliberately outside the workspace (the root `Cargo.toml`
+# lists it under `exclude`). `cargo fuzz` builds this crate on nightly with a
+# sanitizer and `libfuzzer-sys`'s C++ runtime, none of which belongs in the
+# stable build the workspace gates run. Every target is a one-line wrapper over
+# a function in `kimmy-fuzz-harness`, which *is* a workspace member, so the
+# code that matters is compiled on every pull request even though this crate
+# is not (ADR-111).
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.kimmy-fuzz-harness]
+path = "../crates/kimmy-fuzz-harness"
+
+# The sanitizer build is a release build with debug assertions on, so integer
+# overflow and every `debug_assert!` in the tree still fire. Line tables are
+# what makes a crash report name a line rather than an address.
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "filter_parse"
+path = "fuzz_targets/filter_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "update_parse_apply"
+path = "fuzz_targets/update_parse_apply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "projection_sort_parse"
+path = "fuzz_targets/projection_sort_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "aggregate_parse_run"
+path = "fuzz_targets/aggregate_parse_run.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expr_eval"
+path = "fuzz_targets/expr_eval.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "extended_json_bson"
+path = "fuzz_targets/extended_json_bson.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "key_encoding"
+path = "fuzz_targets/key_encoding.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_local_verify"
+path = "fuzz_targets/jwt_local_verify.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jwt_oidc_verify"
+path = "fuzz_targets/jwt_oidc_verify.rs"
+test = false
+doc = false
+bench = false

@@ -193,7 +193,7 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
             return Err(Error::InvalidUpdate(format!("${op} requires a document")));
         };
         for (target_path, arg) in targets {
-            if target_path == ID_FIELD {
+            if touches_id(target_path) {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
             let kind = parse_op(op, arg)?;
@@ -404,6 +404,18 @@ fn paths_overlap(a: &str, b: &str) -> bool {
     a == b
         || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.'))
         || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
+}
+
+/// Whether a target path is `_id` or anything beneath it.
+///
+/// The exact match alone was not enough. `_id` holds a scalar in almost every
+/// document, and `path::set` on `"_id.x"` replaces a scalar with a document to
+/// make room — so `{$set: {"_id.x": 1}}` turned `_id: 7` into `_id: {x: 1}`,
+/// past a check that only knew the literal name. That relocates the document
+/// out from under every index entry and oplog record that named it, silently.
+/// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
+fn touches_id(path: &str) -> bool {
+    path == ID_FIELD || path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
@@ -832,7 +844,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
 
         OpKind::Rename(target) => {
-            if target == ID_FIELD {
+            if touches_id(target) {
                 return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
             // Renaming a missing field is a no-op, matching Mongo.
@@ -1325,6 +1337,23 @@ mod tests {
             let mut d = doc! { "_id": 1, "a": 2 };
             apply(&u, &mut d, NOW).is_err()
         }));
+    }
+
+    #[test]
+    fn operators_may_not_reach_under_id_either() {
+        // `_id.x` is not `_id`, so the exact check let it through — and
+        // `path::set` replaces a scalar `_id` with a document to make room for
+        // `x`, which changes the document's identity. Every operator goes
+        // through the same check, so `$unset` and `$rename` are pinned too.
+        assert!(parse(&doc! { "$set": { "_id.x": 1 } }).is_err());
+        assert!(parse(&doc! { "$unset": { "_id.x": "" } }).is_err());
+        assert!(parse(&doc! { "$inc": { "_id.0": 1 } }).is_err());
+        assert!(parse(&doc! { "$rename": { "a": "_id.x" } }).is_ok_and(|u| {
+            let mut d = doc! { "_id": 1, "a": 2 };
+            apply(&u, &mut d, NOW).is_err()
+        }));
+        // A field that merely starts with the letters is an ordinary field.
+        assert!(parse(&doc! { "$set": { "_identity": 1 } }).is_ok());
     }
 
     #[test]

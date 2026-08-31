@@ -1,0 +1,1 @@
+{ "$add": [ { "$multiply": ["$qty", "$price"] }, { "$subtract": [10, "$qty"] }, { "$mod": ["$qty", 3] } ] }

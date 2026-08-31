@@ -1,0 +1,1 @@
+{ "$inc": { "qty": -1 }, "$push": { "history": "shipped" } }

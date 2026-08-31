@@ -1,0 +1,1 @@
+{ "$currentDate": { "seen": true }, "$rename": { "item": "name" } }

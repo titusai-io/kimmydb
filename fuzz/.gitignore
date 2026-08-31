@@ -1,0 +1,6 @@
+# Build output and the crash reproducers `cargo fuzz` writes. A crash is
+# minimised and committed as a seed under corpus/<target>/ once it has been
+# fixed; the raw artifact is never checked in.
+target/
+artifacts/
+coverage/

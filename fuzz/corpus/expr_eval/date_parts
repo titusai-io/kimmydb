@@ -1,0 +1,1 @@
+[ { "$year": "$placed" }, { "$month": "$placed" }, { "$dayOfMonth": "$placed" }, { "$hour": "$placed" }, { "$minute": "$placed" }, { "$second": "$placed" } ]

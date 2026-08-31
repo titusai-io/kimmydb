@@ -457,6 +457,21 @@ direction, at the previous behaviour.
   or made non-unique no longer contributes any. Nothing is stored or written
   by the route; the change-stream event and the `/metrics` count are as
   before.
+- **An update can no longer reach under `_id`.** The operators refused `_id`
+  itself, but `{"$set": {"_id.x": 1}}` named a path *beneath* it, and setting
+  a path beneath a scalar replaces the scalar with a document to make room —
+  so `_id: 7` became `_id: {"x": 1}` and the document quietly left every index
+  entry and oplog record that named it. `$set`, `$unset`, `$inc` and the rest
+  now refuse any path under `_id` with the same `400` the bare name gets, and
+  `$rename` refuses to rename onto one. Found by the fuzz harness on its first
+  run over its own seeds (ADR-111).
+- **A binary value's subtype survives the JSON boundary.** Responses always
+  wrote it — `{"$binary": {"base64": …, "subType": "04"}}` for a UUID — but
+  the request side ignored it and decoded every binary as generic, so a
+  client that read a document and wrote it back changed the value without
+  either side noticing. `subType` is now honoured on the way in: absent still
+  means generic, and anything other than two hex digits is a malformed
+  wrapper (`400`) like any other. Found by fuzzing (ADR-111).
 
 ## 0.16.4 - 2026-08-29
 

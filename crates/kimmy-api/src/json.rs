@@ -134,7 +134,23 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(b64)
                 .map_err(|_| bad("$binary"))?;
-            Bson::Binary(bson::Binary { subtype: bson::spec::BinarySubtype::Generic, bytes })
+            // The subtype is read, not assumed. `bson_to_json` writes it, so a
+            // decoder that ignored it turned every UUID or user-defined binary
+            // that passed through a client into a generic one on the way back
+            // — a silent change, and one `canonical_cmp` can see, since it
+            // orders binaries by subtype. Absent means generic, matching what
+            // a plain-JSON caller expects; present and not two hex digits is
+            // a malformed wrapper like any other. Found by fuzzing (ADR-111).
+            let subtype = match inner.get("subType") {
+                None => bson::spec::BinarySubtype::Generic,
+                Some(Value::String(hex))
+                    if hex.len() == 2 && hex.bytes().all(|b| b.is_ascii_hexdigit()) =>
+                {
+                    u8::from_str_radix(hex, 16).map_err(|_| bad("$binary"))?.into()
+                }
+                Some(_) => return Err(bad("$binary")),
+            };
+            Bson::Binary(bson::Binary { subtype, bytes })
         }
         "$minKey" => Bson::MinKey,
         "$maxKey" => Bson::MaxKey,
@@ -266,6 +282,38 @@ mod tests {
         let bson = json_to_bson(&value).unwrap();
         assert!(matches!(&bson, Bson::Binary(b) if b.bytes == vec![1, 2, 3, 4]));
         assert_eq!(round_trip(value.clone()), value);
+    }
+
+    #[test]
+    fn binary_subtypes_survive_the_round_trip() {
+        use bson::spec::BinarySubtype;
+
+        // The encoder always wrote the subtype; the decoder used to discard
+        // it, so a UUID read back and written again came back generic.
+        let uuid = json!({ "$binary": { "base64": "AQIDBA==", "subType": "04" } });
+        assert!(matches!(
+            json_to_bson(&uuid).unwrap(),
+            Bson::Binary(b) if b.subtype == BinarySubtype::Uuid
+        ));
+        assert_eq!(round_trip(uuid.clone()), uuid);
+
+        let user_defined = json!({ "$binary": { "base64": "", "subType": "de" } });
+        assert!(matches!(
+            json_to_bson(&user_defined).unwrap(),
+            Bson::Binary(b) if b.subtype == BinarySubtype::UserDefined(0xde)
+        ));
+        assert_eq!(round_trip(user_defined.clone()), user_defined);
+
+        // Absent is generic, for the caller who never heard of subtypes.
+        assert!(matches!(
+            json_to_bson(&json!({ "$binary": { "base64": "AA==" } })).unwrap(),
+            Bson::Binary(b) if b.subtype == BinarySubtype::Generic
+        ));
+        // Present and malformed is a malformed wrapper, not a silent generic.
+        assert!(
+            json_to_bson(&json!({ "$binary": { "base64": "AA==", "subType": "zz" } })).is_err()
+        );
+        assert!(json_to_bson(&json!({ "$binary": { "base64": "AA==", "subType": 4 } })).is_err());
     }
 
     #[test]
