@@ -433,6 +433,11 @@ static OIDC: LazyLock<OidcFixture> = LazyLock::new(|| {
         }],
         require_at_jwt: false,
         allow_federated_admin: false,
+        // The production defaults, so the fuzzer runs the path a deployment
+        // runs: the lifetime ceiling (ADR-096) is part of what verification
+        // decides, and an unset `subject_claim` keeps `sub` as the identity.
+        max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+        subject_claim: None,
     };
     let verifier =
         OidcVerifier::new(settings).expect("valid settings").with_keys(JwkSet { keys: vec![jwk] });
@@ -443,8 +448,8 @@ static OIDC: LazyLock<OidcFixture> = LazyLock::new(|| {
 ///
 /// The verifier takes its key set by injection (`with_keys`), so no network
 /// is involved and the full path — header, `kid` lookup, signature, issuer,
-/// audience, expiry, not-before, then the roles claim and the grants it maps
-/// to — runs in process. As with the local verifier, the raw bytes cover the
+/// audience, expiry, not-before, the lifetime ceiling, then the roles claim
+/// and the grants it maps to — runs in process. As with the local verifier, the raw bytes cover the
 /// parsing that precedes the signature check and a token signed with the
 /// fixture key covers everything after it. The claims generator leans on the
 /// right issuer and audience often enough that the fuzzer gets past both

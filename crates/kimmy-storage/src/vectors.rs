@@ -298,16 +298,87 @@ impl crate::Engine {
         shadow: &CollectionMeta,
         source: &DocId,
     ) -> Result<Vec<VectorRecord>> {
-        let key = source.to_string();
         let mut out = Vec::new();
-        self.for_each_doc(shadow, |id, doc| {
-            if VectorRecord::parse_id(&id).is_some_and(|(s, _)| s == key) {
-                out.push(decode_vector(doc)?);
-            }
+        self.for_each_chunk_doc_of(shadow, source, |_, doc| {
+            out.push(decode_vector(doc)?);
             Ok(true)
         })?;
+        // Keys order chunk numbers as text — `#10` before `#2` — so the read
+        // sorts numerically rather than trusting the scan.
         out.sort_by_key(|r| r.chunk);
         Ok(out)
+    }
+
+    /// Visit every vector belonging to one source document.
+    ///
+    /// The bounded form of [`Engine::for_each_vector`]: it reads one
+    /// document's run of chunks rather than the collection, so a search that
+    /// already knows which documents it wants can fetch their chunks by key
+    /// instead of scanning for them. A record that does not decode is skipped
+    /// with a warning, for the reason `for_each_vector` gives.
+    pub fn for_each_vector_of<F>(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(VectorRecord) -> Result<bool>,
+    {
+        self.for_each_chunk_doc_of(shadow, source, |id, doc| match decode_vector(doc) {
+            Ok(record) => f(record),
+            Err(e) => {
+                tracing::warn!(
+                    collection = %shadow.name,
+                    document = %id,
+                    error = %e,
+                    "skipping a document in a vector collection that is not a vector record"
+                );
+                Ok(true)
+            }
+        })
+    }
+
+    /// The raw chunk documents of one source document, in key order.
+    ///
+    /// Chunk records are keyed `{source}#{chunk}`, and a string key encodes
+    /// byte-for-byte in `_id` order, so one document's chunks are a contiguous
+    /// run of the shadow collection: the scan starts just past the encoded
+    /// `{source}#` prefix — which sorts before every key that extends it — and
+    /// stops at the first key that does not carry it. Reading a document's
+    /// chunks therefore costs its chunk count, not the collection's.
+    ///
+    /// The prefix alone is not proof of ownership: a string id may itself
+    /// contain `#`, so `a#1#0` (document `a#1`, chunk 0) sits inside `a#`'s
+    /// run. Each key is parsed and its source compared, and a key inside the
+    /// run that belongs to another document is passed over rather than ending
+    /// the scan.
+    fn for_each_chunk_doc_of<F>(
+        &self,
+        shadow: &CollectionMeta,
+        source: &DocId,
+        mut f: F,
+    ) -> Result<()>
+    where
+        F: FnMut(DocId, bson::Document) -> Result<bool>,
+    {
+        let wanted = source.to_string();
+        let prefix = format!("{wanted}#");
+        let after = kimmy_core::keyenc::encode(&bson::Bson::String(prefix.clone()))?;
+        self.for_each_doc_after(shadow, Some(&after), |id, doc| {
+            // Strings sort together, so the first non-string key — or the first
+            // string outside the prefix — is the end of the run.
+            let DocId::String(raw) = &id else {
+                return Ok(false);
+            };
+            if !raw.starts_with(&prefix) {
+                return Ok(false);
+            }
+            if !VectorRecord::parse_id(&id).is_some_and(|(s, _)| s == wanted) {
+                return Ok(true);
+            }
+            f(id, doc)
+        })
     }
 
     /// Remove every vector belonging to one source document.
@@ -369,12 +440,9 @@ impl crate::Engine {
     }
 
     fn vector_chunk_numbers(&self, shadow: &CollectionMeta, source: &DocId) -> Result<Vec<u32>> {
-        let key = source.to_string();
         let mut out = Vec::new();
-        self.for_each_doc(shadow, |id, _| {
-            if let Some((s, chunk)) = VectorRecord::parse_id(&id)
-                && s == key
-            {
+        self.for_each_chunk_doc_of(shadow, source, |id, _| {
+            if let Some((_, chunk)) = VectorRecord::parse_id(&id) {
                 out.push(chunk);
             }
             Ok(true)
@@ -681,6 +749,93 @@ mod tests {
             })
             .unwrap();
         assert_eq!(seen, 3);
+    }
+
+    #[test]
+    fn one_documents_chunks_are_read_as_a_run_of_keys() {
+        // Ids `1`, `10` and `1#2` all begin with `1`, and `1#2`'s chunk key
+        // `1#2#0` sits *inside* `1#`'s run, between `1#2` and `1#3`. The
+        // per-document read must return exactly the document's own chunks:
+        // pass over the interloper without ending the run, and end the run
+        // before `10#0` rather than at the end of the collection.
+        let (engine, shadow, _dir) = with_vectors();
+        let put = |id: DocId, chunks: &[u32]| {
+            let records: Vec<VectorRecord> = chunks
+                .iter()
+                .map(|&c| {
+                    let mut r = record(c, 10, &format!("{id}/{c}"));
+                    r.source = id.clone();
+                    r
+                })
+                .collect();
+            engine.put_vectors(&shadow, &id, &records).unwrap();
+        };
+        put(DocId::Int64(1), &[0, 1, 2, 10]);
+        put(DocId::Int64(10), &[0]);
+        put(DocId::String("1#2".into()), &[0]);
+        put(DocId::Int64(2), &[0]);
+
+        let texts = |id: DocId| -> Vec<String> {
+            let mut out = Vec::new();
+            engine
+                .for_each_vector_of(&shadow, &id, |r| {
+                    out.push(r.text);
+                    Ok(true)
+                })
+                .unwrap();
+            out
+        };
+        // Key order, which is textual: `#10` before `#2`.
+        assert_eq!(texts(DocId::Int64(1)), vec!["1/0", "1/1", "1/10", "1/2"]);
+        assert_eq!(texts(DocId::Int64(10)), vec!["10/0"]);
+        assert_eq!(texts(DocId::String("1#2".into())), vec!["1#2/0"]);
+        assert_eq!(texts(DocId::Int64(2)), vec!["2/0"]);
+        assert!(texts(DocId::Int64(3)).is_empty(), "a document with no chunks reads as none");
+
+        // `get_vectors` puts the same run in chunk order.
+        let chunks: Vec<u32> = engine
+            .get_vectors(&shadow, &DocId::Int64(1))
+            .unwrap()
+            .iter()
+            .map(|r| r.chunk)
+            .collect();
+        assert_eq!(chunks, vec![0, 1, 2, 10]);
+
+        // The visitor's stop is honoured.
+        let mut seen = 0;
+        engine
+            .for_each_vector_of(&shadow, &DocId::Int64(1), |_| {
+                seen += 1;
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn a_documents_run_skips_records_that_are_not_vectors() {
+        // Same rule as the full scan: a malformed record inside the run is
+        // passed over, and a key inside the run that is not a chunk key at all
+        // (`1#junk`) neither ends it nor surfaces.
+        let (engine, shadow, _dir) = with_vectors();
+        engine
+            .put_vectors(
+                &shadow,
+                &DocId::Int64(1),
+                &[record(0, 10, "first"), record(9, 10, "last")],
+            )
+            .unwrap();
+        engine.insert(&shadow, bson::doc! { "_id": "1#5", "not": "a vector record" }).unwrap();
+        engine.insert(&shadow, bson::doc! { "_id": "1#junk", "not": "a chunk key" }).unwrap();
+
+        let mut seen = Vec::new();
+        engine
+            .for_each_vector_of(&shadow, &DocId::Int64(1), |r| {
+                seen.push(r.text);
+                Ok(true)
+            })
+            .unwrap();
+        assert_eq!(seen, vec!["first".to_string(), "last".to_string()]);
     }
 
     #[test]

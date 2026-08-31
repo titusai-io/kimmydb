@@ -11,7 +11,9 @@ POST /v1/db/{db}/coll/{coll}/aggregate
 
 A pipeline is an array of stages applied in order. Each stage takes the previous
 stage's output, so ordering is the main thing that decides what a pipeline
-costs: **put `$match` first**, so every later stage sees less.
+costs: **put `$match` first**, so every later stage sees less — and so an index
+can answer it, which only a *leading* `$match` gets (see
+[Performance](#performance)).
 
 ---
 
@@ -19,7 +21,7 @@ costs: **put `$match` first**, so every later stage sees less.
 
 | Stage | Notes |
 |---|---|
-| `$match` | The same filter language as `find` — all 17 operators |
+| `$match` | The same filter language as `find` — every operator it has, `$expr` and `$mod` included. **Planned like `find` when it is the first stage** |
 | `$project` | The same projection language as `find`, **plus computed fields** |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
@@ -28,7 +30,7 @@ costs: **put `$match` first**, so every later stage sees less.
 | `$unwind` | One output document per array element |
 | `$group` | Blocking. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count |
-| `$lookup` | Join another collection. **Authorized separately** |
+| `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
 
 ### Accumulators
 
@@ -62,6 +64,10 @@ field path.
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
+| Arrays | `$size` `$arrayElemAt` `$first` `$last` `$slice` `$concatArrays` `$in` `$indexOfArray` `$isArray` `$reverseArray` `$range` |
+| Iteration | `$filter` `$map` `$reduce` — each binds a variable per element |
+| Variables | `$$ROOT` `$$CURRENT` `$let` |
+| Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
 | Escape | `$literal` |
 
 ```json
@@ -76,6 +82,8 @@ field path.
 ### How a value is read
 
 - `"$field"` is a **field path**; a bare string is a literal.
+- `"$$name"` is a **variable** — see below — and `"$$name.path"` reads into its
+  value.
 - A document whose **first key starts with `$`** is an **operator**, and it may
   not carry any other key.
 - **Any other document is computed** — its values are expressions. This is what
@@ -111,6 +119,133 @@ specifier is an error rather than being copied through — a literal `%q` in eve
 row of a report is the kind of wrong output nobody notices. BSON dates carry no
 zone, so there is nothing for `%z` to convert to.
 
+### Variables
+
+An expression evaluates in a **scope**: the document, plus whatever the
+constructs around it have bound. A variable is written `$$name`, and
+`$$name.path` reads a field out of its value.
+
+| Variable | Bound by | Value |
+|---|---|---|
+| `$$ROOT` | always | the document the expression is evaluated against |
+| `$$CURRENT` | always | the same document — nothing here rebinds it |
+| `$$this` | `$filter`, `$map` (or the name given as `as`), `$reduce` | the current element |
+| `$$value` | `$reduce` | the accumulator so far |
+| any lowercase name | `$let`, a `$lookup` `let` | what its expression evaluated to |
+
+```json
+{ "$addFields": {
+    "bulk":  { "$filter": { "input": "$items", "as": "it",
+                            "cond": { "$gte": ["$$it.qty", "$min"] } } },
+    "skus":  { "$map":    { "input": "$items", "in": "$$this.sku" } },
+    "total": { "$reduce": { "input": "$items", "initialValue": 0,
+                            "in": { "$add": ["$$value", "$$this.qty"] } } },
+    "net":   { "$let":    { "vars": { "gross": { "$multiply": ["$qty", "$price"] } },
+                            "in": { "$subtract": ["$$gross", "$discount"] } } } } }
+```
+
+**Scopes nest lexically.** A `$map` inside a `$map` sees its own element as
+`$$this`; the outer element is shadowed, and the way to reach both is to name
+them — `as: "row"` outside and `as: "cell"` inside. `$let` inside `$let` shadows
+the same way, and the outer binding is back once the inner construct closes.
+
+**An unknown variable is a parse error, not null.** `$$this` outside anything
+that binds it, `$$order` where the `let` said `oid`, or a typo in either, is
+refused before a single document is read. Reading it as a field called `$this`
+would silently yield null in every row. MongoDB's other system variables —
+`$$NOW`, `$$REMOVE`, `$$DESCEND` and the rest — are refused with a message that
+says they are unsupported rather than misspelled.
+
+**`$let` values see the enclosing scope, not each other.** `{vars: {a: 1, b:
+"$$a"}}` is refused; nest a second `$let` to build on the first. **A user
+variable name** starts with a lowercase letter and continues with letters,
+digits and underscores — MongoDB's rule, which also keeps user names from ever
+colliding with the uppercase system ones.
+
+### Arrays
+
+**Null in, null out; a non-array refuses.** Every array operator returns null
+when its array is null or the field is missing, so a sparse collection does not
+fail the pipeline, and errors when it is any other type, so `{$size: "$name"}`
+on a string is a 400 rather than a silent null. `$isArray` is the exception and
+answers `false` for anything that is not an array.
+
+**`$arrayElemAt` counts from the end when negative** (`-1` is the last element)
+and is null when the index is out of range on either side. **`$first`** and
+**`$last`** are `$arrayElemAt` at `0` and `-1`; on an empty array they are null.
+**A fractional index is refused**, not truncated.
+
+**`$slice` has two shapes.** `[array, n]` takes the first `n`, or the last
+`|n|` when `n` is negative. `[array, position, n]` takes `n` from `position`,
+counted from the end when negative, and `n` must be positive there. A window
+past either end is empty rather than an error.
+
+**`$in`** is `[value, array]` — the value first, the opposite order from the
+filter's `$in` — and tests membership in the canonical order, so `5` is in
+`[5.0]`. **`$indexOfArray`** is `[array, value, start?, end?]` and answers `-1`
+when nothing matches. **`$concatArrays`** is null if any input is, as `$concat`
+is for strings.
+
+**`$filter` takes an optional `limit`**, stops once it has that many matches,
+and treats a null limit as no limit. Zero or a negative limit is refused.
+
+**Reach into array elements with `$map`, not a dotted path.** A field path
+that crosses an array — `$items.sku` — yields the *first* matching value here,
+not an array of them as it does in MongoDB (a long-standing behaviour of the
+expression layer's path resolution, now more visible). `{$map: {input:
+"$items", in: "$$this.sku"}}` is the array of skus.
+
+**`$range`** produces at most 100,000 integers — the same ceiling as the
+pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
+exhaustion written as an expression, and it is refused before anything is
+allocated. Its elements are 64-bit integers, as every integer result here is.
+
+### Type conversion
+
+```json
+{ "$convert": { "input": "$qty", "to": "int", "onError": 0, "onNull": 0 } }
+{ "$toInt": "$qty" }
+```
+
+`to` is a type name or its numeric BSON code, as `$type` spells them:
+`"double"` (1), `"string"` (2), `"objectId"` (7), `"bool"` (8), `"date"` (9),
+`"int"` (16), `"long"` (18). The `$toX` shorthands are the same operator with
+the target fixed and no fallbacks. Both exist for two situations that come up
+as soon as data arrives from more than one source:
+
+- **A `$lookup` whose keys differ in type across collections** — an order's
+  `customerId` stored as text, the customer's `_id` as a number. Convert in an
+  `$addFields` before the join: `{ "$addFields": { "cid": { "$toLong":
+  "$customerId" } } }`, then `localField: "cid"`.
+- **A `$group` by a date that was stored as a string.** `{ "$group": { "_id":
+  { "$month": { "$toDate": "$placed" } } } }` — the date operators need a date,
+  and `$toDate` makes one out of ISO 8601 text.
+
+**Null in, null out, unless `onNull` says otherwise.** A missing field is null.
+**A value with no conversion is a 400, unless `onError` gives a value** — the
+error names both types, so `$toInt` of a document says so rather than yielding
+null. Neither fallback is evaluated unless it is needed. `onError` covers the
+*conversion*, not the `input` expression: `{ "$convert": { "input": { "$divide":
+[1, 0] }, ... } }` still fails, because hiding a broken expression behind a
+fallback would make a typo look like data.
+
+What converts to what:
+
+| To | From |
+|---|---|
+| `double` | any number; bool (`0`/`1`); date (epoch milliseconds); string, parsed strictly — `"1.5"`, `"-1e3"`; not `"1.5kg"` |
+| `int`, `long` | any number, **truncated toward zero** and refused when out of range — `$toInt` of 2^40 is an error, not a wrap; bool; string as a base-10 integer — `"42"`, not `"1.5"`; date to `long` only (epoch milliseconds never fit an int) |
+| `string` | number (a whole double prints as `"2"`, not `"2.0"`); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
+| `bool` | a number is `false` when zero; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
+| `date` | a number as epoch milliseconds (a double is truncated); a string in RFC 3339 / ISO 8601 with an offset or `Z`, or the looser forms `"2026-08-12"`, `"2026-08-12 13:45:07"` and a missing zone, all read as UTC; an ObjectId's creation time |
+| `objectId` | a string of 24 hex characters |
+
+Everything not in the table — an array to a number, a document to a date — is
+an error. **`decimal` (`Decimal128`) is refused at parse**: it has no exact key
+encoding here ([ADR-005](decisions.md)), so a value converted to it could be
+neither indexed nor grouped, and producing one would only move the refusal
+somewhere less obvious. Convert to `double` or `long` instead.
+
 ---
 
 ## Four behaviours worth knowing
@@ -135,6 +270,10 @@ grouping key goes through the same encoder the indexes use.
 
 ## `$lookup`
 
+Two forms. The first joins on one key and is a single pass; the second runs a
+sub-pipeline per input document and is a nested loop. Reach for the first
+whenever the join *is* an equality.
+
 ```json
 [ { "$lookup": { "from": "customers", "localField": "customerId",
                  "foreignField": "_id", "as": "customer" } } ]
@@ -154,10 +293,93 @@ around the single authorization point ([ADR-024](decisions.md)).
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
 
+### The `let` / `pipeline` form
+
+```json
+[ { "$lookup": {
+      "from": "lines",
+      "let": { "oid": "$_id", "min": "$minQty" },
+      "pipeline": [
+        { "$match": { "kind": "line" } },
+        { "$addFields": { "mine": { "$eq": ["$order", "$$oid"] },
+                          "over": { "$gte": ["$qty", "$$min"] } } },
+        { "$match": { "mine": true } },
+        { "$project": { "_id": 1, "over": 1 } } ],
+      "as": "lines" } } ]
+```
+
+`let` evaluates each expression **against the input document** and binds the
+result under that name; `pipeline` then runs **over the foreign collection**
+with those names in scope, and whatever comes out is the `as` array for that
+document. Inside the sub-pipeline `$field` and `$$ROOT` are the *foreign*
+document, the `let` names are the only way to reach the local one, and every
+stage takes them — `$project`, `$addFields`, `$group`, `$replaceRoot` and a
+nested `$lookup`'s own `let` included. `let` may be omitted for an uncorrelated
+join, and a `$lookup` may not carry both `localField`/`foreignField` and
+`pipeline`: join on the key, then reshape the attached array with `$filter` or
+`$map` in the following `$addFields`.
+
+**This form is O(local × foreign).** The sub-pipeline may do anything at all
+with the variables, so there is no one key to index the foreign side by; it is
+run once per input document, over a copy of the foreign collection. Two things
+keep that tolerable: the foreign collection is read from storage **once** and
+held in memory for the stage, and a **leading `$match`** is applied once,
+before the loop, because a filter has no access to the variables. Put one
+first whenever there is a constant condition — it shrinks what every iteration
+copies. A join that is an equality on one field belongs in the
+`localField`/`foreignField` form, which is a single pass however large either
+side is; the pipeline form is for the joins that form cannot express — a
+range, a computed key, a sub-pipeline that groups or reshapes before
+attaching.
+
+**The ceiling applies throughout.** The foreign collection, each sub-pipeline
+stage's output and the total of everything attached across all input documents
+are each held to the 100,000-document limit below, so the nested loop cannot
+be used to occupy a node's memory by degrees.
+
+**Where `$match` meets `let`.** A `$match` inside the sub-pipeline is the
+ordinary filter language, and the filter language has no variables, so a
+`$$oid` in one is refused. Correlate in a computed field and `$match` on that,
+as the example does. `$expr` in a filter — which is the natural place for a
+correlation, `{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` — is a separate
+addition to the filter language and, once the two compose, will be the direct
+way to write it.
+
 **No cross-collection snapshot.** A `$lookup` sees the foreign collection as of
 when the stage runs. There are no multi-document transactions in a leaderless
 store ([ADR-006](decisions.md)), so there is no consistent snapshot to take —
 inherent, not an omission.
+
+---
+
+## Performance
+
+**A leading `$match` is planned exactly as `find` is.** When the first stage is
+`$match` — or the first several are, which run as one conjunction — its filter
+goes through the same planner and the same access paths: a primary-key lookup
+for `_id`, an index for an equality, range or `$in` on an indexed field, a
+collection scan otherwise. An indexed leading `$match` reads its candidates and
+nothing else, so a pipeline over a large collection costs what its `$match`
+admits, not what the collection holds.
+
+```json
+[ { "$match": { "city": "London", "placed": { "$gte": "2026-08-01" } } },
+  { "$group": { "_id": "$sku", "n": { "$sum": 1 } } } ]
+```
+
+With an index on `[city, placed]`, the group sees London's August orders and
+the rest of the collection is never touched.
+
+**Only the leading `$match` is pushed down.** A `$match` after `$project`,
+`$unwind`, `$group` or any other stage reads the documents *that stage
+produced*, and moving it to the source would change what it matches — so it
+stays where it was written and runs as an ordinary in-memory filter over what
+reaches it. The rule is the same one MongoDB's optimizer follows, and it is
+what keeps a pipeline's meaning independent of whether an index exists.
+
+**`aggregate` has no `explain`.** To see which access path a leading `$match`
+gets, send the same filter to `find` with `"explain": true` — it is the same
+planner reading the same indexes, so the answer is the same.
 
 ---
 
@@ -169,7 +391,12 @@ bounded by `MAX_LIMIT`, but a pipeline's input is a whole collection — so
 without a ceiling one request could take all the memory on a node.
 
 Every stage checks its output against a cap of **100,000 documents**, and
-exceeding it is an error naming the stage:
+exceeding it is an error naming the stage. **The ceiling applies to what the
+leading `$match` admits**, not to the collection: a pipeline over a million
+documents runs when its first `$match` selects fewer than 100,000 of them, and
+a pipeline with no leading `$match` over that collection is refused at the
+source, as it always was. The scan stops as soon as the ceiling is passed
+rather than materialising everything to refuse it.
 
 ```json
 { "error": "bad_request",
@@ -192,12 +419,14 @@ documents holding large arrays can exceed the cap long before the stage ends.
 
 | | Why |
 |---|---|
-| Array and set operators (`$size`, `$arrayElemAt`, `$slice`, `$filter`, `$map`, `$reduce`) | Deliberately out of the first expression pass. `$map`/`$filter`/`$reduce` also need `$$this`-style variable binding, which is an evaluation *scope* rather than another operator |
-| Variable expressions — `$$ROOT`, `$$this`, `$let` | Same reason. Refused explicitly rather than read as a field named `$ROOT`, which would silently yield null |
-| Type conversion (`$convert`, `$toInt`, `$toString`, `$toDate`) | Not built |
+| Set operators (`$setUnion`, `$setIntersection`, `$setDifference`, `$setEquals`, `$allElementsTrue`, `$anyElementTrue`) | Not built. The array operators above cover membership and iteration; the set family is a further pass over the same scope |
+| `$zip`, `$objectToArray`, `$arrayToObject`, `$sortArray` | Not built |
+| System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
+| `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
+| `$convert` to `decimal`, and `$toDecimal` | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse with a pointer to `double` or `long` |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
-| Index-aware `$match` | A pipeline reads the collection; the planner is not consulted. A selective `$match` still helps, by shrinking what later stages see |
+| Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |
 
 ---
 
@@ -213,4 +442,5 @@ including through `$lookup`, which is asserted at both edges.
 
 - [HTTP API](http-api.md) — the endpoint reference
 - [Query Language](query-language.md) — the `$match` and `$project` languages
-- [Decisions](decisions.md) — ADR-024 on why both edges share one executor
+- [Decisions](decisions.md) — ADR-024 on why both edges share one executor,
+  ADR-105 on the expression scope

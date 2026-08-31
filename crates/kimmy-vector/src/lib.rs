@@ -18,7 +18,7 @@ pub mod provider;
 pub mod search;
 pub mod worker;
 
-pub use cache::{Access, IndexCache};
+pub use cache::{Access, DEFAULT_MAX_BYTES as DEFAULT_INDEX_CACHE_BYTES, IndexCache};
 pub use error::{Result, TransportKind, VectorError};
 
 /// Whether this build can embed in-process.
@@ -33,5 +33,8 @@ pub fn local_embeddings_available() -> bool {
 
 pub use index::HnswIndex;
 pub use provider::{EmbeddingProvider, build, provider_totals};
-pub use search::{Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search};
-pub use worker::{EmbeddingWorker, Outcome, WorkerCounters};
+pub use search::{
+    Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search,
+    weighted_reciprocal_rank_fusion,
+};
+pub use worker::{BatchSettings, EmbeddingWorker, Outcome, WorkerCounters};

@@ -1,0 +1,77 @@
+# The dependency policy, enforced: `cargo deny check` against deny.toml
+# (ADR-108). Advisories, licenses, banned crates, and sources.
+#
+# Its own workflow rather than a job in ci.yml because of what triggers it. A
+# path filter is a property of a workflow, not of a job, and this check has
+# nothing to say about a change that touches no manifest: it reads
+# Cargo.lock, not source. So it runs on a pull request or a push to main only
+# when a Cargo manifest, the lockfile, or the policy itself changed — on a
+# typical PR it does not run at all, which is the point of keeping it out of
+# ci.yml. A run is about a minute: no compilation, one advisory-database
+# fetch.
+#
+# The weekly run covers the case the path filter cannot: an advisory
+# published against a crate already in an unchanged lockfile. That run
+# fails loudly on a schedule rather than on the next unrelated PR to touch
+# Cargo.lock, which is when it would otherwise be found.
+name: deny
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/deny.yml"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/**/Cargo.toml"
+      - ".github/workflows/deny.yml"
+  schedule:
+    # Monday 06:00 UTC, before the week's first work lands.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Same rule as ci.yml: a newer push to a branch supersedes the older run, but
+# a run on main always finishes.
+concurrency:
+  group: deny-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Pinned to a commit, with the release it corresponds to beside it;
+      # Dependabot (.github/dependabot.yml) moves both together. The action
+      # downloads a prebuilt cargo-deny and runs it against the lockfile — no
+      # Rust build, no cache to manage.
+      #
+      # `arguments` is set to nothing on purpose: the action's default is
+      # `--all-features`, and the graph to check is the default feature set,
+      # the build that ships. deny.toml explains why (the opt-in
+      # `local-embeddings` feature pulls OpenSSL, and the ban on OpenSSL is
+      # exactly what must not be weakened to accommodate it).
+      - name: cargo deny check
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check
+          arguments: ""
+
+      # The one licensing rule the allowlist in deny.toml cannot state: the
+      # Apache-2.0 `kimmy-client` depends on no AGPL crate. Same trigger,
+      # because it reads the same lockfile; `cargo tree` resolves without
+      # compiling anything.
+      - name: License boundary
+        run: ./scripts/check-license-boundary.sh

@@ -56,6 +56,11 @@ curl -XPOST .../orders/find -H "$A" -d '{"filter":{"qty":7},"explain":true}'
 `documentsExamined` fall while `documentsMatched` stays the same is the whole
 point of an index.
 
+The `filter` of `vector_search` and `hybrid_search` is planned the same way, so
+an index on a field that searches filter by is used there too; `explain` on a
+`find` with the same filter shows the strategy the search gets
+([Vectors](vectors.md#search)).
+
 ## `_id` needs no index
 
 **A filter that pins `_id` is answered through the primary key**, reported as
@@ -95,6 +100,19 @@ write feels slow, ask it the same question you would ask a read.
 So every candidate an index produces is **re-checked against the full filter**
 before it is returned. Skipping that recheck is how index-backed queries start
 returning documents that do not match.
+
+Candidates are **streamed, not gathered.** A read walks the index range and
+rechecks each document as it arrives, so a `limit` bounds the work and nothing
+proportional to the range is held ([ADR-098](decisions.md)). An equality that
+pins a complete key — every field of the index, or a `$in` on its last field
+behind equalities on the rest — is one run of entries already in `_id` order,
+read in place and stopped where the caller stops. A `$in` is those runs
+merged, one head per probe. A range, or an equality on a prefix of a compound
+index, spans many keys whose document keys interleave; a read that needs
+`_id` order keeps only the `skip + limit` smallest document keys of one pass
+over the range, and goes back for more only if the recheck rejected enough of
+them. `explain` reports the entries read as `indexEntriesRead`, beside the
+documents examined.
 
 It follows that a computed key range may be **too wide, but never too narrow**.
 A wide range costs time; a narrow one silently drops matching documents. Every
@@ -202,6 +220,7 @@ re-applied regardless.
 | `$or` / `$nor` branches | Their branches need not all hold; narrowing on one would drop what the other matches |
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
+| `$mod` | A remainder is not a range — every fourth key is not a contiguous run of them |
 
 `$in` **is planned**, as a union of point probes — one per distinct value,
 deduplicated on the encoded key so `[5, 5.0]` probes once, each probe carrying
@@ -209,8 +228,9 @@ the equality prefix. `$in` differs from `$or` in the way that matters: it is a
 disjunction *on one field*, so every match still satisfies "this field is one
 of these", which a union of index probes can answer. The probes are
 equalities, so they are sound on a multikey index — a document whose array
-holds two listed values is found by both probes and deduplicated by document
-key. `explain` reports the shape as `"strategy": "indexUnion"` with a
+holds two listed values is found by both probes, and the merge that reads
+them sees its key twice in a row and takes it once. `explain` reports the
+shape as `"strategy": "indexUnion"` with a
 `"probes"` count. An empty `$in` list plans an empty union: zero probes,
 zero candidates, no documents touched.
 | The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
@@ -424,9 +444,11 @@ curl 'localhost:7878/v1/db/shop/coll/users/violations?index=email_1' -H "$A"
 
 The recipe: for each group, decide which document keeps the value — `merged`
 is the one whose arrival revealed the collision, the others were already
-visible — then delete or rewrite the rest. A violation whose documents no
-longer all exist is resolved and stops being reported; nothing is written by
-the route itself. The report is derived from the retained oplog, so a
+visible — then delete or rewrite the rest. Either resolves it: the route
+re-evaluates each group's documents when asked, so a member that is gone, or
+whose value no longer meets another member's under the index, drops out of
+the group, and a group left with one member stops being reported. Nothing is
+written by the route itself. The report is derived from the retained oplog, so a
 collision older than `storage.oplog_retention_secs` is no longer listed even
 if both documents still exist — the change-stream event is the durable
 record, and an application that needs longer memory keeps it.
@@ -566,7 +588,8 @@ scale; an online backfill is a later concern.
 ## Sharp edges
 
 **`skip` is still O(n).** Skipped documents are visited even with an index. Deep
-paging remains expensive.
+paging remains expensive, and with a `sort` other than `{"_id": 1}` the window
+`skip + limit` may not exceed 10,000 ([ADR-098](decisions.md)).
 
 **Order without an explicit `sort` is unspecified.** An index-backed query and a
 scan visit documents in different orders, so which documents a `limit` returns

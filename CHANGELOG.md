@@ -12,8 +12,451 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+A minor when it ships, not a patch. Nothing changes on the wire, on disk or
+in the `/v1` API, members of this version and 0.16.x replicate to each other,
+and the upgrade is an ordinary rolling one — but two configurations that
+started under 0.16.x are refused now, and the pre-1.0 policy puts a refusal
+of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
+`jwt_secret` of 16 to 31 bytes must be replaced with one of 32 or more
+(rotating it ends every session once, on every node at the same time), and a
+node reachable from the network must not be running on one of this
+repository's own example secrets. `kimmyd check-config` against the new
+binary answers both without starting anything. Nothing else in the release
+asks anything of an operator: the rest is additive query, search and
+configuration surface — the entries below say what — along with settings
+whose defaults are meant to be left alone, and documentation corrections.
+
+### Added
+
+- **`$setOnInsert`.** Fields written only to the document an upsert creates,
+  and left alone on a match — the created-at idiom `{$setOnInsert: {created:
+  t}, $inc: {n: 1}}` on `find_and_modify` with `upsert: true`. The inserted
+  document is the filter's equalities, then `$setOnInsert`, then the other
+  operators. A `$setOnInsert` path that another operator in the same update
+  also writes — the same path, a prefix or an extension of it, or a
+  `$rename`'s destination — is refused with a `400`, as MongoDB refuses it.
+  Other operator pairs are still applied in order rather than checked; the
+  reason that stays a non-change is in `docs/deviations.md`.
+- **`$push` modifiers `$position`, `$sort` and `$slice`** alongside `$each`,
+  applied in that order: insert at an index (negative from the end), order
+  whole elements by `1` / `-1` or document elements by a `{field: direction}`
+  specification using the engine's canonical comparison, then keep the first
+  `n` or last `-n`. `{$each: [x], $sort: {t: 1}, $slice: -100}` is a capped,
+  ordered history in one write. A modifier without `$each`, or a clause
+  `$push` does not know, is an error rather than a value pushed literally.
+  `$addToSet` takes `$each` and refuses the other three, which have no
+  meaning on a set.
+- **`[vector.batch]`** — `max_chunks` (32), `max_tokens` (32768, estimated)
+  and `max_wait_ms` (100) bound one embedding provider call. Process-level
+  rather than per collection, because they describe the round trip this
+  node makes and not the collection; documented in `kimmy.example.toml` and
+  [docs/operations.md](docs/operations.md#settings).
+- **`$expr` in filters.** `{$expr: <aggregation expression>}` is a filter
+  clause everywhere a filter is taken — `find`, `count`, `update`, `delete`,
+  `find_and_modify`, `$match`, the vector pre-filter and the MCP tools. The
+  expression is evaluated against the whole document and the clause matches
+  when the result is truthy, so `{$expr: {$gt: ["$spent", "$budget"]}}` is
+  the over-budget query that previously needed an aggregation, and `{$expr:
+  {$gt: [{$multiply: ["$qty", "$price"]}, 100]}}` computes on the way. The
+  whole expression operator set is available. Comparison operators inside
+  `$expr` are the *expression* ones — canonical cross-type order, arrays
+  compared whole — which differ from the filter operators in the cases
+  `docs/query-language.md` sets side by side. `$expr` is never indexable; an
+  indexable clause beside it still plans, and `explain` reports which. An
+  expression that cannot be evaluated for a particular document (a type
+  violation) makes that document a non-match rather than failing the request;
+  that and one deliberate leniency are recorded in `docs/deviations.md`.
+  ADR-106.
+- **Variables in expressions.** `$$ROOT` and `$$CURRENT` name the document;
+  `{$let: {vars: {...}, in: <expr>}}` binds names for its body; `$$name.path`
+  reads into a variable's value. Scopes nest and shadow lexically. A `$$name`
+  that nothing binds is a `400` at parse time, before any document is read,
+  rather than a null in every row.
+- **Array expression operators.** `$size`, `$arrayElemAt` (negative from the
+  end, null out of range), `$first`, `$last`, `$slice` (two- and three-argument
+  forms), `$concatArrays`, `$in` (expression form, `[value, array]`),
+  `$indexOfArray`, `$isArray`, `$reverseArray`, `$range` (capped at 100,000
+  elements), and the three that iterate with a bound variable: `$filter`
+  (`input`, `as`, `cond`, optional `limit`), `$map` (`input`, `as`, `in`) and
+  `$reduce` (`input`, `initialValue`, `in` with `$$value` and `$$this`). Null or
+  a missing field yields null throughout; any other non-array is an error.
+  Four places where that is more lenient than MongoDB are recorded in
+  `docs/deviations.md`.
+- **`$lookup` `let`/`pipeline` form.** `{$lookup: {from, let: {name: <expr over
+  the local document>}, pipeline: [<stages over the foreign collection>], as}}`.
+  The `let` is evaluated per input document and visible as `$$name` in every
+  stage of the sub-pipeline, `$$ROOT` there is the foreign document, and a
+  nested `$lookup` inside the sub-pipeline sees the outer `let` too. The
+  foreign collection is read once; a leading `$match` in the sub-pipeline is
+  applied once before the per-document loop. This form is O(local × foreign)
+  by construction — `docs/aggregation.md` says when to prefer the
+  `localField`/`foreignField` form, which remains a single pass. Authorized
+  against `from` exactly as the equality form is. Carrying both forms in one
+  stage is refused.
+- **`weights` and `min_overlap` on `hybrid_search`.** Measured on a corpus of
+  short conversational documents, hybrid search recalled roughly a third less
+  than plain vector search on the same queries, for every one of eight
+  embedding models. The lexical half ranks by term overlap, and on documents
+  of a sentence or two nearly every candidate shares a word with the query,
+  so that ranking is close to random — and equal-weight reciprocal rank
+  fusion gave it the same say as the dense rank. `weights`
+  (`{ "dense": w, "lexical": w }`, both `>= 0`, not both zero) scales each
+  half's contribution; `min_overlap` (`>= 1`) is the number of distinct query
+  terms a chunk must contain before it counts as lexical evidence, and a
+  document it removes from the lexical half keeps whatever the dense half
+  gave it. Defaults are `{1, 1}` and `1`: plain RRF, as before. The MCP
+  `hybrid_search` tool and `kimmy hybrid-search` (`--dense-weight`,
+  `--lexical-weight`, `--min-overlap`) take the same controls. ADR-094.
+- **`auth.oidc.max_token_lifetime_secs`** (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`),
+  default `900`: a federated token whose own `exp − iat` exceeds it is refused,
+  as is one with no `iat`. A federated principal's role membership is frozen in
+  its access token, so a revocation at the provider was honoured only when the
+  token expired — for however long the provider had chosen (ADR-073). This
+  bounds that window from this side. The refusal is a 401 whose
+  `WWW-Authenticate` challenge names the limit in seconds and nothing about the
+  token. **Before upgrading, check the access-token lifetime your provider
+  mints for this resource:** at or below 900 seconds nothing changes; above it,
+  shorten it at the provider or raise the limit knowingly. Refused outside
+  1–86400; a raised limit is printed in the startup summary. ADR-096.
+- **`server.request_timeout_secs`** (default `30`, `KIMMY_REQUEST_TIMEOUT_SECS`).
+  A deadline on every REST route that answers with a document. A request
+  still *waiting* at the deadline — for the rest of its body, or for an
+  embedding provider — is abandoned and answered **`503`** with the new error
+  code **`timeout`** (`retry: wait`). It does not cut short storage work
+  already running: a scan, a bulk insert, an index backfill or a database drop
+  completes and is answered with its result, so it is not a query timeout and
+  none of those needed an exemption. The change-stream upgrade
+  (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with a connection and
+  carry no deadline.
+- **`server.max_body_bytes`** (default `2097152`, `KIMMY_MAX_BODY_BYTES`). The
+  request body ceiling, previously axum's fixed 2 MiB, as a setting. Over it,
+  `413 payload_too_large` as before. `/mcp` keeps rmcp's own 4 MiB limit.
+- **`server.rate_limit.per_principal`** and **`per_principal_window_secs`**
+  (defaults `0` — off — and `60`; `KIMMY_RATE_LIMIT_PER_PRINCIPAL`,
+  `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS`). A second token bucket, keyed
+  on the authenticated principal — a local user by name, a federated identity
+  by issuer and subject — checked after the token is verified on every route
+  that takes one, REST, `/mcp` and change streams alike. Over it, `429` with
+  `Retry-After`, the same response the login limiter gives; a client should
+  now treat a `429` as possible on any authenticated call. The key map shares
+  `max_tracked_keys` with the login limiters. The documentation offers `3000`
+  over `60` seconds as a starting point and says what it is relative to.
+- **`kimmy_rate_limited_principal_total`** on `/metrics` (and
+  `kimmy.rate_limited.principal` over OTLP): the part of
+  `kimmy_rate_limited_total` refused by the per-principal limit. A sibling
+  series rather than a label, so the existing series is byte-for-byte what it
+  was.
+- `check-config` refuses `request_timeout_secs = 0`, `max_body_bytes = 0`, and
+  a per-principal window of `0` with a non-zero burst, by name.
+- **`auth.local.login`** (`KIMMY_LOCAL_LOGIN`, `--local-login`): `always`,
+  `loopback_only` or `disabled`. Under `loopback_only`, `POST /v1/auth/login`
+  and `POST /v1/auth/refresh` answer only a connection whose peer address is
+  loopback and refuse everyone else with a 403 carrying the `forbidden` code;
+  under `disabled` both answer 404. The mode governs the *minting* of local
+  tokens: a local token already issued keeps verifying under every mode,
+  federated tokens are untouched, and the break-glass root stays reachable
+  from the node's own host under `loopback_only`. Startup refuses `disabled`
+  unless `auth.oidc` is configured, because a node with neither could
+  authenticate nobody. The startup summary and `check-config` name the mode;
+  `kimmy login <user>` explains a 403 or 404 from the login route rather than
+  printing it bare.
+- **`auth.oidc.subject_claim`** (`KIMMY_OIDC_SUBJECT_CLAIM`,
+  `--oidc-subject-claim`): a claim — `preferred_username`, `email`, `upn` —
+  whose string value is carried as a federated principal's *display* name.
+  `GET /v1/auth/whoami` gains a required `display` field (the claim's value,
+  or the subject when the claim is absent, not a string, or not configured),
+  and an audit record gains a `display` field when the value differs from
+  `user`. Display only: `sub` remains the identity for authorization, role
+  resolution, rate limiting and every comparison the server makes, because
+  an email is mutable and not unique across providers. A subject whose email
+  changes keeps its roles.
+- **`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`,
+  `--jwt-previous-secret`): a two-key window for rotating `jwt_secret`.**
+  Tokens are always signed with `jwt_secret`; a token is accepted if either
+  secret verifies it, the current one tried first. Rotate by moving the old
+  value to `jwt_previous_secret`, putting the new one in `jwt_secret`, rolling
+  every node, waiting one `token_ttl_secs`, and removing the previous secret.
+  The node logs an `info` at startup naming that deadline and one `warn` when
+  it passes (counted from process start; not persisted across restarts). The
+  previous secret is held to the same length floor as the current one and to
+  the same placeholder refusal off loopback, must
+  differ from it, and every refusal is `check-config`'s too; the startup summary
+  says `jwt_previous_secret=set` and never the value. Rotation does not revoke
+  — the token version still does that, identically for a token the previous
+  secret verified — and `cluster_secret` is not covered. ADR-101; procedure in
+  `docs/security.md`.
+- **`describe` reports the node's durability class.** `GET
+  /v1/db/{db}/coll/{coll}/describe` — and through it the MCP
+  `describe_collection` tool — carries `nodeDurability`: `durable` or
+  `coalesced`, the same value `GET /v1/version` reports as `durability`
+  (ADR-088). It is a fact about the node that answered, not about the
+  collection, which is what the name says; it is on `describe` because that
+  is the one call a client makes before writing, and it said everything
+  about a collection except what an acknowledged write to it means.
+- **Positional update paths and `arrayFilters`.** An update path may contain
+  `$[]` (every element) and `$[<identifier>]` (the elements an `arrayFilters`
+  entry on the request selects): `{"$set": {"items.$[line].shipped": true}}`
+  with `"arrayFilters": [{"line.sku": "gasket"}]` marks one line item shipped
+  and touches nothing else, so a concurrent update to another field survives
+  where a whole-document replacement would have lost it. A filter takes any
+  filter operator, tests several fields of the same element, addresses scalar
+  elements through a bare identifier, and nests
+  (`orders.$[o].items.$[i].qty`). Every operator that takes a path accepts
+  one except `$rename`; `$unset` of an element leaves `null` in its place.
+  The field is `arrayFilters` on `update` and `find_and_modify`, on the MCP
+  `update` tool, `kimmy update --array-filters`, `UpdateOptions` in the Rust
+  and Go clients and `array_filters=` in Python; the conformance suite gains a
+  scenario for it. MongoDB's `$` — the element the query matched — is not
+  implemented and is refused with a message naming the replacement; ADR-104
+  and `docs/deviations.md` say why.
+
+- **Build provenance for the container image, verifiable with `gh`.** The
+  release workflow records a signed SLSA provenance attestation against the
+  image manifest's digest — keyless, through Sigstore, under the workflow
+  run's own identity — so that
+  `gh attestation verify oci://ghcr.io/titusai-io/kimmydb:<version> -R titusai-io/kimmydb`
+  proves the image was built by this repository's release workflow at the
+  tagged commit. One caveat, stated plainly: GitHub issues attestations for a
+  private repository only on an Enterprise Cloud plan, so the step is
+  conditional on the repository being public, no release made before that
+  carries one, and the release archives are switched on at the same moment
+  (`dist-workspace.toml`). The commands, and what a successful verification
+  shows, are in [Verifying a release](docs/operations.md#verifying-a-release).
+  The dependency policy (`deny.toml`), the update cadence, and the licensing
+  boundary check are described under
+  [Supply chain](docs/security.md#supply-chain); ADR-108 records the decision.
+- **`vector.index_cache.max_bytes`** bounds the HNSW graphs a node keeps in
+  memory across its vector collections — 512 MiB by default, `0` for the old
+  unbounded behaviour. A graph costs about `dim × 4 + 5,000` bytes per chunk
+  (6.5 KB at 384 dimensions, 11 KB at 1,536 — measured, and about twice what
+  the vector alone suggests) and was kept for the life of the process once its
+  collection had been searched. Past the budget the least recently searched
+  graphs are evicted and their collections pay a snapshot reload, or a
+  rebuild, on their next search; a single graph larger than the whole budget
+  is held anyway, with a warning, because a search is never refused over
+  memory. `/metrics` gains `kimmy_vector_index_cache_bytes`, the resident
+  total by the same estimate (ADR-103).
+
+
+- **A CycloneDX SBOM per binary per target, on every release.** Beside each
+  `kimmyd-<target>.tar.xz` and `kimmy-cli-<target>.tar.xz` on the Release
+  page is a `<name>.cdx.json` (CycloneDX 1.5) listing every crate compiled
+  into that binary — versions, licences, package hashes and the dependency
+  graph — with a `.sha256` beside it. Feed it to whatever already scans your
+  dependencies (`grype sbom:…`, `osv-scanner --sbom …`, Dependency-Track)
+  without pulling the image or building from source. Generated from
+  `Cargo.lock` at the release commit by `scripts/sbom.sh` inside the release
+  workflow (ADR-110); [Security › Software bill of materials](docs/security.md#software-bill-of-materials)
+  says how to verify and consume one.
+- **A written threat model**, [`docs/threat-model.md`](docs/threat-model.md):
+  the assets, every trust boundary with its threats and the control in place
+  for each — naming the file the control lives in — what is explicitly not
+  defended against, and the operational assumptions the controls rest on.
+  Nothing in it is new behaviour; it is the security model written down in
+  one place and checked against the code. The FIPS position is stated there
+  too: `aws-lc-rs` has a validated mode, this build uses `ring`, and no FIPS
+  claim is made.
+- **Type conversion expressions.** `$convert: {input, to, onError?, onNull?}`
+  with `to` as a type name or numeric BSON code, and the shorthands
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`, `$toDate` and
+  `$toObjectId`. Null or missing input is null (or `onNull`); a value with no
+  conversion is a `400` naming both types (or `onError`); integers are refused
+  out of range rather than wrapped; strings are parsed strictly; a date
+  converts to and from epoch milliseconds and to and from ISO 8601 text. The
+  two shapes it exists for: a `$lookup` whose keys differ in type across
+  collections, and a `$group` by a date that was stored as a string. `decimal`
+  is refused, because `Decimal128` has no exact key encoding here (ADR-005).
+- **`$mod` in filters.** `{field: {$mod: [divisor, remainder]}}`, with
+  MongoDB's rules: numeric values only, doubles truncated toward zero, the
+  remainder keeping the dividend's sign, arrays matched element-wise, a zero
+  divisor refused at parse. Never index-eligible; an equality or range beside
+  it still plans.
+- **`$pullAll`.** Removes every element equal to any value in the given list,
+  by the same canonical equality `$pull` uses. A missing field is a no-op; a
+  non-array field is a `400`.
+
+### Changed
+
+- **The HS256 signing key must be at least 32 bytes; it was 16.** RFC 7518
+  §3.2 asks for a key no shorter than the hash's output, 256 bits, and a
+  short key shared by every node of a cluster is the one weakness a single
+  captured token is enough to attack offline. `TokenIssuer` and
+  `check-config` refuse the same values, and the error names the floor.
+  A secret of 16–31 bytes has to be rotated before the upgrade; the docs,
+  the example configuration and the quick starts say 32 now (ADR-093).
+- **Placeholder secrets are refused off loopback.** A node whose HTTP
+  listener — or, with clustering on, whose cluster listener — binds anything
+  other than a loopback address refuses to start when `auth.root_password`,
+  `auth.jwt_secret`, `auth.jwt_previous_secret` or `cluster.cluster_secret`
+  is one of the values this
+  repository's own examples use: `changeme`, `change-me`, `hunter2`, the
+  defaults the compose file used to fall back to, the commented-out lines in
+  `kimmy.example.toml`, and the obvious words (`password`, `secret`, `root`,
+  …; the full list is `PLACEHOLDER_SECRETS` in `kimmyd`). The error names
+  the setting and never the value. On `127.0.0.1` the same values are
+  accepted, so local development and the examples still run unchanged
+  (ADR-093).
+- **`docker-compose.yml` no longer supplies default secrets.** Its
+  `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` and `KIMMY_CLUSTER_SECRET` were
+  placeholders, and inside a container the node listens on every interface,
+  so the file would now start nothing. Compose stops at `up` and names the
+  missing variable; a `.env` beside the file (gitignored) or the environment
+  supplies them, and the file says how to generate each.
+- **Quick starts generate their secrets.** The README and the operations
+  guide ran the container with `change-me` and a 20-byte signing key; both
+  would be refused now, so the commands generate a root password and a key
+  with `openssl rand` and the login line reads the password back from the
+  environment.
+- **The security guide states what a local token is**: a signed,
+  unencrypted, readable grant list. Anyone holding one can read its user,
+  grants, roles and expiry without the secret; the secret provides integrity,
+  and confidentiality comes from TLS and from handling the token as a
+  credential.
+- **The embedding worker batches provider calls across documents**
+  ([ADR-095](docs/decisions.md)). It used to send one document's chunks per
+  call, so a document short enough to be one chunk paid a whole round trip
+  by itself: measured against a CPU llama.cpp server, 32 calls of one short
+  input took 394 ms and one call of 32 took 18 ms, and a live ingest arriving
+  a little faster than that per-document floor grew its backlog without
+  bound. The worker now fills a call from consecutive documents of the same
+  collection, on the streaming path and in a backfill alike, up to the
+  bounds above. The storage write is still one per document, the oplog
+  position is still recorded after the work, and a batch that fails
+  permanently is taken apart so the one document at fault is skipped and
+  named while the rest land. `kimmy_embed_documents_total` and
+  `kimmy_embed_chunks_total` count what they always did;
+  `kimmy_embed_provider_requests_total` now climbs more slowly than chunks,
+  and chunks over requests is the batch size achieved.
+- **A sorted `find` holds at most 10,000 documents: `skip + limit`.** Beyond
+  that it is refused with `400` and a message saying how to page instead —
+  sort by `_id` and follow `nextCursor`, or narrow the filter on the sort
+  field to where the last page ended. An unsorted `find`, or one sorted by
+  `{"_id": 1}`, holds only its page and keeps its unbounded `skip`. Refused
+  rather than clamped because a clamped `skip` would return a different page
+  and say nothing.
+- **`explain` reports `indexEntriesRead`** when an index answered a read: how
+  much of the index the query touched, as distinct from `documentsExamined`.
+  Additive; absent for a scan, an `idLookup`, and for filtered writes.
+- **A graph is built off the index-cache lock.** It was built while holding
+  the lock every collection's entry lives in, so one collection's rebuild —
+  4 s at 4,000 vectors, minutes at tens of thousands — stalled vector and
+  hybrid search on every collection the node serves for that long, and did so
+  on an async worker thread. The lock is now held to look and to install; the
+  build runs under a per-collection lock on a thread the runtime is told
+  about, as a storage commit's fsync has been since 0.16.2; and concurrent
+  searches on the collection being built take the previous graph, or wait for
+  that one build rather than starting a duplicate.
+- **A build holds less.** It read every chunk record whole — text included —
+  and kept the lot until its reachability probe had finished, so a rebuild's
+  peak was the graph plus a copy of the shadow collection, every staleness
+  window under writes and up to three times when a build was discarded. It
+  now reads only keys and vectors, frees each vector as the graph takes it,
+  and probes with a 128-vector sample copied out first.
+- **A search `filter` uses secondary indexes, and a selective one is joined
+  the other way round.** `vector_search` and `hybrid_search` evaluated
+  `filter` by scanning the source collection and keeping every matching id,
+  whatever indexes existed. The filter now runs through the query planner —
+  primary key, secondary index or scan, with the same recheck `find`
+  applies — and keeps only the ids, a page at a time. When it admits at most
+  1,000 documents the search reads those documents' chunks by key and scores
+  them exactly, instead of searching everything and discarding what the
+  filter excluded; above that it searches as before and discards. The hits
+  are the same either way, and for a selective filter they are now exact
+  where the graph walk could previously come back with fewer than `k`.
+  [docs/vectors.md](docs/vectors.md#search) describes the rule; ADR-102 the
+  reasoning.
+- **The exact and lexical search paths hold only the top `k`.** The exact
+  vector path — collections under 500 chunks, the `dot` metric, a failed
+  graph build — and the lexical half of `hybrid_search` built a hit, text
+  included, for every chunk they scored and sorted the lot. Both now keep a
+  bounded set of the best `k` as chunks arrive, with the per-document cap
+  applied on the way in, so a search over a large shadow collection costs
+  memory proportional to `k`. Ties on score are ordered by chunk key rather
+  than by scan order: stable either way, but a different order for exact
+  ties.
+- **Reading one document's vectors no longer scans the shadow collection.**
+  A document's chunks are one contiguous run under its id, and
+  `GET .../docs/{id}/vectors`, the write of a document's vectors and the
+  embedding worker's staleness check now read that run rather than every
+  record in the shadow. Same results; the cost is the document's chunk count
+  instead of the collection's.
+- **A pipeline's leading `$match` uses indexes, and the ceiling is measured
+  after it.** `aggregate` now reads its source through the same planner-backed
+  scan `find` uses, with the first `$match` stage — or the first several,
+  merged — as the scan's filter. An indexed equality, range or `$in` there
+  reads its candidates rather than the whole collection, and the
+  100,000-document limit applies to what the `$match` admits, so a pipeline
+  over a larger collection runs when its leading `$match` is selective enough.
+  Only the leading `$match` is pushed down; a `$match` after any other stage
+  runs where it was written, on what that stage produced, so results are
+  unchanged with or without an index (ADR-109). The refusal for an oversized
+  source names the leading `$match` when there is one.
+
 ### Fixed
 
+- **`docs/query-language.md` no longer lists the aggregation pipeline and
+  index-backed `$in` as planned.** Both have shipped — the pipeline has its own
+  page — and the "Not implemented" table had not been updated to say so.
+- **A restarted member no longer names its converged peers stale on its
+  first round.** On a roll, half a second after a member came back, its
+  first sync round logged `peer trails this node by more than tombstone
+  retention … a stale rejoiner should be reset, not merged` for *both*
+  peers, `behind_secs` reading the time since the previous roll, and
+  withdrew it five seconds later. The peers were converged and had never
+  been away; the member had just written its topology record after 36
+  hours of writing nothing, and the span between that write and the
+  previous one is what the measure read. The verdict now also requires that
+  the peer lack something retention has removed here at that origin — a
+  peer that can still be served every entry it lacks has nothing to
+  resurrect. A genuinely stale peer is still named, on the first round that
+  sees it, with the same `behind_secs` and the same `staleSince` /
+  `behindSecs` on `GET /v1/topology`. If you alert on that line, a roll no
+  longer trips it.
+- **A restarted member no longer answers `BeyondHorizon` to its first
+  puller.** Each time a member came back, the first peer to pull from it
+  logged `behind the peer's retention horizon; falling back to a snapshot`
+  and transferred the whole store to learn one entry. The puller asked from
+  its coverage of the member's origin — the member's previous write, from
+  before the silence, collected long ago along with everything around it —
+  and by a single horizon stamp that is beyond it. The puller now sends its
+  vector with the request, and the member serves it when nothing it lacks
+  has been collected, snapshot otherwise. On a large store this was the
+  real cost of a routine restart.
+
+Both fixes take full effect from the *second* roll onto this build: a
+database an earlier build collected from has no per-origin record of what
+was removed, so it is seeded with the old horizon and stays coarse below
+it until each member has written and been collected once more. A member
+running this build interoperates with one that does not, in either
+direction, at the previous behaviour.
+- **`count` no longer decodes every match into memory.** It took the length
+  of a collected vector, which over a large collection — or a `__vectors`
+  shadow, where every document is a vector with its text — cost the memory
+  of the collection per request. It now counts as it goes and holds nothing.
+- **An index-backed `find` no longer gathers every candidate key before
+  reading the first document.** The range's keys were collected, sorted and
+  deduplicated up front, so an unselective equality with `limit: 1` held the
+  whole range and a `$in` union added a set on top. Candidates now stream out
+  of one read transaction and are rechecked as they arrive: an equality on a
+  complete key is one run already in `_id` order and stops where the page
+  does; a `$in` is a merge of such runs; a range needing `_id` order keeps the
+  `skip + limit` smallest keys of a pass. Results and their order are
+  unchanged.
+- **A sorted `find` no longer collects every match to sort it.** It keeps a
+  heap of the `skip + limit` least under the sort, with `_id` ascending as
+  the final key — the order a stable sort over an `_id`-ordered scan
+  produced, so every page is the page it was.
+- **The violations route no longer lists documents whose value has since
+  been rewritten.** `GET …/violations` reported a recorded collision as long
+  as every document it named still existed, so resolving one by rewriting a
+  colliding value — the recipe the documentation gives alongside deletion —
+  left it in the report until the oplog entry aged out. Each group is now
+  re-evaluated when asked: a member deleted or rewritten so that its index
+  keys no longer meet another member's leaves the group, a group with fewer
+  than two members left is not reported, and an index that has been dropped
+  or made non-unique no longer contributes any. Nothing is stored or written
+  by the route; the change-stream event and the `/metrics` count are as
+  before.
 - **An update can no longer reach under `_id`.** The operators refused `_id`
   itself, but `{"$set": {"_id.x": 1}}` named a path *beneath* it, and setting
   a path beneath a scalar replaces the scalar with a document to make room —

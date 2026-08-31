@@ -46,6 +46,7 @@ SCENARIOS = [
     "recreated_collection_serves_its_own_history",
     "stale_resume_token_is_refused",
     "stale_write_is_typed",
+    "array_filters_address_one_element",
 ]
 
 PASSWORD = os.environ.get("KIMMY_ROOT_PASSWORD", "conformance-password")
@@ -273,6 +274,25 @@ def run(scenario: str, base: str, dead: str) -> dict:
                 "code": e.code,
                 "retry": e.retry.value,
                 "status": e.status,
+            }
+
+    if scenario == "array_filters_address_one_element":
+        db = connect(base)
+        seed(db, 0)
+        items = [{"sku": "a", "shipped": False}, {"sku": "b", "shipped": False}]
+        db.insert("shop", "orders", {"_id": 0, "items": items})
+        update = {"$set": {"items.$[line].shipped": True}}
+        updated = db.update("shop", "orders", {"_id": 0}, update, array_filters=[{"line.sku": "b"}])
+        shipped = [line["shipped"] for line in db.get("shop", "orders", 0)["items"]]
+        try:
+            db.update("shop", "orders", {"_id": 0}, update)
+            raise AssertionError("an identifier without a filter must be refused")
+        except KimmyError as e:
+            return {
+                "modified": updated["modified"],
+                "shipped": shipped,
+                "missing_filter_code": e.code,
+                "missing_filter_status": e.status,
             }
 
     if scenario == "stale_resume_token_is_refused":

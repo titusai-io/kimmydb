@@ -145,6 +145,19 @@ pub fn record(
     // read the answer back from later, so this line is the only place that
     // association is ever recoverable.
     let roles = principal.roles.join(",");
+    // The readable name, only when it adds something: a federated subject is
+    // opaque, and `display=ada@example.com` beside `user=3f2a…` is what lets
+    // the person reading this line know who that was without opening the
+    // provider's console. Omitted when it would repeat `user`, and omitted for
+    // every local principal, so the field's presence itself says "this came
+    // from the provider's claim". It is presentation: `user` is the identity
+    // the decision was made on, and this is never used to make one (ADR-100).
+    //
+    // An `Option` field records nothing when it is `None`, which is how the
+    // field is absent rather than empty; wrapped as a `Display` value so it
+    // prints unquoted like `user` does. (Not named `display` locally: the
+    // macro brings `tracing::field::display` into scope under that name.)
+    let display_name = principal.display.as_deref().filter(|d| *d != principal.user);
     // `unauthenticated` distinguishes "root did this" from "the server was
     // started with authentication disabled", and `federated` distinguishes
     // both from "somebody the identity provider called root did this" — which
@@ -155,6 +168,7 @@ pub fn record(
         info!(
             target: "kimmy::audit",
             user = %principal.user,
+            display = display_name.map(tracing::field::display),
             unauthenticated = principal.unauthenticated,
             federated = principal.federated,
             roles = %roles,
@@ -168,6 +182,7 @@ pub fn record(
         warn!(
             target: "kimmy::audit",
             user = %principal.user,
+            display = display_name.map(tracing::field::display),
             unauthenticated = principal.unauthenticated,
             federated = principal.federated,
             roles = %roles,
@@ -254,6 +269,31 @@ mod tests {
         let no_auth = record_of(&Principal::insecure_root());
         assert!(no_auth.contains("unauthenticated=true"), "{no_auth}");
         assert!(no_auth.contains("federated=false"), "{no_auth}");
+    }
+
+    #[test]
+    fn the_display_name_appears_only_when_it_says_something_the_user_does_not() {
+        // The federated subject from a real provider is opaque; the display
+        // is what a person recognises. It rides beside `user`, never in place
+        // of it — the identity the decision was made on stays on the line.
+        let named = record_of(
+            &Principal::federated("3f2a9c1e", vec![]).with_display(Some("ada@example.com".into())),
+        );
+        assert!(named.contains("user=3f2a9c1e"), "{named}");
+        assert!(named.contains("display=ada@example.com"), "{named}");
+
+        // Absent, not empty, when there is nothing to add: a local principal,
+        // and a federated one whose claim was missing or merely repeated the
+        // subject. A collector keyed on the field's presence can then read
+        // "this came from the provider's claim" from it.
+        for principal in [
+            Principal::superuser("root"),
+            Principal::federated("ada", vec![]),
+            Principal::federated("ada", vec![]).with_display(Some("ada".into())),
+        ] {
+            let line = record_of(&principal);
+            assert!(!line.contains("display"), "{line}");
+        }
     }
 
     #[test]
