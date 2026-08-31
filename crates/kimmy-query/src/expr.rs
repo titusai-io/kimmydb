@@ -17,7 +17,10 @@
 //!
 //! MongoDB's convention, followed here:
 //!
-//! - a string starting with `$` is a **field path**, and `$$` is not supported;
+//! - a string starting with `$$` is a **variable** — `$$ROOT`, `$$CURRENT`, or
+//!   a name bound by an enclosing `$let`, `$map`, `$filter`, `$reduce` or
+//!   `$lookup` `let` — optionally followed by a dot path into its value;
+//! - any other string starting with `$` is a **field path**;
 //! - a document whose **first key starts with `$`** is an **operator**, and its
 //!   keys may not mix operator and plain names;
 //! - any other document is an **object expression** — its values are
@@ -29,6 +32,17 @@
 //! constant document, so every input landed in one bucket. It now computes.
 //! [`Op::Literal`] is the escape hatch, and exists because the rule needs one —
 //! without it there is no way to produce the string `"$x"`.
+//!
+//! # Scope
+//!
+//! Evaluation happens in a [`Scope`]: the root document plus a chain of frames,
+//! one per enclosing construct that binds a name. A variable reference searches
+//! the innermost frame first and walks outward, so an inner `as` shadows an
+//! outer one exactly as a lexical scope does, and a name no enclosing construct
+//! binds is refused when the expression is **parsed** rather than evaluating to
+//! null per document. That one mechanism is what admits the whole array family:
+//! `$$this` is not special-cased per operator, it is a binding like any other
+//! (ADR-105).
 //!
 //! # Numbers
 //!
@@ -100,6 +114,18 @@ pub enum Op {
     Hour,
     Minute,
     Second,
+    // Arrays
+    Size,
+    ArrayElemAt,
+    First,
+    Last,
+    Slice,
+    ConcatArrays,
+    In,
+    IndexOfArray,
+    IsArray,
+    ReverseArray,
+    Range,
     // Escape
     Literal,
 }
@@ -109,6 +135,7 @@ pub enum Op {
 enum Arity {
     Exact(usize),
     AtLeast(usize),
+    Between(usize, usize),
 }
 
 impl Op {
@@ -143,6 +170,17 @@ impl Op {
             "$hour" => Op::Hour,
             "$minute" => Op::Minute,
             "$second" => Op::Second,
+            "$size" => Op::Size,
+            "$arrayElemAt" => Op::ArrayElemAt,
+            "$first" => Op::First,
+            "$last" => Op::Last,
+            "$slice" => Op::Slice,
+            "$concatArrays" => Op::ConcatArrays,
+            "$in" => Op::In,
+            "$indexOfArray" => Op::IndexOfArray,
+            "$isArray" => Op::IsArray,
+            "$reverseArray" => Op::ReverseArray,
+            "$range" => Op::Range,
             "$literal" => Op::Literal,
             _ => return None,
         })
@@ -180,13 +218,26 @@ impl Op {
             Op::Hour => "$hour",
             Op::Minute => "$minute",
             Op::Second => "$second",
+            Op::Size => "$size",
+            Op::ArrayElemAt => "$arrayElemAt",
+            Op::First => "$first",
+            Op::Last => "$last",
+            Op::Slice => "$slice",
+            Op::ConcatArrays => "$concatArrays",
+            Op::In => "$in",
+            Op::IndexOfArray => "$indexOfArray",
+            Op::IsArray => "$isArray",
+            Op::ReverseArray => "$reverseArray",
+            Op::Range => "$range",
             Op::Literal => "$literal",
         }
     }
 
     fn arity(self) -> Arity {
         match self {
-            Op::Add | Op::Multiply | Op::Concat | Op::And | Op::Or => Arity::AtLeast(1),
+            Op::Add | Op::Multiply | Op::Concat | Op::And | Op::Or | Op::ConcatArrays => {
+                Arity::AtLeast(1)
+            }
             Op::Subtract
             | Op::Divide
             | Op::Mod
@@ -198,9 +249,13 @@ impl Op {
             | Op::Gte
             | Op::Lt
             | Op::Lte
-            | Op::Cmp => Arity::Exact(2),
+            | Op::Cmp
+            | Op::ArrayElemAt
+            | Op::In => Arity::Exact(2),
             Op::Substr => Arity::Exact(3),
             Op::Cond => Arity::Exact(3),
+            Op::Slice | Op::Range => Arity::Between(2, 3),
+            Op::IndexOfArray => Arity::Between(2, 4),
             Op::ToUpper
             | Op::ToLower
             | Op::StrLenCp
@@ -211,6 +266,11 @@ impl Op {
             | Op::Hour
             | Op::Minute
             | Op::Second
+            | Op::Size
+            | Op::First
+            | Op::Last
+            | Op::IsArray
+            | Op::ReverseArray
             | Op::Literal => Arity::Exact(1),
         }
     }
@@ -235,6 +295,9 @@ impl Op {
 pub enum Expr {
     /// `"$qty"` — the value at a dot path in the incoming document.
     Field(String),
+    /// `"$$name"` or `"$$name.path"` — a variable from the [`Scope`], read into
+    /// with a dot path when one is given.
+    Var { name: String, path: Option<String> },
     /// Any other BSON value, used as-is.
     Literal(Bson),
     /// An operator over positional arguments.
@@ -243,33 +306,178 @@ pub enum Expr {
     Switch { branches: Vec<(Expr, Expr)>, default: Option<Box<Expr>> },
     /// `{$dateToString: {date: <expr>, format: "<fmt>"}}`.
     DateToString { date: Box<Expr>, format: String },
+    /// `{$let: {vars: {name: <expr>, ...}, in: <expr>}}`.
+    Let { vars: Vec<(String, Expr)>, body: Box<Expr> },
+    /// `{$filter: {input: <expr>, as: "name", cond: <expr>, limit: <expr>}}`.
+    Filter { input: Box<Expr>, as_name: String, cond: Box<Expr>, limit: Option<Box<Expr>> },
+    /// `{$map: {input: <expr>, as: "name", in: <expr>}}`.
+    Map { input: Box<Expr>, as_name: String, body: Box<Expr> },
+    /// `{$reduce: {input: <expr>, initialValue: <expr>, in: <expr>}}` — `in`
+    /// sees `$$value` and `$$this`.
+    Reduce { input: Box<Expr>, initial: Box<Expr>, body: Box<Expr> },
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
 }
 
+// ---------------------------------------------------------------------------
+// Variables
+// ---------------------------------------------------------------------------
+
+/// A variable bound in a [`Scope`]: its name and its value.
+pub type Binding<'a> = (&'a str, &'a Bson);
+
+/// What an expression can see while it evaluates.
+///
+/// The root document and a chain of frames. `$let`, `$map`, `$filter` and
+/// `$reduce` each push a frame holding the names they bind and evaluate their
+/// body in it; a reference searches the innermost frame first and walks
+/// outward, so an inner binding shadows an outer one of the same name. The
+/// chain is borrowed rather than copied — pushing a frame per array element
+/// costs a stack slot and nothing else.
+#[derive(Clone, Copy, Debug)]
+pub struct Scope<'a> {
+    root: &'a Document,
+    bindings: &'a [Binding<'a>],
+    parent: Option<&'a Scope<'a>>,
+}
+
+impl<'a> Scope<'a> {
+    /// A scope over a document with nothing bound beyond `$$ROOT` and
+    /// `$$CURRENT` — what every stage outside a `$lookup` sub-pipeline wants.
+    pub fn new(root: &'a Document) -> Self {
+        Self { root, bindings: &[], parent: None }
+    }
+
+    /// A scope over a document with variables already in place — what a
+    /// `$lookup` sub-pipeline runs its stages in, its `let` bound.
+    ///
+    /// A later binding shadows an earlier one of the same name, so a caller
+    /// layering an inner set over an outer one appends rather than prepends.
+    pub fn with_bindings(root: &'a Document, bindings: &'a [Binding<'a>]) -> Self {
+        Self { root, bindings, parent: None }
+    }
+
+    /// The document `$$ROOT` names.
+    pub fn root(&self) -> &'a Document {
+        self.root
+    }
+
+    fn nested<'b>(&'b self, bindings: &'b [Binding<'b>]) -> Scope<'b> {
+        Scope { root: self.root, bindings, parent: Some(self) }
+    }
+
+    fn get(&self, name: &str) -> Option<&'a Bson> {
+        self.bindings
+            .iter()
+            .rev()
+            .find(|(bound, _)| *bound == name)
+            .map(|(_, value)| *value)
+            .or_else(|| self.parent.and_then(|parent| parent.get(name)))
+    }
+}
+
+/// The variables bound without being asked. `$$CURRENT` is `$$ROOT`: nothing
+/// here rebinds it, because `$map` and its relatives bind `$$this` instead.
+const SYSTEM_VARIABLES: [&str; 2] = ["ROOT", "CURRENT"];
+
+/// A user variable is a lowercase ASCII letter followed by letters, digits
+/// and underscores. MongoDB's rule, kept so a pipeline written for it parses
+/// here — and so a user name can never collide with a system one, which are
+/// all uppercase.
+pub(crate) fn validate_variable_name(name: &str) -> Result<()> {
+    let mut chars = name.chars();
+    let ok = matches!(chars.next(), Some(c) if c.is_ascii_lowercase())
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if ok {
+        Ok(())
+    } else {
+        Err(Error::InvalidQuery(format!(
+            "variable name {name:?} must start with a lowercase letter and contain only letters, \
+             digits and underscores"
+        )))
+    }
+}
+
 impl Expr {
     /// Parse an expression from BSON.
+    ///
+    /// Only `$$ROOT` and `$$CURRENT` are in scope; a `$$name` nothing binds is
+    /// an error here rather than a null later.
     pub fn parse(value: &Bson) -> Result<Self> {
+        Self::parse_with_vars(value, &[])
+    }
+
+    /// Parse with `vars` already bound by an enclosing construct — a `$lookup`
+    /// `let`, whose names the sub-pipeline's expressions may use.
+    pub fn parse_with_vars(value: &Bson, vars: &[String]) -> Result<Self> {
+        let mut declared = vars.to_vec();
+        Self::parse_in(value, &mut declared)
+    }
+
+    /// `{name: <expr>, ...}` — the `vars` of `$let` and the `let` of `$lookup`.
+    ///
+    /// The values are parsed against `vars`, the enclosing scope: one binding
+    /// cannot see its sibling, only what was in scope around the whole
+    /// construct. Names are validated here so both callers refuse the same
+    /// things.
+    pub fn parse_bindings(raw: &Document, vars: &[String]) -> Result<Vec<(String, Expr)>> {
+        let mut declared = vars.to_vec();
+        Self::parse_bindings_in(raw, &mut declared)
+    }
+
+    /// `declared` is the lexical environment: every construct that binds a
+    /// name pushes it before parsing its body and pops it after, so an unknown
+    /// variable is caught where it is written.
+    fn parse_in(value: &Bson, declared: &mut Vec<String>) -> Result<Self> {
         match value {
             Bson::String(s) => Ok(match s.strip_prefix('$') {
-                // `$$ROOT` and friends are not supported: they need an
-                // evaluation scope, which is a deliberate M9 exclusion.
-                Some(field) if field.starts_with('$') => {
-                    return Err(Error::UnsupportedOperator(format!(
-                        "variable expressions like {s:?} are not supported"
-                    )));
-                }
+                Some(rest) if rest.starts_with('$') => Self::parse_variable(&rest[1..], declared)?,
                 Some(field) if !field.is_empty() => Expr::Field(field.to_string()),
                 // A bare string without `$` is a literal, which is what
                 // MongoDB does: `{$sum: "total"}` sums the constant.
                 _ => Expr::Literal(value.clone()),
             }),
-            Bson::Document(doc) => Self::parse_document(doc),
+            Bson::Document(doc) => Self::parse_document(doc, declared),
             other => Ok(Expr::Literal(other.clone())),
         }
     }
 
-    fn parse_document(doc: &Document) -> Result<Self> {
+    /// `name` or `name.path`, after the `$$`.
+    ///
+    /// Refused unless something binds the name. Parsing `$$ROOT` as a field
+    /// called `$ROOT` — which is what a naive reading does — would silently
+    /// yield null in every row, and a typo in `$$this` deserves the same
+    /// refusal as a typo in an operator name.
+    fn parse_variable(spec: &str, declared: &[String]) -> Result<Self> {
+        let (name, path) = match spec.split_once('.') {
+            Some((name, path)) => (name, Some(path)),
+            None => (spec, None),
+        };
+        if name.is_empty() {
+            return Err(Error::InvalidQuery("a variable needs a name after $$".into()));
+        }
+        if path.is_some_and(str::is_empty) {
+            return Err(Error::InvalidQuery(format!("$${name}. needs a field path after the dot")));
+        }
+        if !SYSTEM_VARIABLES.contains(&name) && !declared.iter().any(|d| d == name) {
+            // MongoDB's other system variables — `$$NOW`, `$$REMOVE`,
+            // `$$DESCEND` and the rest — are uppercase by rule, so an
+            // uppercase name that is not bound is a feature this does not
+            // have rather than a typo, and the message says which.
+            if name.starts_with(|c: char| c.is_ascii_uppercase()) {
+                return Err(Error::UnsupportedOperator(format!(
+                    "system variable $${name} is not supported; $$ROOT and $$CURRENT are"
+                )));
+            }
+            return Err(Error::InvalidQuery(format!(
+                "unknown variable $${name}; the variables in scope are $$ROOT, $$CURRENT and any \
+                 bound by an enclosing $let, $map, $filter, $reduce or $lookup let"
+            )));
+        }
+        Ok(Expr::Var { name: name.to_string(), path: path.map(str::to_string) })
+    }
+
+    fn parse_document(doc: &Document, declared: &mut Vec<String>) -> Result<Self> {
         let Some((first, _)) = doc.iter().next() else {
             // `{}` is an empty object expression, not an operator.
             return Ok(Expr::Object(Vec::new()));
@@ -284,7 +492,7 @@ impl Expr {
                         "cannot mix operator {key:?} with field {first:?} in one expression"
                     )));
                 }
-                fields.push((key.clone(), Self::parse(value)?));
+                fields.push((key.clone(), Self::parse_in(value, declared)?));
             }
             return Ok(Expr::Object(fields));
         }
@@ -298,8 +506,12 @@ impl Expr {
 
         let raw = doc.get(first).expect("key from the same document");
         match first.as_str() {
-            "$switch" => Self::parse_switch(raw),
-            "$dateToString" => Self::parse_date_to_string(raw),
+            "$switch" => Self::parse_switch(raw, declared),
+            "$dateToString" => Self::parse_date_to_string(raw, declared),
+            "$let" => Self::parse_let(raw, declared),
+            "$filter" => Self::parse_filter(raw, declared),
+            "$map" => Self::parse_map(raw, declared),
+            "$reduce" => Self::parse_reduce(raw, declared),
             name => {
                 let Some(op) = Op::from_name(name) else {
                     return Err(Error::UnsupportedOperator(format!(
@@ -309,7 +521,7 @@ impl Expr {
                 if op == Op::Literal {
                     return Ok(Expr::Op(op, vec![Expr::Literal(raw.clone())]));
                 }
-                let args = Self::parse_args(op, raw)?;
+                let args = Self::parse_args(op, raw, declared)?;
                 Ok(Expr::Op(op, args))
             }
         }
@@ -319,20 +531,24 @@ impl Expr {
     ///
     /// MongoDB allows `{$toUpper: "$name"}` as well as `{$toUpper: ["$name"]}`,
     /// and the shorthand is what people actually write.
-    fn parse_args(op: Op, raw: &Bson) -> Result<Vec<Expr>> {
+    fn parse_args(op: Op, raw: &Bson, declared: &mut Vec<String>) -> Result<Vec<Expr>> {
         let args = match raw {
-            Bson::Array(items) => items.iter().map(Self::parse).collect::<Result<Vec<_>>>()?,
-            single => vec![Self::parse(single)?],
+            Bson::Array(items) => {
+                items.iter().map(|v| Self::parse_in(v, declared)).collect::<Result<Vec<_>>>()?
+            }
+            single => vec![Self::parse_in(single, declared)?],
         };
 
         let ok = match op.arity() {
             Arity::Exact(n) => args.len() == n,
             Arity::AtLeast(n) => args.len() >= n,
+            Arity::Between(lo, hi) => (lo..=hi).contains(&args.len()),
         };
         if !ok {
             let want = match op.arity() {
                 Arity::Exact(n) => format!("exactly {n}"),
                 Arity::AtLeast(n) => format!("at least {n}"),
+                Arity::Between(lo, hi) => format!("{lo} to {hi}"),
             };
             return Err(Error::InvalidQuery(format!(
                 "{} takes {want} argument(s), found {}",
@@ -343,7 +559,7 @@ impl Expr {
         Ok(args)
     }
 
-    fn parse_switch(raw: &Bson) -> Result<Self> {
+    fn parse_switch(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
         let Bson::Document(spec) = raw else {
             return Err(Error::InvalidQuery(format!(
                 "$switch takes a document, found {}",
@@ -370,17 +586,17 @@ impl Expr {
                     "each $switch branch needs `case` and `then`".into(),
                 ));
             };
-            branches.push((Self::parse(case)?, Self::parse(then)?));
+            branches.push((Self::parse_in(case, declared)?, Self::parse_in(then, declared)?));
         }
 
         let default = match spec.get("default") {
-            Some(d) => Some(Box::new(Self::parse(d)?)),
+            Some(d) => Some(Box::new(Self::parse_in(d, declared)?)),
             None => None,
         };
         Ok(Expr::Switch { branches, default })
     }
 
-    fn parse_date_to_string(raw: &Bson) -> Result<Self> {
+    fn parse_date_to_string(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
         let Bson::Document(spec) = raw else {
             return Err(Error::InvalidQuery(format!(
                 "$dateToString takes a document, found {}",
@@ -403,39 +619,162 @@ impl Expr {
                 )));
             }
         };
-        Ok(Expr::DateToString { date: Box::new(Self::parse(date)?), format })
+        Ok(Expr::DateToString { date: Box::new(Self::parse_in(date, declared)?), format })
+    }
+
+    // -- the binding operators ------------------------------------------
+
+    /// The document a named-argument operator takes, checked for keys it does
+    /// not know: `{$filter: {input: …, condition: …}}` should fail on the
+    /// typo, not silently keep every element.
+    fn named_spec<'a>(op: &str, raw: &'a Bson, allowed: &[&str]) -> Result<&'a Document> {
+        let Bson::Document(spec) = raw else {
+            return Err(Error::InvalidQuery(format!(
+                "{op} takes a document, found {}",
+                type_name(raw)
+            )));
+        };
+        for key in spec.keys() {
+            if !allowed.contains(&key.as_str()) {
+                return Err(Error::InvalidQuery(format!(
+                    "{op} does not take `{key}`; it takes {}",
+                    allowed.join(", ")
+                )));
+            }
+        }
+        Ok(spec)
+    }
+
+    fn required<'a>(op: &str, spec: &'a Document, key: &str) -> Result<&'a Bson> {
+        spec.get(key).ok_or_else(|| Error::InvalidQuery(format!("{op} needs `{key}`")))
+    }
+
+    /// `as` names the element variable and defaults to `this`, as in MongoDB.
+    fn as_name(op: &str, spec: &Document) -> Result<String> {
+        match spec.get("as") {
+            None => Ok("this".to_string()),
+            Some(Bson::String(name)) => {
+                validate_variable_name(name)?;
+                Ok(name.clone())
+            }
+            Some(other) => Err(Error::InvalidQuery(format!(
+                "{op} `as` is a string, found {}",
+                type_name(other)
+            ))),
+        }
+    }
+
+    /// Parse `body` with `names` bound, and unbind them after.
+    fn parse_scoped<'n>(
+        body: &Bson,
+        names: impl IntoIterator<Item = &'n str>,
+        declared: &mut Vec<String>,
+    ) -> Result<Self> {
+        let depth = declared.len();
+        declared.extend(names.into_iter().map(str::to_string));
+        let parsed = Self::parse_in(body, declared);
+        declared.truncate(depth);
+        parsed
+    }
+
+    fn parse_bindings_in(
+        raw: &Document,
+        declared: &mut Vec<String>,
+    ) -> Result<Vec<(String, Expr)>> {
+        raw.iter()
+            .map(|(name, value)| {
+                validate_variable_name(name)?;
+                Ok((name.clone(), Self::parse_in(value, declared)?))
+            })
+            .collect()
+    }
+
+    fn parse_let(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+        let spec = Self::named_spec("$let", raw, &["vars", "in"])?;
+        let Bson::Document(raw_vars) = Self::required("$let", spec, "vars")? else {
+            return Err(Error::InvalidQuery(
+                "$let `vars` is a document of name: expression".into(),
+            ));
+        };
+        let body = Self::required("$let", spec, "in")?;
+        // The values are parsed before the names are declared, so a value
+        // cannot see its sibling — the same rule evaluation follows.
+        let vars = Self::parse_bindings_in(raw_vars, declared)?;
+        let body = Self::parse_scoped(body, vars.iter().map(|(n, _)| n.as_str()), declared)?;
+        Ok(Expr::Let { vars, body: Box::new(body) })
+    }
+
+    fn parse_filter(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+        let spec = Self::named_spec("$filter", raw, &["input", "as", "cond", "limit"])?;
+        let input = Self::parse_in(Self::required("$filter", spec, "input")?, declared)?;
+        let limit = match spec.get("limit") {
+            Some(l) => Some(Box::new(Self::parse_in(l, declared)?)),
+            None => None,
+        };
+        let as_name = Self::as_name("$filter", spec)?;
+        let cond = Self::required("$filter", spec, "cond")?;
+        let cond = Self::parse_scoped(cond, [as_name.as_str()], declared)?;
+        Ok(Expr::Filter { input: Box::new(input), as_name, cond: Box::new(cond), limit })
+    }
+
+    fn parse_map(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+        let spec = Self::named_spec("$map", raw, &["input", "as", "in"])?;
+        let input = Self::parse_in(Self::required("$map", spec, "input")?, declared)?;
+        let as_name = Self::as_name("$map", spec)?;
+        let body = Self::required("$map", spec, "in")?;
+        let body = Self::parse_scoped(body, [as_name.as_str()], declared)?;
+        Ok(Expr::Map { input: Box::new(input), as_name, body: Box::new(body) })
+    }
+
+    fn parse_reduce(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
+        let spec = Self::named_spec("$reduce", raw, &["input", "initialValue", "in"])?;
+        let input = Self::parse_in(Self::required("$reduce", spec, "input")?, declared)?;
+        let initial = Self::parse_in(Self::required("$reduce", spec, "initialValue")?, declared)?;
+        let body = Self::required("$reduce", spec, "in")?;
+        let body = Self::parse_scoped(body, ["value", "this"], declared)?;
+        Ok(Expr::Reduce {
+            input: Box::new(input),
+            initial: Box::new(initial),
+            body: Box::new(body),
+        })
     }
 
     /// Resolve against a document.
     ///
-    /// A missing field is `Null`, matching how the filter layer treats absence.
+    /// Nothing is bound beyond `$$ROOT` and `$$CURRENT`, which is what every
+    /// caller outside a `$lookup` sub-pipeline wants. A missing field is
+    /// `Null`, matching how the filter layer treats absence.
     pub fn eval(&self, doc: &Document) -> Result<Bson> {
+        self.eval_in(&Scope::new(doc))
+    }
+
+    /// Resolve in a scope that may already bind variables.
+    pub fn eval_in(&self, scope: &Scope<'_>) -> Result<Bson> {
         match self {
-            Expr::Field(p) => {
-                Ok(path::resolve(doc, p).into_iter().next().cloned().unwrap_or(Bson::Null))
-            }
+            Expr::Field(p) => Ok(first_at(scope.root, p)),
+            Expr::Var { name, path } => eval_variable(name, path.as_deref(), scope),
             Expr::Literal(v) => Ok(v.clone()),
             Expr::Object(fields) => {
                 let mut out = Document::new();
                 for (key, expr) in fields {
-                    out.insert(key.clone(), expr.eval(doc)?);
+                    out.insert(key.clone(), expr.eval_in(scope)?);
                 }
                 Ok(Bson::Document(out))
             }
             Expr::Switch { branches, default } => {
                 for (case, then) in branches {
-                    if truthy(&case.eval(doc)?) {
-                        return then.eval(doc);
+                    if truthy(&case.eval_in(scope)?) {
+                        return then.eval_in(scope);
                     }
                 }
                 match default {
-                    Some(d) => d.eval(doc),
+                    Some(d) => d.eval_in(scope),
                     None => Err(Error::InvalidQuery(
                         "no $switch branch matched and there is no `default`".into(),
                     )),
                 }
             }
-            Expr::DateToString { date, format } => match date.eval(doc)? {
+            Expr::DateToString { date, format } => match date.eval_in(scope)? {
                 Bson::Null => Ok(Bson::Null),
                 Bson::DateTime(dt) => Ok(Bson::String(format_date(dt.timestamp_millis(), format)?)),
                 other => Err(Error::InvalidQuery(format!(
@@ -443,13 +782,55 @@ impl Expr {
                     type_name(&other)
                 ))),
             },
-            Expr::Op(op, args) if op.is_lazy() => eval_lazy(*op, args, doc),
+            Expr::Let { vars, body } => {
+                // Values are evaluated in the enclosing scope, then bound
+                // together: `{a: 1, b: "$$a"}` is an error at parse, not 1.
+                let values =
+                    vars.iter().map(|(_, e)| e.eval_in(scope)).collect::<Result<Vec<_>>>()?;
+                let frame: Vec<Binding<'_>> =
+                    vars.iter().zip(&values).map(|((name, _), v)| (name.as_str(), v)).collect();
+                body.eval_in(&scope.nested(&frame))
+            }
+            Expr::Filter { input, as_name, cond, limit } => {
+                eval_filter(input, as_name, cond, limit.as_deref(), scope)
+            }
+            Expr::Map { input, as_name, body } => eval_map(input, as_name, body, scope),
+            Expr::Reduce { input, initial, body } => eval_reduce(input, initial, body, scope),
+            Expr::Op(op, args) if op.is_lazy() => eval_lazy(*op, args, scope),
             Expr::Op(op, args) => {
-                let values = args.iter().map(|a| a.eval(doc)).collect::<Result<Vec<_>>>()?;
+                let values = args.iter().map(|a| a.eval_in(scope)).collect::<Result<Vec<_>>>()?;
                 eval_op(*op, &values)
             }
         }
     }
+}
+
+/// The single value at a path, or null when there is none.
+fn first_at(doc: &Document, p: &str) -> Bson {
+    path::resolve(doc, p).into_iter().next().cloned().unwrap_or(Bson::Null)
+}
+
+fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bson> {
+    if SYSTEM_VARIABLES.contains(&name) {
+        return Ok(match path {
+            None => Bson::Document(scope.root.clone()),
+            Some(p) => first_at(scope.root, p),
+        });
+    }
+    let Some(value) = scope.get(name) else {
+        // Parsing declares every name before reading its body, so this is a
+        // caller evaluating with fewer bindings than it parsed with.
+        return Err(Error::InvalidQuery(format!("variable $${name} is not bound")));
+    };
+    Ok(match path {
+        None => value.clone(),
+        // A path reads into a document. On anything else it is a missing
+        // field — exactly what `$a.b` is when `a` holds a number.
+        Some(p) => match value {
+            Bson::Document(doc) => first_at(doc, p),
+            _ => Bson::Null,
+        },
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -457,31 +838,118 @@ impl Expr {
 // ---------------------------------------------------------------------------
 
 /// The operators that must not have their arguments pre-evaluated.
-fn eval_lazy(op: Op, args: &[Expr], doc: &Document) -> Result<Bson> {
+fn eval_lazy(op: Op, args: &[Expr], scope: &Scope<'_>) -> Result<Bson> {
     match op {
         Op::Literal => match args {
-            [inner] => inner.eval(doc),
+            [inner] => inner.eval_in(scope),
             _ => unreachable!("arity checked at parse"),
         },
         Op::Cond => match args {
             [cond, then, otherwise] => {
-                if truthy(&cond.eval(doc)?) {
-                    then.eval(doc)
+                if truthy(&cond.eval_in(scope)?) {
+                    then.eval_in(scope)
                 } else {
-                    otherwise.eval(doc)
+                    otherwise.eval_in(scope)
                 }
             }
             _ => unreachable!("arity checked at parse"),
         },
         Op::IfNull => match args {
             [value, fallback] => {
-                let v = value.eval(doc)?;
-                if matches!(v, Bson::Null | Bson::Undefined) { fallback.eval(doc) } else { Ok(v) }
+                let v = value.eval_in(scope)?;
+                if matches!(v, Bson::Null | Bson::Undefined) {
+                    fallback.eval_in(scope)
+                } else {
+                    Ok(v)
+                }
             }
             _ => unreachable!("arity checked at parse"),
         },
         _ => unreachable!("only lazy operators reach here"),
     }
+}
+
+/// The array an iteration operator walks, or `None` when the input is null
+/// and the whole result should be. A non-array is refused: `$map` over a
+/// string has no meaning, and returning null would hide the type error.
+fn iteration_input(op: &str, value: Bson) -> Result<Option<Vec<Bson>>> {
+    match value {
+        Bson::Null | Bson::Undefined => Ok(None),
+        Bson::Array(items) => Ok(Some(items)),
+        other => Err(Error::InvalidQuery(format!(
+            "{op} needs an array as its input, found {}",
+            type_name(&other)
+        ))),
+    }
+}
+
+fn eval_filter(
+    input: &Expr,
+    as_name: &str,
+    cond: &Expr,
+    limit: Option<&Expr>,
+    scope: &Scope<'_>,
+) -> Result<Bson> {
+    let Some(items) = iteration_input("$filter", input.eval_in(scope)?)? else {
+        return Ok(Bson::Null);
+    };
+    // A null limit means no limit, as in MongoDB. Zero or a negative number is
+    // refused: neither can be what a caller meant, and an empty result would
+    // look exactly like a condition nothing satisfied.
+    let limit = match limit {
+        None => None,
+        Some(l) => match l.eval_in(scope)? {
+            Bson::Null | Bson::Undefined => None,
+            v => {
+                let n = as_integer(&v, "$filter limit")?;
+                if n < 1 {
+                    return Err(Error::InvalidQuery(format!(
+                        "$filter limit must be a positive number, found {n}"
+                    )));
+                }
+                Some(n as usize)
+            }
+        },
+    };
+
+    let mut out = Vec::new();
+    for item in &items {
+        if limit.is_some_and(|n| out.len() >= n) {
+            break;
+        }
+        let frame = [(as_name, item)];
+        if truthy(&cond.eval_in(&scope.nested(&frame))?) {
+            out.push(item.clone());
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+fn eval_map(input: &Expr, as_name: &str, body: &Expr, scope: &Scope<'_>) -> Result<Bson> {
+    let Some(items) = iteration_input("$map", input.eval_in(scope)?)? else {
+        return Ok(Bson::Null);
+    };
+    let mut out = Vec::with_capacity(items.len());
+    for item in &items {
+        let frame = [(as_name, item)];
+        out.push(body.eval_in(&scope.nested(&frame))?);
+    }
+    Ok(Bson::Array(out))
+}
+
+fn eval_reduce(input: &Expr, initial: &Expr, body: &Expr, scope: &Scope<'_>) -> Result<Bson> {
+    let Some(items) = iteration_input("$reduce", input.eval_in(scope)?)? else {
+        return Ok(Bson::Null);
+    };
+    // The initial value is evaluated in the enclosing scope, once: it may not
+    // refer to `$$this`, and there is no element for it to refer to.
+    let mut acc = initial.eval_in(scope)?;
+    for item in &items {
+        let frame = [("value", &acc), ("this", item)];
+        let next = body.eval_in(&scope.nested(&frame))?;
+        acc = next;
+    }
+    Ok(acc)
 }
 
 fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
@@ -518,6 +986,17 @@ fn eval_op(op: Op, args: &[Bson]) -> Result<Bson> {
         Op::Year | Op::Month | Op::DayOfMonth | Op::Hour | Op::Minute | Op::Second => {
             date_part(op, &args[0])
         }
+
+        Op::Size => array_size(&args[0]),
+        Op::ArrayElemAt => array_elem_at(&args[0], &args[1]),
+        Op::First | Op::Last => array_end(op, &args[0]),
+        Op::Slice => array_slice(args),
+        Op::ConcatArrays => concat_arrays(args),
+        Op::In => array_in(&args[0], &args[1]),
+        Op::IndexOfArray => index_of_array(args),
+        Op::IsArray => Ok(Bson::Boolean(matches!(args[0], Bson::Array(_)))),
+        Op::ReverseArray => reverse_array(&args[0]),
+        Op::Range => range(args),
 
         Op::Cond | Op::IfNull | Op::Literal => unreachable!("handled lazily"),
     }
@@ -846,6 +1325,228 @@ fn split(value: &Bson, delimiter: &Bson) -> Result<Bson> {
 }
 
 // ---------------------------------------------------------------------------
+// Arrays
+// ---------------------------------------------------------------------------
+
+/// The array an operator works on, or `None` when it is null and the result
+/// should be too. A non-array is refused — the same rule as the numeric
+/// operators: absence propagates, a wrong type does not pass silently.
+fn as_array(op: Op, value: &Bson) -> Result<Option<&[Bson]>> {
+    match value {
+        Bson::Null | Bson::Undefined => Ok(None),
+        Bson::Array(items) => Ok(Some(items)),
+        other => Err(Error::InvalidQuery(format!(
+            "{} needs an array, found {}",
+            op.name(),
+            type_name(other)
+        ))),
+    }
+}
+
+/// A whole number from any numeric type.
+///
+/// A double with a fraction is refused rather than truncated:
+/// `{$arrayElemAt: ["$xs", 1.5]}` is a mistake, not a request for element 1.
+fn as_integer(value: &Bson, what: &str) -> Result<i64> {
+    match value {
+        Bson::Int32(n) => Ok(i64::from(*n)),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(d) if d.is_finite() && d.fract() == 0.0 => Ok(*d as i64),
+        other => Err(Error::InvalidQuery(format!(
+            "{what} must be a whole number, found {}",
+            type_name(other)
+        ))),
+    }
+}
+
+/// [`as_integer`], with null passed through so the caller can return null.
+fn integer_or_null(value: &Bson, what: &str) -> Result<Option<i64>> {
+    match value {
+        Bson::Null | Bson::Undefined => Ok(None),
+        other => as_integer(other, what).map(Some),
+    }
+}
+
+fn as_count(value: &Bson, what: &str) -> Result<usize> {
+    let n = as_integer(value, what)?;
+    usize::try_from(n)
+        .map_err(|_| Error::InvalidQuery(format!("{what} cannot be negative, found {n}")))
+}
+
+/// Resolve a possibly negative index against a length: `-1` is the last
+/// element. `None` when it falls outside on either side.
+fn position(len: usize, index: i64) -> Option<usize> {
+    let len = len as i64;
+    let p = if index < 0 { index + len } else { index };
+    (0..len).contains(&p).then_some(p as usize)
+}
+
+fn array_size(value: &Bson) -> Result<Bson> {
+    Ok(match as_array(Op::Size, value)? {
+        None => Bson::Null,
+        Some(items) => Bson::Int64(items.len() as i64),
+    })
+}
+
+/// Out of range on either side is null, which is as near to MongoDB's
+/// "missing" as a value can come — see `docs/deviations.md`.
+fn array_elem_at(array: &Bson, index: &Bson) -> Result<Bson> {
+    let Some(items) = as_array(Op::ArrayElemAt, array)? else {
+        return Ok(Bson::Null);
+    };
+    let Some(i) = integer_or_null(index, "$arrayElemAt index")? else {
+        return Ok(Bson::Null);
+    };
+    Ok(position(items.len(), i).and_then(|p| items.get(p)).cloned().unwrap_or(Bson::Null))
+}
+
+fn array_end(op: Op, value: &Bson) -> Result<Bson> {
+    let Some(items) = as_array(op, value)? else {
+        return Ok(Bson::Null);
+    };
+    let picked = match op {
+        Op::First => items.first(),
+        Op::Last => items.last(),
+        _ => unreachable!("only $first and $last reach here"),
+    };
+    Ok(picked.cloned().unwrap_or(Bson::Null))
+}
+
+/// `[array, n]` takes the first `n`, or the last `|n|` when `n` is negative.
+/// `[array, position, n]` takes `n` from `position`, counted from the end when
+/// negative. Both are MongoDB's readings, and a window past either end is
+/// empty rather than an error, as `$substr` past the end is.
+fn array_slice(args: &[Bson]) -> Result<Bson> {
+    let Some(items) = as_array(Op::Slice, &args[0])? else {
+        return Ok(Bson::Null);
+    };
+    let len = items.len();
+    let (start, count) = match args {
+        [_, n] => {
+            let Some(n) = integer_or_null(n, "$slice count")? else {
+                return Ok(Bson::Null);
+            };
+            if n < 0 {
+                (len.saturating_sub(n.unsigned_abs() as usize), len)
+            } else {
+                (0, n.unsigned_abs() as usize)
+            }
+        }
+        [_, pos, n] => {
+            let (Some(pos), Some(n)) =
+                (integer_or_null(pos, "$slice position")?, integer_or_null(n, "$slice count")?)
+            else {
+                return Ok(Bson::Null);
+            };
+            if n < 1 {
+                return Err(Error::InvalidQuery(format!(
+                    "$slice count must be positive when a position is given, found {n}; the \
+                     two-argument form takes from the end"
+                )));
+            }
+            let start = if pos < 0 {
+                len.saturating_sub(pos.unsigned_abs() as usize)
+            } else {
+                (pos.unsigned_abs() as usize).min(len)
+            };
+            (start, n.unsigned_abs() as usize)
+        }
+        _ => unreachable!("arity checked at parse"),
+    };
+    Ok(Bson::Array(items.iter().skip(start).take(count).cloned().collect()))
+}
+
+fn concat_arrays(args: &[Bson]) -> Result<Bson> {
+    let mut out = Vec::new();
+    for arg in args {
+        match as_array(Op::ConcatArrays, arg)? {
+            // One null makes the whole result null, as `$concat` does: a
+            // missing array must not silently vanish from the middle.
+            None => return Ok(Bson::Null),
+            Some(items) => out.extend_from_slice(items),
+        }
+    }
+    Ok(Bson::Array(out))
+}
+
+/// Membership by the canonical order, so `5` is in `[5.0]` — the same equality
+/// `$eq` and the indexes use.
+fn array_in(value: &Bson, array: &Bson) -> Result<Bson> {
+    let Some(items) = as_array(Op::In, array)? else {
+        return Ok(Bson::Null);
+    };
+    Ok(Bson::Boolean(items.iter().any(|item| canonical_cmp(item, value) == Ordering::Equal)))
+}
+
+/// `[array, value, start?, end?]` — the first index of `value` in
+/// `array[start..end]`, or `-1`.
+fn index_of_array(args: &[Bson]) -> Result<Bson> {
+    let Some(items) = as_array(Op::IndexOfArray, &args[0])? else {
+        return Ok(Bson::Null);
+    };
+    let needle = &args[1];
+    let start = match args.get(2) {
+        None => 0,
+        Some(Bson::Null | Bson::Undefined) => return Ok(Bson::Null),
+        Some(v) => as_count(v, "$indexOfArray start")?,
+    };
+    let end = match args.get(3) {
+        None => items.len(),
+        Some(Bson::Null | Bson::Undefined) => return Ok(Bson::Null),
+        Some(v) => as_count(v, "$indexOfArray end")?.min(items.len()),
+    };
+    let found = items
+        .iter()
+        .enumerate()
+        .take(end)
+        .skip(start)
+        .find(|(_, item)| canonical_cmp(item, needle) == Ordering::Equal)
+        .map(|(i, _)| i as i64);
+    Ok(Bson::Int64(found.unwrap_or(-1)))
+}
+
+fn reverse_array(value: &Bson) -> Result<Bson> {
+    Ok(match as_array(Op::ReverseArray, value)? {
+        None => Bson::Null,
+        Some(items) => Bson::Array(items.iter().rev().cloned().collect()),
+    })
+}
+
+/// The most elements `$range` will build.
+///
+/// The same figure as the pipeline's document ceiling, for the same reason:
+/// `{$range: [0, 1000000000]}` is a memory exhaustion written as an
+/// expression, and refusing it is better than becoming slow.
+pub const MAX_RANGE_LENGTH: usize = 100_000;
+
+/// `[start, end, step?]` — integers from `start` up to but excluding `end`.
+fn range(args: &[Bson]) -> Result<Bson> {
+    let mut nums = Vec::with_capacity(3);
+    for (arg, what) in args.iter().zip(["$range start", "$range end", "$range step"]) {
+        match integer_or_null(arg, what)? {
+            None => return Ok(Bson::Null),
+            Some(n) => nums.push(n),
+        }
+    }
+    let (start, end) = (nums[0], nums[1]);
+    let step = nums.get(2).copied().unwrap_or(1);
+    if step == 0 {
+        return Err(Error::InvalidQuery("$range step cannot be zero".into()));
+    }
+
+    // The length is decided before anything is allocated: the point of the
+    // cap is to stop the allocation, not to report it afterwards.
+    let span = if step > 0 { end.saturating_sub(start) } else { start.saturating_sub(end) };
+    let count = if span <= 0 { 0 } else { span.unsigned_abs().div_ceil(step.unsigned_abs()) };
+    if count > MAX_RANGE_LENGTH as u64 {
+        return Err(Error::InvalidQuery(format!(
+            "$range would produce {count} elements, over the limit of {MAX_RANGE_LENGTH}"
+        )));
+    }
+    Ok(Bson::Array((0..count as i64).map(|i| Bson::Int64(start + i * step)).collect()))
+}
+
+// ---------------------------------------------------------------------------
 // Dates
 // ---------------------------------------------------------------------------
 
@@ -1050,10 +1751,25 @@ mod tests {
     }
 
     #[test]
-    fn variable_expressions_are_refused_rather_than_read_as_a_field() {
-        // `$$ROOT` needs an evaluation scope, which is deliberately out of
-        // scope. Parsing it as a field named `$ROOT` would silently yield null.
-        assert!(Expr::parse(&Bson::String("$$ROOT".into())).is_err());
+    fn an_unknown_variable_is_refused_at_parse_rather_than_read_as_a_field() {
+        // Parsing `$$this` outside anything that binds it as a field named
+        // `$this` would silently yield null in every row.
+        let err = Expr::parse(&Bson::String("$$this".into())).unwrap_err();
+        assert!(matches!(err, Error::InvalidQuery(_)), "{err:?}");
+        assert!(err.to_string().contains("$$this"), "{err}");
+        // And so would a typo inside a construct that binds something else.
+        let expr = doc! {"$map": {"input": "$xs", "as": "x", "in": "$$y"}};
+        assert!(Expr::parse(&expr.into()).is_err());
+    }
+
+    #[test]
+    fn an_unsupported_system_variable_says_so() {
+        // `$$NOW` is a feature this does not have, not a typo, and the error
+        // class says which.
+        let err = Expr::parse(&Bson::String("$$NOW".into())).unwrap_err();
+        assert!(matches!(err, Error::UnsupportedOperator(_)), "{err:?}");
+        assert!(Expr::parse(&Bson::String("$$".into())).is_err());
+        assert!(Expr::parse(&Bson::String("$$ROOT.".into())).is_err());
     }
 
     // -- object expressions, the behaviour change -------------------------
@@ -1453,6 +2169,442 @@ mod tests {
             on(doc! {"$toUpper": "$user.name"}.into(), doc! {"user": {"name": "ada"}}),
             Bson::String("ADA".into())
         );
+    }
+
+    // -- variables --------------------------------------------------------
+
+    #[test]
+    fn root_is_the_whole_document_and_current_is_its_alias() {
+        let d = doc! {"a": 1, "b": {"c": 2}};
+        assert_eq!(on(Bson::String("$$ROOT".into()), d.clone()), Bson::Document(d.clone()));
+        assert_eq!(on(Bson::String("$$CURRENT".into()), d.clone()), Bson::Document(d.clone()));
+        // Inside an object expression, so a `$project` can embed the source.
+        assert_eq!(
+            on(doc! {"src": "$$ROOT", "n": "$a"}.into(), d.clone()),
+            Bson::Document(doc! {"src": d, "n": 1})
+        );
+    }
+
+    #[test]
+    fn a_variable_path_reads_into_its_value() {
+        let d = doc! {"a": 1, "b": {"c": 2}};
+        assert_eq!(on(Bson::String("$$ROOT.b.c".into()), d.clone()), Bson::Int32(2));
+        assert_eq!(on(Bson::String("$$ROOT.nope".into()), d), Bson::Null);
+        // On a bound variable holding a document.
+        let expr = doc! {"$let": {"vars": {"p": {"x": 5}}, "in": "$$p.x"}};
+        assert_eq!(ok(expr.into()), Bson::Int32(5));
+        // A path into a scalar is a missing field, exactly as `$a.b` is when
+        // `a` is a number.
+        let expr = doc! {"$let": {"vars": {"p": 5}, "in": "$$p.x"}};
+        assert_eq!(ok(expr.into()), Bson::Null);
+    }
+
+    #[test]
+    fn let_binds_names_for_its_body() {
+        let expr = doc! {"$let": {
+            "vars": {"total": {"$multiply": ["$qty", "$price"]}, "tax": 0.2},
+            "in": {"$multiply": ["$$total", {"$add": [1, "$$tax"]}]},
+        }};
+        assert_eq!(on(expr.into(), doc! {"qty": 10, "price": 5}), Bson::Double(60.0));
+    }
+
+    #[test]
+    fn let_values_see_the_enclosing_scope_not_each_other() {
+        // `b` cannot read `a`: the values are evaluated together in the outer
+        // scope, and the parser says so rather than the evaluator yielding null.
+        let expr = doc! {"$let": {"vars": {"a": 1, "b": "$$a"}, "in": "$$b"}};
+        assert!(Expr::parse(&expr.into()).is_err());
+        // But an outer `$let` is visible from an inner one's values.
+        let expr = doc! {"$let": {"vars": {"a": 1}, "in": {
+            "$let": {"vars": {"b": {"$add": ["$$a", 1]}}, "in": "$$b"}
+        }}};
+        assert_eq!(ok(expr.into()), Bson::Int64(2));
+    }
+
+    #[test]
+    fn an_inner_binding_shadows_an_outer_one() {
+        let expr = doc! {"$let": {"vars": {"x": "outer"}, "in": {
+            "$let": {"vars": {"x": "inner"}, "in": "$$x"}
+        }}};
+        assert_eq!(ok(expr.into()), Bson::String("inner".into()));
+        // And the outer one is back once the inner construct closes.
+        let expr = doc! {"$let": {"vars": {"x": "outer"}, "in": {
+            "$concat": [{"$let": {"vars": {"x": "inner"}, "in": "$$x"}}, "-", "$$x"]
+        }}};
+        assert_eq!(ok(expr.into()), Bson::String("inner-outer".into()));
+    }
+
+    #[test]
+    fn a_variable_name_follows_mongos_rule() {
+        assert!(Expr::parse(&doc! {"$let": {"vars": {"Total": 1}, "in": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"vars": {"a-b": 1}, "in": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"vars": {"": 1}, "in": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"vars": {"a_1": 1}, "in": "$$a_1"}}.into()).is_ok());
+        assert!(Expr::parse(&doc! {"$map": {"input": [], "as": "X", "in": 1}}.into()).is_err());
+    }
+
+    #[test]
+    fn let_needs_its_two_parts_and_nothing_else() {
+        assert!(Expr::parse(&doc! {"$let": {"vars": {"a": 1}}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"in": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"vars": [], "in": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": {"vars": {}, "in": 1, "extra": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$let": "$x"}.into()).is_err());
+    }
+
+    #[test]
+    fn a_variable_bound_by_the_caller_is_visible_to_the_expression() {
+        // The `$lookup` `let` path: parsed with the name declared, evaluated
+        // with it bound.
+        let expr = Expr::parse_with_vars(
+            &doc! {"$add": ["$$order_qty", "$qty"]}.into(),
+            &["order_qty".to_string()],
+        )
+        .unwrap();
+        let bound = Bson::Int32(40);
+        let frame = [("order_qty", &bound)];
+        let d = doc! {"qty": 2};
+        assert_eq!(expr.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), Bson::Int64(42));
+        // Evaluating with fewer bindings than it was parsed with is an error,
+        // not a null.
+        assert!(expr.eval(&d).is_err());
+    }
+
+    // -- arrays: the positional operators ---------------------------------
+
+    fn arr(items: Vec<i32>) -> Bson {
+        Bson::Array(items.into_iter().map(Bson::Int32).collect())
+    }
+
+    #[test]
+    fn size_counts_elements_and_refuses_a_non_array() {
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": [1, 2, 3]}), Bson::Int64(3));
+        assert_eq!(on(doc! {"$size": "$xs"}.into(), doc! {"xs": []}), Bson::Int64(0));
+        assert_eq!(on(doc! {"$size": "$gone"}.into(), doc! {}), Bson::Null);
+        assert!(ev(doc! {"$size": "text"}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$size": 5}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn array_elem_at_counts_from_either_end_and_is_null_past_them() {
+        let d = doc! {"xs": ["a", "b", "c"]};
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", 0]}.into(), d.clone()), "a".into());
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", -1]}.into(), d.clone()), "c".into());
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", 2.0]}.into(), d.clone()), "c".into());
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", 3]}.into(), d.clone()), Bson::Null);
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", -4]}.into(), d.clone()), Bson::Null);
+        assert_eq!(on(doc! {"$arrayElemAt": ["$gone", 0]}.into(), d.clone()), Bson::Null);
+        assert_eq!(on(doc! {"$arrayElemAt": ["$xs", "$gone"]}.into(), d.clone()), Bson::Null);
+        // A fractional index is a mistake, not a request for element 1.
+        assert!(ev(doc! {"$arrayElemAt": ["$xs", 1.5]}.into(), &d).is_err());
+        assert!(ev(doc! {"$arrayElemAt": ["$xs", "1"]}.into(), &d).is_err());
+        assert!(ev(doc! {"$arrayElemAt": ["text", 0]}.into(), &d).is_err());
+    }
+
+    #[test]
+    fn first_and_last_take_the_ends_and_an_empty_array_is_null() {
+        let d = doc! {"xs": [1, 2, 3], "empty": []};
+        assert_eq!(on(doc! {"$first": "$xs"}.into(), d.clone()), Bson::Int32(1));
+        assert_eq!(on(doc! {"$last": "$xs"}.into(), d.clone()), Bson::Int32(3));
+        assert_eq!(on(doc! {"$first": "$empty"}.into(), d.clone()), Bson::Null);
+        assert_eq!(on(doc! {"$last": "$gone"}.into(), d.clone()), Bson::Null);
+        assert!(ev(doc! {"$first": "text"}.into(), &d).is_err());
+    }
+
+    #[test]
+    fn slice_takes_from_the_front_the_back_or_a_position() {
+        let d = doc! {"xs": [1, 2, 3, 4, 5]};
+        assert_eq!(on(doc! {"$slice": ["$xs", 2]}.into(), d.clone()), arr(vec![1, 2]));
+        assert_eq!(on(doc! {"$slice": ["$xs", -2]}.into(), d.clone()), arr(vec![4, 5]));
+        assert_eq!(on(doc! {"$slice": ["$xs", 0]}.into(), d.clone()), arr(vec![]));
+        assert_eq!(on(doc! {"$slice": ["$xs", 1, 2]}.into(), d.clone()), arr(vec![2, 3]));
+        assert_eq!(on(doc! {"$slice": ["$xs", -2, 1]}.into(), d.clone()), arr(vec![4]));
+        // A window past either end is empty, not an error.
+        assert_eq!(on(doc! {"$slice": ["$xs", 10]}.into(), d.clone()), arr(vec![1, 2, 3, 4, 5]));
+        assert_eq!(on(doc! {"$slice": ["$xs", 10, 2]}.into(), d.clone()), arr(vec![]));
+        assert_eq!(on(doc! {"$slice": ["$xs", -10, 2]}.into(), d.clone()), arr(vec![1, 2]));
+        assert_eq!(on(doc! {"$slice": ["$gone", 2]}.into(), d.clone()), Bson::Null);
+        // With a position the count must be positive: "from the end" is the
+        // two-argument form's job.
+        assert!(ev(doc! {"$slice": ["$xs", 1, -2]}.into(), &d).is_err());
+        assert!(ev(doc! {"$slice": ["$xs", 1, 0]}.into(), &d).is_err());
+        assert!(ev(doc! {"$slice": ["text", 1]}.into(), &d).is_err());
+        assert!(Expr::parse(&doc! {"$slice": ["$xs"]}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$slice": ["$xs", 1, 2, 3]}.into()).is_err());
+    }
+
+    #[test]
+    fn concat_arrays_joins_and_null_poisons() {
+        let d = doc! {"a": [1], "b": [2, 3]};
+        assert_eq!(
+            on(doc! {"$concatArrays": ["$a", "$b", []]}.into(), d.clone()),
+            arr(vec![1, 2, 3])
+        );
+        assert_eq!(on(doc! {"$concatArrays": ["$a", "$gone"]}.into(), d.clone()), Bson::Null);
+        assert!(ev(doc! {"$concatArrays": ["$a", 5]}.into(), &d).is_err());
+    }
+
+    #[test]
+    fn in_tests_membership_by_the_canonical_order() {
+        let d = doc! {"tags": ["a", "b"], "ns": [5]};
+        assert_eq!(on(doc! {"$in": ["b", "$tags"]}.into(), d.clone()), Bson::Boolean(true));
+        assert_eq!(on(doc! {"$in": ["z", "$tags"]}.into(), d.clone()), Bson::Boolean(false));
+        // 5.0 is in [5], as it is to `$eq` and to an index.
+        assert_eq!(on(doc! {"$in": [5.0, "$ns"]}.into(), d.clone()), Bson::Boolean(true));
+        assert_eq!(on(doc! {"$in": ["a", "$gone"]}.into(), d.clone()), Bson::Null);
+        assert!(ev(doc! {"$in": ["a", "abc"]}.into(), &d).is_err());
+        assert!(Expr::parse(&doc! {"$in": ["a"]}.into()).is_err());
+    }
+
+    #[test]
+    fn index_of_array_finds_the_first_match_within_a_window() {
+        let d = doc! {"xs": ["a", "b", "a", "c"]};
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a"]}.into(), d.clone()), Bson::Int64(0));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 1]}.into(), d.clone()), Bson::Int64(2));
+        assert_eq!(
+            on(doc! {"$indexOfArray": ["$xs", "c", 0, 3]}.into(), d.clone()),
+            Bson::Int64(-1)
+        );
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "z"]}.into(), d.clone()), Bson::Int64(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$xs", "a", 9]}.into(), d.clone()), Bson::Int64(-1));
+        assert_eq!(on(doc! {"$indexOfArray": ["$gone", "a"]}.into(), d.clone()), Bson::Null);
+        assert!(ev(doc! {"$indexOfArray": ["$xs", "a", -1]}.into(), &d).is_err());
+        assert!(ev(doc! {"$indexOfArray": ["text", "a"]}.into(), &d).is_err());
+    }
+
+    #[test]
+    fn is_array_never_errors() {
+        assert_eq!(on(doc! {"$isArray": "$xs"}.into(), doc! {"xs": [1]}), Bson::Boolean(true));
+        assert_eq!(on(doc! {"$isArray": "$xs"}.into(), doc! {"xs": "no"}), Bson::Boolean(false));
+        assert_eq!(on(doc! {"$isArray": "$gone"}.into(), doc! {}), Bson::Boolean(false));
+        assert_eq!(on(doc! {"$isArray": ["$xs"]}.into(), doc! {"xs": []}), Bson::Boolean(true));
+    }
+
+    #[test]
+    fn reverse_array_reverses_and_passes_null_through() {
+        assert_eq!(
+            on(doc! {"$reverseArray": "$xs"}.into(), doc! {"xs": [1, 2, 3]}),
+            arr(vec![3, 2, 1])
+        );
+        assert_eq!(on(doc! {"$reverseArray": "$gone"}.into(), doc! {}), Bson::Null);
+        assert!(ev(doc! {"$reverseArray": "abc"}.into(), &Document::new()).is_err());
+    }
+
+    fn ints(items: Vec<i64>) -> Bson {
+        Bson::Array(items.into_iter().map(Bson::Int64).collect())
+    }
+
+    #[test]
+    fn range_counts_up_down_and_not_past_its_cap() {
+        assert_eq!(ok(doc! {"$range": [0, 4]}.into()), ints(vec![0, 1, 2, 3]));
+        assert_eq!(ok(doc! {"$range": [0, 10, 3]}.into()), ints(vec![0, 3, 6, 9]));
+        assert_eq!(ok(doc! {"$range": [5, 0, -2]}.into()), ints(vec![5, 3, 1]));
+        assert_eq!(ok(doc! {"$range": [4, 0]}.into()), ints(vec![]));
+        assert_eq!(ok(doc! {"$range": [0, 4, -1]}.into()), ints(vec![]));
+        assert_eq!(on(doc! {"$range": [0, "$gone"]}.into(), doc! {}), Bson::Null);
+        assert!(ev(doc! {"$range": [0, 4, 0]}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$range": [0, 1.5]}.into(), &Document::new()).is_err());
+        // Refused before anything is allocated.
+        let err = ev(doc! {"$range": [0, 1_000_000_000]}.into(), &Document::new()).unwrap_err();
+        assert!(err.to_string().contains("limit"), "{err}");
+        assert!(ev(doc! {"$range": [i64::MIN, i64::MAX]}.into(), &Document::new()).is_err());
+    }
+
+    // -- arrays: the binding operators ------------------------------------
+
+    #[test]
+    fn filter_keeps_what_the_condition_accepts() {
+        let d = doc! {"xs": [1, 5, 10, 15]};
+        assert_eq!(
+            on(
+                doc! {"$filter": {"input": "$xs", "cond": {"$gte": ["$$this", 5]}}}.into(),
+                d.clone()
+            ),
+            arr(vec![5, 10, 15])
+        );
+        // A named element variable.
+        assert_eq!(
+            on(
+                doc! {"$filter": {"input": "$xs", "as": "n", "cond": {"$lt": ["$$n", 10]}}}.into(),
+                d.clone()
+            ),
+            arr(vec![1, 5])
+        );
+        // The condition may read the document as well as the element.
+        assert_eq!(
+            on(
+                doc! {"$filter": {"input": "$xs", "cond": {"$gt": ["$$this", "$min"]}}}.into(),
+                doc! {"xs": [1, 5, 10], "min": 4}
+            ),
+            arr(vec![5, 10])
+        );
+    }
+
+    #[test]
+    fn filter_limit_stops_early_and_null_means_no_limit() {
+        let d = doc! {"xs": [1, 2, 3, 4]};
+        assert_eq!(
+            on(doc! {"$filter": {"input": "$xs", "cond": true, "limit": 2}}.into(), d.clone()),
+            arr(vec![1, 2])
+        );
+        assert_eq!(
+            on(
+                doc! {"$filter": {"input": "$xs", "cond": true, "limit": "$gone"}}.into(),
+                d.clone()
+            ),
+            arr(vec![1, 2, 3, 4])
+        );
+        assert!(
+            ev(doc! {"$filter": {"input": "$xs", "cond": true, "limit": 0}}.into(), &d).is_err()
+        );
+        assert!(
+            ev(doc! {"$filter": {"input": "$xs", "cond": true, "limit": -1}}.into(), &d).is_err()
+        );
+    }
+
+    #[test]
+    fn filter_on_null_is_null_and_on_a_non_array_is_an_error() {
+        assert_eq!(
+            on(doc! {"$filter": {"input": "$gone", "cond": true}}.into(), doc! {}),
+            Bson::Null
+        );
+        assert!(
+            ev(doc! {"$filter": {"input": "text", "cond": true}}.into(), &Document::new()).is_err()
+        );
+    }
+
+    #[test]
+    fn the_binding_operators_check_their_shape_at_parse() {
+        // A typo in a key must fail loudly rather than filter nothing.
+        assert!(
+            Expr::parse(&doc! {"$filter": {"input": "$xs", "condition": true}}.into()).is_err()
+        );
+        assert!(Expr::parse(&doc! {"$filter": {"cond": true}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$filter": "$xs"}.into()).is_err());
+        assert!(
+            Expr::parse(&doc! {"$filter": {"input": "$xs", "as": 5, "cond": true}}.into()).is_err()
+        );
+        assert!(Expr::parse(&doc! {"$map": {"input": "$xs"}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$map": {"input": "$xs", "in": 1, "cond": 1}}.into()).is_err());
+        assert!(Expr::parse(&doc! {"$reduce": {"input": "$xs", "in": 1}}.into()).is_err());
+        assert!(
+            Expr::parse(&doc! {"$reduce": {"input": "$xs", "initialValue": 0}}.into()).is_err()
+        );
+    }
+
+    #[test]
+    fn map_transforms_each_element() {
+        let d = doc! {"xs": [1, 2, 3]};
+        assert_eq!(
+            on(
+                doc! {"$map": {"input": "$xs", "in": {"$multiply": ["$$this", 10]}}}.into(),
+                d.clone()
+            ),
+            ints(vec![10, 20, 30])
+        );
+        assert_eq!(
+            on(doc! {"$map": {"input": "$xs", "as": "x", "in": {"v": "$$x"}}}.into(), d.clone()),
+            Bson::Array(vec![
+                Bson::Document(doc! {"v": 1}),
+                Bson::Document(doc! {"v": 2}),
+                Bson::Document(doc! {"v": 3}),
+            ])
+        );
+        assert_eq!(on(doc! {"$map": {"input": "$gone", "in": 1}}.into(), doc! {}), Bson::Null);
+        assert!(ev(doc! {"$map": {"input": 5, "in": 1}}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn map_reads_a_field_of_each_element_through_the_variable() {
+        let d = doc! {"items": [{"sku": "a", "qty": 2}, {"sku": "b", "qty": 3}]};
+        assert_eq!(
+            on(doc! {"$map": {"input": "$items", "in": "$$this.sku"}}.into(), d),
+            Bson::Array(vec!["a".into(), "b".into()])
+        );
+    }
+
+    #[test]
+    fn nested_iteration_shadows_this_and_named_variables_tell_the_levels_apart() {
+        // Inner `$$this` is the inner element; the outer one is unreachable
+        // by that name — which is what a lexical scope does.
+        let expr = doc! {"$map": {"input": "$rows", "in": {
+            "$map": {"input": "$$this", "in": {"$multiply": ["$$this", 10]}}
+        }}};
+        assert_eq!(
+            on(expr.into(), doc! {"rows": [[1, 2], [3]]}),
+            Bson::Array(vec![ints(vec![10, 20]), ints(vec![30])])
+        );
+
+        // With `as` names, both levels are reachable at once.
+        let expr = doc! {"$map": {"input": "$groups", "as": "g", "in": {
+            "$filter": {
+                "input": "$$g.items",
+                "as": "it",
+                "cond": {"$gte": ["$$it", "$$g.min"]},
+            }
+        }}};
+        let d = doc! {"groups": [
+            {"min": 2, "items": [1, 2, 3]},
+            {"min": 10, "items": [5, 10]},
+        ]};
+        assert_eq!(on(expr.into(), d), Bson::Array(vec![arr(vec![2, 3]), arr(vec![10])]));
+    }
+
+    #[test]
+    fn reduce_folds_with_value_and_this() {
+        let d = doc! {"xs": [1, 2, 3, 4]};
+        assert_eq!(
+            on(
+                doc! {"$reduce": {"input": "$xs", "initialValue": 0, "in": {"$add": ["$$value", "$$this"]}}}
+                    .into(),
+                d.clone()
+            ),
+            Bson::Int64(10)
+        );
+        // Strings, to show the accumulator is any value.
+        assert_eq!(
+            on(
+                doc! {"$reduce": {"input": "$ws", "initialValue": "", "in": {"$concat": ["$$value", "$$this"]}}}
+                    .into(),
+                doc! {"ws": ["a", "b", "c"]}
+            ),
+            Bson::String("abc".into())
+        );
+        // An empty input is the initial value; a null input is null.
+        assert_eq!(
+            on(
+                doc! {"$reduce": {"input": "$e", "initialValue": 7, "in": 0}}.into(),
+                doc! {"e": []}
+            ),
+            Bson::Int32(7)
+        );
+        assert_eq!(
+            on(doc! {"$reduce": {"input": "$gone", "initialValue": 7, "in": 0}}.into(), doc! {}),
+            Bson::Null
+        );
+        assert!(
+            ev(doc! {"$reduce": {"input": "x", "initialValue": 0, "in": 0}}.into(), &d).is_err()
+        );
+    }
+
+    #[test]
+    fn reduce_initial_value_cannot_see_this() {
+        // There is no element yet; the parser refuses rather than binding null.
+        let expr = doc! {"$reduce": {"input": "$xs", "initialValue": "$$this", "in": 0}};
+        assert!(Expr::parse(&expr.into()).is_err());
+    }
+
+    #[test]
+    fn array_operators_compose_with_the_rest() {
+        // Sum of the qty of every item over a threshold — the shape a report
+        // actually needs, and the one that was impossible without a scope.
+        let expr = doc! {"$reduce": {
+            "input": {"$filter": {"input": "$items", "cond": {"$gt": ["$$this.qty", 1]}}},
+            "initialValue": 0,
+            "in": {"$add": ["$$value", "$$this.qty"]},
+        }};
+        let d = doc! {"items": [{"qty": 1}, {"qty": 2}, {"qty": 5}]};
+        assert_eq!(on(expr.into(), d), Bson::Int64(7));
     }
 
     // -- the $sum accumulator's exactness ---------------------------------

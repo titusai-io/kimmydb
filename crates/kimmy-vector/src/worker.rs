@@ -16,13 +16,20 @@
 //! durable; embedding happens behind it. That is the only reason a remote
 //! provider — which can be slow, rate-limited, or briefly down — is tolerable
 //! at all.
+//!
+//! **One provider call carries many documents.** The provider takes a batch,
+//! and the worker fills it from consecutive documents of the same collection
+//! rather than from one document's chunks (ADR-095). The storage write stays
+//! per document: `put_vectors` replaces one document's chunks, staleness is
+//! one document's HLC, and neither knows or cares how many documents shared
+//! the round trip.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kimmy_core::{Hlc, OpKind, VectorConfig, VectorRecord, path};
+use kimmy_core::{ChunkConfig, Hlc, OpKind, VectorConfig, VectorRecord, path};
 use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
 use tracing::{debug, info, warn};
 
@@ -91,9 +98,200 @@ const MAX_DEFERRED: usize = 4096;
 /// The injected ownership test. See [`EmbeddingWorker::set_owner_check`].
 pub type OwnerCheck = Box<dyn Fn(&str) -> bool + Send>;
 
+/// How the worker gathers documents into one provider call (ADR-095).
+///
+/// [`EmbeddingProvider::embed`] has always taken a batch; until this the
+/// worker handed it one document's chunks at a time, so a document short
+/// enough to be one chunk was a batch of one and paid a whole round trip —
+/// HTTP, tokenisation, the provider's own scheduling — by itself. Measured
+/// against a llama.cpp CPU server with ~43-character inputs: 32 calls of one
+/// input took 394 ms; one call of 32 inputs took 18 ms. Under a steady
+/// arrival rate a little above the per-document service rate the backlog
+/// grows without bound (Little's law), which is what a live ingest showed.
+///
+/// These bound the call, not the collection: they are about the provider
+/// round trip this node makes, which is why they are process settings
+/// (`[vector.batch]` in `kimmyd`) and not part of a collection's vector
+/// configuration. A batch only ever holds documents of one collection, so
+/// the per-collection provider, model and prefix are respected without
+/// being repeated here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BatchSettings {
+    /// The most chunks one provider call carries.
+    ///
+    /// 32 is the size the measurement above was taken at; it is below every
+    /// hosted provider's per-request input cap (Cohere accepts 96 texts,
+    /// Gemini 100) so the worker's batch is never re-split by the provider.
+    pub max_chunks: usize,
+    /// The most *estimated* tokens one provider call carries, by the same
+    /// estimate `chunk.max_tokens` cuts on ([`ChunkConfig::estimate_tokens`]:
+    /// one token per two bytes, an overestimate for every common script).
+    ///
+    /// 32 768 is `max_chunks` chunks at the default chunk ceiling — 2 000
+    /// characters is at most 1 000 estimated tokens — so with default
+    /// chunking the count bound is the one that binds, and a collection
+    /// with `chunk.max_tokens = 1024` fills a call exactly. That is about
+    /// 64 KiB of text per request, well inside every hosted provider's
+    /// per-request token limit.
+    ///
+    /// One document's chunks always travel together, because the storage
+    /// write behind them replaces the document's chunks as one. A single
+    /// document over this bound goes alone rather than being split across
+    /// calls, exactly as it did before batching.
+    pub max_tokens: usize,
+    /// How long the streaming path holds a partial batch for company before
+    /// sending it.
+    ///
+    /// The wait only happens when the stream is idle: on a backlog the next
+    /// entry is already there and the batch fills without waiting. So this
+    /// costs a quiet collection at most this much added latency per
+    /// document, and 100 ms is less than the remote round trip it saves.
+    /// Zero sends whatever has queued the moment the stream is idle.
+    pub max_wait: Duration,
+}
+
+impl Default for BatchSettings {
+    fn default() -> Self {
+        Self { max_chunks: 32, max_tokens: 32_768, max_wait: Duration::from_millis(100) }
+    }
+}
+
+/// One document's share of a provider call: what was prepared from its text,
+/// and the version that text belongs to.
+struct Job {
+    source: kimmy_core::DocId,
+    /// The document version this work is for. Checked again after the
+    /// provider call: a document that moved meanwhile has its own entry
+    /// behind this one, and a deleted one has nothing to store vectors for.
+    hlc: Hlc,
+    /// Bare chunk text, as stored.
+    chunks: Vec<String>,
+    /// What the provider is sent: the chunks behind the document prefix.
+    inputs: Vec<String>,
+    /// Estimated tokens across `inputs`, for the batch's token bound.
+    tokens: usize,
+}
+
+/// Documents of one collection gathered for one provider call.
+///
+/// One collection per batch, always: the collection names the provider, the
+/// model and the prefix, and a call can only go to one of those.
+struct Batch {
+    collection: CollectionMeta,
+    shadow: CollectionMeta,
+    config: VectorConfig,
+    jobs: Vec<Job>,
+    chunks: usize,
+    tokens: usize,
+}
+
+impl Batch {
+    fn new(collection: CollectionMeta, shadow: CollectionMeta, config: VectorConfig) -> Self {
+        Self { collection, shadow, config, jobs: Vec::new(), chunks: 0, tokens: 0 }
+    }
+
+    /// Whether a job fits under both bounds. An empty batch takes anything:
+    /// a document too large for the bounds still has to be embedded, and it
+    /// goes alone.
+    fn accepts(&self, job: &Job, limits: &BatchSettings) -> bool {
+        self.jobs.is_empty()
+            || (self.chunks + job.chunks.len() <= limits.max_chunks
+                && self.tokens + job.tokens <= limits.max_tokens)
+    }
+
+    fn full(&self, limits: &BatchSettings) -> bool {
+        self.chunks >= limits.max_chunks || self.tokens >= limits.max_tokens
+    }
+
+    fn push(&mut self, job: Job) {
+        // A document written twice before the batch went out needs only its
+        // latest version embedded; the older version's vectors would fail
+        // the stamp check after the call and be discarded unread.
+        if let Some(i) = self.jobs.iter().position(|j| j.source == job.source) {
+            let stale = self.jobs.remove(i);
+            self.chunks -= stale.chunks.len();
+            self.tokens -= stale.tokens;
+        }
+        self.chunks += job.chunks.len();
+        self.tokens += job.tokens;
+        self.jobs.push(job);
+    }
+}
+
+/// A prepared document together with where its vectors go.
+struct Item {
+    collection: CollectionMeta,
+    shadow: CollectionMeta,
+    config: VectorConfig,
+    job: Job,
+}
+
+/// What looking at one oplog entry decided.
+enum Prepared {
+    /// Handled in full: nothing to embed, or the work was not a provider call.
+    Done(Outcome),
+    /// A document to embed, ready to join a batch.
+    Embed(Box<Item>),
+}
+
+/// What the streaming path holds between provider calls: the batches, the
+/// newest position seen, and when the oldest waiting job arrived.
+///
+/// The position is recorded only when this is empty, so the recorded position
+/// never runs ahead of an entry whose vectors are still in a batch. The
+/// crash-replay guarantee is unchanged; it just covers a few entries at once.
+#[derive(Default)]
+struct Pending {
+    /// At most one per collection, in the order the collections first
+    /// appeared.
+    batches: Vec<Batch>,
+    /// The position of the newest entry seen since the last flush — the one
+    /// to record once everything before it has landed.
+    token: Option<kimmy_core::ResumeToken>,
+    /// When the first job now waiting arrived; the batch wait is measured
+    /// from here.
+    opened: Option<Instant>,
+}
+
+impl Pending {
+    fn is_empty(&self) -> bool {
+        self.batches.is_empty()
+    }
+
+    fn deadline(&self, wait: Duration) -> Option<Instant> {
+        self.opened.map(|opened| opened + wait)
+    }
+
+    /// Whether the item fits its collection's batch without a flush first.
+    fn accepts(&self, item: &Item, limits: &BatchSettings) -> bool {
+        self.batches
+            .iter()
+            .find(|b| b.collection.id == item.collection.id)
+            .is_none_or(|b| b.accepts(&item.job, limits))
+    }
+
+    /// Add a job to its collection's batch, opening one if needed. Returns
+    /// whether that batch is now full.
+    fn push(&mut self, item: Item, now: Instant, limits: &BatchSettings) -> bool {
+        self.opened.get_or_insert(now);
+        let Item { collection, shadow, config, job } = item;
+        let batch = match self.batches.iter().position(|b| b.collection.id == collection.id) {
+            Some(i) => &mut self.batches[i],
+            None => {
+                self.batches.push(Batch::new(collection, shadow, config));
+                self.batches.last_mut().expect("just pushed")
+            }
+        };
+        batch.push(job);
+        batch.full(limits)
+    }
+}
+
 /// Keeps a collection's vectors in step with its documents.
 pub struct EmbeddingWorker {
     engine: Arc<Engine>,
+    /// How documents are gathered into provider calls.
+    batching: BatchSettings,
     /// Providers are built once per configuration and reused — constructing a
     /// local one loads a model, which is far too expensive per document.
     ///
@@ -229,11 +427,18 @@ impl EmbeddingWorker {
     pub fn new(engine: Arc<Engine>) -> Self {
         Self {
             engine,
+            batching: BatchSettings::default(),
             providers: HashMap::new(),
             deferred: VecDeque::new(),
             am_owner: None,
             counters: Arc::new(WorkerCounters::default()),
         }
+    }
+
+    /// Set how documents are gathered into provider calls. See
+    /// [`BatchSettings`] for the bounds and their defaults.
+    pub fn set_batching(&mut self, batching: BatchSettings) {
+        self.batching = batching;
     }
 
     /// Install the cluster-ownership check. See the `am_owner` field for why
@@ -339,61 +544,128 @@ impl EmbeddingWorker {
     }
 
     /// Process one stream until it ends or is invalidated.
+    ///
+    /// Entries that need a provider call are gathered into batches — one per
+    /// collection, bounded by [`BatchSettings`] — and sent when a batch is
+    /// full, when the oldest waiting job has waited `max_wait`, or when the
+    /// stream ends. Everything else an entry can mean (a delete, a skip, a
+    /// deferral, a configuration change) is handled the moment it arrives.
     async fn drive(&mut self, stream: &mut kimmy_storage::ChangeStream) -> Result<StreamEnd> {
+        let mut pending = Pending::default();
         loop {
-            // Timed rather than a plain await, so deferred documents are still
-            // re-checked on a cluster that has gone quiet. `next` is safe to
-            // cancel here: its only await is the wake-up channel, and it
-            // records where to resume *before* waiting, so a dropped future
-            // costs a notification and not a position. The re-read from the
-            // arrival index on the next call is what recovers it.
-            let event = match tokio::time::timeout(DEFERRAL_TICK, stream.next(&self.engine)).await {
+            // Timed rather than a plain await, so a partial batch goes out on
+            // schedule and deferred documents are still re-checked on a
+            // cluster that has gone quiet. `next` is safe to cancel here: its
+            // only await is the wake-up channel, and it records where to
+            // resume *before* waiting, so a dropped future costs a
+            // notification and not a position. The re-read from the arrival
+            // index on the next call is what recovers it.
+            let wait = pending.deadline(self.batching.max_wait).map_or(DEFERRAL_TICK, |due| {
+                due.saturating_duration_since(Instant::now()).min(DEFERRAL_TICK)
+            });
+            let event = match tokio::time::timeout(wait, stream.next(&self.engine)).await {
                 Ok(Some(event)) => event,
-                Ok(None) => return Ok(StreamEnd::Ended),
+                Ok(None) => {
+                    self.flush(&mut pending).await?;
+                    return Ok(StreamEnd::Ended);
+                }
                 Err(_) => {
-                    self.drain_deferred(Instant::now()).await;
+                    let now = Instant::now();
+                    if pending.deadline(self.batching.max_wait).is_some_and(|due| due <= now) {
+                        self.flush(&mut pending).await?;
+                    }
+                    self.drain_deferred(now).await;
                     continue;
                 }
             };
 
             let (entry, token) = match event {
                 ChangeEvent::Change { entry, token } => (entry, token),
-                ChangeEvent::Invalidate { reason } => return Ok(StreamEnd::Invalidated(reason)),
+                ChangeEvent::Invalidate { reason } => {
+                    // What was gathered is real work from a stream that was
+                    // good when it delivered it; cheaper to finish than to
+                    // leave for the rescan.
+                    self.flush(&mut pending).await?;
+                    return Ok(StreamEnd::Invalidated(reason));
+                }
             };
+
+            // A configuration change rescans the collection under the new
+            // configuration. Anything gathered under the old one goes first:
+            // its stamp check would still pass after the scan, and it would
+            // overwrite the new model's vectors with the old model's.
+            if entry.kind == OpKind::ConfigureVectors {
+                self.flush(&mut pending).await?;
+            }
 
             // Retry rather than advance: losing an entry means a document stays
             // unembedded with nothing to notice it.
-            loop {
-                match self.process(&entry).await {
-                    Ok(_) => break,
+            let prepared = loop {
+                match self.prepare_entry(&entry).await {
+                    Ok(prepared) => break prepared,
                     Err(e) if e.is_retryable() => {
                         warn!(error = %e, "embedding failed; retrying");
                         tokio::time::sleep(RETRY_DELAY).await;
                     }
                     Err(e) => {
-                        // A permanent failure (bad config, wrong dimension)
-                        // would retry forever. Record it and move on, so one
-                        // poisoned document cannot stall every other one.
+                        // A permanent failure would retry forever. Record it
+                        // and move on, so one poisoned entry cannot stall
+                        // every other one.
                         warn!(
                             error = %e,
                             collection = ?entry.collection,
                             doc = ?entry.doc_id,
                             "embedding permanently failed; skipping this entry"
                         );
-                        break;
+                        break Prepared::Done(Outcome::Skipped);
+                    }
+                }
+            };
+
+            match prepared {
+                // Only after the work is done, so a crash re-processes rather
+                // than skips. Re-processing is safe because embedding is
+                // idempotent. With a batch waiting, "done" is not yet true of
+                // everything before this entry, so the position waits with it.
+                Prepared::Done(_) if pending.is_empty() => {
+                    self.engine.put_consumer_position(CONSUMER, token)?;
+                }
+                Prepared::Done(_) => pending.token = Some(token),
+                Prepared::Embed(item) => {
+                    if !pending.accepts(&item, &self.batching) {
+                        self.flush(&mut pending).await?;
+                    }
+                    let full = pending.push(*item, Instant::now(), &self.batching);
+                    pending.token = Some(token);
+                    if full {
+                        self.flush(&mut pending).await?;
                     }
                 }
             }
-
-            // Only after the work is done, so a crash re-processes rather than
-            // skips. Re-processing is safe because embedding is idempotent.
-            self.engine.put_consumer_position(CONSUMER, token)?;
 
             // Also here, not only on the idle tick: a busy cluster may never
             // reach the timeout, and a deferral that is due should not have to
             // wait for a lull.
             self.drain_deferred(Instant::now()).await;
         }
+    }
+
+    /// Send everything gathered, oldest collection first, then record the
+    /// position that covers it.
+    ///
+    /// Any batch here may span several collections' worth of entries in the
+    /// stream, and the token recorded is the newest one seen: by the time it
+    /// is written every entry before it has either been handled on arrival or
+    /// embedded just now.
+    async fn flush(&mut self, pending: &mut Pending) -> Result<()> {
+        for batch in std::mem::take(&mut pending.batches) {
+            self.embed_batch(batch).await;
+        }
+        pending.opened = None;
+        if let Some(token) = pending.token.take() {
+            self.engine.put_consumer_position(CONSUMER, token)?;
+        }
+        Ok(())
     }
 
     /// Bring every owned, server-embedded collection up to date by scanning
@@ -549,27 +821,51 @@ impl EmbeddingWorker {
         })
     }
 
-    /// Handle one oplog entry.
+    /// Handle one oplog entry on its own, embedding at once.
+    ///
+    /// The streaming path in [`Self::run`] gathers entries into batches
+    /// instead; this is the one-entry form, which embeds a document as a
+    /// batch of one and reports the provider's answer — including its
+    /// failure — to the caller.
+    pub async fn process(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
+        match self.prepare_entry(entry).await? {
+            Prepared::Done(outcome) => Ok(outcome),
+            Prepared::Embed(item) => {
+                let Item { collection, shadow, config, job } = *item;
+                let chunks = job.chunks.len();
+                let vectors =
+                    self.call_provider(&collection, &config, std::slice::from_ref(&job)).await?;
+                Ok(if self.store(&collection, &shadow, &config, vec![job], vectors)? == 1 {
+                    Outcome::Embedded { chunks }
+                } else {
+                    Outcome::Skipped
+                })
+            }
+        }
+    }
+
+    /// Decide what one oplog entry means: handle everything that is not a
+    /// provider call here and now, and hand back what is.
     #[tracing::instrument(
         name = "vector.process",
         skip_all,
         fields(kind = ?entry.kind, collection_id = entry.collection.0 as i64)
     )]
-    pub async fn process(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Outcome> {
+    async fn prepare_entry(&mut self, entry: &kimmy_core::OplogEntry) -> Result<Prepared> {
         // The collection *id* rather than its name, and no document id: the
-        // span answers "which entry, and how long did embedding it take", and
+        // span answers "which entry, and what did it take to look at", and
         // an id answers that without publishing what a deployment calls its
-        // data (ADR-068). Embedding is the slowest thing this node does off
-        // the write path — a remote provider is a network round trip per chunk
-        // — so this is the span that explains why a document's vectors are
-        // minutes behind its write.
+        // data (ADR-068). The provider call itself — the slowest thing this
+        // node does off the write path — is the `vector.embed` span, one per
+        // batch, which is the span that explains why a document's vectors
+        // are minutes behind its write.
         //
         // Not every oplog entry describes a mutation. A unique-violation entry
         // reports something that happened *to* the data and has nothing to
         // embed. It would be filtered by the `doc_id` check below anyway, but
         // relying on that would make the safety incidental.
         if entry.kind == OpKind::UniqueViolation {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         }
 
         // A configuration change is the reindex trigger. The entry arrives
@@ -582,22 +878,22 @@ impl EmbeddingWorker {
         // the worker's first-ever run starting from zero, and a worker whose
         // position had ever advanced was past those entries forever.
         if entry.kind == OpKind::ConfigureVectors {
-            return self.backfill_from_entry(entry).await;
+            return Ok(Prepared::Done(self.backfill_from_entry(entry).await?));
         }
 
         let Some(source) = entry.doc_id.clone() else {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         };
         let Some(collection) = self.engine.collection_by_id(entry.collection)? else {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         };
         // A shadow collection is the worker's own output; embedding it would
         // recurse.
         let Some(config) = collection.vector.clone() else {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         };
         if kimmy_core::vector_meta::is_shadow(&collection.name) {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         }
 
         let shadow = self.engine.get_collection(
@@ -614,22 +910,22 @@ impl EmbeddingWorker {
         if entry.kind == OpKind::Delete {
             let removed = self.engine.delete_vectors(&shadow, &source)?;
             debug!(chunks = removed, "removed vectors for a deleted document");
-            return Ok(Outcome::Removed);
+            return Ok(Prepared::Done(Outcome::Removed));
         }
 
         // `byo` means the client supplies vectors, so there is nothing to embed.
         if !config.provider.embeds_server_side() {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         }
 
         let Some(document) = entry.document()? else {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         };
 
         // The entry carries the version this work is for. Anything newer has
         // its own entry coming, so redoing older work would be wasted.
         if !self.engine.vectors_are_stale(&shadow, &source, entry.stamp.hlc)? {
-            return Ok(Outcome::Skipped);
+            return Ok(Prepared::Done(Outcome::Skipped));
         }
 
         // Ownership decides, not origin. Until 2026-08-28 the node that wrote
@@ -642,67 +938,16 @@ impl EmbeddingWorker {
         // holds the document only against the owner leaving.
         if !self.is_owner_of(&collection.db, &collection.name) {
             self.defer(entry.collection, source);
-            return Ok(Outcome::Deferred);
+            return Ok(Prepared::Done(Outcome::Deferred));
         }
 
-        let text = extract_text(&document, &config);
-        let chunks = config.chunk.split(&text);
-        if chunks.is_empty() {
-            // No embeddable text: drop any vectors from a previous version
-            // that did have some, or they would outlive their source text.
-            self.engine.delete_vectors(&shadow, &source)?;
-            return Ok(Outcome::Skipped);
-        }
-
-        let provider = self.provider_for(collection.id.0, &config)?;
-        // Counted here as well as in `embed_one`: this is the streaming path
-        // for a document this node owns, and it embeds from the entry rather
-        // than re-reading the document, so it does not go through `embed_one`.
-        // Shipped uncounted in 0.5.0 — on a healthy owner every
-        // `kimmy_embed_{documents,chunks,failures}_total` stayed at zero while
-        // the vectors demonstrably landed, which is the one thing a spend
-        // counter must never do.
-        let inputs = prefixed(&config, &chunks);
-        let vectors = provider.embed(&inputs).await.inspect_err(|e| self.counters.failed(e))?;
-
-        // The provider call is the long part, and the document can move while
-        // it runs. Embedding from the entry's own image is what makes this
-        // path cheap, but writing that image's vectors after the document has
-        // been deleted would leave chunks with no source — and the `Delete`
-        // entry that would have removed them has already gone by. A newer
-        // version is the same case with a different ending: its own entry is
-        // behind this one and will do the work, so this write would only be
-        // overwritten. Either way, nothing to store.
-        match self.engine.document_stamp(&collection, &source)? {
-            Some(current) if current.hlc == entry.stamp.hlc => {}
-            Some(_) => {
-                debug!("document moved while it was being embedded; its own entry follows");
-                return Ok(Outcome::Skipped);
-            }
-            None => {
-                debug!("document was deleted while it was being embedded");
-                return Ok(Outcome::Skipped);
-            }
-        }
-
-        let records: Vec<VectorRecord> = chunks
-            .into_iter()
-            .zip(vectors)
-            .enumerate()
-            .map(|(i, (text, vector))| VectorRecord {
-                source: source.clone(),
-                chunk: i as u32,
-                source_hlc: entry.stamp.hlc,
-                vector,
-                text,
-            })
-            .collect();
-
-        let count = records.len();
-        self.engine.put_vectors(&shadow, &source, &records)?;
-        self.counters.embedded(count);
-        debug!(chunks = count, "embedded a document");
-        Ok(Outcome::Embedded { chunks: count })
+        // Embedding from the entry's own image is what makes this path cheap:
+        // no re-read of the document. The version is the entry's, and the
+        // stamp check after the provider call is what keeps that honest.
+        let Some(job) = self.prepare(&shadow, &config, source, entry.stamp.hlc, &document)? else {
+            return Ok(Prepared::Done(Outcome::Skipped));
+        };
+        Ok(Prepared::Embed(Box::new(Item { collection, shadow, config, job })))
     }
 
     /// React to a `ConfigureVectors` entry: scan the collection and bring
@@ -803,34 +1048,44 @@ impl EmbeddingWorker {
 
         let total = ids.len();
         let mut embedded = 0usize;
+        // Documents are gathered into provider calls up to the batch bounds
+        // and sent as each fills; the last, partial one goes when the scan
+        // ends. No timer here — the set is known, so there is nothing to
+        // wait for. Transient failures retry and a permanent one skips its
+        // document, inside `embed_batch`, exactly as the streaming path.
+        let mut batch = Batch::new(collection.clone(), shadow.clone(), config.clone());
         for source in ids {
-            // Retry transient provider failures per document, exactly as the
-            // streaming path does; a permanent failure skips the document
-            // rather than stalling the rest of the scan.
-            loop {
-                match self.embed_one(collection, shadow, config, &source, force).await {
-                    Ok(true) => {
-                        embedded += 1;
-                        break;
-                    }
-                    Ok(false) => break,
-                    Err(e) if e.is_retryable() => {
-                        warn!(error = %e, "backfill embedding failed; retrying");
-                        tokio::time::sleep(RETRY_DELAY).await;
-                    }
-                    Err(e) => {
-                        warn!(
-                            error = %e,
-                            db = %collection.db,
-                            collection = %collection.name,
-                            doc = %source,
-                            "backfill permanently failed for a document"
-                        );
-                        break;
-                    }
+            let job = match self.prepare_one(collection, shadow, config, &source, force) {
+                Ok(Some(job)) => job,
+                Ok(None) => continue,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        db = %collection.db,
+                        collection = %collection.name,
+                        doc = %source,
+                        "backfill could not read a document; skipping it"
+                    );
+                    continue;
                 }
+            };
+            if !batch.accepts(&job, &self.batching) {
+                let ready = std::mem::replace(
+                    &mut batch,
+                    Batch::new(collection.clone(), shadow.clone(), config.clone()),
+                );
+                embedded += self.embed_batch(ready).await;
+            }
+            batch.push(job);
+            if batch.full(&self.batching) {
+                let ready = std::mem::replace(
+                    &mut batch,
+                    Batch::new(collection.clone(), shadow.clone(), config.clone()),
+                );
+                embedded += self.embed_batch(ready).await;
             }
         }
+        embedded += self.embed_batch(batch).await;
 
         // The completed scan is what the fingerprint attests. Failing to
         // write it costs a redundant re-scan next time, never a gap.
@@ -845,15 +1100,9 @@ impl EmbeddingWorker {
         Ok(embedded)
     }
 
-    /// Bring one document's vectors up to date. `Ok(true)` if work was done.
-    ///
-    /// `force` re-embeds even current-looking vectors — the configuration
-    /// changed, so "current" was measured against the wrong ruler.
-    #[tracing::instrument(
-        name = "vector.embed",
-        skip_all,
-        fields(force, provider = config.provider.name(), chunks = tracing::field::Empty)
-    )]
+    /// Bring one document's vectors up to date, alone. `Ok(true)` if work was
+    /// done. The deferred re-check's path: one document, one call, and the
+    /// provider's failure reported to the caller, which has its own retry.
     async fn embed_one(
         &mut self,
         collection: &CollectionMeta,
@@ -862,59 +1111,275 @@ impl EmbeddingWorker {
         source: &kimmy_core::DocId,
         force: bool,
     ) -> Result<bool> {
+        let Some(job) = self.prepare_one(collection, shadow, config, source, force)? else {
+            return Ok(false);
+        };
+        let vectors = self.call_provider(collection, config, std::slice::from_ref(&job)).await?;
+        Ok(self.store(collection, shadow, config, vec![job], vectors)? == 1)
+    }
+
+    /// Read one document afresh and prepare it, or nothing if its vectors are
+    /// already current.
+    ///
+    /// `force` re-embeds even current-looking vectors — the configuration
+    /// changed, so "current" was measured against the wrong ruler.
+    fn prepare_one(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        source: &kimmy_core::DocId,
+        force: bool,
+    ) -> Result<Option<Job>> {
         // The stamp is the document's *current* version, read fresh — a
         // document replaced mid-scan is embedded at whichever version the
         // read sees, and the newer version's own oplog entry follows behind
         // this backfill in the stream.
         let Some(stamp) = self.engine.document_stamp(collection, source)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if !force && !self.engine.vectors_are_stale(shadow, source, stamp.hlc)? {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(document) = self.engine.get(collection, source)? else {
-            return Ok(false);
+            return Ok(None);
         };
+        self.prepare(shadow, config, source.clone(), stamp.hlc, &document)
+    }
 
-        let text = extract_text(&document, config);
+    /// Text to chunks to provider inputs, for one version of one document.
+    ///
+    /// `None` means there is nothing to embed — and any vectors a previous
+    /// version had are removed here, or they would outlive their source text.
+    fn prepare(
+        &self,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        source: kimmy_core::DocId,
+        hlc: Hlc,
+        document: &bson::Document,
+    ) -> Result<Option<Job>> {
+        let text = extract_text(document, config);
         let chunks = config.chunk.split(&text);
-        // Recorded rather than declared up front, because the split is what
-        // decides it — and the chunk count is what makes a slow embed legible:
-        // a remote provider is charged a round trip per chunk, so thirty
-        // chunks and one are two different costs behind the same span name.
-        tracing::Span::current().record("chunks", chunks.len() as i64);
         if chunks.is_empty() {
-            self.engine.delete_vectors(shadow, source)?;
-            return Ok(false);
+            self.engine.delete_vectors(shadow, &source)?;
+            return Ok(None);
         }
+        let inputs = prefixed(config, &chunks);
+        let tokens = inputs.iter().map(|input| ChunkConfig::estimate_tokens(input)).sum();
+        Ok(Some(Job { source, hlc, chunks, inputs, tokens }))
+    }
 
+    /// One provider call for every chunk of every job, in job order.
+    ///
+    /// The document and chunk counts are on the span because they are what
+    /// make a slow embed legible: thirty chunks and one are two different
+    /// costs behind the same span name.
+    #[tracing::instrument(
+        name = "vector.embed",
+        skip_all,
+        fields(
+            provider = config.provider.name(),
+            documents = jobs.len(),
+            chunks = jobs.iter().map(|j| j.chunks.len()).sum::<usize>(),
+        )
+    )]
+    async fn call_provider(
+        &mut self,
+        collection: &CollectionMeta,
+        config: &VectorConfig,
+        jobs: &[Job],
+    ) -> Result<Vec<Vec<f32>>> {
         let provider = self.provider_for(collection.id.0, config)?;
+        let gathered: Vec<String>;
+        let inputs: &[String] = match jobs {
+            [only] => &only.inputs,
+            _ => {
+                gathered = jobs.iter().flat_map(|j| j.inputs.iter().cloned()).collect();
+                &gathered
+            }
+        };
         // Counted at the only line a provider outage can produce — including
         // the retries, so a sustained outage reads as a climbing counter
         // rather than one flat increment.
-        let inputs = prefixed(config, &chunks);
-        let vectors = provider.embed(&inputs).await.inspect_err(|e| self.counters.failed(e))?;
-        let chunk_count = chunks.len();
-        let records: Vec<VectorRecord> = chunks
-            .into_iter()
-            .zip(vectors)
-            .enumerate()
-            .map(|(i, (text, vector))| VectorRecord {
-                source: source.clone(),
-                chunk: i as u32,
-                source_hlc: stamp.hlc,
-                vector,
-                text,
-            })
-            .collect();
-        self.engine.put_vectors(shadow, source, &records)?;
-        // Deferred re-checks and scans funnel through here; the streaming
-        // path for a locally written document embeds from its entry in
-        // `process` and counts there. Two sites, each reached exactly once
-        // per embedding — a comment here once claimed this was the only one,
-        // and the streaming path shipped uncounted on the strength of it.
-        self.counters.embedded(chunk_count);
-        Ok(true)
+        provider.embed(inputs).await.inspect_err(|e| self.counters.failed(e))
+    }
+
+    /// Write each job's vectors: one replace-all write per document, each
+    /// counted as one document and its chunks. Returns how many were written.
+    ///
+    /// This is the half of the work batching does not touch. `put_vectors`
+    /// replaces one document's chunks, staleness is one document's HLC, and
+    /// a crash between two documents' writes leaves the second one stale
+    /// for the replay to find — no different from a crash before it.
+    fn store(
+        &self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        jobs: Vec<Job>,
+        vectors: Vec<Vec<f32>>,
+    ) -> Result<usize> {
+        let expected: usize = jobs.iter().map(|j| j.chunks.len()).sum();
+        if vectors.len() != expected {
+            // Storing a shifted answer would give every later document in
+            // the batch its neighbour's vectors; refusing costs one retry.
+            return Err(VectorError::MalformedResponse {
+                provider: config.provider.name(),
+                detail: format!("expected {expected} vectors, got {}", vectors.len()),
+            });
+        }
+        let mut vectors = vectors.into_iter();
+        let mut written = 0;
+        for job in jobs {
+            let own: Vec<Vec<f32>> = vectors.by_ref().take(job.chunks.len()).collect();
+            // The provider call is the long part, and the document can move
+            // while it runs. Writing vectors for a version that has since
+            // been deleted would leave chunks with no source — and the
+            // `Delete` entry that would have removed them has already gone
+            // by. A newer version is the same case with a different ending:
+            // its own entry is behind this one and will do the work, so this
+            // write would only be overwritten. Either way, nothing to store.
+            match self.engine.document_stamp(collection, &job.source)? {
+                Some(current) if current.hlc == job.hlc => {}
+                Some(_) => {
+                    debug!("document moved while it was being embedded; its own entry follows");
+                    continue;
+                }
+                None => {
+                    debug!("document was deleted while it was being embedded");
+                    continue;
+                }
+            }
+            let count = job.chunks.len();
+            let records: Vec<VectorRecord> = job
+                .chunks
+                .into_iter()
+                .zip(own)
+                .enumerate()
+                .map(|(i, (text, vector))| VectorRecord {
+                    source: job.source.clone(),
+                    chunk: i as u32,
+                    source_hlc: job.hlc,
+                    vector,
+                    text,
+                })
+                .collect();
+            self.engine.put_vectors(shadow, &job.source, &records)?;
+            // Every path that writes vectors ends here, so this is the one
+            // place the document and chunk counters move. They count what
+            // was written, never how many calls it took: a batch of thirty
+            // documents is thirty here.
+            self.counters.embedded(count);
+            debug!(chunks = count, "embedded a document");
+            written += 1;
+        }
+        Ok(written)
+    }
+
+    /// Embed one batch and return how many documents were written.
+    ///
+    /// A retryable failure retries the whole batch, forever, exactly as one
+    /// document retried before: a provider that is briefly down must not
+    /// cost a document. A permanent failure on a batch of several documents
+    /// is almost never the batch's fault but one document's — a `400` for an
+    /// input the model cannot take — and the provider does not say which. So
+    /// the batch is taken apart and each document sent alone: the one at
+    /// fault is skipped and named, the rest land. That costs one extra call
+    /// per document, once, on a path that had already failed.
+    ///
+    /// Storage errors are logged and end the batch: the documents written so
+    /// far are counted, the rest stay stale for a replay or rescan to find.
+    async fn embed_batch(&mut self, batch: Batch) -> usize {
+        let Batch { collection, shadow, config, jobs, .. } = batch;
+        if jobs.is_empty() {
+            return 0;
+        }
+        if jobs.len() == 1 {
+            let job = jobs.into_iter().next().expect("one job");
+            return self.embed_alone(&collection, &shadow, &config, job).await;
+        }
+        let vectors = loop {
+            match self.call_provider(&collection, &config, &jobs).await {
+                Ok(vectors) => break vectors,
+                Err(e) if e.is_retryable() => {
+                    warn!(error = %e, documents = jobs.len(), "embedding failed; retrying");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        db = %collection.db,
+                        collection = %collection.name,
+                        documents = jobs.len(),
+                        "a batch permanently failed; embedding its documents one at a time"
+                    );
+                    let mut written = 0;
+                    for job in jobs {
+                        written += self.embed_alone(&collection, &shadow, &config, job).await;
+                    }
+                    return written;
+                }
+            }
+        };
+        match self.store(&collection, &shadow, &config, jobs, vectors) {
+            Ok(written) => written,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    db = %collection.db,
+                    collection = %collection.name,
+                    "storing a batch's vectors failed; the rest of the batch stays stale"
+                );
+                0
+            }
+        }
+    }
+
+    /// Embed one document by itself, retrying what is worth retrying and
+    /// skipping — by name — what is not.
+    async fn embed_alone(
+        &mut self,
+        collection: &CollectionMeta,
+        shadow: &CollectionMeta,
+        config: &VectorConfig,
+        job: Job,
+    ) -> usize {
+        let vectors = loop {
+            match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
+                Ok(vectors) => break vectors,
+                Err(e) if e.is_retryable() => {
+                    warn!(error = %e, "embedding failed; retrying");
+                    tokio::time::sleep(RETRY_DELAY).await;
+                }
+                Err(e) => {
+                    // A permanent failure (bad config, wrong dimension, an
+                    // input the model refuses) would retry forever. Name it
+                    // and move on, so one poisoned document cannot stall
+                    // every other one.
+                    warn!(
+                        error = %e,
+                        db = %collection.db,
+                        collection = %collection.name,
+                        doc = %job.source,
+                        "embedding permanently failed; skipping this document"
+                    );
+                    return 0;
+                }
+            }
+        };
+        match self.store(collection, shadow, config, vec![job], vectors) {
+            Ok(written) => written,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    db = %collection.db,
+                    collection = %collection.name,
+                    "storing a document's vectors failed; it stays stale"
+                );
+                0
+            }
+        }
     }
 
     /// A provider for one collection, built once per configuration.
@@ -1055,6 +1520,12 @@ mod tests {
         calls: std::sync::atomic::AtomicUsize,
         /// Every input text the provider was asked to embed, in order.
         inputs: std::sync::Mutex<Vec<String>>,
+        /// How many inputs each call carried, in order — the batching
+        /// evidence.
+        sizes: std::sync::Mutex<Vec<usize>>,
+        /// An input the model "cannot take": any call containing it fails
+        /// permanently, as a provider refusing one oversized input does.
+        poison: std::sync::Mutex<Option<String>>,
     }
 
     impl FakeProvider {
@@ -1065,7 +1536,17 @@ mod tests {
                 permanent: Default::default(),
                 calls: Default::default(),
                 inputs: Default::default(),
+                sizes: Default::default(),
+                poison: Default::default(),
             })
+        }
+
+        fn calls(&self) -> usize {
+            self.calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn sizes(&self) -> Vec<usize> {
+            self.sizes.lock().unwrap().clone()
         }
     }
 
@@ -1075,7 +1556,14 @@ mod tests {
             use std::sync::atomic::Ordering;
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.inputs.lock().unwrap().extend(texts.iter().cloned());
-            if self.permanent.load(Ordering::SeqCst) {
+            self.sizes.lock().unwrap().push(texts.len());
+            let poisoned = self
+                .poison
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p| texts.iter().any(|t| t.contains(p.as_str())));
+            if self.permanent.load(Ordering::SeqCst) || poisoned {
                 // A 400 is the canonical "retrying will not help".
                 return Err(VectorError::ProviderRejected {
                     provider: "fake",
@@ -1718,11 +2206,343 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, Outcome::Backfilled { embedded: 0 }, "nothing could be embedded");
-        assert_eq!(
-            fake.calls.load(std::sync::atomic::Ordering::SeqCst),
-            3,
-            "each document is attempted exactly once, then skipped"
+        // The three documents go out as one batch; when that fails
+        // permanently each is tried alone, once, to find the one at fault —
+        // here all of them — and then skipped.
+        assert_eq!(fake.sizes(), vec![3, 1, 1, 1], "one batch, then each document once");
+    }
+
+    // -----------------------------------------------------------------------
+    // Batching: one provider call carries many documents (ADR-095)
+    // -----------------------------------------------------------------------
+
+    /// A collection whose documents are one short chunk each — the case
+    /// batching exists for — with a fake provider that records call sizes.
+    async fn setup_with_short_documents(
+        count: usize,
+    ) -> (Arc<Engine>, CollectionMeta, EmbeddingWorker, Arc<FakeProvider>, tempfile::TempDir) {
+        let (engine, coll, mut worker, dir) = setup_with_history(count).await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        (engine, coll, worker, fake, dir)
+    }
+
+    fn total_chunks(engine: &Engine, count: usize) -> usize {
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        (0..count)
+            .map(|i| {
+                engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(i as i64)).unwrap().len()
+            })
+            .sum()
+    }
+
+    #[tokio::test]
+    async fn a_backfill_of_short_documents_makes_far_fewer_calls_than_documents() {
+        // Before this, 100 one-chunk documents were 100 provider calls, each
+        // paying a whole round trip for one input. Measured against a CPU
+        // llama.cpp server: 32 calls of one input took 394 ms, one call of
+        // 32 took 18 ms.
+        let count = 100;
+        let (engine, _coll, mut worker, fake, _dir) = setup_with_short_documents(count).await;
+
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: count });
+
+        let max = BatchSettings::default().max_chunks;
+        assert!(
+            fake.calls() <= count.div_ceil(max) + 1,
+            "{} documents took {} provider calls",
+            count,
+            fake.calls()
         );
+        assert!(fake.sizes().iter().all(|&n| n <= max), "{:?}", fake.sizes());
+        assert_eq!(fake.sizes().iter().sum::<usize>(), count, "every document went exactly once");
+        assert_eq!(total_chunks(&engine, count), count);
+
+        // The counters count documents and chunks, never calls.
+        let counters = worker.counters();
+        assert_eq!(counters.documents_embedded.load(Ordering::SeqCst), count as u64);
+        assert_eq!(counters.chunks_embedded.load(Ordering::SeqCst), count as u64);
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_documents_keep_their_chunks_in_one_call_and_count_as_chunks() {
+        // Each document is several chunks; the counters must say so, and no
+        // document may be split across two calls, because the storage write
+        // behind it replaces the document's chunks as one.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "docs").unwrap();
+        let count = 10;
+        // 50 characters at max_chars 20 / overlap 5 is four chunks.
+        let chunks_each = config(&["body"]).chunk.split(&"x".repeat(50)).len();
+        assert!(chunks_each > 1);
+        for i in 0..count {
+            engine.insert(&coll, doc! { "_id": i as i64, "body": "x".repeat(50) }).unwrap();
+        }
+        engine.configure_vectors("app", "docs", config(&["body"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings { max_chunks: 10, ..Default::default() });
+
+        let outcome = worker.process(&last_entry(&engine)).await.unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: count });
+
+        // Ten chunks per call and several per document: as many whole
+        // documents as fit, never a partial one, so every call is a multiple
+        // of the per-document chunk count.
+        assert!(fake.sizes().iter().all(|&n| n % chunks_each == 0), "{:?}", fake.sizes());
+        assert!(fake.sizes().iter().all(|&n| n <= 10), "{:?}", fake.sizes());
+        assert_eq!(fake.calls(), count.div_ceil(10 / chunks_each));
+
+        let counters = worker.counters();
+        assert_eq!(counters.documents_embedded.load(Ordering::SeqCst), count as u64);
+        assert_eq!(counters.chunks_embedded.load(Ordering::SeqCst), (count * chunks_each) as u64);
+    }
+
+    #[tokio::test]
+    async fn the_token_bound_splits_a_batch_of_large_chunks_at_a_small_count() {
+        // Every document here is one 20-character chunk, ten estimated tokens
+        // at two bytes per token. With room for 25 tokens a call takes two;
+        // with room for 5 a single document already exceeds the bound and
+        // goes alone — never split, because its storage write cannot be.
+        let count = 6;
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let coll = engine.create_collection("app", "docs").unwrap();
+        for i in 0..count {
+            engine
+                .insert(&coll, doc! { "_id": i as i64, "title": "abcdefghijklmnopqrst" })
+                .unwrap();
+        }
+        engine.configure_vectors("app", "docs", config(&["title"])).unwrap();
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let entry = last_entry(&engine);
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+
+        worker.set_batching(BatchSettings { max_chunks: 32, max_tokens: 25, ..Default::default() });
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: count });
+        assert_eq!(fake.sizes(), vec![2, 2, 2], "25 tokens is room for two ten-token chunks");
+
+        // Reconfigure so the scan is forced, then bound below one document.
+        let mut tighter = config(&["title"]);
+        tighter.chunk.overlap = 4;
+        engine.configure_vectors("app", "docs", tighter).unwrap();
+        let entry = last_entry(&engine);
+        fake.sizes.lock().unwrap().clear();
+        worker.set_batching(BatchSettings { max_chunks: 32, max_tokens: 5, ..Default::default() });
+        assert_eq!(worker.process(&entry).await.unwrap(), Outcome::Backfilled { embedded: count });
+        assert_eq!(fake.sizes(), vec![1; count], "a document over the bound goes alone");
+    }
+
+    #[tokio::test]
+    async fn a_permanently_failing_document_does_not_poison_its_batch() {
+        // A provider refuses one input in a batch of five — an oversized
+        // chunk, say — with a 400 that names nothing. The batch fails once;
+        // each document is then sent alone, the four good ones land, and the
+        // bad one is skipped after exactly one attempt of its own.
+        let count = 5;
+        let (engine, _coll, mut worker, fake, _dir) = setup_with_short_documents(count).await;
+        *fake.poison.lock().unwrap() = Some("doc 2".into());
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            worker.process(&last_entry(&engine)),
+        )
+        .await
+        .expect("a permanent failure must not retry forever")
+        .unwrap();
+        assert_eq!(outcome, Outcome::Backfilled { embedded: count - 1 });
+
+        assert_eq!(fake.sizes(), vec![5, 1, 1, 1, 1, 1], "the batch once, then each alone once");
+        let attempts = fake.inputs.lock().unwrap().iter().filter(|t| t.contains("doc 2")).count();
+        assert_eq!(attempts, 2, "the bad document: once in the batch, once alone, never again");
+
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        for i in 0..count as i64 {
+            let vectors = engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(i)).unwrap();
+            assert_eq!(vectors.len(), usize::from(i != 2), "document {i}");
+        }
+        let counters = worker.counters();
+        assert_eq!(counters.documents_embedded.load(Ordering::SeqCst), count as u64 - 1);
+        assert_eq!(counters.failures.load(Ordering::SeqCst), 2, "the batch and the lone retry");
+    }
+
+    /// Park the worker's recorded position on the newest entry, so a worker
+    /// started afterwards streams only what is written from here on — and
+    /// finds it all already on disk, back to back, as a backlog is.
+    fn position_at_latest(engine: &Engine) {
+        let latest = last_entry(engine);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        engine.put_consumer_position(CONSUMER, token).unwrap();
+    }
+
+    /// Wait until `count` documents have vectors, or give up.
+    async fn vectors_land(engine: &Engine, count: usize) {
+        for _ in 0..2_000 {
+            if total_chunks(engine, count) >= count {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("only {} of {count} documents were embedded", total_chunks(engine, count));
+    }
+
+    #[tokio::test]
+    async fn a_streaming_backlog_is_embedded_in_batches_and_the_position_trails_it() {
+        // The live-ingest shape: writes already on disk when the worker
+        // reaches them. Consecutive entries fill a batch without waiting,
+        // the remainder goes when the timer runs out, and the position is
+        // recorded only once everything before it has landed.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        position_at_latest(&engine);
+
+        let count = 50;
+        for i in 0..count {
+            engine.insert(&coll, doc! { "_id": i as i64, "title": format!("doc {i}") }).unwrap();
+        }
+        let entries: Vec<kimmy_core::OplogEntry> = engine
+            .read_oplog_from(Hlc::ZERO, 10_000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.collection == coll.id && e.doc_id.is_some())
+            .collect();
+        assert_eq!(entries.len(), count);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        tokio::spawn(async move { worker.run().await });
+
+        // At every observation, an entry the recorded position has passed is
+        // an entry whose vectors are on disk: the position is written after
+        // the batch, never before it, so a crash replays rather than skips.
+        let mut landed = 0;
+        for _ in 0..2_000 {
+            let position = engine.consumer_position(CONSUMER).unwrap().map(|t| t.to_stamp());
+            for entry in &entries {
+                if position.is_some_and(|p| entry.stamp <= p) {
+                    let source = entry.doc_id.clone().unwrap();
+                    assert!(
+                        !engine.get_vectors(&shadow, &source).unwrap().is_empty(),
+                        "the position passed {source} before its vectors were written"
+                    );
+                }
+            }
+            landed = total_chunks(&engine, count);
+            if landed == count {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(landed, count, "every streamed document must be embedded");
+
+        let max = BatchSettings::default().max_chunks;
+        assert!(
+            fake.calls() <= count.div_ceil(max) + 1,
+            "{count} streamed documents took {} provider calls: {:?}",
+            fake.calls(),
+            fake.sizes()
+        );
+        assert_eq!(fake.sizes().iter().sum::<usize>(), count);
+    }
+
+    #[tokio::test]
+    async fn a_lone_document_on_a_quiet_stream_is_embedded_within_the_batch_wait() {
+        // The timer, not the size bound: one document arrives and nothing
+        // follows it. It must go out after `max_wait`, not sit until the
+        // five-second deferral tick or the next write.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings {
+            max_wait: std::time::Duration::from_millis(50),
+            ..Default::default()
+        });
+        position_at_latest(&engine);
+        tokio::spawn(async move { worker.run().await });
+
+        let started = Instant::now();
+        engine.insert(&coll, doc! { "_id": 0i64, "title": "alone" }).unwrap();
+        vectors_land(&engine, 1).await;
+        let took = started.elapsed();
+        assert!(
+            took < DEFERRAL_TICK / 2,
+            "a lone document waited {took:?}; the batch timer should have sent it long before \
+             the {DEFERRAL_TICK:?} tick"
+        );
+        assert_eq!(fake.sizes(), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn a_batch_holds_one_collection_only() {
+        // Two vector-enabled collections written turn about. Each has its
+        // own provider — model, prefix, endpoint — so a call can only carry
+        // one collection's chunks; but the *other* collection's run must not
+        // break the first one's batch either.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        engine.create_collection("app", "a").unwrap();
+        engine.create_collection("app", "b").unwrap();
+        engine.configure_vectors("app", "a", config(&["title"])).unwrap();
+        engine.configure_vectors("app", "b", config(&["title"])).unwrap();
+        let a = engine.get_collection("app", "a").unwrap();
+        let b = engine.get_collection("app", "b").unwrap();
+        let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
+        let fake_a = FakeProvider::new(4);
+        let fake_b = FakeProvider::new(4);
+        worker.set_provider(a.id.0, Arc::clone(&fake_a) as Arc<dyn EmbeddingProvider>);
+        worker.set_provider(b.id.0, Arc::clone(&fake_b) as Arc<dyn EmbeddingProvider>);
+        position_at_latest(&engine);
+
+        let count = 20;
+        for i in 0..count {
+            engine.insert(&a, doc! { "_id": i as i64, "title": format!("a {i}") }).unwrap();
+            engine.insert(&b, doc! { "_id": i as i64, "title": format!("b {i}") }).unwrap();
+        }
+        tokio::spawn(async move { worker.run().await });
+
+        for coll in ["a", "b"] {
+            let shadow = engine.vector_collection("app", coll).unwrap().unwrap();
+            for _ in 0..2_000 {
+                let n: usize = (0..count)
+                    .map(|i| engine.get_vectors(&shadow, &kimmy_core::DocId::Int64(i as i64)))
+                    .map(|v| v.unwrap().len())
+                    .sum();
+                if n == count {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }
+
+        for (fake, tag) in [(&fake_a, "a "), (&fake_b, "b ")] {
+            assert!(fake.calls() <= 2, "{tag}took {} calls: {:?}", fake.calls(), fake.sizes());
+            assert_eq!(fake.sizes().iter().sum::<usize>(), count);
+            assert!(fake.inputs.lock().unwrap().iter().all(|t| t.starts_with(tag)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_carries_only_the_latest_version_of_a_document() {
+        // Two writes to one document before the batch goes out: embedding
+        // the first would be a wasted input whose vectors the stamp check
+        // discards. Only the second version is sent.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        position_at_latest(&engine);
+
+        let id = engine.insert(&coll, doc! { "_id": 0i64, "title": "first" }).unwrap();
+        engine.replace(&coll, &id, doc! { "title": "second" }, false).unwrap();
+        tokio::spawn(async move { worker.run().await });
+        vectors_land(&engine, 1).await;
+
+        assert_eq!(fake.sizes(), vec![1]);
+        assert_eq!(*fake.inputs.lock().unwrap(), vec!["second".to_string()]);
     }
 
     // Paused clock: the retry delay is five seconds of real time, and a test

@@ -325,6 +325,19 @@ enum Command {
         filter: Option<String>,
         #[arg(long)]
         per_document: Option<usize>,
+        /// Weight of the dense (vector) half in fusion. At least 0; the
+        /// server's default is 1. Only the ratio to --lexical-weight matters.
+        #[arg(long)]
+        dense_weight: Option<f64>,
+        /// Weight of the lexical (keyword) half in fusion. At least 0; the
+        /// server's default is 1. Zero switches the keyword half off.
+        #[arg(long)]
+        lexical_weight: Option<f64>,
+        /// Distinct query terms a chunk must share with the query to count as
+        /// keyword evidence. At least 1; the server's default is 1. Use 2 on a
+        /// collection of short documents.
+        #[arg(long)]
+        min_overlap: Option<usize>,
     },
     /// The nodes this cluster is made of, and which are live.
     Topology,
@@ -512,7 +525,13 @@ async fn run() -> Result<()> {
         // environment.
         let user = login_user.expect("a local flow has a user by construction");
         let password = read_password(dot_password.as_deref())?;
-        let client = Client::builder(&cli.url).credentials(user, password).connect().await?;
+        let client =
+            Client::builder(&cli.url).credentials(user, password).connect().await.map_err(|e| {
+                match local_login_hint(&e) {
+                    Some(hint) => anyhow::Error::new(e).context(hint),
+                    None => anyhow::Error::new(e),
+                }
+            })?;
         let token = client.token().await.context("the server did not return a token")?;
         println!("{token}");
         return Ok(());
@@ -553,7 +572,17 @@ async fn run() -> Result<()> {
             )?;
             emit(&cli, &client.vector_search(db, coll, &body).await?);
         }
-        Command::HybridSearch { target, query, vector, k, filter, per_document } => {
+        Command::HybridSearch {
+            target,
+            query,
+            vector,
+            k,
+            filter,
+            per_document,
+            dense_weight,
+            lexical_weight,
+            min_overlap,
+        } => {
             let (db, coll) = split_target(target)?;
             let body = search_body(
                 query.as_deref(),
@@ -562,6 +591,7 @@ async fn run() -> Result<()> {
                 filter.as_deref(),
                 *per_document,
             )?;
+            let body = with_fusion_controls(body, *dense_weight, *lexical_weight, *min_overlap);
             emit(&cli, &client.hybrid_search(db, coll, &body).await?);
         }
         Command::Topology => emit(&cli, &client.topology().await?),
@@ -766,6 +796,34 @@ fn search_body(
     Ok(body)
 }
 
+/// Add the hybrid-only fusion controls to a search body.
+///
+/// Each is sent only when given, and a weight that was not given is left out
+/// of `weights` rather than sent as 1: the server owns the defaults, and a
+/// body that spells them out would pin them here the day they change there.
+/// Range checks are the server's too — its message names the field.
+fn with_fusion_controls(
+    mut body: Value,
+    dense_weight: Option<f64>,
+    lexical_weight: Option<f64>,
+    min_overlap: Option<usize>,
+) -> Value {
+    if dense_weight.is_some() || lexical_weight.is_some() {
+        let mut weights = json!({});
+        if let Some(dense) = dense_weight {
+            weights["dense"] = json!(dense);
+        }
+        if let Some(lexical) = lexical_weight {
+            weights["lexical"] = json!(lexical);
+        }
+        body["weights"] = weights;
+    }
+    if let Some(min_overlap) = min_overlap {
+        body["min_overlap"] = json!(min_overlap);
+    }
+    body
+}
+
 /// `db.collection` → `("db", "collection")`.
 ///
 /// Split at the **first** dot: a collection name may contain one, a database
@@ -869,6 +927,26 @@ fn read_password(from_dotfile: Option<&str>) -> Result<String> {
         );
     }
     Ok(password)
+}
+
+/// What a 403 or 404 from the login route means, when it means something.
+///
+/// `POST /v1/auth/login` answers 401 for a bad password and never 403 or 404
+/// of its own accord; both come from the node's `auth.local.login` mode
+/// (ADR-100) — `loopback_only` refuses a peer off the host with 403, and
+/// `disabled` answers 404 to everyone. Recovered from the typed error rather
+/// than from the message, for the reason `unauthorized_hint` is: a message is
+/// prose, and prose gets reworded. Anything else — a transport failure, a 401 —
+/// is left to speak for itself.
+fn local_login_hint(error: &kimmy_client::Error) -> Option<&'static str> {
+    match error {
+        kimmy_client::Error::Api { status: 403 | 404, .. } => Some(
+            "this node does not accept a local login from here (auth.local.login is \
+             loopback_only or disabled on it); log in from the node's own host, or use the \
+             federated `kimmy login`. A token already issued keeps working",
+        ),
+        _ => None,
+    }
 }
 
 /// What to suggest after a 401.
@@ -3099,6 +3177,24 @@ mod tests {
     }
 
     #[test]
+    fn a_login_refused_by_the_node_s_mode_gets_a_hint_and_nothing_else_does() {
+        // 403 and 404 from the login route can only be `auth.local.login`
+        // (ADR-100): the route answers 401 for a bad password, so those two
+        // are the ones worth explaining, and the explanation names the setting.
+        for status in [403, 404] {
+            let code = if status == 403 { ErrorCode::Forbidden } else { ErrorCode::NotFound };
+            let hint = local_login_hint(&api_error(status, code)).expect("a hint");
+            assert!(hint.contains("auth.local.login"), "{hint}");
+            assert!(hint.contains("kimmy login"), "say what to do instead: {hint}");
+        }
+
+        // A wrong password is a 401 and already has its own hint; a node that
+        // could not be reached is not a policy. Neither gets this one.
+        assert!(local_login_hint(&api_error(401, ErrorCode::Unauthorized)).is_none());
+        assert!(local_login_hint(&kimmy_client::Error::NotAuthenticated).is_none());
+    }
+
+    #[test]
     fn creating_a_collection_that_exists_succeeds() {
         // The command exists to leave the caller with a collection. It did.
         let out = collection_created(Err(api_error(409, ErrorCode::Conflict)), "orders")
@@ -3171,5 +3267,21 @@ mod tests {
         let bare = search_body(Some("q"), None, 3, None, None).unwrap();
         assert!(bare.get("filter").is_none(), "an absent filter must not be sent as null");
         assert!(bare.get("per_document").is_none());
+    }
+
+    #[test]
+    fn fusion_controls_are_sent_only_when_given() {
+        let base = search_body(Some("q"), None, 3, None, None).unwrap();
+
+        let bare = with_fusion_controls(base.clone(), None, None, None);
+        assert_eq!(bare, base, "a bare hybrid-search must send exactly what it always has");
+
+        let tilted = with_fusion_controls(base.clone(), Some(0.7), None, Some(2));
+        assert_eq!(tilted["weights"], json!({ "dense": 0.7 }), "the other weight is the server's");
+        assert_eq!(tilted["min_overlap"], 2);
+
+        let lexical_off = with_fusion_controls(base, None, Some(0.0), None);
+        assert_eq!(lexical_off["weights"], json!({ "lexical": 0.0 }));
+        assert!(lexical_off.get("min_overlap").is_none());
     }
 }

@@ -170,7 +170,7 @@ will need to re-authenticate rather than assuming a connection stays good.
 | Tool | |
 |---|---|
 | `vector_search` | Semantic k-NN, optionally composed with a filter |
-| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion. Scores are fusion ranks (around 0.03), not similarities, and not comparable with `vector_search` scores |
+| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion. Scores are fusion ranks (around 0.03), not similarities, and not comparable with `vector_search` scores. Takes the same arguments plus `weights` (`{dense, lexical}`) and `min_overlap`, which tune the fusion — see [Vectors](vectors.md) |
 
 Both require the collection to have embeddings configured — see
 [Vectors](vectors.md).
@@ -225,7 +225,8 @@ results that look like "no matching data" rather than "wrong field".
     { "path": "total",         "types": ["int"],    "presence": 1.0, "example": 25 }
   ],
   "indexes": [],
-  "vector": null
+  "vector": null,
+  "nodeDurability": "durable"
 }
 ```
 
@@ -240,6 +241,11 @@ Points worth understanding:
   not a schema, and nothing here is enforced.
 - **Recursion is bounded** at six levels, so one pathological document cannot
   produce a field list longer than the documents it describes.
+- **`nodeDurability` is about the node, not the collection**: `durable` or
+  `coalesced`, the class the node that answered commits under, the same value
+  `GET /v1/version` reports. Both are durable when a write returns; it is here
+  so a client that describes a collection before writing to it learns that in
+  the same call.
 
 The same information is available over REST at
 `GET /v1/db/{db}/coll/{coll}/describe`.

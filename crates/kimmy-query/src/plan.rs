@@ -49,6 +49,18 @@ pub struct IndexPlan {
     /// Always `false` for a `$in` union: equality probes select exact keys,
     /// which is sound on a multikey index — nothing is intersected.
     pub both_bounds: bool,
+    /// Whether every range pins a **complete** index key: an equality on each
+    /// of the index's fields, or a `$in` on its last field behind equalities
+    /// on the rest.
+    ///
+    /// Index entries sort by `(key, document key)`, so the entries under one
+    /// complete key are already in document-key order and hold each document
+    /// at most once. An exact plan's candidates can therefore be streamed in
+    /// `_id` order straight off the index — one probe as one run, several as
+    /// a merge — where an inexact range (a prefix of a compound index, or any
+    /// `$gt`/`$lt`) spans many keys whose document keys interleave, and has to
+    /// be put in order by the executor.
+    pub exact: bool,
 }
 
 /// Greater than the first byte of any encoded component.
@@ -239,7 +251,8 @@ fn gather_containment(filter: &Filter, out: &mut Vec<(String, PartialOp)>) {
                 }
             }
         }
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue => {}
+        // An expression proves nothing the partial-filter vocabulary can state.
+        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
     }
 }
 
@@ -290,8 +303,11 @@ fn collect(filter: &Filter, out: &mut HashMap<String, Bounds>) {
                 }
             }
         }
-        // A disjunction constrains nothing that must universally hold.
-        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue => {}
+        // A disjunction constrains nothing that must universally hold, and an
+        // `$expr` names no field it puts bounds on: `{$gt: ["$a", "$b"]}` is
+        // a relation between two values that an index on either cannot see.
+        // It is always the scan's, or the residual re-check's, to answer.
+        Filter::Or(_) | Filter::Nor(_) | Filter::AlwaysTrue | Filter::Expr(_) => {}
     }
 }
 
@@ -340,6 +356,9 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
             ranges,
             fields_used: prefix.len() + 1,
             both_bounds: false,
+            // Every probe is a complete key exactly when the `$in` lands on
+            // the index's last field.
+            exact: prefix.len() + 1 == index.fields.len(),
         });
     }
 
@@ -347,6 +366,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
     let mut upper = prefix.clone();
     let mut used = prefix.len();
     let mut both_bounds = false;
+    let mut ranged = false;
 
     if let Some(field) = index.fields.get(prefix.len())
         && let Some(bounds) = predicates.get(&field.path)
@@ -398,6 +418,7 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
             (None, None) => unreachable!("checked above"),
         }
         used += 1;
+        ranged = true;
     }
 
     if used == 0 {
@@ -419,6 +440,9 @@ fn plan_for(index: &IndexMeta, predicates: &HashMap<String, Bounds>) -> Option<I
         ranges: vec![(lower_bytes, upper_bytes)],
         fields_used: used,
         both_bounds,
+        // Only an equality on every field pins one key; a range component,
+        // or a prefix that stops short, leaves the rest of the key free.
+        exact: !ranged && used == index.fields.len(),
     })
 }
 
@@ -694,6 +718,36 @@ mod tests {
     }
 
     #[test]
+    fn an_expr_alone_selects_no_index() {
+        let idx = [
+            index(1, vec![IndexField::ascending("spent")]),
+            index(2, vec![IndexField::ascending("budget")]),
+        ];
+        assert!(plan(doc! { "$expr": { "$gt": ["$spent", "$budget"] } }, &idx).is_none());
+        // Even when the expression is a constant comparison on one indexed
+        // field: the planner does not read into expressions.
+        assert!(plan(doc! { "$expr": { "$gt": ["$spent", 100] } }, &idx).is_none());
+        // Nor does it pin a primary key.
+        assert!(pk(doc! { "$expr": { "$eq": ["$_id", 5] } }).is_none());
+    }
+
+    #[test]
+    fn a_conjunction_containing_an_expr_still_uses_the_indexable_conjunct() {
+        let idx = [index(1, vec![IndexField::ascending("account")])];
+        let p = plan(doc! { "account": "acme", "$expr": { "$gt": ["$spent", "$budget"] } }, &idx)
+            .expect("the equality on account should plan");
+        assert_eq!(p.index_id, 1);
+        assert_eq!(p.fields_used, 1);
+        // The same through an explicit `$and`.
+        let p = plan(
+            doc! { "$and": [ { "account": "acme" }, { "$expr": { "$gt": ["$spent", "$budget"] } } ] },
+            &idx,
+        )
+        .expect("the equality on account should plan");
+        assert_eq!(p.index_id, 1);
+    }
+
+    #[test]
     fn a_conjunction_containing_a_disjunction_still_uses_the_conjunct() {
         // `a == 1` must hold for every match, so narrowing on it is safe.
         let idx = [index(0, vec![IndexField::ascending("a")])];
@@ -815,6 +869,40 @@ mod tests {
         let a = plan(doc! { "n": 5i32 }, &idx).unwrap();
         let b = plan(doc! { "n": 5.0 }, &idx).unwrap();
         assert_eq!(a.ranges, b.ranges);
+    }
+
+    #[test]
+    fn a_plan_is_exact_only_when_every_field_is_pinned() {
+        // The flag the executor streams on. Wrong in the `true` direction and
+        // an index-backed `find` hands back candidates out of `_id` order,
+        // which a cursor would then page wrongly; wrong in the `false`
+        // direction and it merely does more work. So the `true` cases are the
+        // ones that must be precise.
+        let single = [index(0, vec![IndexField::ascending("a")])];
+        let compound = [index(0, vec![IndexField::ascending("a"), IndexField::ascending("b")])];
+
+        assert!(plan(doc! { "a": 1 }, &single).unwrap().exact, "one field, one equality");
+        assert!(plan(doc! { "a": { "$in": [1, 2] } }, &single).unwrap().exact, "probes");
+        assert!(plan(doc! { "a": 1, "b": 2 }, &compound).unwrap().exact, "both pinned");
+        assert!(
+            plan(doc! { "a": 1, "b": { "$in": [2, 3] } }, &compound).unwrap().exact,
+            "a $in on the last field behind an equality prefix"
+        );
+
+        assert!(!plan(doc! { "a": { "$gte": 1 } }, &single).unwrap().exact, "a range");
+        assert!(
+            !plan(doc! { "a": { "$gte": 1, "$lte": 5 } }, &single).unwrap().exact,
+            "a two-sided range is still a range"
+        );
+        assert!(!plan(doc! { "a": 1 }, &compound).unwrap().exact, "a prefix leaves b free");
+        assert!(
+            !plan(doc! { "a": { "$in": [1, 2] } }, &compound).unwrap().exact,
+            "probes on a prefix leave b free"
+        );
+        assert!(
+            !plan(doc! { "a": 1, "b": { "$gt": 2 } }, &compound).unwrap().exact,
+            "an equality prefix with a range after it"
+        );
     }
 
     #[test]
