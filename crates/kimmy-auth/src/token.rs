@@ -16,11 +16,16 @@ use crate::rbac::{Grant, Principal};
 
 /// Shortest signing secret `TokenIssuer` will accept.
 ///
-/// A short secret makes offline brute force cheap, and the whole cluster shares
-/// this one value. Public so a caller can refuse a bad secret *before* building
-/// an issuer — `kimmyd` checks it while validating configuration, so
+/// 32 bytes is the floor RFC 7518 §3.2 sets for HS256: a key shorter than the
+/// hash's 256-bit output has less entropy than the MAC it feeds, and a short
+/// secret makes offline brute force cheap — one captured token is enough
+/// material to try guesses against, and the whole cluster shares this one
+/// value. Public so a caller can refuse a bad secret *before* building an
+/// issuer — `kimmyd` checks it while validating configuration, so
 /// `check-config` answers the same question the server would.
-pub const MIN_SECRET_LEN: usize = 16;
+///
+/// Was 16 up to 0.16.x (ADR-093).
+pub const MIN_SECRET_LEN: usize = 32;
 
 /// The claims KimmyDB puts in a token.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,7 +152,7 @@ mod tests {
     use super::*;
     use crate::rbac::Action;
 
-    const SECRET: &str = "a-sufficiently-long-test-secret";
+    const SECRET: &str = "a-sufficiently-long-test-secret-for-hs256";
 
     fn issuer() -> TokenIssuer {
         TokenIssuer::new(SECRET, 3600).unwrap()
@@ -195,7 +200,7 @@ mod tests {
     #[test]
     fn a_token_signed_with_another_secret_is_rejected() {
         let token = issuer().issue(&analyst()).unwrap();
-        let other = TokenIssuer::new("a-completely-different-secret", 3600).unwrap();
+        let other = TokenIssuer::new("a-completely-different-secret-of-full-length", 3600).unwrap();
         assert!(matches!(other.verify(&token), Err(AuthError::InvalidToken)));
     }
 
@@ -266,7 +271,22 @@ mod tests {
         // The whole cluster shares this value, so a weak one is a cluster-wide
         // weakness rather than a local one.
         assert!(matches!(TokenIssuer::new("short", 3600), Err(AuthError::WeakSecret { .. })));
-        assert!(TokenIssuer::new("0123456789abcdef", 3600).is_ok());
+
+        // The floor is the HS256 key size RFC 7518 §3.2 asks for, 256 bits.
+        // Sixteen bytes was accepted up to 0.16.x and is refused now; the
+        // error names the floor so an operator with such a secret learns the
+        // number without opening the source.
+        assert_eq!(MIN_SECRET_LEN, 32);
+        let sixteen = "0123456789abcdef";
+        match TokenIssuer::new(sixteen, 3600) {
+            Err(AuthError::WeakSecret { min }) => assert_eq!(min, 32),
+            other => panic!("a 16-byte secret must be refused, got {:?}", other.is_ok()),
+        }
+        assert!(matches!(
+            TokenIssuer::new("0123456789abcdef0123456789abcde", 3600),
+            Err(AuthError::WeakSecret { .. })
+        ));
+        assert!(TokenIssuer::new("0123456789abcdef0123456789abcdef", 3600).is_ok());
     }
 
     #[test]

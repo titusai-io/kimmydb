@@ -193,10 +193,11 @@ both — mixing them is rejected rather than guessed at.
 | Operator | Behaviour |
 |---|---|
 | `$set` `$unset` | Set / remove, at any dot path |
+| `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
 | `$inc` `$mul` | Arithmetic; a missing field starts at `0` |
 | `$min` `$max` | Set only if smaller / larger |
-| `$push` | Append; `{"$each": [...]}` appends several |
-| `$addToSet` | Append only if not already present |
+| `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
+| `$addToSet` | Append only if not already present; takes `$each` |
 | `$pull` `$pop` | Remove matching elements / one end |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
@@ -204,6 +205,53 @@ both — mixing them is rejected rather than guessed at.
 ```javascript
 { "$inc": { "qty": -1 }, "$push": { "history": "shipped" } }
 ```
+
+### `$push` modifiers
+
+With `$each`, `$push` takes the three modifiers that turn an append into a
+bounded, ordered list. They apply in a fixed order — **`$position`, then
+`$sort`, then `$slice`** — so the last one always decides what is kept:
+
+```javascript
+// A capped history: add an event, keep the newest 100 in time order
+{ "$push": { "events": {
+    "$each":  [ { "t": 1725000000, "kind": "shipped" } ],
+    "$sort":  { "t": 1 },
+    "$slice": -100 } } }
+```
+
+| Modifier | Meaning |
+|---|---|
+| `$position: n` | Insert the `$each` values at index `n`; negative counts from the end; past either end clamps to it |
+| `$sort: 1 \| -1` | Order whole elements, in the [canonical order](#3-comparisons-do-not-cross-type-groups) |
+| `$sort: {field: 1 \| -1, …}` | Order elements that are documents by these fields, dotted paths allowed; an element missing a field sorts as `null` |
+| `$slice: n` | Keep the first `n` elements; negative keeps the last `n`; `0` empties the array |
+
+A modifier without `$each` is an error, as is a clause `$push` does not know —
+a document argument with any `$`-prefixed key is read as modifiers, never
+pushed as a value. `{"$each": []}` with `$sort` or `$slice` reshapes the array
+without adding to it. `$addToSet` takes `$each` and no other modifier: a set
+has no order to sort or position in.
+
+### `$setOnInsert`
+
+Written only to the document an upsert *creates*; on a match the operator does
+nothing and the field keeps whatever it held. The inserted document is built as
+the filter's equalities, then `$setOnInsert`, then every other operator:
+
+```javascript
+// find_and_modify with upsert: true
+{ "filter": { "_id": "hits" },
+  "update": { "$setOnInsert": { "created_at": 1725000000 }, "$inc": { "n": 1 } } }
+// first call creates { _id: "hits", created_at: 1725000000, n: 1 }
+// every later call increments n and leaves created_at alone
+```
+
+A `$setOnInsert` path that another operator in the same update also writes —
+the same path, or one inside the other, counting a `$rename`'s destination — is
+**rejected at parse time**, as MongoDB rejects it: the two would disagree about
+the inserted document. Other operator pairs are not checked against each other
+and apply in the order written (see [Deviations](deviations.md)).
 
 ### Integers stay integral
 
@@ -288,7 +336,8 @@ queue never hands out the same job twice.
 - **`upsert` seeds the filter's equalities.** `{filter: {_id: "hits", scope:
   "global"}, update: {$inc: {n: 1}}, upsert: true}` creates
   `{_id: "hits", scope: "global", n: 1}`. An equality inside `$or` is **not**
-  seeded, because a match does not imply it.
+  seeded, because a match does not imply it. `$setOnInsert` fields are added
+  to that seed before the other operators run, and only on the insert.
 - **A removal is an ordinary delete** in the change stream and to replication.
 - **`if_stamp` makes it conditional** on the chosen document being at that
   version — `409 stale` and nothing written otherwise. Cannot be combined
@@ -367,9 +416,8 @@ bad pattern in an `$or` should not take down the whole request.
 
 | Feature | Status |
 |---|---|
-| Index-backed `$in` (union of point lookups) | 📋 Planned |
-| Aggregation pipeline (`$match`, `$group`, `$unwind`, …) | 📋 Planned |
-| `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not a pipeline stage |
+| `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not an [aggregation](aggregation.md) stage |
+| `$pullAll`, `$bit`, and the positional update paths `$`, `$[]`, `$[<id>]` | 📋 Planned — the next tier of update-operator compatibility |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
