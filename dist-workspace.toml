@@ -39,6 +39,36 @@ targets = [
     "x86_64-unknown-linux-musl",
 ]
 
+# Software bills of materials, one per shipped binary per target (ADR-110).
+# dist runs the command in the global-artifacts job, after every platform
+# build, and uploads each file named below to the Release beside the
+# archives. `scripts/sbom.sh` says how the files are produced and why there
+# is one per target. The `.sha256` files are the script's too: dist checksums
+# only the archives it builds itself, so an extra artifact that wants one has
+# to bring its own. The target list is repeated here because this table takes
+# literal paths; keep it in step with `targets` above.
+[[dist.extra-artifacts]]
+build = [
+    "scripts/sbom.sh",
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+]
+artifacts = [
+    "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json",
+    "target/sbom/kimmyd-aarch64-apple-darwin.cdx.json.sha256",
+    "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json",
+    "target/sbom/kimmy-cli-aarch64-apple-darwin.cdx.json.sha256",
+    "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json",
+    "target/sbom/kimmyd-aarch64-unknown-linux-musl.cdx.json.sha256",
+    "target/sbom/kimmy-cli-aarch64-unknown-linux-musl.cdx.json",
+    "target/sbom/kimmy-cli-aarch64-unknown-linux-musl.cdx.json.sha256",
+    "target/sbom/kimmyd-x86_64-unknown-linux-musl.cdx.json",
+    "target/sbom/kimmyd-x86_64-unknown-linux-musl.cdx.json.sha256",
+    "target/sbom/kimmy-cli-x86_64-unknown-linux-musl.cdx.json",
+    "target/sbom/kimmy-cli-x86_64-unknown-linux-musl.cdx.json.sha256",
+]
+
 # Native runners for both Linux architectures. Without the arm mapping dist
 # would cross-compile from x86_64, and ring's C and assembly make a native
 # toolchain the path that cannot surprise anyone.
