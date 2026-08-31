@@ -343,9 +343,12 @@ impl KimmyMcp {
     /// Query documents.
     #[tool(description = "Find documents matching a filter. Supports the MongoDB-style \
                        operators $eq $ne $gt $gte $lt $lte $in $nin $exists $type $regex \
-                       $all $size $elemMatch $and $or $not $nor. Use this for exact and \
-                       range conditions; use vector_search when the question is about \
-                       meaning rather than a value.")]
+                       $all $size $elemMatch $and $or $not $nor, and $expr for an \
+                       aggregation expression over the document, e.g. \
+                       {\"$expr\": {\"$gt\": [\"$spent\", \"$budget\"]}} to compare two \
+                       fields. Use this for exact and range conditions; use \
+                       vector_search when the question is about meaning rather than a \
+                       value.")]
     async fn find(
         &self,
         Parameters(args): Parameters<FindArgs>,

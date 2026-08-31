@@ -205,16 +205,23 @@ insecure_no_auth = false
 root_user = "root"
 
 # Prefer KIMMY_ROOT_PASSWORD over writing this down.
+#
+# The value below, like every placeholder in this repository's examples and
+# compose file (`changeme`, `hunter2`, `password`, ...), is refused when the
+# node listens on anything other than a loopback address: a value every reader
+# of the repository holds is not a secret. See docs/security.md and ADR-093.
 # root_password = "change-me"
 
 # Signing key for JWTs. **Required whenever authentication is on** — a single
 # node too, not just a cluster: without one the server would sign tokens with a
 # constant compiled into the binary, so anyone could forge one. It refuses to
-# start instead. 16 bytes minimum. In a cluster every node must use the *same*
-# value, or a token issued by one node will be rejected by the next node a
-# request reaches. Prefer KIMMY_JWT_SECRET over writing this down, which is why
-# it stays commented here — `check-config` on this file needs both it and
-# KIMMY_ROOT_PASSWORD in the environment.
+# start instead. 32 bytes minimum (the HS256 key floor of RFC 7518 §3.2; it was
+# 16 up to 0.16.x). In a cluster every node must use the *same* value, or a
+# token issued by one node will be rejected by the next node a request reaches.
+# Prefer KIMMY_JWT_SECRET over writing this down, which is why it stays
+# commented here — `check-config` on this file needs both it and
+# KIMMY_ROOT_PASSWORD in the environment. The placeholder below is refused off
+# loopback, as above.
 # jwt_secret = "generate-me-with-openssl-rand-base64-32"
 
 token_ttl_secs = 3600
@@ -413,7 +420,8 @@ bind = "0.0.0.0:7900"
 seeds = []
 
 # Shared secret authenticating node-to-node traffic. Required when clustering:
-# without it any host that can reach the gossip port could inject writes.
+# without it any host that can reach the gossip port could inject writes. The
+# placeholder below is refused when either listener is off loopback (ADR-093).
 # cluster_secret = "generate-me-with-openssl-rand-base64-32"
 
 # How often to run an anti-entropy round against each known peer.
@@ -564,3 +572,32 @@ format = "pretty"
 # one-way flag --disable-vector-worker (KIMMY_DISABLE_VECTOR_WORKER).
 [vector]
 worker_enabled = true
+
+# How the worker gathers documents into provider calls (ADR-095). The provider
+# takes a batch; the worker fills one from consecutive documents of the same
+# collection rather than sending each document's chunks alone. Measured against
+# a CPU llama.cpp server: 32 calls of one short input took 394 ms, one call of
+# 32 took 18 ms -- the difference between a live ingest that keeps up and one
+# whose backlog grows without bound.
+#
+# These describe the round trip this node makes, which is why they are here and
+# not in a collection's vector configuration. A batch only ever holds one
+# collection's documents, so each collection's provider, model and prefix are
+# respected as before, and the storage write stays per document.
+[vector.batch]
+# The most chunks in one call. Below every hosted provider's per-request input
+# cap, so a batch is never re-split by the provider.
+max_chunks = 32
+
+# The most estimated tokens in one call, by the estimate a collection's
+# chunk.max_tokens uses (one token per two bytes of UTF-8, an overestimate).
+# The default is 32 chunks at the default chunk ceiling -- about 64 KiB of
+# text. A single document over this goes alone rather than being split.
+max_tokens = 32768
+
+# How long a partial batch waits for more documents before it is sent, in
+# milliseconds. Only waited when the stream is idle -- on a backlog the next
+# document is already there -- so a quiet collection's document is delayed by
+# at most this much, less than the remote round trip it saves. 0 sends
+# whatever has queued the moment the stream is idle. Refused above 10000.
+max_wait_ms = 100
