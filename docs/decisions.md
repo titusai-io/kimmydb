@@ -2901,6 +2901,12 @@ so the first release is preceded by a prerelease shakeout. And dist skips
 publish jobs on prerelease tags by default, which is the safe default and
 means the shakeout proves the build half only.
 
+**Amended 2026-08-30 — the image no longer compiles.** The Dockerfile's
+release-mode build, which is what made QEMU untenable above, is no longer on
+the release path: the image ships the `kimmyd` from the release archive for
+its architecture, and the two native runners and the manifest merge remain
+for the reasons ADR-107 gives.
+
 ---
 
 ## ADR-064 — Two verifiers, routed by the issuer a token claims
@@ -5259,5 +5265,63 @@ element-wise over arrays. The pairs disagree on precisely the inputs
 puts the two readings side by side with the rule of thumb that resolves them:
 a constant on the right means the ordinary operator; a field or a computation
 on the right means `$expr`.
+
+---
+
+## ADR-107 — The container image ships the release archive's binary
+
+**Decision.** `publish-ghcr.yml` compiles nothing. Each architecture's image
+is built with the Dockerfile's `prebuilt` stage from the `kimmyd` inside the
+`kimmyd-<target>.tar.xz` that `build-local-artifacts` produced for that
+target — taken from the release run's own workflow artifacts, or from the
+GitHub Release on a manual dispatch — after verifying dist's checksum and
+running the binary once on the runner that will build its image. The two
+native runners, the digest-then-merge manifest and the tags of ADR-063 stay.
+
+**Why.** ADR-063 rejected QEMU because the Dockerfile compiled the workspace,
+and it compiled it once more per architecture *after* dist had built the
+same target: nine minutes on amd64 in a nineteen-minute release, for a binary
+that already existed. Worse than the time was the provenance. The file in the
+image and the file on the Release page were two builds of one commit — and
+not even the same kind of build: the Dockerfile linked against the Debian
+image's glibc while the archive is the static musl binary ADR-063 chose so
+that one file runs on any distribution and in a `scratch` container. Nothing
+checked that the two agreed. Now they are one file: the archive's checksum is
+verified before the image is built, and the binary in the image is the one
+anyone can download and hash. `--version` on the runner catches an archive of
+the wrong architecture before anything is pushed, and it prints the commit
+the binary carries, which dist's checkout bakes in.
+
+**What changes for the container.** Its `kimmyd` is now the musl binary,
+which is what every other channel already ships. The one difference an
+operator could observe is the allocator: the workspace sets no global
+allocator, so the container moves from glibc's malloc to musl's, which is
+slower under heavy multithreaded allocation. If that shows up in a
+measurement, the answer is a global allocator in `kimmyd` — one change that
+then applies to every channel alike — not a second build of the server for
+the container.
+
+**Alternatives.** One buildx invocation for both platforms under QEMU, with
+the binary chosen by `TARGETARCH`, would remove the merge job; not taken,
+because the runtime stage's apt layer would then run emulated for arm64 while
+native arm64 runners are free, and because the merge flow is the code that
+has produced every tag so far. Downloading from the Release in the release
+flow too, for one code path instead of two: rejected because the workflow
+artifact is the same file one hop closer, and the Release download exists for
+the dispatch, which has no run to draw on. `cache-builds` in dist, a
+rust-cache in `build-local-artifacts`: evaluated and left off — a cache is
+readable only from the ref that wrote it or from the default branch, no job
+on main builds the musl targets, and each tag would write a set of caches a
+gigabyte or more that no later tag could read, against the 10 GiB budget CI
+already had to be pruned back under.
+
+**Cost.** The image on GHCR depends on dist having built the archive first,
+which the job order in `release.yml` already guaranteed (`custom-publish-ghcr`
+runs after `host`); a dispatched republish depends on the Release's assets
+still being there. The `GIT_COMMIT` build argument is passed by nothing on the
+release path any more; it stays in the Dockerfile for the default stage and a
+laptop build. And a `docker build` from a checkout still compiles, so the
+laptop image and the published one are built differently — the published one
+is now the one whose binary can be checked against a published hash.
 
 ---

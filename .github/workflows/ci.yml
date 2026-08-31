@@ -10,14 +10,21 @@ on:
     paths-ignore:
       - "**.md"
       - "docs/**"
+  # A run on request, for re-checking main without pushing to it: after a run
+  # was cancelled or its runner lost, or to rewrite the caches after a quiet
+  # week has let them age out.
+  workflow_dispatch:
 
 # Successive pushes to the same branch supersede each other: only the newest
 # commit's run is ever read, so the older ones burn minutes computing an answer
-# nobody looks at. Cancel them. Keyed on the ref so a push to main never cancels
-# a concurrent PR run.
+# nobody looks at. Cancel them — everywhere but on main. A cancelled run on
+# main is a commit whose verdict was never delivered: a failing run there was
+# cancelled by the push that followed it, and the break went unreported for an
+# hour. On main every run finishes. The group is still keyed on the ref so a
+# push to main never cancels a concurrent PR run.
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,8 +34,16 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
-  check:
-    name: fmt, clippy, test
+  # The pull-request gate is two jobs so that the cheap verdicts arrive first:
+  # formatting and clippy are done in about a minute against a warm cache, the
+  # test suite takes most of ten. As one job, a formatting slip was reported
+  # only after the tests had run to the end. Each job restores its own cache
+  # rather than a shared one, because rust-cache keys on the job and the two
+  # compile different things — clippy keeps check metadata, the tests keep
+  # test binaries — so a cache saved by the other would be a cold start with
+  # extra steps.
+  lint:
+    name: fmt, clippy
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -56,17 +71,72 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --workspace
-
       # ADR-001 and ADR-016 both cite keeping the build free of a C toolchain.
       # That stopped being true in M2 and nobody noticed for two milestones,
       # because the claim lived in prose that nothing checked. This is the
       # narrower rule that replaced it, enforced: do not add a second native
       # stack. Adding one is still allowed — it just has to be a deliberate
-      # line in scripts/allowed-native-deps.txt rather than a surprise.
+      # line in scripts/allowed-native-deps.txt rather than a surprise. It
+      # rides with the fast job because `cargo tree` reads the lockfile and
+      # compiles nothing.
       - name: Native build dependencies
         run: ./scripts/check-native-deps.sh
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # Save only from main — see the note on the `lint` job above.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # nextest rather than `cargo test`: every test runs in its own process,
+      # so a panic, a leaked thread or a stray global in one test cannot take
+      # the rest of its binary down with it, and a failure is reported against
+      # the test that failed rather than the binary that died. And the test
+      # binaries of all the workspace's crates run at once instead of one
+      # binary after another, which is where the time went on a workspace of
+      # a dozen small crates. nextest does not run doctests; the step after
+      # runs them with `cargo test --doc`, against the same build artifacts.
+      # Pinned to a release of the installer rather than its floating tag.
+      - name: Install nextest
+        uses: taiki-e/install-action@v2.87.2
+        with:
+          tool: nextest
+
+      - name: Test
+        run: cargo nextest run --workspace
+
+      - name: Doctests
+        run: cargo test --workspace --doc
+
+  # The required status check on main is the context `fmt, clippy, test`, from
+  # when that was one job. This job keeps that context reporting — green when
+  # both halves passed, red otherwise — so the branch protection rule did not
+  # have to change in the same instant as this file. Not run when the run was
+  # cancelled: a superseded PR run has no verdict to deliver. To retire it,
+  # require `fmt, clippy` and `test` in the repository settings instead, then
+  # delete it here.
+  check:
+    name: fmt, clippy, test
+    needs: [lint, test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both halves passed
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "lint, test: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
 
   cluster:
     name: cluster harness
@@ -78,7 +148,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Save only from main — see the note on the `check` job above.
+      # Save only from main — see the note on the `lint` job above.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -103,7 +173,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Save only from main — see the note on the `check` job above.
+      # Save only from main — see the note on the `lint` job above.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -137,7 +207,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
-      # Save only from main — see the note on the `check` job above.
+      # Save only from main — see the note on the `lint` job above.
       - uses: Swatinem/rust-cache@v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -259,7 +329,9 @@ jobs:
       # compiling inside BuildKit, which was the single slowest step in CI:
       # `target/` is dockerignored and no Rust cache reaches a BuildKit cache
       # mount, so every push paid a cold release build. The release publish
-      # still compiles in-container, per platform, with the default stage.
+      # uses the same stage, fed with the binary from the release archive for
+      # each architecture (publish-ghcr.yml), so this job also exercises the
+      # path a release takes.
       - uses: actions/download-artifact@v4
         with:
           name: kimmyd
