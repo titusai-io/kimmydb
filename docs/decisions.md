@@ -4413,3 +4413,84 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+## ADR-103 — HNSW graphs are built off the lock and live under a budget
+
+**Decision.** `IndexCache` takes its cache-wide lock only to look an entry up
+and to install one. The build itself — the O(n log n) graph construction and
+its reachability probe — runs between the two under a per-collection lock, on
+a thread the async runtime has been told about (`kimmy_storage::blocking`, the
+mechanism a storage commit uses for its fsync). A second search for a
+collection being built takes the graph that already exists, under the
+staleness rule ADR-022 set, or, when none exists, waits for that one build
+rather than starting another. The build reads only each chunk's key and
+vector, releases each vector as the graph copies it in, and keeps a sample of
+128 for the probe. Resident graphs are budgeted by
+`vector.index_cache.max_bytes` (default 512 MiB; `0` unbounded): each graph is
+charged an estimate, `chunks × (dim × 4 + 5,000) + Σ (key length + 24)`, and
+when installing one would exceed the budget the least recently searched graphs
+are evicted first. A graph larger than the whole budget is installed anyway,
+with a warning once. `/metrics` reports the resident total as
+`kimmy_vector_index_cache_bytes`.
+
+**Why.** Three findings from reading the build path, each a way for one
+vector collection to take a node down without any request being unreasonable.
+The build ran under the one lock every vector search on every collection goes
+through, so a 4 s rebuild at 4,000 vectors — minutes at tens of thousands —
+was 4 s in which no vector or hybrid search on the node returned; and it ran
+on an async worker, which is the defect the 0.16.2 commit fix removed from
+writes. The build materialised every `VectorRecord`, text included, and held
+them until the probe had finished, so its peak was the graph plus the whole
+shadow collection, paid every staleness window under writes and up to three
+times when a build was discarded. And graphs were never released: at 6.5 KB
+per 384-dimensional chunk — measured, and about twice what the vector alone
+suggests, because `hnsw_rs` spends about 5 KB per node on neighbour lists and
+per-layer tables whatever the width — a node's resident memory was the sum of
+every collection ever searched, with nothing to say where it would stop. The
+default is twice `storage.cache_bytes` rather than equal to it because the two
+evictions are not alike: a page-cache miss is microseconds, a graph eviction
+is a rebuild, so the graph budget is the one that should rarely be reached.
+It is a ceiling, not an allocation; a node whose searched collections fit in
+less uses less, as before.
+
+**Alternatives.**
+
+- *Parallel insertion.* `hnsw_rs::parallel_insert` was measured
+  ([Benchmarks](benchmarks.md)): 3–4× faster on a ten-core host, saturating
+  at four threads, with recall and reachability indistinguishable from the
+  sequential graph. Not adopted, for now: a four-thread pool is every core of
+  the hosts this project runs on, which returns the stall to the request path
+  in a different suit, and a pool bounded to half the cores is one thread on
+  those hosts anyway; it needs rayon as a direct dependency; and the
+  reachability thresholds (ADR-061) were sized over hundreds of sequential
+  builds, not three parallel ones. Recorded with its numbers so the decision
+  can be reopened with a rebuild backlog in hand.
+- *Memory-mapped graphs.* `hnsw_rs` can hold vectors as slices of a mapped
+  file, which would take the `dim × 4` term out of resident memory and leave
+  the 5 KB of bookkeeping — the larger term at common widths. Deferred: it
+  changes the snapshot layout and the failure modes of a torn file, for a
+  saving the budget already bounds.
+- *Serving graphs from disk.* The snapshots already persist a built graph
+  across restarts through `hnsw_rs`'s dump and reload; serving *from* the
+  file rather than reloading it whole is the path to a graph that needs no
+  budget at all. Deferred for the same reasons as mapping, of which it is the
+  larger half — and an evicted collection already comes back through its
+  snapshot, which is the cheap half.
+- *A per-collection opt-out of the graph* (`index: false`, so a collection
+  always scans). Left out: `VectorConfig` is a `deny_unknown_fields` struct
+  built literally in nine places across the crates, and a field with a
+  non-`false` default does not fit that shape cleanly; the size threshold and
+  the budget cover the case it was for.
+- *Refusing a search whose graph does not fit.* Rejected outright: the exact
+  path exists, and a memory policy must never change what a search returns.
+
+**Cost.** The size is an estimate, not an accounting — the allocator's own
+overhead sits on top, and an in-flight search holds its `Arc` past an
+eviction, so resident memory can exceed the budget briefly. A collection whose
+graph is evicted pays a snapshot reload, or a rebuild, on its next search, so
+a budget sized below the routinely searched set becomes churn;
+`kimmy_vector_index_cache_bytes` pinned at the bound is the sign. Concurrent
+searches for a collection with no graph yet all wait for the one build, which
+is the trade against duplicating it. One more per-collection lock, one more
+setting, one more series.
+
+---

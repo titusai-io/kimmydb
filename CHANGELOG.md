@@ -10,6 +10,47 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. One addition
+and two changes to the approximate vector index, all from reading how a graph
+is built and kept rather than from an incident: a rebuild no longer stalls
+every other collection's search or holds a copy of the collection's text while
+it runs, and resident graphs live under a budget instead of accumulating for
+the life of the process.
+
+### Added
+
+- **`vector.index_cache.max_bytes`** bounds the HNSW graphs a node keeps in
+  memory across its vector collections — 512 MiB by default, `0` for the old
+  unbounded behaviour. A graph costs about `dim × 4 + 5,000` bytes per chunk
+  (6.5 KB at 384 dimensions, 11 KB at 1,536 — measured, and about twice what
+  the vector alone suggests) and was kept for the life of the process once its
+  collection had been searched. Past the budget the least recently searched
+  graphs are evicted and their collections pay a snapshot reload, or a
+  rebuild, on their next search; a single graph larger than the whole budget
+  is held anyway, with a warning, because a search is never refused over
+  memory. `/metrics` gains `kimmy_vector_index_cache_bytes`, the resident
+  total by the same estimate (ADR-103).
+
+### Changed
+
+- **A graph is built off the index-cache lock.** It was built while holding
+  the lock every collection's entry lives in, so one collection's rebuild —
+  4 s at 4,000 vectors, minutes at tens of thousands — stalled vector and
+  hybrid search on every collection the node serves for that long, and did so
+  on an async worker thread. The lock is now held to look and to install; the
+  build runs under a per-collection lock on a thread the runtime is told
+  about, as a storage commit's fsync has been since 0.16.2; and concurrent
+  searches on the collection being built take the previous graph, or wait for
+  that one build rather than starting a duplicate.
+- **A build holds less.** It read every chunk record whole — text included —
+  and kept the lot until its reachability probe had finished, so a rebuild's
+  peak was the graph plus a copy of the shadow collection, every staleness
+  window under writes and up to three times when a build was discarded. It
+  now reads only keys and vectors, frees each vector as the graph takes it,
+  and probes with a 128-vector sample copied out first.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

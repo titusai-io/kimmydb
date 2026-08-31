@@ -54,6 +54,7 @@ fails fast on a bad volume mount.
 | `server.rate_limit.trusted_proxy_header` | — | — | Unset means use the socket peer. **Only set it if a proxy you control rewrites the header** |
 | `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiter's own memory; the key space is attacker-controlled |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
+| `vector.index_cache.max_bytes` | — | `536870912` | Bound on the HNSW graphs kept in memory across vector collections, least recently searched evicted first. About `dim × 4 + 5,000` bytes per chunk (6.5 KB at 384 dimensions, 11 KB at 1,536); size it so the routinely searched collections fit, or their searches pay a rebuild. A single graph over the whole bound is held anyway. `0` lifts the bound (ADR-103) |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
 | `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
@@ -345,6 +346,7 @@ port.
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
+| `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
 | `kimmy_requests_total` | HTTP requests handled |
 | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
 | `kimmy_authz_denied_total` | Refused by RBAC |
@@ -622,12 +624,27 @@ partially read.
 | TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
-| Resident memory | Roughly `storage.cache_bytes` plus indexes (HNSW graphs are held in memory per vector collection) plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, and freed heap is rarely returned to the OS. A restart is the reset |
+| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and freed heap is rarely returned to the OS. A restart is the reset |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly
 860 MB/day. Retention caps that at one window's worth, so provision for the data
 plus roughly `oplog_retention_secs` of log.
+
+**Vector collections and the graph budget.** A collection that is searched
+keeps its HNSW graph resident, at about `dim × 4 + 5,000` bytes per chunk —
+6.5 KB at 384 dimensions, 11 KB at 1,536; the 5,000 is the graph's own
+bookkeeping and does not shrink with narrower vectors. **The chunks of every
+collection that is searched routinely, times that per-chunk cost, must fit
+`vector.index_cache.max_bytes`**, or searches on evicted collections pay a
+rebuild: 4 s at 4,000 chunks of 384 dimensions, O(n log n) beyond, during
+which that collection's searches wait (other collections' do not). A rebuild
+also needs roughly one extra copy of the collection's vectors while it runs,
+on top of the graph. With snapshots on — the default for `kimmyd` — an
+evicted graph comes back by reloading its file rather than rebuilding, which
+is cheaper but still a full read. `kimmy_vector_index_cache_bytes` sitting at
+the bound while vector searches are slow is the signature of churn; raise the
+bound or drop graphs that are not earning their place.
 
 **A collection pass temporarily grows the file before it shrinks it.** redb is
 copy-on-write, so the transaction that removes records allocates new pages
