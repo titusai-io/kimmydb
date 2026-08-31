@@ -18,6 +18,7 @@ pub mod expiry;
 pub mod federation;
 pub mod json;
 pub mod limits;
+pub mod local_login;
 pub mod metrics;
 pub mod ownership;
 pub mod ratelimit;
@@ -45,6 +46,7 @@ pub use audit::AuditMode;
 pub use error::ApiError;
 pub use federation::Federation;
 pub use limits::RequestLimits;
+pub use local_login::LocalLogin;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use sessions::Sessions;
@@ -99,6 +101,7 @@ pub fn state_with_egress(
         members: std::sync::OnceLock::new(),
         federation: std::sync::OnceLock::new(),
         stale_peers: Default::default(),
+        local_login: std::sync::OnceLock::new(),
     }))
 }
 

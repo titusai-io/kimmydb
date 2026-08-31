@@ -140,6 +140,13 @@ route that takes a token). A client should treat a `429` as possible on every
 authenticated call, not only on login. See
 [Security](security.md#limits-on-authenticated-requests).
 
+**Login may be restricted to the host.** Under `auth.local.login =
+"loopback_only"`, `/v1/auth/login` and `/v1/auth/refresh` answer `403
+forbidden` to any connection whose TCP peer is not loopback; under `"disabled"`
+both answer `404`. A token already issued keeps working under either — the
+setting restricts minting, not verifying — and federated tokens are unaffected.
+See [Security](security.md#local-login-is-a-mode).
+
 ---
 
 ## Documents

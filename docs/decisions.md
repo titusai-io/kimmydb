@@ -4928,6 +4928,93 @@ it is on. The 429 counter is no longer a single-source number:
 
 ---
 
+## ADR-100 — Local login is a mode, and a federated subject has a display name that is never an identity
+
+**Decision.** Two settings, one about each way in.
+
+`auth.local.login` says where `POST /v1/auth/login` answers: `always` (the
+default, and exactly what shipped), `loopback_only` (only to a connection whose
+TCP peer is a loopback address; anyone else gets a 403 with the `forbidden`
+code), or `disabled` (the route answers 404). `/v1/auth/refresh` follows the
+same rule, because it mints a local token too. The mode governs **minting**
+and nothing else: a local token already issued keeps verifying under every
+mode, on every node, until it expires. Startup refuses `disabled` unless
+`auth.oidc` is configured, since a node with neither could authenticate
+nobody. The peer is the socket's, never a forwarded header — the setting is
+about who can reach the process, and a header is something a client writes.
+
+`auth.oidc.subject_claim` names a claim — `preferred_username`, `email`,
+`upn` — whose string value rides on a federated principal as its **display**
+name. It appears in the audit record (as `display`, only when it differs from
+the subject) and in `/v1/auth/whoami` (always, falling back to the subject).
+It appears nowhere else: `sub` remains the principal's name for authorization,
+role resolution, rate limiting, the `federated` flag and every comparison the
+server makes. A claim that is missing or not a string falls back to `sub`
+without refusing the token.
+
+**Why.** Federation made two things true at once that pulled in opposite
+directions. A node behind an identity provider still needs its break-glass
+root: ADR-067 reserved `admin` to local accounts precisely so that a
+misconfigured or compromised provider cannot mint a superuser, and that
+account is worthless if it cannot log in. But the password route is also the
+one unauthenticated endpoint that costs Argon2 work per attempt and accepts a
+guess from anywhere, and an operator whose people all arrive through the IdP
+has no reason to leave it open to the network. `loopback_only` is the middle
+position that keeps both properties: root is reachable from the host — over
+SSH, from a sidecar, through a tunnel — and unreachable from the network the
+IdP was meant to front. `disabled` exists for the deployment that has decided
+to run its emergency account elsewhere (a second node bound to loopback, say)
+and wants this one to hold no password door at all; the startup refusal keeps
+it from being chosen by accident on a node with no other way in.
+
+The subject claim answers a different complaint. A subject from a real
+provider is an opaque identifier — a GUID from Entra ID, a `00u…` string from
+Okta — and an audit line that says `user=3f2a…` tells the person reading it
+nothing until they open the provider's console. Every deployment that has
+tried to read its own audit trail has asked for the email. The tempting fix is
+to *use* the email as the principal, and it is wrong: an email is mutable (a
+rename at the provider would silently make one person two principals, or two
+people one), it is not unique across providers, and some providers let a user
+set it. `sub` is the one claim OpenID Connect makes stable and provider-scoped,
+which is why ADR-064 built on it. So the readable name is carried **beside**
+the identity, labelled as display, and consulted by nothing that decides
+anything. A principal whose email changes keeps its roles, because its roles
+never depended on the email; a test holds that.
+
+**Alternatives.**
+
+- *Remove local login entirely once `auth.oidc` is configured.* Rejected: it
+  deletes the break-glass account ADR-067 and ADR-074 both lean on, and the
+  canonical pattern elsewhere (Vault, MinIO, Grafana) is an emergency local
+  account kept alongside SSO, not removed by it.
+- *A 404 for `loopback_only` as well as `disabled`, to hide the route.* A 404
+  from a route that answers 200 to the neighbour is not a secret, it is a
+  puzzle; the route is documented and its existence is not the thing being
+  protected. 403 with the `forbidden` code says what happened, and the CLI can
+  turn it into advice. `disabled` answers 404 because there the route really
+  is absent from what this node offers.
+- *Honour `X-Forwarded-For` for the loopback test.* Rejected: the header is
+  client-supplied, and the login rate limiter already documents why trusting
+  one without a proxy that rewrites it is worse than nothing. A reverse proxy
+  on the same host will look like loopback, and the documentation says so
+  rather than the code pretending otherwise.
+- *Use the email as the principal, or key roles on it.* Rejected above; it is
+  the whole point of the decision.
+- *Put the display name in the local token.* There is no local token for a
+  federated principal, and minting one is the identity laundering ADR-065
+  refuses.
+
+**Cost.** A deployment that sets `loopback_only` behind a same-host reverse
+proxy gets no restriction from it and has to know that; the docs say it in
+three places. `refresh` under `loopback_only` refuses a client that logged in
+from the host and later refreshes from elsewhere, which is the rule applied
+consistently rather than a gap. The audit record grows a field that appears
+only on federated lines whose provider set the claim, and any collector
+keyed on the exact field set has one more optional field to know about.
+`whoami` grows a required `display` field, which is additive.
+
+---
+
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
 
 **Decision.** `{$expr: <expression>}` is a filter clause. It parses through

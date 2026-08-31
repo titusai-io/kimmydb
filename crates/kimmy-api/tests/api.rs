@@ -177,12 +177,26 @@ impl Server {
     /// The same, with the audience chosen — which is what decides whether this
     /// node names itself as an OAuth 2.0 protected resource (ADR-071).
     async fn start_federated_for(audience: &str) -> Self {
-        Self::start_federated_with(audience, kimmy_api::RateLimits::disabled()).await
+        Self::start_federated_with(audience, None, kimmy_api::RateLimits::disabled()).await
+    }
+
+    /// A federated server whose provider names its people by `claim` (ADR-100).
+    async fn start_federated_with_subject_claim(claim: &str) -> Self {
+        Self::start_federated_with(
+            oidc::AUDIENCE,
+            Some(claim.to_string()),
+            kimmy_api::RateLimits::disabled(),
+        )
+        .await
     }
 
     /// The same, with the limiters chosen — for the per-principal limit, whose
     /// key has to tell a federated subject from a local user (ADR-099).
-    async fn start_federated_with(audience: &str, limits: kimmy_api::RateLimits) -> Self {
+    async fn start_federated_with(
+        audience: &str,
+        subject_claim: Option<String>,
+        limits: kimmy_api::RateLimits,
+    ) -> Self {
         let server = Self::build(false, limits).await;
         let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
             issuer: oidc::ISSUER.into(),
@@ -200,6 +214,7 @@ impl Server {
             require_at_jwt: false,
             allow_federated_admin: false,
             max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -228,6 +243,7 @@ impl Server {
             require_at_jwt: false,
             allow_federated_admin,
             max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -298,6 +314,45 @@ impl Server {
 
     async fn root(&self) -> String {
         self.login("root", ROOT_PASSWORD).await
+    }
+
+    /// Drive one request through the router as though it arrived from `peer`.
+    ///
+    /// The real socket in `build` can only ever produce a loopback peer, which
+    /// is exactly the case `auth.local.login = "loopback_only"` admits. To
+    /// exercise the refusal, the request is handed to the router directly with
+    /// the connect-info extension a listener would have attached — the same
+    /// extension `ClientAddr` and `LocalMinting` read, set by hand.
+    async fn request_from(
+        &self,
+        peer: &str,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        body: Option<Value>,
+    ) -> Res {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let peer: SocketAddr = peer.parse().expect("a socket address");
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let payload = body.map(|b| b.to_string()).unwrap_or_default();
+        let mut request = request.body(axum::body::Body::from(payload)).expect("a request");
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+
+        let response =
+            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let status = response.status().as_u16();
+        let head = format!("{:?}", response.headers());
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        let body = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+        Res { status, body, head }
     }
 
     /// Write a peer's record into the node registry directly.
@@ -665,7 +720,8 @@ async fn a_bad_token_is_refused_before_it_can_spend_a_budget() {
 async fn a_federated_subject_named_like_a_local_user_has_its_own_budget() {
     // Whoever controls the name `root` at the identity provider must not be
     // able to spend the local root's budget, nor be charged for it.
-    let server = Server::start_federated_with(oidc::AUDIENCE, Server::principal_limits(1)).await;
+    let server =
+        Server::start_federated_with(oidc::AUDIENCE, None, Server::principal_limits(1)).await;
     let local = server.root().await;
     let federated = oidc::token(oidc::claims("root", json!(["kimmydb-analyst"])));
 
@@ -5594,6 +5650,231 @@ async fn a_federated_token_with_no_iat_is_refused_because_its_lifetime_is_unboun
     assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
     assert!(challenge.contains("carries no iat"), "{challenge}");
     assert!(challenge.contains("900 seconds"), "{challenge}");
+}
+
+// ---------------------------------------------------------------------------
+// The display name (ADR-100)
+// ---------------------------------------------------------------------------
+
+/// A subject shaped like a real provider's: opaque, and nothing a person
+/// would recognise in an audit line.
+const OPAQUE_SUBJECT: &str = "3f2a9c1e-7b4d-4e0a-9c1e-0f1e2d3c4b5a";
+
+fn opaque_claims(email: Option<&str>) -> Value {
+    let mut claims = oidc::claims(OPAQUE_SUBJECT, json!(["kimmydb-analyst"]));
+    if let Some(email) = email {
+        claims["email"] = json!(email);
+    }
+    claims
+}
+
+#[tokio::test]
+async fn whoami_reports_the_display_name_beside_the_identity() {
+    let server = Server::start_federated_with_subject_claim("email").await;
+
+    let token = oidc::token(opaque_claims(Some("ada@example.com")));
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    // Both, and in that order of importance: `user` is what every decision
+    // was made on, `display` is what a person reads.
+    assert_eq!(who.body["user"], OPAQUE_SUBJECT);
+    assert_eq!(who.body["display"], "ada@example.com");
+    assert_eq!(who.body["federated"], true);
+
+    // A token the provider minted without the claim is not refused; it just
+    // has no better name than its subject.
+    let who = server.get("/v1/auth/whoami", Some(&oidc::token(opaque_claims(None)))).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["display"], OPAQUE_SUBJECT);
+
+    // A local caller's display is its user name, always.
+    let who = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
+    assert_eq!(who.body["user"], "root");
+    assert_eq!(who.body["display"], "root");
+}
+
+#[tokio::test]
+async fn without_a_subject_claim_the_display_is_the_subject_even_when_the_token_carries_one() {
+    // The shipped default. A node that did not ask reads nothing extra out of
+    // the token, so nothing about adding the setting changes what it shows.
+    let server = Server::start_federated().await;
+    let who = server
+        .get("/v1/auth/whoami", Some(&oidc::token(opaque_claims(Some("ada@example.com")))))
+        .await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["display"], OPAQUE_SUBJECT);
+}
+
+#[tokio::test]
+async fn a_renamed_email_keeps_the_same_grants_because_the_identity_is_the_subject() {
+    // The property the whole decision rests on (ADR-100). Two tokens for one
+    // subject, minted before and after a rename at the provider, are the same
+    // principal for every purpose but presentation — the display is never an
+    // input to authorization.
+    let server = Server::start_federated_with_subject_claim("email").await;
+    let root = server.root().await;
+    server.post("/v1/db/sales/collections", Some(&root), json!({"name":"orders"})).await;
+
+    let before = oidc::token(opaque_claims(Some("ada@example.com")));
+    let after = oidc::token(opaque_claims(Some("ada.lovelace@example.com")));
+
+    for token in [&before, &after] {
+        assert_eq!(server.get("/v1/db/sales/coll/orders/docs", Some(token)).await.status, 200);
+    }
+    let was = server.get("/v1/auth/whoami", Some(&before)).await.body;
+    let now = server.get("/v1/auth/whoami", Some(&after)).await.body;
+    assert_eq!(was["user"], now["user"], "one subject, one identity");
+    assert_eq!(was["grants"], now["grants"], "and one set of grants");
+    assert_ne!(was["display"], now["display"], "only the presentation moved");
+}
+
+// ---------------------------------------------------------------------------
+// Local login modes (ADR-100)
+// ---------------------------------------------------------------------------
+
+/// A peer that is on some network and not on this host.
+const OFF_HOST: &str = "203.0.113.9:4000";
+
+fn credentials() -> Value {
+    json!({ "user": "root", "password": ROOT_PASSWORD })
+}
+
+#[tokio::test]
+async fn local_login_answers_every_peer_by_default() {
+    // Nothing about adding the mode may change what a node that did not set
+    // it does: the socket peer (loopback) and a peer off the host both log in.
+    let server = Server::start().await;
+    assert_eq!(server.state.local_login(), kimmy_api::LocalLogin::Always);
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 200);
+    let res =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body["token"].is_string());
+}
+
+#[tokio::test]
+async fn loopback_only_admits_the_host_and_refuses_the_network_with_a_403() {
+    let server = Server::start().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+
+    // The host, both families.
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 200);
+    let v6 = server
+        .request_from("[::1]:4000", "POST", "/v1/auth/login", None, Some(credentials()))
+        .await;
+    assert_eq!(v6.status, 200, "{:?}", v6.body);
+
+    // The network: refused before the password is looked at, in the API's own
+    // envelope, with the setting named so the caller knows it is policy and
+    // not a wrong password.
+    let res =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+    assert_eq!(res.body["error"], "forbidden");
+    assert_eq!(res.body["retry"], "no");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("auth.local.login"), "{message}");
+
+    // A private address is still not the host.
+    let lan = server
+        .request_from("10.0.0.5:4000", "POST", "/v1/auth/login", None, Some(credentials()))
+        .await;
+    assert_eq!(lan.status, 403, "{:?}", lan.body);
+}
+
+#[tokio::test]
+async fn loopback_only_governs_minting_and_not_verifying() {
+    // The property an operator relies on when flipping the mode on a live
+    // node: nobody's session ends, and a token minted from the host works
+    // from anywhere. Only *renewing* it is confined to the host, because
+    // refresh mints too.
+    let server = Server::start().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+    let token = server.root().await;
+
+    let who = server.request_from(OFF_HOST, "GET", "/v1/auth/whoami", Some(&token), None).await;
+    assert_eq!(who.status, 200, "a token already issued verifies off the host: {:?}", who.body);
+    assert_eq!(who.body["user"], "root");
+
+    let refreshed =
+        server.request_from(OFF_HOST, "POST", "/v1/auth/refresh", Some(&token), None).await;
+    assert_eq!(refreshed.status, 403, "{:?}", refreshed.body);
+    assert_eq!(refreshed.body["error"], "forbidden");
+    // Not an RBAC refusal, so not an `insufficient_scope` challenge: a header
+    // saying the principal lacks a grant would describe a refusal that did
+    // not happen.
+    assert!(
+        !refreshed.head.to_ascii_lowercase().contains("www-authenticate"),
+        "a refusal by mode is not a bearer challenge: {}",
+        refreshed.head
+    );
+
+    let refreshed = server.post("/v1/auth/refresh", Some(&token), json!({})).await;
+    assert_eq!(refreshed.status, 200, "from the host, refresh still works: {:?}", refreshed.body);
+    assert!(refreshed.body["token"].is_string());
+}
+
+#[tokio::test]
+async fn disabled_answers_404_from_everywhere_and_issued_tokens_keep_working() {
+    let server = Server::start().await;
+    // Minted before the door closes: the mode is fixed for the life of a
+    // process, so this is the order a real deployment sees across a restart
+    // with a still-valid token in hand.
+    let token = server.root().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::Disabled);
+
+    for res in [
+        server.post("/v1/auth/login", None, credentials()).await,
+        server.request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials())).await,
+    ] {
+        assert_eq!(res.status, 404, "{:?}", res.body);
+        assert_eq!(res.body["error"], "not_found");
+        assert!(res.body["message"].as_str().unwrap_or_default().contains("disabled"));
+    }
+
+    // Refresh is a 404 too, and the mode is checked *before* the token — a
+    // caller with none is not told to go and fetch one by a route that does
+    // not exist for them.
+    assert_eq!(server.post("/v1/auth/refresh", Some(&token), json!({})).await.status, 404);
+    let bare = server.post("/v1/auth/refresh", None, json!({})).await;
+    assert_eq!(bare.status, 404, "{:?}", bare.body);
+
+    // The token itself is untouched.
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["user"], "root");
+}
+
+#[tokio::test]
+async fn disabling_local_login_leaves_the_identity_provider_as_the_way_in() {
+    // The configuration `disabled` exists for, and the one startup allows it
+    // in: a federated caller is unaffected, because nothing about the mode
+    // touches the verifier a federated token is offered to.
+    let server = Server::start_federated().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::Disabled);
+
+    let token = oidc::token(oidc::claims("ada@example.com", json!(["kimmydb-analyst"])));
+    let who = server.get("/v1/auth/whoami", Some(&token)).await;
+    assert_eq!(who.status, 200, "{:?}", who.body);
+    assert_eq!(who.body["federated"], true);
+
+    assert_eq!(server.post("/v1/auth/login", None, credentials()).await.status, 404);
+}
+
+#[tokio::test]
+async fn a_refusal_by_mode_is_not_a_failed_login_for_the_limiter() {
+    // A refusal by policy costs no Argon2 work and reveals nothing about a
+    // password, so it must not spend the caller's failure budget: an operator
+    // who later reopens the route would otherwise find the host's neighbours
+    // pre-throttled by requests that were never attempts.
+    let server = Server::start_rate_limited(1).await;
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+    for _ in 0..3 {
+        let res = server
+            .request_from(OFF_HOST, "POST", "/v1/auth/login", None, Some(credentials()))
+            .await;
+        assert_eq!(res.status, 403, "never 429: {:?}", res.body);
+    }
 }
 
 // ---------------------------------------------------------------------------

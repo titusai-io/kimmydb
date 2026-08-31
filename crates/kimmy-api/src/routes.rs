@@ -218,6 +218,12 @@ async fn count_request(
     // bearer-protected resource. Challenging there would tell a client to come
     // back with a token, which is the opposite of what it should do.
     let challengeable = request.uri().path() != "/v1/auth/login";
+    // `/v1/auth/refresh` never refuses on grants — it takes no `require` — so
+    // a 403 from it can only be `auth.local.login` saying the peer is off the
+    // host (ADR-100). An `insufficient_scope` challenge there would describe a
+    // refusal that did not happen. Its 401s are still challenged: an expired
+    // token is exactly what a challenge is for.
+    let is_refresh = request.uri().path() == "/v1/auth/refresh";
 
     let span = timed.then(|| request_span(&request));
     let mut response = match &span {
@@ -225,7 +231,8 @@ async fn count_request(
         None => next.run(request).await,
     };
 
-    if challengeable {
+    let mode_refusal = is_refresh && response.status() == axum::http::StatusCode::FORBIDDEN;
+    if challengeable && !mode_refusal {
         add_challenge(&state, offered_credentials, &mut response);
     }
 
@@ -534,7 +541,13 @@ struct LoginRequest {
 /// Only *failed* attempts are recorded. A caller with correct credentials is not
 /// the thing being defended against, and a fleet re-authenticating on a short
 /// `token_ttl_secs` must not be throttled for succeeding.
+///
+/// `LocalMinting` comes first, before the body is even read: under
+/// `auth.local.login = "loopback_only"` a caller off the host is told no
+/// before any password crosses into the handler, and a refusal by mode is not
+/// a failed attempt for the limiter to count (ADR-100).
 async fn login(
+    _mint: crate::local_login::LocalMinting,
     State(state): State<SharedState>,
     client: crate::state::ClientAddr,
     JsonBody(body): JsonBody<LoginRequest>,
@@ -592,7 +605,17 @@ async fn login(
 ///
 /// Not rate-limited. The login limiter exists to bound Argon2 work, and there
 /// is none here; this route verifies a signature and reads one record.
-async fn refresh(State(state): State<SharedState>, auth: Auth) -> Result<Json<Value>, ApiError> {
+///
+/// Bound by `auth.local.login` exactly as `login` is, because this mints a
+/// local token too (ADR-100): a mode that closed login and left refresh open
+/// would let a session opened from the host be extended forever from anywhere.
+/// `LocalMinting` is declared before `Auth` so that under `disabled` the
+/// answer is the mode's 404 for everyone, not a 401 inviting a token fetch.
+async fn refresh(
+    _mint: crate::local_login::LocalMinting,
+    State(state): State<SharedState>,
+    auth: Auth,
+) -> Result<Json<Value>, ApiError> {
     if auth.principal().unauthenticated {
         return Err(ApiError::bad_request(
             "this node runs with authentication disabled, so there is no token to refresh",

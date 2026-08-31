@@ -424,8 +424,39 @@ pub struct AuthConfig {
     #[serde(serialize_with = "redact")]
     pub jwt_secret: Option<String>,
     pub token_ttl_secs: u64,
+    /// Where the password login answers (ADR-100).
+    pub local: LocalConfig,
     /// Federation with an external OpenID Connect provider.
     pub oidc: OidcConfig,
+}
+
+/// The local, password-and-user-store half of authentication.
+///
+/// A section of its own rather than a key on `[auth]` so that what is being
+/// configured is named: `auth.local.login` reads as "where the *local* login
+/// answers", beside `auth.oidc.*` for the other way in. Local tokens are
+/// verified everywhere regardless of anything here — this section is about
+/// minting them, and the field documentation says so.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LocalConfig {
+    /// Where `POST /v1/auth/login` (and `/v1/auth/refresh`, which mints too)
+    /// answers: `always`, `loopback_only` or `disabled`.
+    ///
+    /// `loopback_only` judges the **TCP peer** of the connection and ignores
+    /// any forwarded header, so a reverse proxy on the same host makes every
+    /// caller look local. `disabled` is refused unless `auth.oidc` is
+    /// configured — see [`Config::validate`]. A token already issued keeps
+    /// verifying under every mode; this governs minting, not verifying.
+    pub login: String,
+}
+
+impl Default for LocalConfig {
+    fn default() -> Self {
+        // What shipped: the route answers everyone. Anything stricter is a
+        // choice an operator makes knowing where root will log in from.
+        Self { login: kimmy_api::LocalLogin::Always.name().to_string() }
+    }
 }
 
 /// What a secret serializes as, in place of itself.
@@ -551,6 +582,20 @@ pub struct OidcConfig {
     /// lifetime. A token with no `iat` is refused too — RFC 9068 §2.2
     /// requires the claim. Refused outside 1..=86400 at startup.
     pub max_token_lifetime_secs: u64,
+    /// A claim carried as a federated principal's **display** name (ADR-100):
+    /// `preferred_username`, `email`, `upn`.
+    ///
+    /// A provider's `sub` is stable and opaque — a GUID, an `00u…` string —
+    /// which makes it a good identity and a bad thing to read in an audit
+    /// line. This names the claim a person would recognise, and it appears in
+    /// `whoami` and the audit record and nowhere else: `sub` stays the
+    /// identity for authorization, role resolution, rate limiting and every
+    /// comparison the server makes, because an email is mutable and not
+    /// unique across providers. A token whose claim is missing or not a string
+    /// is not refused; the display falls back to `sub`.
+    ///
+    /// `None`, the default, keeps the subject as the display name.
+    pub subject_claim: Option<String>,
 }
 
 impl Default for OidcConfig {
@@ -558,6 +603,7 @@ impl Default for OidcConfig {
         Self {
             issuer: None,
             audience: None,
+            subject_claim: None,
             // What most providers use. Entra ID is the notable exception.
             roles_claim: "roles".to_string(),
             role_mappings: Vec::new(),
@@ -599,6 +645,7 @@ impl OidcConfig {
             require_at_jwt: self.require_at_jwt,
             allow_federated_admin: self.allow_federated_admin,
             max_token_lifetime_secs: self.max_token_lifetime_secs,
+            subject_claim: self.subject_claim.clone(),
         })
     }
 
@@ -639,6 +686,16 @@ impl OidcConfig {
                  for Entra ID."
             );
         }
+        // Refused rather than treated as unset: an operator who wrote the key
+        // meant to name a claim, and a blank one would silently mean "the
+        // subject", which is what they were trying to get away from.
+        if self.subject_claim.as_deref().is_some_and(|c| c.trim().is_empty()) {
+            anyhow::bail!(
+                "auth.oidc.subject_claim is empty; a claim with no name can never resolve. Name \
+                 the claim that carries a readable identity — `preferred_username`, `email`, \
+                 `upn` — or omit the setting (KIMMY_OIDC_SUBJECT_CLAIM) to show the subject."
+            );
+        }
         if self.refresh_interval_secs == 0 {
             anyhow::bail!(
                 "auth.oidc.refresh_interval_secs must be greater than zero; a node that never \
@@ -675,6 +732,13 @@ impl OidcConfig {
             Some(issuer) => {
                 let admin =
                     if self.allow_federated_admin { ", FEDERATED ADMIN ALLOWED" } else { "" };
+                // Named when set, for the same reason the admin flag is: the
+                // default is silent, and a display claim that was configured
+                // is a fact an operator reading an audit line wants confirmed.
+                let display = match &self.subject_claim {
+                    Some(claim) => format!(", display from {claim}"),
+                    None => String::new(),
+                };
                 let lifetime = if self.max_token_lifetime_secs
                     == kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS
                 {
@@ -682,9 +746,19 @@ impl OidcConfig {
                 } else {
                     format!(", max token lifetime {}s", self.max_token_lifetime_secs)
                 };
-                format!("{issuer} ({} role mappings{admin}{lifetime})", self.role_mappings.len())
+                format!(
+                    "{issuer} ({} role mappings{display}{admin}{lifetime})",
+                    self.role_mappings.len()
+                )
             }
         }
+    }
+}
+
+impl LocalConfig {
+    /// The mode, once the name has been checked.
+    pub fn login_mode(&self) -> Result<kimmy_api::LocalLogin> {
+        kimmy_api::LocalLogin::parse(&self.login).map_err(|e| anyhow::anyhow!("auth.local.{e}"))
     }
 }
 
@@ -1064,6 +1138,7 @@ impl Default for AuthConfig {
             root_password: None,
             jwt_secret: None,
             token_ttl_secs: 60 * 60,
+            local: LocalConfig::default(),
             oidc: OidcConfig::default(),
         }
     }
@@ -1203,6 +1278,22 @@ impl Config {
             );
         }
         self.auth.oidc.validate()?;
+
+        // Parsed here so a typo is a boot failure rather than the most
+        // permissive mode by accident, and checked against federation so that
+        // `disabled` can never leave a node nobody can log in to (ADR-100).
+        // The mode says nothing about verifying — a token already issued
+        // keeps working — so nothing here needs to consider existing sessions.
+        let local_login = self.auth.local.login_mode()?;
+        if local_login == kimmy_api::LocalLogin::Disabled && !self.auth.oidc.is_configured() {
+            anyhow::bail!(
+                "auth.local.login is \"disabled\" but auth.oidc is not configured, so nobody \
+                 could ever authenticate: the password route would answer 404 and there is no \
+                 identity provider to answer instead. Configure auth.oidc, or use \
+                 \"loopback_only\" (KIMMY_LOCAL_LOGIN) to keep the login reachable from this \
+                 host alone."
+            );
+        }
 
         if self.cluster.enabled {
             if self.cluster.seeds.is_empty() {
@@ -1350,12 +1441,17 @@ impl Config {
             format!("{}s", self.storage.gc_interval_secs)
         };
         format!(
-            "bind={} scheme={} data_dir={} auth={} oidc={} mcp={} gc={} ratelimit=[{}] \
-             limits=[timeout={}s body={}B] audit={} cluster={} seeds=[{}] log={}/{:?} otel={}",
+            "bind={} scheme={} data_dir={} auth={} local_login={} oidc={} mcp={} gc={} \
+             ratelimit=[{}] limits=[timeout={}s body={}B] audit={} cluster={} \
+             seeds=[{}] log={}/{:?} otel={}",
             self.server.bind,
             if self.server.tls.is_enabled() { "https" } else { "http" },
             self.storage.data_dir.display(),
             if self.auth.insecure_no_auth { "DISABLED" } else { "enabled" },
+            // The name as configured, not as parsed: the summary is printed
+            // after validation, so the two agree, and printing the string
+            // means a summary never claims a mode `validate` would refuse.
+            self.auth.local.login,
             self.auth.oidc.describe(),
             if self.server.mcp { "enabled" } else { "off" },
             gc,
@@ -2036,6 +2132,107 @@ mod tests {
             }],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn local_login_defaults_to_always_and_every_name_parses() {
+        // The default is what shipped, and it is the one mode with nothing to
+        // say at startup. The summary still names it, so an operator reading
+        // the boot line sees the mode rather than inferring it.
+        let cfg = valid();
+        assert_eq!(cfg.auth.local.login, "always");
+        assert_eq!(cfg.auth.local.login_mode().unwrap(), kimmy_api::LocalLogin::Always);
+        assert!(cfg.summary().contains("local_login=always"), "{}", cfg.summary());
+
+        let mut cfg = valid();
+        cfg.auth.local.login = "loopback_only".into();
+        cfg.validate().unwrap();
+        assert!(cfg.summary().contains("local_login=loopback_only"), "{}", cfg.summary());
+    }
+
+    #[test]
+    fn an_unknown_local_login_mode_is_refused_with_the_valid_ones_named() {
+        // A typo must not quietly mean "always", which is the permissive end.
+        let mut cfg = valid();
+        cfg.auth.local.login = "localhost".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auth.local"), "name the setting: {err}");
+        assert!(err.contains("localhost"), "name the value: {err}");
+        assert!(err.contains("loopback_only") && err.contains("disabled"), "list the modes: {err}");
+    }
+
+    #[test]
+    fn disabling_local_login_needs_an_identity_provider() {
+        // With the password route gone and no provider, nobody could ever log
+        // in — refused at startup rather than discovered at the first 404.
+        let mut cfg = valid();
+        cfg.auth.local.login = "disabled".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auth.local.login"), "unhelpful error: {err}");
+        assert!(err.contains("auth.oidc"), "say what would fix it: {err}");
+        assert!(err.contains("KIMMY_LOCAL_LOGIN"), "name the variable: {err}");
+
+        // With a provider it is a legitimate choice.
+        cfg.auth.oidc = oidc();
+        cfg.validate().unwrap();
+        assert!(cfg.summary().contains("local_login=disabled"), "{}", cfg.summary());
+
+        // `loopback_only` never needs one: the login is still reachable, from
+        // the host.
+        let mut cfg = valid();
+        cfg.auth.local.login = "loopback_only".into();
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn local_login_reads_back_from_toml_as_documented() {
+        let cfg: Config = toml::from_str(
+            "[auth]\nroot_password = \"a-root-password-for-the-tests\"\n\
+             jwt_secret = \"a-signing-key-of-adequate-length\"\n\
+             [auth.local]\nlogin = \"loopback_only\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.local.login_mode().unwrap(), kimmy_api::LocalLogin::LoopbackOnly);
+        cfg.validate().unwrap();
+
+        // And an unknown key under the section is a typo, like everywhere else.
+        let err = toml::from_str::<Config>("[auth.local]\nlogin_mode = \"always\"\n").unwrap_err();
+        assert!(err.to_string().contains("login_mode"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn the_subject_claim_is_optional_reaches_the_verifier_and_shows_in_the_summary() {
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        assert_eq!(cfg.auth.oidc.subject_claim, None, "unset by default: the subject is shown");
+        assert_eq!(cfg.auth.oidc.settings().unwrap().subject_claim, None);
+        assert!(!cfg.summary().contains("display from"), "{}", cfg.summary());
+
+        cfg.auth.oidc.subject_claim = Some("email".into());
+        cfg.validate().unwrap();
+        assert_eq!(cfg.auth.oidc.settings().unwrap().subject_claim.as_deref(), Some("email"));
+        assert!(cfg.summary().contains("display from email"), "{}", cfg.summary());
+
+        // From the file, in the documented spelling.
+        let cfg: Config = toml::from_str(
+            "[auth.oidc]\nissuer = \"https://auth.example.com\"\naudience = \"kimmydb\"\n\
+             subject_claim = \"preferred_username\"\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.auth.oidc.subject_claim.as_deref(), Some("preferred_username"));
+    }
+
+    #[test]
+    fn an_empty_subject_claim_is_refused_rather_than_read_as_unset() {
+        // An operator who wrote the key meant to name a claim; a blank one
+        // would silently mean "the subject", which is what they were trying to
+        // get away from.
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        cfg.auth.oidc.subject_claim = Some("  ".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auth.oidc.subject_claim"), "unhelpful error: {err}");
+        assert!(err.contains("KIMMY_OIDC_SUBJECT_CLAIM"), "name the variable: {err}");
     }
 
     #[test]

@@ -211,6 +211,7 @@ mod tests {
             require_at_jwt: false,
             allow_federated_admin: false,
             max_token_lifetime_secs: DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         }
     }
 
