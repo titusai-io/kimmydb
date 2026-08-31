@@ -766,10 +766,13 @@ mod tests {
     fn a_previous_jwt_secret_arrives_by_flag_and_reaches_validate() {
         // The flag lands in the same field the file uses, and an absent flag
         // leaves the file's value alone.
-        let cli = parse(&["--jwt-previous-secret", "the-signing-key-being-retired"]);
+        let cli = parse(&["--jwt-previous-secret", "the-signing-key-being-retired-now"]);
         let mut cfg = Config::default();
         cli.overrides.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.auth.jwt_previous_secret.as_deref(), Some("the-signing-key-being-retired"));
+        assert_eq!(
+            cfg.auth.jwt_previous_secret.as_deref(),
+            Some("the-signing-key-being-retired-now")
+        );
 
         let mut cfg = Config::default();
         cfg.auth.jwt_previous_secret = Some("from-the-file-and-long-enough".into());

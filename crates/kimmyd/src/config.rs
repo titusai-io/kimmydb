@@ -1718,7 +1718,7 @@ mod tests {
         // token the cluster issues, so printing it hands over the ability to
         // mint any principal, `root` included.
         let mut cfg = valid();
-        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired".into());
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
         let secrets = [
             cfg.auth.root_password.clone().expect("the fixture sets a root password"),
             cfg.auth.jwt_secret.clone().expect("the fixture sets a signing key"),
@@ -1744,7 +1744,7 @@ mod tests {
         cfg.auth.jwt_previous_secret = None;
         cfg.validate().expect("no previous secret is the ordinary case");
 
-        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired".into());
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
         cfg.validate().expect("a distinct previous secret of adequate length opens the window");
 
         // Too short: it still verifies tokens, so the floor is the same.
@@ -1795,7 +1795,7 @@ mod tests {
         let mut cfg = valid();
         assert!(cfg.summary().contains("jwt_previous_secret=none"), "{}", cfg.summary());
 
-        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired".into());
+        cfg.auth.jwt_previous_secret = Some("the-signing-key-being-retired-now".into());
         let summary = cfg.summary();
         assert!(summary.contains("jwt_previous_secret=set"), "{summary}");
         assert!(!summary.contains("being-retired"), "the value leaked: {summary}");
