@@ -171,6 +171,38 @@ enum Graph {
     Euclidean(Hnsw<'static, f32, DistL2>),
 }
 
+/// What one graph node costs beyond its vector, approximately.
+///
+/// **Measured, not derived** — see [Benchmarks](../../../docs/benchmarks.md).
+/// Building 20,000 pseudo-random vectors under a counting allocator, the
+/// graph held 6,512 bytes per node at 384 dimensions and 5,315 at 64. Take
+/// the vector out of each (1,536 and 256 bytes) and what is left is the same
+/// in both — 4,976 and 5,059 — which is `hnsw_rs`'s bookkeeping: the node (a
+/// `Vec` of sixteen per-layer neighbour lists, allocated for every point
+/// whatever its level), the neighbour lists themselves (up to
+/// `2 × MAX_CONNECTIONS` at layer 0, each an `Arc` to a small heap cell, in
+/// `Vec`s that grow by doubling), and the layer tables. It does not depend on
+/// the width, which is why it is a constant added to `dim × 4` rather than a
+/// multiplier; at 4,000 vectors it measured within 1% of the 20,000 figure.
+///
+/// The figure is for the graph the build produces; a snapshot reloaded from
+/// disk has the same shape. It is an estimate for a budget, not an
+/// accounting — the allocator's own overhead and fragmentation sit on top.
+const NODE_OVERHEAD_BYTES: usize = 5_000;
+
+/// Estimated resident bytes of a graph over `keys`, at `dim` dimensions.
+///
+/// `n × (dim × 4 + NODE_OVERHEAD_BYTES) + Σ (key length + 24)`: the vectors
+/// the graph copies in, the per-node bookkeeping above, and the key table
+/// that names each node (a `String` is 24 bytes of header plus its bytes).
+/// The same formula is documented in `docs/vectors.md`, so an operator can
+/// size `vector.index_cache.max_bytes` from a chunk count.
+fn estimate_bytes(keys: &[String], dim: usize) -> usize {
+    let per_node = dim * 4 + NODE_OVERHEAD_BYTES;
+    let key_bytes: usize = keys.iter().map(|k| k.len() + 24).sum();
+    keys.len() * per_node + key_bytes
+}
+
 /// An approximate index over one collection's vectors.
 pub struct HnswIndex {
     graph: Graph,
@@ -178,6 +210,9 @@ pub struct HnswIndex {
     keys: Vec<String>,
     metric: Metric,
     dim: usize,
+    /// [`estimate_bytes`] at construction, so the cache can budget without
+    /// recomputing it on every install.
+    bytes: usize,
 }
 
 impl HnswIndex {
@@ -281,14 +316,24 @@ impl HnswIndex {
                 detail: format!("{metric:?} has no approximate index; searches use an exact scan"),
             });
         }
-        // Collected first so the expected element count is known before the
-        // graph allocates its tables.
-        let mut records = Vec::new();
+        // Collected first, for two reasons: the expected element count is
+        // known before the graph allocates its tables, and the read
+        // transaction closes before the O(n log n) build starts rather than
+        // pinning the store's pages for the seconds it takes.
+        //
+        // Only the key and the vector are kept. A `VectorRecord` also carries
+        // the chunk's text, which the graph never looks at, and holding every
+        // record whole meant the build's peak was the graph *plus* a copy of
+        // the entire shadow collection — text included — until the
+        // reachability probe below had finished with it. That was most of the
+        // headroom a rebuild needed, paid every `MAX_STALENESS` under writes.
+        let mut records: Vec<(String, Vec<f32>)> = Vec::new();
         engine.for_each_vector(shadow, |record| {
             // A wrong width belongs to a different model and would corrupt
             // every distance the graph computes.
             if record.vector.len() == dim {
-                records.push(record);
+                let VectorRecord { source, chunk, vector, .. } = record;
+                records.push((VectorRecord::id(&source, chunk).to_string(), vector));
             }
             Ok(true)
         })?;
@@ -313,43 +358,76 @@ impl HnswIndex {
             Metric::Dot => unreachable!("dot is not supported; see HnswIndex::supports"),
         };
 
-        let mut keys = Vec::with_capacity(records.len());
-        for record in &records {
+        // The probe below needs a few vectors to query with. They are copied
+        // out now — a spread sample of at most `REACHABILITY_SAMPLE` — so
+        // that the rest can be released as they go in, rather than the whole
+        // collection staying resident until the probe has run.
+        let n = records.len();
+        let probes: Vec<(usize, Vec<f32>)> = if n >= REACHABILITY_SAMPLE {
+            let stride = (n / REACHABILITY_SAMPLE).max(1);
+            (0..n)
+                .step_by(stride)
+                .take(REACHABILITY_SAMPLE)
+                .map(|i| (i, records[i].1.clone()))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // Sequential, deliberately. `hnsw_rs` offers `parallel_insert` over
+        // rayon's global pool, and it was measured rather than assumed away
+        // ([Benchmarks](../../../docs/benchmarks.md)): on a ten-core host at
+        // 4,000 × 384 it built in 1.1 s on every core and 1.4 s confined to
+        // four threads against 4.3 s sequential, and at 20,000 × 384 in 13 s
+        // on four threads against 45 s — with recall and reachability
+        // indistinguishable from the sequential graph. It is not used, for
+        // now, because the win is bounded by contention inside the graph
+        // (four threads get most of what ten do) while the cost is not: a
+        // four-thread pool is every core of the hosts this project runs on,
+        // which puts the multi-second stall back on the request path in a
+        // different suit, and a pool bounded to half the cores is one thread
+        // on those hosts anyway. It would also need rayon as a direct
+        // dependency, and the reachability constants above were sized over
+        // hundreds of sequential builds, not three parallel ones. The build
+        // is off the cache lock and paid at most once per staleness window;
+        // revisit with a measured rebuild backlog on a host with cores to
+        // spare.
+        //
+        // `into_iter`, not `iter`: the graph copies each vector in, so the
+        // collected one is freed the moment it has been inserted and the
+        // build's peak is one copy plus the graph's bookkeeping, not two.
+        let mut keys = Vec::with_capacity(n);
+        for (key, vector) in records {
             let id = keys.len();
-            let vector = record.vector.as_slice();
             match &graph {
-                Graph::Cosine(g) => g.insert((vector, id)),
-                Graph::Euclidean(g) => g.insert((vector, id)),
+                Graph::Cosine(g) => g.insert((vector.as_slice(), id)),
+                Graph::Euclidean(g) => g.insert((vector.as_slice(), id)),
             }
-            keys.push(VectorRecord::id(&record.source, record.chunk).to_string());
+            keys.push(key);
         }
 
         debug!(vectors = keys.len(), "built HNSW index");
-        let index = Self { graph, keys, metric, dim };
+        let bytes = estimate_bytes(&keys, dim);
+        let index = Self { graph, keys, metric, dim, bytes };
 
-        // Ask a spread sample of the stored vectors to find themselves. The
-        // records are still in hand here, so this costs a few dozen searches
-        // and no extra reads.
-        let n = index.keys.len();
+        // Ask the sampled vectors to find themselves. A few dozen searches
+        // against an O(n log n) build, and no extra reads.
         let mut reach = Reachability::default();
-        if n >= REACHABILITY_SAMPLE {
-            let stride = (n / REACHABILITY_SAMPLE).max(1);
-            for i in (0..n).step_by(stride).take(REACHABILITY_SAMPLE) {
-                reach.sampled += 1;
-                let found = index.search_keys(&records[i].vector, 1, None)?;
-                if found.first() == index.keys.get(i) {
-                    continue;
-                }
-                reach.missed += 1;
-                // Asked again with a much larger budget. An ordinary search is
-                // a fixed amount of exploration, so as a collection grows the
-                // same budget covers less of it and a reachable point starts
-                // being missed for want of looking — which is a fact about the
-                // query, not about the graph. Only a point that stays missing
-                // when the budget stops mattering is one the graph has lost.
-                if !index.finds_itself(&records[i].vector, i) {
-                    reach.unreachable += 1;
-                }
+        for (i, vector) in &probes {
+            reach.sampled += 1;
+            let found = index.search_keys(vector, 1, None)?;
+            if found.first() == index.keys.get(*i) {
+                continue;
+            }
+            reach.missed += 1;
+            // Asked again with a much larger budget. An ordinary search is a
+            // fixed amount of exploration, so as a collection grows the same
+            // budget covers less of it and a reachable point starts being
+            // missed for want of looking — which is a fact about the query,
+            // not about the graph. Only a point that stays missing when the
+            // budget stops mattering is one the graph has lost.
+            if !index.finds_itself(vector, *i) {
+                reach.unreachable += 1;
             }
         }
         Ok((index, reach))
@@ -385,6 +463,15 @@ impl HnswIndex {
 
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
+    }
+
+    /// Approximately how many bytes this graph keeps resident.
+    ///
+    /// An estimate from the node count, the width and the key table — the
+    /// formula is on [`NODE_OVERHEAD_BYTES`] — not a measurement of the heap.
+    /// It is what the index cache budgets against.
+    pub fn approx_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Persist this index into `dir`, atomically.
@@ -469,7 +556,8 @@ impl HnswIndex {
         .map_err(|e| corrupt(format!("graph reload: {e}")))?;
 
         debug!(vectors = meta.keys.len(), ?dir, "loaded HNSW snapshot");
-        Ok(Self { graph, keys: meta.keys, metric, dim })
+        let bytes = estimate_bytes(&meta.keys, dim);
+        Ok(Self { graph, keys: meta.keys, metric, dim, bytes })
     }
 
     /// Approximate k-nearest neighbours, as chunk keys.

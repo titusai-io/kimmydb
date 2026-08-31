@@ -21,8 +21,17 @@ installers = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "titusai-io/homebrew-tap"
 # Publish jobs to run in CI. `./publish-ghcr` is ours:
-# .github/workflows/publish-ghcr.yml, the multi-arch container image.
+# .github/workflows/publish-ghcr.yml, the multi-arch container image. dist
+# runs publish jobs after `host`, which runs after every build job, so the
+# image job can take the Linux archives from the run's own workflow artifacts
+# (`artifacts-build-local-<target>`) rather than compiling again (ADR-107).
 publish-jobs = ["homebrew", "./publish-ghcr"]
+# `cache-builds` (a rust-cache in build-local-artifacts) stays off. A cache is
+# readable only from the ref that wrote it or from the default branch; no job
+# on main builds the musl targets, so a tag would never find a cache to read
+# and would write a set — a gigabyte or more per release — that no later tag
+# can read either, against the 10 GiB budget CI already had to be pruned back
+# under. Enable it only if main starts building the release targets.
 # Target platforms to build apps for (Rust target-triple syntax).
 #
 # musl rather than gnu for Linux, deliberately: the result is a static binary
@@ -77,6 +86,20 @@ aarch64-unknown-linux-musl = "ubuntu-24.04-arm"
 x86_64-unknown-linux-musl = "ubuntu-24.04"
 
 # Pushing a multi-arch image needs more than the release workflow's
-# `contents: write`.
+# `contents: write`. `id-token` and `attestations` are for the build
+# provenance attestation on the image manifest (ADR-108): a called workflow's
+# job can hold no permission its caller did not grant, and dist writes the
+# caller, so the grant has to be made here.
 [dist.github-custom-job-permissions]
-publish-ghcr = { packages = "write", contents = "read" }
+publish-ghcr = { packages = "write", contents = "read", id-token = "write", attestations = "write" }
+
+# Build provenance for the release archives — dist's `github-attestations`
+# adds an `actions/attest` step to `build-local-artifacts` over everything it
+# built — stays OFF until the repository is public. GitHub generates
+# attestations for a private repository only on an Enterprise Cloud plan; on
+# any other plan the step fails, and dist emits it with no condition, so
+# enabling it now would fail every release at the attest step. The container
+# image's attestation (publish-ghcr.yml) is conditional on visibility and
+# needs no such care. At go-public: uncomment, run `dist generate`, commit
+# the regenerated release.yml, and the next tag's archives are attested.
+# github-attestations = true

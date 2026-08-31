@@ -43,8 +43,11 @@ pub struct SyncOutcome {
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds — the mirror of
-    /// `lag_ms`. Above tombstone retention it names a stale rejoiner
-    /// (ADR-085).
+    /// `lag_ms`, counted only at origins where the peer also lacks an entry
+    /// retention has removed here. Above tombstone retention it names a stale
+    /// rejoiner (ADR-085); zero for a peer that can still be served every
+    /// entry it lacks, however wide the gap (ADR-097). See
+    /// [`lag_beyond_horizon_ms`].
     pub behind_ms: u64,
     /// Milliseconds of the peer's history still unapplied after this round.
     ///
@@ -76,6 +79,52 @@ pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector) -> u64 {
         .filter_map(|(node, hlc)| {
             let held = mine.get(node);
             (held > Hlc::ZERO && hlc > held).then(|| hlc.wall_ms.saturating_sub(held.wall_ms))
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// Whether `held` lacks, at any origin `mine` is ahead of it, an entry that
+/// retention has removed here — the highest removed per origin being
+/// `collected` ([`Engine::oplog_collected`]).
+///
+/// Only origins the peer trails count. An origin it has caught up on has no
+/// gap to hold anything, and an origin whose newest entry sits below a
+/// collected stamp of *another* origin is not behind anything.
+pub fn lacks_collected(
+    held: &VersionVector,
+    mine: &VersionVector,
+    collected: &VersionVector,
+) -> bool {
+    mine.iter().any(|(node, newest)| {
+        let theirs = held.get(node);
+        theirs < newest && theirs < collected.get(node)
+    })
+}
+
+/// How far `theirs` trails `mine` at the origins where it also lacks an
+/// entry retention has removed here; zero when it lacks nothing collected.
+///
+/// [`lag_behind_ms`] with its roles swapped is what names a stale rejoiner
+/// (ADR-085): a peer more than tombstone retention behind may hold documents
+/// whose deletes it never saw and whose tombstones are gone. But the span
+/// between two stamps is the age of the *gap*, not of anything in it. An
+/// origin that wrote nothing for longer than retention and then wrote once
+/// leaves every peer a gap as wide as its silence holding one entry a few
+/// seconds old, which each peer pulls on its next round — and a peer that can
+/// still be served every entry it lacks has nothing to resurrect. So the
+/// verdict requires both: the span, and something in it that retention has
+/// removed, which is what `collected` records per origin (ADR-097).
+pub fn lag_beyond_horizon_ms(
+    theirs: &VersionVector,
+    mine: &VersionVector,
+    collected: &VersionVector,
+) -> u64 {
+    mine.iter()
+        .filter_map(|(node, newest)| {
+            let held = theirs.get(node);
+            let lacking = held > Hlc::ZERO && newest > held && held < collected.get(node);
+            lacking.then(|| newest.wall_ms.saturating_sub(held.wall_ms))
         })
         .max()
         .unwrap_or(0)
@@ -1556,5 +1605,134 @@ mod tests {
 
         // A fresh member trails nobody: it holds nothing old enough to resurrect.
         assert_eq!(lag_behind_ms(&VersionVector::default(), &mine), 0);
+    }
+
+    const HOUR_MS: u64 = 60 * 60 * 1000;
+
+    #[test]
+    fn a_gap_holding_nothing_collected_is_not_a_stale_rejoiner() {
+        // The false verdict from the rolling restart (ADR-097). A wrote once,
+        // idled 36 hours, wrote again; B holds the first write and has not yet
+        // pulled the second. The span is 36 hours, but nothing in it was
+        // collected: B can still be served the one entry it lacks.
+        let a = kimmy_core::NodeId::generate();
+        let first = Hlc::new(1_000, 0);
+        let second = Hlc::new(1_000 + 36 * HOUR_MS, 0);
+        let mut theirs = VersionVector::new();
+        theirs.insert(a, first);
+        let mut mine = VersionVector::new();
+        mine.insert(a, second);
+
+        assert_eq!(lag_behind_ms(&theirs, &mine), 36 * HOUR_MS, "the bare span is the silence");
+
+        let mut collected = VersionVector::new();
+        collected.insert(a, first);
+        assert_eq!(
+            lag_beyond_horizon_ms(&theirs, &mine, &collected),
+            0,
+            "B holds everything of A's that was collected, so it is not stale"
+        );
+        assert!(!lacks_collected(&theirs, &mine, &collected), "and it can be served");
+
+        // Had A written in between and had that write been collected, B would
+        // lack it, and the same span is then what it says it is.
+        collected.insert(a, Hlc::new(1_000 + HOUR_MS, 0));
+        assert_eq!(lag_beyond_horizon_ms(&theirs, &mine, &collected), 36 * HOUR_MS);
+        assert!(lacks_collected(&theirs, &mine, &collected));
+
+        // An origin the peer has never seen still counts for nothing, as in
+        // `lag_behind_ms`: a brand-new member holds nothing to resurrect.
+        assert_eq!(lag_beyond_horizon_ms(&VersionVector::default(), &mine, &collected), 0);
+        // ...but a peer that holds *nothing* does lack what was collected, so
+        // it is served a snapshot rather than a silent gap.
+        assert!(lacks_collected(&VersionVector::default(), &mine, &collected));
+    }
+
+    #[test]
+    fn an_origin_that_wrote_once_after_a_long_silence_is_still_servable() {
+        // Two engines, the restart shape without a network. A writes, both
+        // converge, B writes twice more, and everything ages past retention on
+        // A — everything but B's last entry, which is the tail. Then A writes
+        // once. B asks from A's *previous* write, which A collected along
+        // with B's first, so by the threshold B is beyond the horizon and gets
+        // a snapshot for a gap that holds exactly one servable entry.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+        sync(&a, &b);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
+        b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
+        sync(&a, &b);
+
+        let a_previous = b.witnessed_vector().unwrap().get(a.node_id());
+        a.collect_garbage_at(
+            crate::physical_now_ms() + 365 * 24 * HOUR_MS,
+            RetentionPolicy::new(DAY, DAY),
+        )
+        .unwrap();
+        assert!(
+            a.oplog_collected_through().unwrap() > a_previous,
+            "B's first write was collected after A's, so the coarse horizon is above A's previous write"
+        );
+        assert_eq!(
+            a.oplog_collected().unwrap().get(a.node_id()),
+            a_previous,
+            "the per-origin record names A's previous write as the last of A's collected"
+        );
+
+        a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
+        let held = b.witnessed_vector().unwrap();
+        let from = held.behind(&a.version_vector().unwrap()).expect("B trails A now");
+        assert_eq!(from, a_previous);
+
+        assert!(
+            !a.can_serve_from_oplog(from).unwrap(),
+            "by the threshold, B is beyond the horizon"
+        );
+        assert!(
+            a.can_serve_peer_holding(&held).unwrap(),
+            "per origin, B lacks nothing A collected: it can be served the one entry"
+        );
+
+        // And it is exactly what a stale-rejoiner verdict must not fire on.
+        let mine = a.witnessed_vector().unwrap();
+        let theirs = b.version_vector().unwrap();
+        assert_eq!(lag_beyond_horizon_ms(&theirs, &mine, &a.oplog_collected().unwrap()), 0);
+    }
+
+    #[test]
+    fn a_peer_that_missed_a_collected_entry_is_beyond_the_horizon_per_origin_too() {
+        // The control. B holds A's first write but not its second; A collects
+        // the second along with the rest. B lacks something gone, at A's
+        // origin, and both the threshold and the per-origin check say so.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+        sync(&a, &b);
+        a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
+        b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
+        pull(&a, &b);
+
+        a.collect_garbage_at(
+            crate::physical_now_ms() + 365 * 24 * HOUR_MS,
+            RetentionPolicy::new(DAY, DAY),
+        )
+        .unwrap();
+        a.insert(&ca, doc! { "_id": "a-3" }).unwrap();
+
+        let held = b.witnessed_vector().unwrap();
+        let from = held.behind(&a.version_vector().unwrap()).unwrap();
+        assert!(!a.can_serve_from_oplog(from).unwrap());
+        assert!(!a.can_serve_peer_holding(&held).unwrap(), "B lacks A's collected second write");
+
+        // A fresh peer against a node that has collected: a snapshot, as
+        // before. Against one that has not: served, as before.
+        assert!(!a.can_serve_peer_holding(&VersionVector::default()).unwrap());
+        assert!(b.can_serve_peer_holding(&VersionVector::default()).unwrap());
     }
 }

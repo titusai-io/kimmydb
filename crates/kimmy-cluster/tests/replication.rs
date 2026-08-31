@@ -21,6 +21,8 @@ const SECRET: &str = "a-shared-cluster-secret";
 struct Node {
     engine: Arc<Engine>,
     addr: std::net::SocketAddr,
+    serving: tokio::task::JoinHandle<()>,
+    path: std::path::PathBuf,
     _dir: tempfile::TempDir,
 }
 
@@ -31,14 +33,48 @@ async fn node() -> Node {
 
 async fn node_with_secret(secret: &str) -> Node {
     let dir = tempfile::tempdir().unwrap();
-    let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+    let path = dir.path().join("kimmy.redb");
+    let engine = Arc::new(Engine::open(&path).unwrap());
+    let (addr, serving) = listen(&engine, secret).await;
+    Node { engine, addr, serving, path, _dir: dir }
+}
 
-    // Port 0: the OS picks, so parallel tests never collide.
+/// Bind an ephemeral port and serve `engine` on it.
+///
+/// Port 0: the OS picks, so parallel tests never collide.
+async fn listen(
+    engine: &Arc<Engine>,
+    secret: &str,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(serve(Arc::clone(&engine), listener, secret.to_string()));
+    let serving = tokio::spawn(serve(Arc::clone(engine), listener, secret.to_string()));
+    (addr, serving)
+}
 
-    Node { engine, addr, _dir: dir }
+impl Node {
+    /// Stop serving, close the engine, and reopen the same database under the
+    /// same identity — a member restarting, in process.
+    ///
+    /// The address changes, because the old listener is gone; what a restart
+    /// preserves is the data directory and the node id, and those are what the
+    /// tests using this are about.
+    async fn restart(self) -> Node {
+        let Node { engine, serving, path, _dir, .. } = self;
+        serving.abort();
+        let _ = serving.await;
+        // Per-connection tasks hold their own handle and end when the peer
+        // hangs up, which is moments after a round returns. redb allows one
+        // open handle per process, so wait for the last one.
+        while Arc::strong_count(&engine) > 1 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        drop(engine);
+
+        let engine = Arc::new(Engine::open(&path).unwrap());
+        let (addr, serving) = listen(&engine, SECRET).await;
+        Node { engine, addr, serving, path, _dir }
+    }
 }
 
 /// Pull into `into` from `from`, both directions making a full round.
@@ -760,4 +796,195 @@ async fn a_peer_that_keeps_failing_is_reported_more_than_once() {
         health.failed(dead, start + WARN_INTERVAL),
         "a peer still failing a full interval later must be reported again"
     );
+}
+
+const HOUR_MS: u64 = 60 * 60 * 1000;
+const DAY_SECS: u64 = 24 * 60 * 60;
+
+/// Converge three nodes: every pair, both ways, twice, so a write reaches the
+/// third member through the middle one as well as directly.
+async fn converge(a: &Node, b: &Node, c: &Node) {
+    for _ in 0..2 {
+        sync(a, b).await;
+        sync(b, c).await;
+        sync(a, c).await;
+    }
+}
+
+/// An entry from an origin nobody is, stamped `wall_ms`: applied to a node, it
+/// moves that node's logical clock there, and once replicated it is the oplog
+/// tail every member resumes its clock from after a restart. How a test makes
+/// 36 hours pass without waiting for them.
+fn entry_stamped(collection: kimmy_core::CollectionId, wall_ms: u64) -> kimmy_core::OplogEntry {
+    kimmy_core::OplogEntry {
+        stamp: kimmy_core::Stamp::new(
+            kimmy_core::Hlc::new(wall_ms, 0),
+            kimmy_core::NodeId::generate(),
+        ),
+        kind: kimmy_core::OpKind::Insert,
+        collection,
+        doc_id: Some(DocId::String("clock".into())),
+        body: Some(bson::serialize_to_vec(&doc! { "_id": "clock" }).unwrap()),
+    }
+}
+
+/// Run a retention pass on every node as though it were `now_ms`, with the
+/// default day of retention for both the oplog and tombstones.
+fn age_out(nodes: [&Node; 3], now_ms: u64) {
+    for node in nodes {
+        node.engine
+            .collect_garbage_at(now_ms, kimmy_storage::RetentionPolicy::new(DAY_SECS, DAY_SECS))
+            .unwrap();
+    }
+}
+
+/// The rolling-restart shape (ADR-097): a three-member cluster, converged, in
+/// which A last wrote 36 hours ago and everything from back then except the
+/// tail has been collected on every member. Returns the nodes and the stamp of
+/// A's last write before the silence — which is every peer's coverage of A.
+///
+/// A restart of A then writes once, the way a member re-registers itself in
+/// the topology when its build or endpoint changed, and the tests below look
+/// at A's first round afterwards from both sides.
+async fn converged_after_a_long_silence() -> (Node, Node, Node, kimmy_core::Hlc) {
+    let a = node().await;
+    let b = node().await;
+    let c = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-before" }).unwrap();
+    converge(&a, &b, &c).await;
+    // B and C both write after A, so the coarse horizon on every member ends
+    // up above A's last write once all of it is collected.
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-before" }).unwrap();
+    let cc = c.engine.get_collection("shop", "orders").unwrap();
+    c.engine.insert(&cc, doc! { "_id": "c-before" }).unwrap();
+    converge(&a, &b, &c).await;
+    let a_last = b.engine.witnessed_vector().unwrap().get(a.engine.node_id());
+    assert!(a_last > kimmy_core::Hlc::ZERO);
+
+    // 36 hours pass. Every member's clock moves, and the entry that moved it
+    // becomes the tail each of them keeps through collection.
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    b.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
+    converge(&a, &b, &c).await;
+    age_out([&a, &b, &c], later + HOUR_MS);
+
+    assert!(
+        a.engine.oplog_collected_through().unwrap() > a_last,
+        "A's last write was collected, and so was something after it"
+    );
+    (a, b, c, a_last)
+}
+
+#[tokio::test]
+async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first_round() {
+    // The first finding from the roll (ADR-097). Half a second after A came
+    // back, its first round named both peers stale: behind by the time since
+    // the *previous* restart, with the message that tells an operator to reset
+    // them. Both were converged; neither had been away a minute.
+    let (a, b, c, a_last) = converged_after_a_long_silence().await;
+
+    let a = a.restart().await;
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-after-restart" }).unwrap();
+
+    for peer in [&b, &c] {
+        // The bare span is the incident's number: A's new write against the
+        // peer's coverage of A, which is A's write from before the silence.
+        let raw = kimmy_storage::lag_behind_ms(
+            &peer.engine.version_vector().unwrap(),
+            &a.engine.witnessed_vector().unwrap(),
+        );
+        assert!(raw > DAY_SECS * 1_000, "the scenario must reproduce the raw gap: {raw} ms");
+        assert_eq!(peer.engine.version_vector().unwrap().get(a.engine.node_id()), a_last);
+
+        let outcome = sync_once(&a.engine, peer.addr, SECRET).await.unwrap();
+        assert_eq!(
+            outcome.behind_ms, 0,
+            "a peer that can still be served everything it lacks is not a stale rejoiner: {outcome:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
+    // The second finding. The first peer to pull from a restarted member was
+    // told it was beyond the horizon and fell back to a snapshot — of a store
+    // it already held in full but for one entry. The threshold it asked from
+    // is A's write before the silence, which A collected along with everything
+    // around it; per origin, nothing B lacks is gone.
+    let (a, b, _c, a_last) = converged_after_a_long_silence().await;
+
+    let a = a.restart().await;
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-after-restart" }).unwrap();
+
+    let held = b.engine.witnessed_vector().unwrap();
+    let from = held.behind(&a.engine.version_vector().unwrap()).expect("B trails A by one write");
+    assert_eq!(from, a_last);
+    assert!(
+        !a.engine.can_serve_from_oplog(from).unwrap(),
+        "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
+    );
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    // An incremental round re-serves the tail B already holds and reports it
+    // superseded; a snapshot reports only what it applied. That is the tell.
+    assert!(
+        outcome.superseded > 0,
+        "the round must be served from the oplog, not a snapshot: {outcome:?}"
+    );
+    assert_eq!(outcome.applied, 1, "{outcome:?}");
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert!(b.engine.get(&cb, &DocId::String("a-after-restart".into())).unwrap().is_some());
+
+    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(second.total(), 0, "and B is then caught up: {second:?}");
+}
+
+#[tokio::test]
+async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots() {
+    // The control for both. B holds A's first write but never received the
+    // second, and A has since collected it. B lacks something gone: A names
+    // it on the first round that sees it, and serves it a snapshot rather
+    // than a silent gap.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+    sync(&a, &b).await;
+    a.engine.insert(&ca, doc! { "_id": "a-missed" }).unwrap();
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-1" }).unwrap();
+    b.engine.insert(&cb, doc! { "_id": "b-2" }).unwrap();
+    sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+
+    let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
+    a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
+    a.engine
+        .collect_garbage_at(
+            later + HOUR_MS,
+            kimmy_storage::RetentionPolicy::new(DAY_SECS, DAY_SECS),
+        )
+        .unwrap();
+    a.engine.insert(&ca, doc! { "_id": "a-after" }).unwrap();
+
+    let outcome = sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+    assert!(
+        outcome.behind_ms > DAY_SECS * 1_000,
+        "B lacks a collected write of A's, 36 hours behind: it is stale: {outcome:?}"
+    );
+
+    let pulled = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(pulled.superseded, 0, "served as a snapshot, not from the oplog: {pulled:?}");
+    for id in ["a-missed", "a-after"] {
+        assert!(
+            b.engine.get(&cb, &DocId::String(id.into())).unwrap().is_some(),
+            "{id} must arrive"
+        );
+    }
+    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(second.total(), 0, "{second:?}");
 }

@@ -86,9 +86,42 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_JWT_SECRET", hide_env_values = true)]
     pub jwt_secret: Option<String>,
 
+    /// The JWT signing secret being retired. Tokens it signed stay valid while
+    /// it is set; new tokens are signed with --jwt-secret. Remove it one token
+    /// lifetime after the rotation.
+    #[arg(long, env = "KIMMY_JWT_PREVIOUS_SECRET", hide_env_values = true)]
+    pub jwt_previous_secret: Option<String>,
+
     /// Run with authentication disabled. Only permitted on a loopback bind.
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
+
+    /// Seconds a request may spend waiting — for its body, or for an embedding
+    /// provider — before this node abandons it with 503.
+    #[arg(long, env = "KIMMY_REQUEST_TIMEOUT_SECS")]
+    pub request_timeout_secs: Option<u64>,
+
+    /// Largest request body the API will read, in bytes. Over it, 413.
+    #[arg(long, env = "KIMMY_MAX_BODY_BYTES")]
+    pub max_body_bytes: Option<usize>,
+
+    /// Requests allowed per authenticated principal per window. 0 disables it.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL")]
+    pub rate_limit_per_principal: Option<u32>,
+
+    /// The window, in seconds, for --rate-limit-per-principal.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS")]
+    pub rate_limit_per_principal_window_secs: Option<u64>,
+
+    /// Where the password login answers: `always`, `loopback_only` or
+    /// `disabled`.
+    ///
+    /// `loopback_only` judges the TCP peer, never a forwarded header, so a
+    /// reverse proxy on the same host makes every caller look local.
+    /// `disabled` is refused unless an OIDC provider is configured. A token
+    /// already issued keeps working under every mode (ADR-100).
+    #[arg(long, env = "KIMMY_LOCAL_LOGIN", value_name = "MODE")]
+    pub local_login: Option<String>,
 
     /// Do not run the automatic embedding worker on this node.
     ///
@@ -116,6 +149,12 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_OIDC_ROLES_CLAIM")]
     pub oidc_roles_claim: Option<String>,
 
+    /// Claim carried as a federated caller's display name: `preferred_username`,
+    /// `email`, `upn`. Shown by `whoami` and in the audit record; `sub` stays
+    /// the identity for everything else (ADR-100).
+    #[arg(long, env = "KIMMY_OIDC_SUBJECT_CLAIM")]
+    pub oidc_subject_claim: Option<String>,
+
     /// Claim values and what each earns here, overriding the config file.
     ///
     /// One JSON array of role mappings, aimed at deployments that configure
@@ -136,6 +175,11 @@ pub struct Overrides {
     /// How often to re-fetch the provider's signing keys, in seconds.
     #[arg(long, env = "KIMMY_OIDC_REFRESH_INTERVAL_SECS")]
     pub oidc_refresh_interval_secs: Option<u64>,
+
+    /// The longest a federated token may be valid for by its own exp - iat,
+    /// in seconds. Default 900; refused outside 1..=86400 (ADR-096).
+    #[arg(long, env = "KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")]
+    pub oidc_max_token_lifetime_secs: Option<u64>,
 
     /// PEM certificate chain, leaf first. Enables TLS together with --tls-key.
     #[arg(long, env = "KIMMY_TLS_CERT")]
@@ -251,6 +295,9 @@ impl Overrides {
         if let Some(secret) = &self.jwt_secret {
             cfg.auth.jwt_secret = Some(secret.clone());
         }
+        if let Some(previous) = &self.jwt_previous_secret {
+            cfg.auth.jwt_previous_secret = Some(previous.clone());
+        }
         if let Some(issuer) = &self.oidc_issuer {
             cfg.auth.oidc.issuer = Some(issuer.clone());
         }
@@ -260,17 +307,43 @@ impl Overrides {
         if let Some(claim) = &self.oidc_roles_claim {
             cfg.auth.oidc.roles_claim = claim.clone();
         }
+        if let Some(claim) = &self.oidc_subject_claim {
+            cfg.auth.oidc.subject_claim = Some(claim.clone());
+        }
+        // A name, not a boolean, so it overrides in both directions like
+        // `--log-level` does: passing `--local-login always` deliberately
+        // reopens what a file closed, and an absent flag leaves the file's
+        // answer alone. Validation is `Config::validate`'s, where a bad name
+        // is refused with the valid ones listed.
+        if let Some(mode) = &self.local_login {
+            cfg.auth.local.login = mode.clone();
+        }
         if let Some(raw) = &self.oidc_role_mappings {
             cfg.auth.oidc.role_mappings = parse_role_mappings(raw)?;
         }
         if let Some(secs) = self.oidc_refresh_interval_secs {
             cfg.auth.oidc.refresh_interval_secs = secs;
         }
+        if let Some(secs) = self.oidc_max_token_lifetime_secs {
+            cfg.auth.oidc.max_token_lifetime_secs = secs;
+        }
         if let Some(cert) = &self.tls_cert {
             cfg.server.tls.cert_file = Some(cert.clone());
         }
         if let Some(key) = &self.tls_key {
             cfg.server.tls.key_file = Some(key.clone());
+        }
+        if let Some(secs) = self.request_timeout_secs {
+            cfg.server.request_timeout_secs = secs;
+        }
+        if let Some(bytes) = self.max_body_bytes {
+            cfg.server.max_body_bytes = bytes;
+        }
+        if let Some(burst) = self.rate_limit_per_principal {
+            cfg.server.rate_limit.per_principal = burst;
+        }
+        if let Some(secs) = self.rate_limit_per_principal_window_secs {
+            cfg.server.rate_limit.per_principal_window_secs = secs;
         }
         // Boolean flags are one-way: passing `--insecure-no-auth` turns the
         // setting on, but omitting it must not silently turn off what the
@@ -451,6 +524,138 @@ mod tests {
     }
 
     #[test]
+    fn local_login_and_subject_claim_override_the_file_and_an_absent_flag_does_not() {
+        let cli = parse(&["--local-login", "loopback_only", "--oidc-subject-claim", "email"]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.local.login, "loopback_only");
+        assert_eq!(cfg.auth.oidc.subject_claim.as_deref(), Some("email"));
+
+        // Absent, so the file's answer stands — in both directions for the
+        // mode, which is a name rather than a one-way boolean.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.auth.local.login = "disabled".into();
+        cfg.auth.oidc.subject_claim = Some("upn".into());
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.local.login, "disabled", "an absent flag must not override the file");
+        assert_eq!(cfg.auth.oidc.subject_claim.as_deref(), Some("upn"));
+
+        // And the flag reopens what a file closed, because it is the more
+        // specific thing the operator typed.
+        let cli = parse(&["--local-login", "always"]);
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.local.login, "always");
+    }
+
+    #[test]
+    fn the_new_flags_read_the_documented_environment_variables() {
+        // The variable names are documented in three places; this pins the
+        // one the binary actually reads.
+        let command = Cli::command();
+        let env_of = |id: &str| {
+            command
+                .get_arguments()
+                .find(|a| a.get_id() == id)
+                .unwrap_or_else(|| panic!("no argument {id}"))
+                .get_env()
+                .map(|e| e.to_string_lossy().into_owned())
+        };
+        assert_eq!(env_of("local_login").as_deref(), Some("KIMMY_LOCAL_LOGIN"));
+        assert_eq!(env_of("oidc_subject_claim").as_deref(), Some("KIMMY_OIDC_SUBJECT_CLAIM"));
+    }
+
+    #[test]
+    fn a_bad_local_login_mode_from_the_flag_reaches_validate() {
+        // The flag carries a string so that the refusal is `validate`'s, with
+        // the valid names listed, rather than clap's — and so that
+        // `check-config` gives the same answer the server would.
+        let cli = parse(&["--local-login", "localhost"]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("a-root-password-for-the-tests".into()),
+                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("localhost"), "the error should name the bad value: {err}");
+        assert!(err.contains("loopback_only"), "and list the valid ones: {err}");
+    }
+
+    #[test]
+    fn request_limit_flags_override_the_file_and_absent_ones_do_not() {
+        // Each flag also reads a KIMMY_* variable; clap resolves both into the
+        // same field, so what is asserted here is the field reaching the
+        // configuration (ADR-099).
+        let cli = parse(&[
+            "--request-timeout-secs",
+            "90",
+            "--max-body-bytes",
+            "4194304",
+            "--rate-limit-per-principal",
+            "3000",
+            "--rate-limit-per-principal-window-secs",
+            "60",
+        ]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 90);
+        assert_eq!(cfg.server.max_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.server.rate_limit.per_principal, 3000);
+        assert_eq!(cfg.server.rate_limit.per_principal_window_secs, 60);
+
+        // A file that set them keeps them when the flags are absent.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.server.request_timeout_secs = 7;
+        cfg.server.max_body_bytes = 512;
+        cfg.server.rate_limit.per_principal = 5;
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 7);
+        assert_eq!(cfg.server.max_body_bytes, 512);
+        assert_eq!(cfg.server.rate_limit.per_principal, 5);
+    }
+
+    #[test]
+    fn check_config_refuses_an_invalid_request_limit() {
+        // `check-config` runs the same `resolve` the server does, so a bad
+        // value arriving by flag or variable is refused there, by name, rather
+        // than at boot.
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--request-timeout-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("server.request_timeout_secs"), "must name the setting: {err}");
+
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--rate-limit-per-principal",
+            "10",
+            "--rate-limit-per-principal-window-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("per_principal_window_secs"), "must name the setting: {err}");
+    }
+
+    #[test]
     fn seeds_parse_and_imply_clustering() {
         let cli = parse(&["--seeds", "k8s:kimmy-headless.default.svc.cluster.local"]);
         let mut cfg = Config::default();
@@ -468,6 +673,56 @@ mod tests {
     #[test]
     fn a_bad_seed_is_a_parse_error() {
         assert!(Cli::try_parse_from(["kimmyd", "--seeds", "static:garbage"]).is_err());
+    }
+
+    #[test]
+    fn the_token_lifetime_limit_overrides_the_file_and_reaches_validate() {
+        // The flag and the variable are one clap argument, so exercising the
+        // flag exercises the variable's path; the variable's name is pinned
+        // separately because it is documented and a rename would be a silent
+        // break for every environment block that sets it.
+        let arg = Cli::command()
+            .get_arguments()
+            .chain(Cli::command().get_subcommands().flat_map(|c| c.get_arguments()))
+            .find(|a| a.get_id() == "oidc_max_token_lifetime_secs")
+            .cloned()
+            .expect("the argument exists");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")
+        );
+
+        let cli = parse(&["--oidc-max-token-lifetime-secs", "3600"]);
+        let mut cfg = Config::default();
+        cfg.auth.oidc.max_token_lifetime_secs = 600;
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 3600, "the override wins");
+
+        // Absent, the file's value stands — and the file's default is 900.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 900);
+
+        // A value that arrived through the environment is refused by the same
+        // rule as one in the file.
+        let cli = parse(&["--oidc-max-token-lifetime-secs", "0"]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("a-root-password-for-the-tests".into()),
+                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
+                oidc: crate::config::OidcConfig {
+                    issuer: Some("https://auth.example.com".into()),
+                    audience: Some("https://kimmydb.example.com".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_token_lifetime_secs"), "unhelpful error: {err}");
     }
 
     #[test]
@@ -508,6 +763,51 @@ mod tests {
     }
 
     #[test]
+    fn a_previous_jwt_secret_arrives_by_flag_and_reaches_validate() {
+        // The flag lands in the same field the file uses, and an absent flag
+        // leaves the file's value alone.
+        let cli = parse(&["--jwt-previous-secret", "the-signing-key-being-retired-now"]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(
+            cfg.auth.jwt_previous_secret.as_deref(),
+            Some("the-signing-key-being-retired-now")
+        );
+
+        let mut cfg = Config::default();
+        cfg.auth.jwt_previous_secret = Some("from-the-file-and-long-enough".into());
+        parse(&[]).overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.jwt_previous_secret.as_deref(), Some("from-the-file-and-long-enough"));
+
+        // The environment name is part of the documented interface.
+        let command = Cli::command();
+        let arg = command
+            .get_arguments()
+            .find(|a| a.get_id() == "jwt_previous_secret")
+            .expect("the flag exists");
+        assert_eq!(arg.get_env().and_then(|e| e.to_str()), Some("KIMMY_JWT_PREVIOUS_SECRET"));
+
+        // And validate is where the refusals live, however the value arrived:
+        // a previous secret equal to the current one is not a rotation.
+        let cli = parse(&[
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--jwt-previous-secret",
+            "a-signing-key-of-adequate-length",
+        ]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("hunter2".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("jwt_previous_secret"), "unhelpful error: {err}");
+    }
+
+    #[test]
     fn role_mappings_from_the_env_reach_validate() {
         // The startup refusals are validate()'s to make, and the env form
         // lands in the same field the file does. Asserting the refusal itself
@@ -517,7 +817,7 @@ mod tests {
         let cli = parse(&["--oidc-role-mappings", r#"[{"claim_value":"user"}]"#]);
         let mut cfg = Config {
             auth: crate::config::AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
                 oidc: crate::config::OidcConfig {
                     issuer: Some("https://auth.example.com".into()),

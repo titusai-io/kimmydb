@@ -682,25 +682,29 @@ impl Engine {
     }
 }
 
+/// A group's identity for deduplication: its ids, order-free.
+fn id_set(ids: &[DocId]) -> Vec<String> {
+    let mut key: Vec<String> = ids.iter().map(|id| id.to_string()).collect();
+    key.sort();
+    key
+}
+
 impl Engine {
-    /// Append the oplog entry that carries a violation to change streams.
-    ///
-    /// Locally stamped, because this is *this node's* observation rather than a
-    /// replicated fact — every node detects the same collision independently
-    /// when it merges, so a shared stamp would be wrong and shipping the entry
-    /// to peers would double-report.
-    ///
-    /// A separate transaction from the merge itself, deliberately. The merge
-    /// must not fail because reporting failed: a converged write with an
-    /// unreported violation is bad, but a *rejected* replicated write is worse,
     /// Unique violations still standing on a collection (ADR-087).
     ///
     /// Every `UniqueViolation` entry in the retained oplog for this
-    /// collection whose named documents **all still exist** — one deleted
-    /// resolves it, and it is not reported. Deduplicated by index and id set,
-    /// because a collision is recorded once per node that merged it and a
-    /// resend must not read as two. Costs one pass over the retained oplog,
-    /// which retention bounds; a route, not a hot path.
+    /// collection, re-evaluated against the documents **as they are now**:
+    /// a named document that is gone, or whose current keys under the index
+    /// meet none of the others', has resolved its part of the collision and
+    /// is left out of the group; a group with fewer than two members left is
+    /// not reported; an index that no longer exists (or is no longer unique)
+    /// has no constraint left to break. Deduplicated by index and id set —
+    /// once on the recorded set, because a collision is recorded once per
+    /// node that merged it and a resend must not read as two, and again on
+    /// the surviving set, because two records can shrink to the same group.
+    /// Costs one pass over the retained oplog and one read plus one key
+    /// computation per named document, which retention bounds; a route, not
+    /// a hot path.
     pub fn live_unique_violations(
         &self,
         coll: &CollectionMeta,
@@ -708,6 +712,7 @@ impl Engine {
         const PAGE: usize = 1024;
         let mut out = Vec::new();
         let mut seen: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
+        let mut reported: std::collections::BTreeSet<(String, Vec<String>)> = Default::default();
         let mut from = kimmy_core::Hlc::ZERO;
         let mut last_seen: Option<Stamp> = None;
         loop {
@@ -728,20 +733,13 @@ impl Engine {
                 if detail.ids.is_empty() {
                     continue;
                 }
-                let mut key: Vec<String> = detail.ids.iter().map(|id| id.to_string()).collect();
-                key.sort();
-                if !seen.insert((detail.index.clone(), key)) {
+                if !seen.insert((detail.index.clone(), id_set(&detail.ids))) {
                     continue;
                 }
-                let mut all_live = true;
-                for id in &detail.ids {
-                    if self.get(coll, id)?.is_none() {
-                        all_live = false;
-                        break;
-                    }
-                }
-                if all_live {
-                    out.push(detail);
+                if let Some(standing) = self.standing_members(coll, &detail)?
+                    && reported.insert((standing.index.clone(), id_set(&standing.ids)))
+                {
+                    out.push(standing);
                 }
             }
             if page.len() < PAGE {
@@ -753,6 +751,66 @@ impl Engine {
         Ok(out)
     }
 
+    /// The members of a recorded collision that still collide.
+    ///
+    /// The record names the documents that shared a key when the merge
+    /// happened; this asks whether they still do. Each named document that
+    /// still exists has its keys recomputed under the index as it is defined
+    /// now — the same function the write path uses, over a document this
+    /// pass had to read anyway to know it exists — and a member stays only if
+    /// some other member holds one of its keys. Deleting a member and
+    /// rewriting its value are one case here: a document with no key in
+    /// common with the rest has left the group. `merged` is kept as recorded,
+    /// because it names the arrival that revealed the collision, which no
+    /// later write changes.
+    ///
+    /// `None` when fewer than two members remain, or when the index the record
+    /// names is gone or no longer unique.
+    fn standing_members(
+        &self,
+        coll: &CollectionMeta,
+        detail: &kimmy_core::UniqueViolationDetail,
+    ) -> Result<Option<kimmy_core::UniqueViolationDetail>> {
+        let Some(index) = coll.indexes.iter().find(|i| i.unique && i.name == detail.index) else {
+            return Ok(None);
+        };
+        let mut keyed: Vec<(&DocId, Vec<Vec<u8>>)> = Vec::with_capacity(detail.ids.len());
+        for id in &detail.ids {
+            if let Some(doc) = self.get(coll, id)? {
+                keyed.push((id, index::index_keys(index, &doc)?));
+            }
+        }
+        let ids: Vec<DocId> = keyed
+            .iter()
+            .enumerate()
+            .filter(|(i, (_, keys))| {
+                keyed
+                    .iter()
+                    .enumerate()
+                    .any(|(j, (_, theirs))| j != *i && keys.iter().any(|key| theirs.contains(key)))
+            })
+            .map(|(_, (id, _))| (*id).clone())
+            .collect();
+        if ids.len() < 2 {
+            return Ok(None);
+        }
+        Ok(Some(kimmy_core::UniqueViolationDetail::new(
+            detail.index.clone(),
+            detail.merged.clone(),
+            ids,
+        )))
+    }
+
+    /// Append the oplog entry that carries a violation to change streams.
+    ///
+    /// Locally stamped, because this is *this node's* observation rather than a
+    /// replicated fact — every node detects the same collision independently
+    /// when it merges, so a shared stamp would be wrong and shipping the entry
+    /// to peers would double-report.
+    ///
+    /// A separate transaction from the merge itself, deliberately. The merge
+    /// must not fail because reporting failed: a converged write with an
+    /// unreported violation is bad, but a *rejected* replicated write is worse,
     /// because the nodes then never agree.
     fn log_unique_violation(
         &self,
@@ -1510,6 +1568,61 @@ mod tests {
 
         assert_eq!(engine.unique_violations(), 1, "a resend must not be counted again");
     }
+
+    #[test]
+    fn a_standing_violation_is_re_evaluated_against_the_documents_as_they_are() {
+        // ADR-087, amended: the record says who collided when the merge
+        // happened; the report says who still does. A later state of a
+        // member that keeps the value keeps the collision; one that changes
+        // the value resolves it, exactly as a delete would.
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+        let entry =
+            remote_insert(&coll, "remote", doc! { "_id": "remote", "email": "clash@x" }, 9_000);
+        engine.apply_remote(&coll, &entry).unwrap();
+
+        let live = engine.live_unique_violations(&coll).unwrap();
+        assert_eq!(live.len(), 1, "{live:?}");
+        assert_eq!(live[0].ids.len(), 2);
+
+        // The peer rewrote its document but kept the email: still colliding.
+        let later = remote_insert(
+            &coll,
+            "remote",
+            doc! { "_id": "remote", "email": "clash@x", "note": "still here" },
+            9_500,
+        );
+        engine.apply_remote(&coll, &later).unwrap();
+        let live = engine.live_unique_violations(&coll).unwrap();
+        assert_eq!(live.len(), 1, "a rewrite that keeps the value keeps the collision");
+        assert_eq!(live[0].ids.len(), 2);
+
+        // Rewritten to a value of its own: the key is unique again, and the
+        // record — still in the oplog, both documents still present — no
+        // longer describes a standing violation.
+        engine
+            .replace(
+                &coll,
+                &DocId::String("remote".into()),
+                doc! { "_id": "remote", "email": "remote@x" },
+                false,
+            )
+            .unwrap();
+        assert!(engine.get(&coll, &DocId::String("local".into())).unwrap().is_some());
+        assert!(engine.get(&coll, &DocId::String("remote".into())).unwrap().is_some());
+        assert!(
+            engine.live_unique_violations(&coll).unwrap().is_empty(),
+            "a rewrite of the colliding value resolves the violation"
+        );
+        // The metric counts detections, not standing violations: the peer's
+        // second state was merged into an occupied key and detected again,
+        // and neither detection is undone by the resolution. The two records
+        // name the same ids, which is why the report showed one group.
+        assert_eq!(engine.unique_violations(), 2, "the detection count is history, and stays");
+    }
+
     #[tokio::test]
     async fn a_merged_violation_reaches_a_change_stream() {
         // ADR-020's commitment: the violation is an event a client can act on,

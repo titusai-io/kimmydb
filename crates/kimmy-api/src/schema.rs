@@ -97,6 +97,13 @@ pub fn describe_collection(
         "fields": described,
         "indexes": meta.indexes.iter().map(index_to_json).collect::<Vec<_>>(),
         "vector": meta.vector,
+        // A fact about the node that answered, not about the collection —
+        // named so, because a client that read it as a per-collection setting
+        // would look for a way to change it here. The same value, from the
+        // same source, as `/v1/version` reports (ADR-088); repeated here so
+        // that the one call a client makes before writing already says
+        // what an acknowledged write means on this node.
+        "nodeDurability": state.engine.durability().as_str(),
     }))
 }
 
