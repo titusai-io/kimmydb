@@ -77,7 +77,22 @@ pub enum Message {
     /// The answer.
     Versions(VersionVector),
     /// "Send me everything at or after this point."
-    AskEntries { from: Hlc, limit: usize },
+    ///
+    /// `held` is the requester's witnessed vector — the one `from` was derived
+    /// from — so the sender can judge the horizon per origin rather than by
+    /// the single threshold: a requester below the coarse horizon is served
+    /// when nothing it lacks has been collected, and told `BeyondHorizon`
+    /// only when something has (ADR-097). Optional on the wire, because the
+    /// handshake negotiates no version: a sender that predates the field
+    /// ignores it and judges by `from` as before, and a requester that
+    /// predates it sends none, which a sender reads the same way. Neither
+    /// direction of a mixed-version cluster loses anything it had.
+    AskEntries {
+        from: Hlc,
+        limit: usize,
+        #[serde(default)]
+        held: Option<VersionVector>,
+    },
     /// The answer, in stamp order.
     Entries(Vec<OplogEntry>),
     /// "That many entries will not fit in a frame; ask for this many."
@@ -102,6 +117,13 @@ pub enum Message {
     /// retention horizon. Serving it entries anyway would hand it a silent gap:
     /// it would apply what still exists, advance its version vector, and never
     /// learn what it missed.
+    ///
+    /// "Below the horizon" is judged per origin when the requester sent its
+    /// vector (`AskEntries::held`), and by the threshold alone when it did
+    /// not. The difference is a requester that trails one origin by a long
+    /// silence and one entry: by the threshold it is beyond the horizon and
+    /// pulls a snapshot; per origin, nothing it lacks was collected and it is
+    /// served the entry (ADR-097).
     BeyondHorizon {},
     /// "Send me current state instead of history."
     AskSnapshot { after: Option<SnapshotCursor> },
@@ -335,7 +357,8 @@ mod tests {
     async fn frames_round_trip() {
         let messages = [
             Message::AskVersions {},
-            Message::AskEntries { from: Hlc::new(7, 1), limit: 10 },
+            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None },
+            Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: Some(populated_vector()) },
             Message::Versions(populated_vector()),
             Message::Entries(Vec::new()),
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
@@ -357,13 +380,50 @@ mod tests {
         // would consume the tail of the first message.
         let mut buffer = Vec::new();
         write_frame(&mut buffer, &Message::AskVersions {}).await.unwrap();
-        write_frame(&mut buffer, &Message::AskEntries { from: Hlc::ZERO, limit: 5 }).await.unwrap();
+        write_frame(&mut buffer, &Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None })
+            .await
+            .unwrap();
 
         let mut stream = buffer.as_slice();
         assert_eq!(read_frame(&mut stream).await.unwrap(), Message::AskVersions {});
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
-            Message::AskEntries { from: Hlc::ZERO, limit: 5 }
+            Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None }
+        );
+    }
+
+    #[tokio::test]
+    async fn ask_entries_crosses_a_version_boundary_in_both_directions() {
+        // The handshake negotiates no protocol version, so a field added to a
+        // request has to be one an older peer can ignore and a newer peer can
+        // do without. Both halves, as frames: what a requester before `held`
+        // sends, and what a sender before `held` sees.
+        let from = Hlc::new(7, 1);
+
+        // A frame from a requester that predates the field: no `held` at all.
+        let old_request = bson::doc! { "AskEntries": { "from": bson::serialize_to_bson(&from).unwrap(), "limit": 10i64 } };
+        let mut buffer = Vec::new();
+        let body = bson::serialize_to_vec(&old_request).unwrap();
+        buffer.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buffer.extend_from_slice(&body);
+        assert_eq!(
+            read_frame(&mut buffer.as_slice()).await.unwrap(),
+            Message::AskEntries { from, limit: 10, held: None },
+            "a request without the field must read as one that did not send it"
+        );
+
+        // A frame carrying a field this build does not know, standing in for
+        // what a sender that predates `held` sees when a newer requester
+        // writes one: it must be ignored, not refused.
+        let future = bson::doc! { "AskEntries": { "from": bson::serialize_to_bson(&from).unwrap(), "limit": 10i64, "somethingNewer": true } };
+        let mut buffer = Vec::new();
+        let body = bson::serialize_to_vec(&future).unwrap();
+        buffer.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        buffer.extend_from_slice(&body);
+        assert_eq!(
+            read_frame(&mut buffer.as_slice()).await.unwrap(),
+            Message::AskEntries { from, limit: 10, held: None },
+            "a field this build does not know must not fail the frame"
         );
     }
 

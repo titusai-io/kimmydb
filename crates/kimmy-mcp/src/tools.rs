@@ -102,7 +102,8 @@ pub struct FindArgs {
     /// Maximum documents to return. Defaults to 100.
     #[serde(default)]
     pub limit: Option<usize>,
-    /// Documents to skip, for paging.
+    /// Documents to skip, for paging. With a sort other than `{"_id": 1}`,
+    /// `skip + limit` may not exceed 10,000.
     #[serde(default)]
     pub skip: Option<usize>,
     /// Also report whether an index was used and how many documents were
@@ -155,6 +156,43 @@ pub struct SearchArgs {
     pub k: Option<usize>,
 }
 
+/// How much each half of a hybrid search counts when the two rankings are
+/// fused. Only the ratio matters. Leave both out for plain reciprocal rank
+/// fusion, which is the default.
+#[derive(Deserialize, JsonSchema)]
+pub struct FusionWeightsArgs {
+    /// Weight of the dense (vector) rank. At least 0; defaults to 1.
+    #[serde(default = "one")]
+    pub dense: f64,
+    /// Weight of the lexical (keyword) rank. At least 0; defaults to 1. Zero
+    /// switches the keyword half off.
+    #[serde(default = "one")]
+    pub lexical: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HybridSearchArgs {
+    #[serde(flatten)]
+    pub search: SearchArgs,
+    /// How much each half counts in fusion: the score is
+    /// `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`. Each at
+    /// least 0, not both zero. Defaults to equal weights.
+    #[serde(default)]
+    pub weights: Option<FusionWeightsArgs>,
+    /// How many distinct query terms a chunk must contain to count as keyword
+    /// evidence at all (at least 1; defaults to 1). The keyword half ranks by
+    /// term overlap, so on short documents almost everything shares one word
+    /// with the query and its ranking is noise; `2` keeps only chunks that
+    /// really match. A document this removes from the keyword half keeps its
+    /// vector-search contribution.
+    #[serde(default)]
+    pub min_overlap: Option<usize>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct InsertArgs {
     /// Database name.
@@ -190,6 +228,12 @@ pub struct UpdateArgs {
     /// Update every match rather than only the first.
     #[serde(default)]
     pub multi: bool,
+    /// Filters for the `$[<identifier>]` segments in update paths, one
+    /// document per identifier, for example `[{"line.sku": "b"}]` with
+    /// `{"$set": {"items.$[line].shipped": true}}`. `$[]` addresses every
+    /// element and needs no filter.
+    #[serde(default, rename = "arrayFilters")]
+    pub array_filters: Vec<Value>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -306,9 +350,12 @@ impl KimmyMcp {
     /// Query documents.
     #[tool(description = "Find documents matching a filter. Supports the MongoDB-style \
                        operators $eq $ne $gt $gte $lt $lte $in $nin $exists $type $regex \
-                       $all $size $elemMatch $and $or $not $nor. Use this for exact and \
-                       range conditions; use vector_search when the question is about \
-                       meaning rather than a value.")]
+                       $all $size $elemMatch $and $or $not $nor, and $expr for an \
+                       aggregation expression over the document, e.g. \
+                       {\"$expr\": {\"$gt\": [\"$spent\", \"$budget\"]}} to compare two \
+                       fields. Use this for exact and range conditions; use \
+                       vector_search when the question is about meaning rather than a \
+                       value.")]
     async fn find(
         &self,
         Parameters(args): Parameters<FindArgs>,
@@ -355,8 +402,9 @@ impl KimmyMcp {
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
                        $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
                        $lookup (join; you need read access to the joined collection too). \
-                       Field references are written \"$field\". There are no computed \
-                       expressions such as $add. A pipeline that would hold too many \
+                       Field references are written \"$field\"; computed expressions \
+                       ($add, $concat, $cond, $size, $filter, $map and the rest) work \
+                       anywhere a value is derived. A pipeline that would hold too many \
                        documents is refused, naming the stage — add an earlier $match.")]
     async fn aggregate(
         &self,
@@ -399,14 +447,21 @@ impl KimmyMcp {
                        half needs words. Scores are rank-fusion values (small numbers, \
                        around 0.03), not similarities: they order the results and are \
                        not comparable with vector_search scores, so do not threshold \
-                       them.")]
+                       them. `weights` and `min_overlap` tune the fusion; their \
+                       defaults are plain reciprocal rank fusion. On a collection of \
+                       short documents, set `min_overlap` to 2 so that a chunk sharing \
+                       a single common word with the query does not count as a \
+                       keyword match.")]
     async fn hybrid_search(
         &self,
-        Parameters(args): Parameters<SearchArgs>,
+        Parameters(args): Parameters<HybridSearchArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let (db, coll, request) = search_request(args);
+        let (db, coll, mut request) = search_request(args.search);
+        request.weights =
+            args.weights.map(|w| vectors::FusionWeights { dense: w.dense, lexical: w.lexical });
+        request.min_overlap = args.min_overlap;
         render(vectors::run_hybrid_search(&self.state, &auth, &db, &coll, &request).await)
     }
 
@@ -445,7 +500,10 @@ impl KimmyMcp {
     #[tool(description = "Apply update operators ($set, $unset, $inc, $mul, $min, $max, \
                        $rename, $currentDate, $push, $pull, $addToSet, $pop) to \
                        documents matching a filter. Only the first match is updated \
-                       unless `multi` is true.")]
+                       unless `multi` is true. A path may address array elements: \
+                       `items.$[].qty` for every element, or `items.$[line].qty` for \
+                       the elements an `arrayFilters` entry such as \
+                       `{\"line.sku\": \"b\"}` selects.")]
     async fn update(
         &self,
         Parameters(args): Parameters<UpdateArgs>,
@@ -460,6 +518,7 @@ impl KimmyMcp {
             multi: args.multi,
             explain: false,
             if_stamp: None,
+            array_filters: args.array_filters,
         };
         render(exec::update(
             &self.state,
@@ -485,6 +544,7 @@ impl KimmyMcp {
             multi: args.multi,
             explain: false,
             if_stamp: None,
+            array_filters: Vec::new(),
         };
         render(exec::delete(&self.state, &auth, &args.database, &args.collection, params))
     }
@@ -552,6 +612,8 @@ fn search_request(args: SearchArgs) -> (String, String, vectors::SearchRequest) 
         filter: args.filter,
         k: args.k,
         per_document: None,
+        weights: None,
+        min_overlap: None,
     };
     (args.database, args.collection, request)
 }

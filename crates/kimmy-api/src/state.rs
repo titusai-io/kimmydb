@@ -58,6 +58,13 @@ pub struct AppState {
     /// than tombstone retention (ADR-085), for `/v1/topology`.
     pub(crate) stale_peers:
         parking_lot::Mutex<std::collections::BTreeMap<kimmy_core::NodeId, StalePeer>>,
+    /// Where a local token may be minted from (ADR-100).
+    ///
+    /// A `OnceLock` like `federation`, and for the same reason: there is one
+    /// answer for the life of the process, and a mode that could be flipped
+    /// while serving would be one more thing a request could race. Unset reads
+    /// as [`LocalLogin::Always`], which is exactly the behaviour that shipped.
+    pub(crate) local_login: std::sync::OnceLock<crate::local_login::LocalLogin>,
 }
 
 /// A peer that has been away longer than tombstone retention.
@@ -121,6 +128,17 @@ impl AppState {
     pub fn federation(&self) -> Option<&Arc<crate::federation::Federation>> {
         self.federation.get()
     }
+
+    /// Say where a local token may be minted from. Called once, at startup; a
+    /// second call is ignored.
+    pub fn set_local_login(&self, mode: crate::local_login::LocalLogin) {
+        let _ = self.local_login.set(mode);
+    }
+
+    /// Where a local token may be minted from. `Always` until told otherwise.
+    pub fn local_login(&self) -> crate::local_login::LocalLogin {
+        self.local_login.get().copied().unwrap_or_default()
+    }
 }
 
 pub type SharedState = Arc<AppState>;
@@ -183,7 +201,47 @@ impl FromRequestParts<SharedState> for Auth {
         // not been logged out since — which is this (ADR-052). A federated
         // principal has no local record to check, and the check knows that.
         state.sessions.check(&state.engine, &principal)?;
+
+        // The per-principal budget (ADR-099), spent only by a request that has
+        // fully authenticated: a refused token is a 401 and never a 429, so
+        // the limiter counts principals rather than guesses. Here rather than
+        // in a layer because this is the first place the key exists — and
+        // because every surface that takes a principal passes through here,
+        // so `/mcp` and the change-stream upgrade are covered without a layer
+        // each of them would have to remember.
+        let limiter = &state.limits.per_principal;
+        if !limiter.limit().is_disabled() {
+            let issuer =
+                principal.federated.then(|| state.federation().map(|f| f.issuer())).flatten();
+            let key = principal_key(&principal, issuer.as_deref());
+            if let crate::ratelimit::Decision::Limited { retry_after } = limiter.acquire(&key) {
+                state.metrics.record_principal_rate_limited();
+                warn!(
+                    user = %principal.user,
+                    federated = principal.federated,
+                    "rate-limited an authenticated request by principal"
+                );
+                return Err(crate::ratelimit::too_many_requests(retry_after));
+            }
+        }
         Ok(Auth(principal))
+    }
+}
+
+/// The key a principal's request budget is kept under.
+///
+/// A local user is its name, which is the token's subject. A federated
+/// principal is its issuer *and* its subject, under a different prefix: a
+/// provider's `sub` of `root` is not this cluster's `root`, and a limiter that
+/// let the two share a budget would let whoever controls one name at the
+/// provider spend the other's. The issuer is included even though a node
+/// federates with one provider today (ADR-064), so the key stays right if that
+/// ever changes, and so the two prefixes can never collide with each other.
+fn principal_key(principal: &Principal, issuer: Option<&str>) -> String {
+    if principal.federated {
+        format!("oidc:{}:{}", issuer.unwrap_or_default(), principal.user)
+    } else {
+        format!("local:{}", principal.user)
     }
 }
 
@@ -346,5 +404,36 @@ impl Auth {
 
     pub fn principal(&self) -> &Principal {
         &self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_federated_subject_and_a_local_user_of_the_same_name_have_different_keys() {
+        // Whoever controls the name `root` at the provider must not be able to
+        // spend, or be charged for, the local root's budget.
+        let local = Principal::new("root", Vec::new());
+        let mut federated = Principal::new("root", Vec::new());
+        federated.federated = true;
+
+        let local_key = principal_key(&local, None);
+        let federated_key = principal_key(&federated, Some("https://auth.example.com"));
+        assert_ne!(local_key, federated_key);
+        assert!(federated_key.contains("https://auth.example.com"), "{federated_key}");
+    }
+
+    #[test]
+    fn the_same_local_user_always_gets_the_same_key() {
+        // Otherwise a principal spread across many addresses would draw on
+        // many budgets, which is the case keying on the principal exists for.
+        let a = Principal::new("ada", Vec::new());
+        let b = Principal::new(
+            "ada",
+            vec![kimmy_auth::Grant::new("shop", "*", vec![kimmy_auth::Action::Read])],
+        );
+        assert_eq!(principal_key(&a, None), principal_key(&b, None), "grants are not identity");
     }
 }

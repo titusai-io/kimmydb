@@ -21,8 +21,17 @@ installers = ["homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "titusai-io/homebrew-tap"
 # Publish jobs to run in CI. `./publish-ghcr` is ours:
-# .github/workflows/publish-ghcr.yml, the multi-arch container image.
+# .github/workflows/publish-ghcr.yml, the multi-arch container image. dist
+# runs publish jobs after `host`, which runs after every build job, so the
+# image job can take the Linux archives from the run's own workflow artifacts
+# (`artifacts-build-local-<target>`) rather than compiling again (ADR-107).
 publish-jobs = ["homebrew", "./publish-ghcr"]
+# `cache-builds` (a rust-cache in build-local-artifacts) stays off. A cache is
+# readable only from the ref that wrote it or from the default branch; no job
+# on main builds the musl targets, so a tag would never find a cache to read
+# and would write a set — a gigabyte or more per release — that no later tag
+# can read either, against the 10 GiB budget CI already had to be pruned back
+# under. Enable it only if main starts building the release targets.
 # Target platforms to build apps for (Rust target-triple syntax).
 #
 # musl rather than gnu for Linux, deliberately: the result is a static binary

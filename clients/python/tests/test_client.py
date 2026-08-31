@@ -41,6 +41,24 @@ def test_documents_round_trip(db):
     assert db.count("shop", "orders") == 5
 
 
+def test_update_carries_array_filters(db):
+    # The one option with a body the other update shapes do not send, so the
+    # request must be seen to carry it: a dropped array_filters would surface
+    # as a 400 for an identifier without a filter.
+    seed(db, 0)
+    items = [{"sku": "a", "shipped": False}, {"sku": "b", "shipped": False}]
+    db.insert("shop", "orders", {"_id": 1, "items": items})
+
+    update = {"$set": {"items.$[line].shipped": True}}
+    result = db.update("shop", "orders", {"_id": 1}, update, array_filters=[{"line.sku": "b"}])
+    assert result["modified"] == 1
+    assert [line["shipped"] for line in db.get("shop", "orders", 1)["items"]] == [False, True]
+
+    with pytest.raises(KimmyError) as refused:
+        db.update("shop", "orders", {"_id": 1}, update)
+    assert refused.value.code == "bad_request"
+
+
 def test_paging_walks_the_whole_collection(db):
     # The reason the client exists rather than a `find` call: an unlimited
     # `find` returns 100 documents and says nothing about the rest.
