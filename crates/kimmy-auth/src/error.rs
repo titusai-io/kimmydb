@@ -15,6 +15,29 @@ pub enum AuthError {
     #[error("authentication token has expired")]
     TokenExpired,
 
+    /// A federated token's own `exp − iat` is longer than this node accepts.
+    ///
+    /// Distinct from [`AuthError::InvalidToken`] because the caller can act on
+    /// it and the reason is not sensitive: the provider minted a longer-lived
+    /// token than `auth.oidc.max_token_lifetime_secs` admits, and either the
+    /// provider's lifetime or this node's limit has to move. The message names
+    /// the limit and nothing about the token (ADR-096).
+    #[error(
+        "the access token is valid for longer than the {max_secs} seconds this node accepts          (auth.oidc.max_token_lifetime_secs); shorten the provider's access token lifetime or          raise the limit"
+    )]
+    TokenLifetimeExceeded { max_secs: u64 },
+
+    /// A federated token carries no `iat`, so its lifetime cannot be bounded.
+    ///
+    /// Refused rather than waved through, because the limit would otherwise be
+    /// one omitted claim away from not applying. RFC 9068 §2.2 makes `iat`
+    /// REQUIRED in a JWT access token, so a conforming provider never produces
+    /// this (ADR-096).
+    #[error(
+        "the access token carries no iat, so its lifetime cannot be checked against the          {max_secs} seconds this node accepts (auth.oidc.max_token_lifetime_secs); RFC 9068          requires the claim"
+    )]
+    TokenLifetimeUnbounded { max_secs: u64 },
+
     #[error("not authorized to {action} {target}")]
     Forbidden { action: String, target: String },
 
@@ -32,6 +55,19 @@ pub enum AuthError {
 
     #[error("the JWT secret must be at least {min} bytes")]
     WeakSecret { min: usize },
+
+    /// The previous signing secret is the current one.
+    ///
+    /// Refused rather than ignored: the two-key window (ADR-101) exists so an
+    /// operator can retire a secret, and a configuration naming the same value
+    /// twice is a rotation that was edited halfway. Starting under it would
+    /// report a rotation in progress when nothing had changed.
+    #[error(
+        "the previous JWT secret is the same as the current one, so nothing is being rotated; \
+         set auth.jwt_secret to the new value and auth.jwt_previous_secret to the old one, or \
+         remove auth.jwt_previous_secret"
+    )]
+    PreviousSecretIsCurrent,
 
     /// The token names a signing key this node has not fetched.
     ///
@@ -86,6 +122,18 @@ pub enum AuthError {
          does not implement resource indicators."
     )]
     InvalidResourceIdentifier { audience: String, reason: String },
+
+    /// `auth.oidc.max_token_lifetime_secs` is outside the range that means
+    /// anything.
+    ///
+    /// Zero would refuse every token, and anything past a day is no longer a
+    /// bound on the window ADR-073 describes but a decision not to have one —
+    /// which is a decision this setting exists to prevent being made by typo
+    /// (ADR-096).
+    #[error(
+        "auth.oidc.max_token_lifetime_secs is {secs}, which is outside 1..={max} seconds. It          bounds how long a federated token may be valid for by its own exp − iat, so that a          provider-side revocation is honoured within that many seconds; zero would refuse every          token, and more than a day is not a bound."
+    )]
+    InvalidTokenLifetimeLimit { secs: u64, max: u64 },
 
     #[error("password hashing failed: {0}")]
     Hashing(String),

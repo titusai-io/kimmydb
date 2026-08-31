@@ -361,8 +361,11 @@ jobs:
           # binary is present, runnable, and correctly wired in the image.
           # Both secrets are supplied because an authenticated node refuses to
           # start -- and `check-config` refuses to bless -- a configuration
-          # with no signing key, single node or cluster.
+          # with no signing key, single node or cluster. The signing key is
+          # generated rather than written here: the image binds 0.0.0.0, and
+          # off loopback the validator also refuses a key shorter than 32
+          # bytes or one of the repository's own placeholder values.
           docker run --rm \
             -e KIMMY_ROOT_PASSWORD=ci-smoke-test \
-            -e KIMMY_JWT_SECRET=ci-smoke-test-signing-secret \
+            -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
             kimmydb:ci check-config

@@ -440,10 +440,14 @@ impl Client {
 
     /// Search by meaning and by keyword at once, fused by rank.
     ///
-    /// Same body as [`Self::vector_search`]. The server runs a dense and a
-    /// lexical search and combines them with Reciprocal Rank Fusion, so the
-    /// scores are fusion scores and are not comparable with the similarity
-    /// scores `vector_search` returns.
+    /// Same body as [`Self::vector_search`], plus two optional fields that tune
+    /// the fusion: `weights` (`{ "dense": w, "lexical": w }`) scales each
+    /// half's rank, and `min_overlap` is how many distinct query terms a chunk
+    /// must share to count as keyword evidence. Left out, both are the plain
+    /// reciprocal rank fusion the route has always done. The server runs a
+    /// dense and a lexical search and combines them with Reciprocal Rank
+    /// Fusion, so the scores are fusion scores and are not comparable with the
+    /// similarity scores `vector_search` returns.
     pub async fn hybrid_search(&self, db: &str, collection: &str, body: &Value) -> Result<Value> {
         self.send(
             reqwest::Method::POST,

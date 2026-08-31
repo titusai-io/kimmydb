@@ -136,9 +136,14 @@ impl Engine {
             })?;
 
             let mut highest = None;
+            // The same high-water mark per origin: the coarse horizon says a
+            // peer below it may lack something collected, this says at which
+            // origins it actually does (ADR-097).
+            let mut per_origin = kimmy_core::VersionVector::new();
             for key in dropped_keys {
                 if let Ok(stamp) = codec::decode_oplog_key(&key) {
                     highest = Some(highest.map_or(stamp.hlc, |h: Hlc| h.max(stamp.hlc)));
+                    per_origin.observe(stamp);
                 }
                 if let Some(seq) = by_stamp.remove(key.as_slice())? {
                     arrival.remove(seq.value())?;
@@ -146,7 +151,9 @@ impl Engine {
             }
 
             // Recording the horizon is what lets a peer be told it needs a
-            // snapshot rather than being served a silent gap.
+            // snapshot rather than being served a silent gap. Both records in
+            // the same transaction as the removal, so neither can claim more
+            // or less was collected than actually was.
             if let Some(highest) = highest {
                 let mut meta = txn.open_table(tables::META)?;
                 let previous = match meta.get(tables::META_OPLOG_COLLECTED_THROUGH)? {
@@ -159,6 +166,11 @@ impl Engine {
                         tables::META_OPLOG_COLLECTED_THROUGH,
                         codec::oplog_key(&marker).as_slice(),
                     )?;
+                }
+
+                for (node, hlc) in per_origin.iter() {
+                    let stamp = kimmy_core::Stamp::new(hlc, node);
+                    crate::engine::raise_version(&txn, tables::OPLOG_COLLECTED, &stamp)?;
                 }
             }
         }
@@ -431,5 +443,107 @@ mod tests {
     fn the_cutoff_is_the_retention_window_behind_now() {
         assert_eq!(cutoff(10 * HOUR_MS, DAY), Hlc::new(0, 0));
         assert_eq!(cutoff(48 * HOUR_MS, DAY), Hlc::new(24 * HOUR_MS, 0));
+    }
+
+    /// Two engines with entries from both origins on `a`, `b` having written
+    /// last so its final entry is the tail `a` keeps.
+    fn two_origins() -> (Engine, Engine, tempfile::TempDir, tempfile::TempDir) {
+        let (a, da) = engine();
+        let (b, db) = engine();
+        let ca = a.create_collection("db", "c").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+        a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
+        for entry in a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap() {
+            b.apply_batch(&[entry]).unwrap();
+        }
+        let cb = b.get_collection("db", "c").unwrap();
+        b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
+        b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
+        let start = a.version_vector().unwrap().get(b.node_id());
+        let entries = b.entries_for_peer(start, usize::MAX).unwrap();
+        a.apply_batch(&entries).unwrap();
+        (a, b, da, db)
+    }
+
+    #[test]
+    fn collection_is_recorded_per_origin_as_well_as_overall() {
+        let (a, b, _da, _db) = two_origins();
+        let before = a.version_vector().unwrap();
+
+        a.collect_garbage_at(much_later(), policy()).unwrap();
+
+        let collected = a.oplog_collected().unwrap();
+        // Everything of A's went; A's record is its newest.
+        assert_eq!(collected.get(a.node_id()), before.get(a.node_id()));
+        // B's last entry is the tail and survives, so B's record is the one
+        // before it — strictly below what A holds of B.
+        let b_recorded = collected.get(b.node_id());
+        assert!(b_recorded > Hlc::ZERO && b_recorded < before.get(b.node_id()), "{collected:?}");
+        // The coarse horizon is the highest of the per-origin records: the two
+        // are one fact at two grains, written in one transaction.
+        assert_eq!(
+            a.oplog_collected_through().unwrap(),
+            collected.iter().map(|(_, hlc)| hlc).max().unwrap()
+        );
+        // Nothing collected on B, so nothing recorded.
+        assert!(b.oplog_collected().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_database_an_earlier_build_collected_from_is_seeded_with_the_coarse_horizon() {
+        // An earlier build moved the horizon without keeping the per-origin
+        // record. Reopened by this one, every origin held is given the
+        // horizon: coarse below it, as before; exact above it, from now on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        let node;
+        let horizon;
+        let held;
+        {
+            let a = Engine::open(&path).unwrap();
+            let ca = a.create_collection("db", "c").unwrap();
+            a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+            a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
+            a.collect_garbage_at(much_later(), policy()).unwrap();
+            node = a.node_id();
+            horizon = a.oplog_collected_through().unwrap();
+            held = a.version_vector().unwrap();
+            assert!(horizon > Hlc::ZERO);
+
+            // What the earlier build leaves behind: the horizon, no record.
+            let db = a.db();
+            let txn = db.begin_write().unwrap();
+            txn.open_table(tables::OPLOG_COLLECTED).unwrap().retain(|_, _| false).unwrap();
+            txn.commit().unwrap();
+            assert!(a.oplog_collected().unwrap().is_empty());
+        }
+
+        let reopened = Engine::open(&path).unwrap();
+        let collected = reopened.oplog_collected().unwrap();
+        assert_eq!(collected.len(), held.len(), "every held origin is seeded");
+        assert_eq!(collected.get(node), horizon);
+
+        // Reopening a database whose record already vouches for the horizon
+        // leaves it alone.
+        drop(reopened);
+        let again = Engine::open(&path).unwrap();
+        assert_eq!(again.oplog_collected().unwrap(), collected);
+    }
+
+    #[test]
+    fn nothing_is_seeded_where_nothing_was_ever_collected() {
+        // The opposite corner: a fresh database has no horizon, so a peer
+        // holding nothing must still be served from the oplog rather than
+        // handed a snapshot it does not need.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kimmy.redb");
+        {
+            let a = Engine::open(&path).unwrap();
+            let ca = a.create_collection("db", "c").unwrap();
+            a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
+        }
+        let reopened = Engine::open(&path).unwrap();
+        assert!(reopened.oplog_collected().unwrap().is_empty());
+        assert!(reopened.can_serve_peer_holding(&kimmy_core::VersionVector::default()).unwrap());
     }
 }
