@@ -424,9 +424,11 @@ curl 'localhost:7878/v1/db/shop/coll/users/violations?index=email_1' -H "$A"
 
 The recipe: for each group, decide which document keeps the value — `merged`
 is the one whose arrival revealed the collision, the others were already
-visible — then delete or rewrite the rest. A violation whose documents no
-longer all exist is resolved and stops being reported; nothing is written by
-the route itself. The report is derived from the retained oplog, so a
+visible — then delete or rewrite the rest. Either resolves it: the route
+re-evaluates each group's documents when asked, so a member that is gone, or
+whose value no longer meets another member's under the index, drops out of
+the group, and a group left with one member stops being reported. Nothing is
+written by the route itself. The report is derived from the retained oplog, so a
 collision older than `storage.oplog_retention_secs` is no longer listed even
 if both documents still exist — the change-stream event is the durable
 record, and an application that needs longer memory keeps it.

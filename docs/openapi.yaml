@@ -1760,8 +1760,11 @@ paths:
         nodes, after the fact, when a replicated write is merged (ADR-029). Each
         detection is a `uniqueViolation` change-stream event and a count on
         `/metrics`; this route is the resolution side — which violations still
-        stand *now*. A violation whose colliding documents no longer all exist
-        is resolved and is not reported (ADR-087).
+        stand *now*. Each recorded collision is re-evaluated against the
+        documents as they are: a member that has been deleted, or whose value
+        has been rewritten so that its index keys no longer meet another
+        member's, is left out of its group, and a group with fewer than two
+        members left is not reported (ADR-087).
 
         Without `index`, a count per index. With `index`, the colliding groups
         on that index with their documents, at most 10,000 groups.
@@ -2978,9 +2981,12 @@ components:
     ViolationGroup:
       type: object
       description: |
-        Documents sharing a key under a unique index, all of which still exist.
-        `merged` is the one whose arrival revealed the collision — the
-        actionable one, since the others were already visible to clients.
+        Documents that still share a key under a unique index, re-evaluated
+        when asked: a member deleted or rewritten out of the collision is no
+        longer listed. `merged` is the one whose arrival revealed the
+        collision — the actionable one, since the others were already visible
+        to clients. It is the recorded arrival, so once its own value has been
+        rewritten it can name a document that is no longer among `ids`.
       required: [ids, merged, documents]
       properties:
         ids:
@@ -3023,11 +3029,22 @@ components:
 
     CollectionDescription:
       type: object
-      required: [database, collection, documentCount, sampled, fields, indexes, vector]
+      required:
+        [database, collection, documentCount, sampled, fields, indexes, vector, nodeDurability]
       properties:
         database: { type: string }
         collection: { type: string }
         documentCount: { type: integer }
+        nodeDurability:
+          type: string
+          enum: [durable, coalesced]
+          description: |
+            The durability class of the **node that answered** — the same
+            value `GET /v1/version` reports as `durability` (ADR-088). A fact
+            about the node's configuration, not about this collection; it is
+            here so that the one call made before writing already says what
+            an acknowledged write means. Both classes are durable when the
+            response returns.
         sampled:
           type: integer
           description: Documents actually examined to produce this.

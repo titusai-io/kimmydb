@@ -10,6 +10,37 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: no wire, storage-format or API break; rolling upgrade. One additive
+field on `describe`, and one fix to the unique-violations report, which could
+keep listing a collision after the application had already resolved it.
+
+### Added
+
+- **`describe` reports the node's durability class.** `GET
+  /v1/db/{db}/coll/{coll}/describe` — and through it the MCP
+  `describe_collection` tool — carries `nodeDurability`: `durable` or
+  `coalesced`, the same value `GET /v1/version` reports as `durability`
+  (ADR-088). It is a fact about the node that answered, not about the
+  collection, which is what the name says; it is on `describe` because that
+  is the one call a client makes before writing, and it said everything
+  about a collection except what an acknowledged write to it means.
+
+### Fixed
+
+- **The violations route no longer lists documents whose value has since
+  been rewritten.** `GET …/violations` reported a recorded collision as long
+  as every document it named still existed, so resolving one by rewriting a
+  colliding value — the recipe the documentation gives alongside deletion —
+  left it in the report until the oplog entry aged out. Each group is now
+  re-evaluated when asked: a member deleted or rewritten so that its index
+  keys no longer meet another member's leaves the group, a group with fewer
+  than two members left is not reported, and an index that has been dropped
+  or made non-unique no longer contributes any. Nothing is stored or written
+  by the route; the change-stream event and the `/metrics` count are as
+  before.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

@@ -872,6 +872,244 @@ async fn standing_unique_violations_are_reported_until_resolved() {
     assert_eq!(res.status, 401);
 }
 
+/// Rewriting a colliding value resolves a violation as surely as deleting the
+/// document, and the report says so (ADR-087, amended).
+///
+/// Three documents share one email: one local, two merged from peers, so the
+/// oplog holds a two-member record and then a three-member one, as it does in
+/// production. The report is checked after each kind of resolution the
+/// recipe offers — an unrelated rewrite (nothing changes), a rewrite of the
+/// colliding value (the member leaves its group), and a delete of a member of
+/// a three-way group (the other two still stand).
+#[tokio::test]
+async fn a_rewritten_member_leaves_its_violation_group() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    server
+        .post(
+            "/v1/db/shop/coll/users/docs",
+            Some(&token),
+            json!({"_id": "a", "email": "clash@x", "name": "first"}),
+        )
+        .await;
+
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    for (id, hlc) in [("b", 9_000), ("c", 9_001)] {
+        let remote = kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(
+                kimmy_core::Hlc::new(hlc, 0),
+                kimmy_core::NodeId::generate(),
+            ),
+            kind: kimmy_core::OpKind::Insert,
+            collection: meta.id,
+            doc_id: Some(kimmy_core::DocId::String(id.into())),
+            body: Some(
+                bson::serialize_to_vec(&bson::doc! { "_id": id, "email": "clash@x" }).unwrap(),
+            ),
+        };
+        server.state.engine.apply_remote(&meta, &remote).unwrap();
+    }
+
+    let groups = |body: &Value| -> Vec<Vec<String>> {
+        body["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|g| {
+                let mut ids: Vec<String> = g["ids"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v.as_str().unwrap().to_string())
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect()
+    };
+    let by_index = "/v1/db/shop/coll/users/violations?index=email_1";
+
+    let res = server.get(by_index, Some(&token)).await;
+    let all_three = vec!["a".to_string(), "b".into(), "c".into()];
+    assert!(
+        groups(&res.body).contains(&all_three),
+        "the three-way collision stands: {:?}",
+        res.body
+    );
+
+    // A local rewrite that keeps the colliding value is refused, as any local
+    // write into an occupied key is — the existing rule, which is what makes
+    // "rewrite the value" the only local way out short of a delete — and the
+    // group stands as it was.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "a"}, "update": {"$set": {"name": "renamed"}} }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+    let res = server.get(by_index, Some(&token)).await;
+    assert!(groups(&res.body).contains(&all_three), "still colliding: {:?}", res.body);
+    let group = res.body["groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["ids"].as_array().unwrap().len() == 3)
+        .unwrap();
+    assert_eq!(group["documents"].as_array().unwrap().len(), 3, "documents follow ids");
+
+    // Rewriting c's email takes c out of the collision. What remains is one
+    // group of a and b: the three-member record shrinks to that pair, and the
+    // two-member record already names it, so they are reported once.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "c"}, "update": {"$set": {"email": "c@x"}} }),
+        )
+        .await;
+    assert_eq!(res.body["modified"], 1, "{:?}", res.body);
+    let res = server.get(by_index, Some(&token)).await;
+    assert_eq!(groups(&res.body), vec![vec!["a".to_string(), "b".into()]], "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+    let group = &res.body["groups"][0];
+    assert_eq!(group["documents"].as_array().unwrap().len(), 2, "c's document is not listed");
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 1, "indexes": [{ "name": "email_1", "count": 1 }] }));
+
+    // Rewriting b's email too leaves a alone under the key: nothing stands.
+    server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "b"}, "update": {"$set": {"email": "b@x"}} }),
+        )
+        .await;
+    let res = server.get(by_index, Some(&token)).await;
+    assert_eq!(res.body["count"], 0, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
+
+    // Rewriting back into the collision is refused locally, as it always was,
+    // so the report cannot be re-populated by this node's own writes.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/users/update",
+            Some(&token),
+            json!({ "filter": {"_id": "b"}, "update": {"$set": {"email": "clash@x"}} }),
+        )
+        .await;
+    assert_eq!(res.status, 409, "{:?}", res.body);
+}
+
+/// Deleting one member of a three-way collision leaves the other two standing.
+///
+/// Under the original definition — every named document still exists — the
+/// three-member record dropped out whole; with keys re-evaluated, the two
+/// survivors still share the key and are still reported as a group.
+#[tokio::test]
+async fn deleting_one_member_of_a_three_way_collision_leaves_the_other_two_standing() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"users"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/users/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }], "unique": true }),
+        )
+        .await;
+    server
+        .post("/v1/db/shop/coll/users/docs", Some(&token), json!({"_id": "a", "email": "clash@x"}))
+        .await;
+
+    // Two merges from one peer: the oplog records {a, b} and then {a, b, c}.
+    let meta = server.state.engine.get_collection("shop", "users").unwrap();
+    let origin = kimmy_core::NodeId::generate();
+    let entry =
+        |hlc: u64, kind: kimmy_core::OpKind, id: &str, email: &str| kimmy_core::OplogEntry {
+            stamp: kimmy_core::Stamp::new(kimmy_core::Hlc::new(hlc, 0), origin),
+            kind,
+            collection: meta.id,
+            doc_id: Some(kimmy_core::DocId::String(id.into())),
+            body: Some(bson::serialize_to_vec(&bson::doc! { "_id": id, "email": email }).unwrap()),
+        };
+    server
+        .state
+        .engine
+        .apply_remote(&meta, &entry(9_000, kimmy_core::OpKind::Insert, "b", "clash@x"))
+        .unwrap();
+    server
+        .state
+        .engine
+        .apply_remote(&meta, &entry(9_001, kimmy_core::OpKind::Insert, "c", "clash@x"))
+        .unwrap();
+
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert!(
+        res.body["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|g| g["ids"].as_array().unwrap().len() == 3),
+        "{:?}",
+        res.body
+    );
+
+    // Deleting c shrinks the three-member record to {a, b}, the same group the
+    // two-member record names, so one group is reported rather than none.
+    server.delete("/v1/db/shop/coll/users/docs/c", Some(&token)).await;
+    let res = server.get("/v1/db/shop/coll/users/violations?index=email_1", Some(&token)).await;
+    assert_eq!(res.body["count"], 1, "{:?}", res.body);
+    let mut ids: Vec<String> = res.body["groups"][0]["ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, vec!["a", "b"], "the survivors still collide");
+
+    // The index itself going away takes the constraint with it.
+    server.delete("/v1/db/shop/coll/users/indexes/email_1", Some(&token)).await;
+    let res = server.get("/v1/db/shop/coll/users/violations", Some(&token)).await;
+    assert_eq!(res.body, json!({ "count": 0, "indexes": [] }));
+}
+
+/// `describe` carries the node's durability class, as `/v1/version` does
+/// (ADR-088, amended): the same value from the same source, named for what it
+/// is — a fact about the node, not the collection.
+#[tokio::test]
+async fn describe_reports_the_node_durability_class() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let described = server.get("/v1/db/shop/coll/c/describe", Some(&token)).await;
+    let version = server.get("/v1/version", None).await;
+    assert_eq!(described.body["nodeDurability"], "durable", "{:?}", described.body);
+    assert_eq!(described.body["nodeDurability"], version.body["durability"]);
+
+    server.state.engine.set_durability(
+        kimmy_storage::DurabilityClass::Coalesced,
+        std::time::Duration::from_millis(5),
+    );
+    let described = server.get("/v1/db/shop/coll/c/describe", Some(&token)).await;
+    let version = server.get("/v1/version", None).await;
+    assert_eq!(described.body["nodeDurability"], "coalesced");
+    assert_eq!(version.body["durability"], "coalesced", "one fact, two routes");
+}
+
 /// Concurrent `$inc`s on one document must all land.
 ///
 /// Multi-threaded on purpose: the defect this pins was a read transaction

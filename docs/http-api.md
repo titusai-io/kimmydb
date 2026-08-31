@@ -344,6 +344,12 @@ matches an *element*. `presence` is a fraction of the **sample**, counting
 documents — it is inference, not a schema, and a field missing from the sample
 may still exist.
 
+`nodeDurability` is the durability class of the node that answered —
+`durable` or `coalesced`, the same value `GET /v1/version` reports as
+`durability` ([Storage](storage.md#durability-classes)). It is a fact about
+the node, not the collection, and is repeated here so the one call made before
+writing already says what an acknowledged write means.
+
 The same information backs the MCP `describe_collection` tool; see
 [MCP](mcp.md).
 
@@ -455,8 +461,9 @@ A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 Across nodes a collision is detected when the replicated write is merged, not
 prevented, and both documents stay. `GET …/violations` lists what still
 stands — counts per index, or with `?index=<name>` the colliding groups with
-their documents — so the application can choose; a violation whose documents
-no longer all exist drops out of the report
+their documents — so the application can choose; a document deleted or
+rewritten out of the collision drops out of its group, and a group with one
+member left drops out of the report
 ([resolving a unique violation](indexes.md#resolving-a-unique-violation)).
 
 Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
