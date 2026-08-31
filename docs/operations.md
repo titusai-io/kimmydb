@@ -52,7 +52,11 @@ fails fast on a bad volume mount.
 | `server.rate_limit.login_per_user` | — | `0` | Failed logins per username across all addresses. Off by default — it is a real defence and a real lockout, see [Security](security.md#login-rate-limiting) |
 | `server.rate_limit.login_per_user_window_secs` | — | `300` | |
 | `server.rate_limit.trusted_proxy_header` | — | — | Unset means use the socket peer. **Only set it if a proxy you control rewrites the header** |
-| `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiter's own memory; the key space is attacker-controlled |
+| `server.rate_limit.max_tracked_keys` | — | `100000` | Bounds the limiters' own memory; the key space is attacker-controlled |
+| `server.rate_limit.per_principal` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL` | `0` | Requests per authenticated principal per window, on every route that takes a token. `0` disables — the default. See [Security](security.md#limits-on-authenticated-requests) |
+| `server.rate_limit.per_principal_window_secs` | `KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS` | `60` | |
+| `server.request_timeout_secs` | `KIMMY_REQUEST_TIMEOUT_SECS` | `30` | Deadline for a request still waiting for its body or for an embedding provider; `503 timeout` past it. Not a query timeout — storage work already running completes. Change streams and `/mcp` are exempt |
+| `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
 | `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth`. Off loopback, an example's value (`changeme`, `hunter2`, …) is refused |
@@ -82,6 +86,24 @@ fails fast on a bad volume mount.
 
 [`kimmy.example.toml`](../kimmy.example.toml) documents every setting inline.
 
+### Limits on a request
+
+Three of the settings above bound what one authenticated caller can cost the
+node ([ADR-099](decisions.md)), and each defaults to what the server already
+did. `request_timeout_secs` is a deadline on *waiting*: a request whose body
+is still trickling in, or whose embedding-provider call has stalled, is
+abandoned with `503 timeout` at 30 s. It does not cut short storage work — a
+scan, a bulk commit or an index backfill runs to completion and is answered
+normally — so raising it is about slow clients and slow providers, never about
+slow queries. `max_body_bytes` is the ceiling axum always applied, now yours to
+move; `/mcp` reads its bodies under rmcp's own 4 MiB limit. `per_principal` is
+off until you set it; when you do, `kimmy_rate_limited_principal_total` is the
+series that tells you whether the number is right, and `3000` over `60`
+seconds (fifty a second, sustained, per principal) is a defensible place to
+start. Two principals behind one address are limited separately; one principal
+across many addresses is limited once. Details and the reasoning are in
+[Security](security.md#limits-on-authenticated-requests).
+
 ### Refused at startup
 
 These are configuration errors, caught before serving rather than surfacing as
@@ -104,6 +126,8 @@ runtime confusion:
 | An unknown `audit.mode` | A typo would produce a server recording nothing, which looks exactly like a server nobody has attacked |
 | A rate-limit window of `0` with a non-zero burst | The burst would divide by a clamped one-millisecond window, making the limit decorative. Disable a limiter by setting its burst to `0` |
 | `max_tracked_keys = 0` | A limiter that can remember nothing cannot limit anything |
+| `request_timeout_secs = 0` | A deadline of zero would abandon every request that has to wait for its own body |
+| `max_body_bytes = 0` | A ceiling of zero refuses every request that carries a body, login included |
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
@@ -358,7 +382,8 @@ port.
 | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
 | `kimmy_authz_denied_total` | Refused by RBAC |
 | `kimmy_auth_failures_total` | Rejected credentials and tokens |
-| `kimmy_rate_limited_total` | Refused by a rate limit |
+| `kimmy_rate_limited_total` | Refused by a rate limit — the login limiters and the per-principal one together |
+| `kimmy_rate_limited_principal_total` | The part of that total refused by `server.rate_limit.per_principal`; the difference is the login limiters. Zero until the limit is set. A legitimate client appearing here is the measurement the number was waiting for ([ADR-099](decisions.md)) |
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
 | `kimmy_commits` | Durable write transactions committed. redb has a single writer and every commit is an fsync, so this over `kimmy_requests_total` is what a write *costs* — a client-visible write that takes two commits costs twice one that takes one, and no latency figure tells you which is happening. This is the number that explained the daemon-versus-engine write gap; see [Benchmarks](benchmarks.md) |
 | `kimmy_backups_total` | Backups served |

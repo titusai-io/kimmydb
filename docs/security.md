@@ -835,7 +835,9 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
 | **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; the node refuses a federated token valid for longer than `max_token_lifetime_secs` (900 s by default), so the revocation is honoured within that long ([ADR-096](decisions.md)) |
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
-| **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
+| **Rate limiting** | ✅ login · ✅ per principal, opt-in | See [Login rate limiting](#login-rate-limiting) and [Limits on authenticated requests](#limits-on-authenticated-requests). Per-*address* limiting of authenticated routes is still a proxy's job |
+| **A slow or oversized request from an authenticated caller** | ✅ Built | A request deadline and a body ceiling, both settings with defaults matching what the server always did — see [Limits on authenticated requests](#limits-on-authenticated-requests) |
+| **A slow query** | 📋 | The deadline does not interrupt storage work already running: a scan or a bulk commit runs to completion. There is no query timeout yet ([ADR-099](decisions.md)) |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No document- or field-level security** | Not planned | Collection is the finest granularity — see [How far authorization goes](#how-far-authorization-goes) |
 | **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
@@ -1135,6 +1137,78 @@ depends on your deployment, so it is not something a default should assume.
 
 With `--insecure-no-auth` the limiter is off entirely: there is no login to
 protect and every request is already a superuser.
+
+---
+
+## Limits on authenticated requests
+
+A valid token is not a licence to hold the server hostage. A principal that is
+compromised — or a client with a broken retry loop — can hold connections open
+by sending a body slowly, send bodies as large as the framework allows, and
+make requests as fast as the network carries them. Three settings bound those
+([ADR-099](decisions.md)); each defaults to what the server already did, so a
+node that sets none of them behaves exactly as before.
+
+```toml
+[server]
+request_timeout_secs = 30      # 503 `timeout` past it; 0 is refused
+max_body_bytes = 2097152       # 413 `payload_too_large` over it; 0 is refused
+
+[server.rate_limit]
+per_principal = 0              # requests per principal per window; 0 disables
+per_principal_window_secs = 60
+```
+
+**The deadline bounds waiting, not working.** It wraps every REST route that
+answers with a document and fires when the request is still *pending* at the
+deadline. In this server a request is pending in two places: while its body is
+still arriving, and while an embedding provider is being waited on. Both are
+where an authenticated caller can impose cost for free, and both are cut off
+with `503 timeout` (`retry: wait`). Storage work is synchronous and never
+yields, so a scan, a bulk insert, an index backfill or a database drop runs to
+completion and is answered with its result however long it took — which is why
+none of them needs an exemption, and why this is **not a query timeout**. The
+change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with
+a connection rather than a document and carry no deadline at all.
+
+**The body ceiling is the one that was always there.** 2 MiB is what axum
+enforced on its own before the setting existed; it is a setting now so an
+operator can lower it for a deployment of small documents or raise it for a
+bulk-import pattern. It applies to every REST route, login included. `/mcp`
+reads its bodies under rmcp's own limit (4 MiB) and answers its own 413.
+
+**The per-principal budget is keyed on who, not where from.** A local user is
+its name; a federated identity is its issuer *and* its subject, under a
+different prefix, so a provider's `root` and this cluster's `root` never share
+a budget. A principal spread across many addresses draws on one budget, and
+two principals behind one NAT do not share one — which is what the login
+limiter, keyed on the address, cannot offer. It is checked in the
+authentication extractor **after** the token is verified and the session
+confirmed, so:
+
+- a bad token is a `401` and spends nothing — the limiter counts principals,
+  not guesses, and cannot be used from outside to exhaust a real user;
+- every surface that takes a principal is covered by construction: REST,
+  `/mcp` and the change-stream upgrade alike.
+
+Over the budget the answer is `429` with `Retry-After`, the same response the
+login limiter gives, and the refusals are counted in
+`kimmy_rate_limited_principal_total` beside the existing
+`kimmy_rate_limited_total`. The key map is bounded by
+`server.rate_limit.max_tracked_keys` like the login limiters', because a
+principal name is attacker-controlled in the same sense an address is.
+
+**It is off by default, and the number is yours.** A capacity limit without a
+measurement behind it is a guess, and the operator is the one holding the
+measurement. If you want a starting point before you have one: `per_principal
+= 3000` over `per_principal_window_secs = 60` is fifty requests a second
+sustained per principal — well above what one well-behaved client produces,
+and comfortably below what a single node serves. Watch
+`kimmy_rate_limited_principal_total` after setting it; a legitimate client
+hitting it is the measurement.
+
+With `--insecure-no-auth` every request is one principal, and the limiter is
+off along with the login ones.
 
 ---
 

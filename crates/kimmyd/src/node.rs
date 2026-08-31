@@ -147,7 +147,11 @@ pub async fn run(config: Config) -> Result<()> {
         kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
     });
     let serving_mcp = mcp.is_some();
-    let app = kimmy_api::router_with(Arc::clone(&state), mcp);
+    // The request deadline and body ceiling ride in with the router rather
+    // than the state: they are parameters of the middleware stack, fixed when
+    // the table is built (ADR-099).
+    let app =
+        kimmy_api::router_with_limits(Arc::clone(&state), mcp, config.server.request_limits());
     if serving_mcp {
         info!("serving MCP at /mcp");
     }

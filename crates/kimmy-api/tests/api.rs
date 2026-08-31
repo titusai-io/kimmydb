@@ -143,6 +143,28 @@ impl Server {
         Self::build(false, limits).await
     }
 
+    /// Every authenticated request per principal, `burst` per minute
+    /// (ADR-099).
+    fn principal_limits(burst: u32) -> kimmy_api::RateLimits {
+        kimmy_api::RateLimits {
+            per_principal: kimmy_api::Limiter::new(
+                kimmy_api::RateLimit::new(burst, std::time::Duration::from_secs(60)),
+                1024,
+            ),
+            ..kimmy_api::RateLimits::disabled()
+        }
+    }
+
+    /// A server whose authenticated routes carry a per-principal budget.
+    async fn start_principal_rate_limited(burst: u32) -> Self {
+        Self::build(false, Self::principal_limits(burst)).await
+    }
+
+    /// A server with a chosen request deadline and body ceiling (ADR-099).
+    async fn start_with_limits(request_limits: kimmy_api::RequestLimits) -> Self {
+        Self::build_with(false, kimmy_api::RateLimits::disabled(), request_limits).await
+    }
+
     /// A server that also federates with the stub identity provider below.
     ///
     /// The provider is a fixed key pair rather than a live IdP: the subject is
@@ -155,7 +177,13 @@ impl Server {
     /// The same, with the audience chosen — which is what decides whether this
     /// node names itself as an OAuth 2.0 protected resource (ADR-071).
     async fn start_federated_for(audience: &str) -> Self {
-        let server = Self::build(false, kimmy_api::RateLimits::disabled()).await;
+        Self::start_federated_with(audience, kimmy_api::RateLimits::disabled()).await
+    }
+
+    /// The same, with the limiters chosen — for the per-principal limit, whose
+    /// key has to tell a federated subject from a local user (ADR-099).
+    async fn start_federated_with(audience: &str, limits: kimmy_api::RateLimits) -> Self {
+        let server = Self::build(false, limits).await;
         let verifier = kimmy_auth::OidcVerifier::new(kimmy_auth::OidcSettings {
             issuer: oidc::ISSUER.into(),
             audience: audience.into(),
@@ -209,6 +237,14 @@ impl Server {
     }
 
     async fn build(insecure_no_auth: bool, limits: kimmy_api::RateLimits) -> Self {
+        Self::build_with(insecure_no_auth, limits, kimmy_api::RequestLimits::default()).await
+    }
+
+    async fn build_with(
+        insecure_no_auth: bool,
+        limits: kimmy_api::RateLimits,
+        request_limits: kimmy_api::RequestLimits,
+    ) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
 
@@ -220,7 +256,7 @@ impl Server {
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
         let state =
             kimmy_api::state(Arc::clone(&engine), tokens, insecure_no_auth, limits).unwrap();
-        let app = kimmy_api::router(Arc::clone(&state));
+        let app = kimmy_api::router_with_limits(Arc::clone(&state), None, request_limits);
 
         // Port 0: let the OS pick, so parallel tests never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -395,6 +431,253 @@ async fn limiting_by_username_is_off_unless_configured() {
         429,
         "when it is switched on it must actually limit"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Authenticated-route limits (ADR-099)
+// ---------------------------------------------------------------------------
+
+/// Open a request and send only part of its declared body, then wait for
+/// whatever the server says about it.
+///
+/// This is the shape of a client that holds a connection open at no cost to
+/// itself — the case the request deadline exists for — and it is also the one
+/// place a request to this server is genuinely *pending*, which is the only
+/// state a deadline can interrupt. Bounded by its own five-second wait, so a
+/// deadline that never fires is a failed test rather than a hung one.
+async fn dribble(base: &str, path: &str, token: &str) -> (u16, Value) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base.strip_prefix("http://").expect("http url");
+    let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: 64\r\n\
+         Authorization: Bearer {token}\r\n\r\n{{\"pad\":\""
+    );
+    stream.write_all(head.as_bytes()).await.expect("write");
+    // The rest of the 64 bytes never comes.
+
+    let mut raw = Vec::new();
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let _ = stream.read_to_end(&mut raw).await;
+    })
+    .await;
+    assert!(read.is_ok(), "no response within five seconds: the deadline did not fire");
+
+    let text = String::from_utf8_lossy(&raw).into_owned();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, serde_json::from_str(body.trim()).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_request_still_waiting_for_its_body_at_the_deadline_is_abandoned() {
+    // The route is real and authenticated: the token is checked from the
+    // headers before the body is awaited, so what the deadline interrupts is
+    // exactly the wait an authenticated caller can impose for free.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(300),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let (status, body) = dribble(&server.base, "/v1/db/shop/coll/c/docs", &token).await;
+    assert_eq!(status, 503, "a request past its deadline is refused: {body}");
+    assert_eq!(body["error"], "timeout");
+    assert_eq!(body["retry"], "wait");
+
+    // The node is fine; only that request was abandoned.
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+/// A real WebSocket handshake that keeps the socket, so a test can watch what
+/// arrives on it later.
+async fn open_watch(base: &str, path: &str, token: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base.strip_prefix("http://").expect("http url");
+    let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Version: 13\r\n\
+         Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Authorization: Bearer {token}\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.expect("write");
+
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => head.push(byte[0]),
+        }
+    }
+    let head = String::from_utf8_lossy(&head).into_owned();
+    assert!(head.starts_with("HTTP/1.1 101"), "the watch route must upgrade: {head}");
+    stream
+}
+
+/// Read one unmasked text frame, as a server sends them.
+async fn read_text_frame(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.expect("frame header");
+    assert_eq!(header[0] & 0x0f, 1, "expected a text frame, got opcode {}", header[0] & 0x0f);
+    let mut len = u64::from(header[1] & 0x7f);
+    if len == 126 {
+        let mut ext = [0u8; 2];
+        stream.read_exact(&mut ext).await.expect("extended length");
+        len = u64::from(u16::from_be_bytes(ext));
+    } else if len == 127 {
+        let mut ext = [0u8; 8];
+        stream.read_exact(&mut ext).await.expect("extended length");
+        len = u64::from_be_bytes(ext);
+    }
+    let mut payload = vec![0u8; len as usize];
+    stream.read_exact(&mut payload).await.expect("payload");
+    String::from_utf8_lossy(&payload).into_owned()
+}
+
+#[tokio::test]
+async fn the_deadline_does_not_apply_to_a_change_stream() {
+    // A change stream's response is a connection, not a document, and it is
+    // meant to outlive any deadline a document request could sensibly have.
+    // Opened, left idle for longer than the deadline, and then shown to still
+    // deliver.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        request_timeout: std::time::Duration::from_millis(200),
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let mut socket = open_watch(&server.base, "/v1/db/shop/coll/orders/watch", &token).await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 7})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let frame =
+        tokio::time::timeout(std::time::Duration::from_secs(5), read_text_frame(&mut socket))
+            .await
+            .expect("an event should arrive on a stream older than the deadline");
+    let event: Value = serde_json::from_str(&frame).expect("a JSON event");
+    assert_eq!(event["operationType"], "insert", "{event}");
+    assert_eq!(event["documentKey"]["_id"], 7, "{event}");
+}
+
+#[tokio::test]
+async fn a_body_at_the_ceiling_is_accepted_and_one_byte_over_is_refused() {
+    // `{"pad":"…"}` is ten bytes of punctuation around the padding, so the
+    // padding is what sets the body to exactly the ceiling.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let at_limit = json!({ "pad": "x".repeat(1014) });
+    assert_eq!(at_limit.to_string().len(), 1024);
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), at_limit).await;
+    assert_eq!(res.status, 200, "exactly the ceiling must be accepted: {:?}", res.body);
+
+    let over = json!({ "pad": "x".repeat(1015) });
+    assert_eq!(over.to_string().len(), 1025);
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), over).await;
+    assert_eq!(res.status, 413, "one byte over must be refused: {:?}", res.body);
+    assert_eq!(res.body["error"], "payload_too_large");
+    assert_eq!(res.body["retry"], "no");
+}
+
+#[tokio::test]
+async fn a_principal_over_its_budget_is_refused_while_another_on_the_same_address_is_not() {
+    // Both callers arrive from loopback. Keying on the address would refuse
+    // them together; keying on the principal refuses only the one that spent
+    // its budget — which is the whole reason the second limiter exists.
+    let server = Server::start_principal_rate_limited(3).await;
+    let root = server.root().await;
+
+    // Login is unauthenticated and spends nothing; creating the second user
+    // is root's first request.
+    let created = server
+        .post("/v1/users", Some(&root), json!({"user":"other","password":"other-password"}))
+        .await;
+    assert!(created.status / 100 == 2, "{} {:?}", created.status, created.body);
+    for attempt in 2..=3 {
+        let res = server.get("/v1/databases", Some(&root)).await;
+        assert_eq!(res.status, 200, "request {attempt} of 3 is within the burst: {:?}", res.body);
+    }
+
+    let refused = server.get("/v1/databases", Some(&root)).await;
+    assert_eq!(refused.status, 429, "the fourth request is past a burst of 3: {:?}", refused.body);
+    assert_eq!(refused.body["error"], "rate_limited");
+    assert_eq!(refused.body["retry"], "wait");
+    let retry = refused.header("retry-after").expect("a 429 must carry Retry-After");
+    assert!(retry.parse::<u64>().is_ok_and(|s| s > 0), "Retry-After should be seconds: {retry}");
+
+    let other = server.login("other", "other-password").await;
+    let res = server.get("/v1/databases", Some(&other)).await;
+    assert_eq!(res.status, 200, "another principal on the same address is unaffected");
+
+    // Still refused: the other principal's request did not refill root.
+    assert_eq!(server.get("/v1/databases", Some(&root)).await.status, 429);
+
+    // Counted under its own series, and inside the total.
+    let metrics = server.state.metrics.render();
+    assert!(metrics.contains("kimmy_rate_limited_principal_total 2"), "{metrics}");
+    assert!(metrics.contains("kimmy_rate_limited_total 2"), "{metrics}");
+}
+
+#[tokio::test]
+async fn a_bad_token_is_refused_before_it_can_spend_a_budget() {
+    // The limiter counts principals, not guesses: a token that fails
+    // verification is a 401 and touches no bucket, so it cannot be used to
+    // exhaust a real user's budget from outside.
+    let server = Server::start_principal_rate_limited(1).await;
+    let root = server.root().await;
+
+    for _ in 0..3 {
+        assert_eq!(server.get("/v1/databases", Some("not-a-token")).await.status, 401);
+    }
+    assert_eq!(
+        server.get("/v1/databases", Some(&root)).await.status,
+        200,
+        "root's single token must still be there after three refused guesses"
+    );
+    assert!(server.state.metrics.render().contains("kimmy_rate_limited_principal_total 0"));
+}
+
+#[tokio::test]
+async fn a_federated_subject_named_like_a_local_user_has_its_own_budget() {
+    // Whoever controls the name `root` at the identity provider must not be
+    // able to spend the local root's budget, nor be charged for it.
+    let server = Server::start_federated_with(oidc::AUDIENCE, Server::principal_limits(1)).await;
+    let local = server.root().await;
+    let federated = oidc::token(oidc::claims("root", json!(["kimmydb-analyst"])));
+
+    assert_eq!(server.get("/v1/databases", Some(&local)).await.status, 200);
+    assert_eq!(server.get("/v1/databases", Some(&local)).await.status, 429, "local root is spent");
+
+    assert_eq!(
+        server.get("/v1/databases", Some(&federated)).await.status,
+        200,
+        "the provider's `root` has a budget of its own"
+    );
+    assert_eq!(server.get("/v1/databases", Some(&federated)).await.status, 429);
 }
 
 #[tokio::test]
@@ -4490,6 +4773,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_authz_denied_total",
             "kimmy_auth_failures_total",
             "kimmy_rate_limited_total",
+            "kimmy_rate_limited_principal_total",
             "kimmy_backups_total",
             "kimmy_ttl_expired_total",
             "kimmy_ttl_skipped_total",

@@ -37,6 +37,27 @@ mcp = true
 # actually connect by — anything else is refused.
 mcp_allowed_hosts = []
 
+# How long a request may spend *waiting* before this node abandons it with
+# 503 `timeout`, in seconds. 0 is refused.
+#
+# A request waits in two places: while its body is still arriving, and while an
+# embedding provider is being asked. Both are where an authenticated caller can
+# hold a connection open at no cost to itself, and both are what this bounds.
+# It does not cut short storage work already running — a scan, a bulk commit or
+# an index backfill completes and is answered with its result however long it
+# took — so this is not a query timeout, and raising it is about slow clients
+# and slow providers. Change-stream upgrades and /mcp carry no deadline.
+request_timeout_secs = 30
+
+# Largest request body the API will read, in bytes. Over it, 413
+# `payload_too_large`. 0 is refused.
+#
+# 2 MiB is the ceiling every release has enforced; it is a setting now so it can
+# be lowered for a deployment of small documents or raised for a bulk-import
+# pattern. Applies to every REST route, login included. /mcp reads its bodies
+# under rmcp's own 4 MiB limit.
+max_body_bytes = 2097152
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -67,8 +88,8 @@ mcp_allowed_hosts = []
 # Rate limiting
 # ---------------------------------------------------------------------------
 #
-# Only /v1/auth/login is limited. That is the one route where a limit is a
-# security control rather than a capacity control: it is unauthenticated by
+# /v1/auth/login is limited by default. That is the one route where a limit is
+# a security control rather than a capacity control: it is unauthenticated by
 # necessity, and every attempt runs a full Argon2id verification — including for
 # a user that does not exist, which is what stops timing from revealing whether
 # one does. Unthrottled, it lets an anonymous caller spend ~19 MB and
@@ -77,6 +98,10 @@ mcp_allowed_hosts = []
 # The limit is checked before the password is verified, and only *failed*
 # attempts are recorded — a client with correct credentials is never throttled
 # for succeeding.
+#
+# The authenticated routes have a limit of their own, per_principal below. It is
+# off by default: a capacity number wants a measurement behind it, and you are
+# the one holding the measurement.
 [server.rate_limit]
 
 # Failed logins allowed per client address, per window. Set to 0 to disable.
@@ -111,8 +136,26 @@ login_per_user_window_secs = 300
 #
 # The key space is attacker-controlled — an address is whatever packets arrive
 # from — so this is what stops the defence becoming a denial of service itself.
-# Buckets that have refilled are forgotten first.
+# Buckets that have refilled are forgotten first. Shared by every limiter in
+# this section, per_principal included.
 max_tracked_keys = 100000
+
+# Requests allowed per authenticated principal, per window, on every route that
+# takes a token — REST, /mcp and change-stream upgrades alike. 0 disables it,
+# and 0 is the default.
+#
+# Keyed on who the caller is rather than where the request came from: a local
+# user by name, a federated identity by issuer and subject. A principal spread
+# across many addresses draws on one budget; two principals behind one NAT do
+# not share one. Checked after the token is verified, so a bad token is a 401
+# and spends nothing. Over the limit: 429 with Retry-After, counted in
+# kimmy_rate_limited_principal_total.
+#
+# A starting point, if you want one before measuring: 3000 over 60 seconds is
+# fifty requests a second sustained per principal — well above what one
+# well-behaved client produces, and comfortably below what a node serves.
+per_principal = 0
+per_principal_window_secs = 60
 
 # ---------------------------------------------------------------------------
 # Audit log

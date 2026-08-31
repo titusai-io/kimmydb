@@ -17,6 +17,7 @@ pub mod exec;
 pub mod expiry;
 pub mod federation;
 pub mod json;
+pub mod limits;
 pub mod metrics;
 pub mod ownership;
 pub mod ratelimit;
@@ -43,6 +44,7 @@ use kimmy_vector::IndexCache;
 pub use audit::AuditMode;
 pub use error::ApiError;
 pub use federation::Federation;
+pub use limits::RequestLimits;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use sessions::Sessions;
@@ -113,6 +115,18 @@ pub fn router(state: SharedState) -> Router {
 /// [`routes::router_with`].
 pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
     routes::router_with(state, extra)
+}
+
+/// As [`router_with`], with the request deadline and body ceiling chosen
+/// rather than defaulted (ADR-099). The daemon builds its router through this;
+/// the other constructors take [`RequestLimits::default`], which is what the
+/// server enforced before the settings existed.
+pub fn router_with_limits(
+    state: SharedState,
+    extra: Option<Router>,
+    limits: RequestLimits,
+) -> Router {
+    routes::router_with_limits(state, extra, limits)
 }
 
 /// Build the application router.

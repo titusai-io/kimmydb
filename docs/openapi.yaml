@@ -2568,7 +2568,11 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     RateLimited:
-      description: Over a rate limit. Carries `Retry-After`.
+      description: |
+        Over a rate limit. Carries `Retry-After`. Login has one by address (and
+        optionally by username); every authenticated operation has one by
+        principal when `server.rate_limit.per_principal` is set, so a 429 can
+        answer any operation that takes a token, not only this one.
       headers:
         Retry-After:
           schema: { type: integer }
@@ -2612,7 +2616,7 @@ components:
         | Code | Status | Retry | Meaning |
         |---|---|---|---|
         | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
-        | `payload_too_large` | 413 | no | Request body over 2 MB |
+        | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
         | `unauthorized` | 401 | no | Missing, invalid or expired token; bad credentials; an account deleted, disabled or re-credentialed since the token was issued |
         | `forbidden` | 403 | no | Denied by RBAC. Identical whether or not the target exists |
@@ -2622,13 +2626,14 @@ components:
         | `unique_violation` | 409 | no | A unique index would be broken |
         | `no_vectors` | 409 | no | Searching a collection whose vectors were never ingested — distinguished from an empty result, which is indistinguishable from "nothing matched" |
         | `resume_token_expired` | 410 | no | The resume point cannot be continued from — collected by retention, or belonging to a previous incarnation of a collection that was dropped and recreated. Resubscribe |
-        | `rate_limited` | 429 | wait | Over a limit. Carries `Retry-After` |
+        | `rate_limited` | 429 | wait | Over a limit — failed logins by address or username, or an authenticated principal's request budget when `server.rate_limit.per_principal` is set. Carries `Retry-After` |
         | `not_implemented` | 501 | no | A reserved capability that does not exist |
         | `provider_error` | 502 | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
         | `internal` | 500 | elsewhere | A storage failure on this node. Details are logged, never returned |
         | `misconfigured` | 500 | elsewhere | This node lacks something it needs, such as an API key named by its vector configuration |
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
+        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
       enum:
         - bad_request
         - payload_too_large
@@ -2648,6 +2653,7 @@ components:
         - not_implemented
         - provider_error
         - stale
+        - timeout
 
     Capability:
       type: string

@@ -4709,6 +4709,126 @@ number of seconds.
 
 ---
 
+## ADR-099 — Authenticated routes carry a request timeout, an explicit body ceiling and a per-principal rate limit
+
+**Decision.** Three settings, each with a default chosen so that a node which
+never sets them behaves as it did before:
+
+- `server.request_timeout_secs` (default `30`) — a deadline on every REST
+  route that answers with a document, applied per route group. A request
+  still pending at the deadline is abandoned and answered `503` with a new
+  error code, `timeout`, `retry: wait`. The change-stream upgrade
+  (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` — the two surfaces whose
+  response is a connection rather than a document — carry no deadline.
+- `server.max_body_bytes` (default `2097152`) — the request body ceiling
+  axum applied on its own, now a setting. Over it, `413 payload_too_large`
+  as before.
+- `server.rate_limit.per_principal` and `per_principal_window_secs`
+  (defaults `0`, meaning off, and `60`) — a second token bucket keyed on the
+  authenticated principal, checked in the `Auth` extractor after the token is
+  verified and the session confirmed. Over it, `429` with `Retry-After`, the
+  login limiter's response. Refusals are counted in a sibling series,
+  `kimmy_rate_limited_principal_total`, and the key map is capped by
+  `max_tracked_keys` exactly as the login limiters' are.
+
+**Why.** ADR-007 put a limiter on the one unauthenticated route where a limit
+is a security control, and left the authenticated routes unbounded on the
+argument that a capacity number without a measurement behind it is a guess.
+That argument still holds for the *number*. It never held for the
+*mechanism*. A principal that is compromised, or a client with a bug in its
+retry loop, can hold connections open by sending a body slowly, send bodies as
+large as the framework allows, and make requests as fast as the network
+carries them — and until now the only answers were a proxy in front of the
+node or revoking the user. These are the three of those an operator can now
+bound on the node itself, with the number left to them.
+
+*What the deadline bounds, and where it lives.* The timeout wraps the whole
+service call for a route and fires when that call is still *pending* at the
+deadline. A request to this server is pending in exactly two places: while
+its body is still arriving, and while an embedding provider is being waited
+on. Storage work is synchronous and never yields, so the deadline cannot fire
+inside a scan, a bulk insert, an index backfill or a database drop — a request
+that finishes late is answered with its result. That is the right outcome for
+those operations (turning a completed index build into a refusal would be
+strictly worse than answering late), and it is why the default stays at 30 s
+without exempting any of them individually. It also means the setting is not
+a query timeout, and every place that documents it says so. The layer is
+applied per route group rather than to the whole table so that the exemption
+is a place a route is registered — visible in a diff — and not an attribute on
+one line of forty.
+
+*Why 503, and why `wait`.* RFC 9110 §15.5.9 defines 408 as the server not
+having received a complete request within the time it was prepared to wait,
+and permits the client to repeat the request; browsers and several HTTP
+libraries do so silently. That is the wrong instruction for a request this
+node may have partly acted on — a write whose embedding call stalled — and
+says nothing true about the provider case at all. 504 is a gateway's
+statement about its upstream, and this node is the origin. 503 says what
+happened: this server did not handle this request. The envelope's `retry`
+says what to do about it, and it is `wait` rather than `elsewhere` (ADR-057)
+because the deadline is only ever reached while waiting for the client's own
+body or for the provider every node shares, and neither improves by moving
+nodes — `elsewhere` would send the same slow upload round the whole cluster.
+No `Retry-After`, because the server has no idea when a slower client or a
+slower provider will be faster.
+
+*Why the per-principal limit is in the extractor and not a layer.* The
+principal is not known until the token is verified, so a layer keyed on it
+would have to authenticate too — either verifying twice or caching the result
+in request extensions for the handler to find. The `Auth` extractor is the
+one place every authenticated surface already passes through: REST handlers
+take it, `/mcp`'s middleware calls it, the change-stream upgrade takes it.
+Checking there covers all three by construction, and ordering the check after
+the session check means a refused token is a `401` and never spends a real
+user's budget: the limiter counts principals, not guesses. The key is
+`local:<name>` for a local user and `oidc:<issuer>:<sub>` for a federated one,
+so a provider's `root` and this cluster's `root` cannot share a budget, and
+the two classes can never collide. `Limiter::acquire` checks and spends under
+one lock, because here every request counts rather than only the failures
+and `check` followed by `record` would admit a whole round of concurrency
+past the burst.
+
+*Why the limit is off by default.* The number is the operator's; the
+mechanism is the server's. The documentation offers a starting point — 3000
+over 60 seconds, fifty a second sustained per principal — and says what it is
+relative to, and names the series that tells an operator whether it is right.
+
+**Alternatives.**
+
+- *A global timeout, WebSocket upgrades included.* Rejected. axum hands the
+  upgraded socket to a task of its own once the `101` is written, so a global
+  layer would today happen not to break change streams; but `/mcp`'s
+  streaming responses would be cut, and the exemption is the contract rather
+  than a property of the current upgrade path. The test holds the contract.
+- *408 or 504.* Rejected, above.
+- *Per-route body limits* — a larger ceiling for `/bulk`, a smaller one for
+  login. Deferred. One ceiling matches what was already enforced; splitting
+  it is a decision that wants bulk-import workloads measured first, and the
+  mechanism (a `DefaultBodyLimit` on a route group) is a one-line change when
+  they have been.
+- *Cooperative cancellation of storage work at the deadline.* Deferred. It
+  needs a deadline threaded through the engine's scans and commits, and what
+  a commit past its deadline should do — finish, or roll back — is a storage
+  decision rather than an HTTP one.
+- *Wiring `max_body_bytes` into rmcp's own body limit.* Deferred. rmcp reads
+  `/mcp` bodies under its own 4 MiB ceiling and answers its own `413`; making
+  the two one setting means either accepting rmcp's envelope for that route
+  or reading the body twice.
+- *A label on `kimmy_rate_limited_total` instead of a sibling series.*
+  Rejected. A label changes the shape of a series production dashboards
+  already name; a sibling leaves the existing one byte-for-byte what it was.
+
+**Cost.** A new error code, `timeout`, in a set clients branch on — additive
+under ADR-057, because the envelope carries `retry`. A client uploading a
+2 MiB body slower than about 70 KB/s now sees a `503` where it saw success;
+the setting exists to raise. Every authenticated request costs one integer
+comparison when the per-principal limit is off and one lock acquisition when
+it is on. The 429 counter is no longer a single-source number:
+`kimmy_rate_limited_total` counts both limiters, and
+`kimmy_rate_limited_principal_total` is how they are told apart.
+
+---
+
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
 
 **Decision.** `{$expr: <expression>}` is a filter clause. It parses through
