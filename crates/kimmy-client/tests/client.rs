@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::response::IntoResponse;
-use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, WatchOptions};
+use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, UpdateOptions, WatchOptions};
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
@@ -480,6 +480,53 @@ async fn a_change_stream_resumes_from_where_it_stopped() {
 
 /// The convenience methods, which the mutation pass found untested.
 ///
+/// `update_with` is the one wrapper with a body the others do not send, so
+/// the request must be seen to carry it: an `arrayFilters` the client dropped
+/// on the floor would surface as a `400` for an identifier without a filter.
+#[tokio::test]
+async fn update_with_carries_array_filters() {
+    let (_server, client) = connected().await;
+    seeded(&client, 0).await;
+    client
+        .insert(
+            "shop",
+            "orders",
+            &json!({ "_id": 1, "items": [ { "sku": "a", "shipped": false },
+                                            { "sku": "b", "shipped": false } ] }),
+        )
+        .await
+        .expect("insert");
+
+    let options = UpdateOptions::new().array_filters(vec![json!({ "line.sku": "b" })]);
+    let updated = client
+        .update_with(
+            "shop",
+            "orders",
+            &json!({ "_id": 1 }),
+            &json!({ "$set": { "items.$[line].shipped": true } }),
+            &options,
+        )
+        .await
+        .expect("update_with");
+    assert_eq!(updated["modified"], 1);
+
+    let doc = client.get_document("shop", "orders", "1").await.unwrap().expect("a document");
+    assert_eq!(doc["items"][0]["shipped"], false, "{doc}");
+    assert_eq!(doc["items"][1]["shipped"], true, "{doc}");
+
+    let refused = client
+        .update_with(
+            "shop",
+            "orders",
+            &json!({ "_id": 1 }),
+            &json!({ "$set": { "items.$[line].shipped": true } }),
+            &UpdateOptions::new(),
+        )
+        .await
+        .expect_err("an identifier without a filter is refused");
+    assert_eq!(refused.code(), Some(ErrorCode::BadRequest), "{refused}");
+}
+
 /// `find`, `update`, `delete`, `aggregate`, `replace_document`,
 /// `delete_document` and `download` could each be replaced with a stub that
 /// returns a default, and nothing failed: the rest of the suite reaches the
@@ -806,6 +853,8 @@ async fn a_federated_token_cannot_be_refreshed_by_the_node_that_accepted_it() {
             role_mappings: Vec::new(),
             require_at_jwt: false,
             allow_federated_admin: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+            subject_claim: None,
         })
         .unwrap(),
     );

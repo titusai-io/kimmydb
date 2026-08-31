@@ -176,6 +176,7 @@ differed.
 | Dimensions other than 384 | 768 and 1536 are both common, and the crossover depends on width |
 | Larger-than-memory collections | Every figure here fits in page cache |
 | A cluster under load | These are single-node numbers; replication's cost to the write path is unmeasured |
+| Peak memory of a read against collection size | `count`, an index-backed `find` with a small `limit`, and a sorted `find` are bounded by what they return rather than by what they scan ([ADR-098](decisions.md)). The bound is argued from the code and tested for what is held; resident memory under those requests has not been measured |
 
 **Recall was the gap, and it is now closed.** Lowering the threshold routes more
 collections through the graph, so the ≥ 90% recall claim covers more traffic

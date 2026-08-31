@@ -104,9 +104,10 @@ Authorization: Bearer <jwt>
 ```
 
 ```bash
+# KIMMY_ROOT_PASSWORD is whatever the node was bootstrapped with.
 TOKEN=$(curl -s -XPOST localhost:7878/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"user":"root","password":"change-me"}' | jq -r .token)
+  -d "{\"user\":\"root\",\"password\":\"$KIMMY_ROOT_PASSWORD\"}" | jq -r .token)
 ```
 
 ```json
@@ -127,6 +128,24 @@ streams become `wss://` on that node. See
 a `Retry-After` header; a successful login spends nothing, so a client that
 re-authenticates on a short TTL is never throttled for succeeding. Tunable under
 `[server.rate_limit]` — see [Security](security.md#login-rate-limiting).
+
+**Authenticated requests carry three limits** ([ADR-099](decisions.md)), each
+defaulting to what the server always did: a body ceiling
+(`server.max_body_bytes`, 2 MiB; over it `413 payload_too_large`), a deadline
+for a request still waiting on its body or on an embedding provider
+(`server.request_timeout_secs`, 30 s; past it `503 timeout`), and — off unless
+an operator sets it — a per-principal request budget
+(`server.rate_limit.per_principal`; over it `429` with `Retry-After`, on any
+route that takes a token). A client should treat a `429` as possible on every
+authenticated call, not only on login. See
+[Security](security.md#limits-on-authenticated-requests).
+
+**Login may be restricted to the host.** Under `auth.local.login =
+"loopback_only"`, `/v1/auth/login` and `/v1/auth/refresh` answer `403
+forbidden` to any connection whose TCP peer is not loopback; under `"disabled"`
+both answer `404`. A token already issued keeps working under either — the
+setting restricts minting, not verifying — and federated tokens are unaffected.
+See [Security](security.md#local-login-is-a-mode).
 
 ---
 
@@ -184,9 +203,10 @@ published. Documents in the batch are checked against each other as well as
 against stored state, so two documents sharing an `_id` — or colliding on a
 unique index — fail the batch even though neither was there when it started.
 
-Two ceilings, whichever binds first: **1000 documents**, and the **2 MB
-request body limit** (`413`, `"error": "payload_too_large"`), which is the
-lower of the two for documents over about 2 KB. Over the document cap is
+Two ceilings, whichever binds first: **1000 documents**, and the **request
+body limit** (`server.max_body_bytes`, 2 MiB by default; `413`,
+`"error": "payload_too_large"`), which is the lower of the two for documents
+over about 2 KB. Over the document cap is
 **400**; a body that is not an array is **422**. An empty array is a no-op
 that inserts nothing and commits nothing.
 
@@ -277,6 +297,15 @@ makes the node list from [Topology](#topology) usable for reads as well as
 failover. End the walk on a short or empty page, not on a missing token.
 [Cursors](query-language.md#cursors) has the full contract.
 
+**A sorted `find` holds `skip + limit` documents, and that window stops at
+10,000.** A larger one is refused with `400` rather than clamped — a clamped
+`skip` would return a different page and say nothing. An unsorted `find`, or
+one sorted by `{"_id": 1}`, holds only its page and has no such ceiling,
+though `skip` still visits everything it steps over. To page deeper through
+another order, narrow the filter on the sort field to where the last page
+ended — `{"score": {"$lt": <last score seen>}}` — which costs a page rather
+than everything before it ([ADR-098](decisions.md)).
+
 ### Count, update, delete by filter
 
 ```bash
@@ -317,6 +346,22 @@ matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
 names one document.
 
+An update path may address array elements — `items.$[].qty` for every
+element, `items.$[line].qty` for the elements an `arrayFilters` entry
+selects — which is how one line item is changed without replacing the order:
+
+```bash
+curl -XPOST localhost:7878/v1/db/shop/coll/orders/update -H "$A" -d '{
+  "filter": { "_id": 42 },
+  "update": { "$set": { "items.$[line].shipped": true } },
+  "arrayFilters": [ { "line.sku": "gasket" } ]
+}'
+```
+
+`find_and_modify` takes the same field. The rules — one identifier per filter
+document, every identifier filtered and every filter used, `$` not
+implemented — are in [Query language](query-language.md#positional-updates).
+
 > **Sharp edge.** A `multi: true` request is atomic per chunk, not per
 > request: a failure in a later chunk leaves the earlier chunks committed and
 > answers with an error. Nothing is visited twice and the oplog reflects
@@ -343,6 +388,12 @@ Array elements are reported under `path[]`, matching how a query on the field
 matches an *element*. `presence` is a fraction of the **sample**, counting
 documents — it is inference, not a schema, and a field missing from the sample
 may still exist.
+
+`nodeDurability` is the durability class of the node that answered —
+`durable` or `coalesced`, the same value `GET /v1/version` reports as
+`durability` ([Storage](storage.md#durability-classes)). It is a fact about
+the node, not the collection, and is repeated here so the one call made before
+writing already says what an acknowledged write means.
 
 The same information backs the MCP `describe_collection` tool; see
 [MCP](mcp.md).
@@ -455,8 +506,9 @@ A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 Across nodes a collision is detected when the replicated write is merged, not
 prevented, and both documents stay. `GET …/violations` lists what still
 stands — counts per index, or with `?index=<name>` the colliding groups with
-their documents — so the application can choose; a violation whose documents
-no longer all exist drops out of the report
+their documents — so the application can choose; a document deleted or
+rewritten out of the collision drops out of its group, and a group with one
+member left drops out of the report
 ([resolving a unique violation](indexes.md#resolving-a-unique-violation)).
 
 Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
@@ -470,7 +522,13 @@ an index was used:
 `strategy` is `collectionScan`, `index`, `indexUnion` (a `$in` union of
 probes) or `idLookup` (the filter pinned `_id`, answered through the primary
 key with no index). Treat an unrecognized value as an access path this client
-does not know about — new names are additive.
+does not know about — new names are additive. `indexEntriesRead` appears when
+an index answered a read: how much of the index was touched, as distinct from
+how many documents were examined — an equality stopped by `limit` reads as
+many entries as it returns, a range put in `_id` order reads the whole range.
+
+`count` visits every match and holds none of them: its cost is the time of
+the scan, not the memory of the result.
 
 ---
 
@@ -562,6 +620,14 @@ failed.
 challenge reveals nothing the body does not: it is byte-identical whether the
 target exists or not, which is the same property the uniform 403 has always
 had.
+
+The `error_description` on a 401 is deliberately generic — `the access token
+is expired, revoked or malformed` — with one exception. A federated token
+refused because its own `exp − iat` exceeds `auth.oidc.max_token_lifetime_secs`
+says so, naming the limit in seconds and nothing about the token: the ordinary
+advice to refresh would have the provider mint the same token again, and the
+fix is on the provider's side or in the node's configuration
+([ADR-096](decisions.md)).
 
 `POST /v1/auth/login` is exempt. It is where a token comes from, not a
 bearer-protected resource, and challenging there would tell a client to come
@@ -747,12 +813,13 @@ failure cannot appear without its retry class being decided in the same commit.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `no_vectors` | no | A search against a collection whose vectors were never ingested. A refusal rather than an empty result, which would be indistinguishable from "nothing matched" |
-| 413 | `payload_too_large` | no | Request body over 2 MB |
+| 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |
 | 410 | `resume_token_expired` | no | Resume point collected from the oplog. Resubscribe — retrying the token loops forever |
-| 429 | `rate_limited` | wait | Too many failed logins from this caller. Carries `Retry-After` in seconds |
+| 429 | `rate_limited` | wait | Too many failed logins from this caller, or an authenticated principal over its request budget (`server.rate_limit.per_principal`). Carries `Retry-After` in seconds |
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
+| 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)) |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
 | 500 | `misconfigured` | elsewhere | This node lacks something it needs, such as an API key its vector configuration names |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |

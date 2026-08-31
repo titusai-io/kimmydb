@@ -272,6 +272,27 @@ impl Engine {
     pub fn can_serve_from_oplog(&self, from: Hlc) -> Result<bool> {
         Ok(from >= self.oplog_collected_through()?)
     }
+
+    /// Whether a peer that has processed `held` can be served from the oplog.
+    ///
+    /// The per-origin form of [`Self::can_serve_from_oplog`], for a peer that
+    /// sent its vector rather than only the threshold it derived from it.
+    /// `false` when, at any origin this node is ahead of the peer, retention
+    /// has removed an entry the peer lacks — that is the silent gap. `true`
+    /// otherwise, *even when the threshold is below the coarse horizon*:
+    /// then every entry the peer lacks is still here to serve, and the gap
+    /// between its threshold and the horizon is made of entries it holds.
+    ///
+    /// The case that needs this is an origin that wrote nothing for longer
+    /// than retention and then wrote once. A peer that had everything asks
+    /// from the previous write — collected long ago, along with everything
+    /// around it — and the coarse horizon can only answer with a snapshot,
+    /// for a gap that holds exactly one servable entry (ADR-097).
+    pub fn can_serve_peer_holding(&self, held: &VersionVector) -> Result<bool> {
+        let mine = self.version_vector()?;
+        let collected = self.oplog_collected()?;
+        Ok(!crate::sync::lacks_collected(held, &mine, &collected))
+    }
 }
 
 #[cfg(test)]

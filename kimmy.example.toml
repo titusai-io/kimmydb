@@ -37,6 +37,27 @@ mcp = true
 # actually connect by — anything else is refused.
 mcp_allowed_hosts = []
 
+# How long a request may spend *waiting* before this node abandons it with
+# 503 `timeout`, in seconds. 0 is refused.
+#
+# A request waits in two places: while its body is still arriving, and while an
+# embedding provider is being asked. Both are where an authenticated caller can
+# hold a connection open at no cost to itself, and both are what this bounds.
+# It does not cut short storage work already running — a scan, a bulk commit or
+# an index backfill completes and is answered with its result however long it
+# took — so this is not a query timeout, and raising it is about slow clients
+# and slow providers. Change-stream upgrades and /mcp carry no deadline.
+request_timeout_secs = 30
+
+# Largest request body the API will read, in bytes. Over it, 413
+# `payload_too_large`. 0 is refused.
+#
+# 2 MiB is the ceiling every release has enforced; it is a setting now so it can
+# be lowered for a deployment of small documents or raised for a bulk-import
+# pattern. Applies to every REST route, login included. /mcp reads its bodies
+# under rmcp's own 4 MiB limit.
+max_body_bytes = 2097152
+
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
@@ -67,8 +88,8 @@ mcp_allowed_hosts = []
 # Rate limiting
 # ---------------------------------------------------------------------------
 #
-# Only /v1/auth/login is limited. That is the one route where a limit is a
-# security control rather than a capacity control: it is unauthenticated by
+# /v1/auth/login is limited by default. That is the one route where a limit is
+# a security control rather than a capacity control: it is unauthenticated by
 # necessity, and every attempt runs a full Argon2id verification — including for
 # a user that does not exist, which is what stops timing from revealing whether
 # one does. Unthrottled, it lets an anonymous caller spend ~19 MB and
@@ -77,6 +98,10 @@ mcp_allowed_hosts = []
 # The limit is checked before the password is verified, and only *failed*
 # attempts are recorded — a client with correct credentials is never throttled
 # for succeeding.
+#
+# The authenticated routes have a limit of their own, per_principal below. It is
+# off by default: a capacity number wants a measurement behind it, and you are
+# the one holding the measurement.
 [server.rate_limit]
 
 # Failed logins allowed per client address, per window. Set to 0 to disable.
@@ -111,8 +136,26 @@ login_per_user_window_secs = 300
 #
 # The key space is attacker-controlled — an address is whatever packets arrive
 # from — so this is what stops the defence becoming a denial of service itself.
-# Buckets that have refilled are forgotten first.
+# Buckets that have refilled are forgotten first. Shared by every limiter in
+# this section, per_principal included.
 max_tracked_keys = 100000
+
+# Requests allowed per authenticated principal, per window, on every route that
+# takes a token — REST, /mcp and change-stream upgrades alike. 0 disables it,
+# and 0 is the default.
+#
+# Keyed on who the caller is rather than where the request came from: a local
+# user by name, a federated identity by issuer and subject. A principal spread
+# across many addresses draws on one budget; two principals behind one NAT do
+# not share one. Checked after the token is verified, so a bad token is a 401
+# and spends nothing. Over the limit: 429 with Retry-After, counted in
+# kimmy_rate_limited_principal_total.
+#
+# A starting point, if you want one before measuring: 3000 over 60 seconds is
+# fifty requests a second sustained per principal — well above what one
+# well-behaved client produces, and comfortably below what a node serves.
+per_principal = 0
+per_principal_window_secs = 60
 
 # ---------------------------------------------------------------------------
 # Audit log
@@ -205,19 +248,58 @@ insecure_no_auth = false
 root_user = "root"
 
 # Prefer KIMMY_ROOT_PASSWORD over writing this down.
+#
+# The value below, like every placeholder in this repository's examples and
+# compose file (`changeme`, `hunter2`, `password`, ...), is refused when the
+# node listens on anything other than a loopback address: a value every reader
+# of the repository holds is not a secret. See docs/security.md and ADR-093.
 # root_password = "change-me"
 
 # Signing key for JWTs. **Required whenever authentication is on** — a single
 # node too, not just a cluster: without one the server would sign tokens with a
 # constant compiled into the binary, so anyone could forge one. It refuses to
-# start instead. 16 bytes minimum. In a cluster every node must use the *same*
-# value, or a token issued by one node will be rejected by the next node a
-# request reaches. Prefer KIMMY_JWT_SECRET over writing this down, which is why
-# it stays commented here — `check-config` on this file needs both it and
-# KIMMY_ROOT_PASSWORD in the environment.
+# start instead. 32 bytes minimum (the HS256 key floor of RFC 7518 §3.2; it was
+# 16 up to 0.16.x). In a cluster every node must use the *same* value, or a
+# token issued by one node will be rejected by the next node a request reaches.
+# Prefer KIMMY_JWT_SECRET over writing this down, which is why it stays
+# commented here — `check-config` on this file needs both it and
+# KIMMY_ROOT_PASSWORD in the environment. The placeholder below is refused off
+# loopback, as above.
 # jwt_secret = "generate-me-with-openssl-rand-base64-32"
 
+# The signing key being retired, during a rotation only. Tokens it signed are
+# still accepted while it is set; new tokens are signed with `jwt_secret` alone.
+# To rotate: move the old value here, put the new one in `jwt_secret`, roll
+# every node, wait one `token_ttl_secs`, then remove this and roll again. Same
+# length floor as `jwt_secret`, and it must differ from it. Prefer
+# KIMMY_JWT_PREVIOUS_SECRET over writing it down, for the same reason as above.
+# jwt_previous_secret = "the-value-jwt-secret-had-before-the-rotation"
+
 token_ttl_secs = 3600
+
+[auth.local]
+# Where the password login route answers (ADR-100). Also KIMMY_LOCAL_LOGIN.
+#
+#   always        -- every caller. The default, and exactly what shipped.
+#   loopback_only -- only a connection whose TCP peer address is loopback;
+#                    anyone else gets 403 `forbidden`. This keeps the break-glass
+#                    root reachable from the node's own host (SSH, a sidecar, a
+#                    tunnel) and unreachable from the network an identity
+#                    provider fronts.
+#   disabled      -- the route answers 404. Refused at startup unless
+#                    [auth.oidc] is configured, because a node with neither
+#                    could authenticate nobody.
+#
+# It governs MINTING only. A local token already issued keeps verifying under
+# every mode until it expires or is revoked, and federated tokens are
+# untouched. /v1/auth/refresh follows the same rule, because it mints too.
+#
+# `loopback_only` judges the TCP peer and deliberately ignores
+# server.rate_limit.trusted_proxy_header: a forwarded header is something the
+# client writes. A reverse proxy or TLS terminator on the SAME HOST therefore
+# makes every caller look local, and the mode restricts nothing — put the proxy
+# elsewhere, or restrict the path at the proxy.
+login = "always"
 
 # ---------------------------------------------------------------------------
 # Federating with an external OpenID Connect provider.
@@ -306,6 +388,42 @@ token_ttl_secs = 3600
 # depth. With an opaque audience it is the only check of its kind.
 # require_at_jwt = false
 
+# The longest a federated token may be valid for, by its own `exp − iat`, in
+# seconds (ADR-096).
+#
+# A federated principal's role membership is frozen in its access token: this
+# database makes no introspection call, so if the provider revokes someone's
+# membership, the old claim is honoured until that token expires (ADR-073).
+# That window is exactly the token's lifetime, and this is the only place it
+# can be bounded from this side. A token over the limit is refused with a 401
+# whose WWW-Authenticate challenge names the limit, so a provider that mints
+# longer tokens is found out on the first request rather than by audit.
+#
+# Fifteen minutes by default. Providers default access tokens to somewhere
+# between five minutes and an hour, with a few defaulting to a day; 900 admits
+# the short defaults outright and asks the rest a question — shorten the
+# lifetime the provider mints for this resource, which every one of them can
+# do per resource or per client, or raise this knowingly. A raised limit is
+# named in the node's startup summary. A token with no `iat` is refused too,
+# because its lifetime cannot be measured; RFC 9068 requires the claim in an
+# access token. Refused outside 1..=86400.
+# max_token_lifetime_secs = 900
+
+# A claim whose string value is carried as a federated principal's DISPLAY
+# name — in `kimmy whoami` and in the audit record (as `display`, when it
+# differs from the subject). A provider's `sub` is stable and opaque (a GUID,
+# an `00u…` string), which makes it a good identity and a bad thing to read in
+# a log; `preferred_username`, `email` or `upn` is what a person recognises.
+#
+# Display ONLY. Role mappings, grants, rate limiting and every comparison the
+# node makes still key on `sub`, and that is not configurable: an email is
+# mutable, is not unique across providers, and at some providers is
+# user-editable, so making it the principal would let a rename merge or split
+# identities silently (ADR-100). A token whose claim is missing or not a string
+# is not refused — the display simply falls back to `sub`. Check a real ACCESS
+# token carries the claim before choosing it; ID tokens often carry more.
+# subject_claim = "preferred_username"
+
 # What a claim value is worth here. Repeat the block per role.
 #
 # Written inline rather than stored in the database on purpose (ADR-066):
@@ -364,7 +482,8 @@ token_ttl_secs = 3600
 # allow_federated_admin = false
 
 # Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
-# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_REFRESH_INTERVAL_SECS.
+# KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_SUBJECT_CLAIM,
+# KIMMY_OIDC_REFRESH_INTERVAL_SECS, KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS.
 #
 # The mappings are file-only in the sense that there are still no per-mapping
 # flags — a grant is a structure, and a command line is where structures go to
@@ -413,7 +532,8 @@ bind = "0.0.0.0:7900"
 seeds = []
 
 # Shared secret authenticating node-to-node traffic. Required when clustering:
-# without it any host that can reach the gossip port could inject writes.
+# without it any host that can reach the gossip port could inject writes. The
+# placeholder below is refused when either listener is off loopback (ADR-093).
 # cluster_secret = "generate-me-with-openssl-rand-base64-32"
 
 # How often to run an anti-entropy round against each known peer.
@@ -564,6 +684,35 @@ format = "pretty"
 # one-way flag --disable-vector-worker (KIMMY_DISABLE_VECTOR_WORKER).
 [vector]
 worker_enabled = true
+
+# How the worker gathers documents into provider calls (ADR-095). The provider
+# takes a batch; the worker fills one from consecutive documents of the same
+# collection rather than sending each document's chunks alone. Measured against
+# a CPU llama.cpp server: 32 calls of one short input took 394 ms, one call of
+# 32 took 18 ms -- the difference between a live ingest that keeps up and one
+# whose backlog grows without bound.
+#
+# These describe the round trip this node makes, which is why they are here and
+# not in a collection's vector configuration. A batch only ever holds one
+# collection's documents, so each collection's provider, model and prefix are
+# respected as before, and the storage write stays per document.
+[vector.batch]
+# The most chunks in one call. Below every hosted provider's per-request input
+# cap, so a batch is never re-split by the provider.
+max_chunks = 32
+
+# The most estimated tokens in one call, by the estimate a collection's
+# chunk.max_tokens uses (one token per two bytes of UTF-8, an overestimate).
+# The default is 32 chunks at the default chunk ceiling -- about 64 KiB of
+# text. A single document over this goes alone rather than being split.
+max_tokens = 32768
+
+# How long a partial batch waits for more documents before it is sent, in
+# milliseconds. Only waited when the stream is idle -- on a backlog the next
+# document is already there -- so a quiet collection's document is delayed by
+# at most this much, less than the remote round trip it saves. 0 sends
+# whatever has queued the moment the stream is idle. Refused above 10000.
+max_wait_ms = 100
 
 # Bound on the HNSW graphs held in memory across every vector collection this
 # node serves. A graph costs about dim x 4 + 5,000 bytes per chunk -- 6.5 KB at

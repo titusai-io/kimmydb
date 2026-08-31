@@ -1,0 +1,165 @@
+# The dependency policy: what the dependency graph may and may not contain.
+# `cargo deny check` reads this file; CI runs it from
+# .github/workflows/deny.yml whenever a manifest or the lockfile changes, and
+# once a week against an unchanged lockfile, because advisories are published
+# against crates that are already in it (ADR-108).
+#
+# Four checks. **Advisories**: a known vulnerability anywhere in the graph
+# fails the build; a yanked crate warns; an unmaintained crate fails when it
+# is a direct dependency and is left to upstream when it is not. **Licenses**: an
+# allowlist, because cargo-deny denies any license it is not told to accept,
+# and the list below is exactly the set the graph carries today — a new
+# license arrives as a line in a diff, with a reason, rather than unnoticed
+# with a version bump (the same rule scripts/allowed-native-deps.txt applies
+# to native code). **Bans**: no OpenSSL and no second crypto stack; the build
+# has one, rustls on `ring` (ADR-016, ADR-039). **Sources**: crates.io only.
+
+[graph]
+# The targets dist builds releases for (dist-workspace.toml) plus the glibc
+# Linux targets CI and local development use. Without this cargo-deny
+# evaluates the graph for every target Rust knows about, and reports on
+# Windows- and wasm-only crates that never compile here.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-gnu",
+    "x86_64-unknown-linux-gnu",
+]
+# The default feature set — the build that ships — not `--all-features`. The
+# opt-in `local-embeddings` feature (ADR-021) knowingly pulls ONNX Runtime and
+# OpenSSL, and checking it here would either fail the ban below or force the
+# ban to carry an exception for the one thing it exists to catch. This is the
+# same scope scripts/check-native-deps.sh checks, for the same reason.
+all-features = false
+
+[advisories]
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# A vulnerability is always an error. A yanked crate is usually a publishing
+# mistake rather than a defect, so it warns. An unmaintained advisory has no
+# warning level in cargo-deny — it is either checked, and then an error, or
+# not — so the choice is *which* crates it is checked for: `workspace` means
+# the crates this workspace names directly, where an unmaintained dependency
+# is a decision to make here, and not the transitive ones, where it is
+# upstream's to make (bincode 1, under hnsw_rs, is the case in point today).
+yanked = "warn"
+unmaintained = "workspace"
+# An ignored advisory that no longer matches anything in the graph is a stale
+# line here; warn so it gets removed.
+unused-ignored-advisory = "warn"
+ignore = [
+    # Empty HTTP/2 DATA frames accepted without limit; low severity, patched
+    # in h2 0.4.16. The fix is `cargo update -p h2`, a lockfile change that
+    # belongs in its own commit and not in the one that introduces the
+    # policy. This line comes out with that bump, and the
+    # `unused-ignored-advisory` warning above is what says so when it lands.
+    { id = "RUSTSEC-2026-0258", reason = "low severity; fixed by a lockfile bump to h2 0.4.16 that is a separate change — remove this line with it" },
+    # `rsa` reaches the graph only through `jsonwebtoken`, which the server
+    # uses to verify federated RS256 tokens against the identity provider's
+    # published public keys (docs/security.md, "Two ways in"). The Marvin
+    # attack recovers an RSA *private* key by timing private-key operations —
+    # decryption or signing. The server performs neither: it holds no RSA
+    # private key, its own tokens are HS256, and the one RSA signing call in
+    # the tree is a test fixture in kimmy-auth. There is no patched release
+    # to move to (the advisory says so); revisit when `rsa` 0.10 ships with
+    # the constant-time rewrite.
+    { id = "RUSTSEC-2023-0071", reason = "RSA is used for signature verification with public keys only; the timing side channel needs a private-key operation the server never performs" },
+]
+
+[licenses]
+# Everything the graph carries today, enumerated with `cargo deny list`. All
+# permissive except MPL-2.0 (file-level copyleft, carried by `foca`, the SWIM
+# implementation), which is compatible with both the AGPL-3.0 server and the
+# Apache-2.0 clients. No GPL-family license is on the list: the server could
+# legally take a GPL dependency, but `kimmy-client` is Apache-2.0
+# (LICENSING.md) and must never pull one, and one allowlist for one lockfile
+# cannot say "for some roots but not others" — so nothing may.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "BSL-1.0",
+    "Zlib",
+    "Unicode-3.0",
+    "Unlicense",
+    "CDLA-Permissive-2.0",
+    "MPL-2.0",
+]
+# The workspace's own license, permitted for the workspace's own crates by
+# name and for nothing else: a third-party AGPL crate is refused like any
+# other unlisted license. `kimmy-client` is deliberately absent — it is
+# Apache-2.0 and is covered by the allowlist above. What this cannot say is
+# that the client must not *depend* on any of these; an allowlist is per
+# lockfile, not per dependent. scripts/check-license-boundary.sh says it.
+exceptions = [
+    { crate = "kimmy-core", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-storage", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-query", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-vector", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-auth", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-cluster", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-mcp", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-api", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmyd", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-cli", allow = ["AGPL-3.0-only"] },
+]
+confidence-threshold = 0.8
+# Dev-dependencies are not license-checked (cargo-deny's default): nothing in
+# them ships. They are still in the advisory and ban checks above.
+include-dev = false
+
+[bans]
+# Two versions of one crate in the graph is a cost, not a defect, and the
+# lockfile has several today (rand, base64, getrandom, thiserror among them).
+# Warn, so a dependency bump that adds one is visible in the log without
+# turning every transitive skew into a merge blocker.
+multiple-versions = "warn"
+# Not checked. The workspace's internal path dependencies carry no version
+# (`kimmy-core = { path = "crates/kimmy-core" }` in Cargo.toml), which
+# cargo-deny reads as a wildcard, and its exemption for path dependencies
+# applies only to crates marked `publish = false` — which none of these are.
+# Turning this on means either versioning every internal path dependency or
+# marking the crates unpublishable, and either is a manifest decision to make
+# on its own, not a side effect of the policy file. A `*` requirement on a
+# registry crate remains something review catches.
+wildcards = "allow"
+# The one TLS and crypto stack is rustls on `ring`. `reqwest` is built with
+# `rustls-tls` and default features off precisely because its default would
+# pull `native-tls` and, on Linux, OpenSSL (Cargo.toml). `aws-lc-rs` is the
+# other rustls provider; ADR-016 and ADR-039 chose `ring` over it because it
+# adds CMake and a second native build for primitives the tree already has.
+# Each of these would arrive as a feature default somewhere in a version
+# bump, which is exactly the way a policy in prose fails.
+[[bans.deny]]
+crate = "openssl"
+reason = "one TLS stack: rustls on ring (ADR-039)"
+use-instead = "rustls"
+
+[[bans.deny]]
+crate = "openssl-sys"
+reason = "one TLS stack: rustls on ring (ADR-039)"
+use-instead = "rustls"
+
+[[bans.deny]]
+crate = "native-tls"
+reason = "one TLS stack: rustls on ring (ADR-039)"
+use-instead = "rustls"
+
+[[bans.deny]]
+crate = "aws-lc-rs"
+reason = "no second crypto provider beside ring (ADR-016)"
+use-instead = "ring"
+
+[[bans.deny]]
+crate = "aws-lc-sys"
+reason = "no second crypto provider beside ring (ADR-016)"
+use-instead = "ring"
+
+[sources]
+# Every crate comes from crates.io. A git dependency or a second registry is
+# a decision to record here, not something a manifest edit makes on its own.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

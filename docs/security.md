@@ -107,6 +107,8 @@ Refused at startup, each because of what it would otherwise break:
 | A mapping naming `admin` | See below |
 | A mapping naming an unknown action | Caught while the file is parsed — the error names the bad value and lists the valid ones |
 | `auth.oidc` together with `--insecure-no-auth` | Every request is already a superuser, so the mappings would enforce nothing while appearing to |
+| `auth.local.login = "disabled"` with no `auth.oidc` | Nobody could authenticate — see [Local login is a mode](#local-login-is-a-mode) |
+| An empty `auth.oidc.subject_claim` | A claim with no name can never resolve; omit the setting to keep the subject as the display name |
 
 ### Naming this node: the audience is the resource identifier
 
@@ -175,12 +177,15 @@ mistyped rather than a different kind of value ([ADR-071](decisions.md)).
 | `sub` | Required to be present; becomes the principal's name. |
 | `exp` | Not past, allowing 60 seconds. **Required to be present.** |
 | `nbf` | Not future, allowing 60 seconds. *Optional* — a token without one is fine. |
+| `iat` | **Required to be present** — without it the lifetime below cannot be measured. RFC 9068 §2.2 requires it in an access token. |
+| Lifetime | `exp − iat` at most `max_token_lifetime_secs`, 900 by default. The token's own two claims: no clock and no leeway in it. |
 | `typ` | `at+jwt`, only when `require_at_jwt = true`. Off by default. |
 
-`iss`, `aud`, `exp` and `sub` are required to be **present**, not merely
+`iss`, `aud`, `exp`, `iat` and `sub` are required to be **present**, not merely
 checked when they happen to appear. A token that simply omits its audience
 would otherwise sail past the audience restriction, which is the whole reason
-the audience is configured.
+the audience is configured — and one that omitted `iat` would sail past the
+lifetime limit the same way.
 
 The 60 seconds of leeway covers `exp` and `nbf` alike. The local HS256 path
 allows none: cluster nodes are expected to agree about the time and are run by
@@ -203,6 +208,43 @@ before `typ` is consulted. The setting is defence in depth for you. With an
 opaque audience it is the only check of its kind, so turn it on — after
 decoding a real token from your provider and confirming what it stamps
 ([ADR-072](decisions.md)).
+
+#### The lifetime limit, and why it is 900 seconds
+
+A federated principal's role *membership* is frozen in its access token. This
+database makes no introspection call — verification is a pure function of the
+token, the key set and the configuration, which is what keeps authentication
+free on the request path — so when the provider revokes someone's membership,
+this node honours the old claim until that token expires
+([ADR-073](decisions.md)). The width of that window is the token's own
+lifetime, and it is the provider that chooses it.
+`auth.oidc.max_token_lifetime_secs` is where this node bounds it: a token whose
+`exp − iat` exceeds the limit is refused, however recently it was minted and
+however little of it remains.
+
+**900 seconds by default.** Providers default access tokens to somewhere
+between five minutes and an hour, and a few to a day. Fifteen minutes admits
+the short defaults outright and asks the rest a question rather than
+answering it silently: shorten the lifetime the provider mints for this
+resource — every provider this federation is written against can do that per
+resource or per client — or raise the limit knowingly. The question arrives on
+the first request: the 401 carries `error="invalid_token"` with an
+`error_description` naming the limit in seconds and nothing about the token. A
+raised limit is printed in the startup summary, and the setting is refused
+outside 1–86400 ([ADR-096](decisions.md)).
+
+The check is on the token's two claims and nothing else. It does not consult
+the clock, so the 60 seconds of leeway above play no part in it: the leeway
+exists because the provider's clock is somebody else's, and that says nothing
+about how long the provider chose to make a token valid for. A token with no
+`iat` is refused because its lifetime cannot be measured — accepting it would
+put the limit one omitted claim away from not applying. RFC 9068 §2.2
+requires the claim in a JWT access token, so a conforming provider never omits
+it.
+
+What this does not do is revoke anything. A membership revoked at the provider
+is still honoured until the token expires; the limit says how long that can
+be, and no longer.
 
 ### Refusals say how to authenticate
 
@@ -324,7 +366,10 @@ local user who happened to share the asserted name would silently decide whether
 the federated caller could connect.
 
 So the session ends where it began: at the provider, and at the moment the
-current token expires. **Keep federated token lifetimes short.**
+current token expires — which is at most `max_token_lifetime_secs` after it was
+issued, 900 seconds by default, because this node refuses a token that would
+live longer ([the lifetime limit](#the-lifetime-limit-and-why-it-is-900-seconds)).
+Keep the provider's lifetime at or below that rather than raising it.
 `/v1/auth/refresh` refuses a federated principal rather than issuing a
 replacement — minting a local token from a federated identity would shed the
 origin flag and outlive the provider's say in it ([ADR-065](decisions.md)).
@@ -340,6 +385,39 @@ user=ada@example.com unauthenticated=false federated=true action=Read db=sales c
 
 A name cannot do this job: nothing stops a provider from asserting a subject
 called `root`. `/v1/auth/whoami` reports the same flag.
+
+### A readable name that is never an identity
+
+A federated principal's name is the token's `sub`, and from a real provider
+that is an opaque identifier — a GUID from Entra ID, a `00u…` string from
+Okta. An audit line reading `user=3f2a…` tells the person reading it nothing
+until they open the provider's console. `auth.oidc.subject_claim`
+(`KIMMY_OIDC_SUBJECT_CLAIM`) names a claim whose string value is carried
+**beside** the identity as its display name:
+
+```toml
+[auth.oidc]
+subject_claim = "preferred_username"    # or "email", "upn"; unset keeps sub
+```
+
+```
+user=3f2a… display=ada@example.com federated=true action=Read db=sales collection=orders decision=allow
+```
+
+`/v1/auth/whoami` reports `display` too — the claim's value, or `user` itself
+when the claim is absent, is not a string, or was never configured. A local
+principal's `display` is always its user name.
+
+**Display only, and the reason is that an email is not an identity.** It is
+mutable — a rename at the provider would silently turn one person into two
+principals, or two people into one — it is not unique across providers, and
+some providers let a user set it themselves. `sub` is the one claim OpenID
+Connect makes stable and provider-scoped. So the display name is consulted by
+nothing that decides anything: authorization, role resolution, rate limiting,
+the `federated` flag and every comparison the server makes still use `sub`. A
+subject whose email changes keeps its roles, and a test holds that. A token
+whose claim is missing or malformed is not refused; it simply has no better
+name than its subject ([ADR-100](decisions.md)).
 
 ### Getting a token
 
@@ -407,6 +485,55 @@ expires on its own.
 
 ---
 
+## Local login is a mode
+
+`POST /v1/auth/login` is the one unauthenticated route that accepts a guess
+from anywhere and spends Argon2 work on each one. A node whose people all
+arrive through an identity provider has no reason to leave it open to the
+network — and every reason to keep it open to the host, because the
+break-glass root that [`admin` is reserved to](#admin-is-not-federatable) has
+to be able to log in from somewhere. `auth.local.login` is that choice:
+
+```toml
+[auth.local]
+login = "always"    # always | loopback_only | disabled
+```
+
+Also `KIMMY_LOCAL_LOGIN` and `--local-login`.
+
+| Mode | `POST /v1/auth/login` and `POST /v1/auth/refresh` |
+|---|---|
+| `always` | Answer every caller. The default, and exactly what shipped |
+| `loopback_only` | Answer only a connection whose **TCP peer address** is loopback. Anyone else gets `403` with the `forbidden` code and a message naming the setting |
+| `disabled` | Answer `404` to everyone. Refused at startup unless `auth.oidc` is configured, because a node with neither could authenticate nobody |
+
+**The mode governs minting, not verifying.** A local token already issued
+keeps verifying under every mode, on every node of the cluster, until it
+expires or is revoked; federated tokens are untouched. Switching to
+`loopback_only` or `disabled` does not end anyone's session — change the
+password or the grants for that ([Revoking a token](#revoking-a-token)).
+`refresh` follows the same rule as `login` because it mints a local token too:
+under `disabled` a local session cannot be extended, and under `loopback_only`
+it can be extended only from where it could have been opened.
+
+**`loopback_only` is about the TCP peer, not `X-Forwarded-For`.** The check
+reads the address the connection was accepted from and deliberately ignores
+`server.rate_limit.trusted_proxy_header`: the setting is about who can reach
+the process, and a header is something a client writes. Two consequences
+follow. A reverse proxy or TLS terminator **on the same host** connects from
+loopback, so every caller behind it looks local and the mode restricts
+nothing — put the proxy elsewhere, or restrict the path at the proxy. And a
+request the server cannot attribute to a peer at all (a router served without
+connect info, which `kimmyd` never does) is refused, because failing open
+would be the wrong direction for a setting whose only purpose is to close.
+
+The startup summary prints `local_login=<mode>`, `check-config` says the same
+in words, and `kimmy login <user>` explains a 403 or 404 from this route
+rather than printing it bare. The full reasoning, including why the refusal
+is a 403 rather than a 404, is [ADR-100](decisions.md).
+
+---
+
 ## Passwords
 
 Argon2id via the `argon2` crate, with a fresh random salt per password, stored
@@ -440,11 +567,25 @@ the local half.)
 
 ```rust
 struct Claims {
-    sub: String,        // user name
-    exp: u64, iat: u64, // seconds since the epoch
-    grants: Vec<Grant>, // embedded, not looked up per request
+    sub: String,         // user name
+    exp: u64, iat: u64,  // seconds since the epoch
+    grants: Vec<Grant>,  // embedded, not looked up per request
+    tv: u64,             // the user's token version when issued (revocation)
+    roles: Vec<String>,  // the named roles in play, for the audit record
 }
 ```
+
+**A local token is a signed, unencrypted, readable grant list.** HS256 is a
+signature, not encryption. The claims above travel as base64url-encoded JSON,
+and anyone holding the token — a proxy log, a shell history, a pasted `curl`
+line — can read the user name, every grant, the role names and the expiry
+without knowing the secret. What the secret provides is integrity: a token
+cannot be altered or minted without it, which is the property authorization
+rests on. Confidentiality of the claims, and of the token itself, comes from
+somewhere else — from carrying it only over TLS, and from handling it as the
+credential it is. Nothing that is itself sensitive belongs in a role name or a
+grant, because it is sent in the clear inside every request the token
+authorizes.
 
 **Why cluster-wide.** In a leaderless cluster a request may land on any node,
 not the one that logged the user in. A per-node key would produce intermittent
@@ -496,14 +637,83 @@ other within about two seconds. Refusals are **not** distinguished — deleted,
 disabled and logged-out all return the same 401, because telling them apart
 reports on an account to whoever is holding a stale token for it.
 
-Rotating `KIMMY_JWT_SECRET` still works and is still the bigger hammer: it
-invalidates every token for every user at once.
+Rotating `KIMMY_JWT_SECRET` on its own is still the bigger hammer: without a
+previous secret configured it invalidates every token for every user at once.
+That is not how to end a session — the rows above are — and it is not how to
+rotate either; see the next section.
 
-Minimum secret length is 16 bytes, enforced at construction — the whole cluster
-shares this value, so a weak one is a cluster-wide weakness.
+Minimum secret length is 32 bytes, enforced at construction and again by
+`check-config` — the 256-bit floor RFC 7518 §3.2 sets for HS256, and the whole
+cluster shares this value, so a weak one is a cluster-wide weakness. (It was
+16 bytes up to 0.16.x; a secret of 16–31 bytes has to be replaced before
+upgrading, which logs every user out once — [ADR-093](decisions.md).)
+
+### Rotating the signing secret
+
+A secret that is never rotated is a secret whose exposure is never recovered
+from, and the reason this one was not rotated is that changing it used to log
+everyone out at once. So the node holds **two** secrets during a rotation
+([ADR-101](decisions.md)): every token is *signed* with `KIMMY_JWT_SECRET`,
+and a token is *accepted* if either `KIMMY_JWT_SECRET` or
+`KIMMY_JWT_PREVIOUS_SECRET` verifies it. The current one is tried first. A
+token neither verifies gets the same 401 as any other bad token.
+
+The procedure:
+
+1. Generate the new secret: `openssl rand -base64 32`.
+2. On every node, set `KIMMY_JWT_PREVIOUS_SECRET` to the **old** value and
+   `KIMMY_JWT_SECRET` to the **new** one. `kimmyd check-config` confirms the
+   pair: the previous secret must meet the same length floor and must differ
+   from the current one, and the summary line says `jwt_previous_secret=set`
+   (never the value).
+3. Restart or roll every node. Sessions opened before the roll keep working on
+   every node, whichever secret signed them; sessions opened after it are
+   signed with the new secret only. In a cluster, roll *all* nodes before
+   considering the rotation done — a node still on the old pair signs tokens
+   the others accept, but a node on the new secret alone does not accept
+   tokens the stragglers sign.
+4. Wait one `token_ttl_secs` (an hour by default). Every token the old secret
+   signed has expired by then. The node says so: it logs an `info` at startup
+   naming the deadline and one `warn` when it passes. The clock starts at
+   process start, not at the moment of the rotation, and is not persisted
+   across restarts — restarting a node restarts its count.
+5. Remove `KIMMY_JWT_PREVIOUS_SECRET` from every node and roll again. Until it
+   is removed, the old secret still verifies tokens, so anyone who has it can
+   still mint one.
+
+**Rotation does not revoke.** A token signed with the old secret is as good as
+one signed with the new one for as long as the window is open. Ending a
+particular user's sessions is the token version's job, above, and it applies
+identically to a token the previous secret verified: the version check runs
+after the signature check, whichever key passed it.
+
+**`KIMMY_CLUSTER_SECRET` is not covered.** It authenticates node-to-node
+traffic, not tokens, and has no previous-value window; rotating it is a
+stop-the-cluster operation, described in the note on rotating `cluster_secret`
+in [operations.md](operations.md).
 
 Attacks covered by tests: `alg=none` unsigned tokens, payload tampering to
 escalate grants, wrong-secret signatures, expired tokens, and malformed input.
+
+### Placeholder secrets are refused off loopback
+
+A node that listens on anything other than a loopback address — the HTTP
+listener, or the cluster listener when clustering is on — refuses to start
+when `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` or `KIMMY_CLUSTER_SECRET` (or
+the TOML setting behind each) is one of the values this repository's own
+examples use: `changeme` and `change-me`, `hunter2`, the defaults the compose
+file used to fall back to, the commented-out lines in `kimmy.example.toml`,
+and the obvious words — `password`, `secret`, `admin`, `root`, and so on. The
+full list is `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`; matching ignores
+case. A value every reader of the repository holds is not a secret, and a
+copied quick start is exactly how a database ends up on a routable address
+with one.
+
+The error names the setting and never the value, and `kimmyd check-config`
+gives the same answer the server would. On `127.0.0.1` or `::1` the same
+values are accepted, so local development and the examples stay copy-and-run.
+It is a denylist and nothing more: a value absent from it is not thereby a
+good secret, and the length floor still applies ([ADR-093](decisions.md)).
 
 ---
 
@@ -582,7 +792,9 @@ surfaces either way.
 - Their *membership* is not. The `roles` claim is frozen in the provider's
   access token and this database makes no introspection call, so if the provider
   revokes someone's membership, this node honours the old claim until that token
-  expires. Short access-token lifetimes are the mitigation.
+  expires. That window is bounded by `auth.oidc.max_token_lifetime_secs`, 900
+  seconds by default: a token that would live longer is refused
+  ([ADR-096](decisions.md)).
 
 **Deleting a role leaves its name on holders' records**, where it resolves to
 nothing — as does a mapping naming a role that was never created. The
@@ -720,6 +932,10 @@ environment can take over an existing database.
 
 Change the root password through the API, not by editing the environment.
 
+A bootstrap password copied from an example — `changeme`, `hunter2`, and the
+rest — is refused when the node listens off loopback; see [Placeholder secrets
+are refused off loopback](#placeholder-secrets-are-refused-off-loopback).
+
 ---
 
 ## `--insecure-no-auth`
@@ -747,9 +963,11 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
 | **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
-| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider and keep token lifetimes short |
+| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; the node refuses a federated token valid for longer than `max_token_lifetime_secs` (900 s by default), so the revocation is honoured within that long ([ADR-096](decisions.md)) |
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
-| **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
+| **Rate limiting** | ✅ login · ✅ per principal, opt-in | See [Login rate limiting](#login-rate-limiting) and [Limits on authenticated requests](#limits-on-authenticated-requests). Per-*address* limiting of authenticated routes is still a proxy's job |
+| **A slow or oversized request from an authenticated caller** | ✅ Built | A request deadline and a body ceiling, both settings with defaults matching what the server always did — see [Limits on authenticated requests](#limits-on-authenticated-requests) |
+| **A slow query** | 📋 | The deadline does not interrupt storage work already running: a scan or a bulk commit runs to completion. There is no query timeout yet ([ADR-099](decisions.md)) |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No document- or field-level security** | Not planned | Collection is the finest granularity — see [How far authorization goes](#how-far-authorization-goes) |
 | **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
@@ -1052,6 +1270,78 @@ protect and every request is already a superuser.
 
 ---
 
+## Limits on authenticated requests
+
+A valid token is not a licence to hold the server hostage. A principal that is
+compromised — or a client with a broken retry loop — can hold connections open
+by sending a body slowly, send bodies as large as the framework allows, and
+make requests as fast as the network carries them. Three settings bound those
+([ADR-099](decisions.md)); each defaults to what the server already did, so a
+node that sets none of them behaves exactly as before.
+
+```toml
+[server]
+request_timeout_secs = 30      # 503 `timeout` past it; 0 is refused
+max_body_bytes = 2097152       # 413 `payload_too_large` over it; 0 is refused
+
+[server.rate_limit]
+per_principal = 0              # requests per principal per window; 0 disables
+per_principal_window_secs = 60
+```
+
+**The deadline bounds waiting, not working.** It wraps every REST route that
+answers with a document and fires when the request is still *pending* at the
+deadline. In this server a request is pending in two places: while its body is
+still arriving, and while an embedding provider is being waited on. Both are
+where an authenticated caller can impose cost for free, and both are cut off
+with `503 timeout` (`retry: wait`). Storage work is synchronous and never
+yields, so a scan, a bulk insert, an index backfill or a database drop runs to
+completion and is answered with its result however long it took — which is why
+none of them needs an exemption, and why this is **not a query timeout**. The
+change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with
+a connection rather than a document and carry no deadline at all.
+
+**The body ceiling is the one that was always there.** 2 MiB is what axum
+enforced on its own before the setting existed; it is a setting now so an
+operator can lower it for a deployment of small documents or raise it for a
+bulk-import pattern. It applies to every REST route, login included. `/mcp`
+reads its bodies under rmcp's own limit (4 MiB) and answers its own 413.
+
+**The per-principal budget is keyed on who, not where from.** A local user is
+its name; a federated identity is its issuer *and* its subject, under a
+different prefix, so a provider's `root` and this cluster's `root` never share
+a budget. A principal spread across many addresses draws on one budget, and
+two principals behind one NAT do not share one — which is what the login
+limiter, keyed on the address, cannot offer. It is checked in the
+authentication extractor **after** the token is verified and the session
+confirmed, so:
+
+- a bad token is a `401` and spends nothing — the limiter counts principals,
+  not guesses, and cannot be used from outside to exhaust a real user;
+- every surface that takes a principal is covered by construction: REST,
+  `/mcp` and the change-stream upgrade alike.
+
+Over the budget the answer is `429` with `Retry-After`, the same response the
+login limiter gives, and the refusals are counted in
+`kimmy_rate_limited_principal_total` beside the existing
+`kimmy_rate_limited_total`. The key map is bounded by
+`server.rate_limit.max_tracked_keys` like the login limiters', because a
+principal name is attacker-controlled in the same sense an address is.
+
+**It is off by default, and the number is yours.** A capacity limit without a
+measurement behind it is a guess, and the operator is the one holding the
+measurement. If you want a starting point before you have one: `per_principal
+= 3000` over `per_principal_window_secs = 60` is fifty requests a second
+sustained per principal — well above what one well-behaved client produces,
+and comfortably below what a single node serves. Watch
+`kimmy_rate_limited_principal_total` after setting it; a legitimate client
+hitting it is the measurement.
+
+With `--insecure-no-auth` every request is one principal, and the limiter is
+off along with the login ones.
+
+---
+
 ## What telemetry sends, and what it does not
 
 Tracing is off unless `telemetry.endpoint` is set. When it is on, **spans omit
@@ -1104,16 +1394,73 @@ delivery. Treat an inbound `traceparent` as a hint, never as evidence.
 
 ---
 
+## Supply chain
+
+What the project does about the code it ships that it did not write, and
+about proving that what you download is what the release workflow built
+([ADR-108](decisions.md)).
+
+**The dependency graph has a written policy**, `deny.toml` at the repository
+root, checked by `cargo deny` on every change to a Cargo manifest or the
+lockfile and once a week against an unchanged one — the weekly run exists
+because advisories are published against crates that are already in the
+lockfile. A known vulnerability anywhere in the graph fails the check.
+Licenses are an allowlist of exactly what the graph carries, with the
+workspace's own AGPL permitted for the server crates by name and no
+GPL-family license permitted at all: `kimmy-client` is Apache-2.0
+([LICENSING.md](../LICENSING.md)), and one allowlist over one lockfile cannot
+permit a license for some crates' dependents and not others, so it permits it
+for none. OpenSSL, `native-tls` and `aws-lc-rs` are banned outright — the
+build has one TLS and crypto stack, rustls on `ring` ([ADR-039](decisions.md)),
+and a second one arriving as somebody's feature default is how "we use
+rustls" quietly stops being true. Crates come from crates.io only. Where an
+advisory is ignored, the reason is written beside it in the file; read it
+there rather than here, so that the file and the reasoning cannot drift.
+
+The policy covers the **default feature set**, the build that ships.
+`local-embeddings` knowingly pulls ONNX Runtime and OpenSSL, and is outside
+the ban for the same reason it is outside `scripts/check-native-deps.sh`.
+
+**The licensing line is checked, not assumed.** The allowlist cannot say
+that the Apache-2.0 client must not *depend* on an AGPL crate;
+`scripts/check-license-boundary.sh` says it, in the same workflow, by
+resolving the client's shipped graph and failing if a server crate is in it.
+
+**Updates arrive weekly, grouped.** Dependabot proposes minor and patch
+updates for the workspace, the GitHub Actions the workflows use, the Go
+client and the Python client as one pull request per ecosystem, majors on
+their own, each held for seven days after publication so that a release
+which is going to be yanked has had its week. Every one of those pull
+requests runs the policy check above and the full CI run.
+
+**Releases carry provenance.** The release workflow attests what it built: a
+[SLSA](https://slsa.dev) provenance statement for the container image's
+manifest and for each release archive, signed keylessly through Sigstore
+under the workflow run's own OIDC identity and recorded by GitHub against the
+artifact's digest. There is no signing key — nothing to keep, rotate or leak
+— and the statement names the repository, the workflow file, the commit and
+the tag, which is what `gh attestation verify` checks. How to run it, and
+from which release the attestations begin, is in
+[Operations → Verifying a release](operations.md#verifying-a-release).
+
+What none of this covers, stated so it is not assumed: GitHub's runners, the
+crates.io index and the Sigstore infrastructure are trusted. A compromise of
+any of them is a compromise of every project that builds this way, and the
+answer to it does not live in this repository.
+
+---
+
 ## Deployment checklist
 
 ```mermaid
 graph TB
-    A["Generate a strong KIMMY_JWT_SECRET<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
-    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file"]
+    A["Generate KIMMY_JWT_SECRET, 32 bytes or more<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
+    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file — never an example's value"]
     C --> D["Set server.tls.cert_file and key_file<br/>(or terminate at a proxy)"]
     D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]
     F --> G["Never expose --insecure-no-auth beyond loopback"]
+    G --> H["Behind an IdP? set auth.local.login = loopback_only<br/>so root stays a host-only door"]
 ```
 
 ---

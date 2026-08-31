@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 const SPEC_SOURCE: &str = include_str!("../../../docs/openapi.yaml");
 const ROUTER_SOURCE: &str = include_str!("../src/routes.rs");
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 /// HTTP methods an OpenAPI path item may carry.
@@ -482,6 +482,9 @@ impl Res {
 /// `/v1/admin/backup` is binary and both are part of the contract.
 struct Server {
     base: String,
+    /// The server's own state, for the one setting a request cannot reach:
+    /// the local login mode, which is fixed at startup.
+    state: kimmy_api::SharedState,
     _dir: tempfile::TempDir,
 }
 
@@ -519,7 +522,7 @@ impl Server {
             kimmy_api::egress::EgressPolicy::new(vec!["127.0.0.1".into()]),
         )
         .unwrap();
-        let app = kimmy_api::router(state);
+        let app = kimmy_api::router(Arc::clone(&state));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -528,7 +531,42 @@ impl Server {
                 .await;
         });
 
-        Self { base: format!("http://{addr}"), _dir: dir }
+        Self { base: format!("http://{addr}"), state, _dir: dir }
+    }
+
+    /// Drive one request through the router as though it arrived from `peer`.
+    ///
+    /// The socket above can only ever produce a loopback peer, which is the
+    /// one case `auth.local.login = "loopback_only"` admits. To produce the
+    /// documented 403 the request is handed to the router directly, carrying
+    /// the same connect-info extension a listener would have attached.
+    async fn request_from(
+        &self,
+        peer: &str,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+    ) -> (u16, Value) {
+        use http_body_util::BodyExt as _;
+        use tower::ServiceExt as _;
+
+        let peer: SocketAddr = peer.parse().unwrap();
+        let mut request = axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json");
+        if let Some(token) = token {
+            request = request.header("authorization", format!("Bearer {token}"));
+        }
+        let body = json!({ "user": "root", "password": ROOT_PASSWORD }).to_string();
+        let mut request = request.body(axum::body::Body::from(body)).unwrap();
+        request.extensions_mut().insert(axum::extract::ConnectInfo(peer));
+
+        let response =
+            kimmy_api::router(Arc::clone(&self.state)).oneshot(request).await.expect("router");
+        let status = response.status().as_u16();
+        let bytes = response.into_body().collect().await.expect("body").to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
     }
 
     async fn request(
@@ -976,6 +1014,45 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         .await;
     assert_eq!(modified["document"]["status"], "packed");
 
+    // `arrayFilters` on both write routes, driven rather than only declared
+    // (ADR-104): the update's `$[line]` needs the filter the request carries.
+    c.check(
+        "POST",
+        docs_t,
+        docs,
+        Some(&root),
+        Some(json!({ "_id": "lines", "items": [ { "sku": "widget", "shipped": false },
+                                                 { "sku": "gasket", "shipped": false } ] })),
+        200,
+    )
+    .await;
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/update",
+        "/v1/db/shop/coll/orders/update",
+        Some(&root),
+        Some(json!({ "filter": { "_id": "lines" },
+                     "update": { "$set": { "items.$[line].shipped": true } },
+                     "arrayFilters": [ { "line.sku": "gasket" } ] })),
+        200,
+    )
+    .await;
+    let modified = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find_and_modify",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            Some(&root),
+            Some(json!({ "filter": { "_id": "lines" },
+                         "update": { "$set": { "items.$[line].shipped": true } },
+                         "arrayFilters": [ { "line.sku": "widget" } ],
+                         "returnDocument": "after" })),
+            200,
+        )
+        .await;
+    assert_eq!(modified["document"]["items"][0]["shipped"], true, "{modified}");
+    assert_eq!(modified["document"]["items"][1]["shipped"], true, "{modified}");
+
     let by_id = "/v1/db/shop/coll/orders/docs/a";
     let by_id_t = "/v1/db/{db}/coll/{coll}/docs/{id}";
     c.check("GET", by_id_t, by_id, Some(&root), None, 200).await;
@@ -1088,6 +1165,31 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         200,
     )
     .await;
+    // The fusion controls (ADR-094) are part of the documented request, and a
+    // meaningless one is the documented 400.
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/hybrid_search",
+        "/v1/db/shop/coll/orders/hybrid_search",
+        Some(&root),
+        Some(json!({
+            "query": "blue widget", "vector": [1.0, 0.0, 0.0], "k": 3,
+            "weights": { "dense": 0.7, "lexical": 0.3 }, "min_overlap": 2,
+        })),
+        200,
+    )
+    .await;
+    let refused = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/hybrid_search",
+            "/v1/db/shop/coll/orders/hybrid_search",
+            Some(&root),
+            Some(json!({ "query": "blue widget", "vector": [1.0, 0.0, 0.0], "min_overlap": 0 })),
+            400,
+        )
+        .await;
+    assert_eq!(refused["error"], "bad_request");
 
     // -- webhooks ----------------------------------------------------------
     let hooks = "/v1/db/shop/coll/orders/webhooks";
@@ -1400,6 +1502,61 @@ async fn a_rate_limited_login_matches_its_documented_response() {
     // than moving on to a peer that shares nothing about this limit.
     assert_eq!(body["error"], "rate_limited");
     assert_eq!(body["retry"], "wait");
+}
+
+/// The two refusals `auth.local.login` adds to the token-minting routes
+/// (ADR-100), validated against the envelope the specification documents for
+/// them. Two servers, because the mode is fixed for the life of a process.
+#[tokio::test]
+async fn local_login_refusals_use_the_documented_envelope() {
+    // `loopback_only`: the socket peer is loopback and is admitted, so the
+    // 403 has to come from a peer off the host, which `request_from` supplies.
+    let server = Server::start().await;
+    let root = server
+        .request(
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(&json!({"user":"root","password":ROOT_PASSWORD})),
+        )
+        .await
+        .json()["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    server.state.set_local_login(kimmy_api::LocalLogin::LoopbackOnly);
+
+    let (status, body) =
+        server.request_from("203.0.113.9:4000", "POST", "/v1/auth/login", None).await;
+    assert_eq!(status, 403, "{body}");
+    validate_response("POST", "/v1/auth/login", 403, &body);
+    assert_eq!(body["error"], "forbidden");
+
+    let (status, body) =
+        server.request_from("203.0.113.9:4000", "POST", "/v1/auth/refresh", Some(&root)).await;
+    assert_eq!(status, 403, "{body}");
+    validate_response("POST", "/v1/auth/refresh", 403, &body);
+
+    // `disabled`: 404 from anywhere, and — for refresh — before the token is
+    // examined, so no token at all still gets the documented answer.
+    let server = Server::start().await;
+    server.state.set_local_login(kimmy_api::LocalLogin::Disabled);
+
+    let res = server
+        .request(
+            "POST",
+            "/v1/auth/login",
+            None,
+            Some(&json!({"user":"root","password":ROOT_PASSWORD})),
+        )
+        .await;
+    assert_eq!(res.status, 404, "{}", res.json());
+    validate_response("POST", "/v1/auth/login", 404, &res.json());
+    assert_eq!(res.json()["error"], "not_found");
+
+    let res = server.request("POST", "/v1/auth/refresh", None, None).await;
+    assert_eq!(res.status, 404, "{}", res.json());
+    validate_response("POST", "/v1/auth/refresh", 404, &res.json());
 }
 
 /// The document is a specification, so it has to be one.
