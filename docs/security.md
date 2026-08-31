@@ -177,12 +177,15 @@ mistyped rather than a different kind of value ([ADR-071](decisions.md)).
 | `sub` | Required to be present; becomes the principal's name. |
 | `exp` | Not past, allowing 60 seconds. **Required to be present.** |
 | `nbf` | Not future, allowing 60 seconds. *Optional* — a token without one is fine. |
+| `iat` | **Required to be present** — without it the lifetime below cannot be measured. RFC 9068 §2.2 requires it in an access token. |
+| Lifetime | `exp − iat` at most `max_token_lifetime_secs`, 900 by default. The token's own two claims: no clock and no leeway in it. |
 | `typ` | `at+jwt`, only when `require_at_jwt = true`. Off by default. |
 
-`iss`, `aud`, `exp` and `sub` are required to be **present**, not merely
+`iss`, `aud`, `exp`, `iat` and `sub` are required to be **present**, not merely
 checked when they happen to appear. A token that simply omits its audience
 would otherwise sail past the audience restriction, which is the whole reason
-the audience is configured.
+the audience is configured — and one that omitted `iat` would sail past the
+lifetime limit the same way.
 
 The 60 seconds of leeway covers `exp` and `nbf` alike. The local HS256 path
 allows none: cluster nodes are expected to agree about the time and are run by
@@ -205,6 +208,43 @@ before `typ` is consulted. The setting is defence in depth for you. With an
 opaque audience it is the only check of its kind, so turn it on — after
 decoding a real token from your provider and confirming what it stamps
 ([ADR-072](decisions.md)).
+
+#### The lifetime limit, and why it is 900 seconds
+
+A federated principal's role *membership* is frozen in its access token. This
+database makes no introspection call — verification is a pure function of the
+token, the key set and the configuration, which is what keeps authentication
+free on the request path — so when the provider revokes someone's membership,
+this node honours the old claim until that token expires
+([ADR-073](decisions.md)). The width of that window is the token's own
+lifetime, and it is the provider that chooses it.
+`auth.oidc.max_token_lifetime_secs` is where this node bounds it: a token whose
+`exp − iat` exceeds the limit is refused, however recently it was minted and
+however little of it remains.
+
+**900 seconds by default.** Providers default access tokens to somewhere
+between five minutes and an hour, and a few to a day. Fifteen minutes admits
+the short defaults outright and asks the rest a question rather than
+answering it silently: shorten the lifetime the provider mints for this
+resource — every provider this federation is written against can do that per
+resource or per client — or raise the limit knowingly. The question arrives on
+the first request: the 401 carries `error="invalid_token"` with an
+`error_description` naming the limit in seconds and nothing about the token. A
+raised limit is printed in the startup summary, and the setting is refused
+outside 1–86400 ([ADR-096](decisions.md)).
+
+The check is on the token's two claims and nothing else. It does not consult
+the clock, so the 60 seconds of leeway above play no part in it: the leeway
+exists because the provider's clock is somebody else's, and that says nothing
+about how long the provider chose to make a token valid for. A token with no
+`iat` is refused because its lifetime cannot be measured — accepting it would
+put the limit one omitted claim away from not applying. RFC 9068 §2.2
+requires the claim in a JWT access token, so a conforming provider never omits
+it.
+
+What this does not do is revoke anything. A membership revoked at the provider
+is still honoured until the token expires; the limit says how long that can
+be, and no longer.
 
 ### Refusals say how to authenticate
 
@@ -326,7 +366,10 @@ local user who happened to share the asserted name would silently decide whether
 the federated caller could connect.
 
 So the session ends where it began: at the provider, and at the moment the
-current token expires. **Keep federated token lifetimes short.**
+current token expires — which is at most `max_token_lifetime_secs` after it was
+issued, 900 seconds by default, because this node refuses a token that would
+live longer ([the lifetime limit](#the-lifetime-limit-and-why-it-is-900-seconds)).
+Keep the provider's lifetime at or below that rather than raising it.
 `/v1/auth/refresh` refuses a federated principal rather than issuing a
 replacement — minting a local token from a federated identity would shed the
 origin flag and outlive the provider's say in it ([ADR-065](decisions.md)).
@@ -524,11 +567,25 @@ the local half.)
 
 ```rust
 struct Claims {
-    sub: String,        // user name
-    exp: u64, iat: u64, // seconds since the epoch
-    grants: Vec<Grant>, // embedded, not looked up per request
+    sub: String,         // user name
+    exp: u64, iat: u64,  // seconds since the epoch
+    grants: Vec<Grant>,  // embedded, not looked up per request
+    tv: u64,             // the user's token version when issued (revocation)
+    roles: Vec<String>,  // the named roles in play, for the audit record
 }
 ```
+
+**A local token is a signed, unencrypted, readable grant list.** HS256 is a
+signature, not encryption. The claims above travel as base64url-encoded JSON,
+and anyone holding the token — a proxy log, a shell history, a pasted `curl`
+line — can read the user name, every grant, the role names and the expiry
+without knowing the secret. What the secret provides is integrity: a token
+cannot be altered or minted without it, which is the property authorization
+rests on. Confidentiality of the claims, and of the token itself, comes from
+somewhere else — from carrying it only over TLS, and from handling it as the
+credential it is. Nothing that is itself sensitive belongs in a role name or a
+grant, because it is sent in the clear inside every request the token
+authorizes.
 
 **Why cluster-wide.** In a leaderless cluster a request may land on any node,
 not the one that logged the user in. A per-node key would produce intermittent
@@ -583,11 +640,34 @@ reports on an account to whoever is holding a stale token for it.
 Rotating `KIMMY_JWT_SECRET` still works and is still the bigger hammer: it
 invalidates every token for every user at once.
 
-Minimum secret length is 16 bytes, enforced at construction — the whole cluster
-shares this value, so a weak one is a cluster-wide weakness.
+Minimum secret length is 32 bytes, enforced at construction and again by
+`check-config` — the 256-bit floor RFC 7518 §3.2 sets for HS256, and the whole
+cluster shares this value, so a weak one is a cluster-wide weakness. (It was
+16 bytes up to 0.16.x; a secret of 16–31 bytes has to be replaced before
+upgrading, which logs every user out once — [ADR-093](decisions.md).)
 
 Attacks covered by tests: `alg=none` unsigned tokens, payload tampering to
 escalate grants, wrong-secret signatures, expired tokens, and malformed input.
+
+### Placeholder secrets are refused off loopback
+
+A node that listens on anything other than a loopback address — the HTTP
+listener, or the cluster listener when clustering is on — refuses to start
+when `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` or `KIMMY_CLUSTER_SECRET` (or
+the TOML setting behind each) is one of the values this repository's own
+examples use: `changeme` and `change-me`, `hunter2`, the defaults the compose
+file used to fall back to, the commented-out lines in `kimmy.example.toml`,
+and the obvious words — `password`, `secret`, `admin`, `root`, and so on. The
+full list is `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`; matching ignores
+case. A value every reader of the repository holds is not a secret, and a
+copied quick start is exactly how a database ends up on a routable address
+with one.
+
+The error names the setting and never the value, and `kimmyd check-config`
+gives the same answer the server would. On `127.0.0.1` or `::1` the same
+values are accepted, so local development and the examples stay copy-and-run.
+It is a denylist and nothing more: a value absent from it is not thereby a
+good secret, and the length floor still applies ([ADR-093](decisions.md)).
 
 ---
 
@@ -666,7 +746,9 @@ surfaces either way.
 - Their *membership* is not. The `roles` claim is frozen in the provider's
   access token and this database makes no introspection call, so if the provider
   revokes someone's membership, this node honours the old claim until that token
-  expires. Short access-token lifetimes are the mitigation.
+  expires. That window is bounded by `auth.oidc.max_token_lifetime_secs`, 900
+  seconds by default: a token that would live longer is refused
+  ([ADR-096](decisions.md)).
 
 **Deleting a role leaves its name on holders' records**, where it resolves to
 nothing — as does a mapping naming a role that was never created. The
@@ -804,6 +886,10 @@ environment can take over an existing database.
 
 Change the root password through the API, not by editing the environment.
 
+A bootstrap password copied from an example — `changeme`, `hunter2`, and the
+rest — is refused when the node listens off loopback; see [Placeholder secrets
+are refused off loopback](#placeholder-secrets-are-refused-off-loopback).
+
 ---
 
 ## `--insecure-no-auth`
@@ -831,9 +917,11 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
 | **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
-| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider and keep token lifetimes short |
+| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; the node refuses a federated token valid for longer than `max_token_lifetime_secs` (900 s by default), so the revocation is honoured within that long ([ADR-096](decisions.md)) |
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
-| **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
+| **Rate limiting** | ✅ login · ✅ per principal, opt-in | See [Login rate limiting](#login-rate-limiting) and [Limits on authenticated requests](#limits-on-authenticated-requests). Per-*address* limiting of authenticated routes is still a proxy's job |
+| **A slow or oversized request from an authenticated caller** | ✅ Built | A request deadline and a body ceiling, both settings with defaults matching what the server always did — see [Limits on authenticated requests](#limits-on-authenticated-requests) |
+| **A slow query** | 📋 | The deadline does not interrupt storage work already running: a scan or a bulk commit runs to completion. There is no query timeout yet ([ADR-099](decisions.md)) |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |
 | **No document- or field-level security** | Not planned | Collection is the finest granularity — see [How far authorization goes](#how-far-authorization-goes) |
 | **No attribute-based access control** | By design | RBAC only. No policy engine, no OPA, no Cedar — see [How far authorization goes](#how-far-authorization-goes) |
@@ -1136,6 +1224,78 @@ protect and every request is already a superuser.
 
 ---
 
+## Limits on authenticated requests
+
+A valid token is not a licence to hold the server hostage. A principal that is
+compromised — or a client with a broken retry loop — can hold connections open
+by sending a body slowly, send bodies as large as the framework allows, and
+make requests as fast as the network carries them. Three settings bound those
+([ADR-099](decisions.md)); each defaults to what the server already did, so a
+node that sets none of them behaves exactly as before.
+
+```toml
+[server]
+request_timeout_secs = 30      # 503 `timeout` past it; 0 is refused
+max_body_bytes = 2097152       # 413 `payload_too_large` over it; 0 is refused
+
+[server.rate_limit]
+per_principal = 0              # requests per principal per window; 0 disables
+per_principal_window_secs = 60
+```
+
+**The deadline bounds waiting, not working.** It wraps every REST route that
+answers with a document and fires when the request is still *pending* at the
+deadline. In this server a request is pending in two places: while its body is
+still arriving, and while an embedding provider is being waited on. Both are
+where an authenticated caller can impose cost for free, and both are cut off
+with `503 timeout` (`retry: wait`). Storage work is synchronous and never
+yields, so a scan, a bulk insert, an index backfill or a database drop runs to
+completion and is answered with its result however long it took — which is why
+none of them needs an exemption, and why this is **not a query timeout**. The
+change-stream upgrade (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` answer with
+a connection rather than a document and carry no deadline at all.
+
+**The body ceiling is the one that was always there.** 2 MiB is what axum
+enforced on its own before the setting existed; it is a setting now so an
+operator can lower it for a deployment of small documents or raise it for a
+bulk-import pattern. It applies to every REST route, login included. `/mcp`
+reads its bodies under rmcp's own limit (4 MiB) and answers its own 413.
+
+**The per-principal budget is keyed on who, not where from.** A local user is
+its name; a federated identity is its issuer *and* its subject, under a
+different prefix, so a provider's `root` and this cluster's `root` never share
+a budget. A principal spread across many addresses draws on one budget, and
+two principals behind one NAT do not share one — which is what the login
+limiter, keyed on the address, cannot offer. It is checked in the
+authentication extractor **after** the token is verified and the session
+confirmed, so:
+
+- a bad token is a `401` and spends nothing — the limiter counts principals,
+  not guesses, and cannot be used from outside to exhaust a real user;
+- every surface that takes a principal is covered by construction: REST,
+  `/mcp` and the change-stream upgrade alike.
+
+Over the budget the answer is `429` with `Retry-After`, the same response the
+login limiter gives, and the refusals are counted in
+`kimmy_rate_limited_principal_total` beside the existing
+`kimmy_rate_limited_total`. The key map is bounded by
+`server.rate_limit.max_tracked_keys` like the login limiters', because a
+principal name is attacker-controlled in the same sense an address is.
+
+**It is off by default, and the number is yours.** A capacity limit without a
+measurement behind it is a guess, and the operator is the one holding the
+measurement. If you want a starting point before you have one: `per_principal
+= 3000` over `per_principal_window_secs = 60` is fifty requests a second
+sustained per principal — well above what one well-behaved client produces,
+and comfortably below what a single node serves. Watch
+`kimmy_rate_limited_principal_total` after setting it; a legitimate client
+hitting it is the measurement.
+
+With `--insecure-no-auth` every request is one principal, and the limiter is
+off along with the login ones.
+
+---
+
 ## What telemetry sends, and what it does not
 
 Tracing is off unless `telemetry.endpoint` is set. When it is on, **spans omit
@@ -1192,8 +1352,8 @@ delivery. Treat an inbound `traceparent` as a hint, never as evidence.
 
 ```mermaid
 graph TB
-    A["Generate a strong KIMMY_JWT_SECRET<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
-    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file"]
+    A["Generate KIMMY_JWT_SECRET, 32 bytes or more<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
+    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file — never an example's value"]
     C --> D["Set server.tls.cert_file and key_file<br/>(or terminate at a proxy)"]
     D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]

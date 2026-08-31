@@ -129,6 +129,13 @@ fusing them with Reciprocal Rank Fusion. **Its scores are fusion scores** — mu
 smaller numbers, and not comparable with the similarity scores `vector-search`
 returns. Compare rankings between them, never scores.
 
+Three further flags tune the fusion and are sent only when given, so a bare
+`hybrid-search` ranks exactly as it did before they existed: `--dense-weight`
+and `--lexical-weight` scale the two halves (the server's `weights` field; only
+the ratio matters), and `--min-overlap` sets how many distinct query terms a
+chunk must share before it counts as lexical evidence (`min_overlap`). The
+[Vectors](vectors.md) page explains when each helps.
+
 Two refusals are worth expecting rather than reading as bugs:
 
 ```

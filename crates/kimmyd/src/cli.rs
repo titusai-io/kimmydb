@@ -90,6 +90,23 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_INSECURE_NO_AUTH")]
     pub insecure_no_auth: bool,
 
+    /// Seconds a request may spend waiting — for its body, or for an embedding
+    /// provider — before this node abandons it with 503.
+    #[arg(long, env = "KIMMY_REQUEST_TIMEOUT_SECS")]
+    pub request_timeout_secs: Option<u64>,
+
+    /// Largest request body the API will read, in bytes. Over it, 413.
+    #[arg(long, env = "KIMMY_MAX_BODY_BYTES")]
+    pub max_body_bytes: Option<usize>,
+
+    /// Requests allowed per authenticated principal per window. 0 disables it.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL")]
+    pub rate_limit_per_principal: Option<u32>,
+
+    /// The window, in seconds, for --rate-limit-per-principal.
+    #[arg(long, env = "KIMMY_RATE_LIMIT_PER_PRINCIPAL_WINDOW_SECS")]
+    pub rate_limit_per_principal_window_secs: Option<u64>,
+
     /// Where the password login answers: `always`, `loopback_only` or
     /// `disabled`.
     ///
@@ -152,6 +169,11 @@ pub struct Overrides {
     /// How often to re-fetch the provider's signing keys, in seconds.
     #[arg(long, env = "KIMMY_OIDC_REFRESH_INTERVAL_SECS")]
     pub oidc_refresh_interval_secs: Option<u64>,
+
+    /// The longest a federated token may be valid for by its own exp - iat,
+    /// in seconds. Default 900; refused outside 1..=86400 (ADR-096).
+    #[arg(long, env = "KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")]
+    pub oidc_max_token_lifetime_secs: Option<u64>,
 
     /// PEM certificate chain, leaf first. Enables TLS together with --tls-key.
     #[arg(long, env = "KIMMY_TLS_CERT")]
@@ -293,11 +315,26 @@ impl Overrides {
         if let Some(secs) = self.oidc_refresh_interval_secs {
             cfg.auth.oidc.refresh_interval_secs = secs;
         }
+        if let Some(secs) = self.oidc_max_token_lifetime_secs {
+            cfg.auth.oidc.max_token_lifetime_secs = secs;
+        }
         if let Some(cert) = &self.tls_cert {
             cfg.server.tls.cert_file = Some(cert.clone());
         }
         if let Some(key) = &self.tls_key {
             cfg.server.tls.key_file = Some(key.clone());
+        }
+        if let Some(secs) = self.request_timeout_secs {
+            cfg.server.request_timeout_secs = secs;
+        }
+        if let Some(bytes) = self.max_body_bytes {
+            cfg.server.max_body_bytes = bytes;
+        }
+        if let Some(burst) = self.rate_limit_per_principal {
+            cfg.server.rate_limit.per_principal = burst;
+        }
+        if let Some(secs) = self.rate_limit_per_principal_window_secs {
+            cfg.server.rate_limit.per_principal_window_secs = secs;
         }
         // Boolean flags are one-way: passing `--insecure-no-auth` turns the
         // setting on, but omitting it must not silently turn off what the
@@ -527,7 +564,7 @@ mod tests {
         let cli = parse(&["--local-login", "localhost"]);
         let mut cfg = Config {
             auth: crate::config::AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
                 ..Default::default()
             },
@@ -537,6 +574,76 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("localhost"), "the error should name the bad value: {err}");
         assert!(err.contains("loopback_only"), "and list the valid ones: {err}");
+    }
+
+    #[test]
+    fn request_limit_flags_override_the_file_and_absent_ones_do_not() {
+        // Each flag also reads a KIMMY_* variable; clap resolves both into the
+        // same field, so what is asserted here is the field reaching the
+        // configuration (ADR-099).
+        let cli = parse(&[
+            "--request-timeout-secs",
+            "90",
+            "--max-body-bytes",
+            "4194304",
+            "--rate-limit-per-principal",
+            "3000",
+            "--rate-limit-per-principal-window-secs",
+            "60",
+        ]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 90);
+        assert_eq!(cfg.server.max_body_bytes, 4 * 1024 * 1024);
+        assert_eq!(cfg.server.rate_limit.per_principal, 3000);
+        assert_eq!(cfg.server.rate_limit.per_principal_window_secs, 60);
+
+        // A file that set them keeps them when the flags are absent.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cfg.server.request_timeout_secs = 7;
+        cfg.server.max_body_bytes = 512;
+        cfg.server.rate_limit.per_principal = 5;
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.server.request_timeout_secs, 7);
+        assert_eq!(cfg.server.max_body_bytes, 512);
+        assert_eq!(cfg.server.rate_limit.per_principal, 5);
+    }
+
+    #[test]
+    fn check_config_refuses_an_invalid_request_limit() {
+        // `check-config` runs the same `resolve` the server does, so a bad
+        // value arriving by flag or variable is refused there, by name, rather
+        // than at boot.
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--request-timeout-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("server.request_timeout_secs"), "must name the setting: {err}");
+
+        let cli = Cli::try_parse_from([
+            "kimmyd",
+            "--root-password",
+            "a-perfectly-adequate-password",
+            "--jwt-secret",
+            "a-signing-key-of-adequate-length",
+            "--rate-limit-per-principal",
+            "10",
+            "--rate-limit-per-principal-window-secs",
+            "0",
+            "check-config",
+        ])
+        .unwrap();
+        let err = cli.resolve().unwrap_err().to_string();
+        assert!(err.contains("per_principal_window_secs"), "must name the setting: {err}");
     }
 
     #[test]
@@ -557,6 +664,56 @@ mod tests {
     #[test]
     fn a_bad_seed_is_a_parse_error() {
         assert!(Cli::try_parse_from(["kimmyd", "--seeds", "static:garbage"]).is_err());
+    }
+
+    #[test]
+    fn the_token_lifetime_limit_overrides_the_file_and_reaches_validate() {
+        // The flag and the variable are one clap argument, so exercising the
+        // flag exercises the variable's path; the variable's name is pinned
+        // separately because it is documented and a rename would be a silent
+        // break for every environment block that sets it.
+        let arg = Cli::command()
+            .get_arguments()
+            .chain(Cli::command().get_subcommands().flat_map(|c| c.get_arguments()))
+            .find(|a| a.get_id() == "oidc_max_token_lifetime_secs")
+            .cloned()
+            .expect("the argument exists");
+        assert_eq!(
+            arg.get_env().and_then(|e| e.to_str()),
+            Some("KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")
+        );
+
+        let cli = parse(&["--oidc-max-token-lifetime-secs", "3600"]);
+        let mut cfg = Config::default();
+        cfg.auth.oidc.max_token_lifetime_secs = 600;
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 3600, "the override wins");
+
+        // Absent, the file's value stands — and the file's default is 900.
+        let cli = parse(&[]);
+        let mut cfg = Config::default();
+        cli.overrides.apply(&mut cfg).unwrap();
+        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 900);
+
+        // A value that arrived through the environment is refused by the same
+        // rule as one in the file.
+        let cli = parse(&["--oidc-max-token-lifetime-secs", "0"]);
+        let mut cfg = Config {
+            auth: crate::config::AuthConfig {
+                root_password: Some("a-root-password-for-the-tests".into()),
+                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
+                oidc: crate::config::OidcConfig {
+                    issuer: Some("https://auth.example.com".into()),
+                    audience: Some("https://kimmydb.example.com".into()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cli.overrides.apply(&mut cfg).unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("max_token_lifetime_secs"), "unhelpful error: {err}");
     }
 
     #[test]
@@ -606,7 +763,7 @@ mod tests {
         let cli = parse(&["--oidc-role-mappings", r#"[{"claim_value":"user"}]"#]);
         let mut cfg = Config {
             auth: crate::config::AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
                 oidc: crate::config::OidcConfig {
                     issuer: Some("https://auth.example.com".into()),

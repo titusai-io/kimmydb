@@ -166,7 +166,11 @@ pub async fn run(config: Config) -> Result<()> {
         kimmy_mcp::mcp_router(Arc::clone(&state), config.server.mcp_allowed_hosts.clone())
     });
     let serving_mcp = mcp.is_some();
-    let app = kimmy_api::router_with(Arc::clone(&state), mcp);
+    // The request deadline and body ceiling ride in with the router rather
+    // than the state: they are parameters of the middleware stack, fixed when
+    // the table is built (ADR-099).
+    let app =
+        kimmy_api::router_with_limits(Arc::clone(&state), mcp, config.server.request_limits());
     if serving_mcp {
         info!("serving MCP at /mcp");
     }
@@ -337,10 +341,12 @@ pub async fn run(config: Config) -> Result<()> {
         let worker_members = cluster.members.clone();
         let worker_counters = Arc::new(kimmy_vector::WorkerCounters::default());
         state.metrics.set_vector_counters(Arc::clone(&worker_counters));
+        let batching = config.vector.batch.settings();
         Some(tokio::spawn({
             let engine = Arc::clone(&engine);
             async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
+                worker.set_batching(batching);
                 worker.set_owner_check(Box::new(move |key| match &worker_members {
                     // No clustering: the candidate set is just this node,
                     // which owns everything.
@@ -1729,6 +1735,7 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim: None,
         })
         .unwrap();

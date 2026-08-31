@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 const SPEC_SOURCE: &str = include_str!("../../../docs/openapi.yaml");
 const ROUTER_SOURCE: &str = include_str!("../src/routes.rs");
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 /// HTTP methods an OpenAPI path item may carry.
@@ -1126,6 +1126,31 @@ async fn every_documented_operation_answers_as_the_specification_says() {
         200,
     )
     .await;
+    // The fusion controls (ADR-094) are part of the documented request, and a
+    // meaningless one is the documented 400.
+    c.check(
+        "POST",
+        "/v1/db/{db}/coll/{coll}/hybrid_search",
+        "/v1/db/shop/coll/orders/hybrid_search",
+        Some(&root),
+        Some(json!({
+            "query": "blue widget", "vector": [1.0, 0.0, 0.0], "k": 3,
+            "weights": { "dense": 0.7, "lexical": 0.3 }, "min_overlap": 2,
+        })),
+        200,
+    )
+    .await;
+    let refused = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/hybrid_search",
+            "/v1/db/shop/coll/orders/hybrid_search",
+            Some(&root),
+            Some(json!({ "query": "blue widget", "vector": [1.0, 0.0, 0.0], "min_overlap": 0 })),
+            400,
+        )
+        .await;
+    assert_eq!(refused["error"], "bad_request");
 
     // -- webhooks ----------------------------------------------------------
     let hooks = "/v1/db/shop/coll/orders/webhooks";

@@ -10,6 +10,7 @@ use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
 use crate::path;
+use crate::shape::{self, SortKey};
 
 /// What an update document asks for.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +30,8 @@ pub struct Operation {
 #[derive(Clone, Debug, PartialEq)]
 pub enum OpKind {
     Set(Bson),
+    /// Set only when an upsert inserts; a no-op on an existing document.
+    SetOnInsert(Bson),
     Unset,
     Inc(Bson),
     Mul(Bson),
@@ -37,8 +40,8 @@ pub enum OpKind {
     /// Set only if the new value is larger than the current one.
     Max(Bson),
     Push(Bson),
-    /// Append several values (`$push` with `$each`).
-    PushEach(Vec<Bson>),
+    /// Append several values (`$push` with `$each`), then reshape the array.
+    PushEach(PushEach),
     /// Append only values not already present.
     AddToSet(Vec<Bson>),
     /// Remove every element equal to this value.
@@ -47,6 +50,76 @@ pub enum OpKind {
     Pop(i32),
     Rename(String),
     CurrentDate,
+}
+
+impl OpKind {
+    /// The operator's name as it appears in an update document.
+    fn name(&self) -> &'static str {
+        match self {
+            OpKind::Set(_) => "$set",
+            OpKind::SetOnInsert(_) => "$setOnInsert",
+            OpKind::Unset => "$unset",
+            OpKind::Inc(_) => "$inc",
+            OpKind::Mul(_) => "$mul",
+            OpKind::Min(_) => "$min",
+            OpKind::Max(_) => "$max",
+            OpKind::Push(_) | OpKind::PushEach(_) => "$push",
+            OpKind::AddToSet(_) => "$addToSet",
+            OpKind::Pull(_) => "$pull",
+            OpKind::Pop(_) => "$pop",
+            OpKind::Rename(_) => "$rename",
+            OpKind::CurrentDate => "$currentDate",
+        }
+    }
+}
+
+/// `$push` with `$each` and its modifiers.
+///
+/// Applied in MongoDB's order — insert at `position`, then `sort`, then
+/// `slice` — which is what makes `{$each: [x], $sort: {t: 1}, $slice: -100}`
+/// a capped, ordered history in one operator.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PushEach {
+    pub values: Vec<Bson>,
+    /// Where the values go; `None` appends. Negative counts from the end.
+    pub position: Option<i64>,
+    pub sort: Option<ArraySort>,
+    /// Keep the first `n` (positive) or last `n` (negative) elements; `0`
+    /// empties the array.
+    pub slice: Option<i64>,
+}
+
+/// How `$push`'s `$sort` orders the array.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArraySort {
+    /// Whole elements, in canonical order.
+    Whole { descending: bool },
+    /// Elements are documents; order them by these fields. An element that
+    /// is not a document sorts as though every field were missing.
+    ByFields(Vec<SortKey>),
+}
+
+impl ArraySort {
+    fn sort(&self, items: &mut [Bson]) {
+        match self {
+            ArraySort::Whole { descending } => items.sort_by(|a, b| {
+                let ordering = canonical_cmp(a, b);
+                if *descending { ordering.reverse() } else { ordering }
+            }),
+            ArraySort::ByFields(keys) => {
+                let empty = Document::new();
+                fn as_document<'a>(value: &'a Bson, empty: &'a Document) -> &'a Document {
+                    match value {
+                        Bson::Document(doc) => doc,
+                        _ => empty,
+                    }
+                }
+                items.sort_by(|a, b| {
+                    shape::compare(keys, as_document(a, &empty), as_document(b, &empty))
+                });
+            }
+        }
+    }
 }
 
 /// The primary key field, which updates may not move.
@@ -83,7 +156,52 @@ pub fn parse(doc: &Document) -> Result<Update> {
         }
     }
 
+    reject_set_on_insert_conflicts(&operations)?;
     Ok(Update::Operators(operations))
+}
+
+/// Refuse a `$setOnInsert` that shares a path — or a prefix of one — with any
+/// other write in the update, as MongoDB does.
+///
+/// The two would disagree about the inserted document depending on the order
+/// they ran in, and an update that means different things on insert and on
+/// match is exactly the kind of thing that should fail loudly at parse time.
+fn reject_set_on_insert_conflicts(operations: &[Operation]) -> Result<()> {
+    let written_paths = |op: &Operation| -> Vec<String> {
+        match &op.kind {
+            // A rename writes its destination as well as clearing its source.
+            OpKind::Rename(target) => vec![op.path.clone(), target.clone()],
+            _ => vec![op.path.clone()],
+        }
+    };
+    for (i, a) in operations.iter().enumerate() {
+        if !matches!(a.kind, OpKind::SetOnInsert(_)) {
+            continue;
+        }
+        for (j, b) in operations.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            for path in written_paths(b) {
+                if paths_overlap(&a.path, &path) {
+                    return Err(Error::InvalidUpdate(format!(
+                        "$setOnInsert on {:?} conflicts with {} on {:?}",
+                        a.path,
+                        b.kind.name(),
+                        path
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether two dot paths name the same field or one lies inside the other.
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('.'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
 }
 
 fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
@@ -96,17 +214,18 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
 
     Ok(match op {
         "set" => OpKind::Set(arg.clone()),
+        "setOnInsert" => OpKind::SetOnInsert(arg.clone()),
         "unset" => OpKind::Unset,
         "inc" => OpKind::Inc(numeric(arg)?),
         "mul" => OpKind::Mul(numeric(arg)?),
         "min" => OpKind::Min(arg.clone()),
         "max" => OpKind::Max(arg.clone()),
-        "push" => match each_values(arg) {
-            Some(values) => OpKind::PushEach(values),
+        "push" => match modifier_document(arg) {
+            Some(modifiers) => OpKind::PushEach(parse_push_each(modifiers)?),
             None => OpKind::Push(arg.clone()),
         },
-        "addToSet" => match each_values(arg) {
-            Some(values) => OpKind::AddToSet(values),
+        "addToSet" => match modifier_document(arg) {
+            Some(modifiers) => OpKind::AddToSet(parse_add_to_set_each(modifiers)?),
             None => OpKind::AddToSet(vec![arg.clone()]),
         },
         "pull" => OpKind::Pull(arg.clone()),
@@ -124,14 +243,90 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
     })
 }
 
-/// Extract the values of a `{$each: [...]}` modifier, if present.
-fn each_values(arg: &Bson) -> Option<Vec<Bson>> {
-    let Bson::Document(doc) = arg else {
-        return None;
-    };
-    match doc.get("$each") {
-        Some(Bson::Array(items)) => Some(items.clone()),
+/// The argument as a modifier document, if that is what it is.
+///
+/// A document with any `$`-prefixed key is read as modifiers rather than as a
+/// value to push: pushing `{$each: [1]}` literally is never what a caller
+/// meant, and reading it as a value would hide a typo in a modifier name.
+fn modifier_document(arg: &Bson) -> Option<&Document> {
+    match arg {
+        Bson::Document(doc) if doc.keys().any(|k| k.starts_with('$')) => Some(doc),
         _ => None,
+    }
+}
+
+/// The values of a modifier document's `$each`, which every modifier needs.
+fn each_values(op: &str, modifiers: &Document) -> Result<Vec<Bson>> {
+    match modifiers.get("$each") {
+        Some(Bson::Array(items)) => Ok(items.clone()),
+        Some(_) => Err(Error::InvalidUpdate(format!("${op}: $each requires an array"))),
+        None => Err(Error::InvalidUpdate(format!(
+            "${op}: a modifier document requires $each (an array of values)"
+        ))),
+    }
+}
+
+/// Parse `{$each, $position, $sort, $slice}` for `$push`.
+fn parse_push_each(modifiers: &Document) -> Result<PushEach> {
+    let mut each = PushEach {
+        values: each_values("push", modifiers)?,
+        position: None,
+        sort: None,
+        slice: None,
+    };
+    for (key, value) in modifiers {
+        match key.as_str() {
+            "$each" => {}
+            "$position" => each.position = Some(integer("$push: $position", value)?),
+            "$slice" => each.slice = Some(integer("$push: $slice", value)?),
+            "$sort" => each.sort = Some(parse_array_sort(value)?),
+            other => {
+                return Err(Error::InvalidUpdate(format!("$push: unrecognized clause {other:?}")));
+            }
+        }
+    }
+    Ok(each)
+}
+
+/// Parse `{$each}` for `$addToSet`, which takes no other modifier: a set has
+/// no order to sort or position in, and no end to slice from.
+fn parse_add_to_set_each(modifiers: &Document) -> Result<Vec<Bson>> {
+    if let Some(other) = modifiers.keys().find(|k| *k != "$each") {
+        return Err(Error::InvalidUpdate(format!("$addToSet: unrecognized clause {other:?}")));
+    }
+    each_values("addToSet", modifiers)
+}
+
+/// `1`, `-1`, or a `{field: direction}` document.
+fn parse_array_sort(value: &Bson) -> Result<ArraySort> {
+    match value {
+        Bson::Int32(1) | Bson::Int64(1) | Bson::Double(1.0) => {
+            Ok(ArraySort::Whole { descending: false })
+        }
+        Bson::Int32(-1) | Bson::Int64(-1) | Bson::Double(-1.0) => {
+            Ok(ArraySort::Whole { descending: true })
+        }
+        Bson::Document(spec) if !spec.is_empty() => {
+            let keys = shape::parse_sort(spec).map_err(|e| match e {
+                Error::InvalidQuery(msg) => Error::InvalidUpdate(format!("$push: $sort: {msg}")),
+                other => other,
+            })?;
+            Ok(ArraySort::ByFields(keys))
+        }
+        _ => Err(Error::InvalidUpdate(
+            "$push: $sort requires 1, -1, or a {field: direction} document".into(),
+        )),
+    }
+}
+
+/// A whole number, in any of the numeric BSON types JSON may have produced.
+fn integer(what: &str, value: &Bson) -> Result<i64> {
+    match value {
+        Bson::Int32(n) => Ok(i64::from(*n)),
+        Bson::Int64(n) => Ok(*n),
+        // JSON has one number type, so `-3` may arrive as `-3.0`.
+        Bson::Double(d) if d.fract() == 0.0 && d.abs() < 9_007_199_254_740_992.0 => Ok(*d as i64),
+        _ => Err(Error::InvalidUpdate(format!("{what} requires an integer"))),
     }
 }
 
@@ -139,11 +334,34 @@ fn each_values(arg: &Bson) -> Option<Vec<Bson>> {
 // Application
 // ---------------------------------------------------------------------------
 
-/// Apply an update to a document in place.
+/// Apply an update to an existing document in place.
+///
+/// `$setOnInsert` is skipped: it speaks only to the document an upsert creates,
+/// for which [`apply_on_insert`] is the entry point.
 ///
 /// `now_ms` is passed in rather than read from the clock so that `$currentDate`
 /// stays deterministic in tests and consistent with the write's own timestamp.
 pub fn apply(update: &Update, doc: &mut Document, now_ms: i64) -> Result<()> {
+    apply_to(update, doc, now_ms, Target::Existing)
+}
+
+/// Apply an update to the document an upsert is about to insert.
+///
+/// `doc` arrives already seeded from the filter's equalities. `$setOnInsert`
+/// runs first, then every other operator, so `{$setOnInsert: {created: t},
+/// $inc: {n: 1}}` creates `{created: t, n: 1}` and later matches only count.
+pub fn apply_on_insert(update: &Update, doc: &mut Document, now_ms: i64) -> Result<()> {
+    apply_to(update, doc, now_ms, Target::Inserted)
+}
+
+/// Which kind of document an update is being applied to.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Existing,
+    Inserted,
+}
+
+fn apply_to(update: &Update, doc: &mut Document, now_ms: i64, target: Target) -> Result<()> {
     let operations = match update {
         Update::Replace(replacement) => {
             // `_id` belongs to the document's identity, not its contents.
@@ -162,7 +380,13 @@ pub fn apply(update: &Update, doc: &mut Document, now_ms: i64) -> Result<()> {
         Update::Operators(ops) => ops,
     };
 
-    for op in operations {
+    let on_insert = |op: &&Operation| matches!(op.kind, OpKind::SetOnInsert(_));
+    if target == Target::Inserted {
+        for op in operations.iter().filter(on_insert) {
+            apply_one(op, doc, now_ms)?;
+        }
+    }
+    for op in operations.iter().filter(|op| !on_insert(op)) {
         apply_one(op, doc, now_ms)?;
     }
     Ok(())
@@ -177,7 +401,8 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
     };
 
     match &op.kind {
-        OpKind::Set(value) => set(doc, value.clone())?,
+        // Reached only from `apply_on_insert`, which is what makes it a set.
+        OpKind::Set(value) | OpKind::SetOnInsert(value) => set(doc, value.clone())?,
 
         OpKind::Unset => {
             path::unset(doc, &op.path);
@@ -221,9 +446,23 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             set(doc, Bson::Array(items))?;
         }
 
-        OpKind::PushEach(values) => {
+        OpKind::PushEach(each) => {
             let mut items = as_array(&current, &op.path)?;
-            items.extend(values.iter().cloned());
+            // A position past either end clamps to that end, as in Mongo.
+            let at = match each.position {
+                None => items.len(),
+                Some(p) if p >= 0 => usize::try_from(p).unwrap_or(usize::MAX).min(items.len()),
+                Some(p) => items
+                    .len()
+                    .saturating_sub(usize::try_from(p.unsigned_abs()).unwrap_or(usize::MAX)),
+            };
+            items.splice(at..at, each.values.iter().cloned());
+            if let Some(sort) = &each.sort {
+                sort.sort(&mut items);
+            }
+            if let Some(n) = each.slice {
+                slice(&mut items, n);
+            }
             set(doc, Bson::Array(items))?;
         }
 
@@ -339,6 +578,18 @@ fn as_f64(value: &Bson) -> Option<f64> {
     }
 }
 
+/// Keep the first `n` elements, or the last `-n` when `n` is negative.
+fn slice(items: &mut Vec<Bson>, n: i64) {
+    if n >= 0 {
+        items.truncate(usize::try_from(n).unwrap_or(usize::MAX));
+    } else {
+        let keep = usize::try_from(n.unsigned_abs()).unwrap_or(usize::MAX);
+        if keep < items.len() {
+            items.drain(..items.len() - keep);
+        }
+    }
+}
+
 /// Interpret the current value as an array for the array operators.
 fn as_array(current: &Option<Bson>, path: &str) -> Result<Vec<Bson>> {
     match current {
@@ -448,6 +699,156 @@ mod tests {
             applied(doc! { "$push": { "a": { "$each": [2, 3] } } }, doc! { "a": [1] }),
             doc! { "a": [1, 2, 3] }
         );
+    }
+
+    #[test]
+    fn push_slice_keeps_one_end_or_empties() {
+        let push = |slice: i32| doc! { "$push": { "a": { "$each": [4, 5], "$slice": slice } } };
+        let base = doc! { "a": [1, 2, 3] };
+        assert_eq!(applied(push(2), base.clone()), doc! { "a": [1, 2] });
+        assert_eq!(applied(push(-2), base.clone()), doc! { "a": [4, 5] });
+        assert_eq!(applied(push(0), base.clone()), doc! { "a": [] });
+        // A slice wider than the array keeps everything.
+        assert_eq!(applied(push(10), base.clone()), doc! { "a": [1, 2, 3, 4, 5] });
+        assert_eq!(applied(push(-10), base), doc! { "a": [1, 2, 3, 4, 5] });
+        // JSON has one number type, so an integral double is an integer.
+        assert_eq!(
+            applied(
+                doc! { "$push": { "a": { "$each": [], "$slice": -1.0 } } },
+                doc! { "a": [1, 2] }
+            ),
+            doc! { "a": [2] }
+        );
+    }
+
+    #[test]
+    fn push_sort_orders_scalars_and_subdocuments() {
+        assert_eq!(
+            applied(doc! { "$push": { "a": { "$each": [2], "$sort": 1 } } }, doc! { "a": [3, 1] }),
+            doc! { "a": [1, 2, 3] }
+        );
+        assert_eq!(
+            applied(doc! { "$push": { "a": { "$each": [2], "$sort": -1 } } }, doc! { "a": [3, 1] }),
+            doc! { "a": [3, 2, 1] }
+        );
+        // Documents sort by the named field, with a missing field as null —
+        // so a stray scalar element sorts first rather than failing.
+        let out = applied(
+            doc! { "$push": { "a": { "$each": [{ "s": 5 }, 9], "$sort": { "s": -1 } } } },
+            doc! { "a": [{ "s": 7 }, { "s": 3 }] },
+        );
+        assert_eq!(out, doc! { "a": [{ "s": 7 }, { "s": 5 }, { "s": 3 }, 9] });
+        // Several keys, dotted paths, mixed direction.
+        let out = applied(
+            doc! { "$push": { "a": { "$each": [], "$sort": { "g": 1, "v.n": -1 } } } },
+            doc! { "a": [{ "g": 2, "v": { "n": 1 } }, { "g": 1, "v": { "n": 1 } }, { "g": 1, "v": { "n": 2 } }] },
+        );
+        assert_eq!(
+            out,
+            doc! { "a": [{ "g": 1, "v": { "n": 2 } }, { "g": 1, "v": { "n": 1 } }, { "g": 2, "v": { "n": 1 } }] }
+        );
+        // Sorting is by canonical order, so 2 and 2.0 tie and 10 follows 9.
+        assert_eq!(
+            applied(
+                doc! { "$push": { "a": { "$each": [10], "$sort": 1 } } },
+                doc! { "a": [9, 2.0, 2] }
+            ),
+            doc! { "a": [2.0, 2, 9, 10] }
+        );
+    }
+
+    #[test]
+    fn push_position_inserts_from_either_end() {
+        let push =
+            |position: i32| doc! { "$push": { "a": { "$each": [9, 8], "$position": position } } };
+        let base = doc! { "a": [1, 2, 3] };
+        assert_eq!(applied(push(0), base.clone()), doc! { "a": [9, 8, 1, 2, 3] });
+        assert_eq!(applied(push(1), base.clone()), doc! { "a": [1, 9, 8, 2, 3] });
+        assert_eq!(applied(push(-1), base.clone()), doc! { "a": [1, 2, 9, 8, 3] });
+        // Beyond either end clamps rather than erroring.
+        assert_eq!(applied(push(50), base.clone()), doc! { "a": [1, 2, 3, 9, 8] });
+        assert_eq!(applied(push(-50), base.clone()), doc! { "a": [9, 8, 1, 2, 3] });
+        // A missing field is an empty array; every position is its start.
+        assert_eq!(applied(push(2), doc! {}), doc! { "a": [9, 8] });
+    }
+
+    #[test]
+    fn push_modifiers_apply_as_position_then_sort_then_slice() {
+        // The capped-history idiom: append, order, keep the newest three.
+        let out = applied(
+            doc! { "$push": { "h": {
+                "$each": [{ "t": 5, "e": "e" }, { "t": 2, "e": "b" }],
+                "$sort": { "t": 1 },
+                "$slice": -3,
+            } } },
+            doc! { "h": [{ "t": 1, "e": "a" }, { "t": 3, "e": "c" }, { "t": 4, "e": "d" }] },
+        );
+        assert_eq!(
+            out,
+            doc! { "h": [{ "t": 3, "e": "c" }, { "t": 4, "e": "d" }, { "t": 5, "e": "e" }] }
+        );
+        // Position, then sort, then slice — the position is observable only
+        // through the slice when there is no sort, and not at all with one.
+        assert_eq!(
+            applied(
+                doc! { "$push": { "a": { "$each": [0], "$position": 0, "$slice": 2 } } },
+                doc! { "a": [1, 2, 3] }
+            ),
+            doc! { "a": [0, 1] }
+        );
+        assert_eq!(
+            applied(
+                doc! { "$push": { "a": { "$each": [0], "$position": 0, "$sort": -1, "$slice": 2 } } },
+                doc! { "a": [1, 2, 3] }
+            ),
+            doc! { "a": [3, 2] }
+        );
+        // An empty $each still sorts and slices what is there.
+        assert_eq!(
+            applied(
+                doc! { "$push": { "a": { "$each": [], "$sort": 1, "$slice": 2 } } },
+                doc! { "a": [3, 1, 2] }
+            ),
+            doc! { "a": [1, 2] }
+        );
+    }
+
+    #[test]
+    fn push_modifiers_require_each_and_reject_strangers() {
+        let err = apply_err(doc! { "$push": { "a": { "$slice": -3 } } }, doc! {});
+        assert!(err.contains("requires $each"), "unhelpful error: {err}");
+        let err = apply_err(doc! { "$push": { "a": { "$each": 1 } } }, doc! {});
+        assert!(err.contains("$each requires an array"), "unhelpful error: {err}");
+        let err = apply_err(doc! { "$push": { "a": { "$each": [1], "$slise": 1 } } }, doc! {});
+        assert!(err.contains("unrecognized clause \"$slise\""), "unhelpful error: {err}");
+        // A plain field alongside modifiers is neither a value nor a modifier.
+        let err = apply_err(doc! { "$push": { "a": { "$each": [1], "x": 1 } } }, doc! {});
+        assert!(err.contains("unrecognized clause \"x\""), "unhelpful error: {err}");
+        for bad in [
+            doc! { "$push": { "a": { "$each": [1], "$slice": 1.5 } } },
+            doc! { "$push": { "a": { "$each": [1], "$slice": "3" } } },
+            doc! { "$push": { "a": { "$each": [1], "$position": true } } },
+            doc! { "$push": { "a": { "$each": [1], "$sort": 2 } } },
+            doc! { "$push": { "a": { "$each": [1], "$sort": {} } } },
+            doc! { "$push": { "a": { "$each": [1], "$sort": { "t": "asc" } } } },
+        ] {
+            assert!(parse(&bad).is_err(), "accepted {bad}");
+        }
+        // A document without modifiers is still a value to push.
+        assert_eq!(
+            applied(doc! { "$push": { "a": { "x": 1 } } }, doc! { "a": [] }),
+            doc! { "a": [{ "x": 1 }] }
+        );
+    }
+
+    #[test]
+    fn add_to_set_takes_each_and_nothing_else() {
+        assert_eq!(
+            applied(doc! { "$addToSet": { "a": { "$each": [2, 3] } } }, doc! { "a": [1, 2] }),
+            doc! { "a": [1, 2, 3] }
+        );
+        let err = apply_err(doc! { "$addToSet": { "a": { "$each": [1], "$slice": 1 } } }, doc! {});
+        assert!(err.contains("unrecognized clause \"$slice\""), "unhelpful error: {err}");
     }
 
     #[test]
@@ -570,5 +971,86 @@ mod tests {
     #[test]
     fn operators_require_a_document_argument() {
         assert!(parse(&doc! { "$set": 1 }).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // $setOnInsert
+    // -----------------------------------------------------------------------
+
+    fn inserted(update: Document, mut seed: Document) -> Document {
+        let parsed = parse(&update).unwrap_or_else(|e| panic!("parse failed: {e}"));
+        apply_on_insert(&parsed, &mut seed, NOW).unwrap_or_else(|e| panic!("apply failed: {e}"));
+        seed
+    }
+
+    #[test]
+    fn set_on_insert_writes_only_the_inserted_document() {
+        let update = doc! { "$setOnInsert": { "created_at": 100 }, "$inc": { "n": 1 } };
+        // The upsert path: the filter's seed, then $setOnInsert, then the rest.
+        assert_eq!(
+            inserted(update.clone(), doc! { "_id": "hits" }),
+            doc! { "_id": "hits", "created_at": 100, "n": 1i64 }
+        );
+        // The match path: the field is left exactly as it was — present or not.
+        assert_eq!(
+            applied(update.clone(), doc! { "_id": "hits", "created_at": 1, "n": 1 }),
+            doc! { "_id": "hits", "created_at": 1, "n": 2i64 }
+        );
+        assert_eq!(applied(update, doc! { "n": 1 }), doc! { "n": 2i64 });
+        // Alone, on an existing document, it is a no-op rather than an error.
+        assert_eq!(applied(doc! { "$setOnInsert": { "a": 1 } }, doc! { "b": 2 }), doc! { "b": 2 });
+    }
+
+    #[test]
+    fn set_on_insert_reaches_nested_and_dotted_paths() {
+        assert_eq!(
+            inserted(doc! { "$setOnInsert": { "meta.created": 1, "tags": ["new"] } }, doc! {}),
+            doc! { "meta": { "created": 1 }, "tags": ["new"] }
+        );
+        // Nested into a seeded subdocument rather than replacing it.
+        assert_eq!(
+            inserted(doc! { "$setOnInsert": { "meta.created": 1 } }, doc! { "meta": { "k": 0 } }),
+            doc! { "meta": { "k": 0, "created": 1 } }
+        );
+        assert_eq!(
+            applied(doc! { "$setOnInsert": { "meta.created": 1 } }, doc! { "meta": { "k": 0 } }),
+            doc! { "meta": { "k": 0 } }
+        );
+    }
+
+    #[test]
+    fn set_on_insert_runs_before_the_other_operators() {
+        // $inc sees the value $setOnInsert put there, on insert only.
+        assert_eq!(
+            inserted(doc! { "$setOnInsert": { "n": 10 }, "$inc": { "m": 1 } }, doc! {}),
+            doc! { "n": 10, "m": 1i64 }
+        );
+    }
+
+    #[test]
+    fn set_on_insert_may_not_share_a_path_with_another_operator() {
+        for bad in [
+            doc! { "$setOnInsert": { "a": 1 }, "$set": { "a": 2 } },
+            doc! { "$set": { "a": 2 }, "$setOnInsert": { "a": 1 } },
+            doc! { "$setOnInsert": { "a": 1 }, "$inc": { "a": 2 } },
+            doc! { "$setOnInsert": { "a": 1 }, "$unset": { "a": "" } },
+            // A prefix in either direction is the same field.
+            doc! { "$setOnInsert": { "a": { "b": 1 } }, "$set": { "a.b": 2 } },
+            doc! { "$setOnInsert": { "a.b": 1 }, "$set": { "a": {} } },
+            doc! { "$setOnInsert": { "a": 1, "a.b": 2 } },
+            // A rename writes its destination.
+            doc! { "$setOnInsert": { "b": 1 }, "$rename": { "a": "b" } },
+        ] {
+            let err = parse(&bad).unwrap_err().to_string();
+            assert!(err.contains("conflicts"), "{bad}: {err}");
+        }
+        // Sharing a prefix of the *name* is not sharing a path.
+        assert!(parse(&doc! { "$setOnInsert": { "ab": 1 }, "$set": { "a": 2 } }).is_ok());
+        assert!(parse(&doc! { "$setOnInsert": { "a.b": 1 }, "$set": { "a.c": 2 } }).is_ok());
+    }
+
+    #[test]
+    fn set_on_insert_may_not_touch_id() {
+        assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_err());
     }
 }

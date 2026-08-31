@@ -13,7 +13,7 @@ use kimmy_client::{Client, ErrorCode, Method, Query, Retry, Safety, WatchOptions
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
@@ -806,6 +806,7 @@ async fn a_federated_token_cannot_be_refreshed_by_the_node_that_accepted_it() {
             role_mappings: Vec::new(),
             require_at_jwt: false,
             allow_federated_admin: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim: None,
         })
         .unwrap(),

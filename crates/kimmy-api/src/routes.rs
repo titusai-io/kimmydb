@@ -15,12 +15,19 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 use crate::error::ApiError;
 use crate::exec;
 use crate::json::JsonBody;
+use crate::limits::RequestLimits;
 use crate::ratelimit::{self, Decision};
 use crate::state::{Auth, SharedState};
 use crate::watch;
 
 pub fn router(state: SharedState) -> Router {
     router_with(state, None)
+}
+
+/// [`router_with_limits`] with the defaults, which are what the server
+/// enforced before the limits were settings.
+pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
+    router_with_limits(state, extra, RequestLimits::default())
 }
 
 /// Build the router, optionally merging routes served on the same listener.
@@ -35,20 +42,71 @@ pub fn router(state: SharedState) -> Router {
 /// it answered 401 with no `WWW-Authenticate` — the one case RFC 9728 exists to
 /// serve, since an MCP client has no other way to discover its authorization
 /// server — and every MCP request was invisible to `/metrics` and to tracing.
-pub fn router_with(state: SharedState, extra: Option<Router>) -> Router {
-    let mut app = routes(state.clone());
+///
+/// `extra` is deliberately **outside** the request deadline (ADR-099): `/mcp`
+/// is a streaming transport whose responses may be held open, and it is merged
+/// here after [`routes`] has already applied the deadline to the routes that
+/// take one. It is inside the body ceiling, though rmcp reads its own bodies
+/// under its own limit, so the ceiling reaches it only in name.
+pub fn router_with_limits(
+    state: SharedState,
+    extra: Option<Router>,
+    limits: RequestLimits,
+) -> Router {
+    let mut app = routes(state.clone(), limits);
     if let Some(extra) = extra {
         app = app.merge(extra);
     }
-    // Counting happens in one layer rather than in each handler: a counter
-    // beside a handler is a counter the next route forgets. It wraps
-    // everything including `/metrics` itself, so a scrape is visible as
-    // traffic rather than being invisible to the thing it scrapes.
-    app.layer(axum::middleware::from_fn_with_state(state, count_request))
+    app
+        // The body ceiling is one layer over the whole table rather than an
+        // argument to each `JsonBody`, for the reason the counter below is: a
+        // limit set beside a handler is a limit the next route forgets. The
+        // default is exactly what axum applied when nothing set one, so an
+        // operator who never touches the setting sees no change (ADR-099).
+        .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
+        // Counting happens in one layer rather than in each handler: a counter
+        // beside a handler is a counter the next route forgets. It wraps
+        // everything including `/metrics` itself, so a scrape is visible as
+        // traffic rather than being invisible to the thing it scrapes. It is
+        // outermost, so a refusal the deadline or the ceiling makes is counted
+        // and traced like any other response.
+        .layer(axum::middleware::from_fn_with_state(state, count_request))
 }
 
 /// The route table, before instrumentation.
-fn routes(state: SharedState) -> Router {
+///
+/// Two groups, because the request deadline is applied per group rather than
+/// to the table as a whole (ADR-099): [`timed_routes`] answer a request with a
+/// document and take the deadline; [`streaming_routes`] answer with a
+/// connection and are exempt. Kept as two functions rather than one table
+/// with a per-route layer so the exemption is a place a route is registered,
+/// visible in a diff, rather than an attribute on one line of forty.
+fn routes(state: SharedState, limits: RequestLimits) -> Router {
+    let timed = timed_routes()
+        .layer(axum::middleware::from_fn_with_state(limits, crate::limits::enforce_timeout));
+    Router::new().merge(timed).merge(streaming_routes()).with_state(state)
+}
+
+/// Routes whose response is a connection rather than a document, and which
+/// therefore carry no request deadline.
+///
+/// Only the change-stream upgrade today. `/mcp` is the other streaming
+/// surface, and it is exempt by being merged after the deadline is applied —
+/// see [`router_with_limits`]. Nothing else on this server long-polls or
+/// streams: `/v1/admin/backup` is buffered before it is sent, and every
+/// document route answers in one piece.
+///
+/// The exemption is the contract rather than a mechanism the upgrade needs
+/// today: axum hands the upgraded socket to a task of its own once the `101`
+/// is written, so the handler future the deadline wraps has already finished
+/// when the stream begins. Registering the route here is what keeps that true
+/// if the upgrade ever moves into the handler, and what a test can hold.
+fn streaming_routes() -> Router<SharedState> {
+    Router::new().route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
+}
+
+/// Every route that answers with a document, public and authenticated alike.
+fn timed_routes() -> Router<SharedState> {
     Router::new()
         // Health endpoints are unauthenticated on purpose: a load balancer
         // probing them should not need credentials.
@@ -131,8 +189,6 @@ fn routes(state: SharedState) -> Router {
         )
         .route("/v1/db/{db}/coll/{coll}/vector_search", post(crate::vectors::vector_search))
         .route("/v1/db/{db}/coll/{coll}/hybrid_search", post(crate::vectors::hybrid_search))
-        .route("/v1/db/{db}/coll/{coll}/watch", get(watch::watch_collection))
-        .with_state(state)
 }
 
 /// Count every response by status, and time the ones that are real traffic.
@@ -226,12 +282,22 @@ fn add_challenge(
 
     let error = match response.status() {
         axum::http::StatusCode::UNAUTHORIZED if offered_credentials => {
-            Some((r#"error="invalid_token""#, "the access token is expired, revoked or malformed"))
+            // A refusal may say more precisely why, through an extension
+            // rather than by setting the header itself, so that a specific
+            // description never costs the `resource_metadata` pointer below.
+            // A federated token refused for its lifetime is the one case
+            // (ADR-096); everything else stays deliberately generic.
+            let description = response
+                .extensions()
+                .get::<crate::error::ChallengeDescription>()
+                .map(|d| quoted_string(&d.0))
+                .unwrap_or_else(|| "the access token is expired, revoked or malformed".to_string());
+            Some((r#"error="invalid_token""#, description))
         }
         axum::http::StatusCode::UNAUTHORIZED => None,
         axum::http::StatusCode::FORBIDDEN => Some((
             r#"error="insufficient_scope""#,
-            "the authenticated principal holds no grant covering this operation",
+            "the authenticated principal holds no grant covering this operation".to_string(),
         )),
         _ => return,
     };
@@ -264,6 +330,22 @@ fn add_challenge(
         // the error path, and the refusal itself is unaffected.
         Err(e) => warn!(error = %e, "could not encode the WWW-Authenticate challenge"),
     }
+}
+
+/// A description made safe to carry as an RFC 6750 §3 quoted-string.
+///
+/// The grammar admits printable ASCII without `"` or `\`. Every description
+/// this node writes already satisfies it, so this is a guard rather than a
+/// transformation — but the header is assembled by string formatting, and a
+/// stray quote in a message would otherwise end the parameter early.
+fn quoted_string(text: &str) -> String {
+    text.chars()
+        .map(|c| match c {
+            '"' | '\\' => '\'',
+            ' '..='~' => c,
+            _ => '?',
+        })
+        .collect()
 }
 
 /// The span for one HTTP request, parented to whatever sent the request.

@@ -109,8 +109,15 @@ by default (providers disagree about stamping it; the audience restriction is
 the real defense — `require_at_jwt` tightens it when yours stamps `at+jwt`),
 and `/v1/auth/refresh` refusing federated principals (minting a local token
 from a federated identity would shed the `federated` flag — identity
-laundering). Keep provider token lifetimes short: there is no revocation path
-shorter than expiry for a federated session ([ADR-065](decisions.md)).
+laundering). There is no revocation path shorter than expiry for a federated
+session ([ADR-065](decisions.md)), so the node bounds expiry itself: a token
+valid for longer than `auth.oidc.max_token_lifetime_secs`
+(`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`, 900 seconds by default) is refused with
+a 401 whose challenge names the limit, and so is a token with no `iat`. Set
+the access-token lifetime your provider mints for this resource at or below
+it; raise the limit only when you cannot, and knowingly — the number is how
+long a revocation at the provider goes unhonoured here
+([ADR-096](decisions.md)).
 
 Signing keys rotate at the provider and are picked up here automatically —
 a token naming an unknown key triggers one rate-limited refetch, and an
@@ -209,17 +216,27 @@ Work down this list; each step is observable from outside the node.
    note it arrives as a JSON **array** — against the node's configured
    audience, byte for byte, and remember the same string must sit in the
    provider's registry.
-5. **`kimmy whoami` answers with grants or a user that cannot exist here.**
+5. **401 whose `WWW-Authenticate` says the token is valid for longer than the
+   seconds this node accepts.** The provider mints access tokens for longer
+   than `max_token_lifetime_secs` (900 by default). Shorten the lifetime on
+   the provider's side for this resource — a per-API setting in Auth0, an
+   access policy on the authorization server in Okta, a token lifetime policy
+   in Entra ID, a client-level lifespan in Keycloak — or raise
+   `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` knowingly: the number is how long a
+   revocation at the provider goes unhonoured here. The same header saying the
+   token *carries no `iat`* means the provider omits a claim RFC 9068 requires,
+   and there is no node-side setting for that.
+6. **`kimmy whoami` answers with grants or a user that cannot exist here.**
    You are talking to a different server than you think — a leftover dev node
    on `localhost:7878` answers the CLI's default URL. Compare
    `curl $KIMMY_URL/v1/version`'s `node` UUID with what `readyz` on the member
    you meant reports, and export `KIMMY_URL` rather than passing `--url` per
    command.
-6. **Everything federated stopped at once after a provider change.** Discovery
+7. **Everything federated stopped at once after a provider change.** Discovery
    or key rotation. `check-config` reaches the provider and says what it found;
    the node retries in the background rather than refusing to start, so a
    briefly unreachable provider is invisible except in logs.
-7. **A federated user needs `/v1/auth/refresh`.** It will keep refusing — that
+8. **A federated user needs `/v1/auth/refresh`.** It will keep refusing — that
    is the anti-laundering rule above. Re-authenticate; shorten lifetimes so
    that is cheap.
 8. **`kimmy login root` answers 403 or 404.** The node's `auth.local.login`
@@ -240,4 +257,5 @@ Work down this list; each step is observable from outside the node.
 - [Decisions](decisions.md) — ADR-064 (verifier routing), ADR-066 (inline
   mappings), ADR-071 (audience = resource identifier), ADR-073 (stored roles),
   ADR-074 (federatable admin), ADR-078 (mappings through the environment),
-  ADR-100 (local login modes and the display name)
+  ADR-096 (the maximum token lifetime), ADR-100 (local login modes and the
+  display name)
