@@ -67,11 +67,77 @@ pub struct VectorConfig {
     /// the same effect from a flag, and see ADR-075 for why ownership is not
     /// derived automatically in every case.
     pub worker_enabled: bool,
+    /// How the worker gathers documents into provider calls.
+    pub batch: BatchConfig,
 }
 
 impl Default for VectorConfig {
     fn default() -> Self {
-        Self { worker_enabled: true }
+        Self { worker_enabled: true, batch: BatchConfig::default() }
+    }
+}
+
+/// Bounds on one embedding provider call (ADR-095).
+///
+/// A process setting rather than part of a collection's vector configuration
+/// because it describes the round trip this node makes, not the collection:
+/// the same provider limits apply whichever collection's documents fill the
+/// call, and a batch only ever holds documents of one collection anyway. The
+/// defaults are `kimmy_vector::BatchSettings::default()`; see there for why
+/// each is what it is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BatchConfig {
+    /// The most chunks one provider call carries.
+    pub max_chunks: usize,
+    /// The most estimated tokens one provider call carries, by the estimate
+    /// `chunk.max_tokens` uses (one token per two bytes of UTF-8). A single
+    /// document over this goes alone rather than being split.
+    pub max_tokens: usize,
+    /// How long the streaming path holds a partial batch for more documents
+    /// before sending it, in milliseconds. Only waited when the stream is
+    /// idle; a backlog fills batches without waiting. `0` sends whatever has
+    /// queued the moment the stream is idle.
+    pub max_wait_ms: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        let defaults = kimmy_vector::BatchSettings::default();
+        Self {
+            max_chunks: defaults.max_chunks,
+            max_tokens: defaults.max_tokens,
+            max_wait_ms: defaults.max_wait.as_millis() as u64,
+        }
+    }
+}
+
+impl BatchConfig {
+    pub fn settings(&self) -> kimmy_vector::BatchSettings {
+        kimmy_vector::BatchSettings {
+            max_chunks: self.max_chunks,
+            max_tokens: self.max_tokens,
+            max_wait: std::time::Duration::from_millis(self.max_wait_ms),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_chunks == 0 {
+            anyhow::bail!("vector.batch.max_chunks must be greater than zero");
+        }
+        if self.max_tokens == 0 {
+            anyhow::bail!("vector.batch.max_tokens must be greater than zero");
+        }
+        // Milliseconds, and a quiet collection waits the whole of it before
+        // its one document is embedded: a value in the tens of thousands is
+        // almost certainly seconds typed into a milliseconds field.
+        if self.max_wait_ms > 10_000 {
+            anyhow::bail!(
+                "vector.batch.max_wait_ms must be at most 10000 (ten seconds); it is a \
+                 milliseconds value, and a quiet collection waits the whole of it"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -1082,6 +1148,7 @@ impl Config {
         self.server.rate_limit.validate()?;
         self.server.tls.validate()?;
         self.telemetry.validate()?;
+        self.vector.batch.validate()?;
         // Parsed at startup so a typo is a boot failure rather than an audit
         // log that silently records nothing.
         kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
@@ -1618,6 +1685,46 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.storage.commit_coalesce_ms = 1000;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_embedding_batch_bounds_are_checked() {
+        let mut cfg = valid();
+        cfg.vector.batch.max_chunks = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_chunks"));
+        cfg.vector.batch.max_chunks = 1;
+        cfg.vector.batch.max_tokens = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_tokens"));
+        cfg.vector.batch.max_tokens = 1;
+        // Milliseconds: a value that looks like seconds is refused rather
+        // than making every quiet collection wait minutes.
+        cfg.vector.batch.max_wait_ms = 60_000;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_wait_ms"));
+        cfg.vector.batch.max_wait_ms = 0;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_vector_batch_section_reads_back_from_toml_as_written() {
+        // The documented shape, exactly as `kimmy.example.toml` shows it, and
+        // the defaults match the worker's own.
+        let cfg: Config = toml::from_str(
+            "[vector]\n\
+             worker_enabled = true\n\
+             [vector.batch]\n\
+             max_chunks = 16\n\
+             max_tokens = 8192\n\
+             max_wait_ms = 250\n",
+        )
+        .unwrap();
+        let settings = cfg.vector.batch.settings();
+        assert_eq!(settings.max_chunks, 16);
+        assert_eq!(settings.max_tokens, 8192);
+        assert_eq!(settings.max_wait, std::time::Duration::from_millis(250));
+        assert_eq!(
+            Config::default().vector.batch.settings(),
+            kimmy_vector::BatchSettings::default()
+        );
     }
 
     #[test]

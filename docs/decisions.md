@@ -4482,3 +4482,89 @@ pins the ones that have shipped so far.
 
 ---
 
+## ADR-095 — The embedding worker batches provider calls across documents
+
+**Decision.** The worker fills one provider call from the chunks of
+consecutive documents of the same collection, on the streaming path and in a
+backfill alike, bounded by three process settings under `[vector.batch]`:
+`max_chunks` (32), `max_tokens` (32 768, by the estimate `chunk.max_tokens`
+already cuts on) and `max_wait_ms` (100, waited only when the stream is
+idle). The storage write stays one per document. A batch that fails
+permanently is taken apart and each document sent alone, so the one at fault
+is skipped and named and the rest land; a retryable failure retries the whole
+batch. The document and chunk counters count what they always did.
+
+**Why.** `EmbeddingProvider::embed` took a batch from the day it was written,
+and the worker handed it one document at a time. A document short enough to
+be one chunk — most documents, in most collections — was a batch of one, and
+paid a whole round trip, the provider's tokenisation and its scheduling by
+itself. Measured against a llama.cpp CPU server with ~43-character inputs: 32
+calls of one input, 394 ms; one call of 32 inputs, 18 ms — a factor of
+twenty-two. Per-document calls put a floor of one round trip under every
+document, and a write rate a little above what the floor allows grows the
+backlog without bound; that is Little's law, and it is what a live ingest
+showed, with the worker healthy, the provider idle most of each round trip,
+and the vectors falling further behind by the minute.
+
+The bounds are three because a provider's limits come in three shapes. A
+count, because hosted providers cap inputs per request (Cohere at 96, Gemini
+at 100) and 32 sits under all of them — it is also the size the measurement
+was taken at. A token total, because request bodies have limits too, and the
+token estimate the chunker already uses is the honest unit: 32 768 estimated
+tokens is exactly 32 chunks at the default chunk ceiling, about 64 KiB of
+text, inside every hosted provider's per-request budget. A wait, because a
+quiet collection's one document must not sit until the next write; it is
+waited only when the stream is idle — on a backlog the next entry is already
+there and the batch fills without waiting — and 100 ms is less than the
+remote round trip it saves.
+
+**Why the storage write is not batched too.** `put_vectors` is replace-all
+for one document's chunks, staleness is one document's HLC, and both are what
+make re-embedding idempotent and a crash replayable (the staleness section
+of `vectors.md`). Batching the write would make a crash between two
+documents' writes a question — which of the batch landed? — that today has
+no answer because it never needs one: each document either has its vectors at
+its HLC or does not. The oplog position is recorded once the batch has
+landed, never before, so the guarantee is unchanged; it merely covers a few
+entries at once. The cost of keeping the writes separate is one commit per
+document, which is what it always was, and which was never the bottleneck.
+
+**Why process settings, not collection settings.** The bounds describe the
+round trip this node makes: the same request-size limits apply whichever
+collection's documents fill the call, and a node against a metered API and a
+node against a local server want different waits regardless of collection.
+A batch only ever holds one collection's documents, so the per-collection
+provider, model and prefix are respected without being repeated. Putting the
+bounds in the collection's vector configuration would also make them
+replicated metadata that changes the fingerprint and triggers a reindex,
+which a change to a *scheduling* parameter must not do.
+
+**Alternatives.** Batching the storage write — rejected above. Per-collection
+bounds — rejected above. Concurrent provider calls (`max_in_flight`) — left
+out: the streaming path records one position for everything before it, and
+several batches in flight would either serialise their completions in
+arrival order (buying little) or record positions out of order (unsafe); the
+measured gain from batching alone is the twenty-two-fold one, and the case
+for concurrency should be made against a provider that batching has left
+idle, which none has yet. A batch-size histogram on `/metrics` — skipped:
+`kimmy_embed_chunks_total` over `kimmy_embed_provider_requests_total` is the
+average the operator wants, and a histogram would be the first bucketed
+series in a set that is otherwise plain counters. Opportunistic batching with
+no timer at all — available as `max_wait_ms = 0`, and not the default,
+because a remote provider gains more from a slightly larger call than a
+quiet collection loses to a tenth of a second.
+
+**Cost.** A quiet collection's document is embedded up to `max_wait_ms`
+later than before. A permanent failure in a batch of *n* costs *n* extra
+calls, once, to find the document at fault. The `ollama` provider still sends
+one request per input, because its embeddings endpoint takes one, so batching
+saves it nothing on the wire. A batch spanning several entries holds their
+positions until it lands, so a crash mid-batch replays up to a batch's worth
+of entries rather than one; every replay is a no-op on the staleness check.
+And the structural fact batching does not change is worth stating where
+operators size deployments: a collection is embedded by exactly one owner
+node, so adding members does not raise one collection's throughput — it
+raises how many collections embed at once.
+
+---
+

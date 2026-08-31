@@ -21,10 +21,11 @@ of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
 (rotating it ends every session once, on every node at the same time), and a
 node reachable from the network must not be running on one of this
 repository's own example secrets. `kimmyd check-config` against the new
-binary answers both without starting anything. The rest of the release is
-additive: two pieces of MongoDB update syntax that were the most common
-reasons an update written against MongoDB was refused here, and a
-documentation correction.
+binary answers both without starting anything. Nothing else in the release
+asks anything of an operator: two pieces of MongoDB update syntax that were
+the most common reasons an update written against MongoDB was refused here,
+a change to how the embedding worker spends provider calls whose three new
+settings are meant to be left alone, and a documentation correction.
 
 ### Added
 
@@ -46,6 +47,11 @@ documentation correction.
   `$push` does not know, is an error rather than a value pushed literally.
   `$addToSet` takes `$each` and refuses the other three, which have no
   meaning on a set.
+- **`[vector.batch]`** — `max_chunks` (32), `max_tokens` (32768, estimated)
+  and `max_wait_ms` (100) bound one embedding provider call. Process-level
+  rather than per collection, because they describe the round trip this
+  node makes and not the collection; documented in `kimmy.example.toml` and
+  [docs/operations.md](docs/operations.md#settings).
 
 ### Changed
 
@@ -83,6 +89,21 @@ documentation correction.
   grants, roles and expiry without the secret; the secret provides integrity,
   and confidentiality comes from TLS and from handling the token as a
   credential.
+- **The embedding worker batches provider calls across documents**
+  ([ADR-095](docs/decisions.md)). It used to send one document's chunks per
+  call, so a document short enough to be one chunk paid a whole round trip
+  by itself: measured against a CPU llama.cpp server, 32 calls of one short
+  input took 394 ms and one call of 32 took 18 ms, and a live ingest arriving
+  a little faster than that per-document floor grew its backlog without
+  bound. The worker now fills a call from consecutive documents of the same
+  collection, on the streaming path and in a backfill alike, up to the
+  bounds above. The storage write is still one per document, the oplog
+  position is still recorded after the work, and a batch that fails
+  permanently is taken apart so the one document at fault is skipped and
+  named while the rest land. `kimmy_embed_documents_total` and
+  `kimmy_embed_chunks_total` count what they always did;
+  `kimmy_embed_provider_requests_total` now climbs more slowly than chunks,
+  and chunks over requests is the batch size achieved.
 
 ### Fixed
 
