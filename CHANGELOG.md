@@ -10,6 +10,34 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch when it ships: nothing changes on the wire, on disk or in `/v1`. What
+changes is what a release carries — a software bill of materials beside every
+archive — and what the documentation says about the security model, in one
+place instead of many.
+
+### Added
+
+- **A CycloneDX SBOM per binary per target, on every release.** Beside each
+  `kimmyd-<target>.tar.xz` and `kimmy-cli-<target>.tar.xz` on the Release
+  page is a `<name>.cdx.json` (CycloneDX 1.5) listing every crate compiled
+  into that binary — versions, licences, package hashes and the dependency
+  graph — with a `.sha256` beside it. Feed it to whatever already scans your
+  dependencies (`grype sbom:…`, `osv-scanner --sbom …`, Dependency-Track)
+  without pulling the image or building from source. Generated from
+  `Cargo.lock` at the release commit by `scripts/sbom.sh` inside the release
+  workflow (ADR-110); [Security › Software bill of materials](docs/security.md#software-bill-of-materials)
+  says how to verify and consume one.
+- **A written threat model**, [`docs/threat-model.md`](docs/threat-model.md):
+  the assets, every trust boundary with its threats and the control in place
+  for each — naming the file the control lives in — what is explicitly not
+  defended against, and the operational assumptions the controls rest on.
+  Nothing in it is new behaviour; it is the security model written down in
+  one place and checked against the code. The FIPS position is stated there
+  too: `aws-lc-rs` has a validated mode, this build uses `ring`, and no FIPS
+  claim is made.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

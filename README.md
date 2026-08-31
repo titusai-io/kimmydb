@@ -351,7 +351,7 @@ wrong answers rather than crashes. These are property-tested:
 | [Change Streams](docs/change-streams.md) | The replay/live splice, resume, lag recovery |
 | [Query Language](docs/query-language.md) · [HTTP API](docs/http-api.md) | Using it |
 | [Vectors](docs/vectors.md) · [MCP](docs/mcp.md) | Embeddings, search, and the agent surface |
-| [Security](docs/security.md) · [Federation](docs/federation.md) · [Operations](docs/operations.md) | Running it |
+| [Security](docs/security.md) · [Threat model](docs/threat-model.md) · [Federation](docs/federation.md) · [Operations](docs/operations.md) | Running it — and what is and is not defended against |
 | [CLI](docs/cli.md) · [Clients](docs/clients.md) · [Compatibility](docs/compatibility.md) | The `kimmy` terminal client, the first-party libraries, and what `/v1` promises |
 | [Benchmarks](docs/benchmarks.md) | What has been measured, with method |
 | [Roadmap](docs/roadmap.md) · [Decisions](docs/decisions.md) · [Testing](docs/testing.md) | Continuing development |
