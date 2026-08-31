@@ -483,11 +483,25 @@ the local half.)
 
 ```rust
 struct Claims {
-    sub: String,        // user name
-    exp: u64, iat: u64, // seconds since the epoch
-    grants: Vec<Grant>, // embedded, not looked up per request
+    sub: String,         // user name
+    exp: u64, iat: u64,  // seconds since the epoch
+    grants: Vec<Grant>,  // embedded, not looked up per request
+    tv: u64,             // the user's token version when issued (revocation)
+    roles: Vec<String>,  // the named roles in play, for the audit record
 }
 ```
+
+**A local token is a signed, unencrypted, readable grant list.** HS256 is a
+signature, not encryption. The claims above travel as base64url-encoded JSON,
+and anyone holding the token — a proxy log, a shell history, a pasted `curl`
+line — can read the user name, every grant, the role names and the expiry
+without knowing the secret. What the secret provides is integrity: a token
+cannot be altered or minted without it, which is the property authorization
+rests on. Confidentiality of the claims, and of the token itself, comes from
+somewhere else — from carrying it only over TLS, and from handling it as the
+credential it is. Nothing that is itself sensitive belongs in a role name or a
+grant, because it is sent in the clear inside every request the token
+authorizes.
 
 **Why cluster-wide.** In a leaderless cluster a request may land on any node,
 not the one that logged the user in. A per-node key would produce intermittent
@@ -542,11 +556,34 @@ reports on an account to whoever is holding a stale token for it.
 Rotating `KIMMY_JWT_SECRET` still works and is still the bigger hammer: it
 invalidates every token for every user at once.
 
-Minimum secret length is 16 bytes, enforced at construction — the whole cluster
-shares this value, so a weak one is a cluster-wide weakness.
+Minimum secret length is 32 bytes, enforced at construction and again by
+`check-config` — the 256-bit floor RFC 7518 §3.2 sets for HS256, and the whole
+cluster shares this value, so a weak one is a cluster-wide weakness. (It was
+16 bytes up to 0.16.x; a secret of 16–31 bytes has to be replaced before
+upgrading, which logs every user out once — [ADR-093](decisions.md).)
 
 Attacks covered by tests: `alg=none` unsigned tokens, payload tampering to
 escalate grants, wrong-secret signatures, expired tokens, and malformed input.
+
+### Placeholder secrets are refused off loopback
+
+A node that listens on anything other than a loopback address — the HTTP
+listener, or the cluster listener when clustering is on — refuses to start
+when `KIMMY_ROOT_PASSWORD`, `KIMMY_JWT_SECRET` or `KIMMY_CLUSTER_SECRET` (or
+the TOML setting behind each) is one of the values this repository's own
+examples use: `changeme` and `change-me`, `hunter2`, the defaults the compose
+file used to fall back to, the commented-out lines in `kimmy.example.toml`,
+and the obvious words — `password`, `secret`, `admin`, `root`, and so on. The
+full list is `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`; matching ignores
+case. A value every reader of the repository holds is not a secret, and a
+copied quick start is exactly how a database ends up on a routable address
+with one.
+
+The error names the setting and never the value, and `kimmyd check-config`
+gives the same answer the server would. On `127.0.0.1` or `::1` the same
+values are accepted, so local development and the examples stay copy-and-run.
+It is a denylist and nothing more: a value absent from it is not thereby a
+good secret, and the length floor still applies ([ADR-093](decisions.md)).
 
 ---
 
@@ -764,6 +801,10 @@ environment variable becomes a privilege grant, and anyone who can influence the
 environment can take over an existing database.
 
 Change the root password through the API, not by editing the environment.
+
+A bootstrap password copied from an example — `changeme`, `hunter2`, and the
+rest — is refused when the node listens off loopback; see [Placeholder secrets
+are refused off loopback](#placeholder-secrets-are-refused-off-loopback).
 
 ---
 
@@ -1153,8 +1194,8 @@ delivery. Treat an inbound `traceparent` as a hint, never as evidence.
 
 ```mermaid
 graph TB
-    A["Generate a strong KIMMY_JWT_SECRET<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
-    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file"]
+    A["Generate KIMMY_JWT_SECRET, 32 bytes or more<br/>openssl rand -base64 32"] --> B["Same secret on every node"]
+    B --> C["Set KIMMY_ROOT_PASSWORD via secret manager,<br/>not a config file — never an example's value"]
     C --> D["Set server.tls.cert_file and key_file<br/>(or terminate at a proxy)"]
     D --> E["Behind a proxy? set trusted_proxy_header<br/>so the login limiter sees real clients"]
     E --> F["Create scoped users; do not use root for applications"]
