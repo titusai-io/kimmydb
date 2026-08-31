@@ -3452,6 +3452,247 @@ async fn an_unlimited_find_returns_a_page_and_not_the_collection() {
     assert_eq!(over.body["count"], 150, "everything there was, and no complaint about the ask");
 }
 
+// ---------------------------------------------------------------------------
+// Reads bounded by what they return (ADR-098)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn count_agrees_on_every_access_path_and_says_which_it_took() {
+    // `count` no longer materialises its matches, on any of the three
+    // routes. The number must be what it was — with and without an index,
+    // with a residual filter the index cannot answer alone, over a `$in`
+    // union, and through the primary key — and `explain` still describes it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+    let count = |body: Value| async {
+        let res = server.post("/v1/db/shop/coll/indexed/count", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body
+    };
+
+    let plain = json!({ "filter": { "qty": 3 }, "explain": true });
+    let residual = json!({ "filter": { "qty": 3, "item": "w1" }, "explain": true });
+    let union = json!({ "filter": { "qty": { "$in": [1, 2] } }, "explain": true });
+
+    let scanned =
+        (count(plain.clone()).await, count(residual.clone()).await, count(union.clone()).await);
+    assert_eq!(scanned.0["explain"]["strategy"], "collectionScan");
+    assert_eq!(scanned.0["count"], 9, "qty == 3 for i in 1..=60");
+    assert_eq!(scanned.0["explain"]["documentsExamined"], 60);
+    assert_eq!(scanned.0["explain"]["documentsMatched"], 9);
+
+    server
+        .post(
+            "/v1/db/shop/coll/indexed/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "qty" }] }),
+        )
+        .await;
+
+    let indexed = (count(plain).await, count(residual).await, count(union).await);
+    assert_eq!(indexed.0["explain"]["strategy"], "index");
+    assert_eq!(indexed.1["explain"]["strategy"], "index");
+    assert_eq!(indexed.2["explain"]["strategy"], "indexUnion");
+    for (before, after) in
+        [(&scanned.0, &indexed.0), (&scanned.1, &indexed.1), (&scanned.2, &indexed.2)]
+    {
+        assert_eq!(after["count"], before["count"], "{after} vs {before}");
+        assert_eq!(after["explain"]["documentsMatched"], before["explain"]["documentsMatched"]);
+    }
+    // The index narrowed the work, and the count says how far into it went.
+    assert_eq!(indexed.0["explain"]["documentsExamined"], 9);
+    assert_eq!(indexed.0["explain"]["indexEntriesRead"], 9);
+    assert!(scanned.0["explain"].get("indexEntriesRead").is_none(), "a scan read no index");
+
+    let by_id =
+        count(json!({ "filter": { "_id": { "$in": [1, 2, 3, 999] } }, "explain": true })).await;
+    assert_eq!(by_id["count"], 3);
+    assert_eq!(by_id["explain"]["strategy"], "idLookup");
+}
+
+#[tokio::test]
+async fn a_sorted_page_is_the_page_the_full_sort_gives() {
+    // A sorted `find` holds `skip + limit` documents instead of every match.
+    // Every window must be the same slice of the same order as one request
+    // for everything, ties — `qty` repeats every seven documents — included,
+    // and the same again when asked twice.
+    let server = Server::start().await;
+    let token = server.root().await;
+    seed_pair(&server, &token).await;
+    let find = |body: Value| async {
+        let res = server.post("/v1/db/shop/coll/control/find", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+
+    for sort in [json!({ "qty": -1 }), json!({ "qty": 1, "item": -1 }), json!({ "item": 1 })] {
+        let full = find(json!({ "sort": sort, "limit": 100 })).await;
+        assert_eq!(full.len(), 60);
+        for (skip, limit) in [(0usize, 10usize), (7, 5), (55, 10), (60, 5), (0, 1)] {
+            let page = find(json!({ "sort": sort, "skip": skip, "limit": limit })).await;
+            let expected: Vec<i64> = full.iter().copied().skip(skip).take(limit).collect();
+            assert_eq!(page, expected, "sort {sort}, skip {skip}, limit {limit}");
+        }
+        assert_eq!(find(json!({ "sort": sort, "limit": 100 })).await, full, "deterministic");
+    }
+
+    // Ties are broken by `_id` ascending: within one `qty`, ids climb.
+    let by_qty = find(json!({ "sort": { "qty": -1 }, "limit": 100 })).await;
+    for pair in by_qty.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        if a % 7 == b % 7 {
+            assert!(a < b, "tie between {a} and {b} broken the wrong way");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_sorted_window_past_the_cap_is_refused_and_says_what_to_do_instead() {
+    // The one behaviour change in ADR-098. `skip + limit` on a sorted find
+    // is what the server holds while it sorts, and it stops at the same
+    // 10,000 `limit` stops at — refused rather than clamped, because a
+    // clamped skip would quietly return the wrong page.
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 20).await;
+    let find = |body: Value| async {
+        server.post("/v1/db/shop/coll/orders/find", Some(&token), body).await
+    };
+
+    let over = find(json!({ "sort": { "parity": 1 }, "skip": 9_950, "limit": 100 })).await;
+    assert_eq!(over.status, 400, "{:?}", over.body);
+    assert_eq!(over.body["error"], "bad_request");
+    let message = over.body["message"].as_str().unwrap();
+    assert!(message.contains("10000"), "the ceiling is named: {message}");
+    assert!(message.contains("nextCursor"), "and the way past it: {message}");
+
+    // Exactly at the ceiling is fine; the collection is just short.
+    let at = find(json!({ "sort": { "parity": 1 }, "skip": 9_900, "limit": 100 })).await;
+    assert_eq!(at.status, 200, "{:?}", at.body);
+    assert_eq!(at.body["count"], 0);
+
+    // The ceiling is about what a sort holds. An unsorted find holds only
+    // its page, and `_id` ascending is the order the scan already delivers,
+    // so neither has one.
+    for body in [
+        json!({ "skip": 20_000, "limit": 100 }),
+        json!({ "sort": { "_id": 1 }, "skip": 20_000, "limit": 100 }),
+    ] {
+        let res = find(body.clone()).await;
+        assert_eq!(res.status, 200, "{body}: {:?}", res.body);
+        assert_eq!(res.body["count"], 0);
+    }
+    // And a deep unsorted skip still lands on the right page.
+    let deep = find(json!({ "skip": 15, "limit": 100 })).await;
+    let ids: Vec<i64> = deep.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, vec![15, 16, 17, 18, 19]);
+}
+
+#[tokio::test]
+async fn an_in_over_overlapping_probes_pages_each_document_once_in_id_order() {
+    // A document whose array holds two of the listed values is under two
+    // probes. Streamed as a merge rather than gathered into a set, it must
+    // still appear once, in `_id` order, and a cursor walk across the union
+    // must neither skip nor repeat it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "tagged" })).await;
+    let batch: Vec<Value> = (0..40i64)
+        .map(|i| {
+            let mut tags = Vec::new();
+            if i % 2 == 0 {
+                tags.push("a");
+            }
+            if i % 3 == 0 {
+                tags.push("b");
+            }
+            if i % 5 == 0 {
+                tags.push("c");
+            }
+            json!({ "_id": i, "tags": tags })
+        })
+        .collect();
+    server.post("/v1/db/shop/coll/tagged/bulk", Some(&token), json!(batch)).await;
+    server
+        .post(
+            "/v1/db/shop/coll/tagged/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "tags" }] }),
+        )
+        .await;
+
+    let filter = json!({ "tags": { "$in": ["a", "b"] } });
+    let expected: Vec<i64> = (0..40).filter(|i| i % 2 == 0 || i % 3 == 0).collect();
+
+    let explained = server
+        .post(
+            "/v1/db/shop/coll/tagged/find",
+            Some(&token),
+            json!({ "filter": filter, "limit": 100, "explain": true }),
+        )
+        .await;
+    assert_eq!(explained.body["explain"]["strategy"], "indexUnion", "{}", explained.body);
+    let ids: Vec<i64> = explained.body["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(ids, expected, "once each, ascending");
+    assert_eq!(explained.body["explain"]["documentsExamined"], expected.len());
+
+    let walked = walk(&server, &token, "tagged", json!({ "filter": filter, "limit": 3 })).await;
+    assert_eq!(walked, expected, "a cursor walk over the union sees each once");
+}
+
+#[tokio::test]
+async fn an_indexed_find_with_limit_one_reads_one_entry() {
+    // The unselective-equality case: 300 documents under one key. The old
+    // path gathered all 300 candidate keys before reading the first
+    // document; now it reads one entry, one document, and stops.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "same" })).await;
+    let batch: Vec<Value> = (0..300i64).map(|i| json!({ "_id": i, "k": 1 })).collect();
+    server.post("/v1/db/shop/coll/same/bulk", Some(&token), json!(batch)).await;
+    server
+        .post("/v1/db/shop/coll/same/indexes", Some(&token), json!({ "fields": [{ "path": "k" }] }))
+        .await;
+
+    let one = server
+        .post(
+            "/v1/db/shop/coll/same/find",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "limit": 1, "explain": true }),
+        )
+        .await;
+    assert_eq!(one.body["explain"]["strategy"], "index", "{}", one.body);
+    assert_eq!(one.body["documents"][0]["_id"], 0, "the least _id");
+    assert_eq!(one.body["explain"]["documentsExamined"], 1);
+    assert_eq!(one.body["explain"]["indexEntriesRead"], 1);
+
+    // The count reads them all — it has to — and says so.
+    let all = server
+        .post(
+            "/v1/db/shop/coll/same/count",
+            Some(&token),
+            json!({ "filter": { "k": 1 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(all.body["count"], 300);
+    assert_eq!(all.body["explain"]["indexEntriesRead"], 300);
+}
+
 #[tokio::test]
 async fn a_full_last_page_still_offers_a_cursor_and_the_next_page_is_empty() {
     // A client must end its walk on a short page or a missing token, not on a

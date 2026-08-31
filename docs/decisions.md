@@ -4808,6 +4808,80 @@ ADR-085 was on.
 
 ---
 
+## ADR-098 — Query paths are bounded by what they return, not by what they scan
+
+**Decision.** A read may hold memory proportional to its result — the page,
+the sort window, the count — and never to the collection or the index range it
+walks. Three paths were changed to make that true. `count` counts through a
+visitor and keeps nothing. Index candidates stream out of one read transaction
+and are rechecked as they arrive: a plan that pins a complete key is one run of
+entries already in `_id` order, read in place and stopped where the caller
+stops; a `$in` is those runs merged, one head per probe; a range that must be
+delivered in `_id` order keeps only the `skip + limit` smallest document keys
+of one pass over it, and goes back for more only when the recheck rejected
+enough that the caller is still asking. A sorted `find` keeps a bounded heap of
+the `skip + limit` least under the sort, with `_id` ascending appended as the
+final key, and that window has a ceiling: `skip + limit` may not exceed 10,000
+on a sorted `find`, refused with `400`.
+
+**Why.** Reading the executor for how memory grows with collection size found
+three places where one request's footprint was the collection's. `count` was
+`collect_matching(..).len()`: every matching document decoded into a vector
+and then counted, which on a `__vectors` shadow is every vector and its text.
+The index path materialised every candidate key in the range, sorted and
+deduplicated, before rechecking the first — on the order of hundreds of
+megabytes for an unselective equality over ten million documents at
+`limit: 1` — and a `$in` union built a set on top. A sorted `find` collected
+every match as a `(stamp, document)` pair to sort it, and `skip` had no bound
+at all. On a small host each of these was the likeliest way for one ordinary
+request to take the node, and every other client's requests, down with it.
+None of the fixes changes an answer: the count is the same count, the
+candidates are the same candidates in the same order, and the bounded sort
+produces the page the stable sort did — `_id` ascending was the order the scan
+fed it, and is now stated as a key instead of relied on as a property of the
+input.
+
+**Why the index path has three shapes rather than one.** Index entries sort by
+`(key, document key)`. Under one complete key the document keys are already in
+order and each document appears once, so an exact probe needs no sorting and
+no set, and a merge of exact probes needs one head per probe. Under a range of
+keys the document keys interleave, and nothing short of seeing the whole range
+says which `_id` comes first — so the range is still read in full, as it was,
+but a bounded set keeps the `skip + limit` smallest instead of the whole range
+sorted. The planner now says which case a plan is (`IndexPlan::exact`),
+because the executor cannot tell from the byte ranges alone: an equality on a
+prefix of a compound index is a range in disguise. A multikey range read in
+index order recognises a repeat by recomputing the document's keys and taking
+it at the first the range covers, rather than by remembering every document
+seen.
+
+**Alternatives.** *Index-backed counts* — answering `count` from the entries
+without touching documents — were deferred: the recheck is what makes an
+index-backed answer correct, and a count that trusted the index alone would be
+wrong wherever the index is a superset (a multikey range, a partial filter the
+query did not prove). It remains the obvious next step for the common case of
+an exact probe with no residual filter. *Keeping an unbounded `skip` with a
+warning* was rejected: a warning is read after the node is gone. *Clamping the
+sort window as `limit` is clamped* was rejected because a clamped `skip`
+returns a different page from the one asked for and says nothing — the one
+kind of wrong a client cannot detect. *A cursor over arbitrary sort keys*,
+which would make deep sorted paging cheap, is the longer road the deviations
+register already names and is not taken here.
+
+**Cost.** The sort window is a behaviour change: a sorted `find` with
+`skip + limit` over 10,000 worked before and is refused now. Under the letter
+of [Compatibility](compatibility.md) a tightened refusal is breaking; this one
+ships in `/v1` as a capacity ceiling — the same class as the body limit and
+`MAX_LIMIT` — with a `0.MINOR` bump and a release note, and the compatibility
+document now records that exception in its table. A range plan in `_id` order
+whose recheck rejects most candidates makes more than one pass over the range,
+logarithmically many in what was rejected, where it made one; the common case
+is one pass, and it no longer holds the range. `explain` gains
+`indexEntriesRead`, so the difference between an exact probe stopped early and
+a range read in full is visible to a client tuning a query.
+
+---
+
 ## ADR-099 — Authenticated routes carry a request timeout, an explicit body ceiling and a per-principal rate limit
 
 **Decision.** Three settings, each with a default chosen so that a node which

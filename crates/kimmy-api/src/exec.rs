@@ -25,6 +25,18 @@ use crate::state::{Auth, SharedState};
 pub const DEFAULT_LIMIT: usize = 100;
 pub const MAX_LIMIT: usize = 10_000;
 
+/// The most documents a sorted `find` may hold: `skip + limit`.
+///
+/// A sort has to see every match before it knows which come first, and what
+/// it keeps while looking is what it will return plus what it will skip. The
+/// same number as [`MAX_LIMIT`] because it bounds the same thing — how many
+/// documents one request may make the node hold — and a deeper offset was
+/// never a good way to page: a cursor costs a page, and a range on the sort
+/// field costs a page (ADR-098). Where `limit` is clamped this is refused,
+/// because a clamped `skip` would return a different page from the one asked
+/// for and say nothing.
+pub const MAX_SORT_WINDOW: usize = MAX_LIMIT;
+
 /// Documents accepted by one bulk insert.
 ///
 /// A batch is one transaction, so the whole of it is held in memory and then
@@ -258,27 +270,58 @@ pub fn find(
         None => None,
     };
 
-    // A sort has to see every match before it can page, so early exit is only
-    // safe for unsorted queries. A cursor is `_id`-ordered, which the scan
-    // already delivers, so it may stop early too.
-    let stop_after = (sort.is_empty() || cursor.is_some()).then_some(skip + limit);
-    let (mut matched, stats) = collect_matching_stamped_after(
-        state,
-        &meta,
-        &filter,
-        stop_after,
-        cursor.as_ref().map(|c| c.key()),
-    )?;
+    // `_id` ascending is the order every access path already delivers, so it
+    // is not a sort the executor has to perform — and, like no sort at all,
+    // the scan can stop once it has `skip + limit` matches.
+    let sorted = !sort.is_empty() && !sort_is_id_ascending(&sort);
+    let window = skip.saturating_add(limit);
 
-    // The stamp travels with its document through the sort. Stable, so the
-    // scan's order holds for documents the sort does not separate — the
-    // same rule `shape::sort` follows.
-    if !sort.is_empty() {
-        matched.sort_by(|a, b| shape::compare(&sort, &a.1, &b.1));
-    }
-
-    let (page_stamps, page_docs): (Vec<kimmy_core::Stamp>, Vec<bson::Document>) =
-        matched.into_iter().skip(skip).take(limit).unzip();
+    let (page_stamps, page_docs, stats): (Vec<kimmy_core::Stamp>, Vec<bson::Document>, _) =
+        if sorted {
+            // A sort has to see every match before it can page, but it need
+            // not *hold* every match: the `skip + limit` least are all it can
+            // return, so that is all it keeps (ADR-098). The window has a
+            // ceiling for the same reason `limit` has one, and it is refused
+            // rather than clamped because a clamped `skip` would silently
+            // return a different page from the one asked for.
+            if window > MAX_SORT_WINDOW {
+                return Err(ApiError::bad_request(format!(
+                    "a sorted find holds `skip + limit` documents while it sorts, which may not \
+                     exceed {MAX_SORT_WINDOW} (got {window}). To page deeper, sort by \
+                     {{\"_id\": 1}} and follow `nextCursor`, or narrow the filter on the sort \
+                     field to where the last page ended"
+                )));
+            }
+            // Ties are broken by `_id`, which is the order the scan used to
+            // feed a stable sort — so the page is the one the full sort gave,
+            // whatever order the matches arrive in.
+            let order = with_id_tiebreak(&sort);
+            let mut top = TopK::new(window, &order);
+            let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
+                top.offer(stamp, doc);
+            })?;
+            let (stamps, docs) = top.into_sorted().into_iter().skip(skip).unzip();
+            (stamps, docs, stats)
+        } else {
+            // What is skipped is counted past, not held.
+            let mut seen = 0usize;
+            let (mut stamps, mut docs) = (Vec::new(), Vec::new());
+            let stats = visit_matching(
+                state,
+                &meta,
+                &filter,
+                Order::ById { after: cursor.as_ref().map(|c| c.key()) },
+                Some(window),
+                |stamp, doc| {
+                    seen += 1;
+                    if seen > skip {
+                        stamps.push(stamp);
+                        docs.push(doc);
+                    }
+                },
+            )?;
+            (stamps, docs, stats)
+        };
 
     // Offered whenever this query *could* be continued, so a caller's first
     // request needs no cursor and no flag — it asks for a page, and the reply
@@ -331,6 +374,87 @@ fn next_cursor(last: Option<&bson::Document>) -> Option<kimmy_core::Cursor> {
     Some(kimmy_core::Cursor::from_key(key))
 }
 
+/// A sort with `_id` ascending as its final key, unless it already sorts by
+/// `_id`.
+///
+/// That makes the order total — `_id` is unique — and it is exactly the order
+/// the old path produced: a stable sort over matches that arrived in `_id`
+/// order. Stated as a key rather than relied on as a property of the input,
+/// so the bounded sort can take its matches in whatever order is cheapest.
+fn with_id_tiebreak(sort: &[shape::SortKey]) -> Vec<shape::SortKey> {
+    let mut order = sort.to_vec();
+    if !order.iter().any(|key| key.path == kimmy_storage::ID_FIELD) {
+        order.push(shape::SortKey { path: kimmy_storage::ID_FIELD.to_string(), descending: false });
+    }
+    order
+}
+
+/// The `n` least of what it is offered, under a total order.
+///
+/// A sorted `find` used to collect every match and sort the lot, so its
+/// memory was the size of the match set. This holds `skip + limit`: the
+/// largest held sits at the top of a max-heap, and an offer that would not
+/// displace it is dropped on the spot. The comparison is `shape::compare`,
+/// the same one the full sort used, over a key list the caller has made total
+/// with [`with_id_tiebreak`] — a heap under a partial order would return a
+/// page that depended on arrival order.
+struct TopK<'a> {
+    n: usize,
+    order: &'a [shape::SortKey],
+    heap: std::collections::BinaryHeap<Ranked<'a>>,
+}
+
+/// One held match, ordered by the sort it was offered under.
+struct Ranked<'a> {
+    order: &'a [shape::SortKey],
+    stamp: kimmy_core::Stamp,
+    doc: bson::Document,
+}
+
+impl Ord for Ranked<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        shape::compare(self.order, &self.doc, &other.doc)
+    }
+}
+
+impl PartialOrd for Ranked<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for Ranked<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for Ranked<'_> {}
+
+impl<'a> TopK<'a> {
+    fn new(n: usize, order: &'a [shape::SortKey]) -> Self {
+        Self { n, order, heap: std::collections::BinaryHeap::with_capacity(n.min(MAX_LIMIT) + 1) }
+    }
+
+    fn offer(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) {
+        if self.n == 0 {
+            return;
+        }
+        let candidate = Ranked { order: self.order, stamp, doc };
+        if self.heap.len() < self.n {
+            self.heap.push(candidate);
+        } else if self.heap.peek().is_some_and(|largest| candidate < *largest) {
+            self.heap.pop();
+            self.heap.push(candidate);
+        }
+    }
+
+    /// Everything held, least first.
+    fn into_sorted(self) -> Vec<(kimmy_core::Stamp, bson::Document)> {
+        self.heap.into_sorted_vec().into_iter().map(|r| (r.stamp, r.doc)).collect()
+    }
+}
+
 pub fn count(
     state: &SharedState,
     auth: &Auth,
@@ -342,10 +466,14 @@ pub fn count(
     let meta = authorize(state, auth, Action::Read, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
 
-    // No early exit: a count must see every match.
-    let (matched, stats) = collect_matching(state, &meta, &filter, None)?;
+    // No early exit — a count must see every match — and nothing kept: each
+    // match is counted as it passes the recheck and dropped, in whatever
+    // order the access path finds cheapest. Counting used to collect every
+    // matching document first, so a count over a large collection cost the
+    // memory of the collection (ADR-098).
+    let stats = visit_matching(state, &meta, &filter, Order::Any, None, |_, _| {})?;
 
-    let mut body = json!({ "count": matched.len() });
+    let mut body = json!({ "count": stats.matched });
     if params.explain {
         body["explain"] = stats.to_json();
     }
@@ -390,6 +518,15 @@ pub struct QueryStats {
     /// Index ranges scanned: 1 for a plain index plan, several for a `$in`
     /// union, 0 for a collection scan.
     pub probes: usize,
+    /// Index entries read, when an index was consulted by a read.
+    ///
+    /// The measure of how much of the index a query touched, as distinct
+    /// from how many documents it examined: an exact probe stopped by
+    /// `limit` reads as many entries as documents, while a range that had
+    /// to be put in `_id` order reads the whole range however few it
+    /// returns. `None` for a scan, a primary-key lookup, or a filtered
+    /// write, whose engine-side scan does not report it.
+    pub index_entries: Option<usize>,
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
     /// Reported separately from `index` because the primary key is not one: no
@@ -420,6 +557,9 @@ impl QueryStats {
         if self.probes > 1 {
             out["probes"] = json!(self.probes);
         }
+        if let Some(entries) = self.index_entries {
+            out["indexEntriesRead"] = json!(entries);
+        }
         out
     }
 }
@@ -430,33 +570,21 @@ impl QueryStats {
 /// against the full filter**, because an index answers "might match" and only
 /// the filter decides. Skipping that recheck is how index-backed queries start
 /// returning documents that do not match.
+///
+/// A convenience over [`visit_matching`] for a caller that wants the matches
+/// as a list; `find` and `count` do not, and go to the visitor directly.
 pub fn collect_matching(
     state: &SharedState,
     meta: &CollectionMeta,
     filter: &filter::Filter,
     stop_after: Option<usize>,
 ) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
-    collect_matching_after(state, meta, filter, stop_after, None)
-}
-
-/// [`collect_matching`], resuming strictly after an encoded document key.
-pub fn collect_matching_after(
-    state: &SharedState,
-    meta: &CollectionMeta,
-    filter: &filter::Filter,
-    stop_after: Option<usize>,
-    after: Option<&[u8]>,
-) -> Result<(Vec<bson::Document>, QueryStats), ApiError> {
-    let (matched, stats) = collect_matching_stamped_after(state, meta, filter, stop_after, after)?;
+    let (matched, stats) = collect_matching_stamped_after(state, meta, filter, stop_after, None)?;
     Ok((matched.into_iter().map(|(_, doc)| doc).collect(), stats))
 }
 
-/// The one read scan, carrying each document's stamp.
-///
-/// Both access paths are already in `_id` order — the documents table by its
-/// key, an index candidate list because `scan_range_in` sorts by document key —
-/// so resuming is a bound rather than a filter, and a page costs its own size
-/// rather than everything before it.
+/// [`collect_matching`], carrying each document's stamp and resuming strictly
+/// after an encoded document key, in `_id` order.
 pub fn collect_matching_stamped_after(
     state: &SharedState,
     meta: &CollectionMeta,
@@ -465,15 +593,80 @@ pub fn collect_matching_stamped_after(
     after: Option<&[u8]>,
 ) -> Result<(Vec<(kimmy_core::Stamp, bson::Document)>, QueryStats), ApiError> {
     let mut matched = Vec::new();
-    let mut examined = 0usize;
+    let stats =
+        visit_matching(state, meta, filter, Order::ById { after }, stop_after, |stamp, doc| {
+            matched.push((stamp, doc));
+        })?;
+    Ok((matched, stats))
+}
+
+/// The order a read wants its matches in.
+#[derive(Clone, Copy, Debug)]
+pub enum Order<'a> {
+    /// `_id` ascending, resuming strictly after an encoded document key — the
+    /// order a page is returned in and a cursor resumes from.
+    ById { after: Option<&'a [u8]> },
+    /// Whichever order the access path finds cheapest. For a count, which
+    /// has no order, or a sort, which imposes its own.
+    Any,
+}
+
+/// The recheck, the count, and the stop — one place, whichever path feeds it.
+struct Recheck<'a, F> {
+    filter: &'a filter::Filter,
+    stop_after: Option<usize>,
+    examined: usize,
+    matched: usize,
+    visit: F,
+}
+
+impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
+    /// Examine one candidate; whether the scan should go on.
+    fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> bool {
+        self.examined += 1;
+        if filter::matches(self.filter, &doc) {
+            self.matched += 1;
+            (self.visit)(stamp, doc);
+        }
+        !self.stop_after.is_some_and(|n| self.matched >= n)
+    }
+}
+
+/// The one read scan. Every match is handed to `visit` as it is found and
+/// nothing is kept here, so what a read holds is decided by the caller — a
+/// page, a bounded sort window, or nothing at all for a count (ADR-098).
+///
+/// Three access paths, tried in order of how little they touch: the primary
+/// key when the filter pins `_id`, an index when one applies, and otherwise
+/// the collection. All three deliver `_id` order when asked for it — the
+/// documents table by its key, primary-key probes because the planner sorts
+/// them, and an index scan by [`kimmy_storage::CandidateOrder::ById`] — so
+/// resuming after a cursor is a bound rather than a filter, and a page costs
+/// its own size rather than everything before it. `stop_after` ends the scan
+/// once that many matches have been visited.
+pub fn visit_matching<F>(
+    state: &SharedState,
+    meta: &CollectionMeta,
+    filter: &filter::Filter,
+    order: Order<'_>,
+    stop_after: Option<usize>,
+    visit: F,
+) -> Result<QueryStats, ApiError>
+where
+    F: FnMut(kimmy_core::Stamp, bson::Document),
+{
+    let after = match order {
+        Order::ById { after } => after,
+        Order::Any => None,
+    };
+    let mut recheck = Recheck { filter, stop_after, examined: 0, matched: 0, visit };
 
     // The primary key first: it is the tightest access path there is, needs no
     // index to exist, and beats anything a secondary index could offer for the
     // same predicate. The keys are already document keys, so this produces the
     // same candidate shape an index scan does and the filter is re-applied to
     // each exactly as it is there.
-    let primary = plan::choose_primary_key(filter);
-    if let Some(pk) = &primary {
+    if let Some(pk) = plan::choose_primary_key(filter) {
         for key in &pk.keys {
             if after.is_some_and(|bound| key.as_slice() <= bound) {
                 continue;
@@ -483,98 +676,69 @@ pub fn collect_matching_stamped_after(
             let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, key)? else {
                 continue;
             };
-            examined += 1;
-            if filter::matches(filter, &doc) {
-                matched.push((stamp, doc));
-                if stop_after.is_some_and(|n| matched.len() >= n) {
-                    break;
-                }
+            if !recheck.take(stamp, doc) {
+                break;
             }
         }
-        let stats = QueryStats {
+        return Ok(QueryStats {
             index: None,
             fields_used: 0,
-            examined,
-            matched: matched.len(),
+            examined: recheck.examined,
+            matched: recheck.matched,
             probes: pk.keys.len(),
+            index_entries: None,
             id_lookup: true,
-        };
-        return Ok((matched, stats));
+        });
     }
 
     let mut plan = plan::choose(filter, &meta.indexes);
-
-    // A plan that intersected both ends of a range is only sound while the
-    // index is not multikey — and it was chosen from a metadata read that is
-    // already stale. The checked scan re-reads the flag in the same snapshot
-    // as the scan; `None` means a write flipped it in between, and the honest
-    // answer is to fall back to scanning the collection. That can happen at
-    // most once per index, ever, since the flag never clears.
-    let candidates = match &plan {
-        Some(p) if p.both_bounds => {
-            // A both-bounds plan is always a single intersected range.
-            let (lower, upper) = &p.ranges[0];
-            let checked =
-                state.engine.index_candidates_unless_multikey(meta, p.index_id, lower, upper)?;
-            if checked.is_none() {
-                plan = None;
+    let mut entries = None;
+    if let Some(p) = &plan {
+        // Candidates stream out of the index and are rechecked as they come,
+        // so stopping stops the read; nothing proportional to the range is
+        // gathered first. A plan that intersected both ends of a range is
+        // only sound while the index is not multikey — and it was chosen
+        // from a metadata read that is already stale. The engine re-reads
+        // the flag in the same snapshot as the scan; `None` means a write
+        // flipped it in between, and the honest answer is to fall back to
+        // scanning the collection. That can happen at most once per index,
+        // ever, since the flag never clears.
+        let scan = kimmy_storage::IndexScan {
+            index_id: p.index_id,
+            ranges: &p.ranges,
+            both_bounds: p.both_bounds,
+            exact: p.exact,
+        };
+        let delivery = match order {
+            Order::ById { after } => {
+                kimmy_storage::CandidateOrder::ById { after, want: stop_after }
             }
-            checked
-        }
-        Some(p) => {
-            // One range for a plain plan, several for a `$in` union. The set
-            // deduplicates across probes: one document can appear under two of
-            // them when an array holds two of the listed values, and examining
-            // it twice would double-count it in the result.
-            let mut union = std::collections::BTreeSet::new();
-            for (lower, upper) in &p.ranges {
-                union.extend(state.engine.index_candidates(meta, p.index_id, lower, upper)?);
-            }
-            Some(union.into_iter().collect())
-        }
-        None => None,
-    };
-
-    match candidates {
-        Some(candidates) => {
-            for key in candidates {
-                // Candidates arrive in document-key order, so this skips a
-                // prefix rather than filtering the whole list.
-                if after.is_some_and(|bound| key.as_slice() <= bound) {
-                    continue;
-                }
-                let Some((stamp, doc)) = state.engine.get_record_by_encoded_key(meta, &key)? else {
-                    continue;
-                };
-                examined += 1;
-                if filter::matches(filter, &doc) {
-                    matched.push((stamp, doc));
-                    if stop_after.is_some_and(|n| matched.len() >= n) {
-                        break;
-                    }
-                }
-            }
-        }
-        None => {
-            state.engine.for_each_record_after(meta, after, |_, stamp, doc| {
-                examined += 1;
-                if filter::matches(filter, &doc) {
-                    matched.push((stamp, doc));
-                }
-                Ok(!stop_after.is_some_and(|n| matched.len() >= n))
+            Order::Any => kimmy_storage::CandidateOrder::Any,
+        };
+        let outcome =
+            state.engine.visit_index_candidates(meta, &scan, delivery, |_, stamp, doc| {
+                Ok(recheck.take(stamp, doc))
             })?;
+        match outcome {
+            Some(outcome) => entries = Some(outcome.entries),
+            None => plan = None,
         }
     }
+    if plan.is_none() {
+        state
+            .engine
+            .for_each_record_after(meta, after, |_, stamp, doc| Ok(recheck.take(stamp, doc)))?;
+    }
 
-    let stats = QueryStats {
+    Ok(QueryStats {
         index: plan.as_ref().map(|p| p.index_name.clone()),
         fields_used: plan.as_ref().map_or(0, |p| p.fields_used),
-        examined,
-        matched: matched.len(),
+        examined: recheck.examined,
+        matched: recheck.matched,
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
+        index_entries: entries,
         id_lookup: false,
-    };
-    Ok((matched, stats))
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +1028,7 @@ impl PlannedAccess {
             examined: outcome.examined as usize,
             matched: outcome.matched as usize,
             probes,
+            index_entries: None,
             id_lookup,
         }
     }
@@ -1485,6 +1650,7 @@ mod tests {
             examined: 0,
             matched: 0,
             probes,
+            index_entries: None,
             id_lookup: false,
         }
     }
@@ -1611,5 +1777,140 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2], "the straddling document must not be lost to a stale plan");
         assert!(stats.index.is_none(), "the fallback is a collection scan, and explain says so");
+    }
+    // -----------------------------------------------------------------------
+    // Bounded reads (ADR-098)
+    // -----------------------------------------------------------------------
+
+    /// A collection of `n` documents `{_id: i, a: i % 10, b: i % 3}`, some
+    /// without `a` — the ties and gaps a sort has to get right.
+    fn seeded(n: i64) -> (SharedState, CollectionMeta, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        let meta = state.engine.get_collection("app", "docs").unwrap();
+        for i in 0..n {
+            let doc = if i % 13 == 0 {
+                bson::doc! { "_id": i, "b": i % 3 }
+            } else {
+                bson::doc! { "_id": i, "a": i % 10, "b": i % 3 }
+            };
+            state.engine.insert(&meta, doc).unwrap();
+        }
+        (state, meta, dir)
+    }
+
+    #[test]
+    fn a_count_visits_every_match_and_keeps_none_of_them() {
+        // `count` used to be `collect_matching(..).len()`: every matching
+        // document decoded into a vector and then counted. The visitor sees
+        // each once and holds nothing; the stats are the count.
+        let (state, meta, _dir) = seeded(250);
+        let filter = filter::parse(&bson::doc! { "b": 1 }).unwrap();
+
+        let mut visited = 0usize;
+        let stats = visit_matching(&state, &meta, &filter, Order::Any, None, |_, doc| {
+            assert_eq!(doc.get_i64("b").unwrap(), 1, "only matches reach the visitor");
+            visited += 1;
+        })
+        .unwrap();
+
+        let expected = (0..250i64).filter(|i| i % 3 == 1).count();
+        assert_eq!(visited, expected);
+        assert_eq!(stats.matched, expected, "the count is the stats, not a vector's length");
+        assert_eq!(stats.examined, 250, "a scan examines everything");
+    }
+
+    #[test]
+    fn a_bounded_sort_window_gives_the_page_the_full_sort_gave() {
+        // The reference is the old path exactly: every match, in `_id`
+        // order, through a stable `sort_by` on the caller's keys, then
+        // `skip`/`take`. The heap is fed the same matches in a scrambled
+        // order and must produce the same page — which is what the `_id`
+        // tie-break exists to guarantee.
+        let (state, meta, _dir) = seeded(300);
+        let filter = filter::parse(&bson::doc! {}).unwrap();
+        let (all, _) = collect_matching_stamped_after(&state, &meta, &filter, None, None).unwrap();
+
+        // A fixed-seed shuffle, so a failure reproduces.
+        let mut scrambled = all.clone();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        for i in (1..scrambled.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            scrambled.swap(i, (seed % (i as u64 + 1)) as usize);
+        }
+
+        let sorts = [
+            bson::doc! { "a": 1 },
+            bson::doc! { "a": -1 },
+            bson::doc! { "a": 1, "b": -1 },
+            bson::doc! { "b": 1 },
+            bson::doc! { "_id": -1 },
+            bson::doc! { "missing": 1 },
+        ];
+        let windows = [(0usize, 10usize), (0, 1), (7, 5), (95, 10), (290, 20), (300, 5), (0, 300)];
+
+        for spec in &sorts {
+            let sort = shape::parse_sort(spec).unwrap();
+            let mut reference = all.clone();
+            reference.sort_by(|x, y| shape::compare(&sort, &x.1, &y.1));
+
+            for &(skip, limit) in &windows {
+                let expected: Vec<i64> = reference
+                    .iter()
+                    .skip(skip)
+                    .take(limit)
+                    .map(|(_, d)| d.get_i64("_id").unwrap())
+                    .collect();
+
+                let order = with_id_tiebreak(&sort);
+                let mut top = TopK::new(skip + limit, &order);
+                for (stamp, doc) in scrambled.iter().cloned() {
+                    top.offer(stamp, doc);
+                }
+                let got: Vec<i64> = top
+                    .into_sorted()
+                    .into_iter()
+                    .skip(skip)
+                    .map(|(_, d)| d.get_i64("_id").unwrap())
+                    .collect();
+                assert_eq!(got, expected, "sort {spec:?}, skip {skip}, limit {limit}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_tiebreak_is_only_added_when_id_is_not_already_a_key() {
+        let by_a = shape::parse_sort(&bson::doc! { "a": 1 }).unwrap();
+        let order = with_id_tiebreak(&by_a);
+        assert_eq!(order.len(), 2);
+        assert_eq!(order[1].path, "_id");
+        assert!(!order[1].descending);
+
+        // A sort that already decides by `_id` is total as it stands, and
+        // appending an ascending `_id` behind a descending one would be
+        // harmless but wrong in spirit.
+        let by_id_desc = shape::parse_sort(&bson::doc! { "_id": -1 }).unwrap();
+        assert_eq!(with_id_tiebreak(&by_id_desc), by_id_desc);
+        let mixed = shape::parse_sort(&bson::doc! { "a": 1, "_id": -1 }).unwrap();
+        assert_eq!(with_id_tiebreak(&mixed), mixed);
+    }
+
+    #[test]
+    fn a_window_of_zero_holds_nothing() {
+        // `limit: 0` is a legal request for an empty page; the heap must not
+        // treat a capacity of zero as unbounded.
+        let (state, meta, _dir) = seeded(3);
+        let filter = filter::parse(&bson::doc! {}).unwrap();
+        let (all, _) = collect_matching_stamped_after(&state, &meta, &filter, None, None).unwrap();
+
+        let order = with_id_tiebreak(&[]);
+        let mut top = TopK::new(0, &order);
+        for (stamp, doc) in all {
+            top.offer(stamp, doc);
+        }
+        assert!(top.into_sorted().is_empty());
     }
 }

@@ -449,8 +449,16 @@ wrong number rather than a short list.
 > in different orders. Add an explicit `sort` when the subset matters — this
 > matches MongoDB.
 
-An unsorted query can stop scanning once it has `skip + limit` matches. A sorted
-one must see every match before it can page.
+An unsorted query — or one sorted by `{"_id": 1}`, the order every access path
+already delivers — stops scanning once it has `skip + limit` matches and holds
+only the page: what it skips is counted past, not kept. A sorted query must see
+every match before it can page, but it holds only the `skip + limit` least of
+them, and **that window may not exceed 10,000**. A sorted `find` asking for
+more is refused with `400` rather than clamped — a clamped `skip` would return
+a different page and say nothing. To go deeper through a sorted order, narrow
+the filter on the sort field to where the last page ended, which costs a page
+instead of everything before it; or sort by `_id` and use a cursor
+([ADR-098](decisions.md)).
 
 ### Cursors
 

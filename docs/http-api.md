@@ -297,6 +297,15 @@ makes the node list from [Topology](#topology) usable for reads as well as
 failover. End the walk on a short or empty page, not on a missing token.
 [Cursors](query-language.md#cursors) has the full contract.
 
+**A sorted `find` holds `skip + limit` documents, and that window stops at
+10,000.** A larger one is refused with `400` rather than clamped — a clamped
+`skip` would return a different page and say nothing. An unsorted `find`, or
+one sorted by `{"_id": 1}`, holds only its page and has no such ceiling,
+though `skip` still visits everything it steps over. To page deeper through
+another order, narrow the filter on the sort field to where the last page
+ended — `{"score": {"$lt": <last score seen>}}` — which costs a page rather
+than everything before it ([ADR-098](decisions.md)).
+
 ### Count, update, delete by filter
 
 ```bash
@@ -490,7 +499,13 @@ an index was used:
 `strategy` is `collectionScan`, `index`, `indexUnion` (a `$in` union of
 probes) or `idLookup` (the filter pinned `_id`, answered through the primary
 key with no index). Treat an unrecognized value as an access path this client
-does not know about — new names are additive.
+does not know about — new names are additive. `indexEntriesRead` appears when
+an index answered a read: how much of the index was touched, as distinct from
+how many documents were examined — an equality stopped by `limit` reads as
+many entries as it returns, a range put in `_id` order reads the whole range.
+
+`count` visits every match and holds none of them: its cost is the time of
+the scan, not the memory of the result.
 
 ---
 

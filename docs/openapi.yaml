@@ -2952,6 +2952,13 @@ components:
           description: |
             Costs work proportional to what it skips. Use `cursor` for paging;
             `skip` is for jumping.
+
+            With a `sort` other than `{"_id": 1}`, `skip + limit` may not
+            exceed 10,000 — that is what the server holds while it sorts — and
+            a larger window is refused with `400` rather than clamped, because
+            a clamped skip would return a different page and say nothing. To
+            page deeper, sort by `_id` and follow `nextCursor`, or narrow the
+            filter on the sort field to where the last page ended.
         explain:
           type: boolean
           default: false
@@ -3052,6 +3059,16 @@ components:
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.
+        indexEntriesRead:
+          type: integer
+          description: |
+            Index entries read, when an index answered a read. How much of the
+            index the query touched, as distinct from how many documents it
+            examined: an equality on a complete key stopped by `limit` reads
+            as many entries as it returns, while a range that had to be put
+            in `_id` order reads the whole range however few documents it
+            returns. Absent for a collection scan, an `idLookup`, and for
+            `update` and `delete`.
 
     ViolationGroup:
       type: object
