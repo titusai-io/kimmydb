@@ -24,6 +24,7 @@ What is tested, how, and — more usefully — *why those particular things*.
 | `kimmyd` | 33 | Config layering and validation, TLS termination, certificate reload, and the serving stack |
 | `kimmy-cli` | 5 | Target parsing, JSON argument errors, and that no `--password` flag exists |
 | `kimmy-cluster` | 62 | Discovery including SRV resolution against a local DNS server, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
+| `kimmy-fuzz-harness` | 3 | Every seed in every fuzz corpus runs clean; the degenerate inputs a fuzzer finds first; the signed token paths are reachable ([Fuzzing](#fuzzing)) |
 
 ---
 
@@ -622,6 +623,95 @@ if verified before being checked, and the check is what caught that.
 
 ---
 
+## Fuzzing
+
+Coverage-guided fuzzing of the surfaces that take attacker-controlled bytes
+([ADR-111](decisions.md)). It sits beside the property tests in the layer
+diagram above, not above them: a property test states an invariant over a
+generator the author designed, and a fuzzer states the same invariant over a
+generator that learns from the code's branches. Each finds what the other's
+generator would not think to try.
+
+**What is fuzzed, and why those.** Every surface below takes bytes from a
+caller who has not authenticated yet, or has authenticated and is not
+trusted. A panic in any of them is a request that takes down a worker; a
+wrong answer is worse, for the usual reason.
+
+| Target | Surface | Beyond "no panic", asserts |
+|---|---|---|
+| `filter_parse` | `find`'s filter document → parse → `matches` over a fixed document set → the index planner | — |
+| `update_parse_apply` | update document → parse → `apply` to each fixture | `_id` is unchanged after any update that applies |
+| `projection_sort_parse` | projection and sort documents → `project`, `sort` | the sort comparator is reflexive and antisymmetric over the fixtures (`sort_by` may panic otherwise) |
+| `aggregate_parse_run` | pipeline → parse → every stage but `$lookup` run in memory over 36 documents under a low document cap | — |
+| `expr_eval` | aggregation expression → parse → `eval` against each fixture | — |
+| `extended_json_bson` | the HTTP edge's JSON ⇄ BSON, from a JSON body and from a generated BSON value | one round trip reaches a fixed point; the decoder accepts everything the encoder emits |
+| `key_encoding` | the order-preserving key encoder over generated BSON pairs | invariant #1 above, plus equal values encode identically, descending inverts, `canonical_cmp` is antisymmetric, and only `Decimal128` is ever refused |
+| `jwt_local_verify` | HS256 verifier: the raw bytes as a bearer token, and a token signed with the fixture secret over generated claims | — |
+| `jwt_oidc_verify` | OIDC verifier against a fixed in-memory JWKS: the raw bytes, and a token signed with the fixture ES256 key over generated claims | an accepted token yields a federated principal |
+
+The fixtures span the type table — arrays, nested documents, `NaN`, an
+infinity, a NUL inside a string, `MinKey`/`MaxKey`, a missing field, an empty
+document — so a filter that parses is also *evaluated* against every shape a
+comparator can get wrong. Targets whose input is a value rather than text draw
+it from the bytes through `arbitrary::Unstructured`, with a generator that
+concentrates on the same edges the key-encoding property test does and adds
+every BSON variant that test leaves out. The verifiers are fuzzed twice over:
+once with the bytes as the token, which covers the parsing that precedes the
+signature check, and once with the bytes as *claims* signed by the fixture
+key, which is the only way to reach the claims deserialiser and the principal
+it builds — an unsigned input never gets past the signature.
+
+**Where the code lives.** The harness bodies are plain functions in
+`crates/kimmy-fuzz-harness`, a workspace member, so `cargo clippy --workspace
+--all-targets` compiles them on every pull request and they cannot rot between
+weekly runs. The libFuzzer entry points are one-liners in `fuzz/fuzz_targets/`,
+a separate root that needs nightly and is excluded from the workspace. Seed
+corpora are under `fuzz/corpus/<target>/`, taken from the documentation's
+examples, and `cargo test -p kimmy-fuzz-harness` runs every seed through its
+harness — which is how a minimised crash, once fixed, becomes a regression test
+on the stable path: drop the reproducer in the corpus directory.
+
+**The first run found two bugs**, neither a panic — both were invariant
+assertions, which is the argument for writing harnesses that assert more than
+"did not crash". Over the seeds alone, before any mutation: `{"$set":
+{"_id.x": 1}}` turned `_id: 7` into `_id: {"x": 1}`. The parser refused the
+literal name `_id` and nothing else, and `path::set` replaces a scalar with a
+document to make room beneath it. The `_id`-is-preserved assertion in
+`update_parse_apply` caught it; the fix refuses any path under `_id`, pinned by
+`operators_may_not_reach_under_id_either`. Then, a few seconds into
+`extended_json_bson`: a binary with subtype `0xde` printed as `"subType":
+"de"` and read back as `"00"` — the encoder wrote the subtype and the decoder
+never looked at it, so any UUID or user-defined binary that passed through a
+client came back generic. The two-byte reproducer is the seed
+`binary_subtype`; `binary_subtypes_survive_the_round_trip` pins the fix.
+
+**Running locally.**
+
+```bash
+rustup toolchain install nightly
+cargo install cargo-fuzz --locked
+
+cargo +nightly fuzz list
+cargo +nightly fuzz run key_encoding -- -max_total_time=60
+cargo +nightly fuzz run filter_parse fuzz/artifacts/filter_parse/crash-…   # replay
+cargo +nightly fuzz tmin filter_parse fuzz/artifacts/filter_parse/crash-…  # minimise
+```
+
+A crash lands under `fuzz/artifacts/<target>/`, which is gitignored. Minimise
+it, fix the bug, copy the minimised input into `fuzz/corpus/<target>/` under a
+descriptive name, and the corpus test keeps it from coming back.
+
+**In CI.** `fuzz.yml` runs weekly and on demand (with a duration input), never
+per pull request: it builds the nine targets once on nightly, hands the
+binaries to a matrix job per target, and runs each for five minutes with a
+30-second per-input timeout and a 2 GiB memory limit. A crash fails that
+target's job and uploads the reproducer for thirty days. The fuzz build has a
+cache of its own, saved only from `main` like every other cache here; one
+sanitizer build of the dependency graph is on the order of a gibibyte, which
+fits the 10 GiB budget beside the stable caches.
+
+---
+
 ## Integration tests
 
 `crates/kimmy-api/tests/api.rs` drives the **real router over a real TCP
@@ -1176,7 +1266,7 @@ a test stays true.
 | Gap | Notes |
 |---|---|
 | Benchmarks do not gate | The vector index, the write path, batched writes, concurrent writers and the planner are all measured against a recorded baseline ([Benchmarks](benchmarks.md)) — but `bench-baseline.py check` is advisory and nothing fails a build on a regression |
-| No fuzzing | The codecs are the obvious target |
+| Fuzzing is short, and stops at the HTTP edge | Nine targets, five minutes each, weekly ([Fuzzing](#fuzzing)). Long enough to find shallow panics and the invariant breaks the harnesses assert; not a campaign. The storage codecs, the cluster wire protocol and the MCP JSON-RPC framing take bytes too and are not fuzzed yet |
 | **Nothing runs for long, or at scale** | Every test finishes in seconds against thousands of documents. Nothing has run for hours, and nothing has been tested near the sizes a real deployment reaches. Bugs that need time or volume to appear — leaks, unbounded growth, degradation as a collection grows — would not be caught by anything here |
 | No crash-consistency tests | Nothing kills a node mid-write and checks what survived. redb is *trusted* for durability rather than verified |
 | Multi-node tests are pairwise and short-lived | 19 integration tests over real sockets and real UDP cover convergence, the handshake, snapshot resync and SWIM. What they do not cover: topologies larger than a pair, partitions healing, or a cluster under sustained write load. Those were driven **by hand** on three daemons and in containers ([verified by hand](#verified-by-hand)), which is not the same as being in the suite |

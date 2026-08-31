@@ -1,0 +1,7 @@
+[ { "$match":  { "status": "shipped" } },
+  { "$group":  { "_id": "$city",
+                 "revenue": { "$sum": "$total" },
+                 "orders":  { "$sum": 1 },
+                 "biggest": { "$max": "$total" } } },
+  { "$sort":   { "revenue": -1 } },
+  { "$limit":  10 } ]

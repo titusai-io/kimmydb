@@ -4413,3 +4413,64 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+
+## ADR-111 — Parsers and token verifiers are fuzzed on a schedule
+
+**Decision.** Nine libFuzzer targets cover the surfaces that take
+attacker-controlled bytes: the filter, update, projection, sort, pipeline and
+expression parsers (each evaluated after parsing, not just parsed), the HTTP
+edge's JSON ⇄ BSON conversion, the order-preserving key encoder, and both
+token verifiers — HS256 with a fixture secret, OIDC with a fixture JWKS held
+in memory. They run weekly and on demand in their own workflow, five minutes
+per target, never per pull request. The harness bodies are plain functions in
+a workspace crate, `kimmy-fuzz-harness`, so the stable PR gate compiles them;
+only the one-line `fuzz_target!` wrappers live outside the workspace, in
+`fuzz/`, where nightly is needed. The seed corpora are committed and run as
+ordinary tests, which is also where a minimised crash goes once it is fixed.
+
+**Why.** [Testing](testing.md) allocates effort by how quietly a bug would
+fail, and every one of these surfaces is reached by bytes from a caller who
+has not yet proven anything: a request body, a bearer header, a document
+that will become an index key. A panic in a parser is a worker gone for one
+request; a wrong answer from the key encoder is an index that silently omits
+documents. Property tests already state the load-bearing invariants over
+generators their authors designed. A coverage-guided fuzzer states the same
+invariants over a generator that learns from the code's branches, and so
+reaches the inputs the author did not think to generate. That the harnesses
+assert invariants and not merely "no panic" is what makes them worth the
+runner time: the first run over the seed corpus, before any mutation, found
+that `{$set: {"_id.x": 1}}` changed a document's identity past a check that
+knew only the literal name, and a few seconds of mutation found the JSON
+boundary writing a binary's subtype and never reading it back. Neither
+panicked. Both are in the changelog.
+
+The split between harness and wrapper is the part that keeps this alive. A
+crate built only by a weekly job breaks the week a function it calls is
+renamed and is noticed the week after; a crate the workspace clippy pass
+compiles breaks in the pull request that renames it. The libFuzzer wrappers
+cannot join the workspace — `libfuzzer-sys` carries a C++ runtime and the
+sanitizer build wants nightly — so the wrappers are made trivial and the
+harnesses are made stable.
+
+**Alternatives.** *Property tests alone* — kept; they are complementary, and
+the fuzz generator for BSON values deliberately mirrors the key-encoding
+property test's edges so the two disagree only where one has found something.
+*Fuzzing per pull request* — rejected for cost: nine targets at even a minute
+each on every push is more runner time than the whole test suite, for a search
+whose yield is proportional to time spent, not to how recently the code
+changed. *OSS-Fuzz* — deferred until the repository is public; it would supply
+the continuous campaign this schedule only approximates, and the harness crate
+is laid out so that adopting it is a build script, not a rewrite. *`cargo fuzz`
+on stable via `--sanitizer none`* — considered for the PR gate and rejected;
+it would still pull the libFuzzer runtime into the workspace, and the crate
+split gives the same compile guarantee with none of it.
+
+**Cost.** One more workspace crate, compiled but not shipped, adding
+`arbitrary` to the dependency graph. A second lockfile under `fuzz/`. Around
+an hour of runner time a week: one sanitizer build shared by the nine run jobs
+through a one-day artifact, plus five minutes each. A fuzz cache on the order
+of a gibibyte, saved only from `main`. And a standing obligation: a red weekly
+run is a bug report against this repository, to be minimised, fixed and turned
+into a seed rather than silenced.
+
+---

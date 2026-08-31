@@ -1,0 +1,1 @@
+{ "$strLenCP": { "$ifNull": [ { "$toLower": "$item" }, "" ] } }

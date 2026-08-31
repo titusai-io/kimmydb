@@ -1,0 +1,1 @@
+{ "a": { "$exists": false }, "b": { "$type": "string" } }

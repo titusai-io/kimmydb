@@ -1,0 +1,1 @@
+{ "$and": [ { "$or": [ { "$ne": ["$status", "new"] }, { "$not": [ "$flag" ] } ] }, { "$cmp": ["$qty", "$price"] } ] }

@@ -12,7 +12,15 @@ members = [
     "crates/kimmy-client",
     "crates/kimmyd",
     "crates/kimmy-cli",
+    # The fuzz harness bodies, as a plain crate so they compile on stable under
+    # the ordinary PR gate. The libFuzzer entry points that call them are in
+    # `fuzz/`, below, which needs nightly and so stays out (ADR-111).
+    "crates/kimmy-fuzz-harness",
 ]
+# Its own root with its own lockfile. `cargo fuzz` builds it with a sanitizer
+# on nightly, and a workspace member would drag `libfuzzer-sys` -- and its C++
+# runtime -- into every `cargo build` here.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.16.4"
@@ -149,6 +157,10 @@ tracing-opentelemetry = { version = "0.33", default-features = false, features =
 # Dev / test
 proptest = "1"
 tempfile = "3"
+# Structured inputs for the fuzz harnesses (ADR-111): turns fuzzer bytes into
+# BSON values and token claims. Pure Rust, and reaches the tree only through
+# `kimmy-fuzz-harness`, which ships nothing.
+arbitrary = "1"
 # The protocol spec and its contract test (ADR-056). Both are dev-only: the
 # server does not read its own specification, and nothing here ships.
 #

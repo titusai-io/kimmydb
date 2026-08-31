@@ -1,0 +1,1 @@
+[ { "$lookup": { "from": "cities", "localField": "city", "foreignField": "name", "as": "cityDoc" } } ]
