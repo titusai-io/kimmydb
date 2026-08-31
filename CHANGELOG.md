@@ -81,6 +81,17 @@ whose defaults are meant to be left alone, and documentation corrections.
   gave it. Defaults are `{1, 1}` and `1`: plain RRF, as before. The MCP
   `hybrid_search` tool and `kimmy hybrid-search` (`--dense-weight`,
   `--lexical-weight`, `--min-overlap`) take the same controls. ADR-094.
+- **`auth.oidc.max_token_lifetime_secs`** (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`),
+  default `900`: a federated token whose own `exp − iat` exceeds it is refused,
+  as is one with no `iat`. A federated principal's role membership is frozen in
+  its access token, so a revocation at the provider was honoured only when the
+  token expired — for however long the provider had chosen (ADR-073). This
+  bounds that window from this side. The refusal is a 401 whose
+  `WWW-Authenticate` challenge names the limit in seconds and nothing about the
+  token. **Before upgrading, check the access-token lifetime your provider
+  mints for this resource:** at or below 900 seconds nothing changes; above it,
+  shorten it at the provider or raise the limit knowingly. Refused outside
+  1–86400; a raised limit is printed in the startup summary. ADR-096.
 
 ### Changed
 

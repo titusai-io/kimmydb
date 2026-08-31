@@ -4547,6 +4547,8 @@ measured default replaces the equal weights. A weight of zero on the lexical
 half is a slower way of running `vector_search`, and the documentation says
 that too.
 
+---
+
 ## ADR-095 — The embedding worker batches provider calls across documents
 
 **Decision.** The worker fills one provider call from the chunks of
@@ -4630,6 +4632,80 @@ And the structural fact batching does not change is worth stating where
 operators size deployments: a collection is embedded by exactly one owner
 node, so adding members does not raise one collection's throughput — it
 raises how many collections embed at once.
+
+---
+
+## ADR-096 — Federated tokens are refused above a maximum lifetime
+
+**Decision.** `OidcVerifier::verify` refuses a token whose own `exp − iat`
+exceeds `auth.oidc.max_token_lifetime_secs`
+(`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`), 900 seconds by default, and refuses a
+token that carries no `iat` at all. The refusal is a 401 whose
+`WWW-Authenticate` challenge carries `error="invalid_token"` and an
+`error_description` naming the limit in seconds and nothing about the token.
+The setting is refused at startup outside 1–86400, by the same function
+`check-config` runs. The check is on the token's two claims and nothing else:
+no clock, and so no leeway.
+
+**Why.** ADR-073 states the window plainly: a federated principal's role
+*membership* is frozen in its access token, because this database makes no
+introspection call, so a revocation at the provider is honoured only when the
+token expires. It named short token lifetimes as the mitigation and left the
+lifetime to the provider. That is a mitigation this node could not see being
+applied — a provider minting day-long tokens was indistinguishable, from here,
+from one minting five-minute tokens, and the security guide's "keep lifetimes
+short" was advice with nothing enforcing it. The lifetime is the one dimension
+of the window that is readable from the token itself, so it is the one this
+node can bound.
+
+Fifteen minutes because of where the providers sit. Their access-token defaults
+fall between five minutes and an hour — Keycloak's is five, Okta's, Google's
+and Entra ID's about an hour — and one of them, Auth0, defaults an API's tokens
+to a day. 900 seconds admits the short defaults outright and refuses the
+day-long tokens that turn the window into a policy. A provider that defaults to
+an hour is not excluded, it is asked a question: shorten the lifetime for this
+resource, which every one of them supports per resource or per client, or raise
+this node's limit — and the error says which number to raise it to, because the
+description names the limit. An operator who raises it does so knowing what it
+costs, which is the property the default is for. A missing `iat` is refused
+rather than waved through because the limit would otherwise be one omitted
+claim away from not applying; RFC 9068 §2.2 makes the claim REQUIRED in a JWT
+access token, so a conforming provider never produces that token.
+
+The limit is checked after the signature and after expiry. After the signature,
+so that only a token the provider really minted is ever answered with anything
+more specific than "invalid"; after expiry, so that a token which is both stale
+and too long-lived is reported as the former, which is the one a client can fix
+by itself. The 60 seconds of leeway (ADR-064) play no part: they exist because
+the provider's clock is somebody else's, and that argument says nothing about
+how long the provider chose to make a token valid for. The description reaches
+the challenge through a response extension the challenge layer reads, rather
+than by the error setting the header itself, so that a more specific
+description never costs the `resource_metadata` pointer (ADR-071).
+
+**Alternatives.** *Token introspection on every request* (RFC 7662) would close
+the window entirely. Rejected: it adds a round trip to the provider on every
+call, makes the provider's availability the database's, and not every provider
+offers the endpoint — Entra ID does not. *A revocation feed* from the provider —
+back-channel logout, a shared-signals stream — rejected because none is
+standard across the providers this federation exists to serve, and a node that
+honoured one provider's feed would be silently unprotected against another's.
+*A warning rather than a refusal above the ceiling*, or no ceiling: rejected
+because every other setting in the section is policed by refusal, and a
+warning printed at startup is a warning nobody reads. *Measuring the remaining
+time rather than the lifetime*: rejected because a long-lived token would then
+be admitted once it had aged enough, which is exactly the token the window is
+about.
+
+**Cost.** An operator whose provider mints access tokens longer than fifteen
+minutes has a change to make on upgrade: shorten the provider's lifetime for
+this resource, or raise `max_token_lifetime_secs`. The refusal names the limit
+so the change is discoverable from the first failed request, and a raised limit
+is printed in the startup summary so it stays visible. A provider that omits
+`iat` cannot be federated with until it stops, and there is no setting for
+that. And the limit is a bound, not a revocation: a membership revoked at the
+provider is still honoured until the token expires, for up to the configured
+number of seconds.
 
 ---
 

@@ -175,12 +175,15 @@ mistyped rather than a different kind of value ([ADR-071](decisions.md)).
 | `sub` | Required to be present; becomes the principal's name. |
 | `exp` | Not past, allowing 60 seconds. **Required to be present.** |
 | `nbf` | Not future, allowing 60 seconds. *Optional* — a token without one is fine. |
+| `iat` | **Required to be present** — without it the lifetime below cannot be measured. RFC 9068 §2.2 requires it in an access token. |
+| Lifetime | `exp − iat` at most `max_token_lifetime_secs`, 900 by default. The token's own two claims: no clock and no leeway in it. |
 | `typ` | `at+jwt`, only when `require_at_jwt = true`. Off by default. |
 
-`iss`, `aud`, `exp` and `sub` are required to be **present**, not merely
+`iss`, `aud`, `exp`, `iat` and `sub` are required to be **present**, not merely
 checked when they happen to appear. A token that simply omits its audience
 would otherwise sail past the audience restriction, which is the whole reason
-the audience is configured.
+the audience is configured — and one that omitted `iat` would sail past the
+lifetime limit the same way.
 
 The 60 seconds of leeway covers `exp` and `nbf` alike. The local HS256 path
 allows none: cluster nodes are expected to agree about the time and are run by
@@ -203,6 +206,43 @@ before `typ` is consulted. The setting is defence in depth for you. With an
 opaque audience it is the only check of its kind, so turn it on — after
 decoding a real token from your provider and confirming what it stamps
 ([ADR-072](decisions.md)).
+
+#### The lifetime limit, and why it is 900 seconds
+
+A federated principal's role *membership* is frozen in its access token. This
+database makes no introspection call — verification is a pure function of the
+token, the key set and the configuration, which is what keeps authentication
+free on the request path — so when the provider revokes someone's membership,
+this node honours the old claim until that token expires
+([ADR-073](decisions.md)). The width of that window is the token's own
+lifetime, and it is the provider that chooses it.
+`auth.oidc.max_token_lifetime_secs` is where this node bounds it: a token whose
+`exp − iat` exceeds the limit is refused, however recently it was minted and
+however little of it remains.
+
+**900 seconds by default.** Providers default access tokens to somewhere
+between five minutes and an hour, and a few to a day. Fifteen minutes admits
+the short defaults outright and asks the rest a question rather than
+answering it silently: shorten the lifetime the provider mints for this
+resource — every provider this federation is written against can do that per
+resource or per client — or raise the limit knowingly. The question arrives on
+the first request: the 401 carries `error="invalid_token"` with an
+`error_description` naming the limit in seconds and nothing about the token. A
+raised limit is printed in the startup summary, and the setting is refused
+outside 1–86400 ([ADR-096](decisions.md)).
+
+The check is on the token's two claims and nothing else. It does not consult
+the clock, so the 60 seconds of leeway above play no part in it: the leeway
+exists because the provider's clock is somebody else's, and that says nothing
+about how long the provider chose to make a token valid for. A token with no
+`iat` is refused because its lifetime cannot be measured — accepting it would
+put the limit one omitted claim away from not applying. RFC 9068 §2.2
+requires the claim in a JWT access token, so a conforming provider never omits
+it.
+
+What this does not do is revoke anything. A membership revoked at the provider
+is still honoured until the token expires; the limit says how long that can
+be, and no longer.
 
 ### Refusals say how to authenticate
 
@@ -324,7 +364,10 @@ local user who happened to share the asserted name would silently decide whether
 the federated caller could connect.
 
 So the session ends where it began: at the provider, and at the moment the
-current token expires. **Keep federated token lifetimes short.**
+current token expires — which is at most `max_token_lifetime_secs` after it was
+issued, 900 seconds by default, because this node refuses a token that would
+live longer ([the lifetime limit](#the-lifetime-limit-and-why-it-is-900-seconds)).
+Keep the provider's lifetime at or below that rather than raising it.
 `/v1/auth/refresh` refuses a federated principal rather than issuing a
 replacement — minting a local token from a federated identity would shed the
 origin flag and outlive the provider's say in it ([ADR-065](decisions.md)).
@@ -619,7 +662,9 @@ surfaces either way.
 - Their *membership* is not. The `roles` claim is frozen in the provider's
   access token and this database makes no introspection call, so if the provider
   revokes someone's membership, this node honours the old claim until that token
-  expires. Short access-token lifetimes are the mitigation.
+  expires. That window is bounded by `auth.oidc.max_token_lifetime_secs`, 900
+  seconds by default: a token that would live longer is refused
+  ([ADR-096](decisions.md)).
 
 **Deleting a role leaves its name on holders' records**, where it resolves to
 nothing — as does a mapping naming a role that was never created. The
@@ -788,7 +833,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
 | **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
-| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider and keep token lifetimes short |
+| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; the node refuses a federated token valid for longer than `max_token_lifetime_secs` (900 s by default), so the revocation is honoured within that long ([ADR-096](decisions.md)) |
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
 | **Rate limiting covers login only** | ✅ login · 📋 the rest | See [Login rate limiting](#login-rate-limiting). Every other route is unbounded; limit at a proxy if you need it |
 | **Audit log** | ✅ Built | Authorization decisions at the `kimmy::audit` target; `audit.mode` selects how much. See [Operations](operations.md#the-audit-log) |

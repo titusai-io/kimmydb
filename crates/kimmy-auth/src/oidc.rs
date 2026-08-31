@@ -43,6 +43,29 @@ pub const OIDC_LEEWAY_SECS: u64 = 60;
 /// key verified as though it were a shared secret.
 pub const OIDC_ALGORITHMS: [Algorithm; 2] = [Algorithm::RS256, Algorithm::ES256];
 
+/// The longest a federated token may be valid for, by its own `exp − iat`,
+/// unless the operator says otherwise (ADR-096).
+///
+/// Fifteen minutes. A federated principal's role *membership* is frozen in its
+/// access token — this database makes no introspection call — so a revocation
+/// at the provider is honoured only when the token expires (ADR-073). That
+/// window is exactly the token's lifetime, and this is the only place it can
+/// be bounded from this side. Providers default access tokens to somewhere
+/// between five minutes and an hour, a few to a day; 900 seconds admits the
+/// short defaults outright, asks the hour-long ones to be shortened for this
+/// resource or the limit raised, and refuses the day-long tokens that turn
+/// the window into a policy.
+pub const DEFAULT_MAX_TOKEN_LIFETIME_SECS: u64 = 900;
+
+/// The largest value `max_token_lifetime_secs` accepts: one day.
+///
+/// A ceiling rather than a warning, in keeping with how every other setting
+/// here is policed. Past a day the setting no longer bounds the window ADR-073
+/// describes; it records a decision not to have one, and that is a decision an
+/// operator should have to make by shortening the provider's lifetime rather
+/// than by adding a zero here.
+pub const MAX_TOKEN_LIFETIME_CEILING_SECS: u64 = 86_400;
+
 /// The one scheme an audience can carry and still be a resource identifier.
 const HTTPS_SCHEME: &str = "https://";
 
@@ -103,7 +126,7 @@ impl RoleMapping {
 /// One issuer, not a list. A second issuer means a second trust root, and the
 /// question "which of these may say a subject is an analyst" has no answer this
 /// round — see ADR-064.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OidcSettings {
     /// The `iss` a token must carry, matched exactly.
     pub issuer: String,
@@ -150,6 +173,35 @@ pub struct OidcSettings {
     /// time. The second check cannot be moved to startup — a role is editable
     /// while the process runs.
     pub allow_federated_admin: bool,
+    /// Refuse a token whose own `exp − iat` exceeds this many seconds
+    /// (ADR-096).
+    ///
+    /// Defaults to [`DEFAULT_MAX_TOKEN_LIFETIME_SECS`]. The check is on the
+    /// token's two claims and nothing else: it does not consult the clock, so
+    /// the leeway that softens `exp` and `nbf` plays no part in it, and a
+    /// token is refused or accepted on this ground identically on every node
+    /// and at every moment of its life. A token with no `iat` is refused too,
+    /// because its lifetime cannot be bounded; RFC 9068 §2.2 requires the
+    /// claim in an access token.
+    pub max_token_lifetime_secs: u64,
+}
+
+impl Default for OidcSettings {
+    /// Not derived, because derived would make the lifetime limit zero — a
+    /// value that refuses every token and that `validate` rejects. The other
+    /// fields are empty, as before; a default `OidcSettings` is a starting
+    /// point for `..Default::default()`, not a configuration.
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            audience: String::new(),
+            roles_claim: String::new(),
+            role_mappings: Vec::new(),
+            require_at_jwt: false,
+            allow_federated_admin: false,
+            max_token_lifetime_secs: DEFAULT_MAX_TOKEN_LIFETIME_SECS,
+        }
+    }
 }
 
 impl OidcSettings {
@@ -206,6 +258,16 @@ impl OidcSettings {
             return Err(AuthError::InvalidResourceIdentifier {
                 audience: self.audience.clone(),
                 reason: reason.to_string(),
+            });
+        }
+
+        // Both ends are refused, not warned about. Zero would refuse every
+        // token the provider ever mints, and more than a day is the setting
+        // being used to switch itself off — see the ceiling's own note.
+        if !(1..=MAX_TOKEN_LIFETIME_CEILING_SECS).contains(&self.max_token_lifetime_secs) {
+            return Err(AuthError::InvalidTokenLifetimeLimit {
+                secs: self.max_token_lifetime_secs,
+                max: MAX_TOKEN_LIFETIME_CEILING_SECS,
             });
         }
 
@@ -291,10 +353,10 @@ impl OidcVerifier {
 
     /// Verify a token and recover the principal it authorizes.
     ///
-    /// Signature, issuer, audience, expiry and not-before. No storage is
-    /// consulted and none exists to consult: a federated subject has no local
-    /// user record, which is also why token-version revocation does not apply
-    /// to it (ADR-065).
+    /// Signature, issuer, audience, expiry, not-before and lifetime. No storage
+    /// is consulted and none exists to consult: a federated subject has no
+    /// local user record, which is also why token-version revocation does not
+    /// apply to it (ADR-065).
     pub fn verify(&self, token: &str) -> Result<Principal> {
         let header = decode_header(token).map_err(|_| AuthError::InvalidToken)?;
         if !OIDC_ALGORITHMS.contains(&header.alg) {
@@ -335,6 +397,16 @@ impl OidcVerifier {
             })?
             .claims;
 
+        // After the signature, so that only a token the provider really minted
+        // is ever answered with anything more specific than "invalid" — and
+        // after expiry, so that a token which is both stale and too long-lived
+        // is reported as the former, which is what the caller can fix by
+        // itself. The lifetime is the token's own `exp − iat`, with no clock
+        // and no leeway in it: the leeway exists because the provider's clock
+        // is somebody else's, and that argument says nothing about how long
+        // the provider chose to make a token valid for (ADR-096).
+        self.check_lifetime(&claims)?;
+
         let subject = claims.get("sub").and_then(Value::as_str).ok_or(AuthError::InvalidToken)?;
         // The inline grants are final; the role *names* are not resolved here,
         // because resolving them needs the storage engine and this function has
@@ -342,6 +414,32 @@ impl OidcVerifier {
         // can finish the job — see `Principal::with_roles`.
         Ok(Principal::federated(subject, self.grants_for(&claims))
             .with_roles(self.roles_for(&claims)))
+    }
+
+    /// Refuse a token whose own `exp − iat` exceeds the configured limit.
+    ///
+    /// `exp` is present, because `verify` required it before this runs. `iat`
+    /// is not made required the same way, deliberately: a token that omits it
+    /// is not malformed, it is unbounded, and the distinction is worth a
+    /// separate error because the fix is on the provider's side. RFC 9068 §2.2
+    /// makes `iat` REQUIRED in a JWT access token, so a provider that omits it
+    /// is already outside the profile this federation is written against.
+    ///
+    /// An `exp` before `iat` counts as a lifetime of zero rather than an error.
+    /// It can only be the provider's clock, and the expiry check has already
+    /// said whatever needs saying about that.
+    fn check_lifetime(&self, claims: &Value) -> Result<()> {
+        let max_secs = self.settings.max_token_lifetime_secs;
+        let Some(exp) = numeric_date(claims, "exp") else {
+            return Err(AuthError::InvalidToken);
+        };
+        let Some(iat) = numeric_date(claims, "iat") else {
+            return Err(AuthError::TokenLifetimeUnbounded { max_secs });
+        };
+        if exp.saturating_sub(iat) > max_secs {
+            return Err(AuthError::TokenLifetimeExceeded { max_secs });
+        }
+        Ok(())
     }
 
     /// The key a token's `kid` names.
@@ -423,6 +521,22 @@ fn is_access_token_type(typ: Option<&str>) -> bool {
         let typ = typ.trim();
         typ.eq_ignore_ascii_case("at+jwt") || typ.eq_ignore_ascii_case("application/at+jwt")
     })
+}
+
+/// A claim read as an RFC 7519 §2 NumericDate, in whole seconds.
+///
+/// Integers are what every provider emits, but the definition admits a
+/// non-integer, and jsonwebtoken itself reads `exp` as a float — so a token
+/// it accepted must not be refused here for carrying `1700000000.0`. A
+/// negative value or a non-number reads as absent, which the caller treats as
+/// the claim being missing.
+fn numeric_date(claims: &Value, claim: &str) -> Option<u64> {
+    match claims.get(claim)? {
+        Value::Number(n) => n
+            .as_u64()
+            .or_else(|| n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64)),
+        _ => None,
+    }
 }
 
 /// The role values a token carries, from the configured claim.
@@ -521,13 +635,19 @@ mod tests {
         jsonwebtoken::encode(&header, &claims, &signing_key(alg)).expect("signed")
     }
 
+    /// The lifetime the stub provider mints. Ten minutes: inside the shipped
+    /// limit, so every test built on this fixture also exercises the default
+    /// lifetime check rather than a raised one.
+    const FIXTURE_LIFETIME_SECS: u64 = 600;
+
     fn claims(roles: Value) -> Value {
+        let issued = now();
         json!({
             "sub": "ada@example.com",
             "iss": ISSUER,
             "aud": AUDIENCE,
-            "exp": now() + 3600,
-            "iat": now(),
+            "exp": issued + FIXTURE_LIFETIME_SECS,
+            "iat": issued,
             "roles": roles,
         })
     }
@@ -547,6 +667,7 @@ mod tests {
             // exercises the configuration an operator gets without asking for
             // anything, which is the one that has to keep working.
             require_at_jwt: false,
+            max_token_lifetime_secs: DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         }
     }
 
@@ -1030,6 +1151,171 @@ mod tests {
         assert!(principal.can(Action::Read, "sales", Some("orders")));
         assert!(principal.can(Action::Write, "hr", Some("people")));
         assert!(!principal.can(Action::Write, "sales", Some("orders")));
+    }
+
+    // -----------------------------------------------------------------------
+    // The maximum lifetime (ADR-096)
+    // -----------------------------------------------------------------------
+
+    /// A token minted `issued_ago` seconds ago that the provider made valid
+    /// for `lifetime` seconds.
+    fn token_living(issued_ago: u64, lifetime: u64) -> String {
+        let issued = now() - issued_ago;
+        let mut claims = claims(json!(["kimmydb-analyst"]));
+        claims["iat"] = json!(issued);
+        claims["exp"] = json!(issued + lifetime);
+        sign(Algorithm::RS256, Some(KID), claims)
+    }
+
+    fn verifier_allowing(max_token_lifetime_secs: u64) -> OidcVerifier {
+        OidcVerifier::new(OidcSettings { max_token_lifetime_secs, ..settings() })
+            .unwrap()
+            .with_keys(jwks(Algorithm::RS256, KID))
+    }
+
+    #[test]
+    fn the_default_lifetime_limit_is_fifteen_minutes() {
+        // The number the ADR argues for: admits the five-minute provider
+        // defaults outright, refuses the day-long tokens that turn the
+        // ADR-073 window into a policy, and asks the hour-long defaults in
+        // between to move. Pinned so that changing it is a decision and not
+        // a drive-by.
+        assert_eq!(DEFAULT_MAX_TOKEN_LIFETIME_SECS, 900);
+        assert_eq!(OidcSettings::default().max_token_lifetime_secs, 900);
+        assert_eq!(settings().max_token_lifetime_secs, 900, "the fixture runs the default");
+    }
+
+    #[test]
+    fn a_token_whose_lifetime_is_exactly_the_limit_is_accepted() {
+        // The bound is inclusive. A provider configured to exactly this
+        // node's limit — the obvious thing to do after reading the error —
+        // must have its tokens accepted, not refused by one second.
+        let token = token_living(0, DEFAULT_MAX_TOKEN_LIFETIME_SECS);
+        assert!(verifier(Algorithm::RS256).verify(&token).is_ok());
+    }
+
+    #[test]
+    fn a_token_one_second_over_the_limit_is_refused_with_the_limit_named() {
+        let token = token_living(0, DEFAULT_MAX_TOKEN_LIFETIME_SECS + 1);
+
+        match verifier(Algorithm::RS256).verify(&token) {
+            Err(AuthError::TokenLifetimeExceeded { max_secs }) => assert_eq!(max_secs, 900),
+            other => panic!("expected a lifetime refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_token_with_no_iat_is_refused_because_its_lifetime_is_unbounded() {
+        // Without `iat` there is nothing to measure the lifetime from, and
+        // accepting the token would make the limit one omitted claim away
+        // from not applying. RFC 9068 §2.2 requires the claim, so a conforming
+        // provider never produces this.
+        let mut undated = claims(json!(["kimmydb-analyst"]));
+        undated.as_object_mut().unwrap().remove("iat");
+        let token = sign(Algorithm::RS256, Some(KID), undated);
+
+        match verifier(Algorithm::RS256).verify(&token) {
+            Err(AuthError::TokenLifetimeUnbounded { max_secs }) => assert_eq!(max_secs, 900),
+            other => panic!("expected an unbounded-lifetime refusal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_lifetime_is_the_tokens_own_and_not_its_remaining_time() {
+        // Two tokens that both expire 100 seconds from now. One was minted 800
+        // seconds ago and one 1000 seconds ago; only the second exceeds the
+        // limit, and it does so however little of it remains. Measuring the
+        // remaining time instead would let a long-lived token through once it
+        // had aged enough, which is precisely the token ADR-073's window is
+        // about.
+        let verifier = verifier(Algorithm::RS256);
+        assert!(verifier.verify(&token_living(800, 900)).is_ok());
+        assert!(matches!(
+            verifier.verify(&token_living(1000, 1100)),
+            Err(AuthError::TokenLifetimeExceeded { .. })
+        ));
+    }
+
+    #[test]
+    fn the_clock_leeway_plays_no_part_in_the_lifetime() {
+        // The leeway exists because the provider's clock is somebody else's.
+        // It softens `exp` and `nbf` against *this* clock; the lifetime is a
+        // difference of two of the provider's own claims, so there is no clock
+        // in it to be lenient about. A token one second over is over, even
+        // though one second is well inside the sixty of leeway in force.
+        let over_by_one = token_living(0, DEFAULT_MAX_TOKEN_LIFETIME_SECS + 1);
+        assert!(matches!(
+            verifier(Algorithm::RS256).verify(&over_by_one),
+            Err(AuthError::TokenLifetimeExceeded { .. })
+        ));
+        assert_eq!(OIDC_LEEWAY_SECS, 60, "the leeway this test claims to be inside");
+    }
+
+    #[test]
+    fn a_token_that_expired_before_it_was_issued_is_not_a_lifetime_failure() {
+        // Only the provider's clock can produce this, and the expiry check
+        // already says what needs saying. Reported as expired, not as
+        // over-long, and never as a panic from the subtraction.
+        let mut backwards = claims(json!(["kimmydb-analyst"]));
+        backwards["iat"] = json!(now());
+        backwards["exp"] = json!(now() - 600);
+        let token = sign(Algorithm::RS256, Some(KID), backwards);
+
+        assert!(matches!(verifier(Algorithm::RS256).verify(&token), Err(AuthError::TokenExpired)));
+    }
+
+    #[test]
+    fn a_raised_limit_admits_a_longer_token() {
+        // The operator whose provider mints hour-long tokens raises the limit
+        // knowingly. The setting has to be what decides, not the constant.
+        let hour = token_living(0, 3600);
+        assert!(matches!(
+            verifier(Algorithm::RS256).verify(&hour),
+            Err(AuthError::TokenLifetimeExceeded { max_secs: 900 })
+        ));
+        assert!(verifier_allowing(3600).verify(&hour).is_ok());
+        assert!(matches!(
+            verifier_allowing(3599).verify(&hour),
+            Err(AuthError::TokenLifetimeExceeded { max_secs: 3599 })
+        ));
+    }
+
+    #[test]
+    fn a_fractional_numeric_date_is_read_as_its_whole_seconds() {
+        // RFC 7519 §2 admits a non-integer NumericDate and jsonwebtoken reads
+        // `exp` as a float, so a token it accepted must not be refused here
+        // for carrying one.
+        let claims = json!({ "iat": 1_700_000_000.5, "exp": 1_700_000_900.0 });
+        assert_eq!(numeric_date(&claims, "iat"), Some(1_700_000_000));
+        assert_eq!(numeric_date(&claims, "exp"), Some(1_700_000_900));
+        // Anything that is not a non-negative number is absent.
+        assert_eq!(numeric_date(&json!({ "iat": "1700000000" }), "iat"), None);
+        assert_eq!(numeric_date(&json!({ "iat": -1 }), "iat"), None);
+        assert_eq!(numeric_date(&json!({}), "iat"), None);
+    }
+
+    #[test]
+    fn a_lifetime_limit_outside_its_bounds_is_refused_at_startup() {
+        // Zero would refuse every token; more than a day is the setting being
+        // used to switch itself off. Both ends are refused, and the check the
+        // configuration layer calls is the one the verifier makes, so
+        // `check-config` cannot bless what the node refuses.
+        for secs in [0, MAX_TOKEN_LIFETIME_CEILING_SECS + 1] {
+            let settings = OidcSettings { max_token_lifetime_secs: secs, ..settings() };
+            match settings.validate() {
+                Err(AuthError::InvalidTokenLifetimeLimit { secs: got, max }) => {
+                    assert_eq!(got, secs);
+                    assert_eq!(max, 86_400);
+                }
+                other => panic!("{secs} should be refused, got {other:?}"),
+            }
+            assert!(OidcVerifier::new(settings).is_err());
+        }
+        for secs in [1, DEFAULT_MAX_TOKEN_LIFETIME_SECS, MAX_TOKEN_LIFETIME_CEILING_SECS] {
+            OidcSettings { max_token_lifetime_secs: secs, ..settings() }
+                .validate()
+                .unwrap_or_else(|e| panic!("{secs} should be accepted: {e}"));
+        }
     }
 
     // -----------------------------------------------------------------------

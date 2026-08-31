@@ -63,6 +63,7 @@ fails fast on a bad volume mount.
 | `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
 | `auth.oidc.roles_claim` | `KIMMY_OIDC_ROLES_CLAIM` | `roles` | `groups` for Entra ID. Getting it wrong is quiet — every federated caller arrives with no grants |
 | `auth.oidc.refresh_interval_secs` | `KIMMY_OIDC_REFRESH_INTERVAL_SECS` | `300` | How often the provider's JWKS is re-fetched. An unknown `kid` triggers one rate-limited refetch besides |
+| `auth.oidc.max_token_lifetime_secs` | `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` | `900` | The longest a federated token may be valid for, by its own `exp − iat`. It bounds how long a revocation at the provider goes unhonoured here (ADR-073); a token over it is a 401 whose challenge names the limit, and one with no `iat` is refused too. 1–86400 — see [Security](security.md#the-lifetime-limit-and-why-it-is-900-seconds) |
 | `auth.oidc.role_mappings` | — | `[]` | File-only. A claim value and the grants it is worth. **`admin` is refused** — see [Security](security.md) |
 | `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
@@ -106,6 +107,7 @@ runtime confusion:
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
+| `auth.oidc.max_token_lifetime_secs` outside 1–86400 | Zero would refuse every federated token; more than a day is the setting being used to switch itself off, which is a decision to make at the provider rather than by adding a zero here (ADR-096) |
 
 Boolean flags are one-way: passing `--insecure-no-auth` turns it on, but
 omitting it does **not** turn off what the config file asked for.

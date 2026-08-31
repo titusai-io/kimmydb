@@ -1712,6 +1712,7 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
