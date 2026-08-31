@@ -1340,6 +1340,31 @@ mod tests {
         .is_err());
     }
 
+    /// `$match` is parsed with no names bound, so a `let` variable cannot reach
+    /// it — which is what lets the executor hoist a leading `$match` out of the
+    /// per-input-document loop and apply it to the foreign collection once.
+    /// `$expr` put variables within a filter's reach (ADR-106 over ADR-105), so
+    /// the boundary is worth holding down: a `let` name is refused, and
+    /// `$$ROOT` is accepted because it names the foreign document either way.
+    /// If this ever starts parsing, `exec::lookup_pipeline`'s hoist is wrong.
+    #[test]
+    fn a_match_in_a_lookup_sub_pipeline_cannot_read_the_let() {
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"oid": "$_id"},
+                "pipeline": [{"$match": {"$expr": {"$eq": ["$order", "$$oid"]}}}], "as": "items"
+            }}])
+            .is_err()
+        );
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"oid": "$_id"},
+                "pipeline": [{"$match": {"$expr": {"$gt": ["$$ROOT.qty", 0]}}}], "as": "items"
+            }}])
+            .is_ok()
+        );
+    }
+
     /// The executor's loop, in miniature: bind the `let` per input document
     /// and run the sub-pipeline over the foreign documents with it in scope.
     /// What `kimmy-api` does with a storage handle, done here over vectors so

@@ -928,6 +928,21 @@ mod tests {
         assert!(!hits(q, doc! { "lines": [1, 2, 3] }));
     }
 
+    /// `$$ROOT` was a parse-time refusal in a filter until the expression scope
+    /// (ADR-105) bound it everywhere. It names whatever document the filter is
+    /// being applied to — which inside `$elemMatch` is the element, not the
+    /// document that contains it.
+    #[test]
+    fn expr_reads_the_document_under_consideration_through_root() {
+        let q = doc! { "$expr": { "$gt": ["$$ROOT.spent", "$budget"] } };
+        assert!(hits(q.clone(), doc! { "spent": 120, "budget": 100 }));
+        assert!(!hits(q, doc! { "spent": 80, "budget": 100 }));
+
+        let q = doc! { "lines": { "$elemMatch": { "$expr": { "$gt": ["$$ROOT.qty", 5] } } } };
+        assert!(hits(q.clone(), doc! { "qty": 0, "lines": [ { "qty": 9 } ] }));
+        assert!(!hits(q, doc! { "qty": 9, "lines": [ { "qty": 1 } ] }));
+    }
+
     #[test]
     fn expr_treats_a_type_violation_as_no_match() {
         // Adding to a string is an error in a pipeline; here it is a document
@@ -946,7 +961,11 @@ mod tests {
             Err(Error::UnsupportedOperator(_))
         ));
         assert!(matches!(parse(&doc! { "$expr": { "$gt": ["$a"] } }), Err(Error::InvalidQuery(_))));
-        assert!(matches!(parse(&doc! { "$expr": "$$ROOT" }), Err(Error::UnsupportedOperator(_))));
+        // A `$$name` nothing binds is still refused before a document is read.
+        // `$$ROOT` and `$$CURRENT` are not such a name: the expression scope
+        // (ADR-105) binds them everywhere, so a filter's `$expr` takes them too.
+        assert!(parse(&doc! { "$expr": "$$nope" }).is_err());
+        assert!(parse(&doc! { "$expr": { "$gt": ["$$ROOT.a", 1] } }).is_ok());
         // `$expr` is not a field operator.
         assert!(parse(&doc! { "a": { "$expr": { "$gt": ["$a", 1] } } }).is_err());
     }

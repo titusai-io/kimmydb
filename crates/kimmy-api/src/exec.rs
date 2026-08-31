@@ -1650,10 +1650,16 @@ fn lookup(
 /// there is no single key to index the foreign side by. What keeps it
 /// tolerable: the foreign collection is read from storage once and held for
 /// the duration, and a leading `$match` is applied once before the loop, since
-/// a filter cannot read `let` (the filter language has no variables, so a
-/// `$$name` inside one is a parse error — if that changes, this hoist must be
-/// conditioned on the filter not using them). A join on one key belongs in the
-/// `localField`/`foreignField` form, which is a single pass.
+/// a filter cannot read `let`. That is still true now that `$expr` has put
+/// variables within a filter's reach (ADR-106 over ADR-105), but the reason is
+/// narrower than "the filter language has no variables": `$match` is parsed by
+/// `filter::parse`, which parses its `$expr` with no names bound, so the only
+/// variables it can name are `$$ROOT` and `$$CURRENT` — and those are the
+/// foreign document under consideration whether the stage runs here or inside
+/// the loop. A `$$name` from `let` is a parse error, not a wrong answer. If
+/// `$match` ever parses with the sub-pipeline's names in scope, this hoist must
+/// be conditioned on the filter not using them. A join on one key belongs in
+/// the `localField`/`foreignField` form, which is a single pass.
 #[allow(clippy::too_many_arguments)]
 fn lookup_pipeline(
     state: &SharedState,
