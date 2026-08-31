@@ -17,6 +17,51 @@ Status meanings:
 
 ---
 
+## 🟢 The violations report over-stated after a rewrite (was a documented limit in ADR-087)
+
+**Was.** `GET …/violations` derived "still standing" from "every named
+document still exists". [ADR-087](decisions.md) recorded the gap in so many
+words — a rewrite that changes the colliding value *also* resolves the
+collision, but the route did not notice, because it did not re-evaluate index
+keys — and argued that re-evaluation would mean re-running index maintenance
+in order to read. The recipe in `indexes.md` told an application to *delete or
+rewrite*, and only one of the two cleared the report.
+
+**Now.** Closed 2026-08-30. The pass already read every named document to
+know it exists; it now also computes that document's keys under the index as
+currently defined, with the same function the write path uses, and keeps a
+member only if some other member shares one of its keys. A group left with
+fewer than two members is not reported, and an index that is gone or no longer
+unique contributes none. Deletion and rewrite are one case. Nothing is stored
+or written, retention still bounds the pass, and the ADR carries a dated note
+correcting its cost argument.
+
+**Kept, and documented.** `merged` names the recorded arrival, so after that
+document's own value is rewritten it can name an `_id` outside the group's
+`ids`. Also unchanged: a collision is recorded once per merge, so three
+documents arriving one after another produce a two-member record and then a
+three-member one, and both are reported while both still collide — the
+surviving-set deduplication collapses them once they shrink to the same group,
+but does not collapse a subset into its superset.
+
+---
+
+## 🟢 `describe` said nothing about durability (hardening item 4.5)
+
+**Was.** [ADR-088](decisions.md) put the node's durability class on
+`GET /v1/version` as `durability` and nowhere else. A client that follows the
+documented sequence — list, describe, then write — learned everything about a
+collection except what an acknowledged write to it means, and the MCP tool
+that forwards `describe` had no way to say it either.
+
+**Now.** Closed 2026-08-30. `describe` carries `nodeDurability`, the same
+value from the same source, and the MCP `describe_collection` tool forwards
+it as it forwards the rest of the document. Named for what it is: a fact about
+the node that answered, not a per-collection setting. Specified, and the
+conformance test drives it.
+
+---
+
 ## 🟡 Array expression operators are lenient about null where MongoDB errors
 
 **Raised 2026-08-30, with the expression scope (ADR-105).** The array operators

@@ -4167,6 +4167,23 @@ report that can over-state after a rewrite, documented; bounded by retention
 — a collision older than the oplog window is no longer listed, and the
 change-stream event is the record that outlives it.
 
+**Amended 2026-08-30 — the route re-evaluates keys, and the over-statement
+is gone.** The cost argument above overstated what re-evaluation would take.
+The pass already reads every named document to know it still exists; the
+one function the write path uses to compute a document's keys under an
+index runs over that same document for a few microseconds, and needs no
+transaction, no index scan and no maintenance. So the route now does it: a
+member whose current keys meet none of the others' has left its group, a
+group with fewer than two members left is not reported, and an index that
+is gone or no longer unique has no constraint to break. Deletion and rewrite
+become one case, which is the definition of "standing" the decision should
+have had — *at least two of the named documents still exist and still share
+a key*. Nothing else changed: still derived on request, nothing stored,
+nothing written, still bounded by retention, still `read`. The one visible
+wrinkle is that `merged` names the recorded arrival, so after that document's
+own value is rewritten it can name an `_id` that is no longer among the
+group's `ids`; a client that wants only the survivors has them in `ids`.
+
 ## ADR-088 — Two durability classes, and the one there is not
 
 **Decision.** `storage.durability` selects how a commit reaches the disk.
@@ -4220,6 +4237,16 @@ request that changed the promise for everyone sharing its fsync.
 of latency per write, one marker key in `meta` rewritten per flush. Two
 configuration keys, one field on `/v1/version`, two metric series. Under
 `durable` nothing changes but a counter.
+
+**Amended 2026-08-30 — `describe` carries it too.** The same value, from the
+same source, is now on `GET …/describe` as `nodeDurability`, and through it
+on the MCP `describe_collection` tool. `/v1/version` remains the operator's
+answer; `describe` is the one call a client makes before it writes, and it
+was the only place a client learned everything about a collection except
+what an acknowledged write to it means. The name says *node* because the
+class is per node, not per collection, and a field named `durability` on a
+collection description reads as something to set there. Still a field, not
+a capability, for the reason above.
 
 ## ADR-089 — The CLI is for people: `client_credentials` leaves `kimmy`
 

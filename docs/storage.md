@@ -277,7 +277,9 @@ pub fn next_index_id(&self) -> u32 {
 ### Durability classes
 
 How a commit reaches the disk is `storage.durability` ([ADR-088](decisions.md)),
-and it is queryable: `GET /v1/version` reports it as `durability`.
+and it is queryable: `GET /v1/version` reports it as `durability`, and a
+collection's `describe` repeats it as `nodeDurability` — per node, whichever
+collection is asked about.
 
 | Class | Mechanism | Durable when the response returns? | What a crash can lose | Cost |
 |---|---|---|---|---|

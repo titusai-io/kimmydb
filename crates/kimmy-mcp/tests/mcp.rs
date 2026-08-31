@@ -815,6 +815,9 @@ async fn describe_collection_reports_paths_and_types() {
 
     assert_eq!(described["documentCount"], 3);
     assert_eq!(described["sampled"], 3);
+    // The tool forwards the whole describe document, so the node's durability
+    // class (ADR-088) reaches a client through the call it makes before writing.
+    assert_eq!(described["nodeDurability"], "durable");
 
     let fields = described["fields"].as_array().unwrap();
     let status = fields.iter().find(|f| f["path"] == "status").expect("status field");

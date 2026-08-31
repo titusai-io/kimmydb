@@ -185,6 +185,14 @@ whose defaults are meant to be left alone, and documentation corrections.
   — the token version still does that, identically for a token the previous
   secret verified — and `cluster_secret` is not covered. ADR-101; procedure in
   `docs/security.md`.
+- **`describe` reports the node's durability class.** `GET
+  /v1/db/{db}/coll/{coll}/describe` — and through it the MCP
+  `describe_collection` tool — carries `nodeDurability`: `durable` or
+  `coalesced`, the same value `GET /v1/version` reports as `durability`
+  (ADR-088). It is a fact about the node that answered, not about the
+  collection, which is what the name says; it is on `describe` because that
+  is the one call a client makes before writing, and it said everything
+  about a collection except what an acknowledged write to it means.
 
 ### Changed
 
@@ -303,6 +311,17 @@ direction, at the previous behaviour.
   heap of the `skip + limit` least under the sort, with `_id` ascending as
   the final key — the order a stable sort over an `_id`-ordered scan
   produced, so every page is the page it was.
+- **The violations route no longer lists documents whose value has since
+  been rewritten.** `GET …/violations` reported a recorded collision as long
+  as every document it named still existed, so resolving one by rewriting a
+  colliding value — the recipe the documentation gives alongside deletion —
+  left it in the report until the oplog entry aged out. Each group is now
+  re-evaluated when asked: a member deleted or rewritten so that its index
+  keys no longer meet another member's leaves the group, a group with fewer
+  than two members left is not reported, and an index that has been dropped
+  or made non-unique no longer contributes any. Nothing is stored or written
+  by the route; the change-stream event and the `/metrics` count are as
+  before.
 
 ## 0.16.4 - 2026-08-29
 
