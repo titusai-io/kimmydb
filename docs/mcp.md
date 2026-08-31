@@ -170,7 +170,7 @@ will need to re-authenticate rather than assuming a connection stays good.
 | Tool | |
 |---|---|
 | `vector_search` | Semantic k-NN, optionally composed with a filter |
-| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion. Scores are fusion ranks (around 0.03), not similarities, and not comparable with `vector_search` scores |
+| `hybrid_search` | Dense + lexical, fused with reciprocal rank fusion. Scores are fusion ranks (around 0.03), not similarities, and not comparable with `vector_search` scores. Takes the same arguments plus `weights` (`{dense, lexical}`) and `min_overlap`, which tune the fusion — see [Vectors](vectors.md) |
 
 Both require the collection to have embeddings configured — see
 [Vectors](vectors.md).

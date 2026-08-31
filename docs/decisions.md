@@ -2901,6 +2901,12 @@ so the first release is preceded by a prerelease shakeout. And dist skips
 publish jobs on prerelease tags by default, which is the safe default and
 means the shakeout proves the build half only.
 
+**Amended 2026-08-30 — the image no longer compiles.** The Dockerfile's
+release-mode build, which is what made QEMU untenable above, is no longer on
+the release path: the image ships the `kimmyd` from the release archive for
+its architecture, and the two native runners and the manifest merge remain
+for the reasons ADR-107 gives.
+
 ---
 
 ## ADR-064 — Two verifiers, routed by the issuer a token claims
@@ -4440,3 +4446,909 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+## ADR-093 — Placeholder secrets are refused off loopback, and the HS256 floor is 32 bytes
+
+**Decision.** Two rules, both enforced in `Config::validate` so that
+`check-config` refuses exactly what the server refuses. First, a node whose
+HTTP listener binds anything other than a loopback address — or, with
+clustering on, whose cluster listener does — refuses to start when
+`auth.root_password`, `auth.jwt_secret` or `cluster.cluster_secret` is one of
+the values this repository's own files put where a secret goes. The list is
+`PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`: the compose file's former
+defaults, the commented-out lines in `kimmy.example.toml`, the quick starts'
+former values, the example programs' passwords, and the words anyone types
+when they mean to come back later (`password`, `secret`, `changeme`, `root`,
+…). Matching is exact apart from case and surrounding whitespace. The error
+names the setting and the environment variable and never the value. Second,
+`kimmy_auth::MIN_SECRET_LEN` is 32 bytes, not 16. Only the local HS256 path
+has a shared secret, so only it has a floor; the OIDC verifier's parallel
+rule (`OidcSettings::validate`) polices the audience and is unaffected.
+
+**Why.** A value that appears in a public repository is held by everyone who
+has read it, so it is not a secret in any sense that matters; and a copied
+quick start is the single most likely way a database ends up on a routable
+address with one. With the signing key anyone can mint a root token; with
+the cluster secret anyone who can reach the gossip port can inject writes;
+the bootstrap password is the first thing tried against a fresh node. The
+existing rule for `--insecure-no-auth` already draws the line at loopback,
+and this is the same line for the same reason: on the host's own interfaces
+nothing off the host can reach the node, so a convenience value costs
+nothing, and off them it costs everything.
+
+The floor moves because RFC 7518 §3.2 says a key for HS256 should be no
+shorter than the hash's output, 256 bits. A 16-byte key is not broken, but it
+is half the entropy of the MAC it feeds, one captured token is all the
+material an offline search needs, and the value is shared by every node of
+the cluster. Sixteen was chosen when the number had to be *something*; it
+should be the number the specification gives.
+
+**Why not an absolute refusal.** ADR-067 refused federated `admin` outright,
+for good reasons, and ADR-074 had to open it behind a flag because the
+absolute form made a legitimate deployment impossible rather than merely
+awkward. A flag whose purpose is to remove a security rule is the outcome to
+avoid, and the way to avoid it is to scope the rule to the condition that
+makes the value dangerous instead of to the value. An absolute refusal of
+placeholders would break exactly the case it is not aimed at — a developer
+on a laptop running an example as written — and the examples are how the
+project is evaluated; an example that has to be edited before it runs is one
+that gets edited into something worse, or into a flag. So loopback keeps
+working with every placeholder, anything reachable refuses them all, and
+there is no switch. A denylist is admittedly the weak form of a rule — a
+value absent from it is not thereby good — which is why the length floor
+still applies on top, and why the list is short and made of things that have
+actually shipped rather than an attempt at a dictionary.
+
+**Why not warn.** A warning at startup is read once, by the person who
+already knows, and never by the person who inherits the deployment. The
+`--insecure-no-auth` precedent is a refusal for the same reason.
+
+**Cost.** Two configurations that ran under 0.16.x do not run under this
+version, which is why the release carrying it is a minor rather than a patch
+(`docs/compatibility.md`). A `jwt_secret` of 16–31 bytes must be rotated
+before upgrading, and rotating it ends every session once, on every node at
+the same time. A node that was running on a placeholder off loopback must be
+given real values, which is the point. The compose file no longer supplies
+defaults, so `docker compose up` needs three variables in a `.env` or the
+environment; it says so, and names them. The list has to be maintained: a
+new example value added anywhere in the repository belongs on it, and a test
+pins the ones that have shipped so far.
+
+---
+
+## ADR-094 — Hybrid fusion is tunable per request; defaults stay equal-weight RRF
+
+**Decision.** `hybrid_search` takes two optional request fields. `weights`
+(`{ "dense": w_d, "lexical": w_l }`, each `>= 0`, not both zero) scales the two
+halves before they are summed, so the fused score is
+`w_d / (60 + rank_dense) + w_l / (60 + rank_lexical)`. `min_overlap` (`>= 1`)
+is the number of distinct query terms a chunk must contain to enter the
+lexical ranking at all; a query with fewer distinct terms than that uses its
+own count. The gate removes lexical *evidence*, not documents: a document it
+drops from the lexical half keeps its full dense contribution. Both fields are
+validated at the API and refused with the ordinary `400`. Their defaults —
+`{1, 1}` and `1` — reproduce the previous ranking to the bit, and the MCP tool
+and the CLI expose the same controls with the same defaults.
+
+**Why.** Measured on a corpus of short conversational documents, forty graded
+queries and eight embedding models, hybrid search recalled roughly a third
+less than plain vector search on the same queries — for every model, the gap
+narrowing only as the dense model got stronger (Recall@10 of 0.677 dense
+against 0.429 hybrid on the weakest). That is the wrong way round for a feature
+whose reason to exist is to improve on the dense half. The mechanism is in
+the lexical half. It ranks by term overlap (recorded in `deviations.md`), and
+each half is retrieved four times wider than `k` before fusion. On documents
+of a sentence or two, nearly every candidate in that window shares one or two
+common words with the query, so the lexical ordering among them is close to
+random; and reciprocal rank fusion, weighting both halves equally, gives that
+near-random rank the same authority as the dense one. Half the evidence being
+noise costs a third of the recall.
+
+The two knobs are the two places the mechanism can be interrupted. `weights`
+lowers the authority of the lexical rank; `min_overlap` removes the candidates
+whose lexical rank is noise, since a chunk that agrees with the query on two
+or more distinct terms is what an exact-term match — the case hybrid search is
+for — actually looks like. Per request rather than per collection because the
+right setting depends on the query as much as the corpus: a query naming a
+product code wants the lexical half; a paraphrase does not.
+
+**Why the defaults do not move.** The measurement was made on one kind of
+corpus. On longer documents term overlap is a weaker but real signal, and a
+default that helped short conversational text could cost a corpus of manuals
+the exact-term matches it relies on. Nothing about an existing deployment's
+ranking changes until the knobs have been measured there; the change ships
+the instrument, not a conclusion. When the measurements are in, a better
+default is a one-line change with evidence behind it.
+
+**Alternatives.** *A BM25 lexical half*, with per-collection term statistics,
+is the principled fix and would make the lexical rank informative on short
+documents too. It is deferred rather than rejected: it needs document
+frequencies maintained under replicated writes and a rebuild path, which is
+real machinery to add ahead of knowing how much of the gap the two knobs
+already close. *A confidence gate relative to the best lexical score* —
+admit only candidates within some fraction of the top lexical score — was
+considered and set aside: term-overlap scores are normalized by chunk length,
+so "within a fraction of the best" measures how short a chunk is as much as
+how well it matches, and the threshold would have no meaning a caller could
+reason about. A count of distinct matched terms is something a caller can
+predict from the query in hand. *Changing the default weighting* was rejected
+for the reason above.
+
+**Cost.** Two more fields on a request that is shared with `vector_search`,
+which ignores them; the specification says so. Callers who want the better
+ranking on a short-document corpus have to ask for it, per request, until a
+measured default replaces the equal weights. A weight of zero on the lexical
+half is a slower way of running `vector_search`, and the documentation says
+that too.
+
+---
+
+## ADR-095 — The embedding worker batches provider calls across documents
+
+**Decision.** The worker fills one provider call from the chunks of
+consecutive documents of the same collection, on the streaming path and in a
+backfill alike, bounded by three process settings under `[vector.batch]`:
+`max_chunks` (32), `max_tokens` (32 768, by the estimate `chunk.max_tokens`
+already cuts on) and `max_wait_ms` (100, waited only when the stream is
+idle). The storage write stays one per document. A batch that fails
+permanently is taken apart and each document sent alone, so the one at fault
+is skipped and named and the rest land; a retryable failure retries the whole
+batch. The document and chunk counters count what they always did.
+
+**Why.** `EmbeddingProvider::embed` took a batch from the day it was written,
+and the worker handed it one document at a time. A document short enough to
+be one chunk — most documents, in most collections — was a batch of one, and
+paid a whole round trip, the provider's tokenisation and its scheduling by
+itself. Measured against a llama.cpp CPU server with ~43-character inputs: 32
+calls of one input, 394 ms; one call of 32 inputs, 18 ms — a factor of
+twenty-two. Per-document calls put a floor of one round trip under every
+document, and a write rate a little above what the floor allows grows the
+backlog without bound; that is Little's law, and it is what a live ingest
+showed, with the worker healthy, the provider idle most of each round trip,
+and the vectors falling further behind by the minute.
+
+The bounds are three because a provider's limits come in three shapes. A
+count, because hosted providers cap inputs per request (Cohere at 96, Gemini
+at 100) and 32 sits under all of them — it is also the size the measurement
+was taken at. A token total, because request bodies have limits too, and the
+token estimate the chunker already uses is the honest unit: 32 768 estimated
+tokens is exactly 32 chunks at the default chunk ceiling, about 64 KiB of
+text, inside every hosted provider's per-request budget. A wait, because a
+quiet collection's one document must not sit until the next write; it is
+waited only when the stream is idle — on a backlog the next entry is already
+there and the batch fills without waiting — and 100 ms is less than the
+remote round trip it saves.
+
+**Why the storage write is not batched too.** `put_vectors` is replace-all
+for one document's chunks, staleness is one document's HLC, and both are what
+make re-embedding idempotent and a crash replayable (the staleness section
+of `vectors.md`). Batching the write would make a crash between two
+documents' writes a question — which of the batch landed? — that today has
+no answer because it never needs one: each document either has its vectors at
+its HLC or does not. The oplog position is recorded once the batch has
+landed, never before, so the guarantee is unchanged; it merely covers a few
+entries at once. The cost of keeping the writes separate is one commit per
+document, which is what it always was, and which was never the bottleneck.
+
+**Why process settings, not collection settings.** The bounds describe the
+round trip this node makes: the same request-size limits apply whichever
+collection's documents fill the call, and a node against a metered API and a
+node against a local server want different waits regardless of collection.
+A batch only ever holds one collection's documents, so the per-collection
+provider, model and prefix are respected without being repeated. Putting the
+bounds in the collection's vector configuration would also make them
+replicated metadata that changes the fingerprint and triggers a reindex,
+which a change to a *scheduling* parameter must not do.
+
+**Alternatives.** Batching the storage write — rejected above. Per-collection
+bounds — rejected above. Concurrent provider calls (`max_in_flight`) — left
+out: the streaming path records one position for everything before it, and
+several batches in flight would either serialise their completions in
+arrival order (buying little) or record positions out of order (unsafe); the
+measured gain from batching alone is the twenty-two-fold one, and the case
+for concurrency should be made against a provider that batching has left
+idle, which none has yet. A batch-size histogram on `/metrics` — skipped:
+`kimmy_embed_chunks_total` over `kimmy_embed_provider_requests_total` is the
+average the operator wants, and a histogram would be the first bucketed
+series in a set that is otherwise plain counters. Opportunistic batching with
+no timer at all — available as `max_wait_ms = 0`, and not the default,
+because a remote provider gains more from a slightly larger call than a
+quiet collection loses to a tenth of a second.
+
+**Cost.** A quiet collection's document is embedded up to `max_wait_ms`
+later than before. A permanent failure in a batch of *n* costs *n* extra
+calls, once, to find the document at fault. The `ollama` provider still sends
+one request per input, because its embeddings endpoint takes one, so batching
+saves it nothing on the wire. A batch spanning several entries holds their
+positions until it lands, so a crash mid-batch replays up to a batch's worth
+of entries rather than one; every replay is a no-op on the staleness check.
+And the structural fact batching does not change is worth stating where
+operators size deployments: a collection is embedded by exactly one owner
+node, so adding members does not raise one collection's throughput — it
+raises how many collections embed at once.
+
+---
+
+## ADR-096 — Federated tokens are refused above a maximum lifetime
+
+**Decision.** `OidcVerifier::verify` refuses a token whose own `exp − iat`
+exceeds `auth.oidc.max_token_lifetime_secs`
+(`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`), 900 seconds by default, and refuses a
+token that carries no `iat` at all. The refusal is a 401 whose
+`WWW-Authenticate` challenge carries `error="invalid_token"` and an
+`error_description` naming the limit in seconds and nothing about the token.
+The setting is refused at startup outside 1–86400, by the same function
+`check-config` runs. The check is on the token's two claims and nothing else:
+no clock, and so no leeway.
+
+**Why.** ADR-073 states the window plainly: a federated principal's role
+*membership* is frozen in its access token, because this database makes no
+introspection call, so a revocation at the provider is honoured only when the
+token expires. It named short token lifetimes as the mitigation and left the
+lifetime to the provider. That is a mitigation this node could not see being
+applied — a provider minting day-long tokens was indistinguishable, from here,
+from one minting five-minute tokens, and the security guide's "keep lifetimes
+short" was advice with nothing enforcing it. The lifetime is the one dimension
+of the window that is readable from the token itself, so it is the one this
+node can bound.
+
+Fifteen minutes because of where the providers sit. Their access-token defaults
+fall between five minutes and an hour — Keycloak's is five, Okta's, Google's
+and Entra ID's about an hour — and one of them, Auth0, defaults an API's tokens
+to a day. 900 seconds admits the short defaults outright and refuses the
+day-long tokens that turn the window into a policy. A provider that defaults to
+an hour is not excluded, it is asked a question: shorten the lifetime for this
+resource, which every one of them supports per resource or per client, or raise
+this node's limit — and the error says which number to raise it to, because the
+description names the limit. An operator who raises it does so knowing what it
+costs, which is the property the default is for. A missing `iat` is refused
+rather than waved through because the limit would otherwise be one omitted
+claim away from not applying; RFC 9068 §2.2 makes the claim REQUIRED in a JWT
+access token, so a conforming provider never produces that token.
+
+The limit is checked after the signature and after expiry. After the signature,
+so that only a token the provider really minted is ever answered with anything
+more specific than "invalid"; after expiry, so that a token which is both stale
+and too long-lived is reported as the former, which is the one a client can fix
+by itself. The 60 seconds of leeway (ADR-064) play no part: they exist because
+the provider's clock is somebody else's, and that argument says nothing about
+how long the provider chose to make a token valid for. The description reaches
+the challenge through a response extension the challenge layer reads, rather
+than by the error setting the header itself, so that a more specific
+description never costs the `resource_metadata` pointer (ADR-071).
+
+**Alternatives.** *Token introspection on every request* (RFC 7662) would close
+the window entirely. Rejected: it adds a round trip to the provider on every
+call, makes the provider's availability the database's, and not every provider
+offers the endpoint — Entra ID does not. *A revocation feed* from the provider —
+back-channel logout, a shared-signals stream — rejected because none is
+standard across the providers this federation exists to serve, and a node that
+honoured one provider's feed would be silently unprotected against another's.
+*A warning rather than a refusal above the ceiling*, or no ceiling: rejected
+because every other setting in the section is policed by refusal, and a
+warning printed at startup is a warning nobody reads. *Measuring the remaining
+time rather than the lifetime*: rejected because a long-lived token would then
+be admitted once it had aged enough, which is exactly the token the window is
+about.
+
+**Cost.** An operator whose provider mints access tokens longer than fifteen
+minutes has a change to make on upgrade: shorten the provider's lifetime for
+this resource, or raise `max_token_lifetime_secs`. The refusal names the limit
+so the change is discoverable from the first failed request, and a raised limit
+is printed in the startup summary so it stays visible. A provider that omits
+`iat` cannot be federated with until it stops, and there is no setting for
+that. And the limit is a bound, not a revocation: a membership revoked at the
+provider is still honoured until the token expires, for up to the configured
+number of seconds.
+
+---
+
+## ADR-097 — The retention horizon is judged per origin
+
+**Decision.** The retention pass records, beside the single
+`oplog_collected_through` stamp, the highest stamp it removed **per origin**
+(`oplog_collected`, one entry per node id, written in the same transaction as
+the removal). Two decisions read it. A peer sends its witnessed vector with
+`AskEntries` (`held`, optional on the wire), and the sender answers
+`BeyondHorizon` only when, at an origin the peer trails, the peer's coverage
+sits below what was collected of that origin — otherwise it is served from
+the threshold it asked from, however far below the coarse horizon that is. And
+the stale-rejoiner verdict of ADR-085 requires, besides trailing this node by
+more than tombstone retention at an origin, that the peer also lack something
+collected at that origin; the reported span is unchanged. A database an
+earlier build collected from has no per-origin record, so `Engine::open` seeds
+every origin it holds with the coarse horizon: coarse below that point, exact
+above it.
+
+**What was observed.** A member-at-a-time roll of a three-member cluster that
+had been converged for 36 hours. Half a second after A came back, its first
+round named *both* peers stale — `behind_secs=129091`, within minutes of the
+time since the previous roll — with the message that tells an operator to
+reset them; five seconds later both were back within retention. And each time
+a member came back, the first peer to pull from it was told it was beyond the
+horizon and pulled a full snapshot of a store it held in full but for one
+entry. Data converged; the signals were false and the snapshots were cost.
+
+**Why.** Both come from one write and one measure. A member re-registers
+itself in the client topology when its build or endpoint changed, which a roll
+that upgrades does on every member. A member that clients do not write
+through has, until then, written nothing since the previous roll — so its own
+origin's previous stamp is 36 hours old, collected on every peer along with
+everything around it. The version vector summarises an origin by its newest
+stamp, so at the next round every peer trails that origin by the whole
+silence: `lag_behind_ms` with its roles swapped reads 36 hours, above
+retention, and names the peer. In the other direction, `VersionVector::behind`
+reduces "what am I missing" to one threshold — the peer's own coverage of the
+origin it trails most — and that threshold is the 36-hour-old stamp, below
+the single horizon stamp; the sender cannot tell that everything under the
+horizon is the peer's own coverage, and the snapshot is the only safe answer
+it has. Both are the same blindness: one stamp across all origins cannot say
+*which* origin's history is gone. Recorded per origin, the question each side
+needs is exact. Does the peer lack anything collected of the origin it trails?
+In the roll, no: the gap held one entry, seconds old, servable, and pulled on
+the next round. A peer that can still be served everything it lacks is not
+beyond the horizon and has nothing to resurrect.
+
+**Why not gate the verdict on the first round, or on two consecutive rounds.**
+The restart is where it was seen, not what causes it: any origin that writes
+after a silence longer than retention does the same to every peer, restart or
+not, and a peer that is a round or two late to pull — a larger cluster's
+fanout makes that routine — would be named on the third. A count is a guess at
+the cause; the record is the cause.
+
+**Why not treat the horizon as unknown just after start.** The horizon was
+not wrong; it is persisted and correct. The threshold was below it for a
+reason that the horizon alone cannot see.
+
+**Why the peer sends its vector rather than the sender sending its record.**
+The sender has both halves once the vector arrives — its own coverage, its
+own record — and decides without another round trip. Sending the record the
+other way would need a second request to say "serve me anyway", and the
+requester already had to derive the threshold from the vector it now sends.
+BSON is self-describing and `Message` derives serde without
+`deny_unknown_fields`, so a field with a default crosses a version boundary
+in both directions: an older sender ignores it and judges by the threshold, a
+newer sender given none does the same. Nothing either build did before is
+lost, and the round-trip test in `protocol.rs` pins both halves.
+
+**Why the seeding.** The per-origin record and the coarse horizon are written
+together, so on a database only this build has collected from, the highest
+entry in the record *is* the horizon. A horizon above the record means an
+earlier build removed entries the record never saw, from origins it cannot
+name. Every held origin is raised to the horizon then — which is exactly the
+coarse answer the horizon alone gave, so nothing is claimed that was not
+claimed before. The record is exact from that point on, and the cost ends once
+each origin has written again and been collected once more: for a cluster
+rolled onto this build, the roll *after* this one is the first quiet one. An
+origin the node learns of later needs no seeding, because nothing of it was
+held here to collect before it was known.
+
+**Alternatives.** Scan the oplog for the oldest entry of the origin above the
+peer's coverage: it has been collected, which is the point. Persist per-peer
+"last caught up" times: lost on restart, which is when this matters. Exclude a
+node's own origin from the verdict: a cluster with one writing member would
+then never name a stale peer. Suppress the topology re-registration: the write
+is legitimate and the same shape arrives from any idle origin's next write.
+
+**Cost.** One redb table with one 26-byte row per origin, raised in the same
+transaction as the retention pass already commits; one map-sized field on
+`AskEntries`; one read of the record per sync round. `behind_ms` and
+`behindSecs` mean what they meant, at fewer peers. What the record does not
+make exact: with `tombstone_retention_secs` longer than
+`oplog_retention_secs`, "collected" is judged at the shorter window, and a
+peer trailing by more than the longer one whose gap holds only entries aged
+between the two is still named — the conservative side, and the same side
+ADR-085 was on.
+
+---
+
+## ADR-098 — Query paths are bounded by what they return, not by what they scan
+
+**Decision.** A read may hold memory proportional to its result — the page,
+the sort window, the count — and never to the collection or the index range it
+walks. Three paths were changed to make that true. `count` counts through a
+visitor and keeps nothing. Index candidates stream out of one read transaction
+and are rechecked as they arrive: a plan that pins a complete key is one run of
+entries already in `_id` order, read in place and stopped where the caller
+stops; a `$in` is those runs merged, one head per probe; a range that must be
+delivered in `_id` order keeps only the `skip + limit` smallest document keys
+of one pass over it, and goes back for more only when the recheck rejected
+enough that the caller is still asking. A sorted `find` keeps a bounded heap of
+the `skip + limit` least under the sort, with `_id` ascending appended as the
+final key, and that window has a ceiling: `skip + limit` may not exceed 10,000
+on a sorted `find`, refused with `400`.
+
+**Why.** Reading the executor for how memory grows with collection size found
+three places where one request's footprint was the collection's. `count` was
+`collect_matching(..).len()`: every matching document decoded into a vector
+and then counted, which on a `__vectors` shadow is every vector and its text.
+The index path materialised every candidate key in the range, sorted and
+deduplicated, before rechecking the first — on the order of hundreds of
+megabytes for an unselective equality over ten million documents at
+`limit: 1` — and a `$in` union built a set on top. A sorted `find` collected
+every match as a `(stamp, document)` pair to sort it, and `skip` had no bound
+at all. On a small host each of these was the likeliest way for one ordinary
+request to take the node, and every other client's requests, down with it.
+None of the fixes changes an answer: the count is the same count, the
+candidates are the same candidates in the same order, and the bounded sort
+produces the page the stable sort did — `_id` ascending was the order the scan
+fed it, and is now stated as a key instead of relied on as a property of the
+input.
+
+**Why the index path has three shapes rather than one.** Index entries sort by
+`(key, document key)`. Under one complete key the document keys are already in
+order and each document appears once, so an exact probe needs no sorting and
+no set, and a merge of exact probes needs one head per probe. Under a range of
+keys the document keys interleave, and nothing short of seeing the whole range
+says which `_id` comes first — so the range is still read in full, as it was,
+but a bounded set keeps the `skip + limit` smallest instead of the whole range
+sorted. The planner now says which case a plan is (`IndexPlan::exact`),
+because the executor cannot tell from the byte ranges alone: an equality on a
+prefix of a compound index is a range in disguise. A multikey range read in
+index order recognises a repeat by recomputing the document's keys and taking
+it at the first the range covers, rather than by remembering every document
+seen.
+
+**Alternatives.** *Index-backed counts* — answering `count` from the entries
+without touching documents — were deferred: the recheck is what makes an
+index-backed answer correct, and a count that trusted the index alone would be
+wrong wherever the index is a superset (a multikey range, a partial filter the
+query did not prove). It remains the obvious next step for the common case of
+an exact probe with no residual filter. *Keeping an unbounded `skip` with a
+warning* was rejected: a warning is read after the node is gone. *Clamping the
+sort window as `limit` is clamped* was rejected because a clamped `skip`
+returns a different page from the one asked for and says nothing — the one
+kind of wrong a client cannot detect. *A cursor over arbitrary sort keys*,
+which would make deep sorted paging cheap, is the longer road the deviations
+register already names and is not taken here.
+
+**Cost.** The sort window is a behaviour change: a sorted `find` with
+`skip + limit` over 10,000 worked before and is refused now. Under the letter
+of [Compatibility](compatibility.md) a tightened refusal is breaking; this one
+ships in `/v1` as a capacity ceiling — the same class as the body limit and
+`MAX_LIMIT` — with a `0.MINOR` bump and a release note, and the compatibility
+document now records that exception in its table. A range plan in `_id` order
+whose recheck rejects most candidates makes more than one pass over the range,
+logarithmically many in what was rejected, where it made one; the common case
+is one pass, and it no longer holds the range. `explain` gains
+`indexEntriesRead`, so the difference between an exact probe stopped early and
+a range read in full is visible to a client tuning a query.
+
+---
+
+## ADR-099 — Authenticated routes carry a request timeout, an explicit body ceiling and a per-principal rate limit
+
+**Decision.** Three settings, each with a default chosen so that a node which
+never sets them behaves as it did before:
+
+- `server.request_timeout_secs` (default `30`) — a deadline on every REST
+  route that answers with a document, applied per route group. A request
+  still pending at the deadline is abandoned and answered `503` with a new
+  error code, `timeout`, `retry: wait`. The change-stream upgrade
+  (`/v1/db/{db}/coll/{coll}/watch`) and `/mcp` — the two surfaces whose
+  response is a connection rather than a document — carry no deadline.
+- `server.max_body_bytes` (default `2097152`) — the request body ceiling
+  axum applied on its own, now a setting. Over it, `413 payload_too_large`
+  as before.
+- `server.rate_limit.per_principal` and `per_principal_window_secs`
+  (defaults `0`, meaning off, and `60`) — a second token bucket keyed on the
+  authenticated principal, checked in the `Auth` extractor after the token is
+  verified and the session confirmed. Over it, `429` with `Retry-After`, the
+  login limiter's response. Refusals are counted in a sibling series,
+  `kimmy_rate_limited_principal_total`, and the key map is capped by
+  `max_tracked_keys` exactly as the login limiters' are.
+
+**Why.** ADR-007 put a limiter on the one unauthenticated route where a limit
+is a security control, and left the authenticated routes unbounded on the
+argument that a capacity number without a measurement behind it is a guess.
+That argument still holds for the *number*. It never held for the
+*mechanism*. A principal that is compromised, or a client with a bug in its
+retry loop, can hold connections open by sending a body slowly, send bodies as
+large as the framework allows, and make requests as fast as the network
+carries them — and until now the only answers were a proxy in front of the
+node or revoking the user. These are the three of those an operator can now
+bound on the node itself, with the number left to them.
+
+*What the deadline bounds, and where it lives.* The timeout wraps the whole
+service call for a route and fires when that call is still *pending* at the
+deadline. A request to this server is pending in exactly two places: while
+its body is still arriving, and while an embedding provider is being waited
+on. Storage work is synchronous and never yields, so the deadline cannot fire
+inside a scan, a bulk insert, an index backfill or a database drop — a request
+that finishes late is answered with its result. That is the right outcome for
+those operations (turning a completed index build into a refusal would be
+strictly worse than answering late), and it is why the default stays at 30 s
+without exempting any of them individually. It also means the setting is not
+a query timeout, and every place that documents it says so. The layer is
+applied per route group rather than to the whole table so that the exemption
+is a place a route is registered — visible in a diff — and not an attribute on
+one line of forty.
+
+*Why 503, and why `wait`.* RFC 9110 §15.5.9 defines 408 as the server not
+having received a complete request within the time it was prepared to wait,
+and permits the client to repeat the request; browsers and several HTTP
+libraries do so silently. That is the wrong instruction for a request this
+node may have partly acted on — a write whose embedding call stalled — and
+says nothing true about the provider case at all. 504 is a gateway's
+statement about its upstream, and this node is the origin. 503 says what
+happened: this server did not handle this request. The envelope's `retry`
+says what to do about it, and it is `wait` rather than `elsewhere` (ADR-057)
+because the deadline is only ever reached while waiting for the client's own
+body or for the provider every node shares, and neither improves by moving
+nodes — `elsewhere` would send the same slow upload round the whole cluster.
+No `Retry-After`, because the server has no idea when a slower client or a
+slower provider will be faster.
+
+*Why the per-principal limit is in the extractor and not a layer.* The
+principal is not known until the token is verified, so a layer keyed on it
+would have to authenticate too — either verifying twice or caching the result
+in request extensions for the handler to find. The `Auth` extractor is the
+one place every authenticated surface already passes through: REST handlers
+take it, `/mcp`'s middleware calls it, the change-stream upgrade takes it.
+Checking there covers all three by construction, and ordering the check after
+the session check means a refused token is a `401` and never spends a real
+user's budget: the limiter counts principals, not guesses. The key is
+`local:<name>` for a local user and `oidc:<issuer>:<sub>` for a federated one,
+so a provider's `root` and this cluster's `root` cannot share a budget, and
+the two classes can never collide. `Limiter::acquire` checks and spends under
+one lock, because here every request counts rather than only the failures
+and `check` followed by `record` would admit a whole round of concurrency
+past the burst.
+
+*Why the limit is off by default.* The number is the operator's; the
+mechanism is the server's. The documentation offers a starting point — 3000
+over 60 seconds, fifty a second sustained per principal — and says what it is
+relative to, and names the series that tells an operator whether it is right.
+
+**Alternatives.**
+
+- *A global timeout, WebSocket upgrades included.* Rejected. axum hands the
+  upgraded socket to a task of its own once the `101` is written, so a global
+  layer would today happen not to break change streams; but `/mcp`'s
+  streaming responses would be cut, and the exemption is the contract rather
+  than a property of the current upgrade path. The test holds the contract.
+- *408 or 504.* Rejected, above.
+- *Per-route body limits* — a larger ceiling for `/bulk`, a smaller one for
+  login. Deferred. One ceiling matches what was already enforced; splitting
+  it is a decision that wants bulk-import workloads measured first, and the
+  mechanism (a `DefaultBodyLimit` on a route group) is a one-line change when
+  they have been.
+- *Cooperative cancellation of storage work at the deadline.* Deferred. It
+  needs a deadline threaded through the engine's scans and commits, and what
+  a commit past its deadline should do — finish, or roll back — is a storage
+  decision rather than an HTTP one.
+- *Wiring `max_body_bytes` into rmcp's own body limit.* Deferred. rmcp reads
+  `/mcp` bodies under its own 4 MiB ceiling and answers its own `413`; making
+  the two one setting means either accepting rmcp's envelope for that route
+  or reading the body twice.
+- *A label on `kimmy_rate_limited_total` instead of a sibling series.*
+  Rejected. A label changes the shape of a series production dashboards
+  already name; a sibling leaves the existing one byte-for-byte what it was.
+
+**Cost.** A new error code, `timeout`, in a set clients branch on — additive
+under ADR-057, because the envelope carries `retry`. A client uploading a
+2 MiB body slower than about 70 KB/s now sees a `503` where it saw success;
+the setting exists to raise. Every authenticated request costs one integer
+comparison when the per-principal limit is off and one lock acquisition when
+it is on. The 429 counter is no longer a single-source number:
+`kimmy_rate_limited_total` counts both limiters, and
+`kimmy_rate_limited_principal_total` is how they are told apart.
+
+---
+
+## ADR-100 — Local login is a mode, and a federated subject has a display name that is never an identity
+
+**Decision.** Two settings, one about each way in.
+
+`auth.local.login` says where `POST /v1/auth/login` answers: `always` (the
+default, and exactly what shipped), `loopback_only` (only to a connection whose
+TCP peer is a loopback address; anyone else gets a 403 with the `forbidden`
+code), or `disabled` (the route answers 404). `/v1/auth/refresh` follows the
+same rule, because it mints a local token too. The mode governs **minting**
+and nothing else: a local token already issued keeps verifying under every
+mode, on every node, until it expires. Startup refuses `disabled` unless
+`auth.oidc` is configured, since a node with neither could authenticate
+nobody. The peer is the socket's, never a forwarded header — the setting is
+about who can reach the process, and a header is something a client writes.
+
+`auth.oidc.subject_claim` names a claim — `preferred_username`, `email`,
+`upn` — whose string value rides on a federated principal as its **display**
+name. It appears in the audit record (as `display`, only when it differs from
+the subject) and in `/v1/auth/whoami` (always, falling back to the subject).
+It appears nowhere else: `sub` remains the principal's name for authorization,
+role resolution, rate limiting, the `federated` flag and every comparison the
+server makes. A claim that is missing or not a string falls back to `sub`
+without refusing the token.
+
+**Why.** Federation made two things true at once that pulled in opposite
+directions. A node behind an identity provider still needs its break-glass
+root: ADR-067 reserved `admin` to local accounts precisely so that a
+misconfigured or compromised provider cannot mint a superuser, and that
+account is worthless if it cannot log in. But the password route is also the
+one unauthenticated endpoint that costs Argon2 work per attempt and accepts a
+guess from anywhere, and an operator whose people all arrive through the IdP
+has no reason to leave it open to the network. `loopback_only` is the middle
+position that keeps both properties: root is reachable from the host — over
+SSH, from a sidecar, through a tunnel — and unreachable from the network the
+IdP was meant to front. `disabled` exists for the deployment that has decided
+to run its emergency account elsewhere (a second node bound to loopback, say)
+and wants this one to hold no password door at all; the startup refusal keeps
+it from being chosen by accident on a node with no other way in.
+
+The subject claim answers a different complaint. A subject from a real
+provider is an opaque identifier — a GUID from Entra ID, a `00u…` string from
+Okta — and an audit line that says `user=3f2a…` tells the person reading it
+nothing until they open the provider's console. Every deployment that has
+tried to read its own audit trail has asked for the email. The tempting fix is
+to *use* the email as the principal, and it is wrong: an email is mutable (a
+rename at the provider would silently make one person two principals, or two
+people one), it is not unique across providers, and some providers let a user
+set it. `sub` is the one claim OpenID Connect makes stable and provider-scoped,
+which is why ADR-064 built on it. So the readable name is carried **beside**
+the identity, labelled as display, and consulted by nothing that decides
+anything. A principal whose email changes keeps its roles, because its roles
+never depended on the email; a test holds that.
+
+**Alternatives.**
+
+- *Remove local login entirely once `auth.oidc` is configured.* Rejected: it
+  deletes the break-glass account ADR-067 and ADR-074 both lean on, and the
+  canonical pattern elsewhere (Vault, MinIO, Grafana) is an emergency local
+  account kept alongside SSO, not removed by it.
+- *A 404 for `loopback_only` as well as `disabled`, to hide the route.* A 404
+  from a route that answers 200 to the neighbour is not a secret, it is a
+  puzzle; the route is documented and its existence is not the thing being
+  protected. 403 with the `forbidden` code says what happened, and the CLI can
+  turn it into advice. `disabled` answers 404 because there the route really
+  is absent from what this node offers.
+- *Honour `X-Forwarded-For` for the loopback test.* Rejected: the header is
+  client-supplied, and the login rate limiter already documents why trusting
+  one without a proxy that rewrites it is worse than nothing. A reverse proxy
+  on the same host will look like loopback, and the documentation says so
+  rather than the code pretending otherwise.
+- *Use the email as the principal, or key roles on it.* Rejected above; it is
+  the whole point of the decision.
+- *Put the display name in the local token.* There is no local token for a
+  federated principal, and minting one is the identity laundering ADR-065
+  refuses.
+
+**Cost.** A deployment that sets `loopback_only` behind a same-host reverse
+proxy gets no restriction from it and has to know that; the docs say it in
+three places. `refresh` under `loopback_only` refuses a client that logged in
+from the host and later refreshes from elsewhere, which is the rule applied
+consistently rather than a gap. The audit record grows a field that appears
+only on federated lines whose provider set the claim, and any collector
+keyed on the exact field set has one more optional field to know about.
+`whoami` grows a required `display` field, which is additive.
+
+---
+
+## ADR-101 — Local signing secrets rotate through a two-key window
+
+**Decision.** `auth.jwt_secret` gains an optional companion,
+`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`). Every local token is
+signed with the current secret; verification tries the current secret first and
+the previous one only if the current one finds the signature wrong. A token
+neither verifies is refused with the unchanged invalid-token error. The previous
+secret is held to `MIN_SECRET_LEN` and must differ from the current one, and
+`check-config` refuses both faults exactly as the node does. Rotation is the
+documented procedure: previous = old, current = new, roll every node, wait one
+`token_ttl_secs`, remove the previous secret, roll again. The node logs an
+`info` at startup naming that deadline and one `warn` when it passes, counted
+from process start and not persisted.
+
+**Why.** The secret was not being rotated, and the reason was mechanical:
+changing it invalidated every outstanding token on every node at once, so a
+rotation was an outage for every client holding a session. A
+control that costs an outage is a control that is not exercised, and a secret
+that is never rotated is one whose exposure is never recovered from. The
+standard remedy for a symmetric key is a window in which two keys verify and
+one signs; because tokens carry their own expiry and the issuer only ever signs
+with the new key, the window closes by itself one lifetime later. The check
+order matters in one respect only — an expired token is reported as expired by
+whichever key verified its signature, and that answer is final, because a token
+the current key signed was never signed by the previous one. The token version
+check (ADR-052) runs after the signature check in `Auth`, whichever key passed
+it, so rotation and revocation stay separate: rotating does not revoke, and
+revoking does not need a rotation.
+
+**Alternatives.** *A `kid` header and a key ring* — the general form, where
+each token names its key and the verifier holds any number. Deferred: HS256 with
+two keys covers what an operator needs (one rotation at a time, closing on its
+own), and a new header claim would be a wire change that every existing token
+lacks, so the verifier would need the two-key fallback anyway for the first
+rotation. *JWKS-style key ids for local tokens* — publishing local keys the way
+a provider publishes its own. Rejected for now: local tokens are symmetric and
+verified only by the nodes that hold the secret, so there is nobody to publish
+to, and a key set implies an asymmetric scheme this database has not chosen.
+*Persisting when the previous secret was first seen*, so the reminder survives
+a restart. Not done: a node's data file is the wrong place for a fact about its
+environment, the reminder exists to be noticed rather than relied on, and
+counting from process start is exact in the common case (the rotation *is* the
+restart) and only ever conservative otherwise.
+
+**Cost.** A stolen previous secret stays valid until it is removed — the window
+is a deliberate extension of exposure, bounded by the operator following the
+procedure, which is why the docs say to remove it after one lifetime and the
+node says so twice. The reminder is per process and forgets on restart. The
+cluster secret is not covered; it is a different key for a different channel,
+and its rotation remains what it was.
+
+---
+
+## ADR-105 — Expressions evaluate in a lexical scope
+
+**Decision.** `Expr::eval` runs in a `Scope`: the root document plus a chain of
+frames, one per enclosing construct that binds a name. `$let`, `$map`,
+`$filter` and `$reduce` push a frame holding the names they bind and evaluate
+their body in it; a `$$name` reference searches the innermost frame first and
+walks outward; `$$ROOT` and `$$CURRENT` are the root document and are never
+rebound. A `$lookup` `let` is one more frame, laid under every stage of the
+sub-pipeline. Names are also tracked while **parsing**, so a `$$name` nothing
+binds is refused where it is written rather than evaluating to null per
+document. `Expr::eval(doc)` remains and is the empty-scope case, so every
+existing caller — `$project`, `$addFields`, `$replaceRoot`, `$group` — is
+unchanged.
+
+**Why.** One design cost unlocks four things that were each separately out of
+reach. The array family — `$filter`, `$map`, `$reduce` and the eleven
+positional operators beside them — was excluded from the first expression pass
+with the recorded reason that `$$this` needs a scope, not another operator.
+`$$ROOT`, which is how a `$project` embeds its source or a `$group` pushes
+whole documents, is the same mechanism with a fixed binding. `$let` is the
+mechanism exposed directly. And the `$lookup` `let`/`pipeline` form, the only
+way to join on anything but one key's equality, is a scope whose frame is
+evaluated once per input document and whose body is a pipeline rather than an
+expression. Building the scope once and expressing all four through it is less
+code and one rule — *a variable is a name in a frame; frames nest* — where four
+special cases would each have carried their own.
+
+The parse-time check follows from the same rule. Because every binder is known
+while the tree is built, the parser can carry the lexical environment for free,
+and a refusal at parse is the difference between "this pipeline is wrong" and
+a null in every row that nobody notices — the failure the expression layer's
+null-versus-error rule exists to avoid.
+
+**Alternatives.** *Special-case `$$this` per operator* — have `$map` evaluate
+its body against a synthetic document with `this` in it, or thread a single
+optional "current element" through `eval`. Rejected: it handles one level of
+nesting and not two, cannot express `$reduce`'s two names or `$let`'s
+arbitrary ones, gives `$$ROOT` nothing to stand on, and leaves the `$lookup`
+form with no way in. Each further operator would have re-derived a scope
+badly. *Substitute variables at parse time* — rewrite `$$this` into a field
+path before evaluation. Rejected because the element is not a field of any
+document the path could name. *Evaluate against a merged document* — clone the
+root and insert the bindings as fields. Rejected as a clone per element per
+document, and because it lets a binding shadow a real field by accident.
+
+**Cost.** A scope chain per evaluation: a frame is a borrowed slice and a
+parent pointer, so pushing one per array element is a stack slot and no
+allocation, and `eval` on a scope with no frames is what it was before. The
+parser carries a `Vec<String>` of declared names that grows and shrinks with
+nesting. The `$lookup` pipeline form is a nested loop — O(local × foreign),
+inherent to a form whose body may do anything with the variables — and is
+documented as such, with the equality form recommended wherever the join is
+one key and a leading `$match` hoisted out of the loop because the filter
+language cannot read the variables. The `$$ROOT` value is a clone of the
+document, paid only when it is read whole. And the parse-time check means an
+expression is bound to the names it was parsed with: `parse_with_vars`
+followed by a plain `eval` is an error rather than a null, which is the point.
+
+---
+
+## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
+
+**Decision.** `{$expr: <expression>}` is a filter clause. It parses through
+`Expr::parse`, evaluates through `Expr::eval` against the whole document, and
+matches when the result is truthy under the expression language's rule. It is
+accepted at the top level and inside `$and` / `$or` / `$nor` like any clause,
+which puts it in every place a filter is taken — `find`, `count`, `update`,
+`delete`, `find_and_modify`, `$match`, the vector pre-filter and the MCP tools
+— by construction, because they share one parser. The planner never reads it.
+
+**Why.** Every other filter operator compares a field with a constant. "Which
+accounts have spent more than their budget" has no spelling in that language:
+the value on the right-hand side is a field, and the only way to ask it was an
+aggregation — `$addFields` a difference, `$match` on its sign — for a question
+that is plainly a filter. That is a scan-side gap with no substitute short of
+the pipeline, and the pipeline's expression evaluator already knows how to
+read a field, compare two values and do arithmetic. `$expr` is what MongoDB
+calls the same bridge, and clients written against MongoDB write it.
+
+Delegating rather than reimplementing means the operator set inside `$expr` is
+the expression set — all of it, arithmetic and `$cond` included — and stays so
+as that set grows. It also means `$expr` inherits the evaluator's judgements
+without a second copy of them: a missing field is null, null propagates, a
+type violation refuses rather than yielding null.
+
+**Alternatives.** *A field-reference syntax inside the existing operators* —
+`{spent: {$gt: "$budget"}}`, say — was rejected. It changes the meaning of a
+string that starts with `$` on the right-hand side of a filter comparison,
+which is a legal constant today and stored in real documents; making it a
+reference is a silent reinterpretation of existing queries, which the filter
+parser has refused to do everywhere else (mixing operators and plain fields,
+`$options` without `$regex`). It would also cover only the two-field
+comparison and not the arithmetic beside it, so the pipeline would still be
+needed for `qty × price > 100`. *A `Result`-returning `matches`* so an
+evaluation error could fail the request, as MongoDB does, was deferred: it
+touches every caller for a data-dependent case the regex arm already resolves
+as "no match", and the register records it as the way to close the gap.
+
+**Cost.** Two, both made visible in `docs/query-language.md` rather than
+smoothed over.
+
+*Never indexable.* An expression names no field the planner can bound, so a
+filter that is only `$expr` is a full scan, and `explain` says so. An indexable
+clause beside it still plans, with the expression applied to each candidate;
+the planner treats `Filter::Expr` exactly as it treats a disjunction —
+contributes nothing, never narrows. A partial index likewise cannot be proven
+usable by an `$expr`.
+
+*Two comparison semantics in one filter document.* `$gt` inside `$expr` is the
+expression `$gt`: the canonical cross-type order, whole-array comparison, no
+type bracketing. `$gt` outside it is the filter `$gt`: within a type group,
+element-wise over arrays. The pairs disagree on precisely the inputs
+`docs/query-language.md` already calls out as surprising — a missing field is
+*less than* zero inside `$expr` and incomparable outside it — and the page
+puts the two readings side by side with the rule of thumb that resolves them:
+a constant on the right means the ordinary operator; a field or a computation
+on the right means `$expr`.
+
+---
+
+## ADR-107 — The container image ships the release archive's binary
+
+**Decision.** `publish-ghcr.yml` compiles nothing. Each architecture's image
+is built with the Dockerfile's `prebuilt` stage from the `kimmyd` inside the
+`kimmyd-<target>.tar.xz` that `build-local-artifacts` produced for that
+target — taken from the release run's own workflow artifacts, or from the
+GitHub Release on a manual dispatch — after verifying dist's checksum and
+running the binary once on the runner that will build its image. The two
+native runners, the digest-then-merge manifest and the tags of ADR-063 stay.
+
+**Why.** ADR-063 rejected QEMU because the Dockerfile compiled the workspace,
+and it compiled it once more per architecture *after* dist had built the
+same target: nine minutes on amd64 in a nineteen-minute release, for a binary
+that already existed. Worse than the time was the provenance. The file in the
+image and the file on the Release page were two builds of one commit — and
+not even the same kind of build: the Dockerfile linked against the Debian
+image's glibc while the archive is the static musl binary ADR-063 chose so
+that one file runs on any distribution and in a `scratch` container. Nothing
+checked that the two agreed. Now they are one file: the archive's checksum is
+verified before the image is built, and the binary in the image is the one
+anyone can download and hash. `--version` on the runner catches an archive of
+the wrong architecture before anything is pushed, and it prints the commit
+the binary carries, which dist's checkout bakes in.
+
+**What changes for the container.** Its `kimmyd` is now the musl binary,
+which is what every other channel already ships. The one difference an
+operator could observe is the allocator: the workspace sets no global
+allocator, so the container moves from glibc's malloc to musl's, which is
+slower under heavy multithreaded allocation. If that shows up in a
+measurement, the answer is a global allocator in `kimmyd` — one change that
+then applies to every channel alike — not a second build of the server for
+the container.
+
+**Alternatives.** One buildx invocation for both platforms under QEMU, with
+the binary chosen by `TARGETARCH`, would remove the merge job; not taken,
+because the runtime stage's apt layer would then run emulated for arm64 while
+native arm64 runners are free, and because the merge flow is the code that
+has produced every tag so far. Downloading from the Release in the release
+flow too, for one code path instead of two: rejected because the workflow
+artifact is the same file one hop closer, and the Release download exists for
+the dispatch, which has no run to draw on. `cache-builds` in dist, a
+rust-cache in `build-local-artifacts`: evaluated and left off — a cache is
+readable only from the ref that wrote it or from the default branch, no job
+on main builds the musl targets, and each tag would write a set of caches a
+gigabyte or more that no later tag could read, against the 10 GiB budget CI
+already had to be pruned back under.
+
+**Cost.** The image on GHCR depends on dist having built the archive first,
+which the job order in `release.yml` already guaranteed (`custom-publish-ghcr`
+runs after `host`); a dispatched republish depends on the Release's assets
+still being there. The `GIT_COMMIT` build argument is passed by nothing on the
+release path any more; it stays in the Dockerfile for the default stage and a
+laptop build. And a `docker build` from a checkout still compiles, so the
+laptop image and the published one are built differently — the published one
+is now the one whose binary can be checked against a published hash.
+
+---

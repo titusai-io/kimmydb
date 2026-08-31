@@ -15,7 +15,7 @@ use kimmy_auth::{Action, Grant, TokenIssuer, UserStore};
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 
 struct Server {
     base: String,
@@ -223,6 +223,52 @@ fn seed(server: &Server) {
             .unwrap();
     }
     server.engine.create_collection("sales", "secrets").unwrap();
+}
+
+/// A `byo` collection with three vectors stored directly, so search can be
+/// driven without an embedding provider or the worker.
+///
+/// For the query `"red blue"` with vector `[1, 0, 0]`: `x` is the nearest
+/// vector and shares no term, `z` is second nearest and shares both, `y` is
+/// farthest and shares one — the candidate `min_overlap` gates.
+fn seed_vectors(server: &Server) {
+    use kimmy_core::{ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig, VectorRecord};
+
+    let meta = server.engine.create_collection("kb", "notes").unwrap();
+    server
+        .engine
+        .configure_vectors(
+            "kb",
+            "notes",
+            VectorConfig {
+                fields: vec!["text".into()],
+                provider: ProviderConfig::Byo,
+                dim: 3,
+                metric: Metric::Cosine,
+                chunk: ChunkConfig::default(),
+                document_prefix: None,
+                query_prefix: None,
+            },
+        )
+        .unwrap();
+    let shadow = server.engine.vector_collection("kb", "notes").unwrap().unwrap();
+    for (id, vector, text) in [
+        ("x", [1.0, 0.0, 0.0], "green paint"),
+        ("y", [0.0, 1.0, 0.0], "red apple"),
+        ("z", [0.6, 0.0, 0.8], "red blue"),
+    ] {
+        server.engine.insert(&meta, bson::doc! { "_id": id, "text": text }).unwrap();
+        let source = DocId::String(id.to_string());
+        let stamp = server.engine.document_stamp(&meta, &source).unwrap().unwrap();
+        let record = VectorRecord {
+            source: source.clone(),
+            chunk: 0,
+            source_hlc: stamp.hlc,
+            vector: vector.to_vec(),
+            text: text.to_string(),
+        };
+        server.engine.put_vectors(&shadow, &source, &[record]).unwrap();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -575,6 +621,87 @@ async fn search_can_be_granted_without_read() {
         message.contains("vector configuration"),
         "expected to get past authorization to the vector check, got: {body}"
     );
+}
+
+#[tokio::test]
+async fn hybrid_search_takes_the_fusion_controls() {
+    // ADR-094. The REST route and the tool share one implementation, so what
+    // is tested here is that the tool's *arguments* carry the two fields
+    // through — and that its advertised schema says they exist, since a
+    // caller can only pass what the schema names.
+    let server = Server::start().await;
+    seed_vectors(&server);
+    let token = server.root();
+
+    let (_, listed) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    let tool = listed["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "hybrid_search")
+        .expect("hybrid_search is listed");
+    let schema = &tool["inputSchema"];
+    let properties = &schema["properties"];
+    for field in ["query", "vector", "filter", "k", "weights", "min_overlap"] {
+        assert!(!properties[field].is_null(), "hybrid_search schema lacks {field}: {tool}");
+    }
+    // An optional nested object is emitted as `anyOf: [{$ref}, {type: null}]`
+    // with the object itself under `$defs`; follow the reference if there is
+    // one, so the check is about what the schema says and not how it says it.
+    let weights = &properties["weights"];
+    let reference = weights["anyOf"]
+        .as_array()
+        .and_then(|options| options.iter().find_map(|option| option["$ref"].as_str()));
+    let weight_fields = match reference {
+        Some(reference) => {
+            let pointer = reference.strip_prefix('#').expect("a local reference");
+            &schema.pointer(pointer).expect("the reference resolves")["properties"]
+        }
+        None => &weights["properties"],
+    };
+    assert!(
+        !weight_fields["dense"].is_null() && !weight_fields["lexical"].is_null(),
+        "weights must spell out dense and lexical: {weights}"
+    );
+
+    let order = |result: &Value| -> Vec<String> {
+        result["matches"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["_id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let base = json!({
+        "database": "kb", "collection": "notes",
+        "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5,
+    });
+
+    // Without the fields: plain RRF, the one-term match `y` outranks the
+    // nearest vector `x` on the strength of its lexical rank alone.
+    let plain = server.call_ok(&token, "hybrid_search", base.clone()).await;
+    assert_eq!(order(&plain), vec!["z", "y", "x"], "{plain}");
+
+    // Gated at two distinct terms, `y` loses its lexical share but keeps its
+    // dense one — it is still there, behind `x`.
+    let mut gated = base.clone();
+    gated["min_overlap"] = json!(2);
+    let gated = server.call_ok(&token, "hybrid_search", gated).await;
+    assert_eq!(order(&gated), vec!["z", "x", "y"], "{gated}");
+
+    // Weighted entirely towards the dense half: the vector order.
+    let mut dense = base.clone();
+    dense["weights"] = json!({ "dense": 1.0, "lexical": 0.0 });
+    let dense = server.call_ok(&token, "hybrid_search", dense).await;
+    assert_eq!(order(&dense), vec!["x", "z", "y"], "{dense}");
+
+    // And a meaningless control is refused in words, not accepted quietly.
+    let mut bad = base.clone();
+    bad["min_overlap"] = json!(0);
+    let refused = server.call(&token, "hybrid_search", bad).await;
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("min_overlap"), "expected a refusal naming the field: {refused}");
 }
 
 #[tokio::test]

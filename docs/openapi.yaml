@@ -343,6 +343,11 @@ paths:
         is what stops timing from revealing whether one does (ADR-038).
 
         Only failed attempts count against the limit.
+
+        Where this route answers at all is `auth.local.login` (ADR-100):
+        `always` (the default), `loopback_only`, or `disabled`. The mode
+        governs the *minting* of local tokens — a token already issued keeps
+        verifying under every mode, and federated tokens are unaffected.
       security: []
       requestBody:
         required: true
@@ -367,6 +372,24 @@ paths:
           description: |
             Wrong password, or no such user. The two are indistinguishable by
             design — body and status are identical.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "403":
+          description: |
+            `auth.local.login` is `loopback_only` and the connection's TCP peer
+            is not a loopback address. The `forbidden` code; the message names
+            the setting. Judged on the socket peer, never on a forwarded
+            header, so a reverse proxy on the node's own host looks local. Log
+            in from the host, or through the identity provider.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: |
+            `auth.local.login` is `disabled`: this node mints no local tokens
+            for anyone, and only its identity provider can authenticate a
+            caller. Not retryable from elsewhere.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -460,6 +483,10 @@ paths:
 
         Not rate-limited: there is no password verification here, which is what
         the login limiter exists to bound.
+
+        Bound by `auth.local.login` exactly as `/v1/auth/login` is, because
+        this mints a local token too (ADR-100). The mode is checked before the
+        token, so under `disabled` every caller sees the 404.
       responses:
         "200":
           description: A fresh token, with the same authority the account has now.
@@ -475,6 +502,23 @@ paths:
               schema: { $ref: "#/components/schemas/Error" }
         "401":
           $ref: "#/components/responses/Unauthorized"
+        "403":
+          description: |
+            `auth.local.login` is `loopback_only` and the connection's TCP peer
+            is not a loopback address. The `forbidden` code. The presented
+            token is still valid everywhere; only its renewal is confined to
+            the host.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+        "404":
+          description: |
+            `auth.local.login` is `disabled`: this node mints no local tokens.
+            Answered before the token is examined, so a missing or expired
+            token gets this rather than a 401.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
 
   /v1/topology:
     get:
@@ -538,10 +582,25 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [user, grants, authenticated, federated]
+                required: [user, display, grants, authenticated, federated]
                 properties:
                   user:
                     type: string
+                    description: |
+                      The identity: a local user name, or a federated token's
+                      `sub`. Everything the server decides is decided on this.
+                  display:
+                    type: string
+                    description: |
+                      A readable name beside the identity, never instead of it
+                      (ADR-100). For a federated caller, the string value of
+                      the claim `auth.oidc.subject_claim` names —
+                      `preferred_username`, `email`, `upn` — falling back to
+                      `user` when the claim is unset, absent from the token,
+                      or not a string. For a local caller, always `user`.
+                      Presentation only: an email is mutable and not unique
+                      across providers, so nothing keys on it, and a client
+                      should not either.
                   grants:
                     type: array
                     items: { $ref: "#/components/schemas/Grant" }
@@ -2190,6 +2249,17 @@ paths:
         **`query` text is required.** The lexical half cannot be derived from a
         bare vector, so that request is refused rather than silently degrading
         to plain vector search.
+
+        Two optional fields tune the fusion. `weights` scales each half's
+        contribution (`dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`);
+        `min_overlap` is how many distinct query terms a chunk must contain to
+        count as lexical evidence at all — a document it removes from the
+        lexical half keeps whatever the dense half gave it. Their defaults,
+        equal weights and `1`, are plain reciprocal rank fusion, exactly the
+        ranking a request that omits them gets. The lexical half ranks by term
+        overlap, so on a corpus of short documents `min_overlap: 2` is the
+        practical way to stop near-random lexical ranks outvoting the dense
+        ones. See `docs/vectors.md`.
       x-kimmy-action: search (plus read when filtering)
       requestBody:
         required: true
@@ -2203,7 +2273,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SearchResponse" }
         "400":
-          description: Missing `query`, or an otherwise unanswerable request.
+          description: |
+            Missing `query`; a negative weight, both weights zero, or
+            `min_overlap` below 1; or an otherwise unanswerable request.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -2558,7 +2630,11 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
     RateLimited:
-      description: Over a rate limit. Carries `Retry-After`.
+      description: |
+        Over a rate limit. Carries `Retry-After`. Login has one by address (and
+        optionally by username); every authenticated operation has one by
+        principal when `server.rate_limit.per_principal` is set, so a 429 can
+        answer any operation that takes a token, not only this one.
       headers:
         Retry-After:
           schema: { type: integer }
@@ -2602,7 +2678,7 @@ components:
         | Code | Status | Retry | Meaning |
         |---|---|---|---|
         | `bad_request` | 400, 422 | no | Malformed filter, update, projection or Extended JSON; a body of the wrong shape; a batch over the cap |
-        | `payload_too_large` | 413 | no | Request body over 2 MB |
+        | `payload_too_large` | 413 | no | Request body over the node's ceiling (`server.max_body_bytes`, 2 MiB by default) |
         | `unsupported_media_type` | 415 | no | A JSON body without a JSON content type |
         | `unauthorized` | 401 | no | Missing, invalid or expired token; bad credentials; an account deleted, disabled or re-credentialed since the token was issued |
         | `forbidden` | 403 | no | Denied by RBAC. Identical whether or not the target exists |
@@ -2612,13 +2688,14 @@ components:
         | `unique_violation` | 409 | no | A unique index would be broken |
         | `no_vectors` | 409 | no | Searching a collection whose vectors were never ingested — distinguished from an empty result, which is indistinguishable from "nothing matched" |
         | `resume_token_expired` | 410 | no | The resume point cannot be continued from — collected by retention, or belonging to a previous incarnation of a collection that was dropped and recreated. Resubscribe |
-        | `rate_limited` | 429 | wait | Over a limit. Carries `Retry-After` |
+        | `rate_limited` | 429 | wait | Over a limit — failed logins by address or username, or an authenticated principal's request budget when `server.rate_limit.per_principal` is set. Carries `Retry-After` |
         | `not_implemented` | 501 | no | A reserved capability that does not exist |
         | `provider_error` | 502 | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
         | `internal` | 500 | elsewhere | A storage failure on this node. Details are logged, never returned |
         | `misconfigured` | 500 | elsewhere | This node lacks something it needs, such as an API key named by its vector configuration |
         | `snapshot` | 500 | elsewhere | A vector index snapshot on this node could not be used |
         | `stale` | 409 | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written. Re-read, decide again, and send a new request with the current stamp |
+        | `timeout` | 503 | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at the node's deadline (`server.request_timeout_secs`, 30 s by default) and was abandoned. Not a query timeout: storage work already running completes and is answered. No `Retry-After`; the server does not know when a slow client or provider will be faster |
       enum:
         - bad_request
         - payload_too_large
@@ -2638,6 +2715,7 @@ components:
         - not_implemented
         - provider_error
         - stale
+        - timeout
 
     Capability:
       type: string
@@ -2877,6 +2955,13 @@ components:
           description: |
             Costs work proportional to what it skips. Use `cursor` for paging;
             `skip` is for jumping.
+
+            With a `sort` other than `{"_id": 1}`, `skip + limit` may not
+            exceed 10,000 — that is what the server holds while it sorts — and
+            a larger window is refused with `400` rather than clamped, because
+            a clamped skip would return a different page and say nothing. To
+            page deeper, sort by `_id` and follow `nextCursor`, or narrow the
+            filter on the sort field to where the last page ended.
         explain:
           type: boolean
           default: false
@@ -2977,6 +3062,16 @@ components:
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.
+        indexEntriesRead:
+          type: integer
+          description: |
+            Index entries read, when an index answered a read. How much of the
+            index the query touched, as distinct from how many documents it
+            examined: an equality on a complete key stopped by `limit` reads
+            as many entries as it returns, while a range that had to be put
+            in `_id` order reads the whole range however few documents it
+            returns. Absent for a collection scan, an `idLookup`, and for
+            `update` and `delete`.
 
     ViolationGroup:
       type: object
@@ -3161,6 +3256,30 @@ components:
         per_document:
           type: integer
           description: Chunks per document allowed into the results.
+        weights:
+          type: object
+          description: |
+            `hybrid_search` only; `vector_search` ignores it. How much each
+            half's rank counts in fusion: the score is
+            `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`. Each
+            weight is `>= 0` and they must not both be zero (`400`). Only the
+            ratio matters; a weight of `0` switches that half off. A weight
+            left out is `1`. The default, equal weights, is plain reciprocal
+            rank fusion.
+          properties:
+            dense: { type: number, minimum: 0, default: 1 }
+            lexical: { type: number, minimum: 0, default: 1 }
+        min_overlap:
+          type: integer
+          minimum: 1
+          default: 1
+          description: |
+            `hybrid_search` only; `vector_search` ignores it. How many
+            distinct query terms a chunk must contain to enter the lexical
+            ranking. A query with fewer distinct terms than this is held to its
+            own count, so a one-word query is never gated to nothing. A
+            document the gate removes from the lexical half keeps its dense
+            contribution. `0` is a `400`.
 
     SearchResponse:
       type: object

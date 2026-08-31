@@ -2,15 +2,27 @@
 #
 # Not run on its own. The dist-generated release workflow calls this as its
 # `./publish-ghcr` publish job (see dist-workspace.toml), after the tag's
-# binaries have been built and the GitHub Release is being hosted — so an
+# binaries have been built and the GitHub Release has been created — so an
 # image only ever exists for a tag whose artifacts built on every platform.
 #
-# Why two native runners and a manifest merge, rather than one buildx run
-# with QEMU: the Dockerfile compiles the workspace in release mode, and a
-# Rust release build under QEMU emulation takes the better part of an hour
-# against minutes natively. GitHub's arm64 runners are free for public
-# repositories, so each architecture builds on its own hardware and a final
-# job stitches the two digests into one multi-arch tag list.
+# Nothing is compiled here. The image ships the `kimmyd` from the release
+# archive for its architecture: the `kimmyd-<target>.tar.xz` dist built in
+# `build-local-artifacts` is taken from this run's workflow artifacts (on a
+# manual dispatch, from the Release itself), checked against the checksum dist
+# wrote beside it, and handed to the Dockerfile's `prebuilt` stage. Before
+# this, each architecture compiled the workspace a second time inside BuildKit
+# — nine minutes on amd64, after the same binary had already been built and
+# attached to the Release — and the file in the image and the file on the
+# Release page were two builds of one commit rather than one file. Now they
+# are one file, which is also the shorter path: what is left per architecture
+# is downloading an archive and building the runtime layer.
+#
+# Still two native runners and a manifest merge, rather than one buildx run
+# with QEMU: the runtime stage's apt layer is what remains to do per
+# architecture, and it is slow under emulation and free on GitHub's arm64
+# runners. And the digest-then-merge flow is the one that has produced every
+# tag so far; changing where the binary comes from was no reason to change
+# how the manifest is assembled.
 
 name: Publish to GHCR
 
@@ -23,9 +35,9 @@ on:
       plan:
         required: true
         type: string
-  # Manual re-publish of an existing tag's image: same builds, same manifest,
-  # no release flow required. The input is the tag (v-prefixed), and every
-  # step that would have read github.sha or github.ref_name reads
+  # Manual re-publish of an existing tag's image: same binaries, same
+  # manifest, no release flow required. The input is the tag (v-prefixed), and
+  # every step that would have read github.sha or github.ref_name reads
   # inputs.tag_name instead so a dispatch lands exactly where the release
   # flow would have.
   workflow_dispatch:
@@ -44,12 +56,16 @@ jobs:
     name: build image (${{ matrix.platform }})
     strategy:
       fail-fast: false
+      # `target` is the dist target whose archive this platform's image ships;
+      # it names the workflow artifact and the archive inside it.
       matrix:
         include:
           - platform: linux/amd64
             runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
           - platform: linux/arm64
             runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: read
@@ -76,6 +92,48 @@ jobs:
         with:
           ref: ${{ inputs.tag_name || github.ref_name }}
 
+      # In the release flow the archive comes from this run: dist uploaded it
+      # from `build-local-artifacts` under this name (see release.yml), and
+      # `host`, which this job runs after, has already attached the same file
+      # to the Release. Downloaded outside the checkout so nothing but the
+      # binary enters the build context.
+      - name: Fetch the release archive
+        if: ${{ !inputs.tag_name }}
+        uses: actions/download-artifact@v8
+        with:
+          name: artifacts-build-local-${{ matrix.target }}
+          path: ${{ runner.temp }}/archive
+
+      # A manual dispatch has no run to take artifacts from, so the same file
+      # comes from the Release, with the checksum published beside it.
+      - name: Fetch the release archive (dispatch)
+        if: ${{ inputs.tag_name }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download "${{ inputs.tag_name }}" \
+            --pattern "kimmyd-${{ matrix.target }}.tar.xz" \
+            --pattern "kimmyd-${{ matrix.target }}.tar.xz.sha256" \
+            --dir "$RUNNER_TEMP/archive"
+
+      # Verify the archive against dist's checksum, unpack only the binary,
+      # and run it: a static musl binary runs on the runner that will build
+      # its image, so `--version` proves the file is the right architecture
+      # and shows the commit it reports, before anything is pushed. The
+      # commit is baked in by dist's build — it compiled from a checkout with
+      # `.git` — which is why no GIT_COMMIT build argument is passed below.
+      - name: Unpack kimmyd
+        env:
+          ARCHIVE: kimmyd-${{ matrix.target }}.tar.xz
+        working-directory: ${{ runner.temp }}/archive
+        run: |
+          sha256sum -c "$ARCHIVE.sha256"
+          mkdir -p "$GITHUB_WORKSPACE/.prebuilt"
+          tar -xJf "$ARCHIVE" --strip-components=1 -C "$GITHUB_WORKSPACE/.prebuilt" \
+            "${ARCHIVE%.tar.xz}/kimmyd"
+          chmod +x "$GITHUB_WORKSPACE/.prebuilt/kimmyd"
+          "$GITHUB_WORKSPACE/.prebuilt/kimmyd" --version
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -93,10 +151,8 @@ jobs:
         with:
           context: .
           platforms: ${{ matrix.platform }}
-          # What `kimmyd` reports as its commit — the build context carries
-          # no .git, so without this the image would say "unknown".
           build-args: |
-            GIT_COMMIT=${{ steps.rel.outputs.commit }}
+            KIMMYD_SOURCE=prebuilt
           labels: |
             org.opencontainers.image.source=https://github.com/titusai-io/kimmydb
             org.opencontainers.image.revision=${{ steps.rel.outputs.commit }}
@@ -126,6 +182,23 @@ jobs:
     permissions:
       packages: write
     steps:
+      # The same resolution as in `build`, because the commit tag below reads
+      # it and a step's outputs do not cross jobs. Until this was here the
+      # tag was a literal `sha-` on every release, each one overwriting the
+      # last.
+      - name: Resolve release commit
+        id: rel
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag_name }}"
+          if [ -n "$TAG" ]; then
+            SHA=$(gh api "repos/$GITHUB_REPOSITORY/commits/$TAG" --jq '.sha')
+            echo "short=${SHA::7}" >> "$GITHUB_OUTPUT"
+          else
+            echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Download digests
         uses: actions/download-artifact@v8
         with:

@@ -61,7 +61,7 @@ it.
 | Removing or renaming a route, field, or error code | |
 | Changing the type of a response field | The `matched` boolean-to-count change in M10 task 1 was exactly this, made before `/v1` had ever been published |
 | Making an optional request field required | |
-| Tightening a refusal so something that worked now fails | |
+| Tightening a refusal so something that worked now fails | With one recorded exception: a **capacity ceiling** on a request the node could only answer by holding more than it may — the 10,000-document sort window of [ADR-098](decisions.md), the same class as `MAX_LIMIT` and the body limit — may be introduced in a `0.MINOR` release with a release note. A request that could take the node, and every other client's requests, down with it was never one this promise could keep at every collection size |
 | Changing what a route *means* while keeping its shape | The worst kind, because nothing observable changes for a client until its data is wrong |
 | Changing a default | A client that omitted the field gets different behaviour without asking for it |
 
