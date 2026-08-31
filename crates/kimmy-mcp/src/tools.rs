@@ -396,8 +396,9 @@ impl KimmyMcp {
                        less), $group (with $sum, $avg, $min, $max, $first, $last, $push, \
                        $addToSet), $unwind, $project, $sort, $skip, $limit, $count, and \
                        $lookup (join; you need read access to the joined collection too). \
-                       Field references are written \"$field\". There are no computed \
-                       expressions such as $add. A pipeline that would hold too many \
+                       Field references are written \"$field\"; computed expressions \
+                       ($add, $concat, $cond, $size, $filter, $map and the rest) work \
+                       anywhere a value is derived. A pipeline that would hold too many \
                        documents is refused, naming the stage — add an earlier $match.")]
     async fn aggregate(
         &self,

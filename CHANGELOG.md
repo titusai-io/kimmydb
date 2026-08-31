@@ -67,6 +67,32 @@ whose defaults are meant to be left alone, and documentation corrections.
   violation) makes that document a non-match rather than failing the request;
   that and one deliberate leniency are recorded in `docs/deviations.md`.
   ADR-106.
+- **Variables in expressions.** `$$ROOT` and `$$CURRENT` name the document;
+  `{$let: {vars: {...}, in: <expr>}}` binds names for its body; `$$name.path`
+  reads into a variable's value. Scopes nest and shadow lexically. A `$$name`
+  that nothing binds is a `400` at parse time, before any document is read,
+  rather than a null in every row.
+- **Array expression operators.** `$size`, `$arrayElemAt` (negative from the
+  end, null out of range), `$first`, `$last`, `$slice` (two- and three-argument
+  forms), `$concatArrays`, `$in` (expression form, `[value, array]`),
+  `$indexOfArray`, `$isArray`, `$reverseArray`, `$range` (capped at 100,000
+  elements), and the three that iterate with a bound variable: `$filter`
+  (`input`, `as`, `cond`, optional `limit`), `$map` (`input`, `as`, `in`) and
+  `$reduce` (`input`, `initialValue`, `in` with `$$value` and `$$this`). Null or
+  a missing field yields null throughout; any other non-array is an error.
+  Four places where that is more lenient than MongoDB are recorded in
+  `docs/deviations.md`.
+- **`$lookup` `let`/`pipeline` form.** `{$lookup: {from, let: {name: <expr over
+  the local document>}, pipeline: [<stages over the foreign collection>], as}}`.
+  The `let` is evaluated per input document and visible as `$$name` in every
+  stage of the sub-pipeline, `$$ROOT` there is the foreign document, and a
+  nested `$lookup` inside the sub-pipeline sees the outer `let` too. The
+  foreign collection is read once; a leading `$match` in the sub-pipeline is
+  applied once before the per-document loop. This form is O(local × foreign)
+  by construction — `docs/aggregation.md` says when to prefer the
+  `localField`/`foreignField` form, which remains a single pass. Authorized
+  against `from` exactly as the equality form is. Carrying both forms in one
+  stage is refused.
 - **`weights` and `min_overlap` on `hybrid_search`.** Measured on a corpus of
   short conversational documents, hybrid search recalled roughly a third less
   than plain vector search on the same queries, for every one of eight
@@ -144,7 +170,6 @@ whose defaults are meant to be left alone, and documentation corrections.
   resolution, rate limiting and every comparison the server makes, because
   an email is mutable and not unique across providers. A subject whose email
   changes keeps its roles.
-
 - **`auth.jwt_previous_secret` (`KIMMY_JWT_PREVIOUS_SECRET`,
   `--jwt-previous-secret`): a two-key window for rotating `jwt_secret`.**
   Tokens are always signed with `jwt_secret`; a token is accepted if either

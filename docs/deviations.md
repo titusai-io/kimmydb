@@ -17,6 +17,62 @@ Status meanings:
 
 ---
 
+## 🟡 Array expression operators are lenient about null where MongoDB errors
+
+**Raised 2026-08-30, with the expression scope (ADR-105).** The array operators
+follow the expression layer's standing rule — *null propagates, a type violation
+refuses* — and in four places that is a strict superset of MongoDB, which
+errors instead:
+
+| Operator | Here | MongoDB |
+|---|---|---|
+| `$size` on null or a missing field | null | error |
+| `$in` with a null array | null | error |
+| `$range` with a null bound or step | null | error |
+| `$slice`, `$arrayElemAt`, `$indexOfArray` with a null count, index or bound | null | error |
+
+A pipeline MongoDB accepts means the same thing here; a pipeline that errors
+there may succeed here with a null in the row. Chosen because a sparse
+collection is the norm in this database and `{$size: "$tags"}` on a document
+without `tags` failing the whole request is the wrong trade; recorded because
+someone porting a pipeline that *relies* on the error to catch bad data will
+not get it.
+
+**Three smaller divergences, same entry.** `$arrayElemAt` out of range and
+`$first`/`$last` on an empty array are **null** rather than MongoDB's *missing*
+— an expression here always yields a value, and a projected field is therefore
+present with null rather than absent. `$range` produces `Int64` elements where
+MongoDB produces `Int32`, as every integer result of the expression layer does
+(see the module notes on numbers). And `$filter`, `$map`, `$reduce` and `$let`
+**refuse a key they do not know** (`condition` for `cond`), where MongoDB
+ignores it; that is stricter, and only turns a silently wrong pipeline into an
+error.
+
+**Made visible, not introduced: a dotted path through an array yields one
+value.** `Expr::Field` takes the first value `path::resolve` finds, so
+`"$items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` is `"a"` where MongoDB
+gives `["a", "b"]`. That has been true since the expression layer existed and
+mattered little while nothing could consume an array; with `$map` and `$size`
+it is the first thing a ported pipeline trips on. Left as is in this change —
+fixing it means a resolver that reports *whether* it crossed an array, which
+`path::resolve` cannot, and it changes what `$group: {_id: "$items.sku"}`
+buckets by — and documented in `aggregation.md` with the `$map` form that
+does what the path was meant to.
+
+**`$lookup` refuses the combined form.** MongoDB 5.0 accepts
+`localField`/`foreignField` *and* `pipeline` in one stage — the "concise
+correlated subquery". Here it is a 400 that points at the equivalent: join on
+the key with the equality form, then `$filter` or `$map` the attached array in
+the following stage, which keeps the single pass. Closing this would mean
+combining the indexed pass with the per-document loop; not planned until
+someone needs it.
+
+**Closing the null leniency** would mean a per-operator strictness flag in the
+evaluator for the sake of matching an error, at the cost of the one rule the
+expression layer has been able to state in a sentence. Not planned.
+
+---
+
 ## 🟡 `$expr` treats an evaluation error as no match, and is accepted under `$elemMatch`
 
 **Raised 2026-08-30, while adding `$expr` to the filter language (ADR-106).**
@@ -31,8 +87,11 @@ the result is returned. `filter::matches` answers a `bool` for every caller —
 the scan, `$elemMatch`, the executor's residual re-check after an index probe
 — and the regex arm already resolves the same tension the same way: an
 unusable pattern matches nothing rather than taking down the request. Parse-
-time errors (an unknown operator, a wrong arity, `$$ROOT`) are still a `400`,
-so the leniency is confined to failures that depend on the data. A pipeline's
+time errors (an unknown operator, a wrong arity, a `$$name` nothing binds) are
+still a `400`, so the leniency is confined to failures that depend on the data.
+`$$ROOT` and `$$CURRENT` were parse-time errors here too until the expression
+scope landed (ADR-105); they now name the document under consideration, which
+inside a document-form `$elemMatch` is the element. A pipeline's
 `$addFields` with the same expression still refuses, as it did before; the
 difference is that a filter *selects* and a stage *derives*, and a
 derivation that cannot be computed has no honest value to write.
@@ -1856,7 +1915,7 @@ here so that the absence of a decision is visible as a decision.
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
-| Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`) and type conversion | Deliberately outside M9 task 1's agreed operator list. Variable binding needs an evaluation *scope*, not another operator | not scheduled |
+| Set expression operators (`$setUnion` and family), `$zip`, `$objectToArray` and type conversion | Deliberately outside M9 task 1's agreed operator list. The array operators and variable binding it also excluded have since shipped on an evaluation scope (ADR-105); the set family is a further pass over the same scope | not scheduled |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is committed on its own. Note this is about *commits*, not about how the matches are found — that is planned now | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |

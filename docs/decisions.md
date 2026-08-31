@@ -5142,6 +5142,66 @@ and its rotation remains what it was.
 
 ---
 
+## ADR-105 — Expressions evaluate in a lexical scope
+
+**Decision.** `Expr::eval` runs in a `Scope`: the root document plus a chain of
+frames, one per enclosing construct that binds a name. `$let`, `$map`,
+`$filter` and `$reduce` push a frame holding the names they bind and evaluate
+their body in it; a `$$name` reference searches the innermost frame first and
+walks outward; `$$ROOT` and `$$CURRENT` are the root document and are never
+rebound. A `$lookup` `let` is one more frame, laid under every stage of the
+sub-pipeline. Names are also tracked while **parsing**, so a `$$name` nothing
+binds is refused where it is written rather than evaluating to null per
+document. `Expr::eval(doc)` remains and is the empty-scope case, so every
+existing caller — `$project`, `$addFields`, `$replaceRoot`, `$group` — is
+unchanged.
+
+**Why.** One design cost unlocks four things that were each separately out of
+reach. The array family — `$filter`, `$map`, `$reduce` and the eleven
+positional operators beside them — was excluded from the first expression pass
+with the recorded reason that `$$this` needs a scope, not another operator.
+`$$ROOT`, which is how a `$project` embeds its source or a `$group` pushes
+whole documents, is the same mechanism with a fixed binding. `$let` is the
+mechanism exposed directly. And the `$lookup` `let`/`pipeline` form, the only
+way to join on anything but one key's equality, is a scope whose frame is
+evaluated once per input document and whose body is a pipeline rather than an
+expression. Building the scope once and expressing all four through it is less
+code and one rule — *a variable is a name in a frame; frames nest* — where four
+special cases would each have carried their own.
+
+The parse-time check follows from the same rule. Because every binder is known
+while the tree is built, the parser can carry the lexical environment for free,
+and a refusal at parse is the difference between "this pipeline is wrong" and
+a null in every row that nobody notices — the failure the expression layer's
+null-versus-error rule exists to avoid.
+
+**Alternatives.** *Special-case `$$this` per operator* — have `$map` evaluate
+its body against a synthetic document with `this` in it, or thread a single
+optional "current element" through `eval`. Rejected: it handles one level of
+nesting and not two, cannot express `$reduce`'s two names or `$let`'s
+arbitrary ones, gives `$$ROOT` nothing to stand on, and leaves the `$lookup`
+form with no way in. Each further operator would have re-derived a scope
+badly. *Substitute variables at parse time* — rewrite `$$this` into a field
+path before evaluation. Rejected because the element is not a field of any
+document the path could name. *Evaluate against a merged document* — clone the
+root and insert the bindings as fields. Rejected as a clone per element per
+document, and because it lets a binding shadow a real field by accident.
+
+**Cost.** A scope chain per evaluation: a frame is a borrowed slice and a
+parent pointer, so pushing one per array element is a stack slot and no
+allocation, and `eval` on a scope with no frames is what it was before. The
+parser carries a `Vec<String>` of declared names that grows and shrinks with
+nesting. The `$lookup` pipeline form is a nested loop — O(local × foreign),
+inherent to a form whose body may do anything with the variables — and is
+documented as such, with the equality form recommended wherever the join is
+one key and a leading `$match` hoisted out of the loop because the filter
+language cannot read the variables. The `$$ROOT` value is a clone of the
+document, paid only when it is read whole. And the parse-time check means an
+expression is bound to the names it was parsed with: `parse_with_vars`
+followed by a plain `eval` is an error rather than a null, which is the point.
+
+---
+
 ## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
 
 **Decision.** `{$expr: <expression>}` is a filter clause. It parses through
