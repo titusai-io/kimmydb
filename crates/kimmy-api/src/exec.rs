@@ -12,6 +12,7 @@
 use bson::Document;
 use kimmy_auth::Action;
 use kimmy_core::DocId;
+use kimmy_query::expr::Binding;
 use kimmy_query::{aggregate, filter, plan, shape, update};
 use kimmy_storage::CollectionMeta;
 use serde_json::{Value, json};
@@ -1368,17 +1369,46 @@ pub fn aggregate(
     })?;
     aggregate::check_limit("the source collection", docs.len(), &limits)?;
 
-    for stage in &stages {
-        docs = match stage {
-            aggregate::Stage::Lookup { from, local_field, foreign_field, as_field } => {
-                lookup(state, auth, db, from, local_field, foreign_field, as_field, docs, &limits)?
-            }
-            other => aggregate::apply(other, docs, &limits)?,
-        };
-    }
+    let docs = run_stages(state, auth, db, &stages, docs, &limits, &[])?;
 
     let documents: Vec<Value> = docs.iter().map(document_to_json).collect();
     Ok(json!({ "documents": documents, "count": documents.len() }))
+}
+
+/// Run stages in order: the two `$lookup` forms go to the functions here that
+/// hold a storage handle, everything else to the pure pipeline.
+///
+/// `vars` is what an enclosing `$lookup` `let` bound — empty at the top level,
+/// and the reason this is a function rather than a loop in `aggregate`: a
+/// sub-pipeline runs through the same dispatch, so a `$lookup` nested inside
+/// another's pipeline is authorized and executed exactly as an outer one is.
+fn run_stages(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    stages: &[aggregate::Stage],
+    mut docs: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    for stage in stages {
+        docs = match stage {
+            aggregate::Stage::Lookup {
+                from,
+                as_field,
+                join: aggregate::Join::Equality { local_field, foreign_field },
+            } => lookup(state, auth, db, from, local_field, foreign_field, as_field, docs, limits)?,
+            aggregate::Stage::Lookup {
+                from,
+                as_field,
+                join: aggregate::Join::Pipeline { vars: let_vars, stages: sub },
+            } => {
+                lookup_pipeline(state, auth, db, from, let_vars, sub, as_field, docs, limits, vars)?
+            }
+            other => aggregate::apply_with_vars(other, docs, limits, vars)?,
+        };
+    }
+    Ok(docs)
 }
 
 fn parse_pipeline(pipeline: &Value) -> Result<Vec<aggregate::Stage>, ApiError> {
@@ -1442,6 +1472,69 @@ fn lookup(
         // Always an array, even when empty: a field whose type depends on
         // whether anything matched forces every caller to handle two shapes.
         doc.insert(as_field.to_string(), bson::Bson::Array(joined));
+        out.push(doc);
+    }
+    Ok(out)
+}
+
+/// The `let`/`pipeline` form: the sub-pipeline runs over the foreign collection
+/// once **per input document**, with that document's `let` bound.
+///
+/// That is a nested loop — O(n·m) in the two collection sizes — and inherent to
+/// the form: the sub-pipeline may do anything at all with the variables, so
+/// there is no single key to index the foreign side by. What keeps it
+/// tolerable: the foreign collection is read from storage once and held for
+/// the duration, and a leading `$match` is applied once before the loop, since
+/// a filter cannot read `let` (the filter language has no variables, so a
+/// `$$name` inside one is a parse error — if that changes, this hoist must be
+/// conditioned on the filter not using them). A join on one key belongs in the
+/// `localField`/`foreignField` form, which is a single pass.
+#[allow(clippy::too_many_arguments)]
+fn lookup_pipeline(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    from: &str,
+    let_vars: &[(String, kimmy_query::Expr)],
+    stages: &[aggregate::Stage],
+    as_field: &str,
+    input: Vec<bson::Document>,
+    limits: &aggregate::Limits,
+    outer: &[Binding<'_>],
+) -> Result<Vec<bson::Document>, ApiError> {
+    // The second authorization point, exactly as for the equality form.
+    let foreign_meta = authorize(state, auth, Action::Read, db, from)?;
+
+    let mut foreign: Vec<bson::Document> = Vec::new();
+    state.engine.for_each_doc(&foreign_meta, |_id, doc| {
+        foreign.push(doc);
+        Ok(true)
+    })?;
+    aggregate::check_limit("$lookup", foreign.len(), limits)?;
+
+    let (base, rest) = match stages.split_first() {
+        Some((first @ aggregate::Stage::Match(_), rest)) => {
+            (aggregate::apply(first, foreign, limits)?, rest)
+        }
+        _ => (foreign, stages),
+    };
+
+    let mut held = 0usize;
+    let mut out = Vec::with_capacity(input.len());
+    for mut doc in input {
+        let bound = aggregate::bind_let(let_vars, &doc, outer)?;
+        // Inner bindings after outer ones, so a name rebound here shadows.
+        let vars: Vec<Binding<'_>> =
+            outer.iter().copied().chain(bound.iter().map(|(n, v)| (n.as_str(), v))).collect();
+        let joined = run_stages(state, auth, db, rest, base.clone(), limits, &vars)?;
+        // Joined documents are held alongside the input, so the total across
+        // every input document is what the ceiling bounds.
+        held += joined.len();
+        aggregate::check_limit("$lookup", held, limits)?;
+        doc.insert(
+            as_field.to_string(),
+            bson::Bson::Array(joined.into_iter().map(bson::Bson::Document).collect()),
+        );
         out.push(doc);
     }
     Ok(out)

@@ -33,16 +33,22 @@
 //!
 //! An accumulator argument, a `$group` key and a computed field are all
 //! [`crate::expr::Expr`], which is a full tree — arithmetic, strings,
-//! conditionals, comparison, boolean and date parts. That module owns the
-//! operator set and its evaluation; this one owns stages and the flow of
+//! conditionals, comparison, boolean, date parts and arrays. That module owns
+//! the operator set and its evaluation; this one owns stages and the flow of
 //! documents between them.
+//!
+//! Expressions evaluate in a [`Scope`]. At the top level that is the document
+//! and nothing else; inside a `$lookup` sub-pipeline it also carries the
+//! `let` bindings, which is why every entry point here has a `_with_vars`
+//! form. The plain form is the empty-variables case and is what every caller
+//! outside a sub-pipeline uses.
 
 use std::collections::HashSet;
 
 use bson::{Bson, Document};
 use kimmy_core::{Error, Result, path};
 
-use crate::expr::{Expr, Total, type_name};
+use crate::expr::{Binding, Expr, Scope, Total, type_name};
 use crate::filter::{self, Filter};
 use crate::shape::{self, ID_FIELD, Projection, SortKey};
 
@@ -111,10 +117,22 @@ pub enum Stage {
     /// documentation.
     Lookup {
         from: String,
-        local_field: String,
-        foreign_field: String,
         as_field: String,
+        join: Join,
     },
+}
+
+/// How a `$lookup` decides which foreign documents belong to an input document.
+#[derive(Clone, Debug)]
+pub enum Join {
+    /// `localField` / `foreignField`: equality on one key. The executor scans
+    /// the foreign collection **once** and indexes it by that key.
+    Equality { local_field: String, foreign_field: String },
+    /// `let` / `pipeline`: `stages` run over the foreign collection **once per
+    /// input document**, with `vars` evaluated against that document and bound
+    /// for the sub-pipeline to read as `$$name`. A nested loop by construction;
+    /// see `docs/aggregation.md` for when to prefer the other form.
+    Pipeline { vars: Vec<(String, Expr)>, stages: Vec<Stage> },
 }
 
 impl Stage {
@@ -143,10 +161,16 @@ impl Stage {
 
 /// Parse a pipeline.
 pub fn parse(pipeline: &[Document]) -> Result<Vec<Stage>> {
-    pipeline.iter().map(parse_stage).collect()
+    parse_with_vars(pipeline, &[])
 }
 
-fn parse_stage(stage: &Document) -> Result<Stage> {
+/// Parse a pipeline whose expressions may read `vars` — a `$lookup`
+/// sub-pipeline, with the names its `let` binds.
+pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Stage>> {
+    pipeline.iter().map(|stage| parse_stage(stage, vars)).collect()
+}
+
+fn parse_stage(stage: &Document, vars: &[String]) -> Result<Stage> {
     if stage.len() != 1 {
         return Err(Error::InvalidQuery(format!(
             "a pipeline stage must have exactly one key naming the operator, found {}",
@@ -157,11 +181,11 @@ fn parse_stage(stage: &Document) -> Result<Stage> {
 
     match name.as_str() {
         "$match" => Ok(Stage::Match(Box::new(filter::parse(as_document(name, value)?)?))),
-        "$project" => parse_project(as_document(name, value)?),
+        "$project" => parse_project(as_document(name, value)?, vars),
         "$addFields" | "$set" => {
-            Ok(Stage::AddFields(parse_computed(name, as_document(name, value)?)?))
+            Ok(Stage::AddFields(parse_computed(name, as_document(name, value)?, vars)?))
         }
-        "$replaceRoot" => parse_replace_root(as_document(name, value)?),
+        "$replaceRoot" => parse_replace_root(as_document(name, value)?, vars),
         "$sort" => Ok(Stage::Sort(shape::parse_sort(as_document(name, value)?)?)),
         "$limit" => Ok(Stage::Limit(as_count(name, value)?)),
         "$skip" => Ok(Stage::Skip(as_count(name, value)?)),
@@ -172,8 +196,8 @@ fn parse_stage(stage: &Document) -> Result<Stage> {
             )),
         },
         "$unwind" => parse_unwind(value),
-        "$group" => parse_group(as_document(name, value)?),
-        "$lookup" => parse_lookup(as_document(name, value)?),
+        "$group" => parse_group(as_document(name, value)?, vars),
+        "$lookup" => parse_lookup(as_document(name, value)?, vars),
         // `UnsupportedOperator` renders its payload quoted — `unsupported
         // operator "x"` — so the guidance goes in an `InvalidQuery`, whose
         // format composes with a sentence. Both are a 400; this is about the
@@ -186,11 +210,13 @@ fn parse_stage(stage: &Document) -> Result<Stage> {
 }
 
 /// `{field: <expression>, ...}` — every value is an expression.
-fn parse_computed(stage: &str, doc: &Document) -> Result<Vec<(String, Expr)>> {
+fn parse_computed(stage: &str, doc: &Document, vars: &[String]) -> Result<Vec<(String, Expr)>> {
     if doc.is_empty() {
         return Err(Error::InvalidQuery(format!("{stage} needs at least one field")));
     }
-    doc.iter().map(|(name, value)| Ok((name.clone(), Expr::parse(value)?))).collect()
+    doc.iter()
+        .map(|(name, value)| Ok((name.clone(), Expr::parse_with_vars(value, vars)?)))
+        .collect()
 }
 
 /// `$project` is two things at once: the include/exclude flags it always was,
@@ -203,7 +229,7 @@ fn parse_computed(stage: &str, doc: &Document) -> Result<Vec<(String, Expr)>> {
 /// Computed fields force inclusion mode. Excluding some fields while computing
 /// others is refused for the same reason mixing inclusion and exclusion is —
 /// the result would be ambiguous about every field nobody named.
-fn parse_project(doc: &Document) -> Result<Stage> {
+fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
     let mut computed = Vec::new();
     let mut include = Vec::new();
     let mut excluded_id = false;
@@ -221,7 +247,7 @@ fn parse_project(doc: &Document) -> Result<Stage> {
             Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => {
                 include.push(key.clone());
             }
-            other => computed.push((key.clone(), Expr::parse(other)?)),
+            other => computed.push((key.clone(), Expr::parse_with_vars(other, vars)?)),
         }
     }
 
@@ -245,13 +271,13 @@ fn parse_project(doc: &Document) -> Result<Stage> {
     Ok(Stage::Project { projection: Some(Projection::Include(include)), computed })
 }
 
-fn parse_replace_root(spec: &Document) -> Result<Stage> {
+fn parse_replace_root(spec: &Document, vars: &[String]) -> Result<Stage> {
     let Some(new_root) = spec.get("newRoot") else {
         return Err(Error::InvalidQuery(
             "$replaceRoot needs a `newRoot`, e.g. {newRoot: \"$address\"}".into(),
         ));
     };
-    Ok(Stage::ReplaceRoot(Expr::parse(new_root)?))
+    Ok(Stage::ReplaceRoot(Expr::parse_with_vars(new_root, vars)?))
 }
 
 fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
@@ -311,7 +337,7 @@ fn parse_unwind(value: &Bson) -> Result<Stage> {
     }
 }
 
-fn parse_group(spec: &Document) -> Result<Stage> {
+fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
     let id = spec.get("_id").ok_or_else(|| {
         Error::InvalidQuery(
             "$group needs an _id naming the grouping key; use {_id: null} to group everything \
@@ -319,7 +345,7 @@ fn parse_group(spec: &Document) -> Result<Stage> {
                 .into(),
         )
     })?;
-    let id = Expr::parse(id)?;
+    let id = Expr::parse_with_vars(id, vars)?;
 
     let mut fields = Vec::new();
     for (name, value) in spec {
@@ -337,7 +363,7 @@ fn parse_group(spec: &Document) -> Result<Stage> {
             )));
         }
         let (op, arg) = acc.iter().next().expect("length checked above");
-        let expr = Expr::parse(arg)?;
+        let expr = Expr::parse_with_vars(arg, vars)?;
         let accumulator = match op.as_str() {
             "$sum" => Accumulator::Sum(expr),
             "$avg" => Accumulator::Avg(expr),
@@ -359,20 +385,94 @@ fn parse_group(spec: &Document) -> Result<Stage> {
     Ok(Stage::Group { id, fields })
 }
 
-fn parse_lookup(spec: &Document) -> Result<Stage> {
-    let required = |key: &str| -> Result<String> {
+/// Two forms, told apart by their keys and never mixed.
+///
+/// `localField`/`foreignField` is the equality join; `let`/`pipeline` is the
+/// general one. MongoDB also accepts both at once — a "concise correlated
+/// subquery" — and that is refused here: the executor would have to combine an
+/// indexed pass with a per-document loop, and a caller who wants to reshape
+/// what an equality join attached can do that with `$filter` or `$map` in the
+/// stage after it.
+fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
+    let string = |key: &str| -> Result<String> {
         spec.get_str(key).map(str::to_string).map_err(|_| {
             Error::InvalidQuery(format!(
-                "$lookup needs a string `{key}`; it takes from, localField, foreignField and as"
+                "$lookup needs a string `{key}`; it takes from and as, then either localField \
+                 and foreignField or let and pipeline"
             ))
         })
     };
-    Ok(Stage::Lookup {
-        from: required("from")?,
-        local_field: required("localField")?,
-        foreign_field: required("foreignField")?,
-        as_field: required("as")?,
-    })
+    let from = string("from")?;
+    let as_field = string("as")?;
+
+    let equality = spec.contains_key("localField") || spec.contains_key("foreignField");
+    let pipeline = spec.contains_key("pipeline") || spec.contains_key("let");
+    let join = match (equality, pipeline) {
+        (true, true) => {
+            return Err(Error::InvalidQuery(
+                "$lookup takes either localField/foreignField or let/pipeline, not both; join \
+                 on the key and reshape the joined array with $filter or $map in the next stage"
+                    .into(),
+            ));
+        }
+        (false, false) => {
+            return Err(Error::InvalidQuery(
+                "$lookup needs either localField and foreignField, or a pipeline".into(),
+            ));
+        }
+        (true, false) => Join::Equality {
+            local_field: string("localField")?,
+            foreign_field: string("foreignField")?,
+        },
+        (false, true) => {
+            let let_vars = match spec.get("let") {
+                None => Vec::new(),
+                Some(Bson::Document(raw)) => Expr::parse_bindings(raw, vars)?,
+                Some(other) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$lookup `let` is a document of name: expression, found {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            let Some(Bson::Array(raw_stages)) = spec.get("pipeline") else {
+                return Err(Error::InvalidQuery("$lookup `pipeline` is an array of stages".into()));
+            };
+            let raw_stages = raw_stages
+                .iter()
+                .map(|stage| {
+                    stage.as_document().cloned().ok_or_else(|| {
+                        Error::InvalidQuery(format!(
+                            "each $lookup pipeline stage is a document, found {}",
+                            type_name(stage)
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // The sub-pipeline sees the outer variables as well as its own:
+            // a `$lookup` nested inside another's pipeline can still read the
+            // outer `let`.
+            let mut in_scope = vars.to_vec();
+            in_scope.extend(let_vars.iter().map(|(name, _)| name.clone()));
+            let stages = parse_with_vars(&raw_stages, &in_scope)?;
+            Join::Pipeline { vars: let_vars, stages }
+        }
+    };
+    Ok(Stage::Lookup { from, as_field, join })
+}
+
+/// Evaluate a `$lookup` `let` against one input document.
+///
+/// `outer` is whatever an enclosing `$lookup` already bound, visible to the
+/// expressions here and shadowed by any name they rebind. The executor appends
+/// the result to `outer` and runs the sub-pipeline in that.
+pub fn bind_let(
+    vars: &[(String, Expr)],
+    doc: &Document,
+    outer: &[Binding<'_>],
+) -> Result<Vec<(String, Bson)>> {
+    let scope = Scope::with_bindings(doc, outer);
+    vars.iter().map(|(name, expr)| Ok((name.clone(), expr.eval_in(&scope)?))).collect()
 }
 
 /// The single value at a path.
@@ -402,6 +502,17 @@ fn group_key(value: &Bson) -> Vec<u8> {
 /// Every stage checks its **output** against the cap, so a stage that grows its
 /// input (`$unwind`) is caught as well as one that merely holds it.
 pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec<Document>> {
+    apply_with_vars(stage, input, limits, &[])
+}
+
+/// [`apply`], with `vars` bound for every expression the stage evaluates —
+/// how a `$lookup` sub-pipeline's stages see its `let`.
+pub fn apply_with_vars(
+    stage: &Stage,
+    input: Vec<Document>,
+    limits: &Limits,
+    vars: &[Binding<'_>],
+) -> Result<Vec<Document>> {
     let out = match stage {
         Stage::Match(f) => input.into_iter().filter(|d| filter::matches(f, d)).collect(),
         Stage::Project { projection, computed } => {
@@ -412,7 +523,7 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
                 // output — otherwise `{$project: {a: 0, b: "$a"}}` would
                 // depend on key order, which BSON preserves and nobody
                 // reasons about.
-                set_computed(&mut projected, computed, doc)?;
+                set_computed(&mut projected, computed, &Scope::with_bindings(doc, vars))?;
                 out.push(projected);
             }
             out
@@ -421,7 +532,7 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
                 let mut with = doc.clone();
-                set_computed(&mut with, computed, doc)?;
+                set_computed(&mut with, computed, &Scope::with_bindings(doc, vars))?;
                 out.push(with);
             }
             out
@@ -429,7 +540,7 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
         Stage::ReplaceRoot(expr) => {
             let mut out = Vec::with_capacity(input.len());
             for doc in &input {
-                match expr.eval(doc)? {
+                match expr.eval_in(&Scope::with_bindings(doc, vars))? {
                     Bson::Document(new_root) => out.push(new_root),
                     // Refused rather than wrapped: a root that is not a
                     // document would have to be given a field name this stage
@@ -458,7 +569,7 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
         Stage::Unwind { path: p, preserve_null_and_empty } => {
             unwind(input, p, *preserve_null_and_empty, limits)?
         }
-        Stage::Group { id, fields } => group(input, id, fields, limits)?,
+        Stage::Group { id, fields } => group(input, id, fields, limits, vars)?,
         Stage::Lookup { .. } => {
             // Not silently passed through: a join that returns its input
             // unchanged is a wrong answer wearing a right answer's shape.
@@ -473,7 +584,7 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
     Ok(out)
 }
 
-/// Write computed fields into `target`, evaluating each against `source`.
+/// Write computed fields into `target`, evaluating each in `source`.
 ///
 /// A dotted name writes into a nested document, matching `$set`'s behaviour on
 /// paths. A path that cannot be written — into an array without an index —
@@ -482,10 +593,10 @@ pub fn apply(stage: &Stage, input: Vec<Document>, limits: &Limits) -> Result<Vec
 fn set_computed(
     target: &mut Document,
     computed: &[(String, Expr)],
-    source: &Document,
+    source: &Scope<'_>,
 ) -> Result<()> {
     for (name, expr) in computed {
-        let value = expr.eval(source)?;
+        let value = expr.eval_in(source)?;
         path::set(target, name, value)
             .map_err(|e| Error::InvalidQuery(format!("cannot set {name:?}: {e}")))?;
     }
@@ -566,6 +677,7 @@ fn group(
     id: &Expr,
     fields: &[(String, Accumulator)],
     limits: &Limits,
+    vars: &[Binding<'_>],
 ) -> Result<Vec<Document>> {
     // Keyed by the *encoded* group value rather than by `Bson`, because `Bson`
     // is not `Hash` and because two numerically equal values of different types
@@ -574,7 +686,8 @@ fn group(
     let mut index: std::collections::HashMap<Vec<u8>, usize> = std::collections::HashMap::new();
 
     for doc in &input {
-        let key = id.eval(doc)?;
+        let scope = Scope::with_bindings(doc, vars);
+        let key = id.eval_in(&scope)?;
         let encoded = group_key(&key);
         let slot = match index.get(&encoded) {
             Some(&slot) => slot,
@@ -589,7 +702,7 @@ fn group(
             }
         };
         for (state, (_, acc)) in order[slot].values.iter_mut().zip(fields) {
-            accumulate(state, acc, doc)?;
+            accumulate(state, acc, &scope)?;
         }
     }
 
@@ -617,19 +730,19 @@ fn init((_, acc): &(String, Accumulator)) -> AccState {
     }
 }
 
-fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) -> Result<()> {
+fn accumulate(state: &mut AccState, acc: &Accumulator, scope: &Scope<'_>) -> Result<()> {
     match (state, acc) {
-        (AccState::Sum(total), Accumulator::Sum(e)) => total.add(&e.eval(doc)?),
+        (AccState::Sum(total), Accumulator::Sum(e)) => total.add(&e.eval_in(scope)?),
         (AccState::Avg(total, n), Accumulator::Avg(e)) => {
             // Non-numeric values are skipped rather than counted as zero, or a
             // field that is missing on half the documents would halve the mean.
-            if let Some(x) = numeric(&e.eval(doc)?) {
+            if let Some(x) = numeric(&e.eval_in(scope)?) {
                 *total += x;
                 *n += 1;
             }
         }
         (AccState::MinMax(current), Accumulator::Min(e)) => {
-            let v = e.eval(doc)?;
+            let v = e.eval_in(scope)?;
             if !matches!(v, Bson::Null)
                 && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_lt())
             {
@@ -637,7 +750,7 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) -> Result
             }
         }
         (AccState::MinMax(current), Accumulator::Max(e)) => {
-            let v = e.eval(doc)?;
+            let v = e.eval_in(scope)?;
             if !matches!(v, Bson::Null)
                 && current.as_ref().is_none_or(|c| kimmy_core::cmp::canonical_cmp(&v, c).is_gt())
             {
@@ -646,15 +759,15 @@ fn accumulate(state: &mut AccState, acc: &Accumulator, doc: &Document) -> Result
         }
         (AccState::FirstLast(current), Accumulator::First(e)) => {
             if current.is_none() {
-                *current = Some(e.eval(doc)?);
+                *current = Some(e.eval_in(scope)?);
             }
         }
         (AccState::FirstLast(current), Accumulator::Last(e)) => {
-            *current = Some(e.eval(doc)?);
+            *current = Some(e.eval_in(scope)?);
         }
-        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval(doc)?),
+        (AccState::Push(items), Accumulator::Push(e)) => items.push(e.eval_in(scope)?),
         (AccState::AddToSet(items), Accumulator::AddToSet(e)) => {
-            let v = e.eval(doc)?;
+            let v = e.eval_in(scope)?;
             // Linear scan rather than a hash set: `Bson` is not `Hash`, and a
             // set is small in every case that is not already refused by the cap.
             if !items.iter().any(|existing| existing == &v) {
@@ -1092,5 +1205,253 @@ mod tests {
         let err = parse(&[doc! {"$bucket": {}}]).unwrap_err().to_string();
         assert!(err.contains("$addFields"), "got: {err}");
         assert!(err.contains("$replaceRoot"), "got: {err}");
+    }
+
+    // -- variables and arrays in stages -----------------------------------
+
+    #[test]
+    fn root_embeds_the_source_document_in_a_projection() {
+        let out = run(
+            vec![doc! {"$project": {"_id": 0, "src": "$$ROOT", "city": "$$ROOT.city"}}],
+            vec![doc! {"_id": 1, "city": "London"}],
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"src": {"_id": 1, "city": "London"}, "city": "London"}]);
+    }
+
+    #[test]
+    fn array_operators_derive_fields_and_group_keys() {
+        let out = run(
+            vec![
+                doc! {"$addFields": {
+                    "n": {"$size": "$tags"},
+                    "first": {"$first": "$tags"},
+                    "loud": {"$map": {"input": "$tags", "in": {"$toUpper": "$$this"}}},
+                }},
+                doc! {"$group": {"_id": "$n", "ids": {"$push": "$_id"}}},
+                doc! {"$sort": {"_id": 1}},
+            ],
+            sample(),
+        )
+        .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                doc! {"_id": 0i64, "ids": [3]},
+                doc! {"_id": 1i64, "ids": [2]},
+                doc! {"_id": 2i64, "ids": [1]},
+            ]
+        );
+    }
+
+    #[test]
+    fn an_unbound_variable_in_a_stage_fails_at_parse() {
+        assert!(parse(&[doc! {"$project": {"x": "$$this"}}]).is_err());
+        assert!(parse(&[doc! {"$group": {"_id": "$$order"}}]).is_err());
+    }
+
+    // -- $lookup: the pipeline form ---------------------------------------
+
+    #[test]
+    fn lookup_parses_either_form_and_refuses_a_mixture() {
+        let equality = parse(&[doc! {"$lookup": {
+            "from": "users", "localField": "uid", "foreignField": "_id", "as": "user"
+        }}])
+        .unwrap();
+        assert!(matches!(&equality[0], Stage::Lookup { join: Join::Equality { .. }, .. }));
+
+        let pipeline = parse(&[doc! {"$lookup": {
+            "from": "items",
+            "let": {"order_id": "$_id"},
+            "pipeline": [{"$project": {"_id": 0, "order": "$$order_id", "sku": 1}}],
+            "as": "items",
+        }}])
+        .unwrap();
+        assert!(matches!(&pipeline[0], Stage::Lookup { join: Join::Pipeline { .. }, .. }));
+        assert!(pipeline[0].needs_storage());
+        assert!(apply(&pipeline[0], sample(), &Limits::default()).is_err());
+
+        // `let` is optional; a pipeline alone is an uncorrelated join.
+        assert!(parse(&[doc! {"$lookup": {"from": "a", "pipeline": [], "as": "x"}}]).is_ok());
+
+        // Both at once is refused rather than guessed at.
+        let err = parse(&[doc! {"$lookup": {
+            "from": "items", "localField": "a", "foreignField": "b",
+            "pipeline": [], "as": "items"
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("not both"), "{err}");
+        // And neither is refused too.
+        assert!(parse(&[doc! {"$lookup": {"from": "items", "as": "items"}}]).is_err());
+    }
+
+    #[test]
+    fn a_lookup_let_declares_names_for_its_pipeline_and_nothing_outside_it() {
+        // Inside the sub-pipeline the variable is known.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"oid": "$_id"},
+                "pipeline": [{"$addFields": {"o": "$$oid"}}], "as": "items"
+            }}])
+            .is_ok()
+        );
+        // A name the `let` does not bind is refused where it is written.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"oid": "$_id"},
+                "pipeline": [{"$addFields": {"o": "$$order"}}], "as": "items"
+            }}])
+            .is_err()
+        );
+        // The `let` values themselves are over the local document, not the
+        // sub-pipeline, so they cannot use its names.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"a": "$_id", "b": "$$a"},
+                "pipeline": [], "as": "items"
+            }}])
+            .is_err()
+        );
+        // Names follow the variable rule, and the shape is checked.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": {"Oid": "$_id"}, "pipeline": [], "as": "items"
+            }}])
+            .is_err()
+        );
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "let": "$_id", "pipeline": [], "as": "items"
+            }}])
+            .is_err()
+        );
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "items", "pipeline": {"$match": {}}, "as": "items"
+            }}])
+            .is_err()
+        );
+        // After the stage, the name is gone again.
+        assert!(parse(&[
+            doc! {"$lookup": {"from": "items", "let": {"oid": "$_id"}, "pipeline": [], "as": "i"}},
+            doc! {"$addFields": {"o": "$$oid"}},
+        ])
+        .is_err());
+    }
+
+    /// The executor's loop, in miniature: bind the `let` per input document
+    /// and run the sub-pipeline over the foreign documents with it in scope.
+    /// What `kimmy-api` does with a storage handle, done here over vectors so
+    /// the variable plumbing is tested where it lives.
+    fn join_in_memory(stage: &Stage, input: Vec<Document>, foreign: &[Document]) -> Vec<Document> {
+        let Stage::Lookup { as_field, join: Join::Pipeline { vars, stages }, .. } = stage else {
+            panic!("expected the pipeline form");
+        };
+        let limits = Limits::default();
+        let mut out = Vec::new();
+        for mut doc in input {
+            let bound = bind_let(vars, &doc, &[]).unwrap();
+            let frame: Vec<Binding<'_>> = bound.iter().map(|(n, v)| (n.as_str(), v)).collect();
+            let mut current = foreign.to_vec();
+            for stage in stages {
+                current = apply_with_vars(stage, current, &limits, &frame).unwrap();
+            }
+            doc.insert(
+                as_field.clone(),
+                Bson::Array(current.into_iter().map(Bson::from).collect()),
+            );
+            out.push(doc);
+        }
+        out
+    }
+
+    #[test]
+    fn a_lookup_let_is_evaluated_per_input_document_and_read_by_the_sub_pipeline() {
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "items",
+            "let": {"order": "$_id", "min_qty": "$threshold"},
+            "pipeline": [
+                {"$match": {"kind": "line"}},
+                {"$project": {
+                    "_id": 0,
+                    "sku": 1,
+                    "for_order": "$$order",
+                    "over": {"$gte": ["$qty", "$$min_qty"]},
+                }},
+            ],
+            "as": "lines",
+        }}])
+        .unwrap();
+        let orders = vec![doc! {"_id": 1, "threshold": 5}, doc! {"_id": 2, "threshold": 1}];
+        let items = vec![
+            doc! {"sku": "a", "qty": 3, "kind": "line"},
+            doc! {"sku": "b", "qty": 9, "kind": "line"},
+            doc! {"sku": "c", "qty": 9, "kind": "note"},
+        ];
+
+        let out = join_in_memory(&stages[0], orders, &items);
+        assert_eq!(
+            out[0].get_array("lines").unwrap(),
+            &vec![
+                Bson::Document(doc! {"sku": "a", "for_order": 1, "over": false}),
+                Bson::Document(doc! {"sku": "b", "for_order": 1, "over": true}),
+            ]
+        );
+        assert_eq!(
+            out[1].get_array("lines").unwrap(),
+            &vec![
+                Bson::Document(doc! {"sku": "a", "for_order": 2, "over": true}),
+                Bson::Document(doc! {"sku": "b", "for_order": 2, "over": true}),
+            ]
+        );
+    }
+
+    #[test]
+    fn inside_a_sub_pipeline_root_is_the_foreign_document_and_let_reaches_every_stage() {
+        // `$group` and `$replaceRoot` take the variables too, not only the
+        // computed-field stages.
+        let stages = parse(&[doc! {"$lookup": {
+            "from": "items",
+            "let": {"tag": "$label"},
+            "pipeline": [
+                {"$group": {"_id": "$$tag", "n": {"$sum": 1}, "docs": {"$push": "$$ROOT.sku"}}},
+                {"$replaceRoot": {"newRoot": {"label": "$_id", "count": "$n", "skus": "$docs"}}},
+            ],
+            "as": "summary",
+        }}])
+        .unwrap();
+        let out = join_in_memory(
+            &stages[0],
+            vec![doc! {"_id": 1, "label": "x"}],
+            &[doc! {"sku": "a"}, doc! {"sku": "b"}],
+        );
+        assert_eq!(
+            out[0].get_array("summary").unwrap(),
+            &vec![Bson::Document(doc! {"label": "x", "count": 2i64, "skus": ["a", "b"]})]
+        );
+    }
+
+    #[test]
+    fn bind_let_layers_over_outer_bindings_and_shadows_them() {
+        let vars = vec![
+            (
+                "inner".to_string(),
+                Expr::parse_with_vars(&"$$outer".into(), &["outer".into()]).unwrap(),
+            ),
+            ("outer".to_string(), Expr::Literal("rebound".into())),
+        ];
+        let outer_value = Bson::String("from outside".into());
+        let outer = [("outer", &outer_value)];
+        let bound = bind_let(&vars, &doc! {}, &outer).unwrap();
+        assert_eq!(bound[0], ("inner".to_string(), "from outside".into()));
+        assert_eq!(bound[1], ("outer".to_string(), "rebound".into()));
+
+        // Appended after the outer frame, the rebinding wins.
+        let frame: Vec<Binding<'_>> =
+            outer.iter().copied().chain(bound.iter().map(|(n, v)| (n.as_str(), v))).collect();
+        let d = doc! {};
+        let read = Expr::parse_with_vars(&"$$outer".into(), &["outer".into()]).unwrap();
+        assert_eq!(read.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), "rebound".into());
     }
 }

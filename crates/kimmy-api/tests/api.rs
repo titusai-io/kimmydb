@@ -3967,6 +3967,153 @@ async fn lookup_is_authorized_against_the_collection_it_joins() {
 }
 
 #[tokio::test]
+async fn array_operators_and_variables_work_over_http() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({"_id": 1, "min": 2, "items": [
+                {"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}, {"sku": "c", "qty": 5}
+            ]}),
+        )
+        .await;
+    // No items at all: the null path, end to end.
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 2})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$project": {
+                    "_id": 1,
+                    "n": {"$size": "$items"},
+                    "last": {"$last": "$items"},
+                    "second": {"$arrayElemAt": [
+                        {"$map": {"input": "$items", "in": "$$this.sku"}}, 1]},
+                    "big": {"$filter": {"input": "$items", "as": "it",
+                                        "cond": {"$gte": ["$$it.qty", "$min"]}}},
+                    "skus": {"$map": {"input": "$items", "in": "$$this.sku"}},
+                    "total": {"$reduce": {"input": "$items", "initialValue": 0,
+                                          "in": {"$add": ["$$value", "$$this.qty"]}}},
+                    "self": "$$ROOT._id",
+                    "taxed": {"$let": {"vars": {"rate": 0.5},
+                                       "in": {"$multiply": ["$min", "$$rate"]}}},
+                }},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2);
+    let d = &docs[0];
+    assert_eq!(d["n"], 3);
+    assert_eq!(d["last"], json!({"sku": "c", "qty": 5}));
+    assert_eq!(d["second"], "b");
+    assert_eq!(d["big"], json!([{"sku": "b", "qty": 2}, {"sku": "c", "qty": 5}]));
+    assert_eq!(d["skus"], json!(["a", "b", "c"]));
+    assert_eq!(d["total"], 8);
+    assert_eq!(d["self"], 1);
+    assert_eq!(d["taxed"], 1.0);
+    // Null in, null out — not an error and not an empty array.
+    let empty = &docs[1];
+    assert_eq!(empty["n"], serde_json::Value::Null);
+    assert_eq!(empty["big"], serde_json::Value::Null);
+    assert_eq!(empty["total"], serde_json::Value::Null);
+
+    // An unbound variable is a 400 naming it, before any document is read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$project": {"x": "$$nothing"}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(format!("{:?}", res.body).contains("$$nothing"), "{:?}", res.body);
+}
+
+#[tokio::test]
+async fn lookup_pipeline_form_binds_let_per_document_and_is_authorized() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"lines"})).await;
+    for (id, min) in [(1, 5), (2, 1)] {
+        server
+            .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": id, "min": min}))
+            .await;
+    }
+    for (id, order, qty, kind) in
+        [(10, 1, 3, "line"), (11, 1, 9, "line"), (12, 2, 9, "line"), (13, 1, 9, "note")]
+    {
+        server
+            .post(
+                "/v1/db/shop/coll/lines/docs",
+                Some(&token),
+                json!({"_id": id, "order": order, "qty": qty, "kind": kind}),
+            )
+            .await;
+    }
+
+    // The correlation is written with the variable in a computed field; a
+    // leading `$match` narrows the foreign side once for every input document.
+    let pipeline = json!({"pipeline": [
+        {"$lookup": {
+            "from": "lines",
+            "let": {"oid": "$_id", "min": "$min"},
+            "pipeline": [
+                {"$match": {"kind": "line"}},
+                {"$addFields": {"mine": {"$eq": ["$order", "$$oid"]},
+                                "over": {"$gte": ["$qty", "$$min"]}}},
+                {"$match": {"mine": true}},
+                {"$project": {"_id": 1, "over": 1}},
+                {"$sort": {"_id": 1}}
+            ],
+            "as": "lines"
+        }},
+        {"$sort": {"_id": 1}}
+    ]});
+    let res =
+        server.post("/v1/db/shop/coll/orders/aggregate", Some(&token), pipeline.clone()).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs[0]["lines"], json!([{"_id": 10, "over": false}, {"_id": 11, "over": true}]));
+    assert_eq!(docs[1]["lines"], json!([{"_id": 12, "over": true}]));
+
+    // Same boundary as the equality form: read on `orders` alone is refused.
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({"user":"limited","password":"limited-password",
+                   "grants":[{"db":"shop","collection":"orders","actions":["read"]}]}),
+        )
+        .await;
+    let limited = server.login("limited", "limited-password").await;
+    let res = server.post("/v1/db/shop/coll/orders/aggregate", Some(&limited), pipeline).await;
+    assert_eq!(res.status, 403, "{:?}", res.body);
+
+    // Mixing the two forms is a 400.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$lookup": {
+                "from": "lines", "localField": "_id", "foreignField": "order",
+                "pipeline": [], "as": "lines"
+            }}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn an_unknown_pipeline_stage_is_a_bad_request() {
     let server = Server::start().await;
     let token = server.root().await;
