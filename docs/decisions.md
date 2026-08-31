@@ -4413,6 +4413,301 @@ know the naming rule, which `list_collections`'s description now states.
 
 ---
 
+## ADR-093 — Placeholder secrets are refused off loopback, and the HS256 floor is 32 bytes
+
+**Decision.** Two rules, both enforced in `Config::validate` so that
+`check-config` refuses exactly what the server refuses. First, a node whose
+HTTP listener binds anything other than a loopback address — or, with
+clustering on, whose cluster listener does — refuses to start when
+`auth.root_password`, `auth.jwt_secret` or `cluster.cluster_secret` is one of
+the values this repository's own files put where a secret goes. The list is
+`PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`: the compose file's former
+defaults, the commented-out lines in `kimmy.example.toml`, the quick starts'
+former values, the example programs' passwords, and the words anyone types
+when they mean to come back later (`password`, `secret`, `changeme`, `root`,
+…). Matching is exact apart from case and surrounding whitespace. The error
+names the setting and the environment variable and never the value. Second,
+`kimmy_auth::MIN_SECRET_LEN` is 32 bytes, not 16. Only the local HS256 path
+has a shared secret, so only it has a floor; the OIDC verifier's parallel
+rule (`OidcSettings::validate`) polices the audience and is unaffected.
+
+**Why.** A value that appears in a public repository is held by everyone who
+has read it, so it is not a secret in any sense that matters; and a copied
+quick start is the single most likely way a database ends up on a routable
+address with one. With the signing key anyone can mint a root token; with
+the cluster secret anyone who can reach the gossip port can inject writes;
+the bootstrap password is the first thing tried against a fresh node. The
+existing rule for `--insecure-no-auth` already draws the line at loopback,
+and this is the same line for the same reason: on the host's own interfaces
+nothing off the host can reach the node, so a convenience value costs
+nothing, and off them it costs everything.
+
+The floor moves because RFC 7518 §3.2 says a key for HS256 should be no
+shorter than the hash's output, 256 bits. A 16-byte key is not broken, but it
+is half the entropy of the MAC it feeds, one captured token is all the
+material an offline search needs, and the value is shared by every node of
+the cluster. Sixteen was chosen when the number had to be *something*; it
+should be the number the specification gives.
+
+**Why not an absolute refusal.** ADR-067 refused federated `admin` outright,
+for good reasons, and ADR-074 had to open it behind a flag because the
+absolute form made a legitimate deployment impossible rather than merely
+awkward. A flag whose purpose is to remove a security rule is the outcome to
+avoid, and the way to avoid it is to scope the rule to the condition that
+makes the value dangerous instead of to the value. An absolute refusal of
+placeholders would break exactly the case it is not aimed at — a developer
+on a laptop running an example as written — and the examples are how the
+project is evaluated; an example that has to be edited before it runs is one
+that gets edited into something worse, or into a flag. So loopback keeps
+working with every placeholder, anything reachable refuses them all, and
+there is no switch. A denylist is admittedly the weak form of a rule — a
+value absent from it is not thereby good — which is why the length floor
+still applies on top, and why the list is short and made of things that have
+actually shipped rather than an attempt at a dictionary.
+
+**Why not warn.** A warning at startup is read once, by the person who
+already knows, and never by the person who inherits the deployment. The
+`--insecure-no-auth` precedent is a refusal for the same reason.
+
+**Cost.** Two configurations that ran under 0.16.x do not run under this
+version, which is why the release carrying it is a minor rather than a patch
+(`docs/compatibility.md`). A `jwt_secret` of 16–31 bytes must be rotated
+before upgrading, and rotating it ends every session once, on every node at
+the same time. A node that was running on a placeholder off loopback must be
+given real values, which is the point. The compose file no longer supplies
+defaults, so `docker compose up` needs three variables in a `.env` or the
+environment; it says so, and names them. The list has to be maintained: a
+new example value added anywhere in the repository belongs on it, and a test
+pins the ones that have shipped so far.
+
+---
+
+## ADR-094 — Hybrid fusion is tunable per request; defaults stay equal-weight RRF
+
+**Decision.** `hybrid_search` takes two optional request fields. `weights`
+(`{ "dense": w_d, "lexical": w_l }`, each `>= 0`, not both zero) scales the two
+halves before they are summed, so the fused score is
+`w_d / (60 + rank_dense) + w_l / (60 + rank_lexical)`. `min_overlap` (`>= 1`)
+is the number of distinct query terms a chunk must contain to enter the
+lexical ranking at all; a query with fewer distinct terms than that uses its
+own count. The gate removes lexical *evidence*, not documents: a document it
+drops from the lexical half keeps its full dense contribution. Both fields are
+validated at the API and refused with the ordinary `400`. Their defaults —
+`{1, 1}` and `1` — reproduce the previous ranking to the bit, and the MCP tool
+and the CLI expose the same controls with the same defaults.
+
+**Why.** Measured on a corpus of short conversational documents, forty graded
+queries and eight embedding models, hybrid search recalled roughly a third
+less than plain vector search on the same queries — for every model, the gap
+narrowing only as the dense model got stronger (Recall@10 of 0.677 dense
+against 0.429 hybrid on the weakest). That is the wrong way round for a feature
+whose reason to exist is to improve on the dense half. The mechanism is in
+the lexical half. It ranks by term overlap (recorded in `deviations.md`), and
+each half is retrieved four times wider than `k` before fusion. On documents
+of a sentence or two, nearly every candidate in that window shares one or two
+common words with the query, so the lexical ordering among them is close to
+random; and reciprocal rank fusion, weighting both halves equally, gives that
+near-random rank the same authority as the dense one. Half the evidence being
+noise costs a third of the recall.
+
+The two knobs are the two places the mechanism can be interrupted. `weights`
+lowers the authority of the lexical rank; `min_overlap` removes the candidates
+whose lexical rank is noise, since a chunk that agrees with the query on two
+or more distinct terms is what an exact-term match — the case hybrid search is
+for — actually looks like. Per request rather than per collection because the
+right setting depends on the query as much as the corpus: a query naming a
+product code wants the lexical half; a paraphrase does not.
+
+**Why the defaults do not move.** The measurement was made on one kind of
+corpus. On longer documents term overlap is a weaker but real signal, and a
+default that helped short conversational text could cost a corpus of manuals
+the exact-term matches it relies on. Nothing about an existing deployment's
+ranking changes until the knobs have been measured there; the change ships
+the instrument, not a conclusion. When the measurements are in, a better
+default is a one-line change with evidence behind it.
+
+**Alternatives.** *A BM25 lexical half*, with per-collection term statistics,
+is the principled fix and would make the lexical rank informative on short
+documents too. It is deferred rather than rejected: it needs document
+frequencies maintained under replicated writes and a rebuild path, which is
+real machinery to add ahead of knowing how much of the gap the two knobs
+already close. *A confidence gate relative to the best lexical score* —
+admit only candidates within some fraction of the top lexical score — was
+considered and set aside: term-overlap scores are normalized by chunk length,
+so "within a fraction of the best" measures how short a chunk is as much as
+how well it matches, and the threshold would have no meaning a caller could
+reason about. A count of distinct matched terms is something a caller can
+predict from the query in hand. *Changing the default weighting* was rejected
+for the reason above.
+
+**Cost.** Two more fields on a request that is shared with `vector_search`,
+which ignores them; the specification says so. Callers who want the better
+ranking on a short-document corpus have to ask for it, per request, until a
+measured default replaces the equal weights. A weight of zero on the lexical
+half is a slower way of running `vector_search`, and the documentation says
+that too.
+
+---
+
+## ADR-095 — The embedding worker batches provider calls across documents
+
+**Decision.** The worker fills one provider call from the chunks of
+consecutive documents of the same collection, on the streaming path and in a
+backfill alike, bounded by three process settings under `[vector.batch]`:
+`max_chunks` (32), `max_tokens` (32 768, by the estimate `chunk.max_tokens`
+already cuts on) and `max_wait_ms` (100, waited only when the stream is
+idle). The storage write stays one per document. A batch that fails
+permanently is taken apart and each document sent alone, so the one at fault
+is skipped and named and the rest land; a retryable failure retries the whole
+batch. The document and chunk counters count what they always did.
+
+**Why.** `EmbeddingProvider::embed` took a batch from the day it was written,
+and the worker handed it one document at a time. A document short enough to
+be one chunk — most documents, in most collections — was a batch of one, and
+paid a whole round trip, the provider's tokenisation and its scheduling by
+itself. Measured against a llama.cpp CPU server with ~43-character inputs: 32
+calls of one input, 394 ms; one call of 32 inputs, 18 ms — a factor of
+twenty-two. Per-document calls put a floor of one round trip under every
+document, and a write rate a little above what the floor allows grows the
+backlog without bound; that is Little's law, and it is what a live ingest
+showed, with the worker healthy, the provider idle most of each round trip,
+and the vectors falling further behind by the minute.
+
+The bounds are three because a provider's limits come in three shapes. A
+count, because hosted providers cap inputs per request (Cohere at 96, Gemini
+at 100) and 32 sits under all of them — it is also the size the measurement
+was taken at. A token total, because request bodies have limits too, and the
+token estimate the chunker already uses is the honest unit: 32 768 estimated
+tokens is exactly 32 chunks at the default chunk ceiling, about 64 KiB of
+text, inside every hosted provider's per-request budget. A wait, because a
+quiet collection's one document must not sit until the next write; it is
+waited only when the stream is idle — on a backlog the next entry is already
+there and the batch fills without waiting — and 100 ms is less than the
+remote round trip it saves.
+
+**Why the storage write is not batched too.** `put_vectors` is replace-all
+for one document's chunks, staleness is one document's HLC, and both are what
+make re-embedding idempotent and a crash replayable (the staleness section
+of `vectors.md`). Batching the write would make a crash between two
+documents' writes a question — which of the batch landed? — that today has
+no answer because it never needs one: each document either has its vectors at
+its HLC or does not. The oplog position is recorded once the batch has
+landed, never before, so the guarantee is unchanged; it merely covers a few
+entries at once. The cost of keeping the writes separate is one commit per
+document, which is what it always was, and which was never the bottleneck.
+
+**Why process settings, not collection settings.** The bounds describe the
+round trip this node makes: the same request-size limits apply whichever
+collection's documents fill the call, and a node against a metered API and a
+node against a local server want different waits regardless of collection.
+A batch only ever holds one collection's documents, so the per-collection
+provider, model and prefix are respected without being repeated. Putting the
+bounds in the collection's vector configuration would also make them
+replicated metadata that changes the fingerprint and triggers a reindex,
+which a change to a *scheduling* parameter must not do.
+
+**Alternatives.** Batching the storage write — rejected above. Per-collection
+bounds — rejected above. Concurrent provider calls (`max_in_flight`) — left
+out: the streaming path records one position for everything before it, and
+several batches in flight would either serialise their completions in
+arrival order (buying little) or record positions out of order (unsafe); the
+measured gain from batching alone is the twenty-two-fold one, and the case
+for concurrency should be made against a provider that batching has left
+idle, which none has yet. A batch-size histogram on `/metrics` — skipped:
+`kimmy_embed_chunks_total` over `kimmy_embed_provider_requests_total` is the
+average the operator wants, and a histogram would be the first bucketed
+series in a set that is otherwise plain counters. Opportunistic batching with
+no timer at all — available as `max_wait_ms = 0`, and not the default,
+because a remote provider gains more from a slightly larger call than a
+quiet collection loses to a tenth of a second.
+
+**Cost.** A quiet collection's document is embedded up to `max_wait_ms`
+later than before. A permanent failure in a batch of *n* costs *n* extra
+calls, once, to find the document at fault. The `ollama` provider still sends
+one request per input, because its embeddings endpoint takes one, so batching
+saves it nothing on the wire. A batch spanning several entries holds their
+positions until it lands, so a crash mid-batch replays up to a batch's worth
+of entries rather than one; every replay is a no-op on the staleness check.
+And the structural fact batching does not change is worth stating where
+operators size deployments: a collection is embedded by exactly one owner
+node, so adding members does not raise one collection's throughput — it
+raises how many collections embed at once.
+
+---
+
+## ADR-096 — Federated tokens are refused above a maximum lifetime
+
+**Decision.** `OidcVerifier::verify` refuses a token whose own `exp − iat`
+exceeds `auth.oidc.max_token_lifetime_secs`
+(`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`), 900 seconds by default, and refuses a
+token that carries no `iat` at all. The refusal is a 401 whose
+`WWW-Authenticate` challenge carries `error="invalid_token"` and an
+`error_description` naming the limit in seconds and nothing about the token.
+The setting is refused at startup outside 1–86400, by the same function
+`check-config` runs. The check is on the token's two claims and nothing else:
+no clock, and so no leeway.
+
+**Why.** ADR-073 states the window plainly: a federated principal's role
+*membership* is frozen in its access token, because this database makes no
+introspection call, so a revocation at the provider is honoured only when the
+token expires. It named short token lifetimes as the mitigation and left the
+lifetime to the provider. That is a mitigation this node could not see being
+applied — a provider minting day-long tokens was indistinguishable, from here,
+from one minting five-minute tokens, and the security guide's "keep lifetimes
+short" was advice with nothing enforcing it. The lifetime is the one dimension
+of the window that is readable from the token itself, so it is the one this
+node can bound.
+
+Fifteen minutes because of where the providers sit. Their access-token defaults
+fall between five minutes and an hour — Keycloak's is five, Okta's, Google's
+and Entra ID's about an hour — and one of them, Auth0, defaults an API's tokens
+to a day. 900 seconds admits the short defaults outright and refuses the
+day-long tokens that turn the window into a policy. A provider that defaults to
+an hour is not excluded, it is asked a question: shorten the lifetime for this
+resource, which every one of them supports per resource or per client, or raise
+this node's limit — and the error says which number to raise it to, because the
+description names the limit. An operator who raises it does so knowing what it
+costs, which is the property the default is for. A missing `iat` is refused
+rather than waved through because the limit would otherwise be one omitted
+claim away from not applying; RFC 9068 §2.2 makes the claim REQUIRED in a JWT
+access token, so a conforming provider never produces that token.
+
+The limit is checked after the signature and after expiry. After the signature,
+so that only a token the provider really minted is ever answered with anything
+more specific than "invalid"; after expiry, so that a token which is both stale
+and too long-lived is reported as the former, which is the one a client can fix
+by itself. The 60 seconds of leeway (ADR-064) play no part: they exist because
+the provider's clock is somebody else's, and that argument says nothing about
+how long the provider chose to make a token valid for. The description reaches
+the challenge through a response extension the challenge layer reads, rather
+than by the error setting the header itself, so that a more specific
+description never costs the `resource_metadata` pointer (ADR-071).
+
+**Alternatives.** *Token introspection on every request* (RFC 7662) would close
+the window entirely. Rejected: it adds a round trip to the provider on every
+call, makes the provider's availability the database's, and not every provider
+offers the endpoint — Entra ID does not. *A revocation feed* from the provider —
+back-channel logout, a shared-signals stream — rejected because none is
+standard across the providers this federation exists to serve, and a node that
+honoured one provider's feed would be silently unprotected against another's.
+*A warning rather than a refusal above the ceiling*, or no ceiling: rejected
+because every other setting in the section is policed by refusal, and a
+warning printed at startup is a warning nobody reads. *Measuring the remaining
+time rather than the lifetime*: rejected because a long-lived token would then
+be admitted once it had aged enough, which is exactly the token the window is
+about.
+
+**Cost.** An operator whose provider mints access tokens longer than fifteen
+minutes has a change to make on upgrade: shorten the provider's lifetime for
+this resource, or raise `max_token_lifetime_secs`. The refusal names the limit
+so the change is discoverable from the first failed request, and a raised limit
+is printed in the startup summary so it stays visible. A provider that omits
+`iat` cannot be federated with until it stops, and there is no setting for
+that. And the limit is a bound, not a revocation: a membership revoked at the
+provider is still honoured until the token expires, for up to the configured
+number of seconds.
+
+---
 
 ## ADR-099 — Authenticated routes carry a request timeout, an explicit body ceiling and a per-principal rate limit
 
@@ -4533,3 +4828,64 @@ it is on. The 429 counter is no longer a single-source number:
 `kimmy_rate_limited_principal_total` is how they are told apart.
 
 ---
+
+## ADR-106 — `$expr` joins the filter language by delegating to the expression evaluator
+
+**Decision.** `{$expr: <expression>}` is a filter clause. It parses through
+`Expr::parse`, evaluates through `Expr::eval` against the whole document, and
+matches when the result is truthy under the expression language's rule. It is
+accepted at the top level and inside `$and` / `$or` / `$nor` like any clause,
+which puts it in every place a filter is taken — `find`, `count`, `update`,
+`delete`, `find_and_modify`, `$match`, the vector pre-filter and the MCP tools
+— by construction, because they share one parser. The planner never reads it.
+
+**Why.** Every other filter operator compares a field with a constant. "Which
+accounts have spent more than their budget" has no spelling in that language:
+the value on the right-hand side is a field, and the only way to ask it was an
+aggregation — `$addFields` a difference, `$match` on its sign — for a question
+that is plainly a filter. That is a scan-side gap with no substitute short of
+the pipeline, and the pipeline's expression evaluator already knows how to
+read a field, compare two values and do arithmetic. `$expr` is what MongoDB
+calls the same bridge, and clients written against MongoDB write it.
+
+Delegating rather than reimplementing means the operator set inside `$expr` is
+the expression set — all of it, arithmetic and `$cond` included — and stays so
+as that set grows. It also means `$expr` inherits the evaluator's judgements
+without a second copy of them: a missing field is null, null propagates, a
+type violation refuses rather than yielding null.
+
+**Alternatives.** *A field-reference syntax inside the existing operators* —
+`{spent: {$gt: "$budget"}}`, say — was rejected. It changes the meaning of a
+string that starts with `$` on the right-hand side of a filter comparison,
+which is a legal constant today and stored in real documents; making it a
+reference is a silent reinterpretation of existing queries, which the filter
+parser has refused to do everywhere else (mixing operators and plain fields,
+`$options` without `$regex`). It would also cover only the two-field
+comparison and not the arithmetic beside it, so the pipeline would still be
+needed for `qty × price > 100`. *A `Result`-returning `matches`* so an
+evaluation error could fail the request, as MongoDB does, was deferred: it
+touches every caller for a data-dependent case the regex arm already resolves
+as "no match", and the register records it as the way to close the gap.
+
+**Cost.** Two, both made visible in `docs/query-language.md` rather than
+smoothed over.
+
+*Never indexable.* An expression names no field the planner can bound, so a
+filter that is only `$expr` is a full scan, and `explain` says so. An indexable
+clause beside it still plans, with the expression applied to each candidate;
+the planner treats `Filter::Expr` exactly as it treats a disjunction —
+contributes nothing, never narrows. A partial index likewise cannot be proven
+usable by an `$expr`.
+
+*Two comparison semantics in one filter document.* `$gt` inside `$expr` is the
+expression `$gt`: the canonical cross-type order, whole-array comparison, no
+type bracketing. `$gt` outside it is the filter `$gt`: within a type group,
+element-wise over arrays. The pairs disagree on precisely the inputs
+`docs/query-language.md` already calls out as surprising — a missing field is
+*less than* zero inside `$expr` and incomparable outside it — and the page
+puts the two readings side by side with the rule of thumb that resolves them:
+a constant on the right means the ordinary operator; a field or a computation
+on the right means `$expr`.
+
+---
+

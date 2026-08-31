@@ -59,14 +59,15 @@ fails fast on a bad volume mount.
 | `server.max_body_bytes` | `KIMMY_MAX_BODY_BYTES` | `2097152` | Largest request body; `413 payload_too_large` over it. The default is what every release has enforced |
 | `storage.cache_bytes` | — | `268435456` | Bound on redb's page cache — most of the node's resident memory. Filled by reads and never released on a timer, so RSS settles at the busiest period's level; raise it for a large, latency-sensitive database, lower it for a small footprint |
 | `auth.root_user` | `KIMMY_ROOT_USER` | `root` | First start only |
-| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth` |
-| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥16 bytes, and **identical on every node** of a cluster |
+| `auth.root_password` | `KIMMY_ROOT_PASSWORD` | — | Required unless `--insecure-no-auth`. Off loopback, an example's value (`changeme`, `hunter2`, …) is refused |
+| `auth.jwt_secret` | `KIMMY_JWT_SECRET` | — | **Required whenever auth is on**, single node or cluster — without it the node refuses to start rather than sign tokens with a built-in constant. ≥32 bytes (was 16 up to 0.16.x), and **identical on every node** of a cluster |
 | `auth.token_ttl_secs` | — | `3600` | Also the revocation delay |
 | `auth.insecure_no_auth` | `KIMMY_INSECURE_NO_AUTH` | `false` | Loopback binds only. Refused together with `auth.oidc` |
 | `auth.oidc.issuer` | `KIMMY_OIDC_ISSUER` | — | Federate with one external OIDC provider. `https` only — the signing keys come down this URL. Setting it obliges `audience` |
 | `auth.oidc.audience` | `KIMMY_OIDC_AUDIENCE` | — | The `aud` a federated token must carry. Required: a provider signs for every application that trusts it |
 | `auth.oidc.roles_claim` | `KIMMY_OIDC_ROLES_CLAIM` | `roles` | `groups` for Entra ID. Getting it wrong is quiet — every federated caller arrives with no grants |
 | `auth.oidc.refresh_interval_secs` | `KIMMY_OIDC_REFRESH_INTERVAL_SECS` | `300` | How often the provider's JWKS is re-fetched. An unknown `kid` triggers one rate-limited refetch besides |
+| `auth.oidc.max_token_lifetime_secs` | `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` | `900` | The longest a federated token may be valid for, by its own `exp − iat`. It bounds how long a revocation at the provider goes unhonoured here (ADR-073); a token over it is a 401 whose challenge names the limit, and one with no `iat` is refused too. 1–86400 — see [Security](security.md#the-lifetime-limit-and-why-it-is-900-seconds) |
 | `auth.oidc.role_mappings` | — | `[]` | File-only. A claim value and the grants it is worth. **`admin` is refused** — see [Security](security.md) |
 | `cluster.enabled` | `KIMMY_CLUSTER_ENABLED` | `false` | Naming seeds implies it. In containers also set `cluster.bind` |
 | `cluster.bind` | `KIMMY_CLUSTER_BIND` | `0.0.0.0:7900` | Gossip |
@@ -75,6 +76,10 @@ fails fast on a bad volume mount.
 | `webhooks.allowed_hosts` | — | `[]` | Hosts a webhook may target beyond the public internet. Empty means public addresses only |
 | `webhooks.max_concurrent_deliveries` | — | `8` | Deliveries in flight at once. A bound, and what stops one dead endpoint delaying the others |
 | `webhooks.max_payload_bytes` | — | `1048576` | Largest request body. Batches are trimmed; a single oversized document is sent without `fullDocument` |
+| `vector.worker_enabled` | `KIMMY_DISABLE_VECTOR_WORKER` (inverse) | `true` | Run the embedding worker on this node. Off makes the node a consumer of embeddings by replication rather than a producer of provider calls; search is unaffected |
+| `vector.batch.max_chunks` | — | `32` | The most chunks one embedding provider call carries ([ADR-095](decisions.md)). Below every hosted provider's per-request input cap |
+| `vector.batch.max_tokens` | — | `32768` | The most *estimated* tokens one call carries, by the estimate a collection's `chunk.max_tokens` uses (one token per two bytes). 32 default-sized chunks, about 64 KiB of text. A single document over this goes alone |
+| `vector.batch.max_wait_ms` | — | `100` | How long a partial batch waits for more documents once the stream is idle. A backlog fills batches without waiting; a quiet collection's document is delayed by at most this. `0` sends whatever has queued; refused above `10000` |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
@@ -109,7 +114,8 @@ runtime confusion:
 | `insecure_no_auth` + non-loopback bind | Would expose an unauthenticated database to the network |
 | No root password, no `insecure_no_auth` | Nothing could authenticate |
 | Auth on with no `jwt_secret` | The node would sign tokens with a constant compiled into the binary, so anyone could forge one. Required for a single node, not just a cluster — and in a cluster the *same* value everywhere, or a token issued by one node is rejected by the next |
-| A `jwt_secret` shorter than 16 bytes | The whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would |
+| A `jwt_secret` shorter than 32 bytes | The HS256 key floor RFC 7518 §3.2 sets, and the whole cluster shares this one value, so a short one makes offline brute force cheap. Checked here as well as at startup, so `check-config` gives the answer the server would. Was 16 up to 0.16.x (ADR-093) |
+| A placeholder secret on a non-loopback bind | `root_password`, `jwt_secret` or `cluster_secret` equal to a value this repository's own examples use — `changeme`, `change-me`, `hunter2`, the compose file's former defaults, `password`, `secret`, and the rest of `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`. A value every reader of the repository holds is not a secret. Loopback binds accept them, so the examples stay runnable; the error names the setting, not the value (ADR-093) |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
 | `oplog_retention_secs = 0` | Change streams could never resume |
@@ -125,6 +131,7 @@ runtime confusion:
 | Exactly one of `server.tls.cert_file` / `key_file` | The node would start and serve plaintext on a port an operator believes is encrypted |
 | A TLS certificate or key that is missing or unreadable | The failure would otherwise land on the first client to connect, not on the operator watching the boot |
 | An empty `trusted_proxy_header` | Reads as a header whose name is empty, so it never matches — an operator would believe forwarding was configured when it was not |
+| `auth.oidc.max_token_lifetime_secs` outside 1–86400 | Zero would refuse every federated token; more than a day is the setting being used to switch itself off, which is a decision to make at the provider rather than by adding a zero here (ADR-096) |
 
 Boolean flags are one-way: passing `--insecure-no-auth` turns it on, but
 omitting it does **not** turn off what the config file asked for.
@@ -134,8 +141,10 @@ omitting it does **not** turn off what the config file asked for.
 ## Running
 
 ```bash
-# From source
-KIMMY_ROOT_PASSWORD=change-me KIMMY_JWT_SECRET=$(openssl rand -base64 32) \
+# From source. The signing key is 32 bytes minimum; an example's value for
+# either secret is refused off loopback, so pick your own.
+export KIMMY_ROOT_PASSWORD=$(openssl rand -base64 18)
+KIMMY_JWT_SECRET=$(openssl rand -base64 32) \
   cargo run --bin kimmyd -- --bind 127.0.0.1:7878 --data-dir ./data
 
 # Local development, no auth (loopback only)
@@ -147,8 +156,8 @@ cargo run --bin kimmyd -- --insecure-no-auth --bind 127.0.0.1:7878 --data-dir ./
 ```bash
 docker build -t kimmydb .
 docker run -d --name kimmy -p 7878:7878 \
-  -e KIMMY_ROOT_PASSWORD=change-me \
-  -e KIMMY_JWT_SECRET=a-long-random-secret \
+  -e KIMMY_ROOT_PASSWORD \
+  -e KIMMY_JWT_SECRET="$(openssl rand -base64 32)" \
   -v kimmy-data:/var/lib/kimmy \
   kimmydb
 ```
@@ -365,7 +374,7 @@ port.
 | `kimmy_up` | Always 1; presence means the node is serving |
 | `kimmy_uptime_seconds` | Since this process started |
 | `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
-| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count |
+| `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count. One call carries many documents ([ADR-095](decisions.md)), so `kimmy_embed_chunks_total` over this is the batch size the worker is achieving; there is no separate batch-size series |
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
@@ -448,7 +457,7 @@ the numbers are in [Benchmarks](benchmarks.md).
 | `find`, `insert`, `update`, `aggregate`, … | One per executor operation, so REST and MCP produce the same spans — they call the same functions |
 | `storage.commit` | The fsync. redb has a single writer and every commit is one, so this is what a write *cost* |
 | `cluster.sync` | One per peer per anti-entropy round, with `applied`, `ddl` and `lag_ms` |
-| `vector.process`, `vector.embed` | The embedding worker, with the chunk count — a remote provider is a round trip per chunk |
+| `vector.process`, `vector.embed` | The embedding worker: one `vector.process` per oplog entry, one `vector.embed` per provider call with its `documents` and `chunks` — a remote provider is a round trip per batch, and this span is that round trip |
 | `webhook.deliver` | One per batch, and it **injects `traceparent`** so a receiver can continue the trace |
 | `oidc.jwks_refresh` | The signing-key fetch |
 
@@ -645,6 +654,7 @@ partially read.
 | Oplog growth | Bounded by `oplog_retention_secs`, enforced every `gc_interval_secs` |
 | Tombstone growth | Bounded by `tombstone_retention_secs`, same pass |
 | TTL expiry | At most 1,000 documents per collection per pass, so a backlog drains over several ticks rather than holding the single writer. **One node expires a given collection**; if it is partitioned that collection stops expiring until ownership moves. Watch `kimmy_ttl_expired_total` and `kimmy_ttl_skipped_total` |
+| Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
 | Resident memory | Roughly `storage.cache_bytes` plus indexes (HNSW graphs are held in memory per vector collection) plus the allocator's retained peak. It does not come down by itself: redb's cache evicts only for room, and freed heap is rarely returned to the OS. A restart is the reset |

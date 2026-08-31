@@ -104,9 +104,10 @@ Authorization: Bearer <jwt>
 ```
 
 ```bash
+# KIMMY_ROOT_PASSWORD is whatever the node was bootstrapped with.
 TOKEN=$(curl -s -XPOST localhost:7878/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"user":"root","password":"change-me"}' | jq -r .token)
+  -d "{\"user\":\"root\",\"password\":\"$KIMMY_ROOT_PASSWORD\"}" | jq -r .token)
 ```
 
 ```json
@@ -574,6 +575,14 @@ failed.
 challenge reveals nothing the body does not: it is byte-identical whether the
 target exists or not, which is the same property the uniform 403 has always
 had.
+
+The `error_description` on a 401 is deliberately generic — `the access token
+is expired, revoked or malformed` — with one exception. A federated token
+refused because its own `exp − iat` exceeds `auth.oidc.max_token_lifetime_secs`
+says so, naming the limit in seconds and nothing about the token: the ordinary
+advice to refresh would have the provider mint the same token again, and the
+fix is on the provider's side or in the node's configuration
+([ADR-096](decisions.md)).
 
 `POST /v1/auth/login` is exempt. It is where a token comes from, not a
 bearer-protected resource, and challenging there would tell a client to come

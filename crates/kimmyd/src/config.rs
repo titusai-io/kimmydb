@@ -67,11 +67,77 @@ pub struct VectorConfig {
     /// the same effect from a flag, and see ADR-075 for why ownership is not
     /// derived automatically in every case.
     pub worker_enabled: bool,
+    /// How the worker gathers documents into provider calls.
+    pub batch: BatchConfig,
 }
 
 impl Default for VectorConfig {
     fn default() -> Self {
-        Self { worker_enabled: true }
+        Self { worker_enabled: true, batch: BatchConfig::default() }
+    }
+}
+
+/// Bounds on one embedding provider call (ADR-095).
+///
+/// A process setting rather than part of a collection's vector configuration
+/// because it describes the round trip this node makes, not the collection:
+/// the same provider limits apply whichever collection's documents fill the
+/// call, and a batch only ever holds documents of one collection anyway. The
+/// defaults are `kimmy_vector::BatchSettings::default()`; see there for why
+/// each is what it is.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BatchConfig {
+    /// The most chunks one provider call carries.
+    pub max_chunks: usize,
+    /// The most estimated tokens one provider call carries, by the estimate
+    /// `chunk.max_tokens` uses (one token per two bytes of UTF-8). A single
+    /// document over this goes alone rather than being split.
+    pub max_tokens: usize,
+    /// How long the streaming path holds a partial batch for more documents
+    /// before sending it, in milliseconds. Only waited when the stream is
+    /// idle; a backlog fills batches without waiting. `0` sends whatever has
+    /// queued the moment the stream is idle.
+    pub max_wait_ms: u64,
+}
+
+impl Default for BatchConfig {
+    fn default() -> Self {
+        let defaults = kimmy_vector::BatchSettings::default();
+        Self {
+            max_chunks: defaults.max_chunks,
+            max_tokens: defaults.max_tokens,
+            max_wait_ms: defaults.max_wait.as_millis() as u64,
+        }
+    }
+}
+
+impl BatchConfig {
+    pub fn settings(&self) -> kimmy_vector::BatchSettings {
+        kimmy_vector::BatchSettings {
+            max_chunks: self.max_chunks,
+            max_tokens: self.max_tokens,
+            max_wait: std::time::Duration::from_millis(self.max_wait_ms),
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.max_chunks == 0 {
+            anyhow::bail!("vector.batch.max_chunks must be greater than zero");
+        }
+        if self.max_tokens == 0 {
+            anyhow::bail!("vector.batch.max_tokens must be greater than zero");
+        }
+        // Milliseconds, and a quiet collection waits the whole of it before
+        // its one document is embedded: a value in the tens of thousands is
+        // almost certainly seconds typed into a milliseconds field.
+        if self.max_wait_ms > 10_000 {
+            anyhow::bail!(
+                "vector.batch.max_wait_ms must be at most 10000 (ten seconds); it is a \
+                 milliseconds value, and a quiet collection waits the whole of it"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -364,7 +430,7 @@ pub struct AuthConfig {
 
 /// What a secret serializes as, in place of itself.
 ///
-/// Below the 16 bytes [`Config::validate`] requires of a signing key, on
+/// Below the 32 bytes [`Config::validate`] requires of a signing key, on
 /// purpose: `check-config` output pasted back into a config file has to fail at
 /// startup rather than run with a placeholder for a key. That refusal comes
 /// first whenever authentication is on, which is also what stops the bootstrap
@@ -466,6 +532,25 @@ pub struct OidcConfig {
     ///
     /// Turning it on is loud: the node says so at startup, every time.
     pub allow_federated_admin: bool,
+    /// The longest a federated token may be valid for, by its own `exp − iat`
+    /// (ADR-096).
+    ///
+    /// **900 seconds by default.** A federated principal's role membership is
+    /// frozen in its access token — this database makes no introspection
+    /// call — so a revocation at the provider takes effect only when the
+    /// token expires (ADR-073). This is the only place that window can be
+    /// bounded from this side. Providers default access tokens to somewhere
+    /// between five minutes and an hour, a few to a day; fifteen minutes
+    /// admits the short defaults outright, asks the hour-long ones to be
+    /// shortened for this resource or the limit raised, and refuses the
+    /// day-long tokens that turn the window into a policy.
+    ///
+    /// A token over the limit is a 401 whose challenge names the limit, so
+    /// an operator whose provider mints longer tokens finds out from the
+    /// first refusal and raises this knowingly, or shortens the provider's
+    /// lifetime. A token with no `iat` is refused too — RFC 9068 §2.2
+    /// requires the claim. Refused outside 1..=86400 at startup.
+    pub max_token_lifetime_secs: u64,
 }
 
 impl Default for OidcConfig {
@@ -486,6 +571,9 @@ impl Default for OidcConfig {
             // Off, so that enabling federation changes nothing about who may
             // administer this database. See the field's documentation.
             allow_federated_admin: false,
+            // Fifteen minutes. The constant is the verifier's, so the two
+            // cannot drift; see the field's documentation for the number.
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         }
     }
 }
@@ -510,6 +598,7 @@ impl OidcConfig {
             role_mappings: self.role_mappings.clone(),
             require_at_jwt: self.require_at_jwt,
             allow_federated_admin: self.allow_federated_admin,
+            max_token_lifetime_secs: self.max_token_lifetime_secs,
         })
     }
 
@@ -576,16 +665,24 @@ impl OidcConfig {
     /// One-line form for the startup summary. Never the mappings themselves —
     /// they are long, and the count is what tells an operator the file was read.
     ///
-    /// `allow_federated_admin` is named only when it is on. A default that is
+    /// `allow_federated_admin` is named only when it is on, and the token
+    /// lifetime limit only when it is not the default. A default that is
     /// printed every time is a default nobody reads; a line that appears only
-    /// when a security boundary has been lowered is one somebody notices.
+    /// when a security boundary has been moved is one somebody notices.
     fn describe(&self) -> String {
         match &self.issuer {
             None => "off".to_string(),
             Some(issuer) => {
                 let admin =
                     if self.allow_federated_admin { ", FEDERATED ADMIN ALLOWED" } else { "" };
-                format!("{issuer} ({} role mappings{admin})", self.role_mappings.len())
+                let lifetime = if self.max_token_lifetime_secs
+                    == kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS
+                {
+                    String::new()
+                } else {
+                    format!(", max token lifetime {}s", self.max_token_lifetime_secs)
+                };
+                format!("{issuer} ({} role mappings{admin}{lifetime})", self.role_mappings.len())
             }
         }
     }
@@ -1053,6 +1150,47 @@ impl Config {
             }
         }
 
+        // A value copied from this repository's own examples is a secret every
+        // reader of the repository holds, so off loopback it is no secret at
+        // all: with the signing key anyone can mint a root token, with the
+        // cluster secret anyone who can reach the gossip port can inject
+        // writes, and the bootstrap password is the first thing tried against
+        // a fresh node. Refused only when a listener is reachable from off the
+        // host (ADR-093), which is what keeps the examples copy-and-run on a
+        // laptop. The message names the setting and never the value: it lands
+        // in logs, and a value that has just been declared a non-secret is
+        // still the one the operator typed.
+        if let Some(bind) = self.listens_off_loopback() {
+            let auth_on = !self.auth.insecure_no_auth;
+            let in_force = [
+                (
+                    "auth.root_password",
+                    "KIMMY_ROOT_PASSWORD",
+                    self.auth.root_password.as_deref().filter(|_| auth_on),
+                ),
+                (
+                    "auth.jwt_secret",
+                    "KIMMY_JWT_SECRET",
+                    self.auth.jwt_secret.as_deref().filter(|_| auth_on),
+                ),
+                (
+                    "cluster.cluster_secret",
+                    "KIMMY_CLUSTER_SECRET",
+                    self.cluster.cluster_secret.as_deref().filter(|_| self.cluster.enabled),
+                ),
+            ];
+            for (setting, env, value) in in_force {
+                if value.is_some_and(is_placeholder_secret) {
+                    anyhow::bail!(
+                        "{setting} is one of the placeholder values from this project's own \
+                         examples, and the node listens on {bind}, which is reachable from the \
+                         network. Set {env} to a value of your own (`openssl rand -base64 32` \
+                         makes a good one), or bind to 127.0.0.1 for local development."
+                    );
+                }
+            }
+        }
+
         // Federation is refused outright with authentication off rather than
         // quietly ignored: `--insecure-no-auth` makes every request a
         // superuser, so a node holding both would be handing out more than the
@@ -1118,6 +1256,7 @@ impl Config {
         self.server.rate_limit.validate()?;
         self.server.tls.validate()?;
         self.telemetry.validate()?;
+        self.vector.batch.validate()?;
         // Parsed at startup so a typo is a boot failure rather than an audit
         // log that silently records nothing.
         kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
@@ -1336,6 +1475,70 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+impl Config {
+    /// The first listener this configuration would open on an address other
+    /// than loopback, if there is one.
+    ///
+    /// The HTTP listener always counts. The cluster transport counts only when
+    /// clustering is on — its default bind is the wildcard, and a node that
+    /// never opens it is not exposed by it.
+    fn listens_off_loopback(&self) -> Option<SocketAddr> {
+        if !is_loopback(&self.server.bind) {
+            return Some(self.server.bind);
+        }
+        if self.cluster.enabled && !is_loopback(&self.cluster.bind) {
+            return Some(self.cluster.bind);
+        }
+        None
+    }
+}
+
+/// Values this repository's own files put where a secret goes.
+///
+/// Every one of these has appeared in a compose file, an example configuration,
+/// a quick start or an example program in this repository, or is what a person
+/// types when asked for a secret they intend to replace later. A node reachable
+/// from the network refuses to start with any of them ([`Config::validate`],
+/// ADR-093). The list is a denylist and nothing more: a value absent from it is
+/// not thereby a good secret, and the length floor still applies.
+pub const PLACEHOLDER_SECRETS: &[&str] = &[
+    // docker-compose.yml, before it required the values to be supplied.
+    "dev-jwt-secret-not-for-production",
+    "dev-cluster-secret",
+    "changeme",
+    // kimmy.example.toml's commented-out lines.
+    "generate-me-with-openssl-rand-base64-32",
+    "change-me",
+    // The quick starts in README.md and docs/, before they generated a key.
+    "a-long-random-secret",
+    // examples/ and the client examples.
+    "a-secret-long-enough-for-the-examples",
+    "example-password",
+    "conformance-password",
+    "hunter2",
+    // What gets typed when the value is meant to be replaced later.
+    "password",
+    "secret",
+    "changeit",
+    "placeholder",
+    "admin",
+    "root",
+    "kimmy",
+    "kimmydb",
+    "test",
+    "example",
+];
+
+/// Whether `value` is one of [`PLACEHOLDER_SECRETS`].
+///
+/// Case-insensitive and blind to surrounding whitespace: `ChangeMe` and
+/// `changeme ` are the same non-secret as `changeme`, and a check that a change
+/// of case defeats would be teaching people to change the case.
+pub fn is_placeholder_secret(value: &str) -> bool {
+    let value = value.trim();
+    PLACEHOLDER_SECRETS.iter().any(|placeholder| placeholder.eq_ignore_ascii_case(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1343,7 +1546,7 @@ mod tests {
     fn valid() -> Config {
         Config {
             auth: AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 // Auth is on by default, and an auth-on node must be given a
                 // signing key or it is refused — see `auth_requires_a_jwt_secret`.
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
@@ -1467,6 +1670,18 @@ mod tests {
             "validate must agree with the issuer about what is too short"
         );
 
+        // The floor is 32 bytes, the HS256 key size RFC 7518 §3.2 asks for. A
+        // 16-byte key was accepted up to 0.16.x, so the error has to give the
+        // number an operator upgrading with one needs (ADR-093).
+        cfg.auth.jwt_secret = Some("0123456789abcdef".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("16 bytes"), "the error should name the length: {err}");
+        assert!(err.contains("32 or more"), "the error should name the floor: {err}");
+        assert!(
+            kimmy_auth::TokenIssuer::new("0123456789abcdef", 3600).is_err(),
+            "validate must agree with the issuer about the floor"
+        );
+
         // With auth off there is no token to forge, so no secret is required —
         // this is what keeps loopback development a single flag.
         let mut off = Config::default();
@@ -1474,6 +1689,106 @@ mod tests {
         off.auth.jwt_secret = None;
         off.server.bind = "127.0.0.1:7878".parse().unwrap();
         off.validate().unwrap();
+    }
+
+    #[test]
+    fn placeholder_secrets_are_refused_off_loopback() {
+        // Each value below is lifted from this repository's own examples, and
+        // each is long enough to pass the length rule, so what is refused is
+        // the value and not its size. The error names the setting and the
+        // variable and never echoes the value: it lands in logs.
+        let mut cfg = valid();
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+
+        cfg.auth.jwt_secret = Some("dev-jwt-secret-not-for-production".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auth.jwt_secret"), "must name the setting: {err}");
+        assert!(err.contains("KIMMY_JWT_SECRET"), "must name the variable: {err}");
+        assert!(err.contains("placeholder"), "must say what is wrong: {err}");
+        assert!(!err.contains("dev-jwt-secret"), "must not echo the value: {err}");
+
+        // The same value on loopback is accepted: the examples stay
+        // copy-and-run on a laptop, and nothing off the host can reach them.
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+        cfg.server.bind = "[::1]:7878".parse().unwrap();
+        cfg.validate().unwrap();
+
+        // A value of adequate length that is not on the list is accepted.
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth.jwt_secret = Some("a-signing-key-of-adequate-length".into());
+        cfg.validate().unwrap();
+
+        // The bootstrap password, including a change of case and stray
+        // whitespace: a check that a capital letter defeats would be teaching
+        // people to add one. (`password` itself is on the list too, but the
+        // setting's own name contains it, so it cannot serve the echo check.)
+        for password in ["changeme", "ChangeMe", "change-me", "hunter2", " changeit "] {
+            cfg.auth.root_password = Some(password.into());
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("auth.root_password"), "{password:?}: {err}");
+            assert!(err.contains("KIMMY_ROOT_PASSWORD"), "{password:?}: {err}");
+            assert!(!err.contains(password.trim()), "must not echo the value: {err}");
+        }
+        cfg.auth.root_password = Some("password".into());
+        assert!(cfg.validate().is_err(), "the word itself is a placeholder");
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth.root_password = Some("a-root-password-of-my-own".into());
+        cfg.validate().unwrap();
+
+        // The cluster secret. With the cluster transport itself on loopback
+        // the HTTP bind alone decides, as for the other two.
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.bind = "127.0.0.1:7900".parse().unwrap();
+        cfg.cluster.cluster_secret = Some("dev-cluster-secret".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cluster.cluster_secret"), "must name the setting: {err}");
+        assert!(err.contains("KIMMY_CLUSTER_SECRET"), "must name the variable: {err}");
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+
+        // A cluster listener off loopback exposes the node on its own, even
+        // with HTTP on loopback: the gossip port is the one that secret guards.
+        cfg.cluster.bind = "0.0.0.0:7900".parse().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cluster.cluster_secret"), "must name the setting: {err}");
+        assert!(err.contains("0.0.0.0:7900"), "must name the listener: {err}");
+        cfg.cluster.cluster_secret = Some("a-cluster-secret-of-my-own".into());
+        cfg.validate().unwrap();
+
+        // A placeholder in a setting that is not in force is not a refusal:
+        // with clustering off the cluster secret guards nothing.
+        cfg.cluster.enabled = false;
+        cfg.cluster.cluster_secret = Some("dev-cluster-secret".into());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn every_placeholder_the_repository_ships_is_on_the_list() {
+        // The values the compose file, the example configuration and the
+        // quick starts have used. If one of these stops matching, an example
+        // that used to be refused off loopback would be accepted.
+        for value in [
+            "dev-jwt-secret-not-for-production",
+            "dev-cluster-secret",
+            "changeme",
+            "generate-me-with-openssl-rand-base64-32",
+            "change-me",
+            "a-long-random-secret",
+            "a-secret-long-enough-for-the-examples",
+            "hunter2",
+            "password",
+            "secret",
+        ] {
+            assert!(is_placeholder_secret(value), "{value:?} should be a placeholder");
+        }
+        assert!(!is_placeholder_secret("a-signing-key-of-adequate-length"));
+        // A prefix or a superstring is not a match: the list is exact values,
+        // and `secret` inside a generated key is not a placeholder.
+        assert!(!is_placeholder_secret("my-secret-2026-08-30-with-real-entropy"));
     }
 
     #[test]
@@ -1502,6 +1817,46 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.storage.commit_coalesce_ms = 1000;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_embedding_batch_bounds_are_checked() {
+        let mut cfg = valid();
+        cfg.vector.batch.max_chunks = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_chunks"));
+        cfg.vector.batch.max_chunks = 1;
+        cfg.vector.batch.max_tokens = 0;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_tokens"));
+        cfg.vector.batch.max_tokens = 1;
+        // Milliseconds: a value that looks like seconds is refused rather
+        // than making every quiet collection wait minutes.
+        cfg.vector.batch.max_wait_ms = 60_000;
+        assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_wait_ms"));
+        cfg.vector.batch.max_wait_ms = 0;
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_vector_batch_section_reads_back_from_toml_as_written() {
+        // The documented shape, exactly as `kimmy.example.toml` shows it, and
+        // the defaults match the worker's own.
+        let cfg: Config = toml::from_str(
+            "[vector]\n\
+             worker_enabled = true\n\
+             [vector.batch]\n\
+             max_chunks = 16\n\
+             max_tokens = 8192\n\
+             max_wait_ms = 250\n",
+        )
+        .unwrap();
+        let settings = cfg.vector.batch.settings();
+        assert_eq!(settings.max_chunks, 16);
+        assert_eq!(settings.max_tokens, 8192);
+        assert_eq!(settings.max_wait, std::time::Duration::from_millis(250));
+        assert_eq!(
+            Config::default().vector.batch.settings(),
+            kimmy_vector::BatchSettings::default()
+        );
     }
 
     #[test]
@@ -1792,6 +2147,7 @@ mod tests {
              issuer = \"https://auth.example.com\"\n\
              audience = \"kimmydb\"\n\
              roles_claim = \"roles\"\n\
+             max_token_lifetime_secs = 600\n\
              [[auth.oidc.role_mappings]]\n\
              claim_value = \"kimmydb-analyst\"\n\
              grants = [{ db = \"sales\", collection = \"orders*\", actions = [\"read\", \"search\"] }]\n",
@@ -1802,6 +2158,7 @@ mod tests {
         assert_eq!(settings.issuer, "https://auth.example.com");
         assert_eq!(settings.audience, "kimmydb");
         assert_eq!(settings.roles_claim, "roles");
+        assert_eq!(settings.max_token_lifetime_secs, 600);
         assert_eq!(settings.role_mappings.len(), 1);
         assert_eq!(settings.role_mappings[0].claim_value, "kimmydb-analyst");
         assert_eq!(settings.role_mappings[0].grants[0].collection, "orders*");
@@ -1831,6 +2188,53 @@ mod tests {
 
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("refresh_interval_secs"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn the_federated_token_lifetime_limit_defaults_to_fifteen_minutes() {
+        // The number ADR-096 argues for, and the verifier's own constant, so
+        // the file's default and the verifier's cannot drift apart. It reaches
+        // the verifier's settings unchanged.
+        let cfg = valid();
+        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 900);
+        assert_eq!(OidcConfig::default().max_token_lifetime_secs, 900);
+
+        let mut cfg = valid();
+        cfg.auth.oidc = oidc();
+        assert_eq!(cfg.auth.oidc.settings().unwrap().max_token_lifetime_secs, 900);
+        // The default is not announced; a raised limit is, because it widens
+        // the revocation window and is worth a second look in the log.
+        assert!(!cfg.summary().contains("max token lifetime"), "{}", cfg.summary());
+        cfg.auth.oidc.max_token_lifetime_secs = 3600;
+        assert!(cfg.summary().contains("max token lifetime 3600s"), "{}", cfg.summary());
+    }
+
+    #[test]
+    fn a_federated_token_lifetime_limit_outside_its_bounds_is_refused() {
+        // Zero would refuse every token the provider mints; more than a day is
+        // the setting being used to switch itself off. Both ends are startup
+        // refusals, and `check-config` gives the same answer because it is
+        // the same function.
+        for secs in [0, 86_401] {
+            let mut cfg = valid();
+            cfg.auth.oidc = oidc();
+            cfg.auth.oidc.max_token_lifetime_secs = secs;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("max_token_lifetime_secs"), "unhelpful error for {secs}: {err}");
+            assert!(err.contains("86400"), "the error should name the ceiling: {err}");
+        }
+        for secs in [1, 900, 86_400] {
+            let mut cfg = valid();
+            cfg.auth.oidc = oidc();
+            cfg.auth.oidc.max_token_lifetime_secs = secs;
+            cfg.validate().unwrap_or_else(|e| panic!("{secs} should be accepted: {e}"));
+        }
+        // With federation off the setting is inert, like every other value in
+        // the section, so a stray value cannot stop a node that does not use
+        // it.
+        let mut cfg = valid();
+        cfg.auth.oidc.max_token_lifetime_secs = 0;
+        cfg.validate().unwrap();
     }
 
     #[test]
@@ -2019,7 +2423,7 @@ mod tests {
         cfg.auth.jwt_secret = Some("super-secret-signing-key".into());
         cfg.cluster.cluster_secret = Some("super-secret-cluster-key".into());
         let summary = cfg.summary();
-        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("a-root-password-for-the-tests"));
         assert!(!summary.contains("super-secret"));
     }
 

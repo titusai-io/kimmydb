@@ -2187,6 +2187,17 @@ paths:
         **`query` text is required.** The lexical half cannot be derived from a
         bare vector, so that request is refused rather than silently degrading
         to plain vector search.
+
+        Two optional fields tune the fusion. `weights` scales each half's
+        contribution (`dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`);
+        `min_overlap` is how many distinct query terms a chunk must contain to
+        count as lexical evidence at all — a document it removes from the
+        lexical half keeps whatever the dense half gave it. Their defaults,
+        equal weights and `1`, are plain reciprocal rank fusion, exactly the
+        ranking a request that omits them gets. The lexical half ranks by term
+        overlap, so on a corpus of short documents `min_overlap: 2` is the
+        practical way to stop near-random lexical ranks outvoting the dense
+        ones. See `docs/vectors.md`.
       x-kimmy-action: search (plus read when filtering)
       requestBody:
         required: true
@@ -2200,7 +2211,9 @@ paths:
             application/json:
               schema: { $ref: "#/components/schemas/SearchResponse" }
         "400":
-          description: Missing `query`, or an otherwise unanswerable request.
+          description: |
+            Missing `query`; a negative weight, both weights zero, or
+            `min_overlap` below 1; or an otherwise unanswerable request.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Error" }
@@ -3150,6 +3163,30 @@ components:
         per_document:
           type: integer
           description: Chunks per document allowed into the results.
+        weights:
+          type: object
+          description: |
+            `hybrid_search` only; `vector_search` ignores it. How much each
+            half's rank counts in fusion: the score is
+            `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`. Each
+            weight is `>= 0` and they must not both be zero (`400`). Only the
+            ratio matters; a weight of `0` switches that half off. A weight
+            left out is `1`. The default, equal weights, is plain reciprocal
+            rank fusion.
+          properties:
+            dense: { type: number, minimum: 0, default: 1 }
+            lexical: { type: number, minimum: 0, default: 1 }
+        min_overlap:
+          type: integer
+          minimum: 1
+          default: 1
+          description: |
+            `hybrid_search` only; `vector_search` ignores it. How many
+            distinct query terms a chunk must contain to enter the lexical
+            ranking. A query with fewer distinct terms than this is held to its
+            own count, so a one-word query is never gated to nothing. A
+            document the gate removes from the lexical half keeps its dense
+            contribution. `0` is a `400`.
 
     SearchResponse:
       type: object

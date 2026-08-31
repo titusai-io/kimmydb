@@ -1024,7 +1024,7 @@ pub fn find_and_modify(
         let mut seed = Document::new();
         implied_equalities(&filter, &mut seed);
         if let Some(update) = &update {
-            update::apply(update, &mut seed, now)?;
+            update::apply_on_insert(update, &mut seed, now)?;
         }
         Some(seed)
     } else {
@@ -1531,7 +1531,8 @@ mod tests {
         let engine = std::sync::Arc::new(
             kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
         );
-        let tokens = kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret", 3600).unwrap();
+        let tokens =
+            kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret-for-hs256", 3600).unwrap();
         crate::state_with_egress(
             engine,
             tokens,

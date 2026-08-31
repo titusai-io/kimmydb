@@ -11,7 +11,7 @@ use kimmy_auth::TokenIssuer;
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
@@ -199,6 +199,7 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -226,6 +227,7 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin,
+            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         })
         .unwrap();
         let federation = kimmy_api::Federation::new(verifier);
@@ -963,6 +965,114 @@ async fn queries_filter_sort_and_project() {
     assert_eq!(res.body["count"], 2);
     assert_eq!(res.body["documents"][0], json!({ "item": "gadget" }));
     assert_eq!(res.body["documents"][1], json!({ "item": "widget" }));
+}
+
+/// `$expr` is parsed by the one filter parser every endpoint shares, so proving
+/// it on `find`, `count`, `$match` and `update` is proving the parser once and
+/// the plumbing four times. The predicate compares two fields of the same
+/// document, which no other filter operator can write.
+#[tokio::test]
+async fn expr_compares_fields_of_the_same_document_everywhere_a_filter_is_taken() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"accounts"})).await;
+
+    for (id, account, spent, budget) in
+        [(1, "acme", 120, 100), (2, "acme", 80, 100), (3, "globex", 500, 100), (4, "globex", 0, 0)]
+    {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/accounts/docs",
+                Some(&token),
+                json!({"_id": id, "account": account, "spent": spent, "budget": budget}),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let over_budget = json!({"$expr": {"$gt": ["$spent", "$budget"]}});
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": over_budget, "sort": {"_id": 1}, "projection": {"_id": 1}}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1}, {"_id": 3}]));
+
+    let res = server
+        .post("/v1/db/shop/coll/accounts/count", Some(&token), json!({"filter": over_budget}))
+        .await;
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+
+    // `$expr` is never index-eligible on its own, but an equality beside it
+    // still plans, and the expression is re-applied to every candidate.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "account"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": over_budget, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "collectionScan", "{:?}", res.body);
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({
+                "filter": {"account": "acme", "$expr": {"$gt": ["$spent", "$budget"]}},
+                "projection": {"_id": 1},
+                "explain": true
+            }),
+        )
+        .await;
+    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 1}]));
+
+    // `$match` takes the same filter, and an expression there can lean on
+    // arithmetic just as it does in `$addFields`.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"$expr": {"$gte": [{"$subtract": ["$spent", "$budget"]}, 400]}}},
+                {"$project": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"], json!([{"_id": 3}]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/update",
+            Some(&token),
+            json!({"filter": over_budget, "update": {"$set": {"flag": "over"}}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 2, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/accounts/docs/2", Some(&token)).await;
+    assert!(res.body.get("flag").is_none(), "an in-budget account was flagged: {:?}", res.body);
+
+    // A malformed expression is the filter parser's ordinary 400.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/accounts/find",
+            Some(&token),
+            json!({"filter": {"$expr": {"$nope": ["$spent", 1]}}}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -2777,6 +2887,192 @@ async fn a_deleted_document_does_not_surface_from_search() {
     assert_eq!(ids, vec!["b"], "nor from hybrid search: {:?}", hybrid.body);
 }
 
+/// Three documents that separate the two halves of a hybrid search for the
+/// query `"red blue"` with vector `[1, 0, 0]`:
+///
+/// - `x` is the nearest vector and shares no term with the query, so it is
+///   dense-only evidence;
+/// - `z` is second nearest and shares both terms;
+/// - `y` is farthest and shares one term — the candidate `min_overlap` gates.
+async fn fusion_fixture(server: &Server) -> String {
+    let token = byo_collection(server).await;
+    for (id, vector, text) in [
+        ("x", [1.0, 0.0, 0.0], "green paint"),
+        ("y", [0.0, 1.0, 0.0], "red apple"),
+        ("z", [0.6, 0.0, 0.8], "red blue"),
+    ] {
+        server
+            .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": text }))
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": text }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+    token
+}
+
+/// `(_id, score)` in result order.
+fn ranked(body: &Value) -> Vec<(String, f64)> {
+    body["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| (m["_id"].as_str().unwrap().to_string(), m["score"].as_f64().unwrap()))
+        .collect()
+}
+
+#[tokio::test]
+async fn hybrid_fusion_controls_default_to_the_previous_ranking() {
+    // ADR-094: the fields exist, and a request that sends their defaults gets
+    // byte-for-byte what a request that omits them gets — same order, same
+    // scores, same response shape.
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+    let base = json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5 });
+
+    let implicit = server.post(path, Some(&token), base.clone()).await;
+    assert_eq!(implicit.status, 200, "{:?}", implicit.body);
+
+    let mut explicit_body = base.clone();
+    explicit_body["weights"] = json!({ "dense": 1.0, "lexical": 1.0 });
+    explicit_body["min_overlap"] = json!(1);
+    let explicit = server.post(path, Some(&token), explicit_body).await;
+    assert_eq!(explicit.status, 200, "{:?}", explicit.body);
+
+    assert_eq!(implicit.body, explicit.body, "the defaults must be the old behaviour exactly");
+    let ranking = ranked(&implicit.body);
+    let order: Vec<&str> = ranking.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(order, vec!["z", "y", "x"], "{:?}", implicit.body);
+
+    // The response shape is the one every client already parses.
+    assert_eq!(explicit.body["count"], 3);
+    for m in explicit.body["matches"].as_array().unwrap() {
+        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["_id", "chunk", "score", "text"], "response shape changed: {m}");
+    }
+}
+
+#[tokio::test]
+async fn min_overlap_removes_lexical_evidence_but_never_a_dense_hit() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+
+    let loose = server
+        .post(path, Some(&token), json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5 }))
+        .await;
+    let strict = server
+        .post(
+            path,
+            Some(&token),
+            json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5, "min_overlap": 2 }),
+        )
+        .await;
+    assert_eq!(strict.status, 200, "{:?}", strict.body);
+
+    let loose = ranked(&loose.body);
+    let strict = ranked(&strict.body);
+    let order: Vec<&str> = strict.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(order, vec!["z", "x", "y"], "{strict:?}");
+
+    let score = |ranking: &[(String, f64)], id: &str| {
+        ranking.iter().find(|(i, _)| i == id).map(|(_, s)| *s).unwrap()
+    };
+    // `y` shared one term: gated out of the lexical half, it keeps its dense
+    // contribution — it is still in the result — and loses only the lexical one.
+    assert!(score(&strict, "y") < score(&loose, "y"), "y must lose its lexical share");
+    assert_eq!(strict.len(), 3, "gating lexical evidence must not drop a dense hit");
+    // `x` never had lexical evidence, so the gate cannot touch it...
+    assert_eq!(score(&strict, "x"), score(&loose, "x"));
+    // ...and `z` shares both terms, so it passes the gate unchanged.
+    assert_eq!(score(&strict, "z"), score(&loose, "z"));
+}
+
+#[tokio::test]
+async fn weights_scale_each_half_and_zero_switches_one_off() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+    let search = |weights: Value| {
+        let token = token.clone();
+        let server = &server;
+        async move {
+            let res = server
+                .post(
+                    path,
+                    Some(&token),
+                    json!({
+                        "query": "red blue", "vector": [1.0, 0.0, 0.0], "k": 5,
+                        "weights": weights,
+                    }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{:?}", res.body);
+            ranked(&res.body)
+        }
+    };
+    let ids = |ranking: &[(String, f64)]| -> Vec<String> {
+        ranking.iter().map(|(id, _)| id.clone()).collect()
+    };
+
+    // Dense only: nearest vector first, and every dense hit present.
+    assert_eq!(ids(&search(json!({ "dense": 1.0, "lexical": 0.0 })).await), ["x", "z", "y"]);
+    // Lexical only: `x` shares no term, so it is not in the result at all.
+    assert_eq!(ids(&search(json!({ "dense": 0.0, "lexical": 1.0 })).await), ["z", "y"]);
+
+    // The weights are applied as stated: halving both halves the score of
+    // every document and moves nothing, because only the ratio orders.
+    let equal = search(json!({ "dense": 1.0, "lexical": 1.0 })).await;
+    let halved = search(json!({ "dense": 0.5, "lexical": 0.5 })).await;
+    assert_eq!(ids(&equal), ids(&halved));
+    for ((id, full), (_, half)) in equal.iter().zip(&halved) {
+        assert!((half - full / 2.0).abs() < 1e-6, "{id}: {half} is not half of {full}");
+    }
+}
+
+#[tokio::test]
+async fn meaningless_fusion_controls_are_a_400() {
+    let server = Server::start().await;
+    let token = fusion_fixture(&server).await;
+    let path = "/v1/db/shop/coll/docs/hybrid_search";
+
+    for (extra, names) in [
+        (json!({ "weights": { "dense": -1.0 } }), "weights.dense"),
+        (
+            json!({ "weights": { "dense": 0.0, "lexical": 0.0 } }),
+            "weights.dense and weights.lexical",
+        ),
+        (json!({ "min_overlap": 0 }), "min_overlap"),
+    ] {
+        let mut body = json!({ "query": "red blue", "vector": [1.0, 0.0, 0.0] });
+        for (k, v) in extra.as_object().unwrap() {
+            body[k] = v.clone();
+        }
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{extra}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{extra}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains(names), "{extra}: the message must name the field: {message}");
+    }
+
+    // `vector_search` has one half and ignores the controls rather than
+    // refusing them, as the specification says.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&token),
+            json!({ "vector": [1.0, 0.0, 0.0], "weights": { "dense": 0.0, "lexical": 0.0 } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
 #[tokio::test]
 async fn client_supplied_vectors_become_searchable() {
     let server = Server::start().await;
@@ -3924,6 +4220,65 @@ async fn upsert_seeds_the_filters_equalities() {
 }
 
 #[tokio::test]
+async fn set_on_insert_applies_to_the_upsert_and_not_to_the_match() {
+    // The created-at idiom: stamp the document once, when the upsert makes
+    // it, and never touch the stamp again however many times it is hit.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"counters"})).await;
+
+    let request = json!({
+        "filter": {"_id": "hits"},
+        "update": {"$setOnInsert": {"created_at": 100, "meta.origin": "upsert"}, "$inc": {"n": 1}},
+        "upsert": true,
+        "returnDocument": "after",
+    });
+    let res = server
+        .post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request.clone())
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 0);
+    assert_eq!(res.body["document"]["created_at"], 100);
+    assert_eq!(res.body["document"]["meta"]["origin"], "upsert");
+    assert_eq!(res.body["document"]["n"], 1);
+
+    // Change what the insert would have set, then match: it stays as stored.
+    server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({"filter": {"_id": "hits"}, "update": {"$set": {"created_at": 7}}}),
+        )
+        .await;
+    let res = server.post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["document"]["created_at"], 7);
+    assert_eq!(res.body["document"]["n"], 2);
+
+    // The same path in $setOnInsert and another operator is refused up front,
+    // whether or not the request would have inserted.
+    let res = server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": "hits"},
+                "update": {"$setOnInsert": {"n": 0}, "$inc": {"n": 1}},
+                "upsert": true,
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("conflicts"),
+        "{:?}",
+        res.body
+    );
+}
+
+#[tokio::test]
 async fn contradictory_find_and_modify_requests_are_refused() {
     let server = Server::start().await;
     let token = jobs(&server).await;
@@ -4730,13 +5085,18 @@ mod oidc {
             .unwrap_or(0)
     }
 
+    /// The lifetime the stub provider mints. Ten minutes: inside the shipped
+    /// limit, so every federated test also runs the default lifetime check.
+    pub const LIFETIME_SECS: u64 = 600;
+
     pub fn claims(subject: &str, roles: Value) -> Value {
+        let issued = now();
         json!({
             "sub": subject,
             "iss": ISSUER,
             "aud": AUDIENCE,
-            "exp": now() + 3600,
-            "iat": now(),
+            "exp": issued + LIFETIME_SECS,
+            "iat": issued,
             "roles": roles,
         })
     }
@@ -5172,6 +5532,68 @@ async fn a_node_without_federation_configured_treats_every_token_as_local() {
     let who = server.get("/v1/auth/whoami", Some(&server.root().await)).await;
     assert_eq!(who.status, 200);
     assert_eq!(who.body["federated"], false);
+}
+
+#[tokio::test]
+async fn a_federated_token_that_lives_too_long_is_refused_and_the_challenge_names_the_limit() {
+    // The window ADR-073 describes is the token's own lifetime, and this is
+    // where it is bounded (ADR-096). A provider minting hour-long tokens
+    // against a node at the default gets a 401 whose challenge says which
+    // limit and how long, so the fix — shorten the provider's lifetime, or
+    // raise the limit knowingly — is discoverable from the response. The
+    // token's own lifetime is not echoed, and the `resource_metadata` pointer
+    // survives the more specific description.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims["aud"] = json!(RESOURCE);
+    claims["exp"] = json!(claims["iat"].as_u64().unwrap() + 3600);
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    assert_eq!(res.body["error"], "unauthorized");
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("900 seconds"), "the body names the limit: {message}");
+
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
+    assert!(
+        challenge.contains(
+            r#"error_description="the access token is valid for longer than the 900 seconds"#
+        ),
+        "the challenge names the limit: {challenge}"
+    );
+    assert!(challenge.contains("max_token_lifetime_secs"), "and the setting: {challenge}");
+    assert!(!challenge.contains("3600"), "the token's own lifetime is not echoed: {challenge}");
+    assert!(
+        challenge.contains(&format!(
+            r#"resource_metadata="{RESOURCE}/.well-known/oauth-protected-resource""#
+        )),
+        "the pointer must survive a specific description: {challenge}"
+    );
+
+    // The same token at the stub provider's ordinary lifetime is accepted, so
+    // the refusal above was the limit and nothing else about the token.
+    let mut ordinary = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    ordinary["aud"] = json!(RESOURCE);
+    let ok = server.get("/v1/auth/whoami", Some(&oidc::token(ordinary))).await;
+    assert_eq!(ok.status, 200, "{:?}", ok.body);
+}
+
+#[tokio::test]
+async fn a_federated_token_with_no_iat_is_refused_because_its_lifetime_is_unbounded() {
+    // RFC 9068 §2.2 requires `iat` in an access token; without it the limit
+    // could not be applied, so the token is refused rather than waved
+    // through, and the challenge says why.
+    let server = Server::start_federated().await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims.as_object_mut().unwrap().remove("iat");
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+    let challenge = res.header("www-authenticate").expect("a challenge");
+    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
+    assert!(challenge.contains("carries no iat"), "{challenge}");
+    assert!(challenge.contains("900 seconds"), "{challenge}");
 }
 
 // ---------------------------------------------------------------------------
