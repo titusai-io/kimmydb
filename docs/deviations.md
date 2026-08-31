@@ -17,6 +17,48 @@ Status meanings:
 
 ---
 
+## 🟡 Update operators are not checked for conflicting paths, except `$setOnInsert`
+
+**Raised 2026-08-30, while adding `$setOnInsert` and the `$push` modifiers.**
+MongoDB rejects any update in which two operators write the same path, or one
+writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails with *"Updating
+the path 'a' would create a conflict at 'a'"*. Here the operators apply in the
+order written and the last one wins, which is what the parser has done since
+the update language existed and what its tests pin.
+
+**`$setOnInsert` is the exception, and it is checked.** An update that sets a
+path on insert and also `$set`s, `$inc`s, `$unset`s or `$rename`s onto it (or a
+prefix or extension of it) means one thing when it inserts and another when it
+matches, and which of the two ran would depend on operator order in a document
+whose key order is an accident of the client's JSON encoder. That case is
+refused at parse time with the same shape of message as MongoDB's. The check is
+confined to pairs involving `$setOnInsert` because extending it to every pair
+would turn an update that works today into a `400` on upgrade — a behaviour
+break, which a patch release does not carry.
+
+**Closing it** is a one-line widening of `reject_set_on_insert_conflicts` to
+all operator pairs, plus the tests that pin ordered application today, and it
+belongs in a `0.MINOR` bump that says so in the changelog. Until then an update
+that names one path twice is applied in order, not refused, and a client that
+relies on MongoDB refusing it will not be told.
+
+Two smaller choices from the same change, recorded here so they are visible
+rather than because either is a debt:
+
+- **`$push`'s `$sort` on elements that are not documents.** With a
+  `{field: direction}` sort, an element that is not a document sorts as though
+  every named field were missing — `null`, at the low end — rather than being
+  an error. MongoDB does the same. A whole-element sort (`1` / `-1`) uses the
+  canonical cross-type order, so mixed arrays sort by type group first.
+- **A document argument to `$push` with any `$`-prefixed key is modifiers.**
+  MongoDB decides by the *first* key. Deciding by *any* key means
+  `{"$each": [1], "x": 2}` and `{"x": 2, "$each": [1]}` are both refused as an
+  unrecognized clause, where MongoDB would push the second literally. Nothing
+  that starts with `$` is a value anyone meant to store, so the stricter
+  reading only ever turns a silent misfiling into an error.
+
+---
+
 ## 🟡 `modified` counts documents written, not documents changed
 
 **Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
