@@ -104,9 +104,10 @@ Authorization: Bearer <jwt>
 ```
 
 ```bash
+# KIMMY_ROOT_PASSWORD is whatever the node was bootstrapped with.
 TOKEN=$(curl -s -XPOST localhost:7878/v1/auth/login \
   -H 'content-type: application/json' \
-  -d '{"user":"root","password":"change-me"}' | jq -r .token)
+  -d "{\"user\":\"root\",\"password\":\"$KIMMY_ROOT_PASSWORD\"}" | jq -r .token)
 ```
 
 ```json

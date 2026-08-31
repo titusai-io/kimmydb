@@ -517,7 +517,7 @@ mod tests {
         let cli = parse(&["--oidc-role-mappings", r#"[{"claim_value":"user"}]"#]);
         let mut cfg = Config {
             auth: crate::config::AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
                 oidc: crate::config::OidcConfig {
                     issuer: Some("https://auth.example.com".into()),

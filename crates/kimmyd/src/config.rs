@@ -363,7 +363,7 @@ pub struct AuthConfig {
 
 /// What a secret serializes as, in place of itself.
 ///
-/// Below the 16 bytes [`Config::validate`] requires of a signing key, on
+/// Below the 32 bytes [`Config::validate`] requires of a signing key, on
 /// purpose: `check-config` output pasted back into a config file has to fail at
 /// startup rather than run with a placeholder for a key. That refusal comes
 /// first whenever authentication is on, which is also what stops the bootstrap
@@ -1043,6 +1043,47 @@ impl Config {
             }
         }
 
+        // A value copied from this repository's own examples is a secret every
+        // reader of the repository holds, so off loopback it is no secret at
+        // all: with the signing key anyone can mint a root token, with the
+        // cluster secret anyone who can reach the gossip port can inject
+        // writes, and the bootstrap password is the first thing tried against
+        // a fresh node. Refused only when a listener is reachable from off the
+        // host (ADR-093), which is what keeps the examples copy-and-run on a
+        // laptop. The message names the setting and never the value: it lands
+        // in logs, and a value that has just been declared a non-secret is
+        // still the one the operator typed.
+        if let Some(bind) = self.listens_off_loopback() {
+            let auth_on = !self.auth.insecure_no_auth;
+            let in_force = [
+                (
+                    "auth.root_password",
+                    "KIMMY_ROOT_PASSWORD",
+                    self.auth.root_password.as_deref().filter(|_| auth_on),
+                ),
+                (
+                    "auth.jwt_secret",
+                    "KIMMY_JWT_SECRET",
+                    self.auth.jwt_secret.as_deref().filter(|_| auth_on),
+                ),
+                (
+                    "cluster.cluster_secret",
+                    "KIMMY_CLUSTER_SECRET",
+                    self.cluster.cluster_secret.as_deref().filter(|_| self.cluster.enabled),
+                ),
+            ];
+            for (setting, env, value) in in_force {
+                if value.is_some_and(is_placeholder_secret) {
+                    anyhow::bail!(
+                        "{setting} is one of the placeholder values from this project's own \
+                         examples, and the node listens on {bind}, which is reachable from the \
+                         network. Set {env} to a value of your own (`openssl rand -base64 32` \
+                         makes a good one), or bind to 127.0.0.1 for local development."
+                    );
+                }
+            }
+        }
+
         // Federation is refused outright with authentication off rather than
         // quietly ignored: `--insecure-no-auth` makes every request a
         // superuser, so a node holding both would be handing out more than the
@@ -1302,6 +1343,70 @@ fn is_loopback(addr: &SocketAddr) -> bool {
     addr.ip().is_loopback()
 }
 
+impl Config {
+    /// The first listener this configuration would open on an address other
+    /// than loopback, if there is one.
+    ///
+    /// The HTTP listener always counts. The cluster transport counts only when
+    /// clustering is on — its default bind is the wildcard, and a node that
+    /// never opens it is not exposed by it.
+    fn listens_off_loopback(&self) -> Option<SocketAddr> {
+        if !is_loopback(&self.server.bind) {
+            return Some(self.server.bind);
+        }
+        if self.cluster.enabled && !is_loopback(&self.cluster.bind) {
+            return Some(self.cluster.bind);
+        }
+        None
+    }
+}
+
+/// Values this repository's own files put where a secret goes.
+///
+/// Every one of these has appeared in a compose file, an example configuration,
+/// a quick start or an example program in this repository, or is what a person
+/// types when asked for a secret they intend to replace later. A node reachable
+/// from the network refuses to start with any of them ([`Config::validate`],
+/// ADR-093). The list is a denylist and nothing more: a value absent from it is
+/// not thereby a good secret, and the length floor still applies.
+pub const PLACEHOLDER_SECRETS: &[&str] = &[
+    // docker-compose.yml, before it required the values to be supplied.
+    "dev-jwt-secret-not-for-production",
+    "dev-cluster-secret",
+    "changeme",
+    // kimmy.example.toml's commented-out lines.
+    "generate-me-with-openssl-rand-base64-32",
+    "change-me",
+    // The quick starts in README.md and docs/, before they generated a key.
+    "a-long-random-secret",
+    // examples/ and the client examples.
+    "a-secret-long-enough-for-the-examples",
+    "example-password",
+    "conformance-password",
+    "hunter2",
+    // What gets typed when the value is meant to be replaced later.
+    "password",
+    "secret",
+    "changeit",
+    "placeholder",
+    "admin",
+    "root",
+    "kimmy",
+    "kimmydb",
+    "test",
+    "example",
+];
+
+/// Whether `value` is one of [`PLACEHOLDER_SECRETS`].
+///
+/// Case-insensitive and blind to surrounding whitespace: `ChangeMe` and
+/// `changeme ` are the same non-secret as `changeme`, and a check that a change
+/// of case defeats would be teaching people to change the case.
+pub fn is_placeholder_secret(value: &str) -> bool {
+    let value = value.trim();
+    PLACEHOLDER_SECRETS.iter().any(|placeholder| placeholder.eq_ignore_ascii_case(value))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1309,7 +1414,7 @@ mod tests {
     fn valid() -> Config {
         Config {
             auth: AuthConfig {
-                root_password: Some("hunter2".into()),
+                root_password: Some("a-root-password-for-the-tests".into()),
                 // Auth is on by default, and an auth-on node must be given a
                 // signing key or it is refused — see `auth_requires_a_jwt_secret`.
                 jwt_secret: Some("a-signing-key-of-adequate-length".into()),
@@ -1433,6 +1538,18 @@ mod tests {
             "validate must agree with the issuer about what is too short"
         );
 
+        // The floor is 32 bytes, the HS256 key size RFC 7518 §3.2 asks for. A
+        // 16-byte key was accepted up to 0.16.x, so the error has to give the
+        // number an operator upgrading with one needs (ADR-093).
+        cfg.auth.jwt_secret = Some("0123456789abcdef".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("16 bytes"), "the error should name the length: {err}");
+        assert!(err.contains("32 or more"), "the error should name the floor: {err}");
+        assert!(
+            kimmy_auth::TokenIssuer::new("0123456789abcdef", 3600).is_err(),
+            "validate must agree with the issuer about the floor"
+        );
+
         // With auth off there is no token to forge, so no secret is required —
         // this is what keeps loopback development a single flag.
         let mut off = Config::default();
@@ -1440,6 +1557,106 @@ mod tests {
         off.auth.jwt_secret = None;
         off.server.bind = "127.0.0.1:7878".parse().unwrap();
         off.validate().unwrap();
+    }
+
+    #[test]
+    fn placeholder_secrets_are_refused_off_loopback() {
+        // Each value below is lifted from this repository's own examples, and
+        // each is long enough to pass the length rule, so what is refused is
+        // the value and not its size. The error names the setting and the
+        // variable and never echoes the value: it lands in logs.
+        let mut cfg = valid();
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+
+        cfg.auth.jwt_secret = Some("dev-jwt-secret-not-for-production".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("auth.jwt_secret"), "must name the setting: {err}");
+        assert!(err.contains("KIMMY_JWT_SECRET"), "must name the variable: {err}");
+        assert!(err.contains("placeholder"), "must say what is wrong: {err}");
+        assert!(!err.contains("dev-jwt-secret"), "must not echo the value: {err}");
+
+        // The same value on loopback is accepted: the examples stay
+        // copy-and-run on a laptop, and nothing off the host can reach them.
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+        cfg.server.bind = "[::1]:7878".parse().unwrap();
+        cfg.validate().unwrap();
+
+        // A value of adequate length that is not on the list is accepted.
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth.jwt_secret = Some("a-signing-key-of-adequate-length".into());
+        cfg.validate().unwrap();
+
+        // The bootstrap password, including a change of case and stray
+        // whitespace: a check that a capital letter defeats would be teaching
+        // people to add one. (`password` itself is on the list too, but the
+        // setting's own name contains it, so it cannot serve the echo check.)
+        for password in ["changeme", "ChangeMe", "change-me", "hunter2", " changeit "] {
+            cfg.auth.root_password = Some(password.into());
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("auth.root_password"), "{password:?}: {err}");
+            assert!(err.contains("KIMMY_ROOT_PASSWORD"), "{password:?}: {err}");
+            assert!(!err.contains(password.trim()), "must not echo the value: {err}");
+        }
+        cfg.auth.root_password = Some("password".into());
+        assert!(cfg.validate().is_err(), "the word itself is a placeholder");
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+        cfg.server.bind = "0.0.0.0:7878".parse().unwrap();
+        cfg.auth.root_password = Some("a-root-password-of-my-own".into());
+        cfg.validate().unwrap();
+
+        // The cluster secret. With the cluster transport itself on loopback
+        // the HTTP bind alone decides, as for the other two.
+        cfg.cluster.enabled = true;
+        cfg.cluster.seeds = vec!["dns:seeds.internal".parse().unwrap()];
+        cfg.cluster.bind = "127.0.0.1:7900".parse().unwrap();
+        cfg.cluster.cluster_secret = Some("dev-cluster-secret".into());
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cluster.cluster_secret"), "must name the setting: {err}");
+        assert!(err.contains("KIMMY_CLUSTER_SECRET"), "must name the variable: {err}");
+        cfg.server.bind = "127.0.0.1:7878".parse().unwrap();
+        cfg.validate().unwrap();
+
+        // A cluster listener off loopback exposes the node on its own, even
+        // with HTTP on loopback: the gossip port is the one that secret guards.
+        cfg.cluster.bind = "0.0.0.0:7900".parse().unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("cluster.cluster_secret"), "must name the setting: {err}");
+        assert!(err.contains("0.0.0.0:7900"), "must name the listener: {err}");
+        cfg.cluster.cluster_secret = Some("a-cluster-secret-of-my-own".into());
+        cfg.validate().unwrap();
+
+        // A placeholder in a setting that is not in force is not a refusal:
+        // with clustering off the cluster secret guards nothing.
+        cfg.cluster.enabled = false;
+        cfg.cluster.cluster_secret = Some("dev-cluster-secret".into());
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn every_placeholder_the_repository_ships_is_on_the_list() {
+        // The values the compose file, the example configuration and the
+        // quick starts have used. If one of these stops matching, an example
+        // that used to be refused off loopback would be accepted.
+        for value in [
+            "dev-jwt-secret-not-for-production",
+            "dev-cluster-secret",
+            "changeme",
+            "generate-me-with-openssl-rand-base64-32",
+            "change-me",
+            "a-long-random-secret",
+            "a-secret-long-enough-for-the-examples",
+            "hunter2",
+            "password",
+            "secret",
+        ] {
+            assert!(is_placeholder_secret(value), "{value:?} should be a placeholder");
+        }
+        assert!(!is_placeholder_secret("a-signing-key-of-adequate-length"));
+        // A prefix or a superstring is not a match: the list is exact values,
+        // and `secret` inside a generated key is not a placeholder.
+        assert!(!is_placeholder_secret("my-secret-2026-08-30-with-real-entropy"));
     }
 
     #[test]
@@ -2025,7 +2242,7 @@ mod tests {
         cfg.auth.jwt_secret = Some("super-secret-signing-key".into());
         cfg.cluster.cluster_secret = Some("super-secret-cluster-key".into());
         let summary = cfg.summary();
-        assert!(!summary.contains("hunter2"));
+        assert!(!summary.contains("a-root-password-for-the-tests"));
         assert!(!summary.contains("super-secret"));
     }
 }

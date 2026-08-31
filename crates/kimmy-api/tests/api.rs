@@ -11,7 +11,7 @@ use kimmy_auth::TokenIssuer;
 use kimmy_storage::Engine;
 use serde_json::{Value, json};
 
-const SECRET: &str = "an-adequately-long-test-secret";
+const SECRET: &str = "an-adequately-long-test-secret-for-hs256";
 const ROOT_PASSWORD: &str = "root-password";
 
 struct Server {
@@ -3638,6 +3638,65 @@ async fn upsert_seeds_the_filters_equalities() {
         .await;
     assert_eq!(res.body["matched"], 1);
     assert_eq!(res.body["document"]["n"], 2);
+}
+
+#[tokio::test]
+async fn set_on_insert_applies_to_the_upsert_and_not_to_the_match() {
+    // The created-at idiom: stamp the document once, when the upsert makes
+    // it, and never touch the stamp again however many times it is hit.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/app/collections", Some(&token), json!({"name":"counters"})).await;
+
+    let request = json!({
+        "filter": {"_id": "hits"},
+        "update": {"$setOnInsert": {"created_at": 100, "meta.origin": "upsert"}, "$inc": {"n": 1}},
+        "upsert": true,
+        "returnDocument": "after",
+    });
+    let res = server
+        .post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request.clone())
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 0);
+    assert_eq!(res.body["document"]["created_at"], 100);
+    assert_eq!(res.body["document"]["meta"]["origin"], "upsert");
+    assert_eq!(res.body["document"]["n"], 1);
+
+    // Change what the insert would have set, then match: it stays as stored.
+    server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({"filter": {"_id": "hits"}, "update": {"$set": {"created_at": 7}}}),
+        )
+        .await;
+    let res = server.post("/v1/db/app/coll/counters/find_and_modify", Some(&token), request).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["matched"], 1);
+    assert_eq!(res.body["document"]["created_at"], 7);
+    assert_eq!(res.body["document"]["n"], 2);
+
+    // The same path in $setOnInsert and another operator is refused up front,
+    // whether or not the request would have inserted.
+    let res = server
+        .post(
+            "/v1/db/app/coll/counters/find_and_modify",
+            Some(&token),
+            json!({
+                "filter": {"_id": "hits"},
+                "update": {"$setOnInsert": {"n": 0}, "$inc": {"n": 1}},
+                "upsert": true,
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("conflicts"),
+        "{:?}",
+        res.body
+    );
 }
 
 #[tokio::test]
