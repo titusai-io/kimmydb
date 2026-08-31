@@ -52,6 +52,22 @@ settings are meant to be left alone, and a documentation correction.
   rather than per collection, because they describe the round trip this
   node makes and not the collection; documented in `kimmy.example.toml` and
   [docs/operations.md](docs/operations.md#settings).
+- **`$expr` in filters.** `{$expr: <aggregation expression>}` is a filter
+  clause everywhere a filter is taken — `find`, `count`, `update`, `delete`,
+  `find_and_modify`, `$match`, the vector pre-filter and the MCP tools. The
+  expression is evaluated against the whole document and the clause matches
+  when the result is truthy, so `{$expr: {$gt: ["$spent", "$budget"]}}` is
+  the over-budget query that previously needed an aggregation, and `{$expr:
+  {$gt: [{$multiply: ["$qty", "$price"]}, 100]}}` computes on the way. The
+  whole expression operator set is available. Comparison operators inside
+  `$expr` are the *expression* ones — canonical cross-type order, arrays
+  compared whole — which differ from the filter operators in the cases
+  `docs/query-language.md` sets side by side. `$expr` is never indexable; an
+  indexable clause beside it still plans, and `explain` reports which. An
+  expression that cannot be evaluated for a particular document (a type
+  violation) makes that document a non-match rather than failing the request;
+  that and one deliberate leniency are recorded in `docs/deviations.md`.
+  ADR-106.
 
 ### Changed
 
