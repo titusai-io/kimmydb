@@ -1,0 +1,1 @@
+[ { "$oid": "nope" }, { "$date": 1.5 }, { "$numberLong": "x" }, { "$binary": { "base64": "!!" } } ]

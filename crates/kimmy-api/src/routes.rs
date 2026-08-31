@@ -457,11 +457,17 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
          # HELP kimmy_storage_bytes Size of the database file on disk.\n\
          # TYPE kimmy_storage_bytes gauge\n\
          kimmy_storage_bytes {storage}\n\
+         # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
+         # TYPE kimmy_vector_index_cache_bytes gauge\n\
+         kimmy_vector_index_cache_bytes {index_cache}\n\
          # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
          # TYPE kimmy_up gauge\n\
          kimmy_up 1\n\
          {process}",
         databases_count = databases.len(),
+        // An estimate from node count and width, not a heap measurement;
+        // what the budget evicts against, so the two agree by construction.
+        index_cache = state.vectors.resident_bytes(),
         // Surfaced here, not only on a change stream, so the condition is
         // visible without anyone having been subscribed when it happened.
         violations = state.engine.unique_violations(),

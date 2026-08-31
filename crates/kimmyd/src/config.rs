@@ -69,11 +69,17 @@ pub struct VectorConfig {
     pub worker_enabled: bool,
     /// How the worker gathers documents into provider calls.
     pub batch: BatchConfig,
+    /// The in-memory HNSW graphs that serve approximate search.
+    pub index_cache: IndexCacheConfig,
 }
 
 impl Default for VectorConfig {
     fn default() -> Self {
-        Self { worker_enabled: true, batch: BatchConfig::default() }
+        Self {
+            worker_enabled: true,
+            batch: BatchConfig::default(),
+            index_cache: IndexCacheConfig::default(),
+        }
     }
 }
 
@@ -138,6 +144,37 @@ impl BatchConfig {
             );
         }
         Ok(())
+    }
+}
+
+/// Bounds on the approximate-search graphs a node keeps in memory.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct IndexCacheConfig {
+    /// Bound, in bytes, on the HNSW graphs held in memory across every vector
+    /// collection this node serves.
+    ///
+    /// A graph costs roughly `dim × 4 + 5,000` bytes per chunk — about 6.5 KB
+    /// at 384 dimensions, 11 KB at 1,536 — and until this setting existed
+    /// every collection ever searched kept its graph for the life of the
+    /// process. When a graph would take the total past this bound, the least
+    /// recently searched graphs are dropped first; their collections pay a
+    /// snapshot reload, or a rebuild, on their next search. A single graph
+    /// larger than the whole bound is still loaded, with a warning, because
+    /// a search is never refused over memory.
+    ///
+    /// 512 MiB by default: twice `storage.cache_bytes`, because an eviction
+    /// here costs seconds of rebuild where a page-cache miss costs
+    /// microseconds, and it is a ceiling rather than an allocation. Size it
+    /// so the chunks of every collection that is searched routinely fit:
+    /// `Σ chunks × per-chunk bytes`. Zero lifts the bound, which is the
+    /// behaviour before it existed (ADR-103).
+    pub max_bytes: u64,
+}
+
+impl Default for IndexCacheConfig {
+    fn default() -> Self {
+        Self { max_bytes: kimmy_vector::DEFAULT_INDEX_CACHE_BYTES }
     }
 }
 
@@ -1402,6 +1439,18 @@ impl Config {
         if self.storage.cache_bytes < 8 * 1024 * 1024 {
             anyhow::bail!("storage.cache_bytes must be at least 8 MiB (8388608)");
         }
+        // The same floor as the page cache, for a related reason: a budget
+        // smaller than one modest graph would evict on every search and
+        // rebuild on the next, which is worse than either bound. Zero is the
+        // explicit way to say "no bound", and is allowed.
+        let budget = self.vector.index_cache.max_bytes;
+        if budget != 0 && budget < 8 * 1024 * 1024 {
+            anyhow::bail!(
+                "vector.index_cache.max_bytes must be 0 (unbounded) or at least 8 MiB \
+                 (8388608); a smaller budget holds no graph worth building and would \
+                 rebuild one on every search"
+            );
+        }
         if self.storage.oplog_retention_secs == 0 {
             anyhow::bail!("storage.oplog_retention_secs must be greater than zero");
         }
@@ -2033,6 +2082,32 @@ mod tests {
         assert!(cfg.validate().is_err());
         cfg.storage.commit_coalesce_ms = 1000;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn the_index_cache_budget_is_zero_or_at_least_eight_mebibytes() {
+        let mut cfg = valid();
+        // Zero is the documented way to lift the bound, not a mistake.
+        cfg.vector.index_cache.max_bytes = 0;
+        cfg.validate().unwrap();
+        cfg.vector.index_cache.max_bytes = 1024 * 1024;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("vector.index_cache.max_bytes"), "{err}");
+        assert!(err.contains("unbounded"), "the error should say how to lift the bound: {err}");
+        cfg.vector.index_cache.max_bytes = 8 * 1024 * 1024;
+        cfg.validate().unwrap();
+
+        // The default is the cache's own default, so a node with no setting
+        // and a test that never sees the config agree on the budget.
+        assert_eq!(
+            Config::default().vector.index_cache.max_bytes,
+            kimmy_vector::DEFAULT_INDEX_CACHE_BYTES
+        );
+        assert_eq!(kimmy_vector::DEFAULT_INDEX_CACHE_BYTES, 512 * 1024 * 1024);
+
+        let parsed: Config = toml::from_str("[vector.index_cache]\nmax_bytes = 0\n").unwrap();
+        assert_eq!(parsed.vector.index_cache.max_bytes, 0);
+        assert!(parsed.vector.worker_enabled, "a sibling table must not disturb the defaults");
     }
 
     #[test]

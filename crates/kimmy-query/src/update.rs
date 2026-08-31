@@ -63,6 +63,8 @@ pub enum OpKind {
     AddToSet(Vec<Bson>),
     /// Remove every element equal to this value.
     Pull(Bson),
+    /// Remove every element equal to any of these values.
+    PullAll(Vec<Bson>),
     /// Remove the first (`-1`) or last (`1`) element.
     Pop(i32),
     Rename(String),
@@ -83,6 +85,7 @@ impl OpKind {
             OpKind::Push(_) | OpKind::PushEach(_) => "$push",
             OpKind::AddToSet(_) => "$addToSet",
             OpKind::Pull(_) => "$pull",
+            OpKind::PullAll(_) => "$pullAll",
             OpKind::Pop(_) => "$pop",
             OpKind::Rename(_) => "$rename",
             OpKind::CurrentDate => "$currentDate",
@@ -190,7 +193,7 @@ pub fn parse_with_filters(doc: &Document, array_filters: &[Document]) -> Result<
             return Err(Error::InvalidUpdate(format!("${op} requires a document")));
         };
         for (target_path, arg) in targets {
-            if target_path == ID_FIELD {
+            if touches_id(target_path) {
                 return Err(Error::InvalidUpdate("_id is immutable and cannot be updated".into()));
             }
             let kind = parse_op(op, arg)?;
@@ -403,6 +406,18 @@ fn paths_overlap(a: &str, b: &str) -> bool {
         || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('.'))
 }
 
+/// Whether a target path is `_id` or anything beneath it.
+///
+/// The exact match alone was not enough. `_id` holds a scalar in almost every
+/// document, and `path::set` on `"_id.x"` replaces a scalar with a document to
+/// make room — so `{$set: {"_id.x": 1}}` turned `_id: 7` into `_id: {x: 1}`,
+/// past a check that only knew the literal name. That relocates the document
+/// out from under every index entry and oplog record that named it, silently.
+/// Found by the fuzz harness's `_id`-is-preserved assertion (ADR-111).
+fn touches_id(path: &str) -> bool {
+    path == ID_FIELD || path.strip_prefix(ID_FIELD).is_some_and(|rest| rest.starts_with('.'))
+}
+
 fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
     let numeric = |arg: &Bson| -> Result<Bson> {
         match arg {
@@ -428,6 +443,10 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
             None => OpKind::AddToSet(vec![arg.clone()]),
         },
         "pull" => OpKind::Pull(arg.clone()),
+        "pullAll" => match arg {
+            Bson::Array(values) => OpKind::PullAll(values.clone()),
+            _ => return Err(Error::InvalidUpdate("$pullAll requires an array of values".into())),
+        },
         "pop" => match arg {
             Bson::Int32(1) | Bson::Int64(1) => OpKind::Pop(1),
             Bson::Int32(-1) | Bson::Int64(-1) => OpKind::Pop(-1),
@@ -786,6 +805,30 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             set(doc, Bson::Array(kept))?;
         }
 
+        OpKind::PullAll(values) => {
+            // Each listed value is matched as `$pull` matches a literal —
+            // canonical equality, so `2` removes `2.0`. Pulling from a missing
+            // field is a no-op; pulling from a scalar is an error, because the
+            // caller believes the field is an array and it is not.
+            let items = match current {
+                None => return Ok(()),
+                Some(Bson::Array(items)) => items,
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "cannot apply $pullAll to non-array field {:?}",
+                        op.path
+                    )));
+                }
+            };
+            let kept: Vec<Bson> = items
+                .into_iter()
+                .filter(|item| {
+                    !values.iter().any(|value| canonical_cmp(item, value) == Ordering::Equal)
+                })
+                .collect();
+            set(doc, Bson::Array(kept))?;
+        }
+
         OpKind::Pop(direction) => {
             let Some(Bson::Array(mut items)) = current else {
                 return Ok(());
@@ -801,7 +844,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
         }
 
         OpKind::Rename(target) => {
-            if target == ID_FIELD {
+            if touches_id(target) {
                 return Err(invalid("_id is immutable and cannot be renamed onto".into()));
             }
             // Renaming a missing field is a no-op, matching Mongo.
@@ -1181,6 +1224,43 @@ mod tests {
     }
 
     #[test]
+    fn pull_all_removes_every_listed_value() {
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [1, 3] } }, doc! { "a": [1, 2, 3, 1, 4, 3] }),
+            doc! { "a": [2, 4] }
+        );
+        // Equality is canonical, so 2 removes 2.0 and a document matches whole.
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [2, {"k": 1}] } }, doc! { "a": [2.0, {"k": 1}, 5] }),
+            doc! { "a": [5] }
+        );
+        // A value that is not present changes nothing.
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [9] } }, doc! { "a": [1, 2] }),
+            doc! { "a": [1, 2] }
+        );
+    }
+
+    #[test]
+    fn pull_all_from_a_missing_field_is_a_no_op() {
+        assert_eq!(applied(doc! { "$pullAll": { "a": [1] } }, doc! { "b": 1 }), doc! { "b": 1 });
+    }
+
+    #[test]
+    fn pull_all_from_a_non_array_is_an_error() {
+        let err = apply_err(doc! { "$pullAll": { "a": [1] } }, doc! { "a": 1 });
+        assert!(err.contains("non-array"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn pull_all_requires_an_array_argument() {
+        // `{$pullAll: {a: 1}}` is the shape of a `$pull`; accepting it would
+        // make the two operators interchangeable by accident.
+        let err = parse(&doc! { "$pullAll": { "a": 1 } }).unwrap_err().to_string();
+        assert!(err.contains("array"), "unhelpful error: {err}");
+    }
+
+    #[test]
     fn pop_removes_from_either_end() {
         assert_eq!(
             applied(doc! { "$pop": { "a": 1 } }, doc! { "a": [1, 2, 3] }),
@@ -1257,6 +1337,23 @@ mod tests {
             let mut d = doc! { "_id": 1, "a": 2 };
             apply(&u, &mut d, NOW).is_err()
         }));
+    }
+
+    #[test]
+    fn operators_may_not_reach_under_id_either() {
+        // `_id.x` is not `_id`, so the exact check let it through — and
+        // `path::set` replaces a scalar `_id` with a document to make room for
+        // `x`, which changes the document's identity. Every operator goes
+        // through the same check, so `$unset` and `$rename` are pinned too.
+        assert!(parse(&doc! { "$set": { "_id.x": 1 } }).is_err());
+        assert!(parse(&doc! { "$unset": { "_id.x": "" } }).is_err());
+        assert!(parse(&doc! { "$inc": { "_id.0": 1 } }).is_err());
+        assert!(parse(&doc! { "$rename": { "a": "_id.x" } }).is_ok_and(|u| {
+            let mut d = doc! { "_id": 1, "a": 2 };
+            apply(&u, &mut d, NOW).is_err()
+        }));
+        // A field that merely starts with the letters is an ordinary field.
+        assert!(parse(&doc! { "$set": { "_identity": 1 } }).is_ok());
     }
 
     #[test]

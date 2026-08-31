@@ -1,0 +1,1 @@
+{ "$mul": { "price": 2 }, "$min": { "qty": 1 }, "$max": { "total": 5 } }

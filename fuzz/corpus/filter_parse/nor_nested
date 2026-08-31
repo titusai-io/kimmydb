@@ -1,0 +1,1 @@
+{ "$nor": [ { "address.city": "Lisbon" }, { "$and": [ { "qty": 5 }, { "price": { "$gte": 2.5 } } ] } ] }

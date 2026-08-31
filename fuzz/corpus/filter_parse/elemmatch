@@ -1,0 +1,1 @@
+{ "items": { "$elemMatch": { "sku": "a", "qty": 9 } } }

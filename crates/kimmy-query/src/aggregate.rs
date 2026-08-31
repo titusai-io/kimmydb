@@ -170,6 +170,34 @@ pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Sta
     pipeline.iter().map(|stage| parse_stage(stage, vars)).collect()
 }
 
+/// The `$match` stages a pipeline *begins* with, merged into one filter, and
+/// how many stages they were.
+///
+/// This is what lets the executor read a pipeline's source through the same
+/// planner `find` uses: a leading `$match` sees documents exactly as stored,
+/// so a filter over it is a filter over the collection and an index answers
+/// it. Only the leading run qualifies. A `$match` after a `$project`,
+/// `$unwind` or `$group` reads reshaped documents, and pushing it down would
+/// change what it matches — so it stays where it was written, and the
+/// executor applies it as an ordinary stage. Consecutive leading matches are
+/// one conjunction, which is what running them in sequence already meant.
+///
+/// `None` when the pipeline does not begin with `$match`.
+pub fn leading_match(stages: &[Stage]) -> Option<(Filter, usize)> {
+    let mut filters: Vec<Filter> = Vec::new();
+    for stage in stages {
+        match stage {
+            Stage::Match(f) => filters.push((**f).clone()),
+            _ => break,
+        }
+    }
+    match filters.len() {
+        0 => None,
+        1 => filters.pop().map(|f| (f, 1)),
+        n => Some((Filter::And(filters), n)),
+    }
+}
+
 fn parse_stage(stage: &Document, vars: &[String]) -> Result<Stage> {
     if stage.len() != 1 {
         return Err(Error::InvalidQuery(format!(
@@ -1207,6 +1235,75 @@ mod tests {
         assert!(err.contains("$replaceRoot"), "got: {err}");
     }
 
+    // -- type conversion in stages ----------------------------------------
+
+    #[test]
+    fn group_by_a_date_parsed_from_a_string() {
+        // The motivating case: a timestamp stored as text, bucketed by month
+        // after `$toDate` makes it a date the date operators can read.
+        let input = docs(vec![
+            doc! { "at": "2026-08-12T10:00:00Z", "n": 1 },
+            doc! { "at": "2026-08-20", "n": 2 },
+            doc! { "at": "2026-09-01T00:00:00Z", "n": 4 },
+        ]);
+        let out = run(
+            vec![
+                doc! {"$group": {
+                    "_id": {"$month": {"$toDate": "$at"}},
+                    "total": {"$sum": "$n"},
+                }},
+                doc! {"$sort": {"_id": 1}},
+            ],
+            input,
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! {"_id": 8, "total": 3i64}, doc! {"_id": 9, "total": 4i64}]);
+    }
+
+    #[test]
+    fn a_failed_conversion_fails_the_stage_unless_on_error_is_given() {
+        let input = docs(vec![doc! { "qty": "ten" }]);
+        assert!(run(vec![doc! {"$addFields": {"n": {"$toInt": "$qty"}}}], input.clone()).is_err());
+        let out = run(
+            vec![doc! {"$addFields": {
+                "n": {"$convert": {"input": "$qty", "to": "int", "onError": 0}}
+            }}],
+            input,
+        )
+        .unwrap();
+        assert_eq!(out, vec![doc! { "qty": "ten", "n": 0 }]);
+    }
+
+    // -- the leading $match -----------------------------------------------
+
+    #[test]
+    fn a_leading_match_is_split_off_as_a_filter() {
+        let stages = parse(&[doc! {"$match": {"a": 1}}, doc! {"$count": "n"}]).unwrap();
+        let (filter, consumed) = leading_match(&stages).expect("a leading $match");
+        assert_eq!(consumed, 1);
+        assert_eq!(filter, filter::parse(&doc! {"a": 1}).unwrap());
+    }
+
+    #[test]
+    fn consecutive_leading_matches_merge_into_one_conjunction() {
+        let stages = parse(&[
+            doc! {"$match": {"a": 1}},
+            doc! {"$match": {"b": {"$gt": 2}}},
+            doc! {"$count": "n"},
+            doc! {"$match": {"n": 0}},
+        ])
+        .unwrap();
+        let (filter, consumed) = leading_match(&stages).expect("a leading $match");
+        assert_eq!(consumed, 2, "the $match after $count is not part of the run");
+        assert_eq!(
+            filter,
+            Filter::And(vec![
+                filter::parse(&doc! {"a": 1}).unwrap(),
+                filter::parse(&doc! {"b": {"$gt": 2}}).unwrap(),
+            ])
+        );
+    }
+
     // -- variables and arrays in stages -----------------------------------
 
     #[test]
@@ -1242,6 +1339,15 @@ mod tests {
                 doc! {"_id": 2i64, "ids": [1]},
             ]
         );
+    }
+
+    #[test]
+    fn a_match_that_is_not_first_is_not_pushed_down() {
+        // A `$match` after `$project` reads reshaped documents; moving it to
+        // the source would change what it matches.
+        let stages = parse(&[doc! {"$project": {"a": 1}}, doc! {"$match": {"a": 1}}]).unwrap();
+        assert!(leading_match(&stages).is_none());
+        assert!(leading_match(&[]).is_none());
     }
 
     #[test]

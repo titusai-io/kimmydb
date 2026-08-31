@@ -1,0 +1,1 @@
+{ "$switch": { "branches": [ { "case": { "$lt": ["$qty", 0] }, "then": "negative" }, { "case": { "$eq": ["$qty", 0] }, "then": "zero" } ], "default": "positive" } }

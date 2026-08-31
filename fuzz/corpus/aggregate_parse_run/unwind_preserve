@@ -1,0 +1,1 @@
+[ { "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": true } }, { "$skip": 2 }, { "$project": { "tags": 1, "_id": 0 } } ]

@@ -1,0 +1,24 @@
+[package]
+name = "kimmy-fuzz-harness"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The fuzz harnesses for KimmyDB's parsers and token verifiers, as plain functions"
+# Nothing here ships. The crate exists so the harness bodies compile on stable
+# under the ordinary workspace gates; the libFuzzer entry points that call them
+# live in `fuzz/`, outside the workspace, because those need nightly (ADR-111).
+publish = false
+
+[dependencies]
+kimmy-core.workspace = true
+kimmy-query.workspace = true
+kimmy-auth.workspace = true
+kimmy-api.workspace = true
+bson.workspace = true
+serde_json.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+arbitrary.workspace = true

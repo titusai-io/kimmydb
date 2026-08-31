@@ -56,6 +56,11 @@ curl -XPOST .../orders/find -H "$A" -d '{"filter":{"qty":7},"explain":true}'
 `documentsExamined` fall while `documentsMatched` stays the same is the whole
 point of an index.
 
+The `filter` of `vector_search` and `hybrid_search` is planned the same way, so
+an index on a field that searches filter by is used there too; `explain` on a
+`find` with the same filter shows the strategy the search gets
+([Vectors](vectors.md#search)).
+
 ## `_id` needs no index
 
 **A filter that pins `_id` is answered through the primary key**, reported as
@@ -215,6 +220,7 @@ re-applied regardless.
 | `$or` / `$nor` branches | Their branches need not all hold; narrowing on one would drop what the other matches |
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
+| `$mod` | A remainder is not a range — every fourth key is not a contiguous run of them |
 
 `$in` **is planned**, as a union of point probes — one per distinct value,
 deduplicated on the encoded key so `[5, 5.0]` probes once, each probe carrying

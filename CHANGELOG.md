@@ -225,6 +225,55 @@ whose defaults are meant to be left alone, and documentation corrections.
   The dependency policy (`deny.toml`), the update cadence, and the licensing
   boundary check are described under
   [Supply chain](docs/security.md#supply-chain); ADR-108 records the decision.
+- **`vector.index_cache.max_bytes`** bounds the HNSW graphs a node keeps in
+  memory across its vector collections — 512 MiB by default, `0` for the old
+  unbounded behaviour. A graph costs about `dim × 4 + 5,000` bytes per chunk
+  (6.5 KB at 384 dimensions, 11 KB at 1,536 — measured, and about twice what
+  the vector alone suggests) and was kept for the life of the process once its
+  collection had been searched. Past the budget the least recently searched
+  graphs are evicted and their collections pay a snapshot reload, or a
+  rebuild, on their next search; a single graph larger than the whole budget
+  is held anyway, with a warning, because a search is never refused over
+  memory. `/metrics` gains `kimmy_vector_index_cache_bytes`, the resident
+  total by the same estimate (ADR-103).
+
+
+- **A CycloneDX SBOM per binary per target, on every release.** Beside each
+  `kimmyd-<target>.tar.xz` and `kimmy-cli-<target>.tar.xz` on the Release
+  page is a `<name>.cdx.json` (CycloneDX 1.5) listing every crate compiled
+  into that binary — versions, licences, package hashes and the dependency
+  graph — with a `.sha256` beside it. Feed it to whatever already scans your
+  dependencies (`grype sbom:…`, `osv-scanner --sbom …`, Dependency-Track)
+  without pulling the image or building from source. Generated from
+  `Cargo.lock` at the release commit by `scripts/sbom.sh` inside the release
+  workflow (ADR-110); [Security › Software bill of materials](docs/security.md#software-bill-of-materials)
+  says how to verify and consume one.
+- **A written threat model**, [`docs/threat-model.md`](docs/threat-model.md):
+  the assets, every trust boundary with its threats and the control in place
+  for each — naming the file the control lives in — what is explicitly not
+  defended against, and the operational assumptions the controls rest on.
+  Nothing in it is new behaviour; it is the security model written down in
+  one place and checked against the code. The FIPS position is stated there
+  too: `aws-lc-rs` has a validated mode, this build uses `ring`, and no FIPS
+  claim is made.
+- **Type conversion expressions.** `$convert: {input, to, onError?, onNull?}`
+  with `to` as a type name or numeric BSON code, and the shorthands
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`, `$toDate` and
+  `$toObjectId`. Null or missing input is null (or `onNull`); a value with no
+  conversion is a `400` naming both types (or `onError`); integers are refused
+  out of range rather than wrapped; strings are parsed strictly; a date
+  converts to and from epoch milliseconds and to and from ISO 8601 text. The
+  two shapes it exists for: a `$lookup` whose keys differ in type across
+  collections, and a `$group` by a date that was stored as a string. `decimal`
+  is refused, because `Decimal128` has no exact key encoding here (ADR-005).
+- **`$mod` in filters.** `{field: {$mod: [divisor, remainder]}}`, with
+  MongoDB's rules: numeric values only, doubles truncated toward zero, the
+  remainder keeping the dividend's sign, arrays matched element-wise, a zero
+  divisor refused at parse. Never index-eligible; an equality or range beside
+  it still plans.
+- **`$pullAll`.** Removes every element equal to any value in the given list,
+  by the same canonical equality `$pull` uses. A missing field is a no-op; a
+  non-array field is a `400`.
 
 ### Changed
 
@@ -288,6 +337,60 @@ whose defaults are meant to be left alone, and documentation corrections.
 - **`explain` reports `indexEntriesRead`** when an index answered a read: how
   much of the index the query touched, as distinct from `documentsExamined`.
   Additive; absent for a scan, an `idLookup`, and for filtered writes.
+- **A graph is built off the index-cache lock.** It was built while holding
+  the lock every collection's entry lives in, so one collection's rebuild —
+  4 s at 4,000 vectors, minutes at tens of thousands — stalled vector and
+  hybrid search on every collection the node serves for that long, and did so
+  on an async worker thread. The lock is now held to look and to install; the
+  build runs under a per-collection lock on a thread the runtime is told
+  about, as a storage commit's fsync has been since 0.16.2; and concurrent
+  searches on the collection being built take the previous graph, or wait for
+  that one build rather than starting a duplicate.
+- **A build holds less.** It read every chunk record whole — text included —
+  and kept the lot until its reachability probe had finished, so a rebuild's
+  peak was the graph plus a copy of the shadow collection, every staleness
+  window under writes and up to three times when a build was discarded. It
+  now reads only keys and vectors, frees each vector as the graph takes it,
+  and probes with a 128-vector sample copied out first.
+- **A search `filter` uses secondary indexes, and a selective one is joined
+  the other way round.** `vector_search` and `hybrid_search` evaluated
+  `filter` by scanning the source collection and keeping every matching id,
+  whatever indexes existed. The filter now runs through the query planner —
+  primary key, secondary index or scan, with the same recheck `find`
+  applies — and keeps only the ids, a page at a time. When it admits at most
+  1,000 documents the search reads those documents' chunks by key and scores
+  them exactly, instead of searching everything and discarding what the
+  filter excluded; above that it searches as before and discards. The hits
+  are the same either way, and for a selective filter they are now exact
+  where the graph walk could previously come back with fewer than `k`.
+  [docs/vectors.md](docs/vectors.md#search) describes the rule; ADR-102 the
+  reasoning.
+- **The exact and lexical search paths hold only the top `k`.** The exact
+  vector path — collections under 500 chunks, the `dot` metric, a failed
+  graph build — and the lexical half of `hybrid_search` built a hit, text
+  included, for every chunk they scored and sorted the lot. Both now keep a
+  bounded set of the best `k` as chunks arrive, with the per-document cap
+  applied on the way in, so a search over a large shadow collection costs
+  memory proportional to `k`. Ties on score are ordered by chunk key rather
+  than by scan order: stable either way, but a different order for exact
+  ties.
+- **Reading one document's vectors no longer scans the shadow collection.**
+  A document's chunks are one contiguous run under its id, and
+  `GET .../docs/{id}/vectors`, the write of a document's vectors and the
+  embedding worker's staleness check now read that run rather than every
+  record in the shadow. Same results; the cost is the document's chunk count
+  instead of the collection's.
+- **A pipeline's leading `$match` uses indexes, and the ceiling is measured
+  after it.** `aggregate` now reads its source through the same planner-backed
+  scan `find` uses, with the first `$match` stage — or the first several,
+  merged — as the scan's filter. An indexed equality, range or `$in` there
+  reads its candidates rather than the whole collection, and the
+  100,000-document limit applies to what the `$match` admits, so a pipeline
+  over a larger collection runs when its leading `$match` is selective enough.
+  Only the leading `$match` is pushed down; a `$match` after any other stage
+  runs where it was written, on what that stage produced, so results are
+  unchanged with or without an index (ADR-109). The refusal for an oversized
+  source names the leading `$match` when there is one.
 
 ### Fixed
 
@@ -354,6 +457,21 @@ direction, at the previous behaviour.
   or made non-unique no longer contributes any. Nothing is stored or written
   by the route; the change-stream event and the `/metrics` count are as
   before.
+- **An update can no longer reach under `_id`.** The operators refused `_id`
+  itself, but `{"$set": {"_id.x": 1}}` named a path *beneath* it, and setting
+  a path beneath a scalar replaces the scalar with a document to make room —
+  so `_id: 7` became `_id: {"x": 1}` and the document quietly left every index
+  entry and oplog record that named it. `$set`, `$unset`, `$inc` and the rest
+  now refuse any path under `_id` with the same `400` the bare name gets, and
+  `$rename` refuses to rename onto one. Found by the fuzz harness on its first
+  run over its own seeds (ADR-111).
+- **A binary value's subtype survives the JSON boundary.** Responses always
+  wrote it — `{"$binary": {"base64": …, "subType": "04"}}` for a UUID — but
+  the request side ignored it and decoded every binary as generic, so a
+  client that read a document and wrote it back changed the value without
+  either side noticing. `subType` is now honoured on the way in: absent still
+  means generic, and anything other than two hex digits is a malformed
+  wrapper (`400`) like any other. Found by fuzzing (ADR-111).
 
 ## 0.16.4 - 2026-08-29
 

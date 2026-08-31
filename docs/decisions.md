@@ -5175,6 +5175,176 @@ and its rotation remains what it was.
 
 ---
 
+## ADR-102 — Vector-search filters use the planner, and the exact and lexical paths hold only the top k
+
+**Decision.** The `filter` of `vector_search` and `hybrid_search` is evaluated
+by the executor's planner-backed read — the primary key when it pins `_id`, a
+secondary index when one applies, a collection scan otherwise, every candidate
+rechecked against the full filter — and only the matching ids are kept, a
+page at a time. The join with the shadow collection then runs in whichever
+direction is cheaper: when the filter admits at most 1,000 documents, their
+chunks are read by key and scored exactly; above that, the search runs as it
+would unfiltered and hits outside the set are discarded. Separately, the exact
+vector path and the lexical half of hybrid search rank through a bounded set
+that holds the best `k` chunks — the per-document cap applied as chunks
+arrive, ties broken by chunk key — rather than collecting a hit per chunk and
+sorting.
+
+**Why.** Both paths held memory in proportion to the collection for a request
+whose answer is `k` hits. The filter was a `for_each_doc` over the source
+collection with no planner at all, building a set of every matching id, so an
+index on the filtered field bought nothing and a filter that admitted three
+documents still decoded a million. The exact path (every collection under 500
+chunks, every `dot`-metric collection, and the fallback for a failed graph
+build) and the lexical path (every hybrid search, at four times `k`) pushed a
+hit — text included — for every chunk they scored and sorted the vector.
+ADR-098 states the rule these break: a read may hold what it returns, not what
+it walks. Routing the filter through `exec` is also what makes the answer
+consistent with `find`: the same plan, the same recheck, the same primary-key
+short cut, and `explain` on a `find` with the same filter tells an operator
+what the search will get.
+
+**Why the join has two directions and a fixed boundary.** With the allowed set
+in hand, reading the admitted documents' chunks by key costs the size of the
+set and is exact; scanning or walking the graph and discarding costs the size
+of the collection, and for the graph is approximate twice over — the walk is
+widened eightfold when a filter is present and still returns fewer than `k`
+when the set is small. So the keyed join wins whenever the set is small, and
+the discard join wins when the set is most of the collection, because then the
+graph's candidates are mostly admitted anyway. The boundary is a count rather
+than a fraction because the keyed join's cost does not depend on the
+collection: a thousand documents' chunks read by key is the same work over a
+million documents as over two thousand, and a thousand is comfortably past the
+widest window any request can ask for (`MAX_K` is 1,000, and hybrid's halves
+run at `4k`). A fraction would need the collection's size, which is a scan to
+learn. A document's chunks are one contiguous run under its id because chunk
+keys are `{source}#{chunk}` and string keys encode in `_id` order, so the keyed
+read is a bounded range, not a probe per chunk number; the same run now serves
+the single-document reads (`get_vectors`, the worker's staleness check), which
+were each a scan of the shadow.
+
+**Why a bounded set with the cap inside it.** The per-document cap is what
+stops a long document filling every slot, and it cannot be applied after a
+heap of size `k` without making the heap unbounded — a document with ten
+thousand chunks better than everything else would need all ten thousand held
+to find the other nine documents. Applied on insertion it is exact: a chunk
+of a document already holding its allowance has to displace that document's
+own worst or it is out regardless of where it stands globally, and a chunk
+that cannot beat the set's worst is out regardless of its document. Ties are
+broken by the chunk's key so that equal scores rank the same way on every
+run and on both join directions; the old stable sort ordered them by scan
+position, which the keyed join does not have.
+
+**Alternatives.** *Filtered traversal inside the graph* — passing the allowed
+set to the walk so it never visits an excluded node — is the right long-term
+answer for the middle ground, a filter that admits ten thousand of a million,
+where the keyed join reads too much and the discard join finds too little. It
+needs a graph that exposes its traversal, which the current one does not, and
+is deferred. *A per-collection inverted index for the lexical half* would make
+keyword search a posting-list merge rather than a scan and tokenisation of
+every chunk; it needs term statistics maintained under replicated writes, and
+the hybrid fusion-controls change (#181) already defers a BM25 lexical half
+on the same ground. The bounded set makes the scan's memory acceptable
+meanwhile; its time is still linear. *A proportion of the collection as the
+boundary* was rejected above. *Reading the matched documents in one call*
+rather than in pages was rejected because an unselective filter would then
+hold every matching document at once — the failure ADR-098 names — where the
+paged read holds a page and the ids.
+
+**Cost.** A filter admitting between a few hundred and a thousand documents
+on a small collection reads by key what a scan would have read in sequence:
+the same records, a seek apiece. The tie order among equal scores changed
+from scan position to chunk key; it was never specified. The paged read of the
+filter re-plans once per page, which on an index plan today gathers the range's
+candidate keys per page; the executor's streaming visitor makes that a seek,
+and the filter's read is written to become one call to it. Hybrid search's
+lexical half still ignores `filter` — a pre-existing gap this change neither
+widens nor closes.
+
+---
+
+## ADR-103 — HNSW graphs are built off the lock and live under a budget
+
+**Decision.** `IndexCache` takes its cache-wide lock only to look an entry up
+and to install one. The build itself — the O(n log n) graph construction and
+its reachability probe — runs between the two under a per-collection lock, on
+a thread the async runtime has been told about (`kimmy_storage::blocking`, the
+mechanism a storage commit uses for its fsync). A second search for a
+collection being built takes the graph that already exists, under the
+staleness rule ADR-022 set, or, when none exists, waits for that one build
+rather than starting another. The build reads only each chunk's key and
+vector, releases each vector as the graph copies it in, and keeps a sample of
+128 for the probe. Resident graphs are budgeted by
+`vector.index_cache.max_bytes` (default 512 MiB; `0` unbounded): each graph is
+charged an estimate, `chunks × (dim × 4 + 5,000) + Σ (key length + 24)`, and
+when installing one would exceed the budget the least recently searched graphs
+are evicted first. A graph larger than the whole budget is installed anyway,
+with a warning once. `/metrics` reports the resident total as
+`kimmy_vector_index_cache_bytes`.
+
+**Why.** Three findings from reading the build path, each a way for one
+vector collection to take a node down without any request being unreasonable.
+The build ran under the one lock every vector search on every collection goes
+through, so a 4 s rebuild at 4,000 vectors — minutes at tens of thousands —
+was 4 s in which no vector or hybrid search on the node returned; and it ran
+on an async worker, which is the defect the 0.16.2 commit fix removed from
+writes. The build materialised every `VectorRecord`, text included, and held
+them until the probe had finished, so its peak was the graph plus the whole
+shadow collection, paid every staleness window under writes and up to three
+times when a build was discarded. And graphs were never released: at 6.5 KB
+per 384-dimensional chunk — measured, and about twice what the vector alone
+suggests, because `hnsw_rs` spends about 5 KB per node on neighbour lists and
+per-layer tables whatever the width — a node's resident memory was the sum of
+every collection ever searched, with nothing to say where it would stop. The
+default is twice `storage.cache_bytes` rather than equal to it because the two
+evictions are not alike: a page-cache miss is microseconds, a graph eviction
+is a rebuild, so the graph budget is the one that should rarely be reached.
+It is a ceiling, not an allocation; a node whose searched collections fit in
+less uses less, as before.
+
+**Alternatives.**
+
+- *Parallel insertion.* `hnsw_rs::parallel_insert` was measured
+  ([Benchmarks](benchmarks.md)): 3–4× faster on a ten-core host, saturating
+  at four threads, with recall and reachability indistinguishable from the
+  sequential graph. Not adopted, for now: a four-thread pool is every core of
+  the hosts this project runs on, which returns the stall to the request path
+  in a different suit, and a pool bounded to half the cores is one thread on
+  those hosts anyway; it needs rayon as a direct dependency; and the
+  reachability thresholds (ADR-061) were sized over hundreds of sequential
+  builds, not three parallel ones. Recorded with its numbers so the decision
+  can be reopened with a rebuild backlog in hand.
+- *Memory-mapped graphs.* `hnsw_rs` can hold vectors as slices of a mapped
+  file, which would take the `dim × 4` term out of resident memory and leave
+  the 5 KB of bookkeeping — the larger term at common widths. Deferred: it
+  changes the snapshot layout and the failure modes of a torn file, for a
+  saving the budget already bounds.
+- *Serving graphs from disk.* The snapshots already persist a built graph
+  across restarts through `hnsw_rs`'s dump and reload; serving *from* the
+  file rather than reloading it whole is the path to a graph that needs no
+  budget at all. Deferred for the same reasons as mapping, of which it is the
+  larger half — and an evicted collection already comes back through its
+  snapshot, which is the cheap half.
+- *A per-collection opt-out of the graph* (`index: false`, so a collection
+  always scans). Left out: `VectorConfig` is a `deny_unknown_fields` struct
+  built literally in nine places across the crates, and a field with a
+  non-`false` default does not fit that shape cleanly; the size threshold and
+  the budget cover the case it was for.
+- *Refusing a search whose graph does not fit.* Rejected outright: the exact
+  path exists, and a memory policy must never change what a search returns.
+
+**Cost.** The size is an estimate, not an accounting — the allocator's own
+overhead sits on top, and an in-flight search holds its `Arc` past an
+eviction, so resident memory can exceed the budget briefly. A collection whose
+graph is evicted pays a snapshot reload, or a rebuild, on its next search, so
+a budget sized below the routinely searched set becomes churn;
+`kimmy_vector_index_cache_bytes` pinned at the bound is the sign. Concurrent
+searches for a collection with no graph yet all wait for the one build, which
+is the trade against duplicating it. One more per-collection lock, one more
+setting, one more series.
+
+---
+
 ## ADR-104 — Array elements are addressed by filtered identifiers, not by query position
 
 **Decision.** An update path may contain `$[]` and `$[<identifier>]`
@@ -5489,5 +5659,205 @@ neither in this repository's code: enable private vulnerability reporting in
 the repository settings, which GitHub offers only for public repositories,
 and uncomment `github-attestations` in `dist-workspace.toml`, run
 `dist generate`, and commit the regenerated `release.yml`.
+
+---
+
+## ADR-109 — A pipeline's leading `$match` is planned like `find`; nothing else is reordered
+
+**Decision.** `aggregate` reads its source through `collect_matching`, the
+same planner-backed path `find`, `count`, `update` and `delete` use. When the
+pipeline begins with `$match` — one stage, or several consecutive ones merged
+into a conjunction — that filter is the scan's filter, so an indexed equality,
+range or `$in` fetches its candidates and a primary-key equality fetches one
+document. The 100,000-document ceiling is measured against what that filter
+admits. Every stage after the leading run executes exactly as before, on
+exactly the input it had. A `$match` anywhere else in the pipeline is not
+moved.
+
+**Why.** Before this, `aggregate` loaded the whole collection and then ran
+the stages, so a pipeline over a collection past the ceiling was refused no
+matter how selective its `$match` was — the one case where "narrow the
+pipeline with an earlier `$match`", which the refusal recommended, could not
+help. Reading through the planner fixes that without a second planner: the
+filter language is shared, `Stage::Match` already holds a `Filter`, and
+`collect_matching` already re-checks every candidate against the full filter,
+so an index can only narrow the candidate set and never change the answer.
+The scan is asked to stop one past the ceiling, so a `$match` that admits too
+much is refused without materialising everything it admits.
+
+Only the *leading* run is safe to push down, and the reason is what the
+documents look like when the stage runs. A leading `$match` sees documents as
+stored, so its filter is a filter over the collection. A `$match` after
+`$project` reads the projected shape; after `$unwind`, one element per
+document; after `$group`, the buckets. Moving any of those to the source would
+change what they match. The conservative rule — plan the prefix, run the rest
+— is the one MongoDB's optimizer follows too, and it keeps a pipeline's
+meaning independent of which indexes happen to exist.
+
+**Alternatives.** *A general stage reorderer* that hoists a `$match` past
+stages it provably does not depend on (`$sort`, `$skip`/`$limit` under some
+conditions, `$addFields` on other fields). It is real value and a real
+analysis — field dependence through computed expressions, `$unwind` changing
+cardinality — and nothing here needs it yet; when it comes it composes with
+this rather than replacing it. *Planning every `$match` independently* is not
+possible: only the source is indexed. *Applying the ceiling to the collection
+as before and only using the index for speed* would have kept the refusal
+that motivated the change.
+
+**Cost.** A pipeline with no leading `$match` behaves as it did, through the
+same scan. `aggregate` has no `explain`, so the access path a leading `$match`
+gets is visible only by sending the same filter to `find` with `explain` — the
+same planner, so the same answer; the docs say so. The refusal for an
+oversized source now names the leading `$match` when there is one, and says
+"more than" the ceiling rather than an exact count, because the scan stopped
+counting there.
+
+---
+
+## ADR-110 — A written threat model and a per-release SBOM
+
+**Decision.** Two documents: one written once and kept, one generated per
+release.
+
+[`docs/threat-model.md`](threat-model.md) states the assets, the actors and
+trust boundaries, the threats considered at each boundary with the control in
+place and the file it lives in, what is out of scope, and the operational
+assumptions the controls rest on. Every claim in it was checked against the
+code before it was written down; the two that could not be settled from the
+code alone are marked *verify* rather than asserted. Controls that are in
+review at the time of writing are marked *next release* and named by their
+setting, so the document is correct for the release it ships with.
+
+Every release ships a CycloneDX 1.5 JSON software bill of materials **per
+shipped binary per target** — `kimmyd-<target>.cdx.json` and
+`kimmy-cli-<target>.cdx.json`, with a `.sha256` beside each — generated by
+`scripts/sbom.sh`: `cargo cyclonedx` at a version pinned in the script,
+fetched on the release runner as a prebuilt binary and checked against a hash
+recorded in the script rather than the one published beside the download. The
+files are attached through dist's `[[dist.extra-artifacts]]`, which runs the
+script in the global-artifacts job after every platform build and uploads
+each named file beside the archives; the generated `release.yml` did not
+change.
+
+**Why.** [Security](security.md) grew as the mechanisms did, a section per
+mechanism, so the question "what happens if *this* is compromised" had to be
+answered by reading all of it and holding it at once. Several things were true
+and written nowhere together: that a member is inside the trust boundary
+rather than at it; that membership gossip is authenticated but readable and
+replayable; that a `ddl` holder chooses where a collection's text is sent and
+which environment variable authenticates the call; that nothing is encrypted
+at rest. A threat model is the document arranged by adversary rather than by
+feature, and writing it against the code rather than from memory is what
+found the provider-endpoint edge and a not-defended-table row that had been
+stale since ADR-040 (corrected alongside) — which is the argument for writing
+one at all.
+
+The bill: a release is a few hundred crates, and which ones at which versions
+is knowable from `Cargo.lock` only by someone holding the source at the right
+commit and a toolchain. The person asked "are we exposed to advisory X" is
+holding an archive or an image, and needs the answer from what they hold, in
+the format their scanner already reads.
+
+**Alternatives.**
+
+- *SPDX rather than CycloneDX.* Both are standards and every scanner reads
+  both; `cargo sbom` emits either. CycloneDX, because the Rust generator is
+  maintained by the CycloneDX project itself, because the dependency graph
+  and per-component hashes are first-class in 1.5, and because it is what
+  Dependency-Track and grype consume natively. A consumer that requires SPDX
+  is one conversion away (`cyclonedx-cli convert`); publishing both was
+  rejected as two files that can disagree.
+- *One bill for the workspace.* Rejected. The graph differs by target —
+  sixty-nine crates, Windows, wasm and Android among them, appear only when
+  every target is included — and a union would have a scanner flagging code
+  that is not in the binary. One per binary per target mirrors the archives
+  exactly, name for name.
+- *Generating the bill on every pull request.* Rejected. A bill describes a
+  released artifact; one per PR is a file nobody consumes and a tool download
+  per run, and the question it would answer on a PR — did the lock file gain
+  something — is what the lockfile diff and `scripts/check-native-deps.sh`
+  already answer. Generation is cheap to run by hand
+  (`scripts/sbom.sh <target>`) when someone wants to look before a tag.
+- *A custom publish job uploading with `gh release upload`.* Would work, and
+  would allow a version in the filename. `extra-artifacts` is the mechanism
+  dist provides: the files are listed in `dist-manifest.json`, the workflow
+  stays generated rather than hand-edited, and the archives are not versioned
+  in their names either.
+- *An SBOM attestation on the container image (`buildx --sbom`).* Deferred.
+  It would describe the Debian layer and see nothing of the crates inside a
+  static binary, and it touches the per-architecture build step of the image
+  workflow, which is being reworked at the same time (ADR-107). The musl
+  `kimmyd` bill describes what the image ships.
+
+**Cost.** The threat model is prose, and prose goes stale; the mitigation is
+the one the rest of the documentation uses — file references so a claim can
+be checked, and *next release* markers that have to be removed once those
+settings ship. The bill adds one pinned tool download to the global-artifacts
+job and a hash to bump when the tool is upgraded. It is not signed: its
+checksum proves the download is the file the workflow uploaded, not how the
+workflow built it, and a build attestation is a separate control. The CLI's
+bill follows the archive's name (`kimmy-cli-…`) rather than the binary's
+(`kimmy`), for the same reason the archive does.
+
+---
+
+## ADR-111 — Parsers and token verifiers are fuzzed on a schedule
+
+**Decision.** Nine libFuzzer targets cover the surfaces that take
+attacker-controlled bytes: the filter, update, projection, sort, pipeline and
+expression parsers (each evaluated after parsing, not just parsed), the HTTP
+edge's JSON ⇄ BSON conversion, the order-preserving key encoder, and both
+token verifiers — HS256 with a fixture secret, OIDC with a fixture JWKS held
+in memory. They run weekly and on demand in their own workflow, five minutes
+per target, never per pull request. The harness bodies are plain functions in
+a workspace crate, `kimmy-fuzz-harness`, so the stable PR gate compiles them;
+only the one-line `fuzz_target!` wrappers live outside the workspace, in
+`fuzz/`, where nightly is needed. The seed corpora are committed and run as
+ordinary tests, which is also where a minimised crash goes once it is fixed.
+
+**Why.** [Testing](testing.md) allocates effort by how quietly a bug would
+fail, and every one of these surfaces is reached by bytes from a caller who
+has not yet proven anything: a request body, a bearer header, a document
+that will become an index key. A panic in a parser is a worker gone for one
+request; a wrong answer from the key encoder is an index that silently omits
+documents. Property tests already state the load-bearing invariants over
+generators their authors designed. A coverage-guided fuzzer states the same
+invariants over a generator that learns from the code's branches, and so
+reaches the inputs the author did not think to generate. That the harnesses
+assert invariants and not merely "no panic" is what makes them worth the
+runner time: the first run over the seed corpus, before any mutation, found
+that `{$set: {"_id.x": 1}}` changed a document's identity past a check that
+knew only the literal name, and a few seconds of mutation found the JSON
+boundary writing a binary's subtype and never reading it back. Neither
+panicked. Both are in the changelog.
+
+The split between harness and wrapper is the part that keeps this alive. A
+crate built only by a weekly job breaks the week a function it calls is
+renamed and is noticed the week after; a crate the workspace clippy pass
+compiles breaks in the pull request that renames it. The libFuzzer wrappers
+cannot join the workspace — `libfuzzer-sys` carries a C++ runtime and the
+sanitizer build wants nightly — so the wrappers are made trivial and the
+harnesses are made stable.
+
+**Alternatives.** *Property tests alone* — kept; they are complementary, and
+the fuzz generator for BSON values deliberately mirrors the key-encoding
+property test's edges so the two disagree only where one has found something.
+*Fuzzing per pull request* — rejected for cost: nine targets at even a minute
+each on every push is more runner time than the whole test suite, for a search
+whose yield is proportional to time spent, not to how recently the code
+changed. *OSS-Fuzz* — deferred until the repository is public; it would supply
+the continuous campaign this schedule only approximates, and the harness crate
+is laid out so that adopting it is a build script, not a rewrite. *`cargo fuzz`
+on stable via `--sanitizer none`* — considered for the PR gate and rejected;
+it would still pull the libFuzzer runtime into the workspace, and the crate
+split gives the same compile guarantee with none of it.
+
+**Cost.** One more workspace crate, compiled but not shipped, adding
+`arbitrary` to the dependency graph. A second lockfile under `fuzz/`. Around
+an hour of runner time a week: one sanitizer build shared by the nine run jobs
+through a one-day artifact, plus five minutes each. A fuzz cache on the order
+of a gibibyte, saved only from `main`. And a standing obligation: a red weekly
+run is a bug report against this repository, to be minimised, fixed and turned
+into a seed rather than silenced.
 
 ---

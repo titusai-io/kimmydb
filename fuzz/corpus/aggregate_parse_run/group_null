@@ -1,0 +1,1 @@
+[ { "$group": { "_id": null, "n": { "$sum": 1 }, "all": { "$push": "$qty" }, "set": { "$addToSet": "$status" }, "first": { "$first": "$item" }, "last": { "$last": "$item" }, "avg": { "$avg": "$qty" }, "min": { "$min": "$price" } } } ]

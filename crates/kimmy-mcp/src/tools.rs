@@ -498,7 +498,7 @@ impl KimmyMcp {
 
     /// Update documents.
     #[tool(description = "Apply update operators ($set, $unset, $inc, $mul, $min, $max, \
-                       $rename, $currentDate, $push, $pull, $addToSet, $pop) to \
+                       $rename, $currentDate, $push, $pull, $pullAll, $addToSet, $pop) to \
                        documents matching a filter. Only the first match is updated \
                        unless `multi` is true. A path may address array elements: \
                        `items.$[].qty` for every element, or `items.$[line].qty` for \

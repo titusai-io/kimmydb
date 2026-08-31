@@ -1,0 +1,144 @@
+name: Fuzz
+
+# Coverage-guided fuzzing of the parsers and the token verifiers (ADR-111).
+#
+# On a schedule, never per pull request. A fuzz run is open-ended by nature --
+# five minutes per target finds what five minutes finds -- and nine targets at
+# five minutes each is three quarters of an hour of runner time, which is not
+# a price to pay for every push. What *does* run on every pull request is the
+# compile: the harness bodies live in `crates/kimmy-fuzz-harness`, a workspace
+# member, so `cargo clippy --workspace --all-targets` in ci.yml keeps them
+# building, and the seed corpora under `fuzz/corpus/` run as ordinary tests.
+# This workflow only adds the part that needs nightly and time.
+on:
+  schedule:
+    # Monday, early UTC: off the hours anyone is pushing, and early enough in
+    # the week that a finding is looked at rather than lost to a weekend.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: "How long to fuzz each target, in seconds"
+        required: false
+        default: "300"
+        type: string
+
+# One run at a time. A dispatch during the weekly run would compete for the
+# same cache key and prove nothing the scheduled run will not.
+concurrency:
+  group: fuzz
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build every target once and hand the binaries to the runners. A fuzz build
+  # is the workspace compiled again from scratch under a sanitizer, on nightly,
+  # so it is the expensive step; nine matrix jobs each paying it would spend
+  # more on compiling than on fuzzing. The binaries are self-contained libFuzzer
+  # executables, so the run jobs need neither a toolchain nor `cargo-fuzz`.
+  build:
+    name: build targets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src, llvm-tools
+
+      # Pinned to a release of the installer rather than its floating tag, as
+      # ci.yml does for nextest.
+      - name: Install cargo-fuzz
+        uses: taiki-e/install-action@v2.87.2
+        with:
+          tool: cargo-fuzz
+
+      # A cache of the fuzz build alone, keyed apart from ci.yml's. The
+      # scheduled run is on the default branch so it may save; a manual run
+      # from a branch restores main's and saves nothing, for the reason ci.yml
+      # gives. One sanitizer build of the dependency graph is on the order of
+      # a gibibyte, which fits the 10 GiB budget beside the stable caches --
+      # and it is one entry, refreshed weekly, not one per branch.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fuzz -> target
+          shared-key: fuzz
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Build
+        run: cargo fuzz build
+
+      - name: Collect the binaries
+        run: |
+          mkdir -p fuzz-bin
+          for target in $(cargo fuzz list); do
+            cp "fuzz/target/$(rustc -vV | sed -n 's/^host: //p')/release/$target" fuzz-bin/
+          done
+          ls -l fuzz-bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-targets
+          path: fuzz-bin
+          if-no-files-found: error
+          retention-days: 1
+
+  fuzz:
+    name: ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      # One target crashing is a finding, not a reason to stop looking in the
+      # other eight.
+      fail-fast: false
+      matrix:
+        target:
+          - filter_parse
+          - update_parse_apply
+          - projection_sort_parse
+          - aggregate_parse_run
+          - expr_eval
+          - extended_json_bson
+          - key_encoding
+          - jwt_local_verify
+          - jwt_oidc_verify
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fuzz-targets
+          path: fuzz-bin
+
+      # libFuzzer's own flags, as `cargo fuzz run` would pass them. The seed
+      # corpus is the starting point and the place new coverage is written to;
+      # a crash lands under artifacts/<target>/ and fails the job. The timeout
+      # and memory limit make a hang or a runaway allocation a finding of its
+      # own rather than a job that dies at the runner's ceiling with no input
+      # to show for it.
+      - name: Fuzz
+        run: |
+          chmod +x fuzz-bin/${{ matrix.target }}
+          mkdir -p fuzz/artifacts/${{ matrix.target }}
+          fuzz-bin/${{ matrix.target }} \
+            -max_total_time=${{ inputs.seconds || 300 }} \
+            -timeout=30 \
+            -rss_limit_mb=2048 \
+            -print_final_stats=1 \
+            -artifact_prefix=fuzz/artifacts/${{ matrix.target }}/ \
+            fuzz/corpus/${{ matrix.target }}
+
+      # The reproducer, kept long enough to be minimised and turned into a
+      # seed. `cargo fuzz run <target> fuzz/artifacts/<target>/<file>` replays
+      # it locally; `cargo fuzz tmin` shrinks it.
+      - name: Keep the crashing input
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+          if-no-files-found: ignore
+          retention-days: 30

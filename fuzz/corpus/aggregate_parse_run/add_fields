@@ -1,0 +1,6 @@
+[ { "$addFields": {
+      "value": { "$multiply": ["$qty", "$price"] },
+      "label": { "$toUpper": "$city" },
+      "band":  { "$cond": [ { "$gte": ["$qty", 10] }, "bulk", "single" ] },
+      "month": { "$dateToString": { "date": "$placed", "format": "%Y-%m" } } } },
+  { "$group": { "_id": "$month", "revenue": { "$sum": "$value" } } } ]

@@ -1,0 +1,1 @@
+{ "$concat": [ { "$toUpper": "$item" }, "-", { "$substr": ["$status", 0, 2] }, { "$toLower": "X" } ] }
