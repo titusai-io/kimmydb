@@ -51,7 +51,7 @@ jobs:
     name: cargo deny
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # Pinned to a commit, with the release it corresponds to beside it;
       # Dependabot (.github/dependabot.yml) moves both together. The action

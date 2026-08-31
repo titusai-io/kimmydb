@@ -88,7 +88,7 @@ jobs:
             echo "short=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.tag_name || github.ref_name }}
 
@@ -134,10 +134,10 @@ jobs:
           chmod +x "$GITHUB_WORKSPACE/.prebuilt/kimmyd"
           "$GITHUB_WORKSPACE/.prebuilt/kimmyd" --version
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -147,7 +147,7 @@ jobs:
       # and a per-arch tag would be one more thing to explain in `docker pull`.
       - name: Build and push by digest
         id: build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           platforms: ${{ matrix.platform }}
@@ -212,10 +212,10 @@ jobs:
           path: ${{ runner.temp }}/digests
           merge-multiple: true
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -233,7 +233,7 @@ jobs:
       # gives everybody.
       - name: Compute tags
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE }}
           tags: |
