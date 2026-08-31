@@ -364,6 +364,62 @@ The lexical half is **term overlap, not BM25**. Since RRF only consumes the
 ordering, the absolute scores need not be principled — but a real BM25 would
 rank better on its own. Recorded in [Deviations](deviations.md).
 
+#### Tuning the fusion
+
+Two optional request fields adjust how the halves are combined. Both default
+to exactly what the paragraphs above describe, so a request that omits them
+ranks as it always has.
+
+```json
+{
+  "query": "how do I rotate a token",
+  "k": 10,
+  "weights": { "dense": 0.7, "lexical": 0.3 },
+  "min_overlap": 2
+}
+```
+
+`weights` scales each half's contribution before the sum:
+
+```
+score(d) = w_dense / (60 + rank_dense(d))  +  w_lexical / (60 + rank_lexical(d))
+```
+
+Both weights must be `>= 0` and they must not both be zero; anything else is a
+`400`. Only their ratio matters — `0.7/0.3` and `7/3` rank identically — since
+the scores are compared with each other and never against a threshold. The
+default is `{ "dense": 1.0, "lexical": 1.0 }`, which is plain RRF. A weight of
+`0` switches a half off entirely, which is a convenient way to see what the
+other one is contributing.
+
+`min_overlap` is the number of **distinct query terms** a chunk must contain
+before it counts as lexical evidence at all. A chunk sharing fewer terms than
+that with the query is dropped from the lexical ranking before fusion; if the
+query itself has fewer distinct terms than `min_overlap`, the query's count is
+used instead, so a one-word query is never gated to nothing. Must be `>= 1`
+(a `400` otherwise); the default is `1`, which admits any chunk sharing a
+single term, as before.
+
+The gate removes *evidence*, not documents: a document dropped from the lexical
+half that the dense half ranked still receives its full dense contribution and
+still appears in the result. Only the lexical term of its score is gone.
+
+**Why the defaults are what they are.** Measured on a corpus of short
+conversational documents, across eight embedding models and forty graded
+queries, `hybrid_search` recalled roughly a third less than `vector_search` on
+the same queries — for every model, with the gap narrowing as the dense model
+got stronger. The mechanism is the lexical half above. On documents of a
+sentence or two, nearly every candidate in the 4×k lexical window shares one
+or two common words with the query, so ordering by term overlap is close to
+random among them; and RRF gives that near-random rank the same authority as
+the dense rank. `min_overlap` is the practical fix for such a corpus: raising
+it to `2` keeps only chunks that agree with the query on more than one word,
+which is what an exact-term match actually looks like, and lets the dense half
+decide the rest. `weights` is the more general knob for a corpus where the
+lexical half is informative but weaker. The defaults stay equal-weight RRF so
+that nothing about an existing deployment's ranking moves until the change has
+been measured there — see [ADR-094](decisions.md).
+
 ### There is no minimum score
 
 k-NN returns the `k` nearest vectors, and "nearest" does not mean "similar". A

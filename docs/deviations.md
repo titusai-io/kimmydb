@@ -2287,7 +2287,12 @@ long-running agent must re-authenticate.
 
 **Keyword search is term overlap, not BM25.** It exists to give hybrid search a
 lexical signal, and RRF only uses the *ordering*, so absolute scores need not
-be principled. A real BM25 would rank better on its own.
+be principled. A real BM25 would rank better on its own. On short documents
+the ordering it produces is close to random — nearly every candidate shares a
+word or two with the query — and equal-weight fusion then costs hybrid search
+recall against plain vector search. The per-request `weights` and
+`min_overlap` fields on `hybrid_search` are the mitigation ([ADR-094](decisions.md),
+[Vectors](vectors.md)); a BM25 half is deferred until those have been measured.
 
 **Chunking counts characters, not tokens.** A token count depends on the
 model's tokenizer, which the storage layer has no business knowing. The default

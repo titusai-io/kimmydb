@@ -22,10 +22,9 @@ of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
 node reachable from the network must not be running on one of this
 repository's own example secrets. `kimmyd check-config` against the new
 binary answers both without starting anything. Nothing else in the release
-asks anything of an operator: two pieces of MongoDB update syntax that were
-the most common reasons an update written against MongoDB was refused here,
-a change to how the embedding worker spends provider calls whose three new
-settings are meant to be left alone, and a documentation correction.
+asks anything of an operator: the rest is additive query, search and
+configuration surface — the entries below say what — along with settings
+whose defaults are meant to be left alone, and documentation corrections.
 
 ### Added
 
@@ -68,6 +67,20 @@ settings are meant to be left alone, and a documentation correction.
   violation) makes that document a non-match rather than failing the request;
   that and one deliberate leniency are recorded in `docs/deviations.md`.
   ADR-106.
+- **`weights` and `min_overlap` on `hybrid_search`.** Measured on a corpus of
+  short conversational documents, hybrid search recalled roughly a third less
+  than plain vector search on the same queries, for every one of eight
+  embedding models. The lexical half ranks by term overlap, and on documents
+  of a sentence or two nearly every candidate shares a word with the query,
+  so that ranking is close to random — and equal-weight reciprocal rank
+  fusion gave it the same say as the dense rank. `weights`
+  (`{ "dense": w, "lexical": w }`, both `>= 0`, not both zero) scales each
+  half's contribution; `min_overlap` (`>= 1`) is the number of distinct query
+  terms a chunk must contain before it counts as lexical evidence, and a
+  document it removes from the lexical half keeps whatever the dense half
+  gave it. Defaults are `{1, 1}` and `1`: plain RRF, as before. The MCP
+  `hybrid_search` tool and `kimmy hybrid-search` (`--dense-weight`,
+  `--lexical-weight`, `--min-overlap`) take the same controls. ADR-094.
 
 ### Changed
 

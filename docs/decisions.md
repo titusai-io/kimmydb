@@ -4482,6 +4482,71 @@ pins the ones that have shipped so far.
 
 ---
 
+## ADR-094 — Hybrid fusion is tunable per request; defaults stay equal-weight RRF
+
+**Decision.** `hybrid_search` takes two optional request fields. `weights`
+(`{ "dense": w_d, "lexical": w_l }`, each `>= 0`, not both zero) scales the two
+halves before they are summed, so the fused score is
+`w_d / (60 + rank_dense) + w_l / (60 + rank_lexical)`. `min_overlap` (`>= 1`)
+is the number of distinct query terms a chunk must contain to enter the
+lexical ranking at all; a query with fewer distinct terms than that uses its
+own count. The gate removes lexical *evidence*, not documents: a document it
+drops from the lexical half keeps its full dense contribution. Both fields are
+validated at the API and refused with the ordinary `400`. Their defaults —
+`{1, 1}` and `1` — reproduce the previous ranking to the bit, and the MCP tool
+and the CLI expose the same controls with the same defaults.
+
+**Why.** Measured on a corpus of short conversational documents, forty graded
+queries and eight embedding models, hybrid search recalled roughly a third
+less than plain vector search on the same queries — for every model, the gap
+narrowing only as the dense model got stronger (Recall@10 of 0.677 dense
+against 0.429 hybrid on the weakest). That is the wrong way round for a feature
+whose reason to exist is to improve on the dense half. The mechanism is in
+the lexical half. It ranks by term overlap (recorded in `deviations.md`), and
+each half is retrieved four times wider than `k` before fusion. On documents
+of a sentence or two, nearly every candidate in that window shares one or two
+common words with the query, so the lexical ordering among them is close to
+random; and reciprocal rank fusion, weighting both halves equally, gives that
+near-random rank the same authority as the dense one. Half the evidence being
+noise costs a third of the recall.
+
+The two knobs are the two places the mechanism can be interrupted. `weights`
+lowers the authority of the lexical rank; `min_overlap` removes the candidates
+whose lexical rank is noise, since a chunk that agrees with the query on two
+or more distinct terms is what an exact-term match — the case hybrid search is
+for — actually looks like. Per request rather than per collection because the
+right setting depends on the query as much as the corpus: a query naming a
+product code wants the lexical half; a paraphrase does not.
+
+**Why the defaults do not move.** The measurement was made on one kind of
+corpus. On longer documents term overlap is a weaker but real signal, and a
+default that helped short conversational text could cost a corpus of manuals
+the exact-term matches it relies on. Nothing about an existing deployment's
+ranking changes until the knobs have been measured there; the change ships
+the instrument, not a conclusion. When the measurements are in, a better
+default is a one-line change with evidence behind it.
+
+**Alternatives.** *A BM25 lexical half*, with per-collection term statistics,
+is the principled fix and would make the lexical rank informative on short
+documents too. It is deferred rather than rejected: it needs document
+frequencies maintained under replicated writes and a rebuild path, which is
+real machinery to add ahead of knowing how much of the gap the two knobs
+already close. *A confidence gate relative to the best lexical score* —
+admit only candidates within some fraction of the top lexical score — was
+considered and set aside: term-overlap scores are normalized by chunk length,
+so "within a fraction of the best" measures how short a chunk is as much as
+how well it matches, and the threshold would have no meaning a caller could
+reason about. A count of distinct matched terms is something a caller can
+predict from the query in hand. *Changing the default weighting* was rejected
+for the reason above.
+
+**Cost.** Two more fields on a request that is shared with `vector_search`,
+which ignores them; the specification says so. Callers who want the better
+ranking on a short-document corpus have to ask for it, per request, until a
+measured default replaces the equal weights. A weight of zero on the lexical
+half is a slower way of running `vector_search`, and the documentation says
+that too.
+
 ## ADR-095 — The embedding worker batches provider calls across documents
 
 **Decision.** The worker fills one provider call from the chunks of
