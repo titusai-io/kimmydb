@@ -43,6 +43,8 @@ pub enum OpKind {
     AddToSet(Vec<Bson>),
     /// Remove every element equal to this value.
     Pull(Bson),
+    /// Remove every element equal to any of these values.
+    PullAll(Vec<Bson>),
     /// Remove the first (`-1`) or last (`1`) element.
     Pop(i32),
     Rename(String),
@@ -110,6 +112,10 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
             None => OpKind::AddToSet(vec![arg.clone()]),
         },
         "pull" => OpKind::Pull(arg.clone()),
+        "pullAll" => match arg {
+            Bson::Array(values) => OpKind::PullAll(values.clone()),
+            _ => return Err(Error::InvalidUpdate("$pullAll requires an array of values".into())),
+        },
         "pop" => match arg {
             Bson::Int32(1) | Bson::Int64(1) => OpKind::Pop(1),
             Bson::Int32(-1) | Bson::Int64(-1) => OpKind::Pop(-1),
@@ -247,6 +253,30 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             let kept: Vec<Bson> = items
                 .into_iter()
                 .filter(|item| canonical_cmp(item, value) != Ordering::Equal)
+                .collect();
+            set(doc, Bson::Array(kept))?;
+        }
+
+        OpKind::PullAll(values) => {
+            // Each listed value is matched as `$pull` matches a literal —
+            // canonical equality, so `2` removes `2.0`. Pulling from a missing
+            // field is a no-op; pulling from a scalar is an error, because the
+            // caller believes the field is an array and it is not.
+            let items = match current {
+                None => return Ok(()),
+                Some(Bson::Array(items)) => items,
+                Some(_) => {
+                    return Err(invalid(format!(
+                        "cannot apply $pullAll to non-array field {:?}",
+                        op.path
+                    )));
+                }
+            };
+            let kept: Vec<Bson> = items
+                .into_iter()
+                .filter(|item| {
+                    !values.iter().any(|value| canonical_cmp(item, value) == Ordering::Equal)
+                })
                 .collect();
             set(doc, Bson::Array(kept))?;
         }
@@ -481,6 +511,43 @@ mod tests {
         );
         // Pulling from a missing field is a no-op.
         assert_eq!(applied(doc! { "$pull": { "a": 2 } }, doc! { "b": 1 }), doc! { "b": 1 });
+    }
+
+    #[test]
+    fn pull_all_removes_every_listed_value() {
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [1, 3] } }, doc! { "a": [1, 2, 3, 1, 4, 3] }),
+            doc! { "a": [2, 4] }
+        );
+        // Equality is canonical, so 2 removes 2.0 and a document matches whole.
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [2, {"k": 1}] } }, doc! { "a": [2.0, {"k": 1}, 5] }),
+            doc! { "a": [5] }
+        );
+        // A value that is not present changes nothing.
+        assert_eq!(
+            applied(doc! { "$pullAll": { "a": [9] } }, doc! { "a": [1, 2] }),
+            doc! { "a": [1, 2] }
+        );
+    }
+
+    #[test]
+    fn pull_all_from_a_missing_field_is_a_no_op() {
+        assert_eq!(applied(doc! { "$pullAll": { "a": [1] } }, doc! { "b": 1 }), doc! { "b": 1 });
+    }
+
+    #[test]
+    fn pull_all_from_a_non_array_is_an_error() {
+        let err = apply_err(doc! { "$pullAll": { "a": [1] } }, doc! { "a": 1 });
+        assert!(err.contains("non-array"), "unhelpful error: {err}");
+    }
+
+    #[test]
+    fn pull_all_requires_an_array_argument() {
+        // `{$pullAll: {a: 1}}` is the shape of a `$pull`; accepting it would
+        // make the two operators interchangeable by accident.
+        let err = parse(&doc! { "$pullAll": { "a": 1 } }).unwrap_err().to_string();
+        assert!(err.contains("array"), "unhelpful error: {err}");
     }
 
     #[test]

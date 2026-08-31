@@ -11,7 +11,9 @@ POST /v1/db/{db}/coll/{coll}/aggregate
 
 A pipeline is an array of stages applied in order. Each stage takes the previous
 stage's output, so ordering is the main thing that decides what a pipeline
-costs: **put `$match` first**, so every later stage sees less.
+costs: **put `$match` first**, so every later stage sees less — and so an index
+can answer it, which only a *leading* `$match` gets (see
+[Performance](#performance)).
 
 ---
 
@@ -19,7 +21,7 @@ costs: **put `$match` first**, so every later stage sees less.
 
 | Stage | Notes |
 |---|---|
-| `$match` | The same filter language as `find` — all 17 operators |
+| `$match` | The same filter language as `find` — all 18 operators, `$mod` included. **Planned like `find` when it is the first stage** |
 | `$project` | The same projection language as `find`, **plus computed fields** |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
@@ -62,6 +64,7 @@ field path.
 | Comparison | `$eq` `$ne` `$gt` `$gte` `$lt` `$lte` `$cmp` |
 | Boolean | `$and` `$or` `$not` |
 | Dates | `$year` `$month` `$dayOfMonth` `$hour` `$minute` `$second` `$dateToString` |
+| Type conversion | `$convert` `$toString` `$toInt` `$toLong` `$toDouble` `$toBool` `$toDate` `$toObjectId` |
 | Escape | `$literal` |
 
 ```json
@@ -110,6 +113,52 @@ invalid UTF-8.
 specifier is an error rather than being copied through — a literal `%q` in every
 row of a report is the kind of wrong output nobody notices. BSON dates carry no
 zone, so there is nothing for `%z` to convert to.
+
+### Type conversion
+
+```json
+{ "$convert": { "input": "$qty", "to": "int", "onError": 0, "onNull": 0 } }
+{ "$toInt": "$qty" }
+```
+
+`to` is a type name or its numeric BSON code, as `$type` spells them:
+`"double"` (1), `"string"` (2), `"objectId"` (7), `"bool"` (8), `"date"` (9),
+`"int"` (16), `"long"` (18). The `$toX` shorthands are the same operator with
+the target fixed and no fallbacks. Both exist for two situations that come up
+as soon as data arrives from more than one source:
+
+- **A `$lookup` whose keys differ in type across collections** — an order's
+  `customerId` stored as text, the customer's `_id` as a number. Convert in an
+  `$addFields` before the join: `{ "$addFields": { "cid": { "$toLong":
+  "$customerId" } } }`, then `localField: "cid"`.
+- **A `$group` by a date that was stored as a string.** `{ "$group": { "_id":
+  { "$month": { "$toDate": "$placed" } } } }` — the date operators need a date,
+  and `$toDate` makes one out of ISO 8601 text.
+
+**Null in, null out, unless `onNull` says otherwise.** A missing field is null.
+**A value with no conversion is a 400, unless `onError` gives a value** — the
+error names both types, so `$toInt` of a document says so rather than yielding
+null. Neither fallback is evaluated unless it is needed. `onError` covers the
+*conversion*, not the `input` expression: `{ "$convert": { "input": { "$divide":
+[1, 0] }, ... } }` still fails, because hiding a broken expression behind a
+fallback would make a typo look like data.
+
+What converts to what:
+
+| To | From |
+|---|---|
+| `double` | any number; bool (`0`/`1`); date (epoch milliseconds); string, parsed strictly — `"1.5"`, `"-1e3"`; not `"1.5kg"` |
+| `int`, `long` | any number, **truncated toward zero** and refused when out of range — `$toInt` of 2^40 is an error, not a wrap; bool; string as a base-10 integer — `"42"`, not `"1.5"`; date to `long` only (epoch milliseconds never fit an int) |
+| `string` | number (a whole double prints as `"2"`, not `"2.0"`); bool; date as ISO 8601 with milliseconds, `"2026-08-12T13:45:07.250Z"`; ObjectId as 24 hex characters |
+| `bool` | a number is `false` when zero; **everything else present is `true`** — including `""` and `"false"`, which is MongoDB's rule and a trap worth knowing |
+| `date` | a number as epoch milliseconds (a double is truncated); a string in RFC 3339 / ISO 8601 with an offset or `Z`, or the looser forms `"2026-08-12"`, `"2026-08-12 13:45:07"` and a missing zone, all read as UTC; an ObjectId's creation time |
+| `objectId` | a string of 24 hex characters |
+
+Everything not in the table — an array to a number, a document to a date — is
+an error. **`decimal` (`Decimal128`) is refused at parse**: it has no exact key
+encoding here ([ADR-005](decisions.md)), so a value converted to it could be
+neither indexed nor grouped, and producing one would only move the refusal
+somewhere less obvious. Convert to `double` or `long` instead.
 
 ---
 
@@ -161,6 +210,37 @@ inherent, not an omission.
 
 ---
 
+## Performance
+
+**A leading `$match` is planned exactly as `find` is.** When the first stage is
+`$match` — or the first several are, which run as one conjunction — its filter
+goes through the same planner and the same access paths: a primary-key lookup
+for `_id`, an index for an equality, range or `$in` on an indexed field, a
+collection scan otherwise. An indexed leading `$match` reads its candidates and
+nothing else, so a pipeline over a large collection costs what its `$match`
+admits, not what the collection holds.
+
+```json
+[ { "$match": { "city": "London", "placed": { "$gte": "2026-08-01" } } },
+  { "$group": { "_id": "$sku", "n": { "$sum": 1 } } } ]
+```
+
+With an index on `[city, placed]`, the group sees London's August orders and
+the rest of the collection is never touched.
+
+**Only the leading `$match` is pushed down.** A `$match` after `$project`,
+`$unwind`, `$group` or any other stage reads the documents *that stage
+produced*, and moving it to the source would change what it matches — so it
+stays where it was written and runs as an ordinary in-memory filter over what
+reaches it. The rule is the same one MongoDB's optimizer follows, and it is
+what keeps a pipeline's meaning independent of whether an index exists.
+
+**`aggregate` has no `explain`.** To see which access path a leading `$match`
+gets, send the same filter to `find` with `"explain": true` — it is the same
+planner reading the same indexes, so the answer is the same.
+
+---
+
 ## The memory limit
 
 `$group` and `$sort` are **blocking**: neither can emit anything until it has
@@ -169,7 +249,12 @@ bounded by `MAX_LIMIT`, but a pipeline's input is a whole collection — so
 without a ceiling one request could take all the memory on a node.
 
 Every stage checks its output against a cap of **100,000 documents**, and
-exceeding it is an error naming the stage:
+exceeding it is an error naming the stage. **The ceiling applies to what the
+leading `$match` admits**, not to the collection: a pipeline over a million
+documents runs when its first `$match` selects fewer than 100,000 of them, and
+a pipeline with no leading `$match` over that collection is refused at the
+source, as it always was. The scan stops as soon as the ceiling is passed
+rather than materialising everything to refuse it.
 
 ```json
 { "error": "bad_request",
@@ -194,10 +279,10 @@ documents holding large arrays can exceed the cap long before the stage ends.
 |---|---|
 | Array and set operators (`$size`, `$arrayElemAt`, `$slice`, `$filter`, `$map`, `$reduce`) | Deliberately out of the first expression pass. `$map`/`$filter`/`$reduce` also need `$$this`-style variable binding, which is an evaluation *scope* rather than another operator |
 | Variable expressions — `$$ROOT`, `$$this`, `$let` | Same reason. Refused explicitly rather than read as a field named `$ROOT`, which would silently yield null |
-| Type conversion (`$convert`, `$toInt`, `$toString`, `$toDate`) | Not built |
+| `$convert` to `decimal`, and `$toDecimal` | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse with a pointer to `double` or `long` |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
-| Index-aware `$match` | A pipeline reads the collection; the planner is not consulted. A selective `$match` still helps, by shrinking what later stages see |
+| Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |
 
 ---
 

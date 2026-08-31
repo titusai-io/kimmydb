@@ -17,6 +17,52 @@ Status meanings:
 
 ---
 
+## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` is outside it
+
+**Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The
+conversion pairs follow MongoDB's table, and every pipeline MongoDB accepts
+means the same thing here. Four places are more lenient or differently
+spelled, and one target is missing:
+
+- **`int` → `date` is accepted.** MongoDB refuses it — its table admits
+  `long`, `double` and `decimal` to `date` but not `int`, for no reason the
+  documentation states — so `{$toDate: 1500}` is an error there and
+  `1970-01-01T00:00:01.500Z` here. An Int32 is a small Int64; refusing one and
+  not the other would be a rule nobody could predict.
+- **`to` is a constant.** MongoDB lets it be an expression, evaluated per
+  document. Nothing here needs a per-row target type, and a constant is what
+  lets the unsupported `decimal` be refused before a document is read.
+- **A string to a date accepts RFC 3339 and three looser spellings** — a bare
+  date, a space between date and time, a missing zone read as UTC. MongoDB's
+  parser accepts those and more (month names, `%Y%m%d`, a `timezone` argument
+  applied to a zoneless string). A string neither accepts is an error in both.
+- **A double to a string is Rust's shortest round-trip rendering.** It agrees
+  with MongoDB on every ordinary value — `2` for `2.0`, `1.5`, `NaN`,
+  `Infinity` — and disagrees on magnitudes MongoDB prints in exponent form:
+  `1e21` is `"1000000000000000000000"` here and `"1e+21"` there. The engine's
+  own JSON edge prints doubles the same way, so a converted string and a
+  returned double read alike.
+- **`decimal` is refused.** `Decimal128` has no exact key encoding
+  ([ADR-005](decisions.md)); a value converted to it could be neither indexed
+  nor grouped. `$convert` to `decimal` or `19`, and a `$toDecimal` operator,
+  are a `400` naming `double` and `long` as the alternatives. A `Decimal128`
+  *input* is likewise unconvertible.
+
+**`$mod` and `$pullAll` have no entry.** Both follow MongoDB — `$mod`
+truncates doubles toward zero, refuses a zero divisor, and refuses a `NaN` or
+unrepresentable operand at parse as MongoDB 5.1 and later do; `$pullAll` on a
+non-array field is an error, as it is there. **The leading `$match` pushdown is not a deviation either**: it changes
+what a pipeline costs and what the 100,000-document ceiling is measured
+against, not what it returns, and the rule — only a *leading* `$match` may be
+planned — is the one MongoDB's own optimizer follows.
+
+**Closing the first would mean refusing something harmless**, so it is
+recorded rather than scheduled. The third and fourth close by widening the
+date parser and adding an exponent threshold to the double renderer, if a
+ported pipeline ever needs either.
+
+---
+
 ## 🟡 `modified` counts documents written, not documents changed
 
 **Raised 2026-08-21, found by sweeping the CLI against a running cluster.**
@@ -1779,7 +1825,7 @@ here so that the absence of a decision is visible as a decision.
 | Rate limiting beyond login | Only `/v1/auth/login` is limited. Every other route is unbounded — see the entry below | M5 |
 | Per-session revocation | Revocation is per user — all of that user's tokens or none. Killing one session while leaving another needs a per-token deny-list, which fails open when an entry has not reached the node handling the request | not planned |
 | `$vectorSearch` as a pipeline stage | The pipeline is built, but vector search stays its own endpoint | M5 |
-| Array/set expression operators, variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`) and type conversion | Deliberately outside M9 task 1's agreed operator list. Variable binding needs an evaluation *scope*, not another operator | not scheduled |
+| Array/set expression operators and variable binding (`$$ROOT`, `$map`, `$filter`, `$reduce`, `$let`) | Deliberately outside M9 task 1's agreed operator list. Variable binding needs an evaluation *scope*, not another operator. Type conversion, once in the same row, is built — see the entry above | not scheduled |
 | Multi-document atomicity | Uneven, on purpose. **Bulk insert is atomic** — one transaction, all or nothing ([ADR-048](decisions.md)). `update` and `delete` still apply document by document and can stop partway, because each match is committed on its own. Note this is about *commits*, not about how the matches are found — that is planned now | by design |
 | Benchmarks | The vector index, the write path, batched writes, concurrent writers and the planner are measured ([Benchmarks](benchmarks.md)), against a recorded baseline that is advisory rather than gating | M8 |
 | No published protocol specification | The HTTP/WebSocket API is the client contract ([ADR-055](decisions.md)) but nothing specifies or versions it, so every client is hand-written and nothing fails when a route drifts | **M10 task 1** |

@@ -3990,6 +3990,123 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
 }
 
 #[tokio::test]
+async fn mod_pull_all_and_type_conversion_work_over_http() {
+    // The three additions through the edge, where Extended JSON is what
+    // carries a date or an ObjectId in and out.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "city" }] }),
+        )
+        .await;
+    for (id, city, qty, placed) in [
+        (1, "london", "5", "2026-08-12T10:00:00Z"),
+        (2, "london", "15", "2026-08-20"),
+        (3, "paris", "ten", "2026-09-01T00:00:00Z"),
+        (4, "paris", "8", "2026-09-02T00:00:00Z"),
+    ] {
+        server
+            .post(
+                "/v1/db/shop/coll/orders/docs",
+                Some(&token),
+                json!({"_id": id, "city": city, "qty": qty, "placed": placed, "tags": [1, 2, 3]}),
+            )
+            .await;
+    }
+
+    // $mod in a filter, and it is residual: the planner reports a scan.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({ "filter": { "_id": { "$mod": [2, 0] } }, "sort": { "_id": 1 }, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 2, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["_id"], 2);
+    assert_eq!(res.body["documents"][1]["_id"], 4);
+    assert_eq!(res.body["explain"]["strategy"], "collectionScan");
+    // A zero divisor is refused at parse.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/find",
+            Some(&token),
+            json!({ "filter": { "_id": { "$mod": [0, 0] } } }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+
+    // $pullAll removes every listed value.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({ "filter": { "_id": 1 }, "update": { "$pullAll": { "tags": [1, 3] } } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let doc = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(doc.body["tags"], json!([2]));
+
+    // A leading $match on the indexed field, then a conversion of a text
+    // quantity with a fallback, and a group by the month of a text date.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"city": {"$in": ["london", "paris"]}}},
+                {"$addFields": {
+                    "n": {"$convert": {"input": "$qty", "to": "int", "onError": 0}},
+                    "month": {"$month": {"$toDate": "$placed"}},
+                    "when": {"$toDate": "$placed"},
+                    "idText": {"$toString": "$_id"},
+                }},
+                {"$group": {"_id": "$month", "total": {"$sum": "$n"},
+                            "first": {"$first": "$when"}, "ids": {"$push": "$idText"}}},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["_id"], 8);
+    assert_eq!(docs[0]["total"], 20);
+    assert_eq!(docs[0]["ids"], json!(["1", "2"]));
+    // A date out is still a date on the wire.
+    assert_eq!(docs[0]["first"]["$date"], 1_786_528_800_000i64);
+    assert_eq!(docs[1]["_id"], 9);
+    assert_eq!(docs[1]["total"], 8, "\"ten\" fell back to 0 through onError");
+
+    // Without the fallback the unconvertible row is a 400 naming the problem.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$addFields": {"n": {"$toInt": "$qty"}}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(format!("{:?}", res.body).contains("ten"), "{:?}", res.body);
+
+    // And decimal is refused before a document is read.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$addFields": {"n": {"$convert": {"input": "$qty", "to": "decimal"}}}}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn a_backup_requires_admin_over_everything() {
     // A backup is every document on the node, so anything less than full admin
     // would let a database-scoped administrator read past their own grants.

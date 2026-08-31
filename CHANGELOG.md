@@ -10,6 +10,48 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A patch: additive syntax in the filter, update and expression languages, and
+one change to how a pipeline reads its source. No wire, storage-format or API
+break; a pipeline, filter or update that parsed before parses the same way
+after, and returns the same documents.
+
+### Added
+
+- **Type conversion expressions.** `$convert: {input, to, onError?, onNull?}`
+  with `to` as a type name or numeric BSON code, and the shorthands
+  `$toString`, `$toInt`, `$toLong`, `$toDouble`, `$toBool`, `$toDate` and
+  `$toObjectId`. Null or missing input is null (or `onNull`); a value with no
+  conversion is a `400` naming both types (or `onError`); integers are refused
+  out of range rather than wrapped; strings are parsed strictly; a date
+  converts to and from epoch milliseconds and to and from ISO 8601 text. The
+  two shapes it exists for: a `$lookup` whose keys differ in type across
+  collections, and a `$group` by a date that was stored as a string. `decimal`
+  is refused, because `Decimal128` has no exact key encoding here (ADR-005).
+- **`$mod` in filters.** `{field: {$mod: [divisor, remainder]}}`, with
+  MongoDB's rules: numeric values only, doubles truncated toward zero, the
+  remainder keeping the dividend's sign, arrays matched element-wise, a zero
+  divisor refused at parse. Never index-eligible; an equality or range beside
+  it still plans.
+- **`$pullAll`.** Removes every element equal to any value in the given list,
+  by the same canonical equality `$pull` uses. A missing field is a no-op; a
+  non-array field is a `400`.
+
+### Changed
+
+- **A pipeline's leading `$match` uses indexes, and the ceiling is measured
+  after it.** `aggregate` now reads its source through the same planner-backed
+  scan `find` uses, with the first `$match` stage — or the first several,
+  merged — as the scan's filter. An indexed equality, range or `$in` there
+  reads its candidates rather than the whole collection, and the
+  100,000-document limit applies to what the `$match` admits, so a pipeline
+  over a larger collection runs when its leading `$match` is selective enough.
+  Only the leading `$match` is pushed down; a `$match` after any other stage
+  runs where it was written, on what that stage produced, so results are
+  unchanged with or without an index (ADR-109). The refusal for an oversized
+  source names the leading `$match` when there is one.
+
 ## 0.16.4 - 2026-08-29
 
 A patch: no wire, storage-format or API break; rolling upgrade. Four

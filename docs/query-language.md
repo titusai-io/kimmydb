@@ -34,10 +34,12 @@ graph LR
 | `$eq` `$ne` | Equal / not equal |
 | `$gt` `$gte` `$lt` `$lte` | Ordered comparison, **within a type group** |
 | `$in` `$nin` | Membership in a list |
+| `$mod` | `[divisor, remainder]` — a numeric value leaves this remainder |
 
 ```javascript
 { "qty": { "$gt": 4, "$lt": 100 } }     // both must hold
 { "status": { "$in": ["new", "paid"] } }
+{ "seq": { "$mod": [4, 0] } }           // every fourth
 ```
 
 ### Logical
@@ -69,6 +71,32 @@ Top-level fields are implicitly `$and`-ed.
 | `$all` | Array contains every listed value |
 | `$size` | Array has exactly this length |
 | `$elemMatch` | **One** element satisfies all the conditions |
+
+### `$mod`
+
+```javascript
+{ "n": { "$mod": [4, 1] } }     // n % 4 == 1
+```
+
+Exactly two numbers, `[divisor, remainder]`. MongoDB's rules, all of them
+tested:
+
+- **Numeric values only.** A string, a null or a missing field never matches —
+  and `$not` inverts that, so `{ "$not": { "$mod": [4, 0] } }` matches them.
+- **Doubles are truncated toward zero**, on both sides: `8.5` satisfies
+  `[4, 0]`, and `[4.9, 0.7]` means `[4, 0]`. A value with no integer at all —
+  `NaN`, infinity, past 2^63 — is a `400` in the argument and a non-match in a
+  document.
+- **The remainder keeps the dividend's sign**, as in C: `-7` satisfies
+  `[3, -1]`, not `[3, 2]`.
+- **A zero divisor is a `400`** at parse, rather than a filter that quietly
+  matches nothing. So is an array of the wrong length.
+- **Arrays match element-wise**, like the comparison operators: `[1, 10, 3]`
+  satisfies `[5, 0]` through the `10`.
+
+`$mod` is never index-eligible. A remainder is not a range, so the planner
+leaves it to the residual re-check every candidate goes through; an equality or
+range beside it still uses the index.
 
 ---
 
@@ -152,12 +180,19 @@ both — mixing them is rejected rather than guessed at.
 | `$push` | Append; `{"$each": [...]}` appends several |
 | `$addToSet` | Append only if not already present |
 | `$pull` `$pop` | Remove matching elements / one end |
+| `$pullAll` | Remove every element equal to **any** value in a list |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
 
 ```javascript
 { "$inc": { "qty": -1 }, "$push": { "history": "shipped" } }
+{ "$pullAll": { "tags": ["draft", "stale"] } }
 ```
+
+`$pull` and `$pullAll` match by **canonical equality** — `2` removes `2.0`, and
+a document matches whole, field order included. `$pullAll` on a field that is
+missing does nothing; on a field that is not an array it is a `400`, because
+the caller believes the field is an array and it is not.
 
 ### Integers stay integral
 
@@ -325,6 +360,9 @@ bad pattern in an `$or` should not take down the whole request.
 | Aggregation pipeline (`$match`, `$group`, `$unwind`, …) | 📋 Planned |
 | `$vectorSearch` | 📋 Planned — vector search works, but as [its own endpoint](vectors.md), not a pipeline stage |
 | `$where`, JavaScript execution | ⛔ Never — an obvious injection surface |
+| `$pull` with a query condition (`{ "$pull": { "scores": { "$gte": 6 } } }`) | 📋 Not built — `$pull` and `$pullAll` match literal values only, so a condition document is compared as a document and removes nothing |
+| `$bitsAllSet` `$bitsAnySet` `$bitsAllClear` `$bitsAnyClear` | 📋 Not built |
+| `$jsonSchema` | 📋 Not built |
 | Geospatial operators | ⛔ Not planned |
 | Text indexes / `$text` | ⛔ Superseded by [vector and hybrid search](vectors.md) |
 

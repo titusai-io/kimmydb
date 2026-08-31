@@ -52,6 +52,12 @@ pub enum Condition {
     /// At least one array element must match the inner filter.
     ElemMatch(Box<Filter>),
     Size(i64),
+    /// `{$mod: [divisor, remainder]}` — the value, truncated to an integer,
+    /// leaves `remainder` when divided by `divisor`. Numeric values only.
+    Mod {
+        divisor: i64,
+        remainder: i64,
+    },
     Not(Box<Condition>),
 }
 
@@ -193,6 +199,7 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
             Bson::Double(n) if n.fract() == 0.0 => Condition::Size(*n as i64),
             _ => return Err(Error::InvalidQuery("$size requires an integer".into())),
         },
+        "mod" => parse_mod(arg)?,
         "type" => Condition::Type(parse_type_arg(arg)?),
         "regex" => match arg {
             Bson::String(pattern) => {
@@ -247,6 +254,56 @@ fn truthy(value: &Bson) -> bool {
         Bson::Null | Bson::Undefined => false,
         _ => true,
     }
+}
+
+/// `{$mod: [divisor, remainder]}`, exactly two numbers.
+///
+/// A double operand is truncated toward zero, as MongoDB does — `{$mod: [4.5,
+/// 0]}` is `{$mod: [4, 0]}` — but one with no integer at all (NaN, infinity,
+/// beyond 2^63) is refused rather than guessed at. A zero divisor is refused
+/// here rather than matching nothing per document, because a filter that can
+/// never match is a mistake the caller wants to hear about.
+fn parse_mod(arg: &Bson) -> Result<Condition> {
+    let Bson::Array(items) = arg else {
+        return Err(Error::InvalidQuery("$mod requires an array of [divisor, remainder]".into()));
+    };
+    if items.len() != 2 {
+        return Err(Error::InvalidQuery(format!(
+            "$mod requires exactly two elements, [divisor, remainder], found {}",
+            items.len()
+        )));
+    }
+    let divisor = mod_operand(&items[0], "divisor")?;
+    let remainder = mod_operand(&items[1], "remainder")?;
+    if divisor == 0 {
+        return Err(Error::InvalidQuery("$mod divisor cannot be 0".into()));
+    }
+    Ok(Condition::Mod { divisor, remainder })
+}
+
+fn mod_operand(value: &Bson, what: &str) -> Result<i64> {
+    match value {
+        Bson::Int32(n) => Ok(i64::from(*n)),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Double(d) => truncate_to_i64(*d).ok_or_else(|| {
+            Error::InvalidQuery(format!(
+                "$mod {what} must be representable as a 64-bit integer, found {d}"
+            ))
+        }),
+        other => Err(Error::InvalidQuery(format!(
+            "$mod {what} must be a number, found {}",
+            type_name_of(other)
+        ))),
+    }
+}
+
+/// A double truncated toward zero, when that is an `i64`.
+fn truncate_to_i64(d: f64) -> Option<i64> {
+    // `as` saturates, so the range is checked first: 2^63 is exactly
+    // representable as a double and is one past the largest i64.
+    let t = d.trunc();
+    (d.is_finite() && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t))
+        .then_some(t as i64)
 }
 
 fn parse_type_arg(arg: &Bson) -> Result<Vec<String>> {
@@ -396,6 +453,24 @@ fn condition_matches(condition: &Condition, values: &[&Bson]) -> bool {
                 scalar => matches_scalar_against(inner, scalar),
             }),
             _ => false,
+        }),
+
+        // Element-wise like the comparisons, and numeric only: a string never
+        // has a remainder. The value is truncated to an integer first, so 8.5
+        // satisfies `[4, 0]`, and the remainder keeps the dividend's sign —
+        // `-7` satisfies `[3, -1]`, not `[3, 2]` — both as MongoDB does.
+        Condition::Mod { divisor, remainder } => any_element(values, |v| {
+            let n = match v {
+                Bson::Int32(n) => i64::from(*n),
+                Bson::Int64(n) => *n,
+                Bson::Double(d) => match truncate_to_i64(*d) {
+                    Some(n) => n,
+                    None => return false,
+                },
+                _ => return false,
+            };
+            // `i64::MIN % -1` overflows; its remainder is zero.
+            n.checked_rem(*divisor).unwrap_or(0) == *remainder
         }),
 
         Condition::Not(inner) => !condition_matches(inner, values),
@@ -765,5 +840,71 @@ mod tests {
         assert!(hits(doc! { "a.b": 1 }, doc! { "a": { "b": 1 } }));
         assert!(hits(doc! { "a.b": 2 }, doc! { "a": [ { "b": 1 }, { "b": 2 } ] }));
         assert!(hits(doc! { "a.0": 10 }, doc! { "a": [10, 20] }));
+    }
+
+    // -----------------------------------------------------------------------
+    // $mod
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mod_matches_a_remainder() {
+        assert!(hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": 8 }));
+        assert!(!hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": 9 }));
+        assert!(hits(doc! { "n": { "$mod": [4, 1] } }, doc! { "n": 9i64 }));
+        assert!(hits(doc! { "n": { "$mod": [4i64, 1i64] } }, doc! { "n": 9 }));
+    }
+
+    #[test]
+    fn mod_truncates_doubles_toward_zero_on_both_sides() {
+        // 8.5 becomes 8, and a double operand becomes its integer part.
+        assert!(hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": 8.5 }));
+        assert!(hits(doc! { "n": { "$mod": [4.9, 0.7] } }, doc! { "n": 8 }));
+        assert!(hits(doc! { "n": { "$mod": [4, -3] } }, doc! { "n": -7.9 }));
+    }
+
+    #[test]
+    fn mod_remainder_keeps_the_dividends_sign() {
+        // -7 = 3 * -2 + -1, as in C and MongoDB, not -7 = 3 * -3 + 2.
+        assert!(hits(doc! { "n": { "$mod": [3, -1] } }, doc! { "n": -7 }));
+        assert!(!hits(doc! { "n": { "$mod": [3, 2] } }, doc! { "n": -7 }));
+        // A negative divisor leaves the sign with the dividend too.
+        assert!(hits(doc! { "n": { "$mod": [-3, 1] } }, doc! { "n": 7 }));
+    }
+
+    #[test]
+    fn mod_never_matches_a_non_number() {
+        assert!(!hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": "8" }));
+        assert!(!hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": Bson::Null }));
+        assert!(!hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "other": 8 }));
+        assert!(!hits(doc! { "n": { "$mod": [4, 0] } }, doc! { "n": f64::NAN }));
+        // But `$not` inverts it, so a non-number then matches.
+        assert!(hits(doc! { "n": { "$not": { "$mod": [4, 0] } } }, doc! { "n": "8" }));
+    }
+
+    #[test]
+    fn mod_applies_to_array_elements() {
+        // Element-wise, like the comparison operators.
+        assert!(hits(doc! { "n": { "$mod": [5, 0] } }, doc! { "n": [1, 10, 3] }));
+        assert!(!hits(doc! { "n": { "$mod": [5, 0] } }, doc! { "n": [1, 11, 3] }));
+        assert!(hits(doc! { "n": { "$mod": [5, 0] } }, doc! { "n": [1, "x", 15] }));
+    }
+
+    #[test]
+    fn mod_does_not_overflow_on_the_smallest_integer() {
+        assert!(hits(doc! { "n": { "$mod": [-1, 0] } }, doc! { "n": i64::MIN }));
+    }
+
+    #[test]
+    fn mod_rejects_a_zero_divisor_and_a_malformed_argument() {
+        let zero = parse(&doc! { "n": { "$mod": [0, 1] } }).unwrap_err().to_string();
+        assert!(zero.contains("divisor"), "unhelpful error: {zero}");
+        // 0.4 truncates to 0 and is refused for the same reason.
+        assert!(parse(&doc! { "n": { "$mod": [0.4, 1] } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": 4 } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": [4] } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": [4, 0, 1] } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": ["4", 0] } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": [4, f64::NAN] } }).is_err());
+        assert!(parse(&doc! { "n": { "$mod": [4, 1.0e19] } }).is_err());
     }
 }

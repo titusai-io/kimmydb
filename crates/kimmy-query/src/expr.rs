@@ -226,6 +226,103 @@ impl Op {
     }
 }
 
+/// The type a `$convert` produces.
+///
+/// The seven of MongoDB's targets the engine can hold. `decimal` is refused at
+/// parse: `Decimal128` has no exact key encoding here (ADR-005), so a value
+/// converted to it could be neither indexed nor grouped, and producing one
+/// would only move the refusal somewhere less obvious.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConvertTo {
+    Double,
+    String,
+    ObjectId,
+    Bool,
+    Date,
+    Int,
+    Long,
+}
+
+impl ConvertTo {
+    /// `to` as written: a type name or its numeric BSON code, both as `$type`
+    /// spells them.
+    fn parse(value: &Bson) -> Result<Self> {
+        let name = match value {
+            Bson::String(s) => s.as_str(),
+            Bson::Int32(1) | Bson::Int64(1) => "double",
+            Bson::Int32(2) | Bson::Int64(2) => "string",
+            Bson::Int32(7) | Bson::Int64(7) => "objectId",
+            Bson::Int32(8) | Bson::Int64(8) => "bool",
+            Bson::Int32(9) | Bson::Int64(9) => "date",
+            Bson::Int32(16) | Bson::Int64(16) => "int",
+            Bson::Int32(18) | Bson::Int64(18) => "long",
+            Bson::Int32(19) | Bson::Int64(19) => "decimal",
+            Bson::Int32(_) | Bson::Int64(_) => {
+                return Err(Error::InvalidQuery(format!(
+                    "$convert `to` code {value} is not a convertible type; use 1 (double), 2 \
+                     (string), 7 (objectId), 8 (bool), 9 (date), 16 (int) or 18 (long)"
+                )));
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$convert `to` is a type name or numeric code, found {}",
+                    type_name(other)
+                )));
+            }
+        };
+        Ok(match name {
+            "double" => ConvertTo::Double,
+            "string" => ConvertTo::String,
+            "objectId" => ConvertTo::ObjectId,
+            "bool" => ConvertTo::Bool,
+            "date" => ConvertTo::Date,
+            "int" => ConvertTo::Int,
+            "long" => ConvertTo::Long,
+            "decimal" => {
+                return Err(Error::InvalidQuery(
+                    "$convert to decimal is not supported: Decimal128 has no exact key encoding \
+                     in this engine, so the result could be neither indexed nor grouped; convert \
+                     to double or long instead"
+                        .into(),
+                ));
+            }
+            other => {
+                return Err(Error::InvalidQuery(format!(
+                    "$convert cannot target {other:?}; supported: double, string, objectId, \
+                     bool, date, int, long"
+                )));
+            }
+        })
+    }
+
+    /// The `$toX` shorthand that fixes this target, if the name is one.
+    fn from_shorthand(name: &str) -> Option<Self> {
+        Some(match name {
+            "$toDouble" => ConvertTo::Double,
+            "$toString" => ConvertTo::String,
+            "$toObjectId" => ConvertTo::ObjectId,
+            "$toBool" => ConvertTo::Bool,
+            "$toDate" => ConvertTo::Date,
+            "$toInt" => ConvertTo::Int,
+            "$toLong" => ConvertTo::Long,
+            _ => return None,
+        })
+    }
+
+    /// The type name, for error messages.
+    pub fn name(self) -> &'static str {
+        match self {
+            ConvertTo::Double => "double",
+            ConvertTo::String => "string",
+            ConvertTo::ObjectId => "objectId",
+            ConvertTo::Bool => "bool",
+            ConvertTo::Date => "date",
+            ConvertTo::Int => "int",
+            ConvertTo::Long => "long",
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The tree
 // ---------------------------------------------------------------------------
@@ -243,6 +340,18 @@ pub enum Expr {
     Switch { branches: Vec<(Expr, Expr)>, default: Option<Box<Expr>> },
     /// `{$dateToString: {date: <expr>, format: "<fmt>"}}`.
     DateToString { date: Box<Expr>, format: String },
+    /// `{$convert: {input, to, onError?, onNull?}}`, and the `$toX` shorthands,
+    /// which are the same node with no fallbacks.
+    ///
+    /// `on_null` answers a null or missing input; `on_error` answers a value
+    /// that has no conversion. Neither is evaluated unless it is needed, so a
+    /// fallback may itself be an expression that would fail on other rows.
+    Convert {
+        input: Box<Expr>,
+        to: ConvertTo,
+        on_error: Option<Box<Expr>>,
+        on_null: Option<Box<Expr>>,
+    },
     /// A document whose values are expressions.
     Object(Vec<(String, Expr)>),
 }
@@ -300,6 +409,10 @@ impl Expr {
         match first.as_str() {
             "$switch" => Self::parse_switch(raw),
             "$dateToString" => Self::parse_date_to_string(raw),
+            "$convert" => Self::parse_convert(raw),
+            name if ConvertTo::from_shorthand(name).is_some() => {
+                Self::parse_convert_shorthand(name, raw)
+            }
             name => {
                 let Some(op) = Op::from_name(name) else {
                     return Err(Error::UnsupportedOperator(format!(
@@ -406,6 +519,64 @@ impl Expr {
         Ok(Expr::DateToString { date: Box::new(Self::parse(date)?), format })
     }
 
+    /// `{$convert: {input: <expr>, to: <type>, onError?: <expr>, onNull?: <expr>}}`.
+    ///
+    /// `to` is a constant. MongoDB lets it be an expression; nothing here
+    /// needs a per-document target type, and a constant is what lets the
+    /// unsupported `decimal` be refused before a document is read. A key this
+    /// does not know is an error rather than being ignored: `onerror` for
+    /// `onError` would otherwise silently mean "no fallback".
+    fn parse_convert(raw: &Bson) -> Result<Self> {
+        let Bson::Document(spec) = raw else {
+            return Err(Error::InvalidQuery(format!(
+                "$convert takes a document, found {}",
+                type_name(raw)
+            )));
+        };
+        for key in spec.keys() {
+            if !matches!(key.as_str(), "input" | "to" | "onError" | "onNull") {
+                return Err(Error::InvalidQuery(format!(
+                    "$convert does not take {key:?}; it takes input, to, onError and onNull"
+                )));
+            }
+        }
+        let Some(input) = spec.get("input") else {
+            return Err(Error::InvalidQuery("$convert needs an `input`".into()));
+        };
+        let Some(to) = spec.get("to") else {
+            return Err(Error::InvalidQuery(
+                "$convert needs a `to`: a type name such as \"int\" or its numeric code".into(),
+            ));
+        };
+        let optional = |key: &str| -> Result<Option<Box<Expr>>> {
+            spec.get(key).map(|v| Self::parse(v).map(Box::new)).transpose()
+        };
+        Ok(Expr::Convert {
+            input: Box::new(Self::parse(input)?),
+            to: ConvertTo::parse(to)?,
+            on_error: optional("onError")?,
+            on_null: optional("onNull")?,
+        })
+    }
+
+    /// `{$toInt: <expr>}` and its siblings: a `$convert` with the target
+    /// fixed and no fallbacks. Takes the single value or a one-element array,
+    /// as every other one-argument operator does.
+    fn parse_convert_shorthand(name: &str, raw: &Bson) -> Result<Self> {
+        let to = ConvertTo::from_shorthand(name).expect("checked by the caller");
+        let arg = match raw {
+            Bson::Array(items) if items.len() == 1 => &items[0],
+            Bson::Array(items) => {
+                return Err(Error::InvalidQuery(format!(
+                    "{name} takes exactly 1 argument, found {}",
+                    items.len()
+                )));
+            }
+            single => single,
+        };
+        Ok(Expr::Convert { input: Box::new(Self::parse(arg)?), to, on_error: None, on_null: None })
+    }
+
     /// Resolve against a document.
     ///
     /// A missing field is `Null`, matching how the filter layer treats absence.
@@ -443,6 +614,25 @@ impl Expr {
                     type_name(&other)
                 ))),
             },
+            Expr::Convert { input, to, on_error, on_null } => {
+                // An error in the input expression itself is not a conversion
+                // error and is not caught by `onError`: a fallback is for a
+                // value that cannot be converted, not for a broken expression.
+                let value = input.eval(doc)?;
+                if matches!(value, Bson::Null | Bson::Undefined) {
+                    return match on_null {
+                        Some(fallback) => fallback.eval(doc),
+                        None => Ok(Bson::Null),
+                    };
+                }
+                match convert(&value, *to) {
+                    Ok(converted) => Ok(converted),
+                    Err(e) => match on_error {
+                        Some(fallback) => fallback.eval(doc),
+                        None => Err(e),
+                    },
+                }
+            }
             Expr::Op(op, args) if op.is_lazy() => eval_lazy(*op, args, doc),
             Expr::Op(op, args) => {
                 let values = args.iter().map(|a| a.eval(doc)).collect::<Result<Vec<_>>>()?;
@@ -961,6 +1151,174 @@ fn format_date(millis: i64, format: &str) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Type conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a non-null value, or say why it cannot be.
+///
+/// The pairs follow MongoDB's table: a number is exact where it can be and an
+/// error where it would be truncated *in range* (`$toInt` of 2^40) rather than
+/// silently wrapped; a string is parsed strictly, so `"12abc"` is an error and
+/// not 12; a date is its epoch milliseconds in either direction. What is not
+/// in the table — a document to a number, an array to a date — is an error
+/// naming both types, which `onError` turns into a value.
+fn convert(value: &Bson, to: ConvertTo) -> Result<Bson> {
+    let unsupported = || {
+        Error::InvalidQuery(format!(
+            "$convert cannot convert {} to {}",
+            type_name(value),
+            to.name()
+        ))
+    };
+    match to {
+        ConvertTo::Double => Ok(Bson::Double(match value {
+            Bson::Double(d) => *d,
+            Bson::Int32(n) => f64::from(*n),
+            Bson::Int64(n) => *n as f64,
+            Bson::Boolean(b) => f64::from(u8::from(*b)),
+            Bson::DateTime(dt) => dt.timestamp_millis() as f64,
+            Bson::String(s) => s.parse::<f64>().map_err(|_| {
+                Error::InvalidQuery(format!("$convert cannot read {s:?} as a double"))
+            })?,
+            _ => return Err(unsupported()),
+        })),
+        ConvertTo::Int => {
+            let n = convert_integer(value, to)?;
+            i32::try_from(n).map(Bson::Int32).map_err(|_| {
+                Error::InvalidQuery(format!("$convert: {n} is out of range for an int"))
+            })
+        }
+        ConvertTo::Long => convert_integer(value, to).map(Bson::Int64),
+        ConvertTo::String => Ok(Bson::String(match value {
+            Bson::String(s) => s.clone(),
+            Bson::Int32(n) => n.to_string(),
+            Bson::Int64(n) => n.to_string(),
+            Bson::Double(d) => double_to_string(*d),
+            Bson::Boolean(b) => b.to_string(),
+            // ISO 8601 with milliseconds, which is `$dateToString`'s default
+            // and what `$toDate` reads back.
+            Bson::DateTime(dt) => format_date(dt.timestamp_millis(), "%Y-%m-%dT%H:%M:%S.%LZ")?,
+            Bson::ObjectId(oid) => oid.to_hex(),
+            _ => return Err(unsupported()),
+        })),
+        // Everything present is true except a zero, which is MongoDB's rule:
+        // `"false"` is a non-empty string and therefore true.
+        ConvertTo::Bool => Ok(Bson::Boolean(match value {
+            Bson::Boolean(b) => *b,
+            Bson::Int32(n) => *n != 0,
+            Bson::Int64(n) => *n != 0,
+            Bson::Double(d) => *d != 0.0,
+            _ => true,
+        })),
+        ConvertTo::Date => Ok(Bson::DateTime(match value {
+            Bson::DateTime(dt) => *dt,
+            Bson::Int32(n) => bson::DateTime::from_millis(i64::from(*n)),
+            Bson::Int64(n) => bson::DateTime::from_millis(*n),
+            Bson::Double(d) => bson::DateTime::from_millis(double_to_i64(*d).ok_or_else(|| {
+                Error::InvalidQuery(format!("$convert: {d} is not a whole number of milliseconds"))
+            })?),
+            Bson::String(s) => parse_date(s)?,
+            // The creation time an ObjectId carries in its leading bytes.
+            Bson::ObjectId(oid) => oid.timestamp(),
+            _ => return Err(unsupported()),
+        })),
+        ConvertTo::ObjectId => match value {
+            Bson::ObjectId(_) => Ok(value.clone()),
+            Bson::String(s) => bson::oid::ObjectId::parse_str(s).map(Bson::ObjectId).map_err(|_| {
+                Error::InvalidQuery(format!(
+                    "$convert cannot read {s:?} as an ObjectId; it takes 24 hexadecimal characters"
+                ))
+            }),
+            _ => Err(unsupported()),
+        },
+    }
+}
+
+/// The integer a value converts to, before the target's range is applied.
+fn convert_integer(value: &Bson, to: ConvertTo) -> Result<i64> {
+    match value {
+        Bson::Int32(n) => Ok(i64::from(*n)),
+        Bson::Int64(n) => Ok(*n),
+        Bson::Boolean(b) => Ok(i64::from(*b)),
+        // Truncated toward zero, as MongoDB does; a value with no integer
+        // representation at all — NaN, infinity, beyond 2^63 — is an error.
+        Bson::Double(d) => double_to_i64(*d).ok_or_else(|| {
+            Error::InvalidQuery(format!("$convert: {d} has no {} representation", to.name()))
+        }),
+        // A base-10 integer and nothing else: `"1.5"` is not one, and neither
+        // is `"12abc"`. Reading a prefix would turn a data error into a number.
+        Bson::String(s) => s.parse::<i64>().map_err(|_| {
+            Error::InvalidQuery(format!("$convert cannot read {s:?} as {}", article(to.name())))
+        }),
+        // Epoch milliseconds fit a long and never an int, so only the one
+        // direction is offered rather than an int conversion that always
+        // fails on range.
+        Bson::DateTime(dt) if to == ConvertTo::Long => Ok(dt.timestamp_millis()),
+        _ => Err(Error::InvalidQuery(format!(
+            "$convert cannot convert {} to {}",
+            type_name(value),
+            to.name()
+        ))),
+    }
+}
+
+/// A double truncated toward zero, when that is an `i64`.
+fn double_to_i64(d: f64) -> Option<i64> {
+    // `as` saturates, so the range is checked first: 2^63 is exactly
+    // representable as a double and is one past the largest i64.
+    let t = d.trunc();
+    (d.is_finite() && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&t))
+        .then_some(t as i64)
+}
+
+/// Rust's shortest round-trip rendering, with the non-finite spellings
+/// MongoDB uses. `2.0` prints as `2`, exactly as MongoDB's `$toString` does.
+fn double_to_string(d: f64) -> String {
+    if d.is_nan() {
+        "NaN".to_string()
+    } else if d.is_infinite() {
+        if d > 0.0 { "Infinity" } else { "-Infinity" }.to_string()
+    } else {
+        d.to_string()
+    }
+}
+
+/// RFC 3339 first, then the looser spellings MongoDB accepts: a bare date, a
+/// space between date and time, and a missing zone — read as UTC, because BSON
+/// dates carry no zone and there is no other honest choice.
+fn parse_date(s: &str) -> Result<bson::DateTime> {
+    if let Ok(dt) = bson::DateTime::parse_rfc3339_str(s) {
+        return Ok(dt);
+    }
+    let mut candidate = s.trim().replacen(' ', "T", 1);
+    let time_at = match candidate.find('T') {
+        Some(i) => i,
+        None => {
+            candidate.push_str("T00:00:00");
+            candidate.len() - 9
+        }
+    };
+    let has_zone = candidate.ends_with(['Z', 'z'])
+        || candidate[time_at..].contains('+')
+        || candidate[time_at..].contains('-');
+    if !has_zone {
+        candidate.push('Z');
+    }
+    bson::DateTime::parse_rfc3339_str(&candidate).map_err(|_| {
+        Error::InvalidQuery(format!(
+            "$convert cannot read {s:?} as a date; use RFC 3339, e.g. \"2026-08-12T13:45:07Z\""
+        ))
+    })
+}
+
+fn article(noun: &str) -> String {
+    match noun.chars().next() {
+        Some('a' | 'e' | 'i' | 'o' | 'u') => format!("an {noun}"),
+        _ => format!("a {noun}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -987,6 +1345,8 @@ pub(crate) fn type_name(value: &Bson) -> &'static str {
         Bson::Null => "null",
         Bson::Int32(_) | Bson::Int64(_) => "an integer",
         Bson::DateTime(_) => "a date",
+        Bson::ObjectId(_) => "an ObjectId",
+        Bson::Decimal128(_) => "a Decimal128",
         _ => "that type",
     }
 }
@@ -1494,5 +1854,220 @@ mod tests {
             Bson::Double(d) => assert!(d > 1.8e19),
             other => panic!("expected a double, got {other:?}"),
         }
+    }
+
+    // -- type conversion --------------------------------------------------
+
+    fn err(expr: Document, d: Document) -> String {
+        ev(expr.into(), &d).expect_err("expression should fail").to_string()
+    }
+
+    #[test]
+    fn a_shorthand_takes_one_value_or_a_one_element_array() {
+        assert_eq!(on(doc! {"$toInt": "$s"}.into(), doc! {"s": "42"}), Bson::Int32(42));
+        assert_eq!(on(doc! {"$toInt": ["$s"]}.into(), doc! {"s": "42"}), Bson::Int32(42));
+        assert!(Expr::parse(&doc! {"$toInt": ["$s", "$t"]}.into()).is_err());
+    }
+
+    #[test]
+    fn convert_takes_a_type_name_or_its_code() {
+        let by_name = doc! {"$convert": {"input": "7", "to": "int"}};
+        let by_code = doc! {"$convert": {"input": "7", "to": 16}};
+        assert_eq!(ok(by_name.into()), Bson::Int32(7));
+        assert_eq!(ok(by_code.into()), Bson::Int32(7));
+        assert_eq!(ok(doc! {"$convert": {"input": 7, "to": 2}}.into()), Bson::String("7".into()));
+    }
+
+    #[test]
+    fn convert_refuses_a_malformed_specification_at_parse() {
+        for spec in [
+            doc! {"$convert": "int"},
+            doc! {"$convert": {"to": "int"}},
+            doc! {"$convert": {"input": 1}},
+            doc! {"$convert": {"input": 1, "to": "int", "onerror": 0}},
+            doc! {"$convert": {"input": 1, "to": "widget"}},
+            doc! {"$convert": {"input": 1, "to": 3}},
+            doc! {"$convert": {"input": 1, "to": "$field"}},
+        ] {
+            assert!(Expr::parse(&spec.clone().into()).is_err(), "{spec:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn convert_to_decimal_is_refused_with_a_reason() {
+        // Decimal128 has no exact key encoding here (ADR-005), so a value
+        // converted to it could be neither indexed nor grouped.
+        let by_name = Expr::parse(&doc! {"$convert": {"input": 1, "to": "decimal"}}.into());
+        let by_code = Expr::parse(&doc! {"$convert": {"input": 1, "to": 19}}.into());
+        for result in [by_name, by_code] {
+            let msg = result.expect_err("decimal must be refused").to_string();
+            assert!(msg.contains("Decimal128"), "the refusal should say why: {msg}");
+        }
+    }
+
+    #[test]
+    fn a_null_or_missing_input_is_null_unless_on_null_says_otherwise() {
+        assert_eq!(on(doc! {"$toInt": "$gone"}.into(), doc! {}), Bson::Null);
+        assert_eq!(on(doc! {"$toInt": "$n"}.into(), doc! {"n": Bson::Null}), Bson::Null);
+        let with_fallback = doc! {"$convert": {"input": "$gone", "to": "int", "onNull": 0}};
+        assert_eq!(on(with_fallback.into(), doc! {}), Bson::Int32(0));
+    }
+
+    #[test]
+    fn on_error_answers_an_unconvertible_value() {
+        let expr = doc! {"$convert": {"input": "$s", "to": "int", "onError": -1}};
+        assert_eq!(on(expr.clone().into(), doc! {"s": "abc"}), Bson::Int32(-1));
+        assert_eq!(on(expr.into(), doc! {"s": "12"}), Bson::Int32(12));
+        // Without it the error names both sides.
+        let msg = err(doc! {"$toInt": "$s"}, doc! {"s": {"a": 1}});
+        assert!(msg.contains("document") && msg.contains("int"), "{msg}");
+    }
+
+    #[test]
+    fn the_fallbacks_are_lazy() {
+        // A fallback that would fail is not evaluated when it is not needed.
+        let on_null = doc! {"$convert": {"input": 5, "to": "long", "onNull": {"$divide": [1, 0]}}};
+        assert_eq!(ok(on_null.into()), Bson::Int64(5));
+        let on_error =
+            doc! {"$convert": {"input": 5, "to": "long", "onError": {"$divide": [1, 0]}}};
+        assert_eq!(ok(on_error.into()), Bson::Int64(5));
+    }
+
+    #[test]
+    fn on_error_does_not_catch_an_error_in_the_input_expression() {
+        // The fallback is for a value with no conversion, not for a broken
+        // expression: hiding the latter would make a typo look like data.
+        let expr = doc! {"$convert": {"input": {"$divide": [1, 0]}, "to": "int", "onError": 0}};
+        assert!(ev(expr.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_double_widens_numbers_and_parses_strings() {
+        assert_eq!(ok(doc! {"$toDouble": 5}.into()), Bson::Double(5.0));
+        assert_eq!(ok(doc! {"$toDouble": 5i64}.into()), Bson::Double(5.0));
+        assert_eq!(ok(doc! {"$toDouble": true}.into()), Bson::Double(1.0));
+        assert_eq!(ok(doc! {"$toDouble": "1.5"}.into()), Bson::Double(1.5));
+        assert_eq!(ok(doc! {"$toDouble": "-1e3"}.into()), Bson::Double(-1000.0));
+        assert_eq!(ok(doc! {"$toDouble": dt(1_500)}.into()), Bson::Double(1500.0));
+        assert!(ev(doc! {"$toDouble": "1.5kg"}.into(), &Document::new()).is_err());
+        // `$literal`, because a bare one-element array is the argument list.
+        assert!(ev(doc! {"$toDouble": {"$literal": [1]}}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_int_truncates_toward_zero_and_refuses_what_does_not_fit() {
+        assert_eq!(ok(doc! {"$toInt": 3.9}.into()), Bson::Int32(3));
+        assert_eq!(ok(doc! {"$toInt": -3.9}.into()), Bson::Int32(-3));
+        assert_eq!(ok(doc! {"$toInt": true}.into()), Bson::Int32(1));
+        assert_eq!(ok(doc! {"$toInt": 7i64}.into()), Bson::Int32(7));
+        assert_eq!(ok(doc! {"$toInt": "-42"}.into()), Bson::Int32(-42));
+        // Out of range is an error, not a wrap: 2^40 has no int.
+        assert!(err(doc! {"$toInt": 1_099_511_627_776i64}, doc! {}).contains("out of range"));
+        assert!(err(doc! {"$toInt": 1.0e12}, doc! {}).contains("out of range"));
+        assert!(ev(doc! {"$toInt": f64::NAN}.into(), &Document::new()).is_err());
+        // A string is a base-10 integer or nothing: no prefixes, no decimals.
+        assert!(ev(doc! {"$toInt": "1.5"}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$toInt": "12abc"}.into(), &Document::new()).is_err());
+        // Epoch milliseconds never fit an int, so a date has no int form.
+        assert!(ev(doc! {"$toInt": dt(0)}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_long_takes_dates_and_large_doubles() {
+        assert_eq!(
+            ok(doc! {"$toLong": dt(1_786_542_307_250)}.into()),
+            Bson::Int64(1_786_542_307_250)
+        );
+        assert_eq!(ok(doc! {"$toLong": 1.0e18}.into()), Bson::Int64(1_000_000_000_000_000_000));
+        assert_eq!(
+            ok(doc! {"$toLong": "9007199254740993"}.into()),
+            Bson::Int64(9_007_199_254_740_993)
+        );
+        assert_eq!(ok(doc! {"$toLong": 5}.into()), Bson::Int64(5));
+        // 1e19 is past i64::MAX.
+        assert!(ev(doc! {"$toLong": 1.0e19}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_string_renders_each_type_the_way_the_edge_does() {
+        assert_eq!(ok(doc! {"$toString": 42}.into()), Bson::String("42".into()));
+        assert_eq!(ok(doc! {"$toString": -7i64}.into()), Bson::String("-7".into()));
+        assert_eq!(ok(doc! {"$toString": 1.5}.into()), Bson::String("1.5".into()));
+        // A whole double prints without a fractional part, as MongoDB's does.
+        assert_eq!(ok(doc! {"$toString": 2.0}.into()), Bson::String("2".into()));
+        assert_eq!(ok(doc! {"$toString": true}.into()), Bson::String("true".into()));
+        assert_eq!(
+            ok(doc! {"$toString": dt(1_786_542_307_250)}.into()),
+            Bson::String("2026-08-12T13:45:07.250Z".into())
+        );
+        let oid = bson::oid::ObjectId::new();
+        assert_eq!(ok(doc! {"$toString": oid}.into()), Bson::String(oid.to_hex()));
+        assert_eq!(ok(doc! {"$toString": f64::INFINITY}.into()), Bson::String("Infinity".into()));
+        assert!(ev(doc! {"$toString": {"$literal": [1, 2]}}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$toString": {"a": 1}}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_bool_is_false_only_for_zero() {
+        assert_eq!(ok(doc! {"$toBool": 0}.into()), Bson::Boolean(false));
+        assert_eq!(ok(doc! {"$toBool": 0.0}.into()), Bson::Boolean(false));
+        assert_eq!(ok(doc! {"$toBool": 0i64}.into()), Bson::Boolean(false));
+        assert_eq!(ok(doc! {"$toBool": 5}.into()), Bson::Boolean(true));
+        assert_eq!(ok(doc! {"$toBool": false}.into()), Bson::Boolean(false));
+        // MongoDB's rule, and a trap worth pinning: any string is true.
+        assert_eq!(ok(doc! {"$toBool": "false"}.into()), Bson::Boolean(true));
+        assert_eq!(ok(doc! {"$toBool": ""}.into()), Bson::Boolean(true));
+        assert_eq!(ok(doc! {"$toBool": dt(0)}.into()), Bson::Boolean(true));
+        assert_eq!(ok(doc! {"$toBool": {"$literal": [0]}}.into()), Bson::Boolean(true));
+    }
+
+    #[test]
+    fn to_date_reads_epoch_milliseconds_and_iso_8601() {
+        assert_eq!(ok(doc! {"$toDate": 1_500i64}.into()), dt(1_500));
+        assert_eq!(ok(doc! {"$toDate": 1_500}.into()), dt(1_500));
+        assert_eq!(ok(doc! {"$toDate": 1_500.9}.into()), dt(1_500));
+        assert_eq!(ok(doc! {"$toDate": "2026-08-12T13:45:07.250Z"}.into()), dt(1_786_542_307_250));
+        // An offset is honoured: 13:45:07 at +02:00 is 11:45:07Z.
+        assert_eq!(
+            ok(doc! {"$toDate": "2026-08-12T13:45:07.250+02:00"}.into()),
+            dt(1_786_542_307_250 - 2 * 3_600_000)
+        );
+        // The looser spellings MongoDB takes: a bare date is midnight UTC, a
+        // space may separate date and time, and no zone means UTC.
+        assert_eq!(ok(doc! {"$toDate": "2026-08-12"}.into()), dt(1_786_492_800_000));
+        assert_eq!(ok(doc! {"$toDate": "2026-08-12 13:45:07"}.into()), dt(1_786_542_307_000));
+        assert_eq!(ok(doc! {"$toDate": "2026-08-12T13:45:07"}.into()), dt(1_786_542_307_000));
+        assert!(ev(doc! {"$toDate": "yesterday"}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$toDate": true}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn to_date_of_an_object_id_is_its_creation_time() {
+        // The leading four bytes are seconds since the epoch, big-endian.
+        let oid = bson::oid::ObjectId::from_bytes([0, 0, 0, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(ok(doc! {"$toDate": oid}.into()), dt(2_000));
+    }
+
+    #[test]
+    fn to_object_id_parses_hex_and_passes_one_through() {
+        let oid = bson::oid::ObjectId::new();
+        assert_eq!(ok(doc! {"$toObjectId": oid.to_hex()}.into()), Bson::ObjectId(oid));
+        assert_eq!(ok(doc! {"$toObjectId": oid}.into()), Bson::ObjectId(oid));
+        assert!(ev(doc! {"$toObjectId": "not-hex"}.into(), &Document::new()).is_err());
+        assert!(ev(doc! {"$toObjectId": 12}.into(), &Document::new()).is_err());
+    }
+
+    #[test]
+    fn a_date_survives_a_round_trip_through_a_string() {
+        let expr = doc! {"$toDate": {"$toString": "$t"}};
+        assert_eq!(on(expr.into(), doc! {"t": dt(1_786_542_307_250)}), dt(1_786_542_307_250));
+    }
+
+    #[test]
+    fn a_conversion_composes_with_arithmetic() {
+        // The motivating shape: a quantity stored as text on some rows.
+        let expr = doc! {"$multiply": [{"$toInt": "$qty"}, 2]};
+        assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int64(42));
+        assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int64(42));
     }
 }
