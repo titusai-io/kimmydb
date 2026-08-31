@@ -291,6 +291,46 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
 mod tests {
     use super::*;
 
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    /// RFC 4231 test case 2, against the primitive these functions are built
+    /// on. A dependency bump that changed what `Hmac<Sha256>` computes would
+    /// re-tag every datagram on the wire and invalidate every webhook
+    /// signature a receiver has stored — silently, because both sides of a
+    /// single-version cluster would agree with each other and with nothing
+    /// else. This is the check that does not move when the crates do.
+    #[test]
+    fn hmac_sha256_matches_rfc_4231() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+
+        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"Jefe").expect("any key length");
+        mac.update(b"what do ya want for nothing?");
+        assert_eq!(
+            hex(&mac.finalize().into_bytes()),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// The framing, not just the primitive: length prefixes in [`prove`] and
+    /// the tag layout in [`tag_datagram`]. Recorded from the implementation
+    /// these values were first produced by, so a refactor that reorders an
+    /// `update` or drops a prefix is caught even though the HMAC itself is
+    /// still correct.
+    #[test]
+    fn the_wire_tags_are_what_they_have_always_been() {
+        assert_eq!(
+            hex(&prove("cluster-secret", b"nonce-bytes", b"binding-bytes")),
+            "20f4bb5890196f25e48f02fb57c95b75b3c1b20be30e9b67140d30a8443e193c"
+        );
+        assert_eq!(
+            hex(&tag_datagram("cluster-secret", b"payload-bytes")[..TAG_LEN]),
+            "8bd9e1ea949555c5dd98a9831e2f79e90717175ac246fb8ce42de1927f6a9796"
+        );
+    }
+
     #[test]
     fn a_tagged_datagram_round_trips_under_the_right_secret() {
         let payload = b"a swim probe".as_slice();
