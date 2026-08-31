@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.17.0 - 2026-08-31
 
 A minor when it ships, not a patch. Nothing changes on the wire, on disk or
 in the `/v1` API, members of this version and 0.16.x replicate to each other,
