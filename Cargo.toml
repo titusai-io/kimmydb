@@ -38,7 +38,7 @@ kimmy-client = { path = "crates/kimmy-client" }
 # HTTP
 axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
-tower-http = { version = "0.6", features = ["trace", "cors"] }
+tower-http = { version = "0.7", features = ["trace", "cors"] }
 http-body-util = "0.1"
 
 # TLS termination. `axum::serve` has no TLS, and the serving stack is
