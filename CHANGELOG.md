@@ -21,7 +21,31 @@ of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
 (rotating it ends every session once, on every node at the same time), and a
 node reachable from the network must not be running on one of this
 repository's own example secrets. `kimmyd check-config` against the new
-binary answers both without starting anything.
+binary answers both without starting anything. The rest of the release is
+additive: two pieces of MongoDB update syntax that were the most common
+reasons an update written against MongoDB was refused here, and a
+documentation correction.
+
+### Added
+
+- **`$setOnInsert`.** Fields written only to the document an upsert creates,
+  and left alone on a match — the created-at idiom `{$setOnInsert: {created:
+  t}, $inc: {n: 1}}` on `find_and_modify` with `upsert: true`. The inserted
+  document is the filter's equalities, then `$setOnInsert`, then the other
+  operators. A `$setOnInsert` path that another operator in the same update
+  also writes — the same path, a prefix or an extension of it, or a
+  `$rename`'s destination — is refused with a `400`, as MongoDB refuses it.
+  Other operator pairs are still applied in order rather than checked; the
+  reason that stays a non-change is in `docs/deviations.md`.
+- **`$push` modifiers `$position`, `$sort` and `$slice`** alongside `$each`,
+  applied in that order: insert at an index (negative from the end), order
+  whole elements by `1` / `-1` or document elements by a `{field: direction}`
+  specification using the engine's canonical comparison, then keep the first
+  `n` or last `-n`. `{$each: [x], $sort: {t: 1}, $slice: -100}` is a capped,
+  ordered history in one write. A modifier without `$each`, or a clause
+  `$push` does not know, is an error rather than a value pushed literally.
+  `$addToSet` takes `$each` and refuses the other three, which have no
+  meaning on a set.
 
 ### Changed
 
@@ -59,6 +83,12 @@ binary answers both without starting anything.
   grants, roles and expiry without the secret; the secret provides integrity,
   and confidentiality comes from TLS and from handling the token as a
   credential.
+
+### Fixed
+
+- **`docs/query-language.md` no longer lists the aggregation pipeline and
+  index-backed `$in` as planned.** Both have shipped — the pipeline has its own
+  page — and the "Not implemented" table had not been updated to say so.
 
 ## 0.16.4 - 2026-08-29
 
