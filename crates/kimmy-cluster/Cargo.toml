@@ -22,8 +22,8 @@ bson.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true
 rcgen.workspace = true
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13"
+sha2 = "0.11"
 subtle = "2"
 parking_lot.workspace = true
 postcard = { version = "1", features = ["alloc"] }

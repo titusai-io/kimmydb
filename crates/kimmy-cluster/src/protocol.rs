@@ -199,10 +199,10 @@ pub async fn read_frame<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Message,
 /// the same bytes, and an attacker who can influence one could shift the
 /// boundary. The same reasoning as the separator in `CollectionId::derive`.
 pub fn prove(secret: &str, nonce: &[u8], binding: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
     mac.update(&(nonce.len() as u64).to_be_bytes());
     mac.update(nonce);
@@ -247,10 +247,10 @@ pub const TAG_LEN: usize = 32;
 /// cheap — so there is no session to authenticate once, and every datagram
 /// carries its own proof. See [ADR-053](../../../docs/decisions.md).
 pub fn tag_datagram(secret: &str, payload: &[u8]) -> Vec<u8> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
     mac.update(payload);
 
@@ -270,7 +270,7 @@ pub fn tag_datagram(secret: &str, payload: &[u8]) -> Vec<u8> {
 /// captured datagram being replayed — see ADR-053 for why that is out of
 /// scope here rather than overlooked.
 pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use subtle::ConstantTimeEq;
 
@@ -279,7 +279,7 @@ pub fn untag_datagram<'a>(secret: &str, datagram: &'a [u8]) -> Option<&'a [u8]> 
     }
     let (tag, payload) = datagram.split_at(TAG_LEN);
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
     mac.update(payload);
     let expected = mac.finalize().into_bytes();
@@ -303,10 +303,10 @@ mod tests {
     /// else. This is the check that does not move when the crates do.
     #[test]
     fn hmac_sha256_matches_rfc_4231() {
-        use hmac::{Hmac, Mac};
+        use hmac::{Hmac, KeyInit, Mac};
         use sha2::Sha256;
 
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(b"Jefe").expect("any key length");
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(b"Jefe").expect("any key length");
         mac.update(b"what do ya want for nothing?");
         assert_eq!(
             hex(&mac.finalize().into_bytes()),

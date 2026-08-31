@@ -490,10 +490,10 @@ pub fn event_id(entry: &OplogEntry) -> String {
 /// replayed later with a fresh one — signing the body alone would leave the
 /// timestamp free to change.
 pub fn sign(secret: &str, timestamp_ms: u64, body: &str) -> String {
-    use hmac::{Hmac, Mac};
+    use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
-    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret.as_bytes())
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret.as_bytes())
         .expect("HMAC accepts a key of any length");
     mac.update(timestamp_ms.to_string().as_bytes());
     mac.update(b".");
