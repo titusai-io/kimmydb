@@ -4670,6 +4670,11 @@ raises how many collections embed at once.
 
 ## ADR-096 — Federated tokens are refused above a maximum lifetime
 
+> **Superseded by [ADR-112](#adr-112--the-provider-decides-how-long-its-tokens-live).**
+> The refusal, its setting and its errors were removed in the release after the
+> one that shipped them. The reasoning below is kept because ADR-112 argues
+> against it and the argument is worth reading in both directions.
+
 **Decision.** `OidcVerifier::verify` refuses a token whose own `exp − iat`
 exceeds `auth.oidc.max_token_lifetime_secs`
 (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`), 900 seconds by default, and refuses a
@@ -5859,5 +5864,100 @@ through a one-day artifact, plus five minutes each. A fuzz cache on the order
 of a gibibyte, saved only from `main`. And a standing obligation: a red weekly
 run is a bug report against this repository, to be minimised, fixed and turned
 into a seed rather than silenced.
+
+---
+
+## ADR-112 — The provider decides how long its tokens live
+
+**Decision.** `OidcVerifier::verify` does not examine a federated token's
+lifetime. Signature, issuer, audience, `exp` and `nbf` decide, and how long the
+provider chose to make the token valid for is not among them.
+`auth.oidc.max_token_lifetime_secs`, its `--oidc-max-token-lifetime-secs` flag,
+its `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` variable, `TokenLifetimeExceeded`,
+`TokenLifetimeUnbounded` and `InvalidTokenLifetimeLimit` are all removed. No
+warning replaces the refusal. This supersedes ADR-096, which shipped in the
+previous release.
+
+**Why.** ADR-096 was right about the problem and wrong about whose problem it
+is. The problem is real and unchanged: a federated principal's role membership
+is frozen in its access token because this database makes no introspection
+call, so a revocation at the provider is honoured only when the token expires
+(ADR-073), and the width of that window is the token's lifetime. ADR-096
+concluded that because the lifetime is the one part of the window readable from
+here, it is the part to bound from here. That does not follow.
+
+**The failure mode is catastrophic and cannot be seen in advance.** The lifetime
+belongs to the provider and arrives only with a real token. `kimmyd
+check-config` passes, the node starts, the startup summary says nothing, and
+then every federated request is refused from the first one. An operator who read
+the upgrade notes, ran the pre-flight check the notes named and rolled the
+cluster a member at a time still ends up with a total authentication outage —
+and the 401 they get back is the same 401 an audience mismatch produces, so the
+cause is not obvious from the failure either. A default whose blast radius is
+"all federated access" and whose detectability before the fact is zero is the
+wrong default whatever it protects.
+
+**It fires on ordinary configurations, not exotic ones.** Okta, Google and Entra
+ID default access tokens to about an hour; Auth0 defaults an API's to a day.
+Every one of those is over a 900-second bound. The refusal's common case is a
+correctly configured, widely deployed identity provider, which makes it a
+compatibility break disguised as a security control.
+
+**The escape hatch ADR-096 assumed does not always exist.** Its cost section
+says an operator can "shorten the provider's lifetime for this resource, which
+every one of them supports per resource or per client". The commercial providers
+it names do. A small or in-house authorization server may mint one lifetime for
+everything it issues, in which case shortening it for this resource shortens it
+for every other relying party too. For that operator the only available lever
+was raising the limit, which makes the setting a step to discover and perform
+before the database works, in exchange for the behaviour they would have had
+without it.
+
+**And it is the operator's decision.** What was being refused is their own
+identity provider's configuration, which they control and which serves their
+other systems too. A database that rejects a token its operator's IdP just
+minted — for a property of that IdP, not of the caller or the request — is
+making a policy decision that is not its to make. No comparable product makes
+it: Elasticsearch's JWT realm, Kafka's SASL/OAUTHBEARER, Trino and MongoDB's
+OIDC support all validate the token and accept the lifetime it carries. The
+enforcement points that exist in this ecosystem are at the authorization server,
+where the operator can act on them.
+
+**Why no warning replaces it.** A rate-limited advisory WARN was implemented and
+then removed in the same round. It keeps ADR-096's premise alive — that this
+node has an opinion about a setting belonging elsewhere — which is the premise
+being rejected. It is unactionable for exactly the operator who most reliably
+triggers it, the one whose provider has a single global lifetime. It fires
+forever on configurations that are deliberate and legitimate. And a permanent
+warning nobody can act on is how a log stops being read, which costs more than
+it buys on a node that otherwise warns only about real faults. The window is now
+stated in `docs/security.md`, which is where a fact an operator should know but
+cannot change from here belongs.
+
+**What this is not.** It is not a claim that the window is harmless. It is the
+cost of verifying without an introspection call, it is why access-token
+lifetimes should be short, and the security guide says so. It is a claim that
+saying so is this project's job and enforcing it is not. An operator who wants a
+fifteen-minute window sets one at their provider, where it also protects
+everything else they run.
+
+**Cost.** The window is now bounded only by the provider, and a node cannot tell
+an operator that theirs is wide. Nothing detects a provider that starts minting
+day-long tokens. Both were true of every release before ADR-096 and are true of
+every comparable product. The tests that pinned the refusal are kept in inverted
+form — an hour-long token, a day-long token and a token with no `iat` must all
+verify, at the unit level and end to end — so that reintroducing the refusal
+fails the suite rather than passing it quietly.
+
+**Upgrade.** A `kimmy.toml` that still sets `max_token_lifetime_secs` will not
+start, because the configuration denies unknown fields; the key has to come out.
+The same is true of the command-line flag. `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`
+is different and may be left set: clap reads an environment variable only for an
+argument that declares it, and nothing declares that one now, so a stale
+variable is ignored rather than fatal. The distinction is worth stating in the
+release notes rather than giving one instruction for all three, because an
+operator told to clear the variable might clear it *before* upgrading, which on
+the previous release reverts them to the 900-second default and causes the very
+outage this removes.
 
 ---

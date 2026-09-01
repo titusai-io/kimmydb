@@ -177,15 +177,13 @@ mistyped rather than a different kind of value ([ADR-071](decisions.md)).
 | `sub` | Required to be present; becomes the principal's name. |
 | `exp` | Not past, allowing 60 seconds. **Required to be present.** |
 | `nbf` | Not future, allowing 60 seconds. *Optional* — a token without one is fine. |
-| `iat` | **Required to be present** — without it the lifetime below cannot be measured. RFC 9068 §2.2 requires it in an access token. |
-| Lifetime | `exp − iat` at most `max_token_lifetime_secs`, 900 by default. The token's own two claims: no clock and no leeway in it. |
+| `iat` | *Optional* — RFC 9068 §2.2 requires it in an access token, but nothing here reads it. |
 | `typ` | `at+jwt`, only when `require_at_jwt = true`. Off by default. |
 
-`iss`, `aud`, `exp`, `iat` and `sub` are required to be **present**, not merely
-checked when they happen to appear. A token that simply omits its audience
-would otherwise sail past the audience restriction, which is the whole reason
-the audience is configured — and one that omitted `iat` would sail past the
-lifetime limit the same way.
+`iss`, `aud`, `exp` and `sub` are required to be **present**, not merely checked
+when they happen to appear. A token that simply omits its audience would
+otherwise sail past the audience restriction, which is the whole reason the
+audience is configured.
 
 The 60 seconds of leeway covers `exp` and `nbf` alike. The local HS256 path
 allows none: cluster nodes are expected to agree about the time and are run by
@@ -209,52 +207,48 @@ opaque audience it is the only check of its kind, so turn it on — after
 decoding a real token from your provider and confirming what it stamps
 ([ADR-072](decisions.md)).
 
-#### The lifetime limit, and why it is 900 seconds
+#### The revocation window, and why this node does not bound it
 
 A federated principal's role *membership* is frozen in its access token. This
 database makes no introspection call — verification is a pure function of the
 token, the key set and the configuration, which is what keeps authentication
 free on the request path — so when the provider revokes someone's membership,
 this node honours the old claim until that token expires
-([ADR-073](decisions.md)). The width of that window is the token's own
-lifetime, and it is the provider that chooses it.
-`auth.oidc.max_token_lifetime_secs` is where this node bounds it: a token whose
-`exp − iat` exceeds the limit is refused, however recently it was minted and
-however little of it remains.
+([ADR-073](decisions.md)).
 
-**900 seconds by default.** Providers default access tokens to somewhere
-between five minutes and an hour, and a few to a day. Fifteen minutes admits
-the short defaults outright and asks the rest a question rather than
-answering it silently: shorten the lifetime the provider mints for this
-resource — the commercial providers this federation is written against can all
-do that per resource or per client — or raise the limit knowingly. Not every
-provider can: a small or in-house authorization server may mint one lifetime
-for everything it issues, in which case shortening it for this resource
-shortens it for every other relying party too, and raising the limit here is
-the only lever that does not. Raising it is then the correct choice rather than
-the lax one, and the number it is raised to should be the lifetime the provider
-actually mints, not a round number above it.
+**So the revocation window is exactly the access-token lifetime your provider
+mints.** If your tokens live an hour, a role you remove at the provider is
+honoured here for up to an hour after you remove it. That is worth knowing
+before you decide it is acceptable, and it is the single most useful number to
+have in mind when configuring federation against this database.
 
-The question arrives on the first request: the 401 carries
-`error="invalid_token"` with an `error_description` naming the limit in seconds
-and nothing about the token, and the node logs the refusal at WARN — at most
-once a minute — naming the minted lifetime alongside the limit, so the
-misconfiguration is legible from the node's own log and not only from a
-caller's failed request. A raised limit is printed in the startup summary, and
-the setting is refused outside 1–86400 ([ADR-096](decisions.md)).
+**Shortening it is done at your provider, not here.** KimmyDB accepts whatever
+lifetime the token carries and says nothing about it
+([ADR-112](decisions.md)) — no refusal, no warning, no setting. Every provider
+this federation is written against exposes the lifetime: an API's token
+lifetime in Auth0, an access policy on the authorization server in Okta, a
+token lifetime policy in Entra ID, a client-level lifespan in Keycloak. Setting
+it there is also what protects everything *else* those tokens reach, which is
+why it is the right place for the control and this is not.
 
-The check is on the token's two claims and nothing else. It does not consult
-the clock, so the 60 seconds of leeway above play no part in it: the leeway
-exists because the provider's clock is somebody else's, and that says nothing
-about how long the provider chose to make a token valid for. A token with no
-`iat` is refused because its lifetime cannot be measured — accepting it would
-put the limit one omitted claim away from not applying. RFC 9068 §2.2
-requires the claim in a JWT access token, so a conforming provider never omits
-it.
+An earlier release refused a token whose `exp − iat` exceeded a configured
+bound, defaulting to 900 seconds. It was removed because the default turned a
+correctly configured provider — Okta, Google and Entra ID all default to about
+an hour — into a total authentication outage on upgrade, with nothing in
+`check-config` or the startup summary able to predict it, and because the
+lifetime is the operator's decision at their identity provider rather than this
+database's to override. [ADR-112](decisions.md) has the full argument.
 
-What this does not do is revoke anything. A membership revoked at the provider
-is still honoured until the token expires; the limit says how long that can
-be, and no longer.
+If a short window matters to you, the practical guidance is the ordinary one:
+five to fifteen minutes for an access token, with refresh handling renewal so
+nobody has to log in again. Anything over an hour is worth a deliberate
+decision rather than a default.
+
+What no lifetime does is revoke anything. A membership revoked at the provider
+is still honoured until the token expires. The local HS256 path is different
+and does have immediate revocation — see [Revoking a token](#revoking-a-token)
+— because a local principal has a user record to check a token version
+against, and a federated one does not.
 
 ### Refusals say how to authenticate
 
@@ -376,10 +370,10 @@ local user who happened to share the asserted name would silently decide whether
 the federated caller could connect.
 
 So the session ends where it began: at the provider, and at the moment the
-current token expires — which is at most `max_token_lifetime_secs` after it was
-issued, 900 seconds by default, because this node refuses a token that would
-live longer ([the lifetime limit](#the-lifetime-limit-and-why-it-is-900-seconds)).
-Keep the provider's lifetime at or below that rather than raising it.
+current token expires — which is however long the provider chose to make it,
+because this node does not examine that
+([the revocation window](#the-revocation-window-and-why-this-node-does-not-bound-it)).
+Keep the provider's access-token lifetime short and the window is short.
 `/v1/auth/refresh` refuses a federated principal rather than issuing a
 replacement — minting a local token from a federated identity would shed the
 origin flag and outlive the provider's say in it ([ADR-065](decisions.md)).
@@ -802,9 +796,9 @@ surfaces either way.
 - Their *membership* is not. The `roles` claim is frozen in the provider's
   access token and this database makes no introspection call, so if the provider
   revokes someone's membership, this node honours the old claim until that token
-  expires. That window is bounded by `auth.oidc.max_token_lifetime_secs`, 900
-  seconds by default: a token that would live longer is refused
-  ([ADR-096](decisions.md)).
+  expires. That window is the provider's access-token lifetime, and it is set
+  at the provider — this node accepts whatever the token carries
+  ([ADR-112](decisions.md)).
 
 **Deleting a role leaves its name on holders' records**, where it resolves to
 nothing — as does a mapping naming a role that was never created. The
@@ -973,7 +967,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **No client certificates** | Not planned | The server proves itself to clients; clients authenticate with a bearer token |
 | **Per-session revocation** | Not planned | Revocation is per user: all of that user's tokens, or none. See above |
 | **Enterprise SSO** | ✅ OIDC | One external issuer, RS256/ES256, inline role mappings — see [Two ways in](#two-ways-in-one-decision). SAML and LDAP are not planned |
-| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; the node refuses a federated token valid for longer than `max_token_lifetime_secs` (900 s by default), so the revocation is honoured within that long ([ADR-096](decisions.md)) |
+| **Revoking a federated session from here** | Not possible | There is no local record to revoke. Revoke at the provider; it is honoured here when the token expires, so the window is the access-token lifetime your provider mints ([ADR-112](decisions.md)) |
 | **Federated `admin`** | By design | `admin` is local-only, so a compromised identity provider cannot mint a superuser ([ADR-067](decisions.md)) |
 | **Rate limiting** | ✅ login · ✅ per principal, opt-in | See [Login rate limiting](#login-rate-limiting) and [Limits on authenticated requests](#limits-on-authenticated-requests). Per-*address* limiting of authenticated routes is still a proxy's job |
 | **A slow or oversized request from an authenticated caller** | ✅ Built | A request deadline and a body ceiling, both settings with defaults matching what the server always did — see [Limits on authenticated requests](#limits-on-authenticated-requests) |

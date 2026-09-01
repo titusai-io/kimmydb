@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use kimmy_auth::{AuthError, JwkSet, OidcVerifier, Principal};
 use parking_lot::{Mutex, RwLock};
 use tokio::sync::Notify;
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Shortest gap between two key-id-driven refetches.
 ///
@@ -35,15 +35,6 @@ use tracing::{debug, warn};
 /// any value with that property is as good as any other.
 pub const MIN_REFETCH_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Shortest gap between two lifetime-refusal warnings.
-///
-/// A lifetime refusal is not a one-off: a provider minting tokens over the
-/// limit produces one on *every* request from *every* caller until somebody
-/// changes a number, so an unlimited warning would be the loudest line in the
-/// log precisely when the node is otherwise silent. One a minute is enough to
-/// find, and few enough to sit alongside a real workload's logs.
-const MIN_LIFETIME_WARNING_INTERVAL: Duration = Duration::from_secs(60);
-
 /// The current verifier, plus the channel that asks for a fresher key set.
 pub struct Federation {
     verifier: RwLock<Arc<OidcVerifier>>,
@@ -51,10 +42,6 @@ pub struct Federation {
     refresh: Notify,
     /// When the last nudge was let through, for the rate limit above.
     last_nudge: Mutex<Option<Instant>>,
-    /// When the last lifetime refusal was warned about, for the rate limit
-    /// above. Separate from `last_nudge`: the two say different things and one
-    /// must not silence the other.
-    last_lifetime_warning: Mutex<Option<Instant>>,
 }
 
 impl Federation {
@@ -63,7 +50,6 @@ impl Federation {
             verifier: RwLock::new(Arc::new(verifier)),
             refresh: Notify::new(),
             last_nudge: Mutex::new(None),
-            last_lifetime_warning: Mutex::new(None),
         })
     }
 
@@ -152,56 +138,10 @@ impl Federation {
         // request and a request cannot hold the writer off.
         let verifier = Arc::clone(&*self.verifier.read());
         let outcome = verifier.verify(token);
-        match &outcome {
-            Err(AuthError::UnknownSigningKey(kid)) => self.request_refresh(kid),
-            Err(AuthError::TokenLifetimeExceeded { max_secs, lifetime_secs }) => {
-                self.warn_about_lifetime(format_args!(
-                    "the provider is minting access tokens valid for {lifetime_secs}s, longer \
-                     than the {max_secs}s this node accepts; every federated request is being \
-                     refused. Shorten the provider's access token lifetime for this resource, \
-                     or raise auth.oidc.max_token_lifetime_secs knowingly"
-                ));
-            }
-            Err(AuthError::TokenLifetimeUnbounded { max_secs }) => {
-                self.warn_about_lifetime(format_args!(
-                    "the provider is minting access tokens with no iat, so their lifetime \
-                     cannot be checked against the {max_secs}s this node accepts; every \
-                     federated request is being refused. RFC 9068 §2.2 requires the claim and \
-                     there is no setting here that waives it"
-                ));
-            }
-            _ => {}
+        if let Err(AuthError::UnknownSigningKey(kid)) = &outcome {
+            self.request_refresh(kid);
         }
         outcome
-    }
-
-    /// Report a lifetime refusal to the operator, at most once a minute.
-    ///
-    /// At WARN and not DEBUG because it is the operator's to fix and nobody
-    /// else's: the client presenting the token cannot shorten it, and the
-    /// challenge it gets back names the limit but not what went wrong at the
-    /// provider. Without this the refusal is a 401 with nothing anywhere to say
-    /// why — which is a configuration this node can see and was choosing not to
-    /// mention.
-    ///
-    /// Nothing from the token reaches the log but its measured lifetime, which
-    /// is a property of the provider's configuration rather than of the caller.
-    fn warn_about_lifetime(&self, message: std::fmt::Arguments<'_>) {
-        if self.take_lifetime_warning_permit() {
-            warn!("{message}");
-        }
-    }
-
-    /// The rate limit itself, separated so a test can drive it without needing
-    /// a provider's key material to produce a genuine refusal.
-    fn take_lifetime_warning_permit(&self) -> bool {
-        let mut last = self.last_lifetime_warning.lock();
-        let now = Instant::now();
-        if last.is_some_and(|at| now.duration_since(at) < MIN_LIFETIME_WARNING_INTERVAL) {
-            return false;
-        }
-        *last = Some(now);
-        true
     }
 
     /// Completes when a refetch has been asked for.
@@ -254,7 +194,7 @@ fn metadata_url_for(resource: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use kimmy_auth::{Action, DEFAULT_MAX_TOKEN_LIFETIME_SECS, Grant, OidcSettings, RoleMapping};
+    use kimmy_auth::{Action, Grant, OidcSettings, RoleMapping};
 
     use super::*;
 
@@ -270,7 +210,6 @@ mod tests {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
-            max_token_lifetime_secs: DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim: None,
         }
     }
@@ -312,37 +251,6 @@ mod tests {
                 .await
                 .is_err(),
             "the other forty-nine must not each become a request to the provider"
-        );
-    }
-
-    #[test]
-    fn a_flood_of_lifetime_refusals_is_one_warning() {
-        // A provider over the limit refuses *every* request from *every*
-        // caller, so the warning has to be rate-limited or it becomes the whole
-        // log. One line is what makes the misconfiguration findable; the next
-        // thousand only make it expensive.
-        let federation = federation();
-        assert!(federation.take_lifetime_warning_permit(), "the first one has to be logged");
-        for _ in 0..1_000 {
-            assert!(
-                !federation.take_lifetime_warning_permit(),
-                "a refusal inside the interval must not repeat the line"
-            );
-        }
-    }
-
-    #[test]
-    fn the_lifetime_warning_and_the_refetch_nudge_do_not_silence_each_other() {
-        // Two rate limits on two unrelated conditions. Sharing one instant
-        // would make an unknown key id hide a lifetime misconfiguration, and
-        // the point of the warning is that it appears when nothing else does.
-        let federation = federation();
-        for n in 0..10 {
-            let _ = federation.verify(&token_naming(&format!("kid-{n}")));
-        }
-        assert!(
-            federation.take_lifetime_warning_permit(),
-            "the nudge limiter must not have consumed the warning's permit"
         );
     }
 

@@ -176,11 +176,6 @@ pub struct Overrides {
     #[arg(long, env = "KIMMY_OIDC_REFRESH_INTERVAL_SECS")]
     pub oidc_refresh_interval_secs: Option<u64>,
 
-    /// The longest a federated token may be valid for by its own exp - iat,
-    /// in seconds. Default 900; refused outside 1..=86400 (ADR-096).
-    #[arg(long, env = "KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")]
-    pub oidc_max_token_lifetime_secs: Option<u64>,
-
     /// PEM certificate chain, leaf first. Enables TLS together with --tls-key.
     #[arg(long, env = "KIMMY_TLS_CERT")]
     pub tls_cert: Option<PathBuf>,
@@ -323,9 +318,6 @@ impl Overrides {
         }
         if let Some(secs) = self.oidc_refresh_interval_secs {
             cfg.auth.oidc.refresh_interval_secs = secs;
-        }
-        if let Some(secs) = self.oidc_max_token_lifetime_secs {
-            cfg.auth.oidc.max_token_lifetime_secs = secs;
         }
         if let Some(cert) = &self.tls_cert {
             cfg.server.tls.cert_file = Some(cert.clone());
@@ -676,53 +668,23 @@ mod tests {
     }
 
     #[test]
-    fn the_token_lifetime_limit_overrides_the_file_and_reaches_validate() {
-        // The flag and the variable are one clap argument, so exercising the
-        // flag exercises the variable's path; the variable's name is pinned
-        // separately because it is documented and a rename would be a silent
-        // break for every environment block that sets it.
-        let arg = Cli::command()
+    fn no_argument_declares_the_removed_token_lifetime_variable() {
+        // ADR-112 removed the setting. Nothing declares
+        // KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS any more, and clap reads an
+        // environment variable only for an argument that declares it — which
+        // is why a stale variable left in a deployment's environment is
+        // ignored rather than fatal, and why the upgrade note says it may be
+        // left set. A `kimmy.toml` key is the opposite case and is pinned in
+        // `config.rs`.
+        let declared = Cli::command()
             .get_arguments()
             .chain(Cli::command().get_subcommands().flat_map(|c| c.get_arguments()))
-            .find(|a| a.get_id() == "oidc_max_token_lifetime_secs")
-            .cloned()
-            .expect("the argument exists");
-        assert_eq!(
-            arg.get_env().and_then(|e| e.to_str()),
-            Some("KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")
-        );
-
-        let cli = parse(&["--oidc-max-token-lifetime-secs", "3600"]);
-        let mut cfg = Config::default();
-        cfg.auth.oidc.max_token_lifetime_secs = 600;
-        cli.overrides.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 3600, "the override wins");
-
-        // Absent, the file's value stands — and the file's default is 900.
-        let cli = parse(&[]);
-        let mut cfg = Config::default();
-        cli.overrides.apply(&mut cfg).unwrap();
-        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 900);
-
-        // A value that arrived through the environment is refused by the same
-        // rule as one in the file.
-        let cli = parse(&["--oidc-max-token-lifetime-secs", "0"]);
-        let mut cfg = Config {
-            auth: crate::config::AuthConfig {
-                root_password: Some("a-root-password-for-the-tests".into()),
-                jwt_secret: Some("a-signing-key-of-adequate-length".into()),
-                oidc: crate::config::OidcConfig {
-                    issuer: Some("https://auth.example.com".into()),
-                    audience: Some("https://kimmydb.example.com".into()),
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        cli.overrides.apply(&mut cfg).unwrap();
-        let err = cfg.validate().unwrap_err().to_string();
-        assert!(err.contains("max_token_lifetime_secs"), "unhelpful error: {err}");
+            .any(|a| {
+                a.get_id() == "oidc_max_token_lifetime_secs"
+                    || a.get_env().and_then(|e| e.to_str())
+                        == Some("KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS")
+            });
+        assert!(!declared, "the lifetime argument and its variable were removed by ADR-112");
     }
 
     #[test]
