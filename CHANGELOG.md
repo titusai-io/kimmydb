@@ -10,16 +10,34 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.18.0 - 2026-08-31
+
+A minor rather than a patch, and one that only ever gives an operator back
+something the last release took away. 0.17.0 began refusing federated access
+tokens that live longer than fifteen minutes; this removes that refusal and the
+setting behind it. Nothing on the wire, on disk or in the `/v1` API moved,
+0.18.0 and 0.17.0 members replicate to each other, and the roll is an ordinary
+one.
+
+**No token that worked under 0.17.0 is refused now, and nothing needs changing
+at your identity provider.** The one thing to check before upgrading is where
+you set `max_token_lifetime_secs`, if you set it at all: in `kimmy.toml` or on
+the command line it has to come out or the node will not start, while
+`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` in an environment block can be left where
+it is and is ignored. The entry below says why the three differ, and why
+clearing the variable *before* you upgrade is the one thing not to do.
+
+If you are upgrading from 0.16.x, read 0.17.0's notes as well — its two startup
+refusals still apply, and its third item does not.
 
 ### Removed
 
 - **The maximum federated token lifetime, and everything that served it.**
   `auth.oidc.max_token_lifetime_secs`, `--oidc-max-token-lifetime-secs`,
   `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`, the two 401 refusals and the startup
-  range check are gone, and so is the WARN added earlier in this section. **A
-  federated access token of any lifetime now verifies, including one with no
-  `iat`.** ADR-112 supersedes ADR-096.
+  range check are all gone. **A federated access token of any lifetime now
+  verifies, including one with no `iat`.** ADR-112 supersedes ADR-096, which
+  shipped one release ago and is marked superseded in place.
 
   The refusal turned a correctly configured identity provider into a total
   authentication outage on upgrade. Okta, Google and Entra ID default access
@@ -58,7 +76,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   the distinction that matters left unsaid: the other two are refused at
   startup and `check-config` catches them, while this one is refused at
   request time and no check on this node can see the provider's lifetime in
-  advance. The section above says so now.
+  advance. 0.17.0's section below says so now — which matters to anyone
+  upgrading from 0.16.x, who reads it on the way past.
 - **Seven rows in [docs/threat-model.md](docs/threat-model.md) still marked
   controls "next release" that shipped in 0.17.0** — the HS256 32-byte floor
   and the placeholder-secret refusal (ADR-093), `auth.jwt_previous_secret`
