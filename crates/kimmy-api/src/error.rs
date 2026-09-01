@@ -591,7 +591,7 @@ mod tests {
         // fix is discoverable from the response; neither says anything about
         // the token itself (ADR-096).
         for e in [
-            AuthError::TokenLifetimeExceeded { max_secs: 900 },
+            AuthError::TokenLifetimeExceeded { max_secs: 900, lifetime_secs: 3600 },
             AuthError::TokenLifetimeUnbounded { max_secs: 900 },
         ] {
             let e: ApiError = e.into();
@@ -601,6 +601,11 @@ mod tests {
             let description = e.challenge_description.as_deref().expect("a specific description");
             assert!(description.contains("900 seconds"), "{description}");
             assert!(description.contains("max_token_lifetime_secs"), "{description}");
+            // The observed lifetime is carried on the variant for the operator's
+            // log line and must not reach the client: the challenge names the
+            // limit and nothing about the token that was presented (ADR-096).
+            assert!(!description.contains("3600"), "{description}");
+            assert!(!e.message.contains("3600"), "{}", e.message);
         }
         // The ordinary refusals keep the generic challenge.
         let plain: ApiError = AuthError::TokenExpired.into();

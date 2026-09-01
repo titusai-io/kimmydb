@@ -458,8 +458,9 @@ impl OidcVerifier {
         let Some(iat) = numeric_date(claims, "iat") else {
             return Err(AuthError::TokenLifetimeUnbounded { max_secs });
         };
-        if exp.saturating_sub(iat) > max_secs {
-            return Err(AuthError::TokenLifetimeExceeded { max_secs });
+        let lifetime_secs = exp.saturating_sub(iat);
+        if lifetime_secs > max_secs {
+            return Err(AuthError::TokenLifetimeExceeded { max_secs, lifetime_secs });
         }
         Ok(())
     }
@@ -1240,7 +1241,12 @@ mod tests {
         let token = token_living(0, DEFAULT_MAX_TOKEN_LIFETIME_SECS + 1);
 
         match verifier(Algorithm::RS256).verify(&token) {
-            Err(AuthError::TokenLifetimeExceeded { max_secs }) => assert_eq!(max_secs, 900),
+            Err(AuthError::TokenLifetimeExceeded { max_secs, lifetime_secs }) => {
+                assert_eq!(max_secs, 900);
+                // Carried for the log line, which names what was observed as
+                // well as what is allowed; the challenge names only the limit.
+                assert_eq!(lifetime_secs, 901);
+            }
             other => panic!("expected a lifetime refusal, got {other:?}"),
         }
     }
@@ -1312,12 +1318,12 @@ mod tests {
         let hour = token_living(0, 3600);
         assert!(matches!(
             verifier(Algorithm::RS256).verify(&hour),
-            Err(AuthError::TokenLifetimeExceeded { max_secs: 900 })
+            Err(AuthError::TokenLifetimeExceeded { max_secs: 900, lifetime_secs: 3600 })
         ));
         assert!(verifier_allowing(3600).verify(&hour).is_ok());
         assert!(matches!(
             verifier_allowing(3599).verify(&hour),
-            Err(AuthError::TokenLifetimeExceeded { max_secs: 3599 })
+            Err(AuthError::TokenLifetimeExceeded { max_secs: 3599, lifetime_secs: 3600 })
         ));
     }
 

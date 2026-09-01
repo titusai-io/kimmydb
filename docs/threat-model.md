@@ -10,9 +10,12 @@ mechanisms; this document is the map that says which threat each mechanism
 answers. Where the two disagree, the code is right and both are wrong; file
 references are given as `crate/src/file.rs` so they can be checked.
 
-Several controls below are marked **next release**. They are merged or in
-review on the main branch and are named by the setting they introduce, so
-that this document is correct for the release it ships with. A claim marked
+A control that is merged or in review but not yet released is marked **next
+release** and named by the setting it introduces, so that this document is
+correct for the release it ships with. Those markers are cleared as part of
+cutting a release and a test refuses a dated release that still carries one —
+an unswept marker reads as a control the operator does not have yet, which is
+the more dangerous direction for a threat model to be wrong in. A claim marked
 *verify* is one the author could not settle from the code alone.
 
 ---
@@ -107,16 +110,16 @@ not is visibly public ([Security › Model](security.md#model)).
 |---|---|---|
 | Password guessing | A token bucket per client address on `POST /v1/auth/login`, spent only by failures and checked *before* the Argon2id verification, so a refused attempt costs the node nothing; optionally a second bucket per user name | `kimmy-api/src/ratelimit.rs`; `server.rate_limit.login_*` ([Security › Login rate limiting](security.md#login-rate-limiting)) |
 | Enumerating accounts through login | Identical responses for a wrong password and an unknown user, and a dummy hash on the unknown-user path so timing does not tell them apart | `kimmy-auth/src/users.rs`, `UserStore::authenticate` |
-| Forging or altering a local token | HS256 over a shared secret of at least 16 bytes — **32 as of the next release** (`MIN_SECRET_LEN`, ADR-093); `alg=none` and any non-HS256 header refused; `exp` enforced with **no** leeway | `kimmy-auth/src/token.rs` |
-| A weak or placeholder signing secret | Refused at startup below the floor; **next release:** a value from this repository's own examples (`PLACEHOLDER_SECRETS`) is refused whenever the node binds off loopback (ADR-093) | `kimmyd/src/config.rs`, `Config::validate` |
-| Rotating the secret without ending every session | **Next release:** `auth.jwt_previous_secret` verifies tokens from the old key while new ones are signed with the current key; the window closes one `token_ttl_secs` later (ADR-101) | `kimmy-auth/src/token.rs`, `TokenIssuer::with_previous` |
+| Forging or altering a local token | HS256 over a shared secret of at least 32 bytes (`MIN_SECRET_LEN`, ADR-093); `alg=none` and any non-HS256 header refused; `exp` enforced with **no** leeway | `kimmy-auth/src/token.rs` |
+| A weak or placeholder signing secret | Refused at startup below the floor, and a value from this repository's own examples (`PLACEHOLDER_SECRETS`) is refused whenever the node binds off loopback (ADR-093) | `kimmyd/src/config.rs`, `Config::validate` |
+| Rotating the secret without ending every session | `auth.jwt_previous_secret` verifies tokens from the old key while new ones are signed with the current key; the window closes one `token_ttl_secs` later (ADR-101) | `kimmy-auth/src/token.rs`, `TokenIssuer::with_previous` |
 | A revoked, disabled or narrowed account keeping its token | A per-user token version, checked on every request and bumped by a password change, a grant change, a role edit or disabling the account; a deleted user has no version and is refused (ADR-052). Replicates as an ordinary write | `kimmy-api/src/sessions.rs`, applied in the `Auth` extractor |
 | Reaching data outside a grant | One authorization decision point, `Principal::can`, called inside every executor operation rather than beside it; `admin` implies everything, `write` implies `read`, `read` implies `search`, nothing else is implied | `kimmy-auth/src/rbac.rs`; `kimmy-api/src/exec.rs` |
 | Probing for collections through status codes | 403 is decided before the collection is resolved, listings filter through the same check, and the `WWW-Authenticate` challenge on a 403 is byte-identical whether the target exists | `kimmy-api/src/exec.rs`; ([Security › Properties enforced](security.md#properties-enforced-and-why)) |
 | A wildcard grant reaching the user store | `__kimmy` never matches a pattern; only `admin` or a grant naming it exactly opens it (ADR-079) | `kimmy-auth/src/rbac.rs` |
 | Passwords and tokens on the wire | Native TLS on the listener when `server.tls.cert_file` and `key_file` are set, hot-reloaded on SIGHUP or file change; plaintext on a non-loopback bind starts with a warning because a proxy in front is legitimate | `kimmyd/src/node.rs` ([Security › TLS](security.md#tls)) |
-| Minting a local token from an untrusted network | **Next release:** `auth.local.login = loopback_only` or `disabled` decides where `login` and `refresh` answer, judged on the TCP peer and never on a forwarded header (ADR-100) | `kimmy-api/src/local_login.rs` |
-| An authenticated caller exhausting the node | Today: `find` stops at 10,000 documents, regex is linear-time, aggregation has a hard memory ceiling, bodies are capped at axum's 2 MiB default. **Next release:** `server.request_timeout_secs` (a deadline on pending requests, answered `503 timeout`), `server.max_body_bytes`, and `server.rate_limit.per_principal` keyed on the verified principal (ADR-099). None of these is a query timeout: storage work runs to completion | `kimmy-api/src/limits.rs`, `routes.rs` |
+| Minting a local token from an untrusted network | `auth.local.login = loopback_only` or `disabled` decides where `login` and `refresh` answer, judged on the TCP peer and never on a forwarded header (ADR-100) | `kimmy-api/src/local_login.rs` |
+| An authenticated caller exhausting the node | `find` stops at 10,000 documents, regex is linear-time, aggregation has a hard memory ceiling; `server.request_timeout_secs` is a deadline on pending requests (answered `503 timeout`), `server.max_body_bytes` is the 2 MiB body ceiling axum always applied and now yours to set, and `server.rate_limit.per_principal` is keyed on the verified principal (ADR-099). None of these is a query timeout: storage work runs to completion | `kimmy-api/src/limits.rs`, `routes.rs` |
 | Running without authentication by accident | `--insecure-no-auth` is refused on any non-loopback bind; the resulting principal is flagged `unauthenticated` in every audit record; federation is refused alongside it | `kimmyd/src/config.rs` |
 | Taking over an existing database through the environment | The root account is created only when the user store is empty; a changed `KIMMY_ROOT_PASSWORD` on a later start changes nothing | ([Security › Bootstrap](security.md#bootstrap)) |
 | A backup read by a database-scoped administrator | `GET /v1/admin/backup` requires `admin` over `*`; there is no grant-filtered backup | `kimmy-api/src/routes.rs`, `backup` |
@@ -270,10 +273,10 @@ issuer is offered to the OIDC verifier and to nothing else
 | A token minted for another audience | `aud` must equal `auth.oidc.audience` byte for byte and must be **present**; likewise `iss`, `exp` and `sub` | `oidc.rs`, `OidcVerifier::verify` |
 | An ID token presented as an access token | An `https` audience closes it by itself; `require_at_jwt` adds the `typ` check where the provider stamps it | `oidc.rs` |
 | A provider that can mint a superuser | `admin` does not federate: an inline mapping naming it stops the node, a stored role resolving to it has the action dropped, unless `allow_federated_admin` is set and announced at startup (ADR-067, ADR-074) | `oidc.rs`, `OidcSettings::validate` |
-| A revocation at the provider going unhonoured | Membership is frozen in the token and there is no introspection, so the token's lifetime is the exposure. **Next release:** `auth.oidc.max_token_lifetime_secs`, default 900, refuses a longer-lived token and one with no `iat` (ADR-096) | `oidc.rs` |
+| A revocation at the provider going unhonoured | Membership is frozen in the token and there is no introspection, so the token's lifetime is the exposure. `auth.oidc.max_token_lifetime_secs`, default 900, refuses a longer-lived token and one with no `iat`, and a refusal is warned about once a minute so the misconfiguration is visible from the node's own log rather than only from the caller's 401 (ADR-096) | `oidc.rs` |
 | Laundering a federated identity into a local one | `/v1/auth/refresh` refuses a federated principal; a federated token never produces a local token (ADR-065) | `kimmy-api/src/sessions.rs` |
 | Making the node hammer its provider | The unknown-`kid` refetch is rate-limited, because `kid` is attacker-controlled | `kimmyd/src/node.rs` |
-| A mutable claim becoming an identity | **Next release:** `auth.oidc.subject_claim` provides a *display* name only; `sub` remains the identity for every decision (ADR-100) | `oidc.rs` |
+| A mutable claim becoming an identity | `auth.oidc.subject_claim` provides a *display* name only; `sub` remains the identity for every decision (ADR-100) | `oidc.rs` |
 
 ### The operator and the host
 
@@ -348,7 +351,7 @@ The controls above are sufficient only when these hold.
    common — so the warning is yours to read.
 2. **Behind a proxy, two settings follow from it.** `trusted_proxy_header`
    only when the proxy rewrites that header, or the login limiter is
-   defeatable by anyone who sets it; and, on the next release, remember that
+   defeatable by anyone who sets it; and remember that
    `auth.local.login = loopback_only` judges the *TCP peer*, so a proxy on the
    same host makes every caller look local.
 3. **Secrets arrive through the environment or a config file readable only by

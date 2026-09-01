@@ -226,12 +226,22 @@ however little of it remains.
 between five minutes and an hour, and a few to a day. Fifteen minutes admits
 the short defaults outright and asks the rest a question rather than
 answering it silently: shorten the lifetime the provider mints for this
-resource — every provider this federation is written against can do that per
-resource or per client — or raise the limit knowingly. The question arrives on
-the first request: the 401 carries `error="invalid_token"` with an
-`error_description` naming the limit in seconds and nothing about the token. A
-raised limit is printed in the startup summary, and the setting is refused
-outside 1–86400 ([ADR-096](decisions.md)).
+resource — the commercial providers this federation is written against can all
+do that per resource or per client — or raise the limit knowingly. Not every
+provider can: a small or in-house authorization server may mint one lifetime
+for everything it issues, in which case shortening it for this resource
+shortens it for every other relying party too, and raising the limit here is
+the only lever that does not. Raising it is then the correct choice rather than
+the lax one, and the number it is raised to should be the lifetime the provider
+actually mints, not a round number above it.
+
+The question arrives on the first request: the 401 carries
+`error="invalid_token"` with an `error_description` naming the limit in seconds
+and nothing about the token, and the node logs the refusal at WARN — at most
+once a minute — naming the minted lifetime alongside the limit, so the
+misconfiguration is legible from the node's own log and not only from a
+caller's failed request. A raised limit is printed in the startup summary, and
+the setting is refused outside 1–86400 ([ADR-096](decisions.md)).
 
 The check is on the token's two claims and nothing else. It does not consult
 the clock, so the 60 seconds of leeway above play no part in it: the leeway

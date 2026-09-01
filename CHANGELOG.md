@@ -10,20 +10,68 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **A lifetime refusal is warned about.** A federated token refused for its
+  lifetime (ADR-096) now logs at WARN, at most once a minute, naming the
+  lifetime the provider minted and the limit this node accepts. It was
+  previously invisible: the refusal produced a 401 with a challenge naming the
+  limit, and no line in the node's log at any level, so a provider over the
+  limit refused every request while the log stayed silent. The rate limit is
+  there because that condition fails *every* request from *every* caller, and
+  it is separate from the JWKS refetch limiter so neither silences the other.
+  The observed lifetime reaches the log only — the `WWW-Authenticate`
+  challenge still names the limit and nothing about the token.
+
+### Fixed
+
+- **The 0.17.0 upgrade note undercounted what to check.** It named two
+  configurations refused on upgrade and the token lifetime was a third, with
+  the distinction that matters left unsaid: the other two are refused at
+  startup and `check-config` catches them, while this one is refused at
+  request time and no check on this node can see the provider's lifetime in
+  advance. The section above says so now.
+- **Seven rows in [docs/threat-model.md](docs/threat-model.md) still marked
+  controls "next release" that shipped in 0.17.0** — the HS256 32-byte floor
+  and the placeholder-secret refusal (ADR-093), `auth.jwt_previous_secret`
+  (ADR-101), `auth.local.login` and `auth.oidc.subject_claim` (ADR-100), the
+  request limits (ADR-099) and `auth.oidc.max_token_lifetime_secs` (ADR-096).
+  A marker left up reads as a control the operator does not have yet, which is
+  the wrong direction for a threat model to be wrong in. ADR-110 already said
+  the markers had to be swept on release; a test now refuses a dated release
+  that still carries one, so the convention is checked rather than remembered.
+
 ## 0.17.0 - 2026-08-31
 
 A minor when it ships, not a patch. Nothing changes on the wire, on disk or
 in the `/v1` API, members of this version and 0.16.x replicate to each other,
-and the upgrade is an ordinary rolling one — but two configurations that
-started under 0.16.x are refused now, and the pre-1.0 policy puts a refusal
-of that kind behind a `0.MINOR` bump. Before upgrading, check two things: a
-`jwt_secret` of 16 to 31 bytes must be replaced with one of 32 or more
-(rotating it ends every session once, on every node at the same time), and a
-node reachable from the network must not be running on one of this
-repository's own example secrets. `kimmyd check-config` against the new
-binary answers both without starting anything. Nothing else in the release
-asks anything of an operator: the rest is additive query, search and
-configuration surface — the entries below say what — along with settings
+and the upgrade is an ordinary rolling one — but three configurations that
+worked under 0.16.x are refused now, and the pre-1.0 policy puts a refusal of
+that kind behind a `0.MINOR` bump.
+
+**Two are refused at startup, and `kimmyd check-config` against the new binary
+answers both without starting anything:** a `jwt_secret` of 16 to 31 bytes must
+be replaced with one of 32 or more (rotating it ends every session once, on
+every node at the same time), and a node reachable from the network must not be
+running on one of this repository's own example secrets.
+
+**The third is refused at request time, and no check on this node can see it in
+advance.** `auth.oidc.max_token_lifetime_secs` (below) refuses any federated
+access token whose own `exp − iat` exceeds 900 seconds. The lifetime is the
+*provider's* to choose and arrives only with a real token, so `check-config`
+passes, the node starts, the startup banner says nothing, and every federated
+request 401s from the first one. A provider minting hour-long tokens — the
+default for Okta, Google and Entra ID, and a day for Auth0 — turns a working
+federation into a total authentication outage on upgrade. **Before upgrading,
+read the access-token lifetime your provider mints for this resource** and
+either shorten it there or set `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` to
+something that admits it. This is the one item in the release that a careful
+operator can do everything else right and still be caught by.
+
+Nothing else asks anything of an operator: the rest is additive query, search
+and configuration surface — the entries below say what — along with settings
 whose defaults are meant to be left alone, and documentation corrections.
 
 ### Added
