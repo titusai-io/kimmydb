@@ -160,6 +160,16 @@ publishes everything; nothing is released by hand. `GET /v1/version` reports
 the build version and the exact commit, so a running node can always be
 matched to its release.
 
+**A tag is a deliberate act, not a step in the merge ritual.** There is no
+schedule and nothing tags automatically: a release happens when there is
+something an operator needs, and `## Unreleased` in
+[CHANGELOG.md](../CHANGELOG.md) accumulates until then. This is worth stating
+because the alternative habit — a tag per round of merges — is easy to fall
+into and expensive: every tag builds every target for both binaries, on both
+Linux architectures and on macOS, plus the SBOMs, the image and the Homebrew
+formula. Trying a change on a cluster does **not** need a tag; the container
+image workflow can be dispatched by hand for that (ADR-113).
+
 ---
 
 ## What is checked, and what is only written down
