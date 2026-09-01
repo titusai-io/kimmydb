@@ -135,15 +135,29 @@ pipeline {
 
     stage('Test') {
       steps {
-        // `cargo test --workspace`, which is the gate the repository documents,
-        // rather than ci.yml's `cargo nextest run` plus a separate doctest run.
-        // nextest is a CI speed optimisation that would have to be installed
-        // into the container on every build; one command that covers unit,
-        // integration and doc tests keeps this a thin wrapper over the
-        // documented gate, which is what makes the two systems comparable.
+        // **nextest, matching ci.yml, and the reason is measured.**
+        //
+        // This stage first ran `cargo test --workspace`, chosen so that both CI
+        // systems ran the identical documented gate and could be compared. That
+        // was the wrong trade. Warm, it took 762s against 777s cold -- fifteen
+        // seconds of benefit from a warm cache -- because this suite is
+        // EXECUTION-bound, not compile-bound: a dozen tests in kimmy-api's
+        // watch and snapshot modules each run for over a minute. A warm target/
+        // only saves compilation, so the one advantage a persistent agent has
+        // did not apply to the stage that dominates the build.
+        //
+        // nextest runs each test in its own process and schedules them far
+        // better than libtest's threads, which is exactly the axis that matters
+        // for a suite like this one. ci.yml has used it for the same reason.
+        //
+        // It does not run doctests, so those follow separately -- again as
+        // ci.yml does.
+        //
+        // The binary is installed into CARGO_HOME, which is the shared volume,
+        // so it is downloaded once for the agent rather than once per build.
         //
         // A C toolchain is needed: ring compiles C and assembly, and the slim
-        // image ships no compiler.
+        // image ships no compiler. curl is for the installer.
         sh '''
           set -e
           docker run --rm \
@@ -156,9 +170,14 @@ pipeline {
             "${RUST_IMAGE}" sh -c '
               set -e
               apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-                gcc libc6-dev pkg-config >/dev/null
+                gcc libc6-dev pkg-config curl >/dev/null
+              if [ ! -x "${CARGO_HOME}/bin/cargo-nextest" ]; then
+                curl -LsSf https://get.nexte.st/latest/linux \
+                  | tar zxf - -C "${CARGO_HOME}/bin"
+              fi
               rc=0
-              cargo test --workspace || rc=$?
+              cargo nextest run --workspace || rc=$?
+              cargo test --workspace --doc || rc=$?
               chown -R "${HOST_UID}:${HOST_GID}" /src
               exit $rc
             '
