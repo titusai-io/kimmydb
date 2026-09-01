@@ -171,10 +171,17 @@ pipeline {
               set -e
               apt-get update -qq && apt-get install -y -qq --no-install-recommends \
                 gcc libc6-dev pkg-config curl >/dev/null
+              # mkdir because cargo creates registry/ and git/ under CARGO_HOME
+              # but never bin/ -- nothing had ever installed a binary there, so
+              # the first run failed with "tar: /cargo/bin: Cannot open".
+              mkdir -p "${CARGO_HOME}/bin"
               if [ ! -x "${CARGO_HOME}/bin/cargo-nextest" ]; then
                 curl -LsSf https://get.nexte.st/latest/linux \
                   | tar zxf - -C "${CARGO_HOME}/bin"
               fi
+              # CARGO_HOME is not the image built-in one, so its bin/ is not on
+              # PATH; cargo would not find the subcommand it just installed.
+              PATH="${CARGO_HOME}/bin:${PATH}"
               rc=0
               cargo nextest run --workspace || rc=$?
               cargo test --workspace --doc || rc=$?
