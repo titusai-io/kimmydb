@@ -64,6 +64,24 @@ pipeline {
     // the entire reason this is faster, not the CPU.
     CARGO_VOLUME = 'kimmydb-cargo-registry'
 
+    // **Separate target directories per stage, and this is not tidiness.**
+    // clippy writes check metadata and `cargo test` writes test binaries; they
+    // are different rustc invocations over the same crates, so sharing one
+    // target/ makes each one invalidate the other's artifacts on every build.
+    // ci.yml says so in as many words -- "a cache saved by the other would be
+    // a cold start with extra steps" -- and gives each job its own cache for
+    // exactly this reason.
+    //
+    // Measured here before it was believed: sharing one directory, the second
+    // build was SLOWER than the first (976s against 887s), with lint dropping
+    // 75s to 33s while the test stage rose 751s to 889s. The cache was working;
+    // the two stages were thrashing it.
+    //
+    // The cluster harness deliberately shares the test directory: it is also a
+    // `cargo test` build of the same workspace, so it wants those artifacts.
+    LINT_TARGET_DIR = '/src/target/ci-lint'
+    TEST_TARGET_DIR = '/src/target/ci-test'
+
     // Matches ci.yml so a failure here means the same thing there.
     CARGO_TERM_COLOR = 'always'
     // Debug info roughly doubles build time and nothing here reads a symbol
@@ -99,7 +117,7 @@ pipeline {
             --memory=6g --memory-swap=6g \
             -v "${WORKSPACE}":/src -w /src \
             -v "${CARGO_VOLUME}":/cargo \
-            -e CARGO_HOME=/cargo \
+            -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR="${LINT_TARGET_DIR}" \
             -e CARGO_TERM_COLOR -e CARGO_PROFILE_TEST_DEBUG -e RUSTFLAGS \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             "${RUST_IMAGE}" sh -c '
@@ -132,7 +150,7 @@ pipeline {
             --memory=10g --memory-swap=10g \
             -v "${WORKSPACE}":/src -w /src \
             -v "${CARGO_VOLUME}":/cargo \
-            -e CARGO_HOME=/cargo \
+            -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR="${TEST_TARGET_DIR}" \
             -e CARGO_TERM_COLOR -e CARGO_PROFILE_TEST_DEBUG -e RUSTFLAGS \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             "${RUST_IMAGE}" sh -c '
@@ -192,7 +210,7 @@ pipeline {
             --memory=8g --memory-swap=8g \
             -v "${WORKSPACE}":/src -w /src \
             -v "${CARGO_VOLUME}":/cargo \
-            -e CARGO_HOME=/cargo \
+            -e CARGO_HOME=/cargo -e CARGO_TARGET_DIR="${TEST_TARGET_DIR}" \
             -e CARGO_TERM_COLOR -e CARGO_PROFILE_TEST_DEBUG -e RUSTFLAGS \
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             "${RUST_IMAGE}" sh -c '
