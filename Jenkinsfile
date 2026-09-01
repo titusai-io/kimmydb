@@ -199,6 +199,12 @@ pipeline {
       // main only, as it is on Actions: it spawns real nodes and is the
       // slowest check that is not the workspace suite.
       when { branch 'main' }
+      // Its own timeout, well under the pipeline's. This stage hung for 41
+      // minutes on its first run and only the 60-minute pipeline timeout would
+      // have ended it; the whole build was then wasted rather than the one
+      // stage. Actions does this work in about two minutes, so fifteen is
+      // generous and still fails fast.
+      options { timeout(time: 15, unit: 'MINUTES') }
       steps {
         // Single-threaded by the test's own requirement, and the nodes bind
         // 127.0.0.1:0 -- ephemeral ports -- so this cannot collide with the
@@ -215,10 +221,20 @@ pipeline {
             -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
             "${RUST_IMAGE}" sh -c '
               set -e
+              # procps is why this stage hung the first time. The tests spawn
+              # real kimmyd children and tear them down with
+              # `Command::new("kill")`; Drop swallows the error and then blocks
+              # on `child.wait()` for a process nothing ever killed. Debian puts
+              # /bin/kill in procps, which -slim images strip, so the binary was
+              # simply absent and the first Drop blocked for ever.
               apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-                gcc libc6-dev pkg-config >/dev/null
+                gcc libc6-dev pkg-config procps >/dev/null
+              # --nocapture because the failure mode here is silence: with
+              # output captured and --test-threads=1, a test that never returns
+              # prints nothing at all, so 41 minutes produced exactly the line
+              # "running 8 tests" and no clue after it.
               rc=0
-              cargo test -p kimmyd --test cluster -- --ignored --test-threads=1 || rc=$?
+              cargo test -p kimmyd --test cluster -- --ignored --test-threads=1 --nocapture || rc=$?
               chown -R "${HOST_UID}:${HOST_GID}" /src
               exit $rc
             '
