@@ -113,11 +113,20 @@ laundering). There is no revocation path shorter than expiry for a federated
 session ([ADR-065](decisions.md)), so the node bounds expiry itself: a token
 valid for longer than `auth.oidc.max_token_lifetime_secs`
 (`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`, 900 seconds by default) is refused with
-a 401 whose challenge names the limit, and so is a token with no `iat`. Set
-the access-token lifetime your provider mints for this resource at or below
-it; raise the limit only when you cannot, and knowingly — the number is how
-long a revocation at the provider goes unhonoured here
+a 401 whose challenge names the limit, and so is a token with no `iat`. The
+node also logs the refusal at WARN, at most once a minute, naming the lifetime
+your provider minted alongside the limit — that line is the fastest way to tell
+this apart from an audience mismatch, which produces the same 401 to a client.
+Set the access-token lifetime your provider mints for this resource at or below
+the limit; raise the limit only when you cannot, and knowingly — the number is
+how long a revocation at the provider goes unhonoured here
 ([ADR-096](decisions.md)).
+
+**This is the one setting `kimmyd check-config` cannot pre-flight.** The
+lifetime belongs to the provider and arrives only with a real token, so a node
+whose provider mints hour-long tokens starts cleanly, reports nothing unusual
+in its startup banner, and refuses every federated request from the first one.
+Read the lifetime at the provider before upgrading rather than after.
 
 Signing keys rotate at the provider and are picked up here automatically —
 a token naming an unknown key triggers one rate-limited refetch, and an
@@ -217,7 +226,10 @@ Work down this list; each step is observable from outside the node.
    audience, byte for byte, and remember the same string must sit in the
    provider's registry.
 5. **401 whose `WWW-Authenticate` says the token is valid for longer than the
-   seconds this node accepts.** The provider mints access tokens for longer
+   seconds this node accepts** — or a `WARN` in the node's log naming a minted
+   lifetime and the limit, which says the same thing from the operator's side
+   and is what to grep for when all you have been handed is "it stopped
+   working". The provider mints access tokens for longer
    than `max_token_lifetime_secs` (900 by default). Shorten the lifetime on
    the provider's side for this resource — a per-API setting in Auth0, an
    access policy on the authorization server in Okta, a token lifetime policy

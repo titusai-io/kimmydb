@@ -627,7 +627,9 @@ refused because its own `exp − iat` exceeds `auth.oidc.max_token_lifetime_secs
 says so, naming the limit in seconds and nothing about the token: the ordinary
 advice to refresh would have the provider mint the same token again, and the
 fix is on the provider's side or in the node's configuration
-([ADR-096](decisions.md)).
+([ADR-096](decisions.md)). The lifetime the provider actually minted is not in
+the challenge — a client can do nothing with it — but the node names it in a
+rate-limited `WARN`, where the operator who can act on it will look.
 
 `POST /v1/auth/login` is exempt. It is where a token comes from, not a
 bearer-protected resource, and challenging there would tell a client to come

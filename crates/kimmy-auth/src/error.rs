@@ -22,10 +22,17 @@ pub enum AuthError {
     /// token than `auth.oidc.max_token_lifetime_secs` admits, and either the
     /// provider's lifetime or this node's limit has to move. The message names
     /// the limit and nothing about the token (ADR-096).
+    ///
+    /// `lifetime_secs` is the token's observed `exp − iat`, and is deliberately
+    /// **not** in the message above. The message becomes the `error_description`
+    /// of a `WWW-Authenticate` challenge, which is read by whoever presented the
+    /// token; the observed lifetime is the provider's business and the
+    /// operator's, so it travels in the variant for the log line to name and
+    /// never in the challenge (ADR-096).
     #[error(
         "the access token is valid for longer than the {max_secs} seconds this node accepts          (auth.oidc.max_token_lifetime_secs); shorten the provider's access token lifetime or          raise the limit"
     )]
-    TokenLifetimeExceeded { max_secs: u64 },
+    TokenLifetimeExceeded { max_secs: u64, lifetime_secs: u64 },
 
     /// A federated token carries no `iat`, so its lifetime cannot be bounded.
     ///
