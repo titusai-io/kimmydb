@@ -5964,6 +5964,13 @@ outage this removes.
 
 ## ADR-113 — Jenkins runs the merge gate; GitHub Actions runs the release
 
+> **Superseded by [ADR-114](#adr-114--github-actions-runs-the-whole-pipeline-again).**
+> The Jenkins pipeline was removed when the repository went public and its
+> minutes became free. The reasoning below is kept because it is a worked
+> example of a measurement overturning the argument that motivated it, and
+> because the boundary it drew — what can and cannot leave GitHub — still
+> holds.
+
 **Decision.** The day-to-day gate — formatting, clippy, the workspace test
 suite, the native-dependency check and the cluster harness — runs on a Jenkins
 multibranch pipeline against a self-hosted Linux agent, described by the
@@ -6047,5 +6054,77 @@ full agent is a host problem rather than a CI one. A persistent workspace can
 also pass on stale state where a fresh runner could not; a periodic clean build
 on `main` is the answer, and it is the one piece of hygiene this arrangement
 needs that the hosted one did not.
+
+---
+
+## ADR-114 — GitHub Actions runs the whole pipeline again
+
+**Decision.** The Jenkins pipeline is removed: the `Jenkinsfile`, the
+multibranch job and its credential. `ci.yml` runs the merge gate on pull
+requests and pushes to `main`, `release.yml` and `publish-ghcr.yml` run on a
+tag, and `main` requires the `fmt, clippy, test` context as it always did.
+This supersedes ADR-113, one release after it.
+
+**Why.** ADR-113 existed for one reason: a private repository bills every
+Actions minute, and the routine gate was the routine spend — about seven
+billable minutes per pull-request push and twenty-three per merge, against an
+allowance a single active day could consume. **Making the repository public
+removes that reason entirely.** Public repositories get standard GitHub-hosted
+runners free with no minute cap, on every plan, and every runner this project
+uses is standard: `ubuntu-latest`, `ubuntu-22.04`, `ubuntu-24.04`, the
+`ubuntu-24.04-arm` native arm64 runner, and a hosted macOS agent. Nothing here
+is a larger runner, which is the one category that is still billed in a public
+repository.
+
+The 10× macOS multiplier that was roughly half of all spend — sixty of the
+eighty-one billable minutes a release cost — stops existing rather than being
+optimised.
+
+**And Jenkins was never the faster option, only the cheaper one.** ADR-113
+argued a persistent agent with a warm `target/` would speed up the gate. Four
+measurements said otherwise: the test stage took 762s warm against 777s cold,
+nextest brought it to 710s, and optimising the test profile made it worse.
+`nextest` reports 613s executing 1725 tests against roughly 110s compiling, with
+a floor at the slowest single test — four run 248–270s, inserting thousands of
+documents where every insert is a real redb write transaction. A warm cache can
+only touch the compile half, and optimisation ruled out CPU, so what remains is
+`fsync`. Against GitHub's ~420s for the same suite, the self-hosted agent was
+roughly 70% slower. Merges took sixteen minutes instead of ten.
+
+So the trade was *cheaper and slower*, and once the cheaper half is worth
+nothing there is no trade left.
+
+**The other reason, which would apply even if minutes still cost something.** A
+pull request from a fork cannot build on that Jenkins. It sits in a LAN-private
+zone, is discovered by a periodic scan rather than a webhook, and authenticates
+as one person. A public repository that accepts contributions needs a gate that
+runs on a contributor's branch, and Actions does that natively. ADR-113 named
+this as the trigger to reverse it; this is that reversal, arriving with the
+going-public decision rather than after it.
+
+**What ADR-113 got right, and is retained.** The boundary it drew still holds
+and is worth not re-deriving: the macOS binaries, the arm64 artifacts and the
+ADR-108 build provenance cannot be built anywhere but GitHub. Provenance in
+particular is signed against GitHub's OIDC workload identity, and it stops being
+dormant the moment this repository is public — `publish-ghcr.yml` guards it with
+`if: ${{ !github.event.repository.private }}`, and `github-attestations` in
+`dist-workspace.toml` can be uncommented at the same time so release archives
+are attested too.
+
+The release-cadence guidance in `docs/compatibility.md` is also retained,
+re-justified. It was written as a cost measure and it is not one any more, but a
+tag per round of merges was never mainly a billing problem: every tag is a
+published release, a Homebrew formula update, an image and a set of SBOMs, and
+twenty in a week tells a reader nothing about which one to run.
+
+**Cost.** One CI system, on somebody else's infrastructure, with the outage
+exposure that implies — the same position as before ADR-113. The self-hosted
+option is also worse than it was: since 1 March 2026 GitHub charges $0.002 per
+minute for self-hosted *runner* usage, which does not apply to an independent
+Jenkins but does apply to the obvious middle path of putting an Actions runner
+on one's own hardware. And this repository now has a documented episode of
+adopting a second CI system and removing it within a day, which is a cost worth
+naming: the measurements were cheap, but they were made after the decision
+rather than before it.
 
 ---
