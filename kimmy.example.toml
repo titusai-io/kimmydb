@@ -388,26 +388,6 @@ login = "always"
 # depth. With an opaque audience it is the only check of its kind.
 # require_at_jwt = false
 
-# The longest a federated token may be valid for, by its own `exp − iat`, in
-# seconds (ADR-096).
-#
-# A federated principal's role membership is frozen in its access token: this
-# database makes no introspection call, so if the provider revokes someone's
-# membership, the old claim is honoured until that token expires (ADR-073).
-# That window is exactly the token's lifetime, and this is the only place it
-# can be bounded from this side. A token over the limit is refused with a 401
-# whose WWW-Authenticate challenge names the limit, so a provider that mints
-# longer tokens is found out on the first request rather than by audit.
-#
-# Fifteen minutes by default. Providers default access tokens to somewhere
-# between five minutes and an hour, with a few defaulting to a day; 900 admits
-# the short defaults outright and asks the rest a question — shorten the
-# lifetime the provider mints for this resource, which every one of them can
-# do per resource or per client, or raise this knowingly. A raised limit is
-# named in the node's startup summary. A token with no `iat` is refused too,
-# because its lifetime cannot be measured; RFC 9068 requires the claim in an
-# access token. Refused outside 1..=86400.
-# max_token_lifetime_secs = 900
 
 # A claim whose string value is carried as a federated principal's DISPLAY
 # name — in `kimmy whoami` and in the audit record (as `display`, when it
@@ -483,7 +463,7 @@ login = "always"
 
 # Every value above is also an environment variable: KIMMY_OIDC_ISSUER,
 # KIMMY_OIDC_AUDIENCE, KIMMY_OIDC_ROLES_CLAIM, KIMMY_OIDC_SUBJECT_CLAIM,
-# KIMMY_OIDC_REFRESH_INTERVAL_SECS, KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS.
+# KIMMY_OIDC_REFRESH_INTERVAL_SECS.
 #
 # The mappings are file-only in the sense that there are still no per-mapping
 # flags — a grant is a structure, and a command line is where structures go to

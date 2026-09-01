@@ -609,25 +609,6 @@ pub struct OidcConfig {
     ///
     /// Turning it on is loud: the node says so at startup, every time.
     pub allow_federated_admin: bool,
-    /// The longest a federated token may be valid for, by its own `exp − iat`
-    /// (ADR-096).
-    ///
-    /// **900 seconds by default.** A federated principal's role membership is
-    /// frozen in its access token — this database makes no introspection
-    /// call — so a revocation at the provider takes effect only when the
-    /// token expires (ADR-073). This is the only place that window can be
-    /// bounded from this side. Providers default access tokens to somewhere
-    /// between five minutes and an hour, a few to a day; fifteen minutes
-    /// admits the short defaults outright, asks the hour-long ones to be
-    /// shortened for this resource or the limit raised, and refuses the
-    /// day-long tokens that turn the window into a policy.
-    ///
-    /// A token over the limit is a 401 whose challenge names the limit, so
-    /// an operator whose provider mints longer tokens finds out from the
-    /// first refusal and raises this knowingly, or shortens the provider's
-    /// lifetime. A token with no `iat` is refused too — RFC 9068 §2.2
-    /// requires the claim. Refused outside 1..=86400 at startup.
-    pub max_token_lifetime_secs: u64,
     /// A claim carried as a federated principal's **display** name (ADR-100):
     /// `preferred_username`, `email`, `upn`.
     ///
@@ -663,9 +644,6 @@ impl Default for OidcConfig {
             // Off, so that enabling federation changes nothing about who may
             // administer this database. See the field's documentation.
             allow_federated_admin: false,
-            // Fifteen minutes. The constant is the verifier's, so the two
-            // cannot drift; see the field's documentation for the number.
-            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         }
     }
 }
@@ -690,7 +668,6 @@ impl OidcConfig {
             role_mappings: self.role_mappings.clone(),
             require_at_jwt: self.require_at_jwt,
             allow_federated_admin: self.allow_federated_admin,
-            max_token_lifetime_secs: self.max_token_lifetime_secs,
             subject_claim: self.subject_claim.clone(),
         })
     }
@@ -768,8 +745,7 @@ impl OidcConfig {
     /// One-line form for the startup summary. Never the mappings themselves —
     /// they are long, and the count is what tells an operator the file was read.
     ///
-    /// `allow_federated_admin` is named only when it is on, and the token
-    /// lifetime limit only when it is not the default. A default that is
+    /// `allow_federated_admin` is named only when it is on. A default that is
     /// printed every time is a default nobody reads; a line that appears only
     /// when a security boundary has been moved is one somebody notices.
     fn describe(&self) -> String {
@@ -785,17 +761,7 @@ impl OidcConfig {
                     Some(claim) => format!(", display from {claim}"),
                     None => String::new(),
                 };
-                let lifetime = if self.max_token_lifetime_secs
-                    == kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS
-                {
-                    String::new()
-                } else {
-                    format!(", max token lifetime {}s", self.max_token_lifetime_secs)
-                };
-                format!(
-                    "{issuer} ({} role mappings{display}{admin}{lifetime})",
-                    self.role_mappings.len()
-                )
+                format!("{issuer} ({} role mappings{display}{admin})", self.role_mappings.len())
             }
         }
     }
@@ -2539,7 +2505,6 @@ mod tests {
              issuer = \"https://auth.example.com\"\n\
              audience = \"kimmydb\"\n\
              roles_claim = \"roles\"\n\
-             max_token_lifetime_secs = 600\n\
              [[auth.oidc.role_mappings]]\n\
              claim_value = \"kimmydb-analyst\"\n\
              grants = [{ db = \"sales\", collection = \"orders*\", actions = [\"read\", \"search\"] }]\n",
@@ -2550,7 +2515,6 @@ mod tests {
         assert_eq!(settings.issuer, "https://auth.example.com");
         assert_eq!(settings.audience, "kimmydb");
         assert_eq!(settings.roles_claim, "roles");
-        assert_eq!(settings.max_token_lifetime_secs, 600);
         assert_eq!(settings.role_mappings.len(), 1);
         assert_eq!(settings.role_mappings[0].claim_value, "kimmydb-analyst");
         assert_eq!(settings.role_mappings[0].grants[0].collection, "orders*");
@@ -2583,50 +2547,35 @@ mod tests {
     }
 
     #[test]
-    fn the_federated_token_lifetime_limit_defaults_to_fifteen_minutes() {
-        // The number ADR-096 argues for, and the verifier's own constant, so
-        // the file's default and the verifier's cannot drift apart. It reaches
-        // the verifier's settings unchanged.
-        let cfg = valid();
-        assert_eq!(cfg.auth.oidc.max_token_lifetime_secs, 900);
-        assert_eq!(OidcConfig::default().max_token_lifetime_secs, 900);
+    fn a_toml_that_still_sets_the_removed_lifetime_key_is_refused() {
+        // ADR-112 removed `max_token_lifetime_secs`. The struct denies unknown
+        // fields, so a configuration file carrying it does not start — which
+        // is what the upgrade note tells a TOML operator to fix, and the only
+        // one of the three surfaces that behaves this way. The environment
+        // variable is simply never read, because nothing declares it any more.
+        let err = toml::from_str::<Config>(
+            "[auth.oidc]\n\
+             issuer = \"https://auth.example.com\"\n\
+             audience = \"kimmydb\"\n\
+             max_token_lifetime_secs = 3600\n",
+        )
+        .unwrap_err()
+        .to_string();
 
-        let mut cfg = valid();
-        cfg.auth.oidc = oidc();
-        assert_eq!(cfg.auth.oidc.settings().unwrap().max_token_lifetime_secs, 900);
-        // The default is not announced; a raised limit is, because it widens
-        // the revocation window and is worth a second look in the log.
-        assert!(!cfg.summary().contains("max token lifetime"), "{}", cfg.summary());
-        cfg.auth.oidc.max_token_lifetime_secs = 3600;
-        assert!(cfg.summary().contains("max token lifetime 3600s"), "{}", cfg.summary());
+        assert!(err.contains("max_token_lifetime_secs"), "the error should name the key: {err}");
     }
 
     #[test]
-    fn a_federated_token_lifetime_limit_outside_its_bounds_is_refused() {
-        // Zero would refuse every token the provider mints; more than a day is
-        // the setting being used to switch itself off. Both ends are startup
-        // refusals, and `check-config` gives the same answer because it is
-        // the same function.
-        for secs in [0, 86_401] {
-            let mut cfg = valid();
-            cfg.auth.oidc = oidc();
-            cfg.auth.oidc.max_token_lifetime_secs = secs;
-            let err = cfg.validate().unwrap_err().to_string();
-            assert!(err.contains("max_token_lifetime_secs"), "unhelpful error for {secs}: {err}");
-            assert!(err.contains("86400"), "the error should name the ceiling: {err}");
-        }
-        for secs in [1, 900, 86_400] {
-            let mut cfg = valid();
-            cfg.auth.oidc = oidc();
-            cfg.auth.oidc.max_token_lifetime_secs = secs;
-            cfg.validate().unwrap_or_else(|e| panic!("{secs} should be accepted: {e}"));
-        }
-        // With federation off the setting is inert, like every other value in
-        // the section, so a stray value cannot stop a node that does not use
-        // it.
+    fn no_lifetime_bound_reaches_the_verifier_or_the_startup_summary() {
+        // The other half of the removal: a configured federation carries no
+        // lifetime setting into the verifier, and the banner says nothing
+        // about one. Reintroducing the refusal means reintroducing both.
         let mut cfg = valid();
-        cfg.auth.oidc.max_token_lifetime_secs = 0;
-        cfg.validate().unwrap();
+        cfg.auth.oidc = oidc();
+
+        cfg.auth.oidc.settings().expect("issuer and audience are both set");
+        cfg.validate().expect("a federation without a lifetime bound is valid");
+        assert!(!cfg.summary().contains("max token lifetime"), "{}", cfg.summary());
     }
 
     #[test]

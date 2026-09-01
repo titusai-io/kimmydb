@@ -1785,7 +1785,6 @@ mod tests {
             roles_claim: "roles".into(),
             role_mappings: Vec::new(),
             require_at_jwt: false,
-            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim: None,
         })
         .unwrap();

@@ -436,7 +436,6 @@ static OIDC: LazyLock<OidcFixture> = LazyLock::new(|| {
         // The production defaults, so the fuzzer runs the path a deployment
         // runs: the lifetime ceiling (ADR-096) is part of what verification
         // decides, and an unset `subject_claim` keeps `sub` as the identity.
-        max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
         subject_claim: None,
     };
     let verifier =

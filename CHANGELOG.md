@@ -12,18 +12,44 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-### Added
+### Removed
 
-- **A lifetime refusal is warned about.** A federated token refused for its
-  lifetime (ADR-096) now logs at WARN, at most once a minute, naming the
-  lifetime the provider minted and the limit this node accepts. It was
-  previously invisible: the refusal produced a 401 with a challenge naming the
-  limit, and no line in the node's log at any level, so a provider over the
-  limit refused every request while the log stayed silent. The rate limit is
-  there because that condition fails *every* request from *every* caller, and
-  it is separate from the JWKS refetch limiter so neither silences the other.
-  The observed lifetime reaches the log only — the `WWW-Authenticate`
-  challenge still names the limit and nothing about the token.
+- **The maximum federated token lifetime, and everything that served it.**
+  `auth.oidc.max_token_lifetime_secs`, `--oidc-max-token-lifetime-secs`,
+  `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`, the two 401 refusals and the startup
+  range check are gone, and so is the WARN added earlier in this section. **A
+  federated access token of any lifetime now verifies, including one with no
+  `iat`.** ADR-112 supersedes ADR-096.
+
+  The refusal turned a correctly configured identity provider into a total
+  authentication outage on upgrade. Okta, Google and Entra ID default access
+  tokens to about an hour and Auth0 defaults an API's to a day — every one of
+  them over the 900-second default. Worse, nothing could predict it: the
+  lifetime belongs to the provider and arrives only with a real token, so
+  `check-config` passed, the node started, the startup summary said nothing,
+  and then every federated request was refused. And the thing being refused was
+  the operator's own provider configuration, which is theirs to set and which
+  serves their other systems too. No comparable product does this.
+
+  The window ADR-096 was bounding is real and unchanged: a revocation at the
+  provider is honoured here when the token expires, so **your provider's
+  access-token lifetime is your revocation window**. That is now stated in
+  [docs/security.md](docs/security.md) and set where it belongs, at the
+  provider, where it also protects everything else those tokens reach.
+
+  **Upgrading — the three ways of setting it behave differently, so there is no
+  single instruction:**
+  - A `kimmy.toml` that sets `max_token_lifetime_secs` **will not start**; the
+    key must be removed. Configuration denies unknown fields.
+  - A `--oidc-max-token-lifetime-secs` flag in a unit file or entrypoint
+    **will not start**; it must be removed.
+  - `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` **may be left set** and is ignored.
+    Nothing declares the variable any more, so nothing reads it. Do not clear
+    it *before* upgrading: on the previous release that reverts the node to the
+    900-second default and causes the outage this release removes.
+
+  Nobody needs to change anything at their provider, and no token that worked
+  before is refused now.
 
 ### Fixed
 
@@ -69,6 +95,10 @@ read the access-token lifetime your provider mints for this resource** and
 either shorten it there or set `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` to
 something that admits it. This is the one item in the release that a careful
 operator can do everything else right and still be caught by.
+
+**If you are upgrading past 0.17.0, skip this paragraph:** the setting and the
+refusal were removed in the next release, so there is nothing to configure. See
+that release's notes for what to do with a value you have already set.
 
 Nothing else asks anything of an operator: the rest is additive query, search
 and configuration surface — the entries below say what — along with settings

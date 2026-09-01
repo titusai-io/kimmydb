@@ -215,7 +215,6 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin: false,
-            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim,
         })
         .unwrap();
@@ -244,7 +243,6 @@ impl Server {
             }],
             require_at_jwt: false,
             allow_federated_admin,
-            max_token_lifetime_secs: kimmy_auth::DEFAULT_MAX_TOKEN_LIFETIME_SECS,
             subject_claim: None,
         })
         .unwrap();
@@ -6567,65 +6565,54 @@ async fn a_node_without_federation_configured_treats_every_token_as_local() {
 }
 
 #[tokio::test]
-async fn a_federated_token_that_lives_too_long_is_refused_and_the_challenge_names_the_limit() {
-    // The window ADR-073 describes is the token's own lifetime, and this is
-    // where it is bounded (ADR-096). A provider minting hour-long tokens
-    // against a node at the default gets a 401 whose challenge says which
-    // limit and how long, so the fix — shorten the provider's lifetime, or
-    // raise the limit knowingly — is discoverable from the response. The
-    // token's own lifetime is not echoed, and the `resource_metadata` pointer
-    // survives the more specific description.
+async fn an_hour_long_federated_token_authenticates() {
+    // The exact token ADR-096 refused, and the exact shape of the outage that
+    // removing it was about: a provider minting hour-long access tokens — the
+    // default for Okta, Google and Entra ID — against a node with no special
+    // configuration. It authenticates (ADR-112).
+    //
+    // How long the provider made the token valid for is its business. The
+    // window in which a revocation there goes unhonoured here is real
+    // (ADR-073) and is documented in docs/security.md; it is not this node's
+    // to refuse, and nothing in the response mentions it.
     let server = Server::start_federated_for(RESOURCE).await;
     let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
     claims["aud"] = json!(RESOURCE);
     claims["exp"] = json!(claims["iat"].as_u64().unwrap() + 3600);
 
     let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
-    assert_eq!(res.status, 401, "{:?}", res.body);
-    assert_eq!(res.body["error"], "unauthorized");
-    let message = res.body["message"].as_str().unwrap_or_default();
-    assert!(message.contains("900 seconds"), "the body names the limit: {message}");
-
-    let challenge = res.header("www-authenticate").expect("a challenge");
-    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
-    assert!(
-        challenge.contains(
-            r#"error_description="the access token is valid for longer than the 900 seconds"#
-        ),
-        "the challenge names the limit: {challenge}"
-    );
-    assert!(challenge.contains("max_token_lifetime_secs"), "and the setting: {challenge}");
-    assert!(!challenge.contains("3600"), "the token's own lifetime is not echoed: {challenge}");
-    assert!(
-        challenge.contains(&format!(
-            r#"resource_metadata="{RESOURCE}/.well-known/oauth-protected-resource""#
-        )),
-        "the pointer must survive a specific description: {challenge}"
-    );
-
-    // The same token at the stub provider's ordinary lifetime is accepted, so
-    // the refusal above was the limit and nothing else about the token.
-    let mut ordinary = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
-    ordinary["aud"] = json!(RESOURCE);
-    let ok = server.get("/v1/auth/whoami", Some(&oidc::token(ordinary))).await;
-    assert_eq!(ok.status, 200, "{:?}", ok.body);
+    assert_eq!(res.status, 200, "an hour-long token must authenticate: {:?}", res.body);
+    assert_eq!(res.body["federated"], true);
+    assert!(res.header("www-authenticate").is_none(), "a success carries no challenge");
 }
 
 #[tokio::test]
-async fn a_federated_token_with_no_iat_is_refused_because_its_lifetime_is_unbounded() {
-    // RFC 9068 §2.2 requires `iat` in an access token; without it the limit
-    // could not be applied, so the token is refused rather than waved
-    // through, and the challenge says why.
+async fn a_day_long_federated_token_authenticates_too() {
+    // Auth0 defaults an API's access tokens to a day. Refusing it was the
+    // clearest case ADR-096 argued for and the clearest case against it: the
+    // lifetime is set at the provider by an operator who is entitled to
+    // choose it, and a database is not where that decision gets overridden.
+    let server = Server::start_federated_for(RESOURCE).await;
+    let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
+    claims["aud"] = json!(RESOURCE);
+    claims["exp"] = json!(claims["iat"].as_u64().unwrap() + 86_400);
+
+    let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
+    assert_eq!(res.status, 200, "a day-long token must authenticate: {:?}", res.body);
+}
+
+#[tokio::test]
+async fn a_federated_token_with_no_iat_authenticates() {
+    // RFC 9068 §2.2 requires `iat`, but nothing reads it here any more — it
+    // existed to measure a lifetime against a bound that no longer exists. A
+    // provider that omits it is outside the profile and is still not this
+    // node's to refuse (ADR-112).
     let server = Server::start_federated().await;
     let mut claims = oidc::claims("ada@example.com", json!(["kimmydb-analyst"]));
     claims.as_object_mut().unwrap().remove("iat");
 
     let res = server.get("/v1/auth/whoami", Some(&oidc::token(claims))).await;
-    assert_eq!(res.status, 401, "{:?}", res.body);
-    let challenge = res.header("www-authenticate").expect("a challenge");
-    assert!(challenge.contains(r#"error="invalid_token""#), "{challenge}");
-    assert!(challenge.contains("carries no iat"), "{challenge}");
-    assert!(challenge.contains("900 seconds"), "{challenge}");
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 // ---------------------------------------------------------------------------

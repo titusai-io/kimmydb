@@ -15,36 +15,6 @@ pub enum AuthError {
     #[error("authentication token has expired")]
     TokenExpired,
 
-    /// A federated token's own `exp − iat` is longer than this node accepts.
-    ///
-    /// Distinct from [`AuthError::InvalidToken`] because the caller can act on
-    /// it and the reason is not sensitive: the provider minted a longer-lived
-    /// token than `auth.oidc.max_token_lifetime_secs` admits, and either the
-    /// provider's lifetime or this node's limit has to move. The message names
-    /// the limit and nothing about the token (ADR-096).
-    ///
-    /// `lifetime_secs` is the token's observed `exp − iat`, and is deliberately
-    /// **not** in the message above. The message becomes the `error_description`
-    /// of a `WWW-Authenticate` challenge, which is read by whoever presented the
-    /// token; the observed lifetime is the provider's business and the
-    /// operator's, so it travels in the variant for the log line to name and
-    /// never in the challenge (ADR-096).
-    #[error(
-        "the access token is valid for longer than the {max_secs} seconds this node accepts          (auth.oidc.max_token_lifetime_secs); shorten the provider's access token lifetime or          raise the limit"
-    )]
-    TokenLifetimeExceeded { max_secs: u64, lifetime_secs: u64 },
-
-    /// A federated token carries no `iat`, so its lifetime cannot be bounded.
-    ///
-    /// Refused rather than waved through, because the limit would otherwise be
-    /// one omitted claim away from not applying. RFC 9068 §2.2 makes `iat`
-    /// REQUIRED in a JWT access token, so a conforming provider never produces
-    /// this (ADR-096).
-    #[error(
-        "the access token carries no iat, so its lifetime cannot be checked against the          {max_secs} seconds this node accepts (auth.oidc.max_token_lifetime_secs); RFC 9068          requires the claim"
-    )]
-    TokenLifetimeUnbounded { max_secs: u64 },
-
     #[error("not authorized to {action} {target}")]
     Forbidden { action: String, target: String },
 
@@ -129,18 +99,6 @@ pub enum AuthError {
          does not implement resource indicators."
     )]
     InvalidResourceIdentifier { audience: String, reason: String },
-
-    /// `auth.oidc.max_token_lifetime_secs` is outside the range that means
-    /// anything.
-    ///
-    /// Zero would refuse every token, and anything past a day is no longer a
-    /// bound on the window ADR-073 describes but a decision not to have one —
-    /// which is a decision this setting exists to prevent being made by typo
-    /// (ADR-096).
-    #[error(
-        "auth.oidc.max_token_lifetime_secs is {secs}, which is outside 1..={max} seconds. It          bounds how long a federated token may be valid for by its own exp − iat, so that a          provider-side revocation is honoured within that many seconds; zero would refuse every          token, and more than a day is not a bound."
-    )]
-    InvalidTokenLifetimeLimit { secs: u64, max: u64 },
 
     #[error("password hashing failed: {0}")]
     Hashing(String),

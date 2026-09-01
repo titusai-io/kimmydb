@@ -110,23 +110,19 @@ the real defense — `require_at_jwt` tightens it when yours stamps `at+jwt`),
 and `/v1/auth/refresh` refusing federated principals (minting a local token
 from a federated identity would shed the `federated` flag — identity
 laundering). There is no revocation path shorter than expiry for a federated
-session ([ADR-065](decisions.md)), so the node bounds expiry itself: a token
-valid for longer than `auth.oidc.max_token_lifetime_secs`
-(`KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS`, 900 seconds by default) is refused with
-a 401 whose challenge names the limit, and so is a token with no `iat`. The
-node also logs the refusal at WARN, at most once a minute, naming the lifetime
-your provider minted alongside the limit — that line is the fastest way to tell
-this apart from an audience mismatch, which produces the same 401 to a client.
-Set the access-token lifetime your provider mints for this resource at or below
-the limit; raise the limit only when you cannot, and knowingly — the number is
-how long a revocation at the provider goes unhonoured here
-([ADR-096](decisions.md)).
+session ([ADR-065](decisions.md)), and the node does not bound expiry itself: a
+token of any lifetime verifies, including one with no `iat`
+([ADR-112](decisions.md)).
 
-**This is the one setting `kimmyd check-config` cannot pre-flight.** The
-lifetime belongs to the provider and arrives only with a real token, so a node
-whose provider mints hour-long tokens starts cleanly, reports nothing unusual
-in its startup banner, and refuses every federated request from the first one.
-Read the lifetime at the provider before upgrading rather than after.
+**So the access-token lifetime you configure at your provider is your
+revocation window here.** Revoke someone's role at the provider and this node
+honours the old claim until their current token expires. Set that lifetime
+where every relying party benefits from it — a per-API setting in Auth0, an
+access policy on the authorization server in Okta, a token lifetime policy in
+Entra ID, a client-level lifespan in Keycloak — rather than expecting the
+database to second-guess it. Five to fifteen minutes is the ordinary
+recommendation; refresh handles renewal, so a short lifetime costs nobody a
+login.
 
 Signing keys rotate at the provider and are picked up here automatically —
 a token naming an unknown key triggers one rate-limited refetch, and an
@@ -225,19 +221,11 @@ Work down this list; each step is observable from outside the node.
    note it arrives as a JSON **array** — against the node's configured
    audience, byte for byte, and remember the same string must sit in the
    provider's registry.
-5. **401 whose `WWW-Authenticate` says the token is valid for longer than the
-   seconds this node accepts** — or a `WARN` in the node's log naming a minted
-   lifetime and the limit, which says the same thing from the operator's side
-   and is what to grep for when all you have been handed is "it stopped
-   working". The provider mints access tokens for longer
-   than `max_token_lifetime_secs` (900 by default). Shorten the lifetime on
-   the provider's side for this resource — a per-API setting in Auth0, an
-   access policy on the authorization server in Okta, a token lifetime policy
-   in Entra ID, a client-level lifespan in Keycloak — or raise
-   `KIMMY_OIDC_MAX_TOKEN_LIFETIME_SECS` knowingly: the number is how long a
-   revocation at the provider goes unhonoured here. The same header saying the
-   token *carries no `iat`* means the provider omits a claim RFC 9068 requires,
-   and there is no node-side setting for that.
+5. **A role you removed at the provider still works.** Not a fault: membership
+   is frozen in the access token and there is no introspection, so the change
+   lands when that token expires. The wait is the access-token lifetime your
+   provider mints. Nothing here shortens it ([ADR-112](decisions.md)) — shorten
+   it at the provider if the window matters.
 6. **`kimmy whoami` answers with grants or a user that cannot exist here.**
    You are talking to a different server than you think — a leftover dev node
    on `localhost:7878` answers the CLI's default URL. Compare
@@ -269,5 +257,5 @@ Work down this list; each step is observable from outside the node.
 - [Decisions](decisions.md) — ADR-064 (verifier routing), ADR-066 (inline
   mappings), ADR-071 (audience = resource identifier), ADR-073 (stored roles),
   ADR-074 (federatable admin), ADR-078 (mappings through the environment),
-  ADR-096 (the maximum token lifetime), ADR-100 (local login modes and the
-  display name)
+  ADR-112 (the provider decides how long its tokens live, superseding
+  ADR-096), ADR-100 (local login modes and the display name)

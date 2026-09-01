@@ -464,15 +464,6 @@ impl From<AuthError> for ApiError {
             AuthError::InvalidToken | AuthError::TokenExpired => {
                 ApiError::unauthorized(e.to_string())
             }
-            // The refusal names this node's limit and nothing about the token,
-            // and it reaches the challenge as well as the body: a client told
-            // only `invalid_token` would refresh, and the provider would mint
-            // the same token again. The fix is on the provider's side or in
-            // this node's configuration, and the description says so
-            // (ADR-096).
-            AuthError::TokenLifetimeExceeded { .. } | AuthError::TokenLifetimeUnbounded { .. } => {
-                ApiError::unauthorized(e.to_string()).with_challenge_description(e.to_string())
-            }
             // Reported to the caller as an ordinary invalid token, with the
             // key id kept out of the message. Which signing keys this node
             // has fetched is not something an unauthenticated caller should
@@ -496,8 +487,7 @@ impl From<AuthError> for ApiError {
             | AuthError::PreviousSecretIsCurrent
             | AuthError::AdminNotFederatable { .. }
             | AuthError::EmptyRoleMapping { .. }
-            | AuthError::InvalidResourceIdentifier { .. }
-            | AuthError::InvalidTokenLifetimeLimit { .. } => ApiError::bad_request(e.to_string()),
+            | AuthError::InvalidResourceIdentifier { .. } => ApiError::bad_request(e.to_string()),
             AuthError::Hashing(_) | AuthError::TokenIssue(_) => {
                 error!(error = %e, "auth failure");
                 ApiError::internal("authentication failure")
@@ -586,30 +576,17 @@ mod tests {
     }
 
     #[test]
-    fn a_lifetime_refusal_is_a_401_whose_challenge_names_the_limit() {
-        // Both the body and the challenge say which limit and how long, so the
-        // fix is discoverable from the response; neither says anything about
-        // the token itself (ADR-096).
-        for e in [
-            AuthError::TokenLifetimeExceeded { max_secs: 900, lifetime_secs: 3600 },
-            AuthError::TokenLifetimeUnbounded { max_secs: 900 },
-        ] {
+    fn every_token_refusal_keeps_the_generic_challenge() {
+        // ADR-096 carved out one specific `error_description` for a lifetime
+        // refusal. ADR-112 removed the refusal, so nothing on the token path
+        // is specific any more: every 401 says the same thing, which is the
+        // property the uniform challenge had before ADR-096 and has again.
+        for e in [AuthError::TokenExpired, AuthError::InvalidToken] {
             let e: ApiError = e.into();
             assert_eq!(e.status, StatusCode::UNAUTHORIZED);
             assert_eq!(e.code, ErrorCode::Unauthorized);
-            assert!(e.message.contains("900 seconds"), "{}", e.message);
-            let description = e.challenge_description.as_deref().expect("a specific description");
-            assert!(description.contains("900 seconds"), "{description}");
-            assert!(description.contains("max_token_lifetime_secs"), "{description}");
-            // The observed lifetime is carried on the variant for the operator's
-            // log line and must not reach the client: the challenge names the
-            // limit and nothing about the token that was presented (ADR-096).
-            assert!(!description.contains("3600"), "{description}");
-            assert!(!e.message.contains("3600"), "{}", e.message);
+            assert!(e.challenge_description.is_none(), "{:?}", e.challenge_description);
         }
-        // The ordinary refusals keep the generic challenge.
-        let plain: ApiError = AuthError::TokenExpired.into();
-        assert!(plain.challenge_description.is_none());
     }
 
     #[test]
