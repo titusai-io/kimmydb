@@ -10,6 +10,14 @@ use clap::Parser;
 
 use crate::cli::{Cli, Command};
 
+// The global allocator, set in the binary and nowhere else. The release
+// binary is a static musl build on every channel, and musl's malloc takes one
+// lock per allocation: at eight concurrent clients a paged `find` ran
+// thirteen times slower than the same code against glibc. mimalloc recovers
+// it on every target alike (ADR-117; the table is in docs/benchmarks.md).
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 

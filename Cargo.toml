@@ -126,6 +126,19 @@ argon2 = { version = "0.5", features = ["std"] }
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
 rand = "0.9"
 
+# The global allocator for `kimmyd`, and the second native library in the
+# default build beside `ring` (ADR-117). Every channel ships the static musl
+# binary (ADR-063, ADR-107), and a musl binary that sets no allocator runs on
+# musl's malloc, which takes one lock for every allocation: under eight
+# concurrent clients a paged `find` measured thirteen times slower than the
+# same code linked against glibc, and `count` ten times. mimalloc closes the
+# gap and then some, on every target alike. One vendored C library with no
+# system dependency, compiled by the `cc` the build already needs for `ring`;
+# default features, so the tree it builds is the one its authors test.
+# Set in the binary crate only -- a library that sets `#[global_allocator]`
+# decides for every program that links it.
+mimalloc = "0.1"
+
 # OpenTelemetry. The API crate is separated from the SDK on purpose: the
 # library crates take `opentelemetry` (context and propagation types only, no
 # exporter, no runtime) and the binary takes the SDK, so nothing but `kimmyd`

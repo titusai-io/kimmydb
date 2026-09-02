@@ -14,3 +14,12 @@
 # alternative provider, aws-lc-rs, additionally needs CMake for the same
 # primitives.
 cc
+
+# The C allocator behind `kimmyd`'s global allocator. Reaches the graph
+# through:
+#   kimmyd -> mimalloc -> libmimalloc-sys         (ADR-117)
+# One vendored C library with no system dependency, compiled by the same `cc`
+# `ring` already requires. Accepted 2026-09-01 after measuring: the static
+# musl binary every channel ships would otherwise run on musl's malloc, which
+# serialises concurrent allocation (docs/benchmarks.md has the table).
+libmimalloc-sys
