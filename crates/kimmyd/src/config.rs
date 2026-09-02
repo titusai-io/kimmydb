@@ -5,6 +5,7 @@
 //! clap). Flags win because they are the most specific thing the operator
 //! typed; the file wins over defaults for the same reason.
 
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -71,6 +72,14 @@ pub struct VectorConfig {
     pub batch: BatchConfig,
     /// The in-memory HNSW graphs that serve approximate search.
     pub index_cache: IndexCacheConfig,
+    /// What an embedding provider may be handed, and where it may be sent.
+    pub provider: ProviderPolicyConfig,
+    /// Providers defined here rather than in a collection, by name
+    /// (ADR-115). A collection uses one with
+    /// `{"kind": "profile", "name": "<name>"}`; the endpoint, model and key
+    /// variable stay in this file. Each is held to the same policy a
+    /// collection's own provider is.
+    pub providers: BTreeMap<String, kimmy_core::ProviderConfig>,
 }
 
 impl Default for VectorConfig {
@@ -79,6 +88,63 @@ impl Default for VectorConfig {
             worker_enabled: true,
             batch: BatchConfig::default(),
             index_cache: IndexCacheConfig::default(),
+            provider: ProviderPolicyConfig::default(),
+            providers: BTreeMap::new(),
+        }
+    }
+}
+
+impl VectorConfig {
+    /// The provider policy this configuration describes, or why it cannot be
+    /// one: an allowlist entry that would reach a node secret, a malformed
+    /// pattern, or a profile the policy itself refuses.
+    pub fn provider_policy(&self) -> Result<kimmy_vector::ProviderPolicy> {
+        kimmy_vector::ProviderPolicy::new(
+            self.provider.allowed_key_env.clone(),
+            self.provider.allowed_hosts.clone(),
+            self.provider.endpoints_locked,
+            self.providers.clone(),
+        )
+        .map_err(anyhow::Error::msg)
+    }
+}
+
+/// The policy for embedding providers (ADR-115).
+///
+/// A collection's vector configuration names an endpoint and an environment
+/// variable, and the provider sends that variable's value to that endpoint.
+/// These settings are what keeps that from being a way for a `ddl` holder to
+/// read the node's own secrets or probe its network.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ProviderPolicyConfig {
+    /// Environment variables a provider may be handed, as exact names or
+    /// prefixes with one trailing `*`. A collection's `api_key_env` outside
+    /// this list is refused by name.
+    ///
+    /// Not configurable past one line: every `KIMMY_*` variable other than
+    /// `KIMMY_PROVIDER_*` is the node's own — the signing secret, the cluster
+    /// secret, the bootstrap password — and listing one here is refused at
+    /// startup rather than honoured.
+    pub allowed_key_env: Vec<String>,
+    /// Hosts a provider may be sent to beyond the public internet, with the
+    /// same meaning as `webhooks.allowed_hosts`: empty is public addresses
+    /// only, and loopback, link-local and private ranges are refused unless
+    /// the host is named here. An Ollama or llama.cpp on this host or on the
+    /// LAN needs its host listed.
+    pub allowed_hosts: Vec<String>,
+    /// Refuse every provider kind but `profile`, `byo` and `local` when a
+    /// collection is configured, so the endpoints this node sends text to are
+    /// the ones defined under `[vector.providers.<name>]` and no others.
+    pub endpoints_locked: bool,
+}
+
+impl Default for ProviderPolicyConfig {
+    fn default() -> Self {
+        Self {
+            allowed_key_env: kimmy_vector::policy::default_allowed_key_env(),
+            allowed_hosts: Vec::new(),
+            endpoints_locked: false,
         }
     }
 }
@@ -1398,6 +1464,11 @@ impl Config {
         self.server.tls.validate()?;
         self.telemetry.validate()?;
         self.vector.batch.validate()?;
+        // The provider policy, built as the node will build it, and every
+        // profile checked against it — resolving each endpoint's host as a
+        // collection's own endpoint is at configure time, so `check-config`
+        // gives the answer the worker would (ADR-115).
+        self.vector.provider_policy()?.validate_profiles().map_err(anyhow::Error::msg)?;
         // Parsed at startup so a typo is a boot failure rather than an audit
         // log that silently records nothing.
         kimmy_api::AuditMode::parse(&self.audit.mode).map_err(|e| anyhow::anyhow!("audit.{e}"))?;
@@ -2091,6 +2162,103 @@ mod tests {
         assert!(cfg.validate().unwrap_err().to_string().contains("vector.batch.max_wait_ms"));
         cfg.vector.batch.max_wait_ms = 0;
         cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn an_allowlist_entry_naming_a_node_secret_is_refused() {
+        // The one line of the provider policy that is not the operator's to
+        // change: `KIMMY_*` other than `KIMMY_PROVIDER_*` is never handed to
+        // a provider, and an allowlist that says otherwise is refused where
+        // it was written rather than silently ignored.
+        for bad in
+            ["KIMMY_JWT_SECRET", "KIMMY_CLUSTER_SECRET", "KIMMY_ROOT_PASSWORD", "KIMMY_*", "K*"]
+        {
+            let mut cfg = valid();
+            cfg.vector.provider.allowed_key_env = vec![bad.into()];
+            let err = cfg.validate().expect_err(bad).to_string();
+            assert!(err.contains("vector.provider.allowed_key_env"), "{bad}: {err}");
+            assert!(err.contains(bad), "{bad}: {err}");
+        }
+        // A star anywhere but the end is a malformed pattern, not a literal.
+        let mut cfg = valid();
+        cfg.vector.provider.allowed_key_env = vec!["ACME_*_KEY".into()];
+        assert!(cfg.validate().unwrap_err().to_string().contains("ACME_*_KEY"));
+
+        // The default is the documented list, and it validates.
+        let cfg = valid();
+        assert_eq!(
+            cfg.vector.provider.allowed_key_env,
+            vec!["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+        );
+        assert!(cfg.vector.provider.allowed_hosts.is_empty());
+        assert!(!cfg.vector.provider.endpoints_locked);
+        cfg.validate().unwrap();
+    }
+
+    #[test]
+    fn a_provider_profile_reads_from_toml_and_is_held_to_the_policy() {
+        // The documented shape: a `[vector.providers.<name>]` table carrying
+        // the same fields a collection's provider would. It round-trips
+        // through `check-config`'s TOML output, and a profile the policy
+        // refuses — here a private host with nothing allowing it — stops
+        // validation by name.
+        let cfg: Config = toml::from_str(
+            r#"
+[vector.provider]
+allowed_hosts = ["10.0.0.5"]
+endpoints_locked = true
+
+[vector.providers.lan]
+kind = "ollama"
+model = "nomic-embed-text"
+endpoint = "http://10.0.0.5:11434"
+
+[vector.providers.hosted]
+kind = "open_ai"
+model = "text-embedding-3-small"
+api_key_env = "KIMMY_PROVIDER_HOSTED"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.vector.providers.len(), 2);
+        assert!(cfg.vector.provider.endpoints_locked);
+        assert_eq!(
+            cfg.vector.providers["lan"],
+            kimmy_core::ProviderConfig::Ollama {
+                model: "nomic-embed-text".into(),
+                endpoint: "http://10.0.0.5:11434".into(),
+            }
+        );
+        let policy = cfg.vector.provider_policy().unwrap();
+        assert!(policy.locked());
+        policy.validate_profiles().unwrap();
+
+        let printed = toml::to_string_pretty(&cfg).unwrap();
+        let again: Config = toml::from_str(&printed).unwrap();
+        assert_eq!(again.vector, cfg.vector, "check-config output reads back as written");
+
+        // Without the host allowed, the profile is refused by name, at
+        // validation, and the message says which setting admits it.
+        let mut cfg = valid();
+        cfg.vector.providers = again.vector.providers.clone();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("vector.providers.lan"), "{err}");
+        assert!(err.contains("vector.provider.allowed_hosts"), "{err}");
+
+        // And a profile naming a node secret is refused whatever else is set.
+        let mut cfg = valid();
+        cfg.vector.providers.insert(
+            "bad".into(),
+            kimmy_core::ProviderConfig::OpenAi {
+                model: "m".into(),
+                endpoint: None,
+                api_key_env: "KIMMY_JWT_SECRET".into(),
+                dimensions: None,
+            },
+        );
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("vector.providers.bad"), "{err}");
+        assert!(err.contains("KIMMY_JWT_SECRET"), "{err}");
     }
 
     #[test]

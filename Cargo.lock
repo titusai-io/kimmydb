@@ -2579,6 +2579,7 @@ dependencies = [
  "fastembed",
  "hnsw_rs",
  "kimmy-core",
+ "kimmy-egress",
  "kimmy-storage",
  "parking_lot",
  "reqwest 0.12.28",

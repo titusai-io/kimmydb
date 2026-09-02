@@ -14,6 +14,7 @@ pub mod error;
 pub mod index;
 #[cfg(feature = "local-embeddings")]
 pub mod local;
+pub mod policy;
 pub mod provider;
 pub mod search;
 pub mod worker;
@@ -32,6 +33,7 @@ pub fn local_embeddings_available() -> bool {
 }
 
 pub use index::HnswIndex;
+pub use policy::{PolicyError, ProviderPolicy};
 pub use provider::{EmbeddingProvider, build, provider_totals};
 pub use search::{
     Hit, SearchOptions, keyword_search, reciprocal_rank_fusion, vector_search,

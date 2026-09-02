@@ -31,9 +31,10 @@ use std::time::{Duration, Instant};
 
 use kimmy_core::{ChunkConfig, Hlc, OpKind, VectorConfig, VectorRecord, path};
 use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::error::{Result, TransportKind, VectorError};
+use crate::policy::ProviderPolicy;
 use crate::provider::{self, EmbeddingProvider};
 
 /// Name under which the worker records its oplog position.
@@ -301,6 +302,16 @@ pub struct EmbeddingWorker {
     /// reconfiguration a live event. `None` marks a test-injected provider
     /// that no configuration should evict.
     providers: HashMap<u64, (Option<VectorConfig>, Arc<dyn EmbeddingProvider>)>,
+    /// What a provider may be handed and where it may be sent (ADR-115).
+    /// Consulted when a provider is built — here, at use time, and not only
+    /// when the configuration was accepted, because a configuration also
+    /// arrives by replication from a member whose API this node never saw.
+    policy: ProviderPolicy,
+    /// Configurations the policy refused, by collection, with the refusal as
+    /// it was logged. A refusal is permanent for that configuration and is
+    /// said once; every document behind it is skipped quietly until the
+    /// collection is reconfigured, which evicts the entry.
+    refused: HashMap<u64, (VectorConfig, String)>,
     /// Documents written by another node, waiting to see whether that node
     /// embeds them. Ordered by deadline, which insertion order already gives.
     deferred: VecDeque<Deferred>,
@@ -429,6 +440,8 @@ impl EmbeddingWorker {
             engine,
             batching: BatchSettings::default(),
             providers: HashMap::new(),
+            policy: ProviderPolicy::default(),
+            refused: HashMap::new(),
             deferred: VecDeque::new(),
             am_owner: None,
             counters: Arc::new(WorkerCounters::default()),
@@ -439,6 +452,13 @@ impl EmbeddingWorker {
     /// [`BatchSettings`] for the bounds and their defaults.
     pub fn set_batching(&mut self, batching: BatchSettings) {
         self.batching = batching;
+    }
+
+    /// Install the operator's provider policy. Call before [`Self::run`]: a
+    /// provider built under the default policy is not rebuilt when this
+    /// changes, and the default admits nothing the operator's would not.
+    pub fn set_policy(&mut self, policy: ProviderPolicy) {
+        self.policy = policy;
     }
 
     /// Install the cluster-ownership check. See the `am_owner` field for why
@@ -610,13 +630,23 @@ impl EmbeddingWorker {
                     Err(e) => {
                         // A permanent failure would retry forever. Record it
                         // and move on, so one poisoned entry cannot stall
-                        // every other one.
-                        warn!(
-                            error = %e,
-                            collection = ?entry.collection,
-                            doc = ?entry.doc_id,
-                            "embedding permanently failed; skipping this entry"
-                        );
+                        // every other one. A policy refusal was reported when
+                        // the provider failed to build, once; the documents
+                        // behind it are noted at debug.
+                        if e.is_refused_by_policy() {
+                            debug!(
+                                collection = ?entry.collection,
+                                doc = ?entry.doc_id,
+                                "skipping an entry of a collection whose provider is refused"
+                            );
+                        } else {
+                            warn!(
+                                error = %e,
+                                collection = ?entry.collection,
+                                doc = ?entry.doc_id,
+                                "embedding permanently failed; skipping this entry"
+                            );
+                        }
                         break Prepared::Done(Outcome::Skipped);
                     }
                 }
@@ -767,6 +797,13 @@ impl EmbeddingWorker {
                     warn!(error = %e, "deferred embedding failed; will retry");
                     self.deferred.push_back(Deferred { due: now + RETRY_DELAY, ..item });
                     break;
+                }
+                Err(e) if e.is_refused_by_policy() => {
+                    debug!(
+                        collection = %item.collection,
+                        doc = %item.source,
+                        "skipping a deferred document of a collection whose provider is refused"
+                    );
                 }
                 Err(e) => {
                     warn!(
@@ -1307,6 +1344,18 @@ impl EmbeddingWorker {
                     tokio::time::sleep(RETRY_DELAY).await;
                 }
                 Err(e) => {
+                    // Splitting a refused batch would ask the policy once per
+                    // document and get the same answer; the batch is simply
+                    // skipped.
+                    if e.is_refused_by_policy() {
+                        debug!(
+                            db = %collection.db,
+                            collection = %collection.name,
+                            documents = jobs.len(),
+                            "skipping a batch of a collection whose provider is refused"
+                        );
+                        return 0;
+                    }
                     warn!(
                         error = %e,
                         db = %collection.db,
@@ -1356,14 +1405,24 @@ impl EmbeddingWorker {
                     // A permanent failure (bad config, wrong dimension, an
                     // input the model refuses) would retry forever. Name it
                     // and move on, so one poisoned document cannot stall
-                    // every other one.
-                    warn!(
-                        error = %e,
-                        db = %collection.db,
-                        collection = %collection.name,
-                        doc = %job.source,
-                        "embedding permanently failed; skipping this document"
-                    );
+                    // every other one. A policy refusal was named once when
+                    // the provider failed to build.
+                    if e.is_refused_by_policy() {
+                        debug!(
+                            db = %collection.db,
+                            collection = %collection.name,
+                            doc = %job.source,
+                            "skipping a document of a collection whose provider is refused"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            db = %collection.db,
+                            collection = %collection.name,
+                            doc = %job.source,
+                            "embedding permanently failed; skipping this document"
+                        );
+                    }
                     return 0;
                 }
             }
@@ -1398,8 +1457,37 @@ impl EmbeddingWorker {
         {
             return Ok(Arc::clone(existing));
         }
+        // A configuration the policy already refused is refused again without
+        // being said again — the message named the variable or the host once,
+        // and a line per document behind it would say nothing new.
+        if let Some((refused_config, message)) = self.refused.get(&collection)
+            && refused_config == config
+        {
+            return Err(VectorError::PolicyRefused(message.clone()));
+        }
         let built: Arc<dyn EmbeddingProvider> =
-            Arc::from(provider::build(&config.provider, config.dim)?);
+            match provider::build(&config.provider, config.dim, &self.policy) {
+                Ok(built) => Arc::from(built),
+                Err(e) if e.is_refused_by_policy() => {
+                    // The one line an operator gets, so it carries what they
+                    // need: which collection, and the name or host refused.
+                    // Never a value — the policy refused the *name* before
+                    // anything read it.
+                    let message = e.to_string();
+                    error!(
+                        collection = collection,
+                        provider = config.provider.name(),
+                        error = %message,
+                        "this node's provider policy refuses the collection's embedding \
+                         configuration; its documents will not be embedded here until it is \
+                         reconfigured"
+                    );
+                    self.refused.insert(collection, (config.clone(), message));
+                    return Err(e);
+                }
+                Err(e) => return Err(e),
+            };
+        self.refused.remove(&collection);
         self.providers.insert(collection, (Some(config.clone()), Arc::clone(&built)));
         Ok(built)
     }
@@ -1497,6 +1585,14 @@ impl VectorError {
             }
             _ => false,
         }
+    }
+
+    /// Whether this node's provider policy refused the configuration, or
+    /// the configuration names a profile this node does not define. Both are
+    /// permanent for the configuration and reported once, when the provider
+    /// fails to build, rather than per document.
+    pub fn is_refused_by_policy(&self) -> bool {
+        matches!(self, VectorError::PolicyRefused(_) | VectorError::UnknownProfile { .. })
     }
 }
 
@@ -1614,6 +1710,17 @@ mod tests {
             query_prefix: None,
             chunk: ChunkConfig { max_chars: 20, overlap: 5, max_tokens: None },
         }
+    }
+
+    /// A policy admitting the loopback endpoint the test configuration names.
+    fn loopback_policy() -> ProviderPolicy {
+        ProviderPolicy::new(
+            crate::policy::default_allowed_key_env(),
+            vec!["localhost".into()],
+            false,
+            Default::default(),
+        )
+        .unwrap()
     }
 
     /// An engine with an embedding-enabled collection and a fake provider.
@@ -2662,6 +2769,9 @@ mod tests {
         // built from a real config. Build one from config A, then ask with
         // config B: the provider must be rebuilt, not reused.
         let mut real = EmbeddingWorker::new(Arc::clone(&_engine));
+        // The test configuration points at localhost, which the default
+        // policy refuses; this worker is an operator who listed it.
+        real.set_policy(loopback_policy());
         let a = config(&["title"]);
         let built_a = real.provider_for(coll.id.0, &a).unwrap();
         let mut b = config(&["title"]);
@@ -2669,6 +2779,96 @@ mod tests {
         let built_b = real.provider_for(coll.id.0, &b).unwrap();
         assert_eq!(built_a.dim(), 4);
         assert_eq!(built_b.dim(), 8, "a changed configuration must rebuild the provider");
+    }
+
+    #[tokio::test]
+    async fn a_stored_configuration_naming_a_node_secret_is_refused_by_the_worker() {
+        // The layer replication reaches. A configuration written straight
+        // into the engine — as a replicated `ConfigureVectors` entry is —
+        // never passed this node's API, so the worker has to refuse it on
+        // its own: no provider is built, the variable is never read, the
+        // document is skipped rather than retried, and the refusal is a
+        // permanent one for that configuration.
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let mut stolen = config(&["title"]);
+        stolen.provider = ProviderConfig::OpenAi {
+            model: "m".into(),
+            endpoint: Some("https://93.184.216.34".into()),
+            api_key_env: "KIMMY_JWT_SECRET".into(),
+            dimensions: None,
+        };
+        engine.configure_vectors("app", "docs", stolen.clone()).unwrap();
+        // The injected fake is evicted by the changed configuration, so the
+        // real builder — and the policy — decide.
+        worker.providers.clear();
+
+        let err = worker.provider_for(coll.id.0, &stolen).err().expect("refused");
+        assert!(err.is_refused_by_policy(), "{err:?}");
+        assert!(!err.is_retryable(), "a policy refusal must not stall the stream");
+        assert!(err.to_string().contains("KIMMY_JWT_SECRET"), "{err}");
+        assert!(worker.refused.contains_key(&coll.id.0), "remembered, so it is said once");
+
+        // The same answer again, from memory rather than a second report.
+        let again = worker.provider_for(coll.id.0, &stolen).err().expect("still refused");
+        assert!(matches!(again, VectorError::PolicyRefused(_)), "{again:?}");
+
+        // Through the stream: the entry fails with the refusal — which `run`
+        // classifies as permanent and skips — and nothing was written to the
+        // shadow collection.
+        let coll = engine.get_collection("app", "docs").unwrap();
+        let id = engine.insert(&coll, doc! { "_id": 1i64, "title": "hello" }).unwrap();
+        let err = worker.process(&last_entry(&engine)).await.unwrap_err();
+        assert!(err.is_refused_by_policy() && !err.is_retryable(), "{err:?}");
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        assert!(engine.get_vectors(&shadow, &id).unwrap().is_empty());
+
+        // Reconfiguring to something the policy admits forgets the refusal.
+        let mut fixed = stolen.clone();
+        fixed.provider =
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://localhost:1".into() };
+        worker.set_policy(loopback_policy());
+        worker.provider_for(coll.id.0, &fixed).expect("an admitted configuration builds");
+        assert!(!worker.refused.contains_key(&coll.id.0));
+    }
+
+    #[tokio::test]
+    async fn a_profile_resolves_in_the_worker_and_a_missing_one_fails_permanently() {
+        // A collection naming a profile embeds through the operator's
+        // provider, with the dialect and endpoint the profile defines. One
+        // naming a profile this node lacks is a permanent, remembered
+        // failure — a retry would ask the same configuration the same
+        // question.
+        let (_engine, coll, mut worker, _dir) = setup().await;
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "lan".to_string(),
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://localhost:1".into() },
+        );
+        worker.set_policy(
+            ProviderPolicy::new(
+                crate::policy::default_allowed_key_env(),
+                vec!["localhost".into()],
+                false,
+                profiles,
+            )
+            .unwrap(),
+        );
+        worker.providers.clear();
+
+        let mut named = config(&["title"]);
+        named.provider = ProviderConfig::Profile { name: "lan".into() };
+        let built = worker.provider_for(coll.id.0, &named).expect("the profile resolves");
+        assert_eq!(built.name(), "ollama", "the profile's dialect");
+
+        let mut missing = config(&["title"]);
+        missing.provider = ProviderConfig::Profile { name: "nope".into() };
+        let err = worker.provider_for(coll.id.0, &missing).err().expect("no such profile");
+        assert!(
+            matches!(err, VectorError::UnknownProfile { ref name } if name == "nope"),
+            "{err:?}"
+        );
+        assert!(!err.is_retryable());
+        assert!(worker.refused.contains_key(&coll.id.0));
     }
 
     /// The same entry as if a different node had written it. Since ownership

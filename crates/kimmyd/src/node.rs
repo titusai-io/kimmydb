@@ -166,12 +166,27 @@ pub async fn run(config: Config) -> Result<()> {
         kimmy_api::egress::WEBHOOKS,
         config.webhooks.allowed_hosts.clone(),
     );
-    let state = kimmy_api::state_with_egress(
+    // What an embedding provider may be handed and where it may be sent
+    // (ADR-115). One policy, built once, held by the API for configure time
+    // and searches and by the worker for documents, so the two cannot
+    // disagree about a configuration. Validation already refused a policy
+    // that could not be built; this cannot fail on a configuration that
+    // passed it.
+    let providers = config.vector.provider_policy().context("building the provider policy")?;
+    if providers.locked() || !providers.profiles().is_empty() {
+        info!(
+            endpoints_locked = providers.locked(),
+            profiles = providers.profiles().len(),
+            "embedding provider policy"
+        );
+    }
+    let state = kimmy_api::state_with_policies(
         Arc::clone(&engine),
         tokens,
         config.auth.insecure_no_auth,
         limits,
         egress,
+        providers.clone(),
     )
     .context("building the API state")?;
 
@@ -403,6 +418,7 @@ pub async fn run(config: Config) -> Result<()> {
             async move {
                 let mut worker = kimmy_vector::EmbeddingWorker::new(engine);
                 worker.set_batching(batching);
+                worker.set_policy(providers);
                 worker.set_owner_check(Box::new(move |key| match &worker_members {
                     // No clustering: the candidate set is just this node,
                     // which owns everything.

@@ -3328,6 +3328,64 @@ async fn byo_collection(server: &Server) -> String {
 }
 
 #[tokio::test]
+async fn configuring_a_provider_with_a_node_secret_or_a_private_endpoint_is_refused() {
+    // ADR-115, over the wire. A `ddl` holder naming the node's own signing
+    // secret as the provider's key variable, or pointing the provider at the
+    // node's own network, is answered 400 with the name and the setting —
+    // and nothing is stored, so the collection is still unconfigured after.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+
+    let stolen = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": {
+            "kind": "open_ai", "model": "m",
+            "endpoint": "https://93.184.216.34",
+            "api_key_env": "KIMMY_JWT_SECRET",
+        },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), stolen).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("KIMMY_JWT_SECRET"), "{message}");
+    assert!(message.contains("api_key_env"), "{message}");
+
+    let inward = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "ollama", "model": "m", "endpoint": "http://169.254.169.254" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), inward).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("169.254.169.254"), "{message}");
+    assert!(message.contains("vector.provider.allowed_hosts"), "{message}");
+
+    let unknown = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "profile", "name": "nope" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), unknown).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("vector.providers.nope"), "{message}");
+
+    // Nothing was stored by any of the refusals.
+    let res = server.get("/v1/db/shop/coll/docs/vector", Some(&token)).await;
+    assert_eq!(res.status, 200);
+    assert!(res.body["vector"].is_null(), "{:?}", res.body);
+
+    // And the shape that has always worked still does: a hosted default
+    // endpoint with its documented variable.
+    let fine = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "open_ai", "model": "m" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), fine).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn searching_a_collection_with_no_vectors_says_so() {
     // An empty result set is indistinguishable from "nothing matched", which is
     // how `byo` being the default produced a collection that silently could
@@ -6546,7 +6604,7 @@ async fn a_token_signed_by_a_key_the_node_has_not_fetched_is_refused_without_nam
 
     let res = server.get("/v1/auth/whoami", Some(&token)).await;
     assert_eq!(res.status, 401, "{:?}", res.body);
-    let message = res.body["error"]["message"].as_str().unwrap_or_default();
+    let message = res.body["message"].as_str().unwrap_or_default();
     assert!(!message.contains("rotated-key-2"), "the message must not echo the key id: {message}");
 }
 

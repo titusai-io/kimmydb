@@ -83,13 +83,34 @@ pub fn state(
     )
 }
 
-/// As [`state`], with an egress policy for webhooks.
+/// As [`state`], with an egress policy for webhooks and the default policy
+/// for embedding providers.
 pub fn state_with_egress(
     engine: Arc<Engine>,
     tokens: TokenIssuer,
     insecure_no_auth: bool,
     limits: RateLimits,
     egress: egress::EgressPolicy,
+) -> Result<SharedState, kimmy_auth::AuthError> {
+    state_with_policies(
+        engine,
+        tokens,
+        insecure_no_auth,
+        limits,
+        egress,
+        kimmy_vector::ProviderPolicy::default(),
+    )
+}
+
+/// As [`state`], with both outbound policies chosen: where a webhook may be
+/// pointed, and what an embedding provider may be handed (ADR-115).
+pub fn state_with_policies(
+    engine: Arc<Engine>,
+    tokens: TokenIssuer,
+    insecure_no_auth: bool,
+    limits: RateLimits,
+    egress: egress::EgressPolicy,
+    providers: kimmy_vector::ProviderPolicy,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
     let users = UserStore::open(&engine)?;
     // Its own handle: the cache reads users on a miss, and threading the
@@ -112,6 +133,7 @@ pub fn state_with_egress(
         limits,
         metrics: Metrics::default(),
         egress,
+        providers,
         sessions,
         members: std::sync::OnceLock::new(),
         federation: std::sync::OnceLock::new(),

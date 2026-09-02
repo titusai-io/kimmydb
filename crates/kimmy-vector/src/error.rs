@@ -64,6 +64,18 @@ pub enum VectorError {
     #[error("environment variable {var} is not set, so the provider has no API key")]
     MissingApiKey { var: String },
 
+    /// This node's provider policy refuses the configuration: a key variable
+    /// it may not be handed, or an endpoint it may not be sent to. Permanent
+    /// for the configuration — a retry asks the same policy the same question.
+    #[error("this node's embedding provider policy refuses the configuration: {0}")]
+    PolicyRefused(String),
+
+    /// The collection names a profile this node does not define.
+    #[error(
+        "no provider profile named {name:?} is configured on this node (vector.providers.{name})"
+    )]
+    UnknownProfile { name: String },
+
     #[error("could not reach the {provider} embedding provider ({kind}): {detail}")]
     Transport { provider: &'static str, kind: TransportKind, detail: String },
 
