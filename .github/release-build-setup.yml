@@ -1,0 +1,36 @@
+# Steps that dist inlines into `build-local-artifacts`, between the runner's
+# package install and `dist build` (`github-build-setup` in
+# dist-workspace.toml). Not a workflow: a file under `.github/workflows/` is
+# schema-checked as one by GitHub and by actionlint, and a bare list of steps
+# fails both, so it lives one directory up. Edit this, then `dist generate`;
+# release.yml carries a copy.
+#
+# What the two steps do (ADR-118): start the Linux release builds from the
+# dependency cache CI writes on `main` for the same target, the same profile
+# and the same toolchain, instead of from cold. The cache is written by the
+# `build kimmyd` and `build kimmyd (arm64)` jobs in ci.yml; the key has to be
+# identical at both ends, and the ADR lists what that requires.
+#
+# The toolchain step is the same action CI uses, for two reasons. The key
+# rust-cache computes hashes the rustc version and every `CARGO_*`/`RUST*`
+# variable in the environment, and this action installs the current stable
+# (a bare runner would use whatever its image shipped, which lags) and
+# exports `CARGO_HOME`, `CARGO_INCREMENTAL=0` and `CARGO_TERM_COLOR=always`
+# — the same variables, with the same values, that CI's build jobs see.
+- name: Install Rust
+  uses: dtolnay/rust-toolchain@stable
+  with:
+    targets: ${{ join(matrix.targets, ',') }}
+
+# `shared-key` replaces the job name in the key, which is what lets a job
+# named differently in another workflow write a cache this one can read.
+# `save-if: false` without exception: a cache written from a tag is readable
+# only from that tag, so nothing could ever read it, and it would cost the
+# 10 GiB budget a gigabyte per release. The macOS entry of the matrix runs
+# this too, finds nothing (no job on main builds that target), and carries
+# on cold, as it did before.
+- name: Restore the dependency cache CI wrote from main
+  uses: Swatinem/rust-cache@v2
+  with:
+    shared-key: release-${{ join(matrix.targets, '-') }}
+    save-if: false
