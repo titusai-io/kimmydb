@@ -1234,30 +1234,6 @@ that binary rather than each compiling their own. The Docker job passes
 `KIMMYD_SOURCE=prebuilt` so the Dockerfile copies the binary in instead of
 building it, then smoke-tests the image with `check-config`.
 
-**The test job runs against a RAM-backed temp directory.** The suite is bound
-by fsync, not by compiling or the CPU: nextest reports about 613 s executing
-1725 tests against about 110 s compiling them, and the floor is four storage
-tests (`snapshot`, `watch`, `expiry`) that each run for four minutes inserting
-thousands of documents, every insert a real write transaction with an fsync at
-the end. A warm cache cannot shorten that; a disk that does not wait can. The
-job mounts a tmpfs and points `TMPDIR` at it, which every test database honours
-because they are all created through `tempfile` or `std::env::temp_dir()`. A
-commit on tmpfs takes the same path through redb — the same ordering, the same
-fsync call — the call just returns at once, so nothing the durability tests
-assert depends on it. The same trick works locally. On Linux, `TMPDIR=/dev/shm
-cargo test --workspace`. On macOS, make a RAM disk first:
-
-```bash
-hdiutil attach -nomount ram://4194304            # 2 GiB, prints /dev/diskN
-diskutil erasevolume APFS kimmytmp /dev/diskN
-TMPDIR=/Volumes/kimmytmp cargo test --workspace
-hdiutil detach /dev/diskN                        # when done
-```
-
-Treat a local number as an indication only: macOS's `fsync` does not wait for
-the platters the way Linux's does, so the gap there is narrower than on a
-hosted runner.
-
 **Caches are written only from `main`.** A GitHub Actions cache is scoped to the
 ref that wrote it, and a pull request can already read the base branch's — so
 saving from PR branches too wrote a second copy of a cache byte-identical to
