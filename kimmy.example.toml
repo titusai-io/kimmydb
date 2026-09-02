@@ -347,10 +347,9 @@ login = "always"
 #     can find out where to go.
 #
 # It also has to be registered with the provider — as a resource server it will
-# issue tokens for, and on each client that may ask for one. On some providers
-# that is `oauth.protected_resources` plus `allowed_resources` on the
-# registration. All three values must match byte for byte: `aud` is compared
-# exactly.
+# issue tokens for, and on each client that may ask for one: the provider's
+# list of resource servers plus the client registration's allowed resources.
+# All three values must match byte for byte: `aud` is compared exactly.
 #
 # audience = "https://kimmydb.example.com"
 #

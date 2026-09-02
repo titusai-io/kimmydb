@@ -110,33 +110,37 @@ jobs:
         with:
           tool: nextest
 
+      # The suite is bound by fsync, not by the compiler or the CPU: nextest
+      # reports about 613s executing 1725 tests against about 110s compiling
+      # them, and the floor is set by four storage tests that each run for
+      # four minutes inserting thousands of documents, every insert a real
+      # redb write transaction with an fsync at the end. A warm cache only
+      # touches the compile half, and a faster test profile made no
+      # difference, which rules out the CPU. What is left is the disk, so
+      # the tests get a RAM-backed one: every test database is created
+      # through `tempfile` or `std::env::temp_dir()`, both of which honour
+      # TMPDIR. This changes where the bytes land and nothing else — a commit
+      # on tmpfs takes the same code path through redb, the same order of
+      # writes, the same fsync call; only the call returns at once instead of
+      # waiting for platters. The durability tests assert what the engine
+      # does before and after a commit, which the platters were never part
+      # of. 6g is comfortably more than the suite writes and comfortably less
+      # than the runner's 16 GB.
+      - name: Mount a tmpfs for the test databases
+        run: |
+          sudo mkdir -p /mnt/kimmy-tmp
+          sudo mount -t tmpfs -o size=6g tmpfs /mnt/kimmy-tmp
+          sudo chmod 1777 /mnt/kimmy-tmp
+
       - name: Test
+        env:
+          TMPDIR: /mnt/kimmy-tmp
         run: cargo nextest run --workspace
 
       - name: Doctests
-        run: cargo test --workspace --doc
-
-  # The required status check on main is the context `fmt, clippy, test`, from
-  # when that was one job. This job keeps that context reporting — green when
-  # both halves passed, red otherwise — so the branch protection rule did not
-  # have to change in the same instant as this file. Not run when the run was
-  # cancelled: a superseded PR run has no verdict to deliver. To retire it,
-  # require `fmt, clippy` and `test` in the repository settings instead, then
-  # delete it here.
-  check:
-    name: fmt, clippy, test
-    needs: [lint, test]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Both halves passed
         env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          echo "lint, test: $RESULTS"
-          for result in $RESULTS; do
-            [ "$result" = success ] || exit 1
-          done
+          TMPDIR: /mnt/kimmy-tmp
+        run: cargo test --workspace --doc
 
   cluster:
     name: cluster harness
