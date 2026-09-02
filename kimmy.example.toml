@@ -718,14 +718,15 @@ max_bytes = 536870912
 [vector.provider]
 # Variables a provider may be handed: exact names, or a prefix with one
 # trailing `*`. A collection's `api_key_env` outside this list is refused by
-# name. The default admits the three documented key variables and the
-# KIMMY_PROVIDER_* namespace, so a key set as KIMMY_PROVIDER_<anything> needs
-# no line here.
+# name. The default admits the documented hosted providers' variables (the
+# three dialect defaults and DeepInfra's) and the KIMMY_PROVIDER_* namespace,
+# so a key for one of those, or set as KIMMY_PROVIDER_<anything>, needs no
+# line here.
 #
 # Every other KIMMY_* variable -- the signing secret, the cluster secret, the
 # root password -- is refused whatever this says, and naming one here (or a
 # pattern that reaches one, such as "KIMMY_*") stops the node at startup.
-allowed_key_env = ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+allowed_key_env = ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "DEEPINFRA_API_KEY", "KIMMY_PROVIDER_*"]
 
 # Hosts a provider may be sent to beyond the public internet, with the same
 # meaning as webhooks.allowed_hosts: empty is public addresses only, and

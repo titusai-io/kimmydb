@@ -1368,10 +1368,11 @@ and the collection cannot change:
   `allowed_key_env` entry that would reach one (`KIMMY_JWT_SECRET`, `KIMMY_*`,
   `K*`) stops the node at startup. Every other variable has to be listed in
   `vector.provider.allowed_key_env`, as an exact name or a prefix with one
-  trailing `*`. The default lists `OPENAI_API_KEY`, `COHERE_API_KEY`,
-  `GEMINI_API_KEY` and `KIMMY_PROVIDER_*` — so a key set for a provider under
-  the `KIMMY_PROVIDER_` prefix needs no configuration, and one under any other
-  name needs a line.
+  trailing `*`. The default lists the documented hosted providers'
+  variables — `OPENAI_API_KEY`, `COHERE_API_KEY`, `GEMINI_API_KEY`,
+  `DEEPINFRA_API_KEY` — and `KIMMY_PROVIDER_*`, so a key for one of those, or
+  set under the `KIMMY_PROVIDER_` prefix, needs no configuration, and one under
+  any other name needs a line.
 - **The endpoint.** The same address policy webhooks have, from the same code:
   loopback, link-local, RFC 1918, carrier-NAT and reserved ranges are refused
   unless the host is in `vector.provider.allowed_hosts`; the host is resolved

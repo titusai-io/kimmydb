@@ -2188,7 +2188,13 @@ mod tests {
         let cfg = valid();
         assert_eq!(
             cfg.vector.provider.allowed_key_env,
-            vec!["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+            vec![
+                "OPENAI_API_KEY",
+                "COHERE_API_KEY",
+                "GEMINI_API_KEY",
+                "DEEPINFRA_API_KEY",
+                "KIMMY_PROVIDER_*"
+            ]
         );
         assert!(cfg.vector.provider.allowed_hosts.is_empty());
         assert!(!cfg.vector.provider.endpoints_locked);

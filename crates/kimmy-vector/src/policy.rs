@@ -61,10 +61,11 @@ pub const PROVIDER_PREFIX: &str = "KIMMY_PROVIDER_";
 const KEY_ENV_SETTING: &str = "vector.provider.allowed_key_env";
 
 /// What `vector.provider.allowed_key_env` holds when the operator sets nothing:
-/// the three documented default key variables, and the namespace reserved for
-/// provider keys.
+/// the key variables of the documented hosted providers — the three dialect
+/// defaults and DeepInfra, which the `open_ai` dialect reaches by endpoint —
+/// and the namespace reserved for provider keys.
 pub fn default_allowed_key_env() -> Vec<String> {
-    ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+    ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "DEEPINFRA_API_KEY", "KIMMY_PROVIDER_*"]
         .into_iter()
         .map(String::from)
         .collect()
@@ -417,7 +418,13 @@ mod tests {
     #[test]
     fn listed_names_and_the_provider_namespace_are_accepted() {
         let p = ProviderPolicy::default();
-        for var in ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_FOO"] {
+        for var in [
+            "OPENAI_API_KEY",
+            "COHERE_API_KEY",
+            "GEMINI_API_KEY",
+            "DEEPINFRA_API_KEY",
+            "KIMMY_PROVIDER_FOO",
+        ] {
             p.check_key_env(var).unwrap_or_else(|e| panic!("{var}: {e}"));
         }
         policy(&["VOYAGE_API_KEY"]).check_key_env("VOYAGE_API_KEY").unwrap();
@@ -594,7 +601,13 @@ mod tests {
     fn the_default_policy_is_the_documented_one() {
         assert_eq!(
             default_allowed_key_env(),
-            vec!["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+            vec![
+                "OPENAI_API_KEY",
+                "COHERE_API_KEY",
+                "GEMINI_API_KEY",
+                "DEEPINFRA_API_KEY",
+                "KIMMY_PROVIDER_*"
+            ]
         );
         let p = ProviderPolicy::default();
         assert!(!p.locked());
