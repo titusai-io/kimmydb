@@ -4256,7 +4256,7 @@ variable and the `client_secret` settings key they existed to consume. The
 CLI runs exactly two flows: a password login for a named local account, and
 the RFC 8628 device flow for everyone else. A script, a cron job or a
 healthcheck sets `KIMMY_TOKEN` (or the settings file's `token`) to a bearer
-token minted elsewhere — for example, a personal access token from the
+token minted elsewhere — a personal access token from the identity provider's
 console, audienced at the node — and every command works as it always did. A
 `client_secret` line left in an existing `.kimmy` is warned about and
 ignored rather than rejected; `kimmy init` drops it when it rewrites the
@@ -4281,7 +4281,7 @@ not about the readers.
 **Rejected: keep the flag and fix the documentation.** A documentation fix
 keeps the pull; it only adds a sign next to it. Nothing depends on the flag —
 no repository invokes it, and the one service that does use the grant (a
-sibling project's agents) has its own implementation and never shelled out to
+chat service's agents) has its own implementation and never shelled out to
 `kimmy`. Removal breaks nothing that exists, and pre-1.0 a `0.MINOR` may
 carry a breaking change that produces the better design.
 
@@ -4309,16 +4309,16 @@ implies it. `ddl` implies no data access and never reaches the system database.
 It maps through an identity provider like `read` and `write` do; the
 federation refusal stays exactly where it was, on `admin`.
 
-**What prompted it.** An agent connecting over MCP through an external
-identity provider — a federated principal — was told to `create_collection`
-before inserting, by the server's own instructions, and was refused: the tool
-needed `admin`, and ADR-067 forbids federating that. The instructions said one
-thing and the authorization model another, and the only ways to reconcile them
-without this change were to hide the tool (ADR-025 says why not), to hand the
-agent `allow_federated_admin` (a superuser with user management and backup, to
+**What prompted it.** An agent connecting over MCP through an OIDC provider — a
+federated principal — was told to `create_collection` before inserting, by the
+server's own instructions, and was refused: the tool needed `admin`, and
+ADR-067 forbids federating that. The instructions said one thing and the
+authorization model another, and the only ways to reconcile them without this
+change were to hide the tool (ADR-025 says why not), to hand the agent
+`allow_federated_admin` (a superuser with user management and backup, to
 create a collection), or to have a person create every collection an agent
-might want. None of those is the model; the model was wrong about what `admin`
-bundled.
+might want. None of those is the model; the model was wrong about what
+`admin` bundled.
 
 **Why a split rather than a flag.** `admin` conflated two things: shaping the
 *data* and administering the *server*. The break-glass argument in ADR-067 is
@@ -6035,7 +6035,7 @@ rather than a webhook, and authenticates as one person. Actions handles fork
 pull requests natively. The day this repository takes outside contributions is
 the day the gate comes back.
 
-**Alternatives.** *Move everything to Jenkins*, as a sibling project
+**Alternatives.** *Move everything to Jenkins*, as a sibling repository
 does: rejected for the three reasons above — that repository ships no macOS
 binaries, no multi-architecture artifacts and no attestations, so it pays none
 of the costs. *Leave everything on Actions and only reduce tag frequency*:
