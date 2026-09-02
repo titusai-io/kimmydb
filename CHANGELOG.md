@@ -871,7 +871,8 @@ rolling one.
   client_credentials grant, reads `KIMMY_OIDC_CLIENT_SECRET`, or uses a
   `client_secret` key in `~/.config/kimmydb/.kimmy`. A script or a service sets
   `KIMMY_TOKEN` (or the settings file's `token`) to a token minted elsewhere —
-  for example, a personal access token from the console, audienced at the node.
+  with a self-hosted provider, a personal access token from its console,
+  audienced at the node.
   A leftover `client_secret` line in the settings file is warned about and
   ignored rather than rejected, and `kimmy init` drops it on rewrite. Migration:
   replace `$(kimmy login --client-credentials)` with a personal access token
