@@ -927,7 +927,7 @@ impl Expr {
     /// Resolve in a scope that may already bind variables.
     pub fn eval_in(&self, scope: &Scope<'_>) -> Result<Bson> {
         match self {
-            Expr::Field(p) => Ok(first_at(scope.root, p)),
+            Expr::Field(p) => Ok(field_path(scope.root, p).unwrap_or(Bson::Null)),
             Expr::Var { name, path } => eval_variable(name, path.as_deref(), scope),
             Expr::Literal(v) => Ok(v.clone()),
             Expr::Object(fields) => {
@@ -1000,16 +1000,96 @@ impl Expr {
     }
 }
 
-/// The single value at a path, or null when there is none.
-fn first_at(doc: &Document, p: &str) -> Bson {
-    path::resolve(doc, p).into_iter().next().cloned().unwrap_or(Bson::Null)
+/// The value a field path names when it is read as an **expression**.
+///
+/// This is not [`path::resolve`]. That function serves the filter language,
+/// where `{"items.sku": "a"}` asks whether *any* element matches, so it
+/// returns every value the path reaches and lets a numeric segment mean
+/// either an index or a field name. An expression asks for *the value*, and
+/// MongoDB's aggregation field-path rules give one answer:
+///
+/// - Segments are walked left to right. A segment that lands on a document
+///   reads the field. The last segment's value is returned as it is, array
+///   or not: `$tags` over `tags: ["a", "b"]` is `["a", "b"]`.
+/// - A segment that lands on an **array** before the path has ended applies
+///   the rest of the path to each element that is a document and collects
+///   the results into a new array. An element that is not a document, or
+///   in which the rest of the path is missing, contributes nothing — it is
+///   skipped, not filled with null. So `$items.sku` over
+///   `items: [{sku: "a"}, {sku: "b"}]` is `["a", "b"]`, and over
+///   `items: [{sku: "a"}, 7, {}]` it is `["a"]`.
+/// - Each array crossed produces one array; nothing is flattened further.
+///   `$a.b` over `a: [{b: [1, 2]}, {b: 3}]` is `[[1, 2], 3]`, because the
+///   last segment returns each `b` as it is, and `$a.b.c` over
+///   `a: [{b: [{c: 1}, {c: 2}]}]` is `[[1, 2]]`, because the inner array is
+///   crossed inside the outer one's single element. An array nested directly
+///   inside an array is not a document and is skipped.
+/// - A **numeric segment is a field name**, never an index. `$items.0.sku`
+///   reads the field called `0` of each element and finds nothing unless an
+///   element has one; positional access is `$arrayElemAt`. The filter
+///   language honours both readings, and that is the one place the two path
+///   rules disagree.
+///
+/// `None` is a *missing* value: the top-level field is absent, a segment
+/// before the last lands on a scalar, or the last segment names a field the
+/// document lacks. Once an array has been crossed nothing is missing — an
+/// array none of whose elements had the field is `[]`. Every caller here maps
+/// `None` to `Bson::Null`, which is the one place this departs from MongoDB:
+/// a `$project` or `$addFields` of a missing path there omits the field, and
+/// here writes null — an expression always yields a value, as the array
+/// operators' entry in `deviations.md` records.
+fn field_path(doc: &Document, p: &str) -> Option<Bson> {
+    field_path_segments(doc, &path::segments(p))
+}
+
+fn field_path_segments(doc: &Document, segs: &[&str]) -> Option<Bson> {
+    let (head, rest) = segs.split_first()?;
+    let value = doc.get(*head)?;
+    if rest.is_empty() {
+        return Some(value.clone());
+    }
+    match value {
+        Bson::Document(inner) => field_path_segments(inner, rest),
+        Bson::Array(items) => Some(Bson::Array(fan_out(items, rest))),
+        _ => None,
+    }
+}
+
+/// The rest of a path applied to each document element of an array crossed
+/// midway — the one rule in [`field_path`] that produces an array.
+fn fan_out(items: &[Bson], rest: &[&str]) -> Vec<Bson> {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            Bson::Document(doc) => field_path_segments(doc, rest),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A path read into a variable's value, by the rules of [`field_path`].
+///
+/// A variable is whatever its expression evaluated to, so unlike the root it
+/// can be an array: `$$this.sku` inside a `$map` over an array of documents
+/// reads one document, but `$$rows.sku` under a `$let` that bound the whole
+/// array fans out over it exactly as `$rows.sku` would. Anything else — a
+/// number, a string, null — has no fields, and a path into it is missing,
+/// exactly what `$a.b` is when `a` holds a number.
+fn value_path(value: &Bson, p: &str) -> Option<Bson> {
+    let segs = path::segments(p);
+    match value {
+        Bson::Document(doc) => field_path_segments(doc, &segs),
+        Bson::Array(items) => Some(Bson::Array(fan_out(items, &segs))),
+        _ => None,
+    }
 }
 
 fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bson> {
     if SYSTEM_VARIABLES.contains(&name) {
         return Ok(match path {
             None => Bson::Document(scope.root.clone()),
-            Some(p) => first_at(scope.root, p),
+            // `$$ROOT.items.sku` is `$items.sku` spelled out.
+            Some(p) => field_path(scope.root, p).unwrap_or(Bson::Null),
         });
     }
     let Some(value) = scope.get(name) else {
@@ -1019,12 +1099,7 @@ fn eval_variable(name: &str, path: Option<&str>, scope: &Scope<'_>) -> Result<Bs
     };
     Ok(match path {
         None => value.clone(),
-        // A path reads into a document. On anything else it is a missing
-        // field — exactly what `$a.b` is when `a` holds a number.
-        Some(p) => match value {
-            Bson::Document(doc) => first_at(doc, p),
-            _ => Bson::Null,
-        },
+        Some(p) => value_path(value, p).unwrap_or(Bson::Null),
     })
 }
 
@@ -2086,6 +2161,149 @@ mod tests {
     #[test]
     fn a_missing_field_is_null() {
         assert_eq!(on(Bson::String("$nope".into()), doc! {"n": 7}), Bson::Null);
+    }
+
+    // -- field paths through arrays ------------------------------------------
+
+    fn field(path: &str, d: Document) -> Bson {
+        on(Bson::String(path.into()), d)
+    }
+
+    fn strings(items: &[&str]) -> Bson {
+        Bson::Array(items.iter().map(|s| Bson::String((*s).into())).collect())
+    }
+
+    #[test]
+    fn a_path_through_an_array_is_every_element_value() {
+        let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
+        assert_eq!(field("$items.sku", d), strings(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_path_that_crosses_no_array_is_the_single_value() {
+        let d = doc! {"a": {"b": {"c": 7}}, "n": 1};
+        assert_eq!(field("$a.b.c", d.clone()), Bson::Int32(7));
+        assert_eq!(field("$n", d), Bson::Int32(1));
+    }
+
+    #[test]
+    fn a_trailing_array_is_returned_as_it_is() {
+        let d = doc! {"tags": ["x", "y"], "a": [{"b": [1, 2]}]};
+        assert_eq!(field("$tags", d.clone()), strings(&["x", "y"]));
+        // The last segment lands on an array inside a crossed one: that array
+        // is one element of the result, not spliced into it.
+        assert_eq!(
+            field("$a.b", d),
+            Bson::Array(vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])])
+        );
+    }
+
+    #[test]
+    fn each_array_crossed_adds_one_level_and_no_more() {
+        let d = doc! {"a": [{"b": [1, 2]}, {"b": 3}]};
+        assert_eq!(
+            field("$a.b", d),
+            Bson::Array(vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)]), Bson::Int32(3)])
+        );
+        let d = doc! {"a": [{"b": [{"c": 1}, {"c": 2}]}]};
+        assert_eq!(
+            field("$a.b.c", d),
+            Bson::Array(vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])])
+        );
+        // Two documents each crossing an inner array: one inner array each.
+        let d = doc! {"a": [{"b": [{"c": 1}]}, {"b": [{"c": 2}, {"c": 3}]}]};
+        assert_eq!(
+            field("$a.b.c", d),
+            Bson::Array(vec![
+                Bson::Array(vec![Bson::Int32(1)]),
+                Bson::Array(vec![Bson::Int32(2), Bson::Int32(3)]),
+            ])
+        );
+    }
+
+    #[test]
+    fn elements_missing_the_field_are_skipped_not_null_filled() {
+        let d = doc! {"items": [{"sku": "a"}, {"qty": 1}, {"sku": "c"}]};
+        assert_eq!(field("$items.sku", d), strings(&["a", "c"]));
+        // Nothing found is an empty array, not null: the array was crossed.
+        let d = doc! {"items": [{"qty": 1}, {"qty": 2}]};
+        assert_eq!(field("$items.sku", d), Bson::Array(vec![]));
+        assert_eq!(field("$items.sku", doc! {"items": []}), Bson::Array(vec![]));
+    }
+
+    #[test]
+    fn elements_that_are_not_documents_are_skipped() {
+        let d =
+            doc! {"items": [{"sku": "a"}, 7, "b", Bson::Null, [{"sku": "nested"}], {"sku": "z"}]};
+        // The nested array is not a document either: a path does not descend
+        // into an array directly inside an array.
+        assert_eq!(field("$items.sku", d), strings(&["a", "z"]));
+    }
+
+    #[test]
+    fn a_numeric_segment_is_a_field_name_not_an_index() {
+        let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
+        // No element has a field called "0", so the fan-out finds nothing;
+        // `$arrayElemAt` is how an element is addressed by position.
+        assert_eq!(field("$items.0.sku", d.clone()), Bson::Array(vec![]));
+        assert_eq!(field("$items.0", d), Bson::Array(vec![]));
+        // But an element that really has a field named "0" is read.
+        let d = doc! {"items": [{"0": {"sku": "zero"}}]};
+        assert_eq!(field("$items.0.sku", d), strings(&["zero"]));
+        // And on a document, "0" is an ordinary field name.
+        assert_eq!(field("$a.0", doc! {"a": {"0": 5}}), Bson::Int32(5));
+    }
+
+    #[test]
+    fn a_missing_path_is_still_null_whether_or_not_it_starts_in_an_array() {
+        let d = doc! {"a": 1, "items": [{"sku": "a"}]};
+        assert_eq!(field("$nope", d.clone()), Bson::Null);
+        assert_eq!(field("$nope.sku", d.clone()), Bson::Null);
+        // A segment landing on a scalar is missing, as before.
+        assert_eq!(field("$a.b", d.clone()), Bson::Null);
+        // An explicit null is a value, not absence.
+        assert_eq!(field("$n", doc! {"n": Bson::Null}), Bson::Null);
+        assert_eq!(field("$items.sku.x", d), Bson::Array(vec![]));
+    }
+
+    #[test]
+    fn size_counts_a_fanned_path() {
+        let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
+        assert_eq!(on(doc! {"$size": "$items.sku"}.into(), d), Bson::Int64(2));
+    }
+
+    #[test]
+    fn root_and_current_paths_fan_out_like_a_field_path() {
+        let d = doc! {"items": [{"sku": "a"}, {"sku": "b"}]};
+        assert_eq!(field("$$ROOT.items.sku", d.clone()), strings(&["a", "b"]));
+        assert_eq!(field("$$CURRENT.items.sku", d), strings(&["a", "b"]));
+    }
+
+    #[test]
+    fn a_variable_path_fans_out_over_what_the_variable_holds() {
+        // Inside `$map`, `$$i` is one element and `$$i.tags.name` crosses the
+        // element's own array.
+        let d = doc! {"items": [
+            {"tags": [{"name": "x"}, {"name": "y"}]},
+            {"tags": [{"name": "z"}]},
+            {"tags": []},
+        ]};
+        let expr = doc! {"$map": {"input": "$items", "as": "i", "in": "$$i.tags.name"}};
+        assert_eq!(
+            on(expr.into(), d.clone()),
+            Bson::Array(vec![strings(&["x", "y"]), strings(&["z"]), Bson::Array(vec![])])
+        );
+        // A `$let` that bound the whole array: the path fans out over it as
+        // `$items.tags.name` would.
+        let expr = doc! {"$let": {"vars": {"rows": "$items"}, "in": "$$rows.tags.name"}};
+        assert_eq!(
+            on(expr.into(), d.clone()),
+            Bson::Array(vec![strings(&["x", "y"]), strings(&["z"]), Bson::Array(vec![])])
+        );
+        // The same variable bound to the fanned path itself.
+        let expr =
+            doc! {"$let": {"vars": {"names": "$items.tags.name"}, "in": {"$size": "$$names"}}};
+        assert_eq!(on(expr.into(), d), Bson::Int64(3));
     }
 
     #[test]
