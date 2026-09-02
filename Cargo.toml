@@ -48,6 +48,9 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 http-body-util = "0.1"
+# The `Frame` and `SizeHint` types a body wrapper's signature has to name;
+# axum re-exports the trait but not those.
+http-body = "1"
 
 # TLS termination. `axum::serve` has no TLS, and the serving stack is
 # load-bearing here for two reasons beyond encryption: connection info must
