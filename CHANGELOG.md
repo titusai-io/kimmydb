@@ -10,6 +10,91 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch. Nothing changes on the wire, on disk or
+in the `/v1` API, members of this version and 0.18.0 replicate to each other,
+and the roll is an ordinary one — but two things a 0.18.0 node accepted are
+refused or answered differently now, and the pre-1.0 policy puts both behind
+a `0.MINOR` bump. A vector configuration that names a private endpoint, or a
+key variable the node has not listed, is refused; that reaches anyone running
+Ollama or llama.cpp on `localhost` or the LAN, and the fix is one line of
+`kimmy.toml`. And an aggregation expression path that crosses an array now
+returns the array MongoDB returns, not its first element.
+
+### Security
+
+- **An embedding provider can no longer be pointed at the node's own secrets
+  or its own network.** A collection's vector configuration names an endpoint
+  and the environment variable holding its key, and the provider sent that
+  variable's value to that endpoint; the only check was the URL's scheme. So
+  anyone holding `ddl` on a collection could name `KIMMY_JWT_SECRET` as the
+  key, point the endpoint at themselves, insert one document, and be sent the
+  node's token-signing secret — or reach anything on the node's network, the
+  hole the webhook address policy closed for webhooks and never applied here.
+  ADR-115.
+
+  Three rules now, all the operator's. Every `KIMMY_*` variable other than
+  `KIMMY_PROVIDER_*` is refused as a provider's key by name, and no setting
+  can allow one — listing one stops the node at startup. Every other variable
+  must be in `vector.provider.allowed_key_env` (exact names or a prefix with
+  one trailing `*`; default `OPENAI_API_KEY`, `COHERE_API_KEY`,
+  `GEMINI_API_KEY`, `KIMMY_PROVIDER_*`). The endpoint is held to the webhook
+  address policy under `vector.provider.allowed_hosts`, resolved and every
+  address checked, and the provider's client checks again at connect time and
+  follows no redirect. A refused configuration is a `400` naming the variable
+  or the host, never a value, and the same checks run again when the worker
+  builds the provider, because a configuration also arrives by replication.
+
+  **The one thing to change: an Ollama or llama.cpp on `localhost` or a LAN
+  address now needs its host in `vector.provider.allowed_hosts`.** Hosted
+  providers at their default endpoints under their documented variables need
+  nothing. Configuring or disabling embeddings now writes an audit record with
+  the provider kind, the endpoint host or profile name, and the key variable's
+  name. Operators who granted `ddl` to anyone but themselves should rotate
+  `KIMMY_JWT_SECRET` (`auth.jwt_previous_secret` makes that a rolling change)
+  and `KIMMY_CLUSTER_SECRET` after upgrading.
+
+### Changed
+
+- **Providers can be defined server-side, and a node can insist on them.**
+  `[vector.providers.<name>]` in `kimmy.toml` defines a provider — endpoint,
+  model, key variable — and a collection uses it as
+  `{"kind": "profile", "name": "<name>"}`, carrying the name and nothing else.
+  `vector.provider.endpoints_locked = true` makes `profile`, `byo` and `local`
+  the only kinds a collection may configure, so the places a node sends text
+  are exactly the ones its operator wrote down. Profiles are held to the same
+  key and address rules at startup and by `kimmyd check-config`. ADR-115.
+- The egress address policy moved from `kimmy-api` into its own crate,
+  `kimmy-egress`, so webhooks and providers share one denylist. No change to
+  webhook behaviour; a refusal now says which subsystem and which setting.
+
+### Fixed
+
+- **A field path through an array is now the array of what it found.**
+  `"$items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` evaluated to `"a"`;
+  it is `["a", "b"]` now, as it is in MongoDB, in every place an expression
+  is taken: `$project`, `$addFields`, `$replaceRoot`, a `$group` key or
+  accumulator argument, `$expr`, and a path into `$$ROOT` or a variable.
+  Elements that are not documents or lack the field are skipped, each array
+  crossed adds one level (`$a.b` over `a: [{b: [1, 2]}, {b: 3}]` is
+  `[[1, 2], 3]`), and a numeric segment names a field, never a position.
+  **Results change for any pipeline that read such a path and relied on
+  getting one value:** `$group: {_id: "$items.sku"}` buckets by the whole
+  array rather than by the first element's sku, `$push` of it collects
+  arrays, and `{$size: "$items.sku"}` — which was an error — counts. The
+  `$map` form the docs recommended still works and returns the same thing.
+  `$unwind`, `$sort` and `$lookup`'s `localField`/`foreignField` name a field
+  rather than compute one and are unchanged. ADR-116; the deviations entry
+  that recorded the old behaviour is gone.
+- A client that keeps sending an oversized request body now receives the
+  `413 payload_too_large` refusal instead of a connection reset. The server
+  used to close on the unread remainder of the body, and the reset that
+  answered the bytes still in flight could discard the response before the
+  client read it — on macOS it did. The remainder is now read and discarded
+  first, bounded by the declared `Content-Length`, a 4 MiB cap and two
+  seconds; a client further over than that is closed on as before.
+
 ## 0.18.0 - 2026-08-31
 
 A minor rather than a patch, and one that only ever gives an operator back
