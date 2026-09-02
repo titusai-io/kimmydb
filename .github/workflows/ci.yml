@@ -142,28 +142,6 @@ jobs:
           TMPDIR: /mnt/kimmy-tmp
         run: cargo test --workspace --doc
 
-  # The required status check on main is the context `fmt, clippy, test`, from
-  # when that was one job. This job keeps that context reporting — green when
-  # both halves passed, red otherwise — so the branch protection rule did not
-  # have to change in the same instant as this file. Not run when the run was
-  # cancelled: a superseded PR run has no verdict to deliver. To retire it,
-  # require `fmt, clippy` and `test` in the repository settings instead, then
-  # delete it here.
-  check:
-    name: fmt, clippy, test
-    needs: [lint, test]
-    if: ${{ !cancelled() }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Both halves passed
-        env:
-          RESULTS: ${{ join(needs.*.result, ' ') }}
-        run: |
-          echo "lint, test: $RESULTS"
-          for result in $RESULTS; do
-            [ "$result" = success ] || exit 1
-          done
-
   cluster:
     name: cluster harness
     runs-on: ubuntu-latest
