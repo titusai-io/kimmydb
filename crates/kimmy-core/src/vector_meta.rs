@@ -150,7 +150,22 @@ pub enum ProviderConfig {
     /// stays free of native dependencies, so this is rejected at configuration
     /// time rather than failing later on the first write.
     Local { model: String },
+    /// A provider the operator defined server-side, under
+    /// `[vector.providers.<name>]` in the node's configuration (ADR-115).
+    ///
+    /// The collection names it; the endpoint, model and key variable are the
+    /// operator's and never appear in collection metadata. With
+    /// `vector.provider.endpoints_locked` set this is the only way a
+    /// collection can reach a remote provider at all.
+    Profile { name: String },
 }
+
+/// Where an `open_ai` provider is called when no `endpoint` is given.
+pub const OPENAI_ENDPOINT: &str = "https://api.openai.com";
+/// Where a `cohere` provider is called when no `endpoint` is given.
+pub const COHERE_ENDPOINT: &str = "https://api.cohere.com";
+/// Where a `gemini` provider is called when no `endpoint` is given.
+pub const GEMINI_ENDPOINT: &str = "https://generativelanguage.googleapis.com";
 
 fn default_openai_key_env() -> String {
     "OPENAI_API_KEY".to_string()
@@ -174,6 +189,36 @@ impl ProviderConfig {
             Self::Cohere { .. } => "cohere",
             Self::Gemini { .. } => "gemini",
             Self::Local { .. } => "local",
+            Self::Profile { .. } => "profile",
+        }
+    }
+
+    /// The base URL this provider is called at, with the dialect's default
+    /// applied where the configuration left it out.
+    ///
+    /// `None` for the providers that make no request (`byo`, `local`) and for
+    /// a profile, whose endpoint is the operator's and known only once the
+    /// profile is resolved. This is the one place the defaults live, so the
+    /// address policy checks the URL the provider will actually be built with.
+    pub fn endpoint(&self) -> Option<&str> {
+        match self {
+            Self::OpenAi { endpoint, .. } => Some(endpoint.as_deref().unwrap_or(OPENAI_ENDPOINT)),
+            Self::Cohere { endpoint, .. } => Some(endpoint.as_deref().unwrap_or(COHERE_ENDPOINT)),
+            Self::Gemini { endpoint, .. } => Some(endpoint.as_deref().unwrap_or(GEMINI_ENDPOINT)),
+            Self::Ollama { endpoint, .. } | Self::CustomHttp { endpoint, .. } => Some(endpoint),
+            Self::Byo | Self::Local { .. } | Self::Profile { .. } => None,
+        }
+    }
+
+    /// The environment variable the provider's key is read from, if it
+    /// authenticates at all. The *name*; the value is never held here.
+    pub fn api_key_env(&self) -> Option<&str> {
+        match self {
+            Self::OpenAi { api_key_env, .. }
+            | Self::Cohere { api_key_env, .. }
+            | Self::Gemini { api_key_env, .. } => Some(api_key_env),
+            Self::CustomHttp { api_key_env, .. } => api_key_env.as_deref(),
+            Self::Byo | Self::Ollama { .. } | Self::Local { .. } | Self::Profile { .. } => None,
         }
     }
 
@@ -185,7 +230,10 @@ impl ProviderConfig {
         !matches!(self, Self::Byo)
     }
 
-    fn validate(&self) -> Result<(), String> {
+    /// Reject a provider that cannot work. Public because a server-side
+    /// profile is a `ProviderConfig` too, and is held to the same rules where
+    /// it is defined.
+    pub fn validate(&self) -> Result<(), String> {
         match self {
             Self::Byo => Ok(()),
             Self::OpenAi { model, .. } if model.is_empty() => {
@@ -225,6 +273,9 @@ impl ProviderConfig {
                  `local-embeddings` feature; the default build has no ONNX runtime. \
                  Use a remote provider, or the `kimmydb:local` image"
                     .into())
+            }
+            Self::Profile { name } if name.is_empty() => {
+                Err("profile provider needs a name".into())
             }
             _ => Ok(()),
         }
@@ -413,6 +464,7 @@ mod tests {
                 api_key_env: default_gemini_key_env(),
             },
             ProviderConfig::Local { model: "m".into() },
+            ProviderConfig::Profile { name: "p".into() },
         ];
 
         let names: std::collections::BTreeSet<_> = all.iter().map(|p| p.name()).collect();
@@ -459,6 +511,56 @@ mod tests {
             assert!(good.validate().is_ok(), "{label}: a model and no endpoint is the common case");
             assert!(bad_url.validate().is_err(), "{label}: a malformed endpoint must be refused");
         }
+    }
+
+    #[test]
+    fn a_profile_names_the_operators_provider_and_nothing_else() {
+        // The whole point of the variant: a collection carries a name, and
+        // the endpoint, model and key variable stay in the node's
+        // configuration. Round-trips through the wire tag, and an empty name
+        // is refused where there is someone to tell.
+        let json = r#"{"kind":"profile","name":"corp-embed"}"#;
+        let p: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(p, ProviderConfig::Profile { name: "corp-embed".into() });
+        assert_eq!(serde_json::to_string(&p).unwrap(), json);
+        assert!(p.embeds_server_side(), "a profile is a server-side provider");
+        assert_eq!(p.endpoint(), None, "the endpoint is the profile's, not the collection's");
+        assert_eq!(p.api_key_env(), None);
+        assert!(p.validate().is_ok());
+        assert!(ProviderConfig::Profile { name: String::new() }.validate().is_err());
+    }
+
+    #[test]
+    fn the_effective_endpoint_is_the_default_when_none_is_given() {
+        // The address policy has to check the URL the provider will really
+        // be built with, which for the hosted dialects is a default the
+        // configuration never spells out.
+        let openai = ProviderConfig::OpenAi {
+            model: "m".into(),
+            endpoint: None,
+            api_key_env: default_openai_key_env(),
+            dimensions: None,
+        };
+        assert_eq!(openai.endpoint(), Some(OPENAI_ENDPOINT));
+        assert_eq!(openai.api_key_env(), Some("OPENAI_API_KEY"));
+        let voyage = ProviderConfig::OpenAi {
+            model: "m".into(),
+            endpoint: Some("https://api.voyageai.com".into()),
+            api_key_env: "VOYAGE_API_KEY".into(),
+            dimensions: None,
+        };
+        assert_eq!(voyage.endpoint(), Some("https://api.voyageai.com"));
+        assert_eq!(voyage.api_key_env(), Some("VOYAGE_API_KEY"));
+        let custom =
+            ProviderConfig::CustomHttp { endpoint: "http://x/embed".into(), api_key_env: None };
+        assert_eq!(custom.endpoint(), Some("http://x/embed"));
+        assert_eq!(
+            custom.api_key_env(),
+            None,
+            "an unauthenticated custom endpoint names no variable"
+        );
+        assert_eq!(ProviderConfig::Byo.endpoint(), None);
+        assert_eq!(ProviderConfig::Local { model: "m".into() }.endpoint(), None);
     }
 
     #[test]

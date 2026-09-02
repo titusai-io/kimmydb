@@ -200,6 +200,12 @@ Which leads directly to the `$elemMatch` distinction:
 // ✗ [1, 20]     — they straddle it, but neither is inside
 ```
 
+A numeric segment is read both ways: `{"items.0.sku": "a"}` matches when the
+first element's `sku` is `"a"` *or* when any element has a field named `0`
+whose `sku` is. That is a filter rule only — in an aggregation expression
+`$items.0.sku` is a field name and never a position; see
+[aggregation.md](aggregation.md#arrays).
+
 ### 3. Comparisons do not cross type groups
 
 ```javascript

@@ -11,6 +11,7 @@ description = "Embedding providers and vector indexing for KimmyDB"
 [dependencies]
 kimmy-core.workspace = true
 kimmy-storage.workspace = true
+kimmy-egress.workspace = true
 bson.workspace = true
 reqwest.workspace = true
 parking_lot.workspace = true

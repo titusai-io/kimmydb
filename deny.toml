@@ -97,6 +97,7 @@ exceptions = [
     { crate = "kimmy-core", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-storage", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-query", allow = ["AGPL-3.0-only"] },
+    { crate = "kimmy-egress", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-vector", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-auth", allow = ["AGPL-3.0-only"] },
     { crate = "kimmy-cluster", allow = ["AGPL-3.0-only"] },

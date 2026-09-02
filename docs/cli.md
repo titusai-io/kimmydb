@@ -189,9 +189,8 @@ export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 export KIMMY_TOKEN=$(kimmy login)
 
 # A script or a service is not a person and does not log in: it sets the
-# same variable to a token minted elsewhere — for example, a personal
-access
-# token from the console, audienced at the node.
+# same variable to a token minted elsewhere — with a self-hosted provider, a
+# personal access token from its console, audienced at the node.
 export KIMMY_TOKEN=<personal access token>
 ```
 

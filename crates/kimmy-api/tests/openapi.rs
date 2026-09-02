@@ -519,7 +519,10 @@ impl Server {
             tokens,
             false,
             limits,
-            kimmy_api::egress::EgressPolicy::new(vec!["127.0.0.1".into()]),
+            kimmy_api::egress::EgressPolicy::new(
+                kimmy_api::egress::WEBHOOKS,
+                vec!["127.0.0.1".into()],
+            ),
         )
         .unwrap();
         let app = kimmy_api::router(Arc::clone(&state));

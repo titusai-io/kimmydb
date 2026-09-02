@@ -44,8 +44,10 @@ fn billed_tokens(dialect: Dialect, body: &serde_json::Value) -> u64 {
 
 use async_trait::async_trait;
 use kimmy_core::ProviderConfig;
+use kimmy_egress::CheckedResolver;
 
 use crate::error::{Result, TransportKind, VectorError};
+use crate::policy::{PolicyError, ProviderPolicy};
 
 /// How long a connection attempt may take before it counts as failed.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -67,13 +69,21 @@ const RETRY_PAUSE: Duration = Duration::from_millis(250);
 /// 2026-08-28 as bursts of handshakes during a deferral drain, with 31
 /// `error sending request` failures in seven seconds against a provider that
 /// answered 40 of 40 sequential probes in the same minute.
-fn http_client() -> reqwest::Client {
+///
+/// The client resolves names through the address policy and follows no
+/// redirect, for the reasons the webhook delivery client does the same
+/// (ADR-115): the endpoint was checked when the provider was built, but a
+/// name can resolve inward later, and a permitted host answering `302` to a
+/// private address would otherwise walk the request through the policy.
+fn http_client(policy: &ProviderPolicy) -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(REQUEST_TIMEOUT)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .tcp_keepalive(Duration::from_secs(30))
         .user_agent(concat!("kimmyd/", env!("CARGO_PKG_VERSION")))
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(std::sync::Arc::new(CheckedResolver::new(policy.egress().clone())))
         .build()
         // The builder only fails when a TLS backend cannot initialise, which
         // is a broken build rather than a runtime condition.
@@ -135,43 +145,86 @@ pub trait EmbeddingProvider: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
-/// Build a provider from its configuration.
+/// Build a provider from its configuration, under this node's policy.
+///
+/// The policy is asked here, at use time, and not only when the configuration
+/// was accepted: a configuration also arrives by replication from another
+/// member, having passed that member's API and never this one's. A profile
+/// is resolved to the operator's definition first; then the key variable and
+/// the endpoint are checked before the variable is read, so a refused name is
+/// never even looked up in the environment.
 ///
 /// The `Byo` provider has no implementation here on purpose: it means the
 /// client supplies vectors and the server never embeds, so there is nothing to
 /// call. Callers check [`ProviderConfig::embeds_server_side`] first.
-pub fn build(config: &ProviderConfig, dim: usize) -> Result<Box<dyn EmbeddingProvider>> {
+pub fn build(
+    config: &ProviderConfig,
+    dim: usize,
+    policy: &ProviderPolicy,
+) -> Result<Box<dyn EmbeddingProvider>> {
+    let config = policy.resolve(config).map_err(|e| refused(e, config.name()))?;
+    policy.check_provider(config).map_err(|e| refused(e, config.name()))?;
+    let endpoint = config.endpoint().map(str::to_string);
     match config {
         ProviderConfig::Byo => Err(VectorError::NoProvider),
 
-        ProviderConfig::OpenAi { model, endpoint, api_key_env, dimensions } => {
-            let base = endpoint.clone().unwrap_or_else(|| "https://api.openai.com".into());
+        ProviderConfig::OpenAi { model, api_key_env, dimensions, .. } => {
             Ok(Box::new(HttpProvider::openai(
-                base,
+                endpoint.expect("openai has an endpoint"),
                 model.clone(),
                 api_key_env.clone(),
                 dim,
                 *dimensions,
+                http_client(policy),
             )?))
         }
-        ProviderConfig::Ollama { model, endpoint } => {
-            Ok(Box::new(HttpProvider::ollama(endpoint.clone(), model.clone(), dim)))
-        }
-        ProviderConfig::CustomHttp { endpoint, api_key_env } => {
-            Ok(Box::new(HttpProvider::custom(endpoint.clone(), api_key_env.clone(), dim)?))
-        }
-        ProviderConfig::Cohere { model, endpoint, api_key_env } => {
-            let base = endpoint.clone().unwrap_or_else(|| "https://api.cohere.com".into());
-            Ok(Box::new(HttpProvider::cohere(base, model.clone(), api_key_env.clone(), dim)?))
-        }
-        ProviderConfig::Gemini { model, endpoint, api_key_env } => {
-            let base = endpoint
-                .clone()
-                .unwrap_or_else(|| "https://generativelanguage.googleapis.com".into());
-            Ok(Box::new(HttpProvider::gemini(base, model.clone(), api_key_env.clone(), dim)?))
-        }
+        ProviderConfig::Ollama { model, endpoint } => Ok(Box::new(HttpProvider::ollama(
+            endpoint.clone(),
+            model.clone(),
+            dim,
+            http_client(policy),
+        ))),
+        ProviderConfig::CustomHttp { endpoint, api_key_env } => Ok(Box::new(HttpProvider::custom(
+            endpoint.clone(),
+            api_key_env.clone(),
+            dim,
+            http_client(policy),
+        )?)),
+        ProviderConfig::Cohere { model, api_key_env, .. } => Ok(Box::new(HttpProvider::cohere(
+            endpoint.expect("cohere has an endpoint"),
+            model.clone(),
+            api_key_env.clone(),
+            dim,
+            http_client(policy),
+        )?)),
+        ProviderConfig::Gemini { model, api_key_env, .. } => Ok(Box::new(HttpProvider::gemini(
+            endpoint.expect("gemini has an endpoint"),
+            model.clone(),
+            api_key_env.clone(),
+            dim,
+            http_client(policy),
+        )?)),
 
         ProviderConfig::Local { model } => local_provider(model, dim),
+        // `resolve` replaced a profile with its definition, and a definition
+        // is never itself a profile (the policy refuses one at construction).
+        ProviderConfig::Profile { name } => Err(VectorError::UnknownProfile { name: name.clone() }),
+    }
+}
+
+/// A policy refusal as the worker and the search path see it.
+///
+/// A host that could not be resolved is the one refusal that is a condition
+/// of the moment rather than of the configuration, so it is reported as the
+/// transport failure it is and retried on the worker's clock. Everything
+/// else asks the same policy the same question on retry, and is permanent.
+fn refused(e: PolicyError, provider: &'static str) -> VectorError {
+    match e {
+        PolicyError::UnknownProfile { name } => VectorError::UnknownProfile { name },
+        e if e.is_unresolvable() => {
+            VectorError::Transport { provider, kind: TransportKind::Connect, detail: e.to_string() }
+        }
+        e => VectorError::PolicyRefused(e.to_string()),
     }
 }
 
@@ -264,6 +317,7 @@ impl HttpProvider {
         key_env: String,
         dim: usize,
         dimensions: Option<usize>,
+        client: reqwest::Client,
     ) -> Result<Self> {
         Ok(Self {
             endpoint: openai_url(&base),
@@ -271,24 +325,29 @@ impl HttpProvider {
             dialect: Dialect::OpenAi,
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
-            client: http_client(),
+            client,
             dimensions,
         })
     }
 
-    fn ollama(endpoint: String, model: String, dim: usize) -> Self {
+    fn ollama(endpoint: String, model: String, dim: usize, client: reqwest::Client) -> Self {
         Self {
             endpoint: format!("{}/api/embeddings", endpoint.trim_end_matches('/')),
             model,
             dialect: Dialect::Ollama,
             auth: Auth::None,
             dim,
-            client: http_client(),
+            client,
             dimensions: None,
         }
     }
 
-    fn custom(endpoint: String, key_env: Option<String>, dim: usize) -> Result<Self> {
+    fn custom(
+        endpoint: String,
+        key_env: Option<String>,
+        dim: usize,
+        client: reqwest::Client,
+    ) -> Result<Self> {
         let auth = match key_env {
             Some(var) => Auth::Bearer(read_key(&var)?),
             None => Auth::None,
@@ -299,30 +358,48 @@ impl HttpProvider {
             dialect: Dialect::Custom,
             auth,
             dim,
-            client: http_client(),
+            client,
             dimensions: None,
         })
     }
 
-    fn cohere(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
+    fn cohere(
+        base: String,
+        model: String,
+        key_env: String,
+        dim: usize,
+        client: reqwest::Client,
+    ) -> Result<Self> {
         Ok(Self {
             endpoint: format!("{}/v2/embed", base.trim_end_matches('/')),
             model,
             dialect: Dialect::Cohere,
             auth: Auth::Bearer(read_key(&key_env)?),
             dim,
-            client: http_client(),
+            client,
             dimensions: None,
         })
     }
 
-    fn gemini(base: String, model: String, key_env: String, dim: usize) -> Result<Self> {
-        Ok(Self::gemini_with_key(&base, &model, read_key(&key_env)?, dim))
+    fn gemini(
+        base: String,
+        model: String,
+        key_env: String,
+        dim: usize,
+        client: reqwest::Client,
+    ) -> Result<Self> {
+        Ok(Self::gemini_with_key(&base, &model, read_key(&key_env)?, dim, client))
     }
 
     /// The Gemini shape with the key already in hand. Split from [`Self::gemini`]
     /// so a test can build one without touching the environment.
-    fn gemini_with_key(base: &str, model: &str, key: String, dim: usize) -> Self {
+    fn gemini_with_key(
+        base: &str,
+        model: &str,
+        key: String,
+        dim: usize,
+        client: reqwest::Client,
+    ) -> Self {
         // The model rides both the URL and the request body; the URL wants it
         // bare, the body wants a `models/` prefix. Stored bare.
         let bare = model.strip_prefix("models/").unwrap_or(model);
@@ -336,7 +413,7 @@ impl HttpProvider {
             // Gemini reads the key from a header, not a bearer token.
             auth: Auth::Header("x-goog-api-key", key),
             dim,
-            client: http_client(),
+            client,
             dimensions: None,
         }
     }
@@ -448,7 +525,9 @@ fn numbers(value: Option<&serde_json::Value>) -> Option<Vec<f32>> {
 /// Read an API key from the environment.
 ///
 /// Keys live in the environment, never in collection metadata, which is
-/// readable by anyone who can read the data directory.
+/// readable by anyone who can read the data directory. Only reached for a
+/// variable the policy has already admitted: [`build`] checks the name before
+/// anything looks it up.
 fn read_key(var: &str) -> Result<String> {
     std::env::var(var).map_err(|_| VectorError::MissingApiKey { var: var.to_string() })
 }
@@ -564,9 +643,20 @@ mod tests {
             dialect,
             auth: Auth::None,
             dim,
-            client: http_client(),
+            client: http_client(&ProviderPolicy::default()),
             dimensions: None,
         }
+    }
+
+    /// A policy that admits the loopback endpoints these tests listen on.
+    fn loopback_policy() -> ProviderPolicy {
+        ProviderPolicy::new(
+            crate::policy::default_allowed_key_env(),
+            vec!["127.0.0.1".into(), "localhost".into()],
+            false,
+            Default::default(),
+        )
+        .unwrap()
     }
 
     /// The far side closing a connection before answering is the failure a
@@ -597,7 +687,7 @@ mod tests {
             dialect: Dialect::Custom,
             auth: Auth::None,
             dim: 2,
-            client: http_client(),
+            client: http_client(&loopback_policy()),
             dimensions: None,
         };
         let out = p.embed(&["a".to_string()]).await.unwrap();
@@ -651,7 +741,10 @@ mod tests {
     #[test]
     fn byo_has_no_provider_to_build() {
         // The client supplies vectors, so there is nothing to call.
-        assert!(matches!(build(&ProviderConfig::Byo, 8).err(), Some(VectorError::NoProvider)));
+        assert!(matches!(
+            build(&ProviderConfig::Byo, 8, &ProviderPolicy::default()).err(),
+            Some(VectorError::NoProvider)
+        ));
     }
 
     #[test]
@@ -766,6 +859,7 @@ mod tests {
             "models/text-embedding-004",
             "k".into(),
             768,
+            http_client(&ProviderPolicy::default()),
         );
         assert!(matches!(p.auth, Auth::Header("x-goog-api-key", _)));
         // The `models/` prefix is stripped for the URL — bare there — and the
@@ -812,22 +906,113 @@ mod tests {
     #[test]
     fn a_missing_api_key_is_reported_by_variable_name() {
         // Naming the variable is what makes this fixable without reading source.
+        // A `KIMMY_PROVIDER_*` name, so the policy admits it and the only
+        // thing left to fail is the lookup.
         let config = ProviderConfig::OpenAi {
             model: "text-embedding-3-small".into(),
             endpoint: None,
-            api_key_env: "KIMMY_TEST_KEY_DEFINITELY_UNSET".into(),
+            api_key_env: "KIMMY_PROVIDER_TEST_KEY_DEFINITELY_UNSET".into(),
             dimensions: None,
         };
-        let Err(err) = build(&config, 1536) else {
+        let Err(err) = build(&config, 1536, &ProviderPolicy::default()) else {
             panic!("an unset key variable should not build a provider");
         };
         assert!(matches!(err, VectorError::MissingApiKey { ref var } if var.contains("UNSET")));
-        assert!(err.to_string().contains("KIMMY_TEST_KEY_DEFINITELY_UNSET"));
+        assert!(err.to_string().contains("KIMMY_PROVIDER_TEST_KEY_DEFINITELY_UNSET"));
+    }
+
+    #[test]
+    fn a_configuration_naming_a_node_secret_is_refused_before_the_variable_is_read() {
+        // The finding, at the layer replication reaches: a stored
+        // configuration that never passed this node's API. The variable is
+        // set here so that, were the policy consulted after the lookup, the
+        // provider would build — the refusal has to come first. Nothing
+        // reads the value; the error carries the name and nothing else.
+        //
+        // `set_var` is unsafe on this edition because another thread could
+        // be reading the environment. The value is a throwaway, the name is
+        // unique to this test, and nothing else in the crate looks it up.
+        const VAR: &str = "KIMMY_TEST_NODE_SECRET_FOR_POLICY";
+        unsafe { std::env::set_var(VAR, "not-a-real-secret") };
+        let config = ProviderConfig::OpenAi {
+            model: "m".into(),
+            endpoint: Some("https://93.184.216.34".into()),
+            api_key_env: VAR.into(),
+            dimensions: None,
+        };
+        let err = build(&config, 8, &ProviderPolicy::default()).err().expect("refused");
+        assert!(matches!(err, VectorError::PolicyRefused(_)), "{err:?}");
+        assert!(!err.is_retryable(), "a policy refusal is permanent");
+        let text = err.to_string();
+        assert!(text.contains(VAR), "{text}");
+        assert!(!text.contains("not-a-real-secret"), "the value must never appear: {text}");
+        unsafe { std::env::remove_var(VAR) };
+
+        // An unlisted name and a private endpoint are refused the same way.
+        let unlisted = ProviderConfig::CustomHttp {
+            endpoint: "https://93.184.216.34/embed".into(),
+            api_key_env: Some("SOMEBODY_ELSES_KEY".into()),
+        };
+        let err = build(&unlisted, 8, &ProviderPolicy::default()).err().expect("refused");
+        assert!(
+            matches!(err, VectorError::PolicyRefused(ref m) if m.contains("SOMEBODY_ELSES_KEY")),
+            "{err:?}"
+        );
+        let private =
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://10.0.0.5:11434".into() };
+        let err = build(&private, 8, &ProviderPolicy::default()).err().expect("refused");
+        assert!(
+            matches!(err, VectorError::PolicyRefused(ref m) if m.contains("10.0.0.5")),
+            "{err:?}"
+        );
+        // ...and admitted once the operator lists the host.
+        let lan = ProviderPolicy::new(
+            crate::policy::default_allowed_key_env(),
+            vec!["10.0.0.5".into()],
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        build(&private, 8, &lan).expect("an allowed host builds");
+    }
+
+    #[test]
+    fn a_profile_builds_the_operators_provider_and_a_missing_one_fails_permanently() {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "lan".to_string(),
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://10.0.0.5:11434".into() },
+        );
+        let policy = ProviderPolicy::new(
+            crate::policy::default_allowed_key_env(),
+            vec!["10.0.0.5".into()],
+            false,
+            profiles,
+        )
+        .unwrap();
+        let built = build(&ProviderConfig::Profile { name: "lan".into() }, 8, &policy).unwrap();
+        assert_eq!(built.name(), "ollama", "the profile's dialect, not \"profile\"");
+        assert_eq!(built.dim(), 8);
+
+        let err = build(&ProviderConfig::Profile { name: "nope".into() }, 8, &policy)
+            .err()
+            .expect("refused");
+        assert!(
+            matches!(err, VectorError::UnknownProfile { ref name } if name == "nope"),
+            "{err:?}"
+        );
+        assert!(!err.is_retryable(), "a missing profile is a configuration, not a blip");
+        assert!(err.to_string().contains("vector.providers.nope"), "{err}");
     }
 
     #[test]
     fn endpoints_are_built_without_double_slashes() {
-        let p = HttpProvider::ollama("http://localhost:11434/".into(), "m".into(), 8);
+        let p = HttpProvider::ollama(
+            "http://localhost:11434/".into(),
+            "m".into(),
+            8,
+            http_client(&ProviderPolicy::default()),
+        );
         assert_eq!(p.endpoint, "http://localhost:11434/api/embeddings");
     }
 
@@ -835,6 +1020,9 @@ mod tests {
     #[test]
     fn the_local_provider_is_unavailable_without_the_feature() {
         let config = ProviderConfig::Local { model: "bge-small-en-v1.5".into() };
-        assert!(matches!(build(&config, 384).err(), Some(VectorError::LocalUnavailable)));
+        assert!(matches!(
+            build(&config, 384, &ProviderPolicy::default()).err(),
+            Some(VectorError::LocalUnavailable)
+        ));
     }
 }

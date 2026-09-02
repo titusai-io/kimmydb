@@ -3246,6 +3246,15 @@ components:
         Tagged by `kind`. `byo` is the default and the only one needing nothing
         external — no API key, no network, no model download. API keys are
         named by environment variable and never stored in collection metadata.
+
+        The node's provider policy decides what is accepted (ADR-115): an
+        `api_key_env` outside `vector.provider.allowed_key_env` — and any
+        `KIMMY_*` name other than `KIMMY_PROVIDER_*`, whatever that setting
+        says — is refused `400` by name, as is an `endpoint` (or a dialect's
+        default endpoint) that resolves to a loopback, link-local or private
+        address the operator has not listed in `vector.provider.allowed_hosts`.
+        With `vector.provider.endpoints_locked` set, only `profile`, `byo` and
+        `local` are accepted.
       required: [kind]
       properties:
         kind:
@@ -3256,10 +3265,26 @@ components:
             `openai`, and the two have been confused before; this is the one
             that goes in a request body. Any OpenAI-compatible `/v1/embeddings`
             endpoint uses it, Voyage included.
-          enum: [byo, open_ai, ollama, custom_http, cohere, gemini, local]
+
+            `profile` names a provider the operator defined server-side under
+            `[vector.providers.<name>]`; the collection carries the name and
+            nothing else.
+          enum: [byo, open_ai, ollama, custom_http, cohere, gemini, local, profile]
         model: { type: string }
         endpoint: { type: string }
         api_key_env: { type: string }
+        dimensions:
+          type: integer
+          minimum: 1
+          description: |
+            `open_ai` only. Asked of the provider as the request field of that
+            name, for Matryoshka-trained models; must equal `dim`.
+        name:
+          type: string
+          description: |
+            `profile` only: the `[vector.providers.<name>]` this collection
+            embeds through. Refused `400` when this node defines no such
+            profile.
 
     SearchRequest:
       type: object

@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bson::doc;
 use kimmy_api::dispatch;
-use kimmy_api::egress::EgressPolicy;
+use kimmy_api::egress::{EgressPolicy, WEBHOOKS};
 use kimmy_auth::TokenIssuer;
 use kimmy_storage::Engine;
 use parking_lot::Mutex;
@@ -125,7 +125,7 @@ fn state_for(dir: &tempfile::TempDir) -> kimmy_api::SharedState {
         tokens,
         false,
         kimmy_api::RateLimits::disabled(),
-        EgressPolicy::new(vec!["127.0.0.1".into()]),
+        EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
     )
     .unwrap()
 }
@@ -191,7 +191,7 @@ async fn pass_under(
 ) -> dispatch::DispatchOutcome {
     let client =
         reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
-    let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
+    let policy = EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]);
     dispatch::dispatch_once(state, &client, &policy, me(), &BTreeSet::new(), backoff, limits).await
 }
 
@@ -211,7 +211,7 @@ async fn the_dispatcher_loop_delivers_without_being_driven() {
 
     let handle = tokio::spawn(dispatch::run(
         state.clone(),
-        EgressPolicy::new(vec!["127.0.0.1".into()]),
+        EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
         me(),
         None,
         dispatch::Limits::default(),
@@ -376,7 +376,7 @@ async fn a_node_that_does_not_own_a_subscription_delivers_nothing() {
     state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
 
     let client = reqwest::Client::new();
-    let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
+    let policy = EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]);
     let mut backoff = dispatch::Backoff::default();
     let outcome = dispatch::dispatch_once(
         &state,
@@ -407,7 +407,7 @@ async fn the_egress_policy_is_enforced_at_delivery_not_only_at_registration() {
     state.engine.insert(&coll, doc! { "_id": 1 }).unwrap();
 
     let client = reqwest::Client::new();
-    let closed = EgressPolicy::default(); // 127.0.0.1 no longer permitted
+    let closed = EgressPolicy::public_only(WEBHOOKS); // 127.0.0.1 no longer permitted
     let mut backoff = dispatch::Backoff::default();
     let outcome = dispatch::dispatch_once(
         &state,
@@ -528,7 +528,7 @@ async fn a_new_subscription_does_not_replay_history() {
         "shop",
         "orders",
         &request,
-        &EgressPolicy::new(vec!["127.0.0.1".into()]),
+        &EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
     )
     .expect("registration");
 
@@ -742,7 +742,7 @@ async fn removing_a_subscription_stops_delivery_and_clears_its_progress() {
             url: format!("http://{addr}/hook"),
             operations: None,
         },
-        &EgressPolicy::new(vec!["127.0.0.1".into()]),
+        &EgressPolicy::new(WEBHOOKS, vec!["127.0.0.1".into()]),
     )
     .expect("registration");
     let id = registered["id"].as_str().unwrap().to_string();

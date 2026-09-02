@@ -195,6 +195,55 @@ pub fn record(
     }
 }
 
+/// Record that a collection's embedding provider was configured or removed.
+///
+/// Beside the authorization record rather than inside it, as the webhook
+/// records are: `Auth::require` already wrote that `ddl` was allowed, and
+/// what this adds is *what the grant was used for* — which provider, at which
+/// host or under which profile, reading which variable. That is the fact an
+/// audit reader needs when asking where a collection's text has been sent
+/// and with what credential (ADR-115). Always the variable's *name*, never a
+/// value: the value is read by the provider at use time and appears nowhere.
+///
+/// Unconditional, like the webhook records: the audit mode governs the volume
+/// of authorization decisions, and a change to where the node sends data is
+/// rare and always worth a line.
+pub fn record_vectors(
+    principal: &Principal,
+    action: &'static str,
+    db: &str,
+    collection: &str,
+    provider: Option<&kimmy_core::ProviderConfig>,
+) {
+    // The host rather than the URL: a path can carry a deployment name or a
+    // query string, and the destination is the fact worth recording.
+    let host = provider.and_then(|p| p.endpoint()).and_then(kimmy_egress::host_of);
+    let profile = provider.and_then(|p| match p {
+        kimmy_core::ProviderConfig::Profile { name } => Some(name.as_str()),
+        _ => None,
+    });
+    let api_key_env = provider.and_then(|p| p.api_key_env());
+    // Display rather than Debug for the string fields, as `user` is, so the
+    // line reads `api_key_env=OPENAI_API_KEY` and not a quoted literal; an
+    // absent `Option` records nothing, which is how a field is absent rather
+    // than empty.
+    warn!(
+        target: "kimmy::audit",
+        user = %principal.user,
+        unauthenticated = principal.unauthenticated,
+        federated = principal.federated,
+        action = %action,
+        db = %db,
+        collection = %collection,
+        provider = provider.map(|p| tracing::field::display(p.name())),
+        endpoint_host = host.map(tracing::field::display),
+        profile = profile.map(tracing::field::display),
+        api_key_env = api_key_env.map(tracing::field::display),
+        decision = "allow",
+        "embedding provider changed"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -294,6 +343,70 @@ mod tests {
             let line = record_of(&principal);
             assert!(!line.contains("display"), "{line}");
         }
+    }
+
+    /// The audit lines one vector record produces.
+    fn vectors_record_of(
+        action: &'static str,
+        provider: Option<&kimmy_core::ProviderConfig>,
+    ) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            record_vectors(&Principal::superuser("root"), action, "shop", "docs", provider);
+        });
+        String::from_utf8(sink.0.lock().clone()).expect("utf-8")
+    }
+
+    #[test]
+    fn a_vector_configuration_is_recorded_with_its_destination_and_key_name() {
+        // What an audit reader asks after ADR-115: where has this
+        // collection's text been sent, and which variable authenticated it.
+        // The host and the variable's *name*; the URL's path and the value
+        // are not facts an audit line should hold.
+        let openai = kimmy_core::ProviderConfig::OpenAi {
+            model: "text-embedding-3-small".into(),
+            endpoint: Some("https://api.voyageai.com/v1/embeddings?deployment=secret".into()),
+            api_key_env: "KIMMY_PROVIDER_VOYAGE".into(),
+            dimensions: None,
+        };
+        let line = vectors_record_of("ConfigureVectors", Some(&openai));
+        assert!(line.contains("kimmy::audit"), "{line}");
+        assert!(line.contains("action=ConfigureVectors"), "{line}");
+        assert!(line.contains("user=root"), "{line}");
+        assert!(line.contains("db=shop"), "{line}");
+        assert!(line.contains("collection=docs"), "{line}");
+        assert!(line.contains("provider=openai"), "{line}");
+        assert!(line.contains("endpoint_host=api.voyageai.com"), "{line}");
+        assert!(line.contains("api_key_env=KIMMY_PROVIDER_VOYAGE"), "{line}");
+        assert!(line.contains("decision=\"allow\""), "{line}");
+        assert!(!line.contains("deployment=secret"), "the path is not recorded: {line}");
+        assert!(!line.contains("profile="), "no profile was named: {line}");
+
+        // A profile records its name; the endpoint is the operator's.
+        let named = kimmy_core::ProviderConfig::Profile { name: "corp".into() };
+        let line = vectors_record_of("ConfigureVectors", Some(&named));
+        assert!(line.contains("provider=profile"), "{line}");
+        assert!(line.contains("profile=corp"), "{line}");
+        assert!(!line.contains("endpoint_host="), "{line}");
+
+        // A default endpoint is the default host, not an absence.
+        let cohere = kimmy_core::ProviderConfig::Cohere {
+            model: "embed-v4".into(),
+            endpoint: None,
+            api_key_env: "COHERE_API_KEY".into(),
+        };
+        let line = vectors_record_of("ConfigureVectors", Some(&cohere));
+        assert!(line.contains("endpoint_host=api.cohere.com"), "{line}");
+
+        // Disabling names no provider.
+        let line = vectors_record_of("DisableVectors", None);
+        assert!(line.contains("action=DisableVectors"), "{line}");
+        assert!(!line.contains("provider="), "{line}");
     }
 
     #[test]

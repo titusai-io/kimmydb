@@ -4,6 +4,7 @@ members = [
     "crates/kimmy-core",
     "crates/kimmy-storage",
     "crates/kimmy-query",
+    "crates/kimmy-egress",
     "crates/kimmy-vector",
     "crates/kimmy-auth",
     "crates/kimmy-cluster",
@@ -36,6 +37,7 @@ authors = ["Titus AI LLC <licensing@titusai.io>"]
 kimmy-core = { path = "crates/kimmy-core" }
 kimmy-storage = { path = "crates/kimmy-storage" }
 kimmy-query = { path = "crates/kimmy-query" }
+kimmy-egress = { path = "crates/kimmy-egress" }
 kimmy-vector = { path = "crates/kimmy-vector" }
 kimmy-auth = { path = "crates/kimmy-auth" }
 kimmy-cluster = { path = "crates/kimmy-cluster" }
@@ -48,6 +50,9 @@ axum = { version = "0.8", features = ["ws", "macros"] }
 tower = "0.5"
 tower-http = { version = "0.7", features = ["trace", "cors"] }
 http-body-util = "0.1"
+# The `Frame` and `SizeHint` types a body wrapper's signature has to name;
+# axum re-exports the trait but not those.
+http-body = "1"
 
 # TLS termination. `axum::serve` has no TLS, and the serving stack is
 # load-bearing here for two reasons beyond encryption: connection info must

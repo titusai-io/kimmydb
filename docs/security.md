@@ -145,8 +145,8 @@ for byte:
 
 | Where | What |
 |---|---|
-| The provider's list of resource servers | e.g. `oauth.protected_resources` |
-| The client registration asking for a token | e.g. `allowed_resources` |
+| The provider's list of resource servers | however the provider names it — its registry of resource servers it will issue tokens for |
+| The client registration asking for a token | the client registration's allowed resources |
 | This node | `auth.oidc.audience` |
 
 Get one of them wrong and the provider answers `invalid_target`, or issues a
@@ -435,9 +435,8 @@ export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 export KIMMY_TOKEN=$(kimmy login)   # RFC 8628 device flow, the default
 
 # A script or a service is not a person and does not log in. It sets
-# KIMMY_TOKEN to a token minted elsewhere — for example, a personal
-access
-# token from the console, audienced at the node (ADR-089).
+# KIMMY_TOKEN to a token minted elsewhere — with a self-hosted provider, a
+# personal access token from its console, audienced at the node (ADR-089).
 export KIMMY_TOKEN=<personal access token>
 ```
 
@@ -845,7 +844,10 @@ graph BT
   says nothing about reading or writing what goes into it, and `write` does not
   let a principal create the collection it writes to. Only `admin` implies it —
   and `ddl` never reaches the system database, which stays behind `admin`
-  alone ([ADR-090](decisions.md)).
+  alone ([ADR-090](decisions.md)). It configures embeddings, which is an
+  outbound path from the node; what that path may carry and where it may go
+  is the operator's policy, not the grant's — see
+  [Embedding providers](#embedding-providers).
 
 ### Patterns
 
@@ -979,6 +981,7 @@ Stated plainly, because a security model you have to infer is worse than none.
 | **`/metrics` is unauthenticated on the main listener** | By design | Counts only, never names. Restrict it at the network or a proxy — see [The metrics endpoint](#the-metrics-endpoint) |
 | **Inter-node authentication** | ✅ Built | A mutual HMAC challenge over `cluster_secret`, bound to the TLS session — see [TLS between nodes](#tls-between-nodes). Membership datagrams are authenticated the same way but are readable and replayable; the [threat model](threat-model.md) says what that means. *(This row said "nothing transports data yet" until it was checked against the code; it had been wrong since ADR-040.)* |
 | **Grants are not validated against reality** | By design | A grant may name a database that does not exist |
+| **A `ddl` holder reading the node's secrets or probing its network through an embedding provider** | ✅ Built | The node's own `KIMMY_*` variables are refused as a provider's key by name and cannot be allowed; other variables must be listed; the endpoint is held to the webhook address policy; `endpoints_locked` leaves a collection nothing to choose but an operator-defined profile — see [Embedding providers](#embedding-providers) ([ADR-115](decisions.md)) |
 
 ### How far authorization goes
 
@@ -1345,6 +1348,56 @@ With `--insecure-no-auth` every request is one principal, and the limiter is
 off along with the login ones.
 
 ---
+
+## Embedding providers
+
+A collection's vector configuration names an endpoint and an environment
+variable, and the embedding provider sends that variable's value to that
+endpoint as a bearer token with every batch of text. Both are chosen by
+whoever holds `ddl` on the collection. Without a policy that is two things at
+once: a way to read any variable the process holds — `KIMMY_JWT_SECRET`
+included, which mints root — by naming it as the key and pointing the
+endpoint at yourself, and a way to make the node issue requests into its own
+network. [ADR-115](decisions.md) closes both with a policy the operator owns
+and the collection cannot change:
+
+- **The key variable.** Every `KIMMY_*` variable other than `KIMMY_PROVIDER_*`
+  is the node's own — the signing secret, the cluster secret, the bootstrap
+  password, the previous secret during a rotation — and is refused as a
+  provider's `api_key_env` by name. This is not a setting: an
+  `allowed_key_env` entry that would reach one (`KIMMY_JWT_SECRET`, `KIMMY_*`,
+  `K*`) stops the node at startup. Every other variable has to be listed in
+  `vector.provider.allowed_key_env`, as an exact name or a prefix with one
+  trailing `*`. The default lists `OPENAI_API_KEY`, `COHERE_API_KEY`,
+  `GEMINI_API_KEY` and `KIMMY_PROVIDER_*` — so a key set for a provider under
+  the `KIMMY_PROVIDER_` prefix needs no configuration, and one under any other
+  name needs a line.
+- **The endpoint.** The same address policy webhooks have, from the same code:
+  loopback, link-local, RFC 1918, carrier-NAT and reserved ranges are refused
+  unless the host is in `vector.provider.allowed_hosts`; the host is resolved
+  and every address checked; the client resolves through the policy again at
+  connect time and follows no redirect. A dialect's default endpoint is checked
+  like a configured one. **An Ollama or llama.cpp on `localhost` or a LAN
+  address needs its host listed** — the one configuration this changes for a
+  node that never had a policy.
+- **Profiles and the lock.** `[vector.providers.<name>]` defines a provider in
+  the node's configuration — endpoint, model and key variable — and a
+  collection names it with `{"kind": "profile", "name": "<name>"}`. The
+  profile is held to the two rules above at startup and by `check-config`.
+  With `vector.provider.endpoints_locked = true` a collection may name a
+  profile, `byo` or `local` and nothing else, so the set of places this node
+  sends text is exactly the set the operator wrote down.
+
+The policy is enforced twice. At configure time the API answers `400` naming
+the variable or the host and the setting that governs it — never a value. And
+again when the provider is built, by the worker and by a search embedding a
+query, because a configuration also arrives by replication from another member
+and never passed this node's API; a stored configuration the policy refuses is
+a permanent failure for that collection, logged once with the name, until it
+is reconfigured. Configuring or disabling embeddings writes an audit record
+carrying the provider kind, the endpoint host or the profile name, and the key
+variable's name. Settings and the consequence for local providers are in
+[Vectors](vectors.md#the-provider-policy).
 
 ## What telemetry sends, and what it does not
 

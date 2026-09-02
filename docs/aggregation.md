@@ -81,7 +81,8 @@ field path.
 
 ### How a value is read
 
-- `"$field"` is a **field path**; a bare string is a literal.
+- `"$field"` is a **field path**; a bare string is a literal. A path that
+  crosses an array is the array of what it found — see [Arrays](#arrays).
 - `"$$name"` is a **variable** — see below — and `"$$name.path"` reads into its
   value.
 - A document whose **first key starts with `$`** is an **operator**, and it may
@@ -189,11 +190,23 @@ is for strings.
 **`$filter` takes an optional `limit`**, stops once it has that many matches,
 and treats a null limit as no limit. Zero or a negative limit is refused.
 
-**Reach into array elements with `$map`, not a dotted path.** A field path
-that crosses an array — `$items.sku` — yields the *first* matching value here,
-not an array of them as it does in MongoDB (a long-standing behaviour of the
-expression layer's path resolution, now more visible). `{$map: {input:
-"$items", in: "$$this.sku"}}` is the array of skus.
+**A field path through an array is the array of what it found.** `$items.sku`
+over `items: [{sku: "a"}, {sku: "b"}]` is `["a", "b"]`, so `{$size:
+"$items.sku"}` is 2 and `{$in: ["a", "$items.sku"]}` is true — MongoDB's rule,
+applied in every expression context: `$project`, `$addFields`, a `$group` key
+(which then buckets by the whole array), an accumulator argument, `$expr`, and
+a path into `$$ROOT` or a variable. An element that is not a document, or that
+lacks the field, is skipped rather than filled with null, and an array none of
+whose elements had it is `[]`. **Each array crossed adds one level, and nothing
+is flattened further:** `$a.b` over `a: [{b: [1, 2]}, {b: 3}]` is `[[1, 2], 3]`
+— the last segment returns each `b` as it is — and `$a.b.c` over `a: [{b: [{c:
+1}, {c: 2}]}]` is `[[1, 2]]`. `$reduce` with `$concatArrays` flattens a level
+when that is what you want. **A numeric segment is a field name here, never an
+index:** `$items.0.sku` reads the field called `0` of each element and finds
+nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
+an expression path and a filter path disagree — the filter language reads
+`items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
+`foreignField` name a field rather than compute one, so they do not fan out.
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory

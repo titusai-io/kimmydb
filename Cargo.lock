@@ -2362,12 +2362,14 @@ dependencies = [
  "bson",
  "futures",
  "hmac 0.13.0",
+ "http-body",
  "http-body-util",
  "jsonschema",
  "jsonwebtoken",
  "kimmy-auth",
  "kimmy-cluster",
  "kimmy-core",
+ "kimmy-egress",
  "kimmy-query",
  "kimmy-storage",
  "kimmy-vector",
@@ -2488,6 +2490,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kimmy-egress"
+version = "0.18.0"
+dependencies = [
+ "reqwest 0.12.28",
+ "tokio",
+]
+
+[[package]]
 name = "kimmy-fuzz-harness"
 version = "0.18.0"
 dependencies = [
@@ -2570,6 +2580,7 @@ dependencies = [
  "fastembed",
  "hnsw_rs",
  "kimmy-core",
+ "kimmy-egress",
  "kimmy-storage",
  "parking_lot",
  "reqwest 0.12.28",

@@ -6063,7 +6063,9 @@ needs that the hosted one did not.
 multibranch job and its credential. `ci.yml` runs the merge gate on pull
 requests and pushes to `main`, `release.yml` and `publish-ghcr.yml` run on a
 tag, and `main` requires the `fmt, clippy, test` context as it always did.
-This supersedes ADR-113, one release after it.
+This supersedes ADR-113, one release after it. *(The aggregate context was
+retired the next day, as ADR-107 had planned: `main` requires `fmt, clippy`
+and `test` directly, and the job that produced the old context is gone.)*
 
 **Why.** ADR-113 existed for one reason: a private repository bills every
 Actions minute, and the routine gate was the routine spend — about seven
@@ -6126,5 +6128,143 @@ on one's own hardware. And this repository now has a documented episode of
 adopting a second CI system and removing it within a day, which is a cost worth
 naming: the measurements were cheap, but they were made after the decision
 rather than before it.
+
+---
+## ADR-115 — An embedding provider is held to a key-variable and address policy
+
+**Decision.** A collection's vector configuration may name only what the node's
+operator allows. Three rules, enforced when the configuration is accepted and
+again when the provider is built:
+
+- **Key variables.** A hard denylist first, configurable by nobody: every
+  `KIMMY_*` variable that is not `KIMMY_PROVIDER_*` is the node's own — the
+  signing secret, the cluster secret, the bootstrap password, the previous
+  secret during a rotation — and is refused as `api_key_env` by name. An
+  `allowed_key_env` entry that would reach one (`KIMMY_JWT_SECRET`, `KIMMY_*`,
+  `K*`) is a startup error. Then `vector.provider.allowed_key_env`: exact names
+  or a prefix with one trailing `*`, defaulting to `OPENAI_API_KEY`,
+  `COHERE_API_KEY`, `GEMINI_API_KEY` and `KIMMY_PROVIDER_*`.
+- **Endpoints.** The address policy webhooks have had since their SSRF fix,
+  moved whole into a new `kimmy-egress` crate so both use one denylist: public
+  addresses only unless the host is in `vector.provider.allowed_hosts`; the
+  endpoint — or the dialect's default — resolved and every address checked;
+  the provider's `reqwest` client resolving through `CheckedResolver` and
+  following no redirect.
+- **Profiles and a lock.** `[vector.providers.<name>]` defines a provider in
+  the node's configuration; a collection names it with a new `ProviderConfig`
+  variant, `{"kind":"profile","name":…}`. `vector.provider.endpoints_locked`
+  makes `profile`, `byo` and `local` the only kinds configure time accepts. A
+  profile's definition is held to the two rules above at startup and by
+  `check-config`.
+
+A refusal at configure time is a `400` that names the variable or the host and
+the setting that governs it, never a value. Configuring or disabling
+embeddings writes an audit record beside the authorization one — provider
+kind, endpoint host or profile name, key variable name — as registering a
+webhook does.
+
+**Alternatives.**
+
+- *Checking at configure time only.* Rejected. A configuration also arrives by
+  replication from another member, having passed that member's API and never
+  this one's; a policy the worker does not enforce is a courtesy. So the
+  worker and the search path build providers through the same policy, and a
+  refused stored configuration is a permanent failure for that collection,
+  logged once by name.
+- *A denylist alone, with every other variable allowed.* Rejected. The node
+  cannot know which of the process's other variables are secrets — a cloud
+  credential injected by the platform is not `KIMMY_*` — so the default has to
+  be a list of what a provider may read, with the node's own names refused on
+  top of it whatever the list says.
+- *Applying the webhook policy by copying `egress.rs` into `kimmy-vector`.*
+  Rejected. Two copies of an address denylist are two places for the next
+  reserved range to be missing from; `kimmy-api` depends on `kimmy-vector`, so
+  the module had to move below both. The only thing that could not move
+  verbatim was the wording, which now arrives as a `Purpose` the caller states.
+- *Making the lock the default.* Rejected for now. A node that ships locked
+  refuses every collection's provider until an operator writes a profile, and
+  the hosted defaults under their documented variables are exactly what the
+  allowlist admits with nothing configured. The lock is for operators who want
+  the set of destinations to be a file they own.
+- *A warn-only period for configurations that predate the rule.* Rejected.
+  The product is pre-launch and every deployment is the operator's own; a
+  refusal that says what to change is worth more than a release of warnings
+  nobody reads.
+
+**Why.** `ddl` was designed to be granted freely — it is what lets an agent
+create its own collections — and a grant that is meant to be given to tenants
+cannot also be a grant of the node's environment and network position. Before
+this, it was: the endpoint check was a scheme check, and `api_key_env` was any
+name at all. The threat model recorded that as a trust statement and told
+operators to treat `ddl` as outbound access. A trust statement is not a
+control, and this is the control.
+
+**Cost.** One behaviour change for an existing deployment: an Ollama or
+llama.cpp on `localhost` or a LAN address needs its host listed in
+`vector.provider.allowed_hosts`, where before nothing was checked. Provider
+clients no longer follow redirects, so a provider that answers `302` fails
+where it used to work. One more workspace crate. A configure-time and a
+build-time DNS resolution per provider, the same cost webhooks already pay.
+What remains out of scope is narrower than before and stated in the threat
+model: a `ddl` holder on an unlocked node choosing a *public* endpoint under
+a listed key can send that collection's text — and that key — there. Binding
+a listed variable to the hosts it may be sent to would close that without the
+lock, and is the next step if it is ever needed.
+
+---
+
+## ADR-116 — An expression field path through an array fans out, as MongoDB's does
+
+**Decision.** The expression layer has its own path resolver. A field path
+read as an expression — `"$items.sku"`, `$$ROOT.items.sku`, `$$var.items.sku`
+— walks its segments left to right; where a segment lands on an array before
+the path ends, the rest of the path is applied to every element that is a
+document, elements that are not documents or lack the field are skipped, and
+the results form one array per array crossed with no further flattening.
+A trailing array is returned as it is, a path that crosses no array is a
+single value, a numeric segment is a field name and never an index, and a
+missing path is still null. A variable bound to an array of documents fans
+out the same way. Stage options that *name* a field rather than compute one
+— `$unwind`'s path, `$sort`'s keys, `$lookup`'s `localField` and
+`foreignField` — keep reading the single value at the path. The filter
+language is untouched.
+
+**Alternatives.** *Keep the first value and tell users to write `$map`.*
+That was the state of things and was recorded as a known deviation; it broke
+exactly the pipelines people port, and `$size`, `$in` and `$concatArrays`
+over a dotted path were errors that MongoDB answers. *Reuse
+`path::resolve` and wrap its result in an array when it returned more than
+one value.* Rejected: that resolver serves the filter language, so it reads
+`items.0` as an index as well as a field name, flattens every array it
+crosses into one list, and cannot say whether an array was crossed at all —
+`$a.b` over `a: [{b: [1, 2]}, {b: 3}]` would come back `[1, 2, 3]` where
+MongoDB gives `[[1, 2], 3]`, and one element found could not be told from a
+scalar. *Fan out everywhere a path appears, including `$unwind` and
+`$lookup`.* Rejected because those are not expressions in MongoDB either;
+`$unwind` needs a single place to write each element back to, and a join key
+read one way on the local side and another on the foreign side would join
+nothing.
+
+**Why.** An expression asks for a value and a filter asks whether any value
+matches, and the two questions have different answers over an array. The
+filter language's resolver already models MongoDB's match semantics
+faithfully; the expression layer had borrowed it and thrown away all but
+the first value, which was wrong in a way that only became visible once
+there were operators that consume arrays. A resolver that follows MongoDB's
+aggregation rules exactly — including the one-level-per-array rule and the
+numeric-segment rule, both easy to get wrong from memory — means a pipeline
+that runs there runs here with the same result, which is the whole promise
+of the compatibility surface. Pre-launch, the old behaviour has no
+compatibility claim, so it is changed outright rather than gated.
+
+**Cost.** A behaviour change in a `0.MINOR`: any pipeline that grouped,
+projected or pushed a path through an array and depended on the first value
+gets an array now. `$group: {_id: "$items.sku"}` buckets by the whole array,
+which is the MongoDB result but not the old one. Two path rules now exist in
+the codebase — the filter's, which reads a numeric segment both ways and
+collects every value, and the expression's — and the doc comment on each
+names the other and the one place they disagree. The expression resolver
+clones the values it collects, as the previous one did for the single value
+it returned; nothing on the hot filter path changed.
 
 ---

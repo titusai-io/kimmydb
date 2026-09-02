@@ -31,7 +31,7 @@ the more dangerous direction for a threat model to be wrong in. A claim marked
 | **User credentials** | `__kimmy.__users`: Argon2id PHC strings, token versions, roles | Never returned by any endpoint; reachable by `admin`, or by a grant naming `__kimmy` exactly — a wildcard never reaches it (ADR-079) |
 | **JWT signing secret** | `auth.jwt_secret` / `KIMMY_JWT_SECRET`, held in process memory | Identical on every member. Whoever holds it can mint any local principal, `root` included |
 | **Cluster secret** | `cluster.cluster_secret` / `KIMMY_CLUSTER_SECRET`, in process memory | Whoever holds it is a full peer: the entire oplog to read, and writes that win last-writer-wins |
-| **Provider API keys** | Environment variables named by `api_key_env` in a collection's vector configuration | Read at provider construction (`kimmy-vector/src/provider.rs`, `read_key`); never stored in collection metadata or returned |
+| **Provider API keys** | Environment variables named by `api_key_env` in a collection's vector configuration, or by a `[vector.providers.<name>]` profile | Read at provider construction (`kimmy-vector/src/provider.rs`, `read_key`), and only for a name the provider policy admits (`kimmy-vector/src/policy.rs`, ADR-115); never stored in collection metadata or returned |
 | **Webhook signing secrets** | `__kimmy.__webhooks`, one per subscription, in the clear | Shown to the registrant once ([Webhooks](webhooks.md)). Stored plaintext, so a backup and an `admin` read both contain them |
 | **Local tokens** | In clients; in the CLI's `0600` cache under `$XDG_CACHE_HOME/kimmy` | A signed, readable grant list: anyone holding one can read its claims and use it until `exp` or revocation |
 | **Cluster membership** | The SWIM member set in memory; `__kimmy.__nodes`; `GET /v1/topology` (authenticated) | Addresses, node ids and liveness. Also visible to anyone who can capture UDP on the cluster network (see below) |
@@ -212,19 +212,27 @@ key travels as `Authorization: Bearer` (or `x-goog-api-key` for Gemini). The
 | Threat | Control | Where |
 |---|---|---|
 | Keys in collection metadata or responses | The configuration names an environment *variable*; the value is read when the provider is built and appears nowhere else | `provider.rs`, `read_key` |
+| A `ddl` holder naming one of the node's own secrets as the key variable — `KIMMY_JWT_SECRET`, `KIMMY_CLUSTER_SECRET`, `KIMMY_ROOT_PASSWORD` — and receiving it at an endpoint they chose | A hard denylist no setting can relax: every `KIMMY_*` variable other than `KIMMY_PROVIDER_*` is refused by name, and an allowlist entry that would reach one is a configuration error. Beyond that, `vector.provider.allowed_key_env` — exact names or prefixes with one trailing `*`, defaulting to the three documented key variables and `KIMMY_PROVIDER_*` — and a variable outside it is refused by name. Checked at configure time (`400`) and again when the provider is built, because a configuration also arrives by replication (ADR-115) | `kimmy-vector/src/policy.rs`, `check_key_env`; `kimmy-api/src/vectors.rs`, `admit_provider`; `provider.rs`, `build` |
+| Server-side request forgery through a provider endpoint | The address policy webhooks use, shared through `kimmy-egress`: loopback, link-local, RFC 1918, carrier-NAT and reserved ranges refused unless the host is in `vector.provider.allowed_hosts`; the endpoint — or the dialect's default — resolved and **every** address checked at configure time and at build time, and again inside the client's resolver at connect time; redirects not followed | `kimmy-egress/src/lib.rs`; `policy.rs`, `check_endpoint`; `provider.rs`, `http_client` |
+| A `ddl` holder choosing where a collection's text goes at all | `vector.provider.endpoints_locked`: a collection may then name only a `[vector.providers.<name>]` profile the operator defined, `byo` or `local`. The profile's own definition is held to the key and address rules at startup and by `check-config` | `policy.rs`, `check_configure`; `kimmyd/src/config.rs` |
+| A change to where text is sent going unrecorded | Configuring or disabling embeddings writes an audit record with the provider kind, the endpoint host or the profile name, and the key variable's *name* | `kimmy-api/src/audit.rs`, `record_vectors` |
 | Eavesdropping on the provider call | HTTPS through `reqwest` on rustls. *Verify:* the trust roots are the compiled-in `webpki-roots` bundle (it is in `Cargo.lock`; `rustls-native-certs` is not), so a provider behind a private CA is not trusted whatever the image's `ca-certificates` holds |  `Cargo.toml`, `reqwest` features |
 | A hung provider holding the worker | 10 s connect, 60 s request timeout, one in-client retry; the worker's own backoff after that | `provider.rs` constants |
 | A provider returning the wrong shape | Every returned vector's width is checked against `dim` before it is stored (`DimensionMismatch`) | `kimmy-vector/src/provider.rs` |
 
-The boundary has a soft edge that should be understood before `ddl` is
-granted. The endpoint and the key variable are part of the collection's vector
-configuration, so they are chosen by whoever holds `ddl` on that collection,
-and the address policy that constrains webhook destinations does **not** apply
-to providers (`kimmy-core/src/vector_meta.rs` checks only that the URL is
-`http` or `https`). A `ddl` holder therefore decides where a collection's text
-is sent and which variable from the node's environment authenticates the
-call. Until a control narrows that, treat `ddl` as a grant of outbound access
-from the node — give it to operators and trusted services, not to tenants.
+The endpoint and the key variable are part of the collection's vector
+configuration, so they are chosen by whoever holds `ddl` on that collection —
+which is why the controls above exist, and why they are enforced twice.
+A configuration is checked when it is accepted, where the person who typed it
+gets a `400` naming the variable or the host; and it is checked again when the
+provider is built, by the worker and by a search embedding a query, because a
+configuration also arrives by replication from another member and never
+passes this node's API. What a `ddl` holder can still choose is a public
+endpoint and a listed variable — so a tenant with `ddl` on their own
+collection can send that collection's text to a public provider under a key
+the operator listed for the purpose. An operator who does not want even that
+sets `endpoints_locked` and defines the providers themselves; the collection
+then names a profile and nothing else.
 
 ### The node → webhook receivers
 
@@ -315,8 +323,11 @@ guide is the per-feature list; this is the list by adversary.
   trusted with both.
 - **A malicious webhook receiver.** It receives what it was subscribed to;
   that is the feature.
-- **A `ddl` holder choosing a provider endpoint.** See the provider boundary
-  above; today this is a trust statement, not a control.
+- **A `ddl` holder choosing a *public* provider endpoint** under a listed key
+  variable, on a node without `endpoints_locked`. The policy above refuses the
+  node's own secrets and the node's own network; it does not decide which
+  public providers are acceptable. That is the lock's job, and it is off by
+  default.
 - **Network-layer denial of service.** SYN floods, volumetric UDP,
   exhausting file descriptors with idle connections. The limits above bound
   what an *authenticated* caller can spend; what reaches the socket is the

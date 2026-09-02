@@ -503,11 +503,18 @@ pub fn bind_let(
     vars.iter().map(|(name, expr)| Ok((name.clone(), expr.eval_in(&scope)?))).collect()
 }
 
-/// The single value at a path.
+/// The single value at a **field path** — a stage option that names a field,
+/// as distinct from an expression that reads one.
 ///
-/// [`path::resolve`] follows arrays implicitly and can return several values,
-/// which is what filters want — `{tags: "a"}` matches any element. An
-/// accumulator argument wants the value *itself*, so the array stays an array
+/// The two contexts have different rules in MongoDB and here. An expression
+/// (`$project`, `$addFields`, `$replaceRoot`, a `$group` key or accumulator
+/// argument, `$expr`) goes through [`Expr`], where a path that crosses an
+/// array fans out into an array of what it found. A field path names a place
+/// in the document: `$unwind`'s `path`, `$lookup`'s `localField` and
+/// `foreignField`, `$sort`'s keys. Those do not fan out, and this helper is
+/// theirs. [`path::resolve`] follows arrays implicitly and can return several
+/// values, which is what filters want — `{tags: "a"}` matches any element;
+/// a field-path option wants the value *itself*, so the array stays an array
 /// and `$unwind` has something to expand.
 fn value_at<'a>(doc: &'a Document, p: &str) -> Option<&'a Bson> {
     path::resolve(doc, p).into_iter().next()
@@ -584,6 +591,9 @@ pub fn apply_with_vars(
             out
         }
         Stage::Sort(keys) => {
+            // A sort key is a field path, not an expression, and orders by
+            // the same rules `find`'s sort does — an array sorts by its
+            // elements, and a path that crosses one is not fanned out.
             let mut docs = input;
             shape::sort(keys, &mut docs);
             docs
@@ -651,6 +661,9 @@ fn unwind(
 ) -> Result<Vec<Document>> {
     let mut out = Vec::with_capacity(input.len());
     for doc in input {
+        // `path` is a field path: `$unwind` names the array to expand, and
+        // `path::set` writes each element back to that same place. A fanned
+        // read would have no single place to write to.
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
                 for item in items.clone() {
@@ -839,6 +852,9 @@ pub fn lookup_keys(input: &[Document], local_field: &str) -> Vec<Bson> {
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut keys = Vec::new();
     for doc in input {
+        // `localField` is a field path, not an expression: it names the key
+        // to join on, and the executor reads the same path the same way
+        // when it matches the foreign side, so the two must agree.
         let value = value_at(doc, local_field).cloned().unwrap_or(Bson::Null);
         if seen.insert(group_key(&value)) {
             keys.push(value);
@@ -939,6 +955,96 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out.len(), 4, "the empty array now yields one document: {out:?}");
+    }
+
+    fn orders() -> Vec<Document> {
+        docs(vec![
+            doc! { "_id": 1, "items": [{"sku": "a"}, {"sku": "b"}] },
+            doc! { "_id": 2, "items": [{"sku": "a"}, {"sku": "b"}] },
+            doc! { "_id": 3, "items": [{"sku": "c"}] },
+            doc! { "_id": 4, "items": [] },
+            doc! { "_id": 5 },
+        ])
+    }
+
+    fn strings(items: &[&str]) -> Bson {
+        Bson::Array(items.iter().map(|s| Bson::String((*s).into())).collect())
+    }
+
+    #[test]
+    fn group_by_a_path_through_an_array_buckets_by_the_whole_array() {
+        // MongoDB groups on the array value itself, not on each element: the
+        // two orders with the same skus share a bucket, and the empty array
+        // and the missing field are distinct buckets.
+        let out = run(
+            vec![
+                doc! {"$group": {"_id": "$items.sku", "n": {"$sum": 1}}},
+                doc! {"$sort": {"n": -1, "_id": 1}},
+            ],
+            orders(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 4, "{out:?}");
+        assert_eq!(out[0], doc! { "_id": strings(&["a", "b"]), "n": 2i64 });
+        let keys: Vec<&Bson> = out.iter().map(|d| d.get("_id").unwrap()).collect();
+        assert!(keys.contains(&&strings(&["c"])), "{keys:?}");
+        assert!(keys.contains(&&Bson::Array(vec![])), "{keys:?}");
+        assert!(keys.contains(&&Bson::Null), "{keys:?}");
+    }
+
+    #[test]
+    fn project_and_add_fields_write_the_fanned_array() {
+        let out = run(
+            vec![
+                doc! {"$addFields": {"skus": "$items.sku"}},
+                doc! {"$project": {"_id": 1, "skus": 1, "n": {"$size": "$items.sku"}}},
+            ],
+            orders(),
+        )
+        .unwrap();
+        assert_eq!(out[0], doc! { "_id": 1, "skus": strings(&["a", "b"]), "n": 2i64 });
+        assert_eq!(out[3], doc! { "_id": 4, "skus": [], "n": 0i64 });
+        // A missing path is null, as it always was; `$size` of null is null
+        // rather than an error, as the deviations register records.
+        assert_eq!(out[4], doc! { "_id": 5, "skus": Bson::Null, "n": Bson::Null });
+    }
+
+    #[test]
+    fn a_match_expr_over_a_fanned_path_sees_the_array() {
+        // `$expr` is evaluated by the expression layer, so `$items.sku` is
+        // the array of skus there — and `$in` can test membership in it.
+        let out =
+            run(vec![doc! {"$match": {"$expr": {"$in": ["b", "$items.sku"]}}}], orders()).unwrap();
+        let ids: Vec<i32> = out.iter().map(|d| d.get_i32("_id").unwrap()).collect();
+        assert_eq!(ids, vec![1, 2]);
+    }
+
+    #[test]
+    fn push_of_a_fanned_path_pushes_one_array_per_document() {
+        let out = run(
+            vec![
+                doc! {"$match": {"_id": {"$lte": 3}}},
+                doc! {"$group": {"_id": null, "all": {"$push": "$items.sku"}}},
+            ],
+            orders(),
+        )
+        .unwrap();
+        assert_eq!(
+            out[0].get("all").unwrap(),
+            &Bson::Array(vec![strings(&["a", "b"]), strings(&["a", "b"]), strings(&["c"])])
+        );
+    }
+
+    #[test]
+    fn unwind_and_lookup_keys_read_a_field_path_and_do_not_fan_out() {
+        // `$unwind` names a place to write back to, so `$a.b` where `a` is an
+        // array reads the first element's `b` as it always has; the fan-out
+        // is an expression rule and these are not expressions.
+        let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": [3]}] }]);
+        let out = run(vec![doc! {"$unwind": "$a.b"}], input.clone()).unwrap();
+        assert_eq!(out.len(), 2, "{out:?}");
+        let keys = lookup_keys(&input, "a.b");
+        assert_eq!(keys, vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])]);
     }
 
     #[test]

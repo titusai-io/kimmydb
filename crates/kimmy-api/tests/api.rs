@@ -58,13 +58,10 @@ impl Client {
         token: Option<&str>,
         body: Option<Value>,
     ) -> Res {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let rest = url.strip_prefix("http://").expect("http url");
         let (host, path) = rest.split_once('/').expect("path");
         let path = format!("/{path}");
 
-        let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
 
         let mut request = format!(
@@ -78,21 +75,22 @@ impl Client {
         request.push_str("\r\n");
         request.push_str(&payload);
 
-        stream.write_all(request.as_bytes()).await.expect("write");
-        let mut raw = Vec::new();
-        // A reset after the response is end-of-stream, not a failure. The
-        // server answers an over-sized body with 413 and closes *without*
-        // draining the rest of the request, so the bytes still in flight are
-        // answered with an RST — and on macOS that surfaces here as
-        // `ConnectionReset` rather than a clean EOF. A real client reads what
-        // arrived and moves on; reading anything at all is what says the
-        // response was received. An empty read really is a failure, so it is
-        // still one.
-        if let Err(e) = stream.read_to_end(&mut raw).await
-            && (raw.is_empty() || e.kind() != std::io::ErrorKind::ConnectionReset)
-        {
-            panic!("read: {e:?}");
-        }
+        // A reset with nothing read is retried once. The server drains a body
+        // it refuses before it answers, so an in-flight request is normally
+        // read to its end and the connection closes cleanly; but a body past
+        // the drain cap is still closed on with bytes unread, and the RST
+        // that answers those can, on macOS, discard a response that had
+        // already arrived. The response was sent, and the request it
+        // answered was one the server never read to the end — so making it
+        // once more is what a real client would do, and what these tests
+        // are about is the status.
+        let raw = match Self::exchange(host, request.as_bytes()).await {
+            Ok(raw) => raw,
+            Err(first) => match Self::exchange(host, request.as_bytes()).await {
+                Ok(raw) => raw,
+                Err(e) => panic!("read: {e:?} (after {first:?} on the first attempt)"),
+            },
+        };
         let text = String::from_utf8_lossy(&raw).into_owned();
 
         let (head, body_text) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
@@ -107,6 +105,35 @@ impl Client {
         // chunked decoding needed.
         let body = serde_json::from_str(body_text.trim()).unwrap_or(Value::Null);
         Res { status, body, head: head.to_string() }
+    }
+
+    /// One request on one connection, answered with whatever the server sent
+    /// before the connection ended.
+    ///
+    /// A reset *after* the response is end-of-stream, not a failure: a body
+    /// the server did not finish reading is answered and then closed on, so
+    /// the bytes still in flight draw an RST, and on macOS that surfaces here
+    /// as `ConnectionReset` rather than a clean EOF. A real client reads what
+    /// arrived and moves on; reading anything at all is what says the
+    /// response was received. The same goes for a write the server cut short
+    /// — the response may be sitting there regardless, so it is read for.
+    /// A reset with nothing read is the failure, and the caller's to judge.
+    async fn exchange(host: &str, request: &[u8]) -> std::io::Result<Vec<u8>> {
+        use std::io::ErrorKind::{BrokenPipe, ConnectionReset};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+        if let Err(e) = stream.write_all(request).await
+            && !matches!(e.kind(), BrokenPipe | ConnectionReset)
+        {
+            panic!("write: {e:?}");
+        }
+        let mut raw = Vec::new();
+        match stream.read_to_end(&mut raw).await {
+            Ok(_) => Ok(raw),
+            Err(e) if e.kind() == ConnectionReset && !raw.is_empty() => Ok(raw),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -991,6 +1018,123 @@ async fn a_bulk_body_over_the_size_limit_is_413_with_a_stable_code() {
 
     assert_eq!(res.status, 413, "a body over 2 MB must be refused: {:?}", res.body);
     assert_eq!(res.body["error"], "payload_too_large");
+}
+
+/// Send `body` in one write and read whatever comes back, the two concurrent:
+/// a server that stopped reading would stall the write once the socket
+/// buffers filled, and a test that wrote first would hang there rather than
+/// fail. Returns both outcomes, since which one a refusal shows up in is the
+/// subject.
+async fn upload(
+    base: &str,
+    path: &str,
+    token: &str,
+    body: Vec<u8>,
+) -> (std::io::Result<()>, std::io::Result<Vec<u8>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let host = base.strip_prefix("http://").expect("http url");
+    let stream = tokio::net::TcpStream::connect(host).await.expect("connect");
+    let (mut reader, mut writer) = stream.into_split();
+    let head = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+         Content-Type: application/json\r\nContent-Length: {}\r\n\
+         Authorization: Bearer {token}\r\n\r\n",
+        body.len()
+    );
+    let written = tokio::spawn(async move {
+        let mut request = head.into_bytes();
+        request.extend_from_slice(&body);
+        // The half comes back with the result rather than being dropped
+        // here: dropping it shuts the write side down, and hyper takes a FIN
+        // that arrives before the response is written as the client having
+        // left, and answers nothing. A real client keeps its socket open
+        // until it has read the response, so this one does too.
+        (writer.write_all(&request).await, writer)
+    });
+    let mut raw = Vec::new();
+    let read = reader.read_to_end(&mut raw).await.map(|_| raw);
+    let (written, _writer) = written.await.expect("the writer task");
+    (written, read)
+}
+
+/// The status line and JSON body of a raw response.
+fn status_and_body(raw: &[u8]) -> (u16, Value) {
+    let text = String::from_utf8_lossy(raw);
+    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    (status, serde_json::from_str(body.trim()).unwrap_or(Value::Null))
+}
+
+#[tokio::test]
+async fn a_client_still_sending_past_the_ceiling_is_answered_with_the_413() {
+    // A body a thousand times the ceiling, inside the drain cap. The server
+    // refuses it on the second kilobyte; what the test holds is that it keeps
+    // reading anyway, so the write completes, the response arrives, and the
+    // connection ends cleanly — no reset to tolerate on either side.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let body = json!({ "pad": "x".repeat(1 << 20) }).to_string().into_bytes();
+    let (written, read) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        upload(&server.base, "/v1/db/shop/coll/c/docs", &token, body),
+    )
+    .await
+    .expect("the exchange completes: a draining server neither stalls nor is stalled");
+
+    written.expect("the whole body is taken: the server reads on past the ceiling");
+    let raw = read.expect("the response is read to a clean end of stream");
+    let (status, body) = status_and_body(&raw);
+    assert_eq!(status, 413, "{} bytes read: {:?}", raw.len(), String::from_utf8_lossy(&raw));
+    assert_eq!(body["error"], "payload_too_large");
+    assert_eq!(body["retry"], "no");
+}
+
+#[tokio::test]
+async fn a_body_past_the_drain_cap_is_answered_or_closed_on_within_the_bound() {
+    // Past the cap by a megabyte. The drain stops at the cap and the refusal
+    // goes out over a body still arriving, so either the 413 is read or the
+    // connection is reset — what is not allowed is a hang on either side,
+    // which is what an unbounded drain, or a client waiting on one, would be.
+    let server = Server::start_with_limits(kimmy_api::RequestLimits {
+        max_body_bytes: 1024,
+        ..kimmy_api::RequestLimits::default()
+    })
+    .await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let padding = kimmy_api::limits::MAX_BODY_DRAIN_BYTES + (1 << 20);
+    let body = json!({ "pad": "x".repeat(padding) }).to_string().into_bytes();
+    let (_written, read) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        upload(&server.base, "/v1/db/shop/coll/c/docs", &token, body),
+    )
+    .await
+    .expect("the exchange completes within the drain's own bound");
+
+    if let Ok(raw) = &read
+        && !raw.is_empty()
+    {
+        let (status, body) = status_and_body(raw);
+        assert_eq!(status, 413, "{body}");
+        assert_eq!(body["error"], "payload_too_large");
+    }
+
+    // The node is fine; only that request was closed on.
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": 1})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 #[tokio::test]
@@ -3328,6 +3472,64 @@ async fn byo_collection(server: &Server) -> String {
 }
 
 #[tokio::test]
+async fn configuring_a_provider_with_a_node_secret_or_a_private_endpoint_is_refused() {
+    // ADR-115, over the wire. A `ddl` holder naming the node's own signing
+    // secret as the provider's key variable, or pointing the provider at the
+    // node's own network, is answered 400 with the name and the setting —
+    // and nothing is stored, so the collection is still unconfigured after.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+
+    let stolen = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": {
+            "kind": "open_ai", "model": "m",
+            "endpoint": "https://93.184.216.34",
+            "api_key_env": "KIMMY_JWT_SECRET",
+        },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), stolen).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("KIMMY_JWT_SECRET"), "{message}");
+    assert!(message.contains("api_key_env"), "{message}");
+
+    let inward = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "ollama", "model": "m", "endpoint": "http://169.254.169.254" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), inward).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("169.254.169.254"), "{message}");
+    assert!(message.contains("vector.provider.allowed_hosts"), "{message}");
+
+    let unknown = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "profile", "name": "nope" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), unknown).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default().to_string();
+    assert!(message.contains("vector.providers.nope"), "{message}");
+
+    // Nothing was stored by any of the refusals.
+    let res = server.get("/v1/db/shop/coll/docs/vector", Some(&token)).await;
+    assert_eq!(res.status, 200);
+    assert!(res.body["vector"].is_null(), "{:?}", res.body);
+
+    // And the shape that has always worked still does: a hosted default
+    // endpoint with its documented variable.
+    let fine = json!({
+        "fields": ["text"], "dim": 3,
+        "provider": { "kind": "open_ai", "model": "m" },
+    });
+    let res = server.post("/v1/db/shop/coll/docs/vector", Some(&token), fine).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn searching_a_collection_with_no_vectors_says_so() {
     // An empty result set is indistinguishable from "nothing matched", which is
     // how `byo` being the default produced a collection that silently could
@@ -5203,6 +5405,72 @@ async fn computed_expressions_derive_fields_over_http() {
 }
 
 #[tokio::test]
+async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
+    // The same pipeline MongoDB runs: a path that crosses an array is the
+    // array of what it found, in `$addFields`, in `$expr` and as a `$group`
+    // key — and `$unwind`, which names a field rather than reading one, is
+    // unchanged by it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for (id, items) in [
+        (1, json!([{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}])),
+        (2, json!([{"sku": "a", "qty": 5}, {"sku": "b", "qty": 1}])),
+        (3, json!([{"sku": "c", "qty": 1}, {"qty": 9}, 7])),
+    ] {
+        let res = server
+            .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": id, "items": items}))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"$expr": {"$in": ["b", "$items.sku"]}}},
+                {"$addFields": {"skus": "$items.sku", "n": {"$size": "$$ROOT.items.qty"}}},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["skus"], json!(["a", "b"]));
+    assert_eq!(docs[0]["n"], 2);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$group": {"_id": "$items.sku", "orders": {"$sum": 1}}},
+                {"$sort": {"orders": -1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["_id"], json!(["a", "b"]));
+    assert_eq!(docs[0]["orders"], 2);
+    // The element without a `sku` and the scalar element contribute nothing.
+    assert_eq!(docs[1]["_id"], json!(["c"]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$unwind": "$items"}, {"$count": "n"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["n"], 7);
+}
+
+#[tokio::test]
 async fn a_computed_date_survives_the_extended_json_boundary() {
     // Dates are the type JSON cannot express, so a date expression is where a
     // working evaluator and a working edge are hardest to tell apart.
@@ -6546,7 +6814,7 @@ async fn a_token_signed_by_a_key_the_node_has_not_fetched_is_refused_without_nam
 
     let res = server.get("/v1/auth/whoami", Some(&token)).await;
     assert_eq!(res.status, 401, "{:?}", res.body);
-    let message = res.body["error"]["message"].as_str().unwrap_or_default();
+    let message = res.body["message"].as_str().unwrap_or_default();
     assert!(!message.contains("rotated-key-2"), "the message must not echo the key id: {message}");
 }
 

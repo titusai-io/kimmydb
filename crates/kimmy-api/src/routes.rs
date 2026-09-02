@@ -64,6 +64,13 @@ pub fn router_with_limits(
         // default is exactly what axum applied when nothing set one, so an
         // operator who never touches the setting sees no change (ADR-099).
         .layer(axum::extract::DefaultBodyLimit::max(limits.max_body_bytes))
+        // Outside the ceiling, so it sees the ceiling's refusal: a 413 is
+        // written while the client may still be sending, and closing on the
+        // unread rest answers it with a reset that can take the 413 with it.
+        // The drain reads a bounded remainder first. Beside the ceiling
+        // rather than beside the deadline for the reason the ceiling is
+        // here: it belongs to every route the ceiling reaches.
+        .layer(axum::middleware::from_fn(crate::limits::drain_refused_body))
         // Counting happens in one layer rather than in each handler: a counter
         // beside a handler is a counter the next route forgets. It wraps
         // everything including `/metrics` itself, so a scrape is visible as
