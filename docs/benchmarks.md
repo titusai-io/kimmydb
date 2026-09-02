@@ -656,6 +656,136 @@ from the exporter's own threads and never reach the request path.
 
 ---
 
+## The allocator: musl, glibc and mimalloc
+
+Every release binary is a static musl build ([ADR-063](decisions.md)), and
+since 0.17.0 the container ships that same file ([ADR-107](decisions.md))
+rather than a glibc build of its own. ADR-107 named the one thing an operator
+could observe in that change — musl's malloc where glibc's had been — and said
+a measurement would decide whether it mattered. This is that measurement,
+taken for [ADR-117](decisions.md), which set the allocator. **Every number
+above this section came from a glibc or macOS build**, which is why none of
+them showed what follows.
+
+| | |
+|---|---|
+| Machine | A Linux arm64 container on Apple silicon, Docker Desktop's `linux/arm64` daemon, `--cpus 4 --memory 4g`; the load generator shares those four cores with the server |
+| Date | 2026-09-01 |
+| Image | `rust:1-slim-trixie` with `musl-tools`; rustc 1.98.0; targets `aarch64-unknown-linux-gnu` and `aarch64-unknown-linux-musl` |
+| Build | `cargo bench` profile — the release profile plus debug info; `mimalloc` 0.1.52 (mimalloc 3.3.2), default features |
+| Fixture | 10,000 documents of six fields, as every socket table above |
+| Method | 3 s per cell after 200 discarded warm-up requests; 1, 8, 32 and 64 clients; plaintext (TLS was run too and orders the three the same way in every cell) |
+| Runs | Two of each configuration, interleaved; the better run is shown. Spread — the two runs' difference as a share of the better — was 1–11% for glibc, 1–23% for musl and 0–10% for mimalloc on plaintext at eight clients and up |
+| Load generator | One binary, the harness built for the glibc target, driving all three servers with the server binary swapped underneath it — so the client's own allocator does not move between columns |
+| Peak RSS | `VmHWM` from `/proc/<pid>/status`, sampled every 200 ms while the node ran |
+
+Three servers, one commit:
+
+- **glibc** — `aarch64-unknown-linux-gnu`, no allocator set: what the
+  container shipped before 0.17.0.
+- **musl** — `aarch64-unknown-linux-musl`, no allocator set: every release
+  tarball, and the container from 0.17.0 through 0.19.0.
+- **musl + mimalloc** — the same musl target with `mimalloc::MiMalloc` as the
+  global allocator: what ships from the next release.
+
+### Reads, plaintext
+
+| Scenario | Clients | glibc req/s | musl req/s | mimalloc req/s | p50 ms, glibc / musl / mimalloc | p99 ms, glibc / musl / mimalloc |
+|---|---:|---:|---:|---:|---|---|
+| point read by `_id` | 1 | 10,718 | 9,714 | 10,779 | 0.09 / 0.10 / 0.09 | 0.15 / 0.18 / 0.16 |
+| point read by `_id` | 8 | 45,116 | **18,345** | 48,217 | 0.15 / 0.44 / 0.15 | 0.28 / 0.78 / 0.28 |
+| point read by `_id` | 32 | 52,303 | **18,930** | 57,588 | 0.33 / 1.63 / 0.31 | 0.71 / 4.24 / 0.66 |
+| point read by `_id` | 64 | 51,956 | **19,682** | 54,686 | 0.65 / 3.22 / 0.65 | 45.25 / 6.20 / 39.23 |
+| `find`, page of 100 | 1 | 1,576 | 1,111 | 2,012 | 0.62 / 0.87 / 0.48 | 0.77 / 1.19 / 0.70 |
+| `find`, page of 100 | 8 | 6,381 | **477** | 8,289 | 1.17 / 16.44 / 0.89 | 6.12 / 31.37 / 2.12 |
+| `find`, page of 100 | 32 | 6,369 | **483** | 7,951 | 4.67 / 62.43 / 3.46 | 13.55 / 138.71 / 16.40 |
+| `find`, page of 100 | 64 | 6,257 | **537** | 8,304 | 9.32 / 116.02 / 6.78 | 22.96 / 239.23 / 21.38 |
+| `count`, whole collection | 1 | 49 | 43 | 59 | 20.38 / 23.40 / 16.80 | 21.95 / 25.24 / 18.18 |
+| `count`, whole collection | 8 | 171 | **19** | 201 | 46.95 / 415.61 / 39.75 | 70.18 / 546.95 / 59.25 |
+| `count`, whole collection | 32 | 175 | **22** | 207 | 164.49 / 1,282.92 / 146.82 | 326.42 / 2,129.66 / 305.71 |
+| `count`, whole collection | 64 | 174 | **20** | 211 | 337.88 / 2,638.86 / 277.90 | 728.31 / 5,223.35 / 540.21 |
+
+### Writes, plaintext
+
+| Scenario | Clients | glibc req/s | musl req/s | mimalloc req/s | p50 ms, glibc / musl / mimalloc | p99 ms, glibc / musl / mimalloc |
+|---|---:|---:|---:|---:|---|---|
+| insert one | 1 | 1,016 | 984 | 1,076 | 0.86 / 0.87 / 0.80 | 2.13 / 2.67 / 2.47 |
+| insert one | 8 | 2,439 | 2,214 | 2,450 | 4.85 / 4.72 / 4.46 | 7.54 / 9.04 / 8.66 |
+| insert one | 32 | 3,626 | 3,283 | 3,756 | 1.63 / 3.24 / 1.51 | 31.73 / 30.47 / 26.27 |
+| insert one | 64 | 4,766 | 4,104 | 5,056 | 2.79 / 7.60 / 2.22 | 54.23 / 52.69 / 47.43 |
+| bulk of 100 | 1 | 230 | 216 | 257 | 3.80 / 4.12 / 3.36 | 6.28 / 6.98 / 5.99 |
+| bulk of 100 | 8 | 508 | **360** | 567 | 23.51 / 18.89 / 22.19 | 33.89 / 48.91 / 29.69 |
+| bulk of 100 | 32 | 771 | **418** | 808 | 5.84 / 67.69 / 4.15 | 114.73 / 170.60 / 123.66 |
+| bulk of 100 | 64 | 992 | **462** | 1,058 | 11.14 / 125.76 / 6.72 | 325.29 / 344.28 / 208.14 |
+
+### Resident memory
+
+| | glibc | musl | musl + mimalloc |
+|---|---:|---:|---:|
+| Peak `VmHWM`, two runs | 273–300 MB | 125–147 MB | 546–576 MB |
+
+The peak is reached in the write cells in every column — sixty-four clients
+each sending hundred-document batches — and until then all three sit between
+35 and 80 MB.
+
+### What it says
+
+**musl's malloc is the regression, and it is large.** At one client the musl
+binary is within 10–30% of glibc. At eight, point reads run at 0.4× the rate,
+a page of 100 documents at 0.07× and `count` at 0.11×, and the ratio follows
+how many allocations a request makes rather than how many requests arrive: a
+point read allocates a handful of times, decoding and re-encoding a hundred
+documents allocates hundreds. musl's allocator serialises every allocation on
+one lock, and four tokio workers stand in one queue for it. The tail says the
+same: a paged `find` at eight clients has a p99 of 31 ms on musl and 6 ms on
+glibc, and a `count` at sixty-four clients waits five seconds where glibc
+waits 0.7.
+
+**mimalloc recovers it and passes glibc.** Reads are 8–30% above glibc at
+every client count, one included — the allocator is on the single-request path
+as well as the contended one — and the p99 on a paged `find` at eight clients
+is 2 ms, a third of glibc's.
+
+**Writes barely move**, as they should: an insert is mostly fsync ([The write
+gap, explained](#the-write-gap-explained)), and no allocator changes that. The
+bulk path is the exception, because decoding a hundred-document batch
+allocates, and at sixty-four clients musl does 462 batches a second to glibc's
+992.
+
+**The cost is resident memory.** mimalloc's peak is about twice glibc's and
+four times musl's. That is retained heap rather than live data — musl's figure
+bounds what was in use — and it is not the purge timer: a run with
+`MIMALLOC_PURGE_DELAY=0` peaked at 608 MB. Where it goes was not chased
+further; mimalloc keeps a heap per thread and hands memory back in whole
+segments, and the burst has sixty-four requests in flight across every worker.
+[Operations](operations.md#capacity) carries the figure, because a container
+sized to the old peak wants headroom.
+
+**The 40 ms p99 on point reads at sixty-four clients** appears with glibc and
+mimalloc alike and not with musl, which never gets that far. It is the load
+generator — sixty-four tasks on four cores — and not the server: a server that
+answers fast enough exposes the client's own scheduling.
+
+### How to reproduce it
+
+Inside a Linux container with `musl-tools` and the musl target installed:
+
+```bash
+cargo bench -p kimmyd --bench http --no-run                       # the harness, glibc, and target/release/kimmyd
+cargo build --profile bench --target aarch64-unknown-linux-musl -p kimmyd --bin kimmyd
+# The harness embeds the path of the binary it was built beside. Copy the
+# musl kimmyd over target/release/kimmyd and run the harness executable that
+# `--no-run` printed, then again with the glibc one; the load generator is
+# then the same binary for every row.
+KIMMY_BENCH_CONCURRENCY=1,8,32,64 KIMMY_BENCH_MS=3000 target/release/deps/http-<hash> --bench
+```
+
+To measure the musl binary without mimalloc, remove the `#[global_allocator]`
+in `crates/kimmyd/src/main.rs` for that build. Peak memory is `VmHWM` in
+`/proc/<pid>/status` of the spawned node, read before the harness kills it.
+
+---
+
 ## The baseline
 
 `scripts/bench-baseline.py` records every Criterion median to

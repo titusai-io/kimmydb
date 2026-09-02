@@ -6272,3 +6272,111 @@ clones the values it collects, as the previous one did for the single value
 it returned; nothing on the hot filter path changed.
 
 ---
+
+## ADR-117 — `kimmyd` sets mimalloc as its global allocator
+
+**Decision.** `crates/kimmyd/src/main.rs` declares `mimalloc::MiMalloc` as the
+`#[global_allocator]`, with the crate's default features, on every target the
+binary is built for. It is set in the binary crate and nowhere else: a library
+that sets a global allocator sets it for every program that links it, and no
+library in this workspace may. `libmimalloc-sys` joins `cc` on
+`scripts/allowed-native-deps.txt`. Measured 2026-09-01; the full table and its
+conditions are in [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc).
+
+**Why.** Every release binary has been a static musl build since ADR-063, and
+ADR-107 made the container ship that same file instead of a glibc build of its
+own. ADR-107 named the one thing an operator could observe in the change —
+musl's malloc where glibc's had been, "slower under heavy multithreaded
+allocation" — and said that if a measurement showed it, the answer would be a
+global allocator in `kimmyd`. Nobody had measured it. This is the measurement,
+taken over a socket with the HTTP benchmark against three servers built from
+one commit inside one Linux arm64 container pinned to four cores and 4 GiB:
+the glibc binary the container used to ship, the musl binary it ships now, and
+the musl binary with mimalloc. One load generator, itself a glibc build, drove
+all three, so the client's allocator never moved. Plaintext, the better of two
+interleaved runs, requests per second with the p99 in milliseconds:
+
+| Scenario | Clients | glibc | musl | musl + mimalloc |
+|---|---:|---:|---:|---:|
+| point read by `_id` | 1 | 10,718 · 0.15 | 9,714 · 0.18 | 10,779 · 0.16 |
+| point read by `_id` | 8 | 45,116 · 0.28 | **18,345 · 0.78** | 48,217 · 0.28 |
+| point read by `_id` | 64 | 51,956 · 45 | **19,682 · 6.2** | 54,686 · 39 |
+| `find`, page of 100 | 1 | 1,576 · 0.77 | 1,111 · 1.19 | 2,012 · 0.70 |
+| `find`, page of 100 | 8 | 6,381 · 6.1 | **477 · 31** | 8,289 · 2.1 |
+| `find`, page of 100 | 64 | 6,257 · 23 | **537 · 239** | 8,304 · 21 |
+| `count`, whole collection | 8 | 171 · 70 | **19 · 547** | 201 · 59 |
+| `count`, whole collection | 64 | 174 · 728 | **20 · 5,223** | 211 · 540 |
+| bulk insert of 100 | 64 | 992 · 325 | **462 · 344** | 1,058 · 208 |
+| peak resident set, MB | | 273–300 | 125–147 | 546–576 |
+
+At one client the musl binary is within 10–30% of the glibc one. At eight it
+serves point reads at 0.4× the rate, a page of 100 documents at 0.07× and a
+`count` at 0.11×, and the ratio tracks how many allocations a request makes,
+not how many requests there are: a point read allocates a handful of times,
+decoding and re-encoding a page of a hundred documents allocates hundreds. musl's
+allocator serialises every allocation on one lock, so four tokio workers stand
+in one queue. The two runs of each configuration differed by 1–12% for glibc and
+mimalloc and by up to 23% for musl, against a gap of 2.5× to 13×. mimalloc recovers all of it
+and then passes glibc by 8–30% on reads, at one client too: the allocator is on
+the single-request path as well as the contended one. Writes barely move in
+any row, as they should — an insert is mostly fsync (the write gap, in
+Benchmarks) — except the bulk path, whose batch decode allocates.
+
+Every number on the benchmarks page before this one was taken from a glibc or
+macOS build, which is why none of them showed it. The shipped binary has been
+the slow one since 0.1.0 for anyone who downloaded a tarball and since 0.17.0
+for the container, and the page said 70,000 point reads a second the whole
+time.
+
+**What this does to ADR-016's rule.** The correction on ADR-016 says: the
+build pays for `ring`, so do not add a second native stack. This is a second
+native library in the default build, and it is accepted with that sentence in
+view rather than around it. It is different in kind from what the rule was
+written against. The rule's case is `aws-lc-rs`: a second implementation of
+primitives the tree already had, bringing CMake and a second build system for
+nothing the first stack did not provide. mimalloc is one vendored C library of
+a dozen files with no system dependency, no CMake, no `bindgen`, compiled by
+the `cc` crate the build already needs for `ring`, so no build or
+cross-compile needs a tool it did not need yesterday — the musl arm64 build
+in the container above used the toolchain `musl-tools` installs and nothing
+else. And it is not a second of anything: the tree had no allocator and took
+the platform's, and the platform's turned out to be the regression. The line it
+adds to the allowlist is the kind the allowlist's header says is right:
+deliberate, with a reason, in a diff. What the rule reads as from here is
+narrower and clearer for it — no second crypto stack, and no native dependency
+without a measurement that justifies it.
+
+**Alternatives.** *Leave the allocator alone.* The shipped binary would stay
+2.5–13× slower under any concurrency above one than the binary that shipped
+before ADR-107, on every channel; rejected because the one measurement ADR-107
+asked for is in and it is not close. *Ship a glibc build in the container.*
+ADR-107's reason for not doing that stands — two builds of one commit, one of
+them unverifiable against the published hash — and the tarballs would still be
+musl and still slow; a global allocator is one change that reaches every
+channel alike, which is what ADR-107 said the answer would be. *jemalloc, via
+`tikv-jemallocator`.* Not measured: it builds through autotools and a
+configure script rather than `cc` alone, it is a larger library, and mimalloc
+answered the question. The rule of thumb applied was one native addition, the
+smallest that closes the gap. *mimalloc's `v2` tree, offered as a crate
+feature.* Measured once: 3–15% above `v3` on throughput, inside the spread of
+the `v3` runs on most cells, with an equal or larger resident set (546–649 MB).
+One run inside the noise does not justify leaving the tree the crate's authors
+ship by default, so `v3` stays; the feature is there if a later measurement
+says otherwise.
+
+**Cost.** A second native build dependency, recorded above. Resident memory:
+under the benchmark's write burst — sixty-four clients each sending
+hundred-document batches — the node's high-water mark was 546–576 MB with
+mimalloc against 273–300 MB with glibc and 125–147 MB with musl. That is
+retained heap rather than live data, since musl's own figure bounds what was in
+use, and it is not the purge timer: `MIMALLOC_PURGE_DELAY=0` gave 608 MB. Where
+it goes was not chased further — mimalloc keeps a heap per thread and hands
+memory back in whole segments, and the burst has sixty-four requests in flight
+across every worker — but `docs/operations.md`'s resident-memory row now
+carries the figure, because a container sized tightly to the old peak wants
+headroom. The SBOM gains two crates, both MIT, a license already on
+`deny.toml`'s allowlist. And a benchmark page that quoted glibc numbers for a
+musl binary from 0.1.0 to 0.19.0 is a cost already paid; the section this ADR
+adds records the conditions under which every future number is taken.
+
+---
