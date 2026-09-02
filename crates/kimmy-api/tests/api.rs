@@ -5203,6 +5203,72 @@ async fn computed_expressions_derive_fields_over_http() {
 }
 
 #[tokio::test]
+async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
+    // The same pipeline MongoDB runs: a path that crosses an array is the
+    // array of what it found, in `$addFields`, in `$expr` and as a `$group`
+    // key — and `$unwind`, which names a field rather than reading one, is
+    // unchanged by it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for (id, items) in [
+        (1, json!([{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}])),
+        (2, json!([{"sku": "a", "qty": 5}, {"sku": "b", "qty": 1}])),
+        (3, json!([{"sku": "c", "qty": 1}, {"qty": 9}, 7])),
+    ] {
+        let res = server
+            .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": id, "items": items}))
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$match": {"$expr": {"$in": ["b", "$items.sku"]}}},
+                {"$addFields": {"skus": "$items.sku", "n": {"$size": "$$ROOT.items.qty"}}},
+                {"$sort": {"_id": 1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["skus"], json!(["a", "b"]));
+    assert_eq!(docs[0]["n"], 2);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$group": {"_id": "$items.sku", "orders": {"$sum": 1}}},
+                {"$sort": {"orders": -1}}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let docs = res.body["documents"].as_array().expect("documents");
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0]["_id"], json!(["a", "b"]));
+    assert_eq!(docs[0]["orders"], 2);
+    // The element without a `sku` and the scalar element contribute nothing.
+    assert_eq!(docs[1]["_id"], json!(["c"]));
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$unwind": "$items"}, {"$count": "n"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0]["n"], 7);
+}
+
+#[tokio::test]
 async fn a_computed_date_survives_the_extended_json_boundary() {
     // Dates are the type JSON cannot express, so a date expression is where a
     // working evaluator and a working edge are hardest to tell apart.

@@ -175,17 +175,6 @@ MongoDB produces `Int32`, as every integer result of the expression layer does
 ignores it; that is stricter, and only turns a silently wrong pipeline into an
 error.
 
-**Made visible, not introduced: a dotted path through an array yields one
-value.** `Expr::Field` takes the first value `path::resolve` finds, so
-`"$items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` is `"a"` where MongoDB
-gives `["a", "b"]`. That has been true since the expression layer existed and
-mattered little while nothing could consume an array; with `$map` and `$size`
-it is the first thing a ported pipeline trips on. Left as is in this change —
-fixing it means a resolver that reports *whether* it crossed an array, which
-`path::resolve` cannot, and it changes what `$group: {_id: "$items.sku"}`
-buckets by — and documented in `aggregation.md` with the `$map` form that
-does what the path was meant to.
-
 **`$lookup` refuses the combined form.** MongoDB 5.0 accepts
 `localField`/`foreignField` *and* `pipeline` in one stage — the "concise
 correlated subquery". Here it is a 400 that points at the equivalent: join on

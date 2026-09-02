@@ -1655,6 +1655,9 @@ fn lookup(
         std::collections::HashMap::new();
     let mut held = 0usize;
     state.engine.for_each_doc(&foreign, |_id, doc| {
+        // `foreignField` and `localField` are field paths, not expressions:
+        // they name the key on each side, read the same way here and in
+        // `aggregate::lookup_keys`, and neither fans out across an array.
         let Some(value) = kimmy_core::path::resolve(&doc, foreign_field).into_iter().next() else {
             return Ok(true);
         };
