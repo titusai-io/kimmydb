@@ -98,7 +98,7 @@ fn deliver_one(runtime: &tokio::runtime::Runtime) -> Received {
         let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
         // 127.0.0.1 is refused by default — that is the SSRF guard doing its
         // job. Allowlisting it is the escape hatch a real operator would use.
-        let policy = EgressPolicy::new(vec!["127.0.0.1".into()]);
+        let policy = EgressPolicy::new(kimmy_api::egress::WEBHOOKS, vec!["127.0.0.1".into()]);
         let state = kimmy_api::state_with_egress(
             engine,
             tokens,

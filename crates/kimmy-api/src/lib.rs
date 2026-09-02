@@ -11,7 +11,16 @@
 
 pub mod audit;
 pub mod dispatch;
-pub mod egress;
+/// The address policy for outbound requests, shared with the embedding
+/// providers in `kimmy-vector` (ADR-115). Re-exported under the name the
+/// webhook code has always used, with the one thing that is this crate's to
+/// say: how a webhook refusal reads.
+pub mod egress {
+    pub use kimmy_egress::*;
+
+    /// The wording of a refused webhook destination.
+    pub const WEBHOOKS: Purpose = Purpose::new("webhooks", "webhooks.allowed_hosts");
+}
 pub mod error;
 pub mod exec;
 pub mod expiry;
@@ -65,7 +74,13 @@ pub fn state(
     insecure_no_auth: bool,
     limits: RateLimits,
 ) -> Result<SharedState, kimmy_auth::AuthError> {
-    state_with_egress(engine, tokens, insecure_no_auth, limits, egress::EgressPolicy::default())
+    state_with_egress(
+        engine,
+        tokens,
+        insecure_no_auth,
+        limits,
+        egress::EgressPolicy::public_only(egress::WEBHOOKS),
+    )
 }
 
 /// As [`state`], with an egress policy for webhooks.

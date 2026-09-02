@@ -1845,7 +1845,7 @@ mod tests {
             tokens,
             false,
             crate::RateLimits::disabled(),
-            crate::egress::EgressPolicy::default(),
+            crate::egress::EgressPolicy::public_only(crate::egress::WEBHOOKS),
         )
         .unwrap()
     }

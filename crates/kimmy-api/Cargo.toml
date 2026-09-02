@@ -15,6 +15,7 @@ kimmy-query.workspace = true
 kimmy-auth.workspace = true
 kimmy-vector.workspace = true
 kimmy-cluster.workspace = true
+kimmy-egress.workspace = true
 axum.workspace = true
 base64.workspace = true
 tower.workspace = true

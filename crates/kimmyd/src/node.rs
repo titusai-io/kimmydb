@@ -162,7 +162,10 @@ pub async fn run(config: Config) -> Result<()> {
     // the operator did not ask to publish (ADR-068).
     kimmy_api::telemetry::set_include_names(config.telemetry.include_names);
 
-    let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
+    let egress = kimmy_api::egress::EgressPolicy::new(
+        kimmy_api::egress::WEBHOOKS,
+        config.webhooks.allowed_hosts.clone(),
+    );
     let state = kimmy_api::state_with_egress(
         Arc::clone(&engine),
         tokens,
@@ -305,7 +308,10 @@ pub async fn run(config: Config) -> Result<()> {
     // survivor without anything being elected. See ADR-045.
     let webhook_handle = {
         let state = Arc::clone(&state);
-        let egress = kimmy_api::egress::EgressPolicy::new(config.webhooks.allowed_hosts.clone());
+        let egress = kimmy_api::egress::EgressPolicy::new(
+            kimmy_api::egress::WEBHOOKS,
+            config.webhooks.allowed_hosts.clone(),
+        );
         let members = cluster.members.clone();
         let limits = kimmy_api::dispatch::Limits {
             max_concurrent_deliveries: config.webhooks.max_concurrent_deliveries,
