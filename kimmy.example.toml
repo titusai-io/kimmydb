@@ -708,3 +708,53 @@ max_wait_ms = 100
 # bound, which is the behaviour before it existed (ADR-103).
 [vector.index_cache]
 max_bytes = 536870912
+
+# What an embedding provider may be handed, and where it may be sent (ADR-115).
+#
+# A collection's vector configuration names an endpoint and the environment
+# variable holding the key for it, and the provider sends that variable's value
+# to that endpoint with every batch of text. Both are chosen by whoever holds
+# `ddl` on the collection, so this section is what keeps that from being a way
+# to read the node's own secrets or to probe its network.
+[vector.provider]
+# Variables a provider may be handed: exact names, or a prefix with one
+# trailing `*`. A collection's `api_key_env` outside this list is refused by
+# name. The default admits the three documented key variables and the
+# KIMMY_PROVIDER_* namespace, so a key set as KIMMY_PROVIDER_<anything> needs
+# no line here.
+#
+# Every other KIMMY_* variable -- the signing secret, the cluster secret, the
+# root password -- is refused whatever this says, and naming one here (or a
+# pattern that reaches one, such as "KIMMY_*") stops the node at startup.
+allowed_key_env = ["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]
+
+# Hosts a provider may be sent to beyond the public internet, with the same
+# meaning as webhooks.allowed_hosts: empty is public addresses only, and
+# loopback, link-local and private ranges are refused unless the host is named
+# here. The host is resolved and every address checked, when the collection is
+# configured and again inside the client at connect time. An Ollama or
+# llama.cpp on this host or on the LAN needs its host listed.
+allowed_hosts = []
+
+# Refuse every provider kind but `profile`, `byo` and `local` when a collection
+# is configured, so the endpoints this node sends text to are exactly the
+# profiles defined below and no others.
+endpoints_locked = false
+
+# Providers defined here rather than in a collection. Each table takes the
+# fields a collection's `provider` object would -- `kind`, `model`, `endpoint`,
+# `api_key_env`, `dimensions` -- and a collection uses it as
+# {"kind": "profile", "name": "<name>"}: the endpoint, model and key variable
+# stay in this file. A profile is held to the two rules above at startup and by
+# `kimmyd check-config`.
+#
+# [vector.providers.corp]
+# kind = "open_ai"
+# model = "text-embedding-3-small"
+# endpoint = "https://embeddings.example.com"
+# api_key_env = "KIMMY_PROVIDER_CORP"
+#
+# [vector.providers.lan]
+# kind = "ollama"
+# model = "nomic-embed-text"
+# endpoint = "http://embed-host:11434"   # needs its host in allowed_hosts
