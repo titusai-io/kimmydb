@@ -1228,9 +1228,11 @@ PROPTEST_CASES=10000 cargo test -p kimmy-core   # deeper property search
 
 CI runs fmt, clippy, and tests, with the cluster harness and the vector
 reachability check in their own jobs. A `build` job compiles `kimmyd` and the
-Rust conformance driver once, in release, and uploads them as a one-day
-artifact; the Python client, Go client, conformance, and Docker jobs download
-that binary rather than each compiling their own. The Docker job passes
+Rust conformance driver once — as the release does, the static musl binary
+under dist's profile and flags, so the dependency cache it saves from `main`
+is the one a tag's release build restores (ADR-118) — and uploads them as a
+one-day artifact; the Python client, Go client, conformance, and Docker jobs
+download that binary rather than each compiling their own. The Docker job passes
 `KIMMYD_SOURCE=prebuilt` so the Dockerfile copies the binary in instead of
 building it, then smoke-tests the image with `check-config`.
 
