@@ -127,6 +127,15 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Install Rust"
+        uses: "dtolnay/rust-toolchain@stable"
+        with:
+          "targets": "${{ join(matrix.targets, ',') }}"
+      - name: "Restore the dependency cache CI wrote from main"
+        uses: "Swatinem/rust-cache@v2"
+        with:
+          "save-if": false
+          "shared-key": "release-${{ join(matrix.targets, '-') }}"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest

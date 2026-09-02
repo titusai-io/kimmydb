@@ -6272,3 +6272,142 @@ clones the values it collects, as the previous one did for the single value
 it returned; nothing on the hot filter path changed.
 
 ---
+
+## ADR-118 — The Linux release builds start from the cache `main` writes
+
+**Decision.** The two Linux entries of dist's `build-local-artifacts` restore,
+just before `dist build`, the rust-cache that CI saves from `main` for the same
+target — and never save one of their own. Three pieces make that true. The
+`build kimmyd` job in `ci.yml`, which every downstream job already took its
+binary from, now compiles `x86_64-unknown-linux-musl` the way dist does — the
+`dist` profile, `--workspace`, dist's musl RUSTFLAGS, dist's runner, the
+current stable — and saves under `shared-key:
+release-x86_64-unknown-linux-musl`. A new `build kimmyd (arm64)` job on
+`ubuntu-24.04-arm` does the same for `aarch64-unknown-linux-musl`, produces no
+artifact, and builds only when the cache has no entry under its exact key. And
+`github-build-setup` in `dist-workspace.toml` points dist at
+`.github/release-build-setup.yml`, two steps it inlines into the generated
+job: the same toolchain action CI uses, then a `Swatinem/rust-cache@v2` with
+`shared-key: release-${{ join(matrix.targets, '-') }}` and `save-if: false`.
+`release.yml` stays generated; dist's `cache-builds` stays off; targets,
+installers, publish jobs, the prebuilt-image flow and the SBOMs are untouched.
+This amends ADR-107, which evaluated `cache-builds` and left it off because no
+job on `main` built the release targets — a job does now, for the two Linux
+ones — and ADR-114, which recorded what a release costs on Actions.
+
+**Why.** Measured on the v0.17.0 release: `build-local-artifacts` took 9 m 24 s
+for `x86_64-unknown-linux-musl`, about 6.5 minutes for the arm64 target and
+about 5.5 for macOS, in a release of about eleven minutes in which everything
+else finished inside two. Every tag started from a cold cargo cache, and
+ADR-107 said why: a GitHub Actions cache is readable only from the ref that
+wrote it or from the default branch, and nothing on `main` compiled a musl
+target, so there was nothing a tag could read and no point writing what no
+later tag could read either. That analysis stands. What it left open was the
+other side of it — make `main` build what the tag builds — and the x86_64 half
+of that was almost free, because a job on `main` already compiled `kimmyd` in
+release for the Python, Go, conformance and docker jobs; it only compiled the
+wrong target. Pointing that job at the release target costs nothing it was not
+already paying, and its output is a better hand-off than before: the binary
+those jobs test and put in the image is now the static musl file a release
+ships, so the docker smoke test runs against the released kind of binary.
+
+**What has to stay aligned.** rust-cache's key is
+`v0-rust-<shared-key>-<os>-<arch>-<envhash>-<lockhash>`, and cargo has its own
+fingerprints beneath it, so a warm start needs both to match. Each input, and
+where it is held equal:
+
+- *`shared-key`.* Set by hand in `ci.yml` and derived from `matrix.targets` in
+  the setup file, so the release side cannot spell a target differently from
+  the target list.
+- *OS and architecture.* `Linux-x64` from `ubuntu-24.04` on both sides — the CI
+  job names dist's runner rather than `ubuntu-latest` so the two cannot drift
+  when the alias moves — and `Linux-arm64` from `ubuntu-24.04-arm` on both.
+- *The environment hash.* It covers the rustc release, host and commit hash,
+  and every `CARGO*`, `CC*`, `CFLAGS*`, `CXX*`, `CMAKE*` and `RUST*` variable
+  the rust-cache step can see. Both sides install Rust with the same
+  `dtolnay/rust-toolchain@stable` step, which gives the same stable at the
+  same moment (a bare dist job would use whatever rustc the runner image
+  shipped, which lags) and exports the same `CARGO_HOME`, `CARGO_INCREMENTAL=0`
+  and `CARGO_TERM_COLOR=always`. `ci.yml`'s `RUSTFLAGS: -D warnings` and
+  `CARGO_PROFILE_TEST_DEBUG: 0` moved from the workflow level to the four
+  gate jobs, because the release job has neither; and the musl RUSTFLAGS are
+  set on the cargo step alone, which is where dist sets them — on cargo's
+  process, not the job — so neither rust-cache step sees a `RUSTFLAGS` at all.
+- *The lockfile hash.* Over `Cargo.toml`, `Cargo.lock` and the toolchain and
+  cargo config files. A tag is pushed at the commit `main` last built (the
+  release pull request merges, `main` builds, the tag follows), so the two are
+  equal. When they are not, rust-cache falls back to the newest entry of the
+  family — the previous lockfile's set — and cargo reuses every dependency the
+  change did not touch.
+- *Cargo's fingerprints.* Same profile (`--profile dist`; `[profile.dist]` in
+  `Cargo.toml` is what makes dist use it), same target directory
+  (`target/<triple>/dist` under the checkout — rust-cache recognises the
+  per-triple directory as a nested target and keeps its `deps`), same package
+  selection (`--workspace`, dist's default, so every dependency is compiled
+  once with the workspace's unioned features), same RUSTFLAGS — for a musl
+  target dist 0.32.0 appends `-Ctarget-feature=+crt-static
+  -Clink-self-contained=yes` to whatever the environment holds, which here is
+  nothing — and the same `CARGO_INCREMENTAL`.
+
+With those equal the tag's key is `main`'s key. When something is not equal
+the cost is what every tag paid before, a cold build, and never a failure:
+rust-cache restores nothing or restores a set cargo mostly rebuilds, and the
+release proceeds. The case that will happen: a stable Rust released between
+`main`'s last build and the tag changes the environment hash, and the fallback
+cannot bridge that, so that one release builds cold; the next push to `main`
+writes the new key — the arm64 job builds because its lookup misses — and the
+tag after it is warm again. The macOS build has no cache at all, since no job
+on `main` builds that target, and runs cold as it always has; with the Linux
+builds warm it becomes the phase's long pole, at about five and a half minutes.
+
+**The budget.** Measured locally on a `dist`-profile build of this workspace:
+`deps` is 725 MiB on disk, of which about 100 MiB is the workspace's own
+crates, which rust-cache drops before saving; the remainder with `.fingerprint`
+and `build` compresses to about 207 MiB under zstd, which is what the cache
+uses, and the registry index and `.crate` files add at most another 100 MiB.
+Call it 300 MiB per family, nearer 350 for x86_64 where the conformance
+driver's dev-dependencies add a few feature variants — against the roughly
+1 GiB each of the existing debug-profile families. Two families, so 0.6 to
+0.7 GiB of a 10 GiB limit. One of them replaces rather than adds: the `build`
+job's old native family is written by nothing now and ages out under the
+seven-day rule, or can be deleted by hand. The keys,
+`v0-rust-release-<target>-Linux-<arch>-<envhash>-<lockhash>`, end in the lock
+hash like every other rust-cache key, so `cache-cleanup.yml`'s family rule —
+strip the trailing segment — groups them as it groups the rest and keeps one
+entry per family. A new rustc opens a new family under a new environment hash;
+the old one is read by nothing and ages out.
+
+**Alternatives.** `cache-builds = true` in dist: it is a rust-cache in the same
+place, keyed on the generated job's name, so it would look for
+`v0-rust-build-local-artifacts-…`, find nothing, and save a set per tag that no
+later tag could read, exactly as ADR-107 said. sccache with the GitHub cache
+backend: it lives under the same visibility rule, so it too can only be fed
+from `main`, and it adds a compiler wrapper and a second cache format for the
+same effect the artifact cache gives directly. Building the release targets on
+every pull request, so a tag could read a fresher cache: every PR pays two
+musl builds so that a tag, which comes after a merge to `main` anyway, saves
+nothing more than it already does — the caches are readable from `main`, and
+`main` is where they are written. Gating the arm64 job on a diff of
+`Cargo.lock` between the push's `before` and `after`: it says nothing about a
+toolchain change or an evicted entry, both of which leave the tag cold until
+the next dependency change, whereas the exact-key lookup is the condition
+rust-cache itself uses to decide whether saving would write anything. Keeping
+`-D warnings` and giving it to the release build too, to avoid moving the
+variable: it changes no byte of the binary and gives a release one more way to
+fail — a warning a newer stable introduces — which is the wrong trade.
+
+**Cost.** The `build kimmyd` job installs `musl-tools` and a target before it
+starts, a few seconds, and what it compiles is what it compiled before under
+another name (`[profile.dist]` inherits `release` unchanged). The arm64 job is
+new: a checkout and a restore per push to `main`, about a minute when the key
+exists; a full build, six to seven minutes, when it does not — and the release
+pull request's version bump changes `Cargo.lock`, so that is at least once per
+release, which is the point. Four jobs now carry two environment lines that
+the workflow carried once. The setup file is a second place where release
+steps are written; dist copies it into `release.yml`, so the `plan` job's drift
+check covers it, and the comment at the top of the file says so. And the
+alignment above is silent when it breaks — a cold release, no red job — so the
+place to look after a tag is the `build-local-artifacts` log for the Linux
+targets, where rust-cache prints the key it restored, and the phase's time.
+
+---
