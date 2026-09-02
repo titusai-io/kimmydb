@@ -83,6 +83,10 @@ fails fast on a bad volume mount.
 | `vector.batch.max_chunks` | — | `32` | The most chunks one embedding provider call carries ([ADR-095](decisions.md)). Below every hosted provider's per-request input cap |
 | `vector.batch.max_tokens` | — | `32768` | The most *estimated* tokens one call carries, by the estimate a collection's `chunk.max_tokens` uses (one token per two bytes). 32 default-sized chunks, about 64 KiB of text. A single document over this goes alone |
 | `vector.batch.max_wait_ms` | — | `100` | How long a partial batch waits for more documents once the stream is idle. A backlog fills batches without waiting; a quiet collection's document is delayed by at most this. `0` sends whatever has queued; refused above `10000` |
+| `vector.provider.allowed_key_env` | — | `["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]` | Environment variables an embedding provider may be handed as its key: exact names or prefixes with one trailing `*`. Every `KIMMY_*` other than `KIMMY_PROVIDER_*` is refused regardless, and listing one is a startup error ([ADR-115](decisions.md)) |
+| `vector.provider.allowed_hosts` | — | `[]` | Hosts a provider may be sent to beyond the public internet, with `webhooks.allowed_hosts` semantics. An Ollama or llama.cpp on `localhost` or the LAN needs its host here |
+| `vector.provider.endpoints_locked` | — | `false` | Refuse every provider kind but `profile`, `byo` and `local` when a collection is configured |
+| `vector.providers.<name>` | — | none | A server-defined provider — the fields a collection's `provider` takes, as TOML keys — that a collection uses as `{"kind":"profile","name":"<name>"}`. Held to the two rules above at startup and by `check-config` |
 | `audit.mode` | — | `denials` | `off`, `denials`, `writes` or `all`. Records go to the `kimmy::audit` target |
 | `log.level` | `KIMMY_LOG_LEVEL` | `info` | `RUST_LOG` overrides |
 | `log.format` | `KIMMY_LOG_FORMAT` | `pretty` | `pretty` or `json` |
@@ -124,6 +128,8 @@ runtime confusion:
 | A placeholder secret on a non-loopback bind | `root_password`, `jwt_secret`, `jwt_previous_secret` or `cluster_secret` equal to a value this repository's own examples use — `changeme`, `change-me`, `hunter2`, the compose file's former defaults, `password`, `secret`, and the rest of `PLACEHOLDER_SECRETS` in `kimmyd`'s `config.rs`. A value every reader of the repository holds is not a secret. Loopback binds accept them, so the examples stay runnable; the error names the setting, not the value (ADR-093) |
 | `cluster.enabled` with no seeds | A node with no discovery source can never find peers |
 | `cluster.enabled` with no `cluster_secret` | Peers would accept replication from anyone |
+| `vector.provider.allowed_key_env` naming a `KIMMY_*` variable other than `KIMMY_PROVIDER_*`, or a malformed pattern | The node's own secrets are never handed to an embedding provider, and an entry that would reach one is refused rather than silently ignored; a `*` anywhere but trailing is a typo, not a wildcard ([ADR-115](decisions.md)) |
+| A `[vector.providers.<name>]` the provider policy refuses | A profile naming a denied or unlisted variable, or a host that is private and not in `vector.provider.allowed_hosts`, is held to the same rule a collection's own provider is, where the operator can see it |
 | `oplog_retention_secs = 0` | Change streams could never resume |
 | `tombstone_retention_secs = 0` | A peer that never saw a delete could resurrect the document immediately |
 | `tombstone_retention_secs` < `oplog_retention_secs` | The oplog would still offer a delete to peers after its tombstone was collected; a peer replaying it has nothing to lose against and its older image wins. Tombstones must outlive the oplog window (ADR-085) |

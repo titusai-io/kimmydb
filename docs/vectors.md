@@ -70,6 +70,14 @@ POST /v1/db/{db}/coll/{coll}/vector
 }
 ```
 
+> An endpoint on `localhost` or a LAN address is refused unless the node lists
+> the host in `vector.provider.allowed_hosts` — see
+> [The provider policy](#the-provider-policy). The example above needs
+> `allowed_hosts = ["localhost"]`.
+
+```json
+```
+
 | Field | Meaning |
 |---|---|
 | `fields` | Which document paths to embed. Joined with a blank line, so a chunk boundary between two fields cannot glue unrelated sentences together |
@@ -95,6 +103,7 @@ POST /v1/db/{db}/coll/{coll}/vector
 | `gemini` | an API key | Google `:batchEmbedContents`. Key goes in the `x-goog-api-key` header ([ADR-047](decisions.md)) |
 | `custom_http` | an endpoint | Accepts `{"input": [...]}`, returns `{"embeddings": [[...]]}`. The escape hatch for anything the named dialects miss |
 | `local` | `--features local-embeddings` | In-process ONNX. **Not in the default build** — see below |
+| `profile` | a `[vector.providers.<name>]` in the node's configuration | `{"kind":"profile","name":"corp"}`. The endpoint, model and key variable are the operator's; the collection carries the name and nothing else. The only remote kind accepted when the node sets `endpoints_locked` — see [The provider policy](#the-provider-policy) |
 
 For `open_ai`, `endpoint` is a base URL and `/v1/embeddings` is appended —
 unless the setting already names the embeddings route, in which case it is
@@ -122,7 +131,33 @@ which is where a shape drift shows up.
 
 API keys are read from the environment by *variable name*. The name is stored in
 collection metadata; the key itself never is, so a metadata dump cannot leak a
-credential.
+credential. Which names a provider may be given, and where it may be sent, is
+the node's policy rather than the collection's — next.
+
+### The provider policy
+
+The provider sends the named variable's value to the named endpoint, and both
+are chosen by whoever holds `ddl` on the collection. So the node decides what
+it will accept ([ADR-115](decisions.md); the reasoning is in
+[Security](security.md#embedding-providers)):
+
+| Setting | Default | What it does |
+|---|---|---|
+| `vector.provider.allowed_key_env` | `["OPENAI_API_KEY", "COHERE_API_KEY", "GEMINI_API_KEY", "KIMMY_PROVIDER_*"]` | The variables a provider may be handed: exact names, or a prefix with one trailing `*`. An `api_key_env` outside the list is refused `400` by name. **Every `KIMMY_*` variable other than `KIMMY_PROVIDER_*` is refused whatever this says**, and listing one here stops the node at startup |
+| `vector.provider.allowed_hosts` | `[]` | Hosts a provider may be sent to beyond the public internet, exactly as `webhooks.allowed_hosts`: loopback, link-local and private ranges are refused unless the host is named here, every resolved address is checked, and the client checks again at connect time. **An Ollama or llama.cpp on `localhost` or a LAN address needs its host listed** |
+| `vector.provider.endpoints_locked` | `false` | Accept only `profile`, `byo` and `local` when a collection is configured. The places this node sends text are then the profiles below and no others |
+| `[vector.providers.<name>]` | none | A provider defined server-side, with the same fields a collection's `provider` object takes (`kind`, `model`, `endpoint`, `api_key_env`, `dimensions`) as TOML keys. Held to the two rules above at startup and by `kimmyd check-config`. A collection uses it as `{"kind":"profile","name":"<name>"}` |
+
+Keys for a provider are simplest under the `KIMMY_PROVIDER_` prefix — `KIMMY_PROVIDER_VOYAGE`, say — which the default allows without a line of configuration. A dialect's default endpoint (`api.openai.com`, `api.cohere.com`, `generativelanguage.googleapis.com`) is public and passes.
+
+The policy is asked twice: when the configuration is accepted, and again when
+the provider is built — by the worker for documents and by a search that
+embeds a `query` — because a configuration also arrives by replication from
+another member. A stored configuration this node refuses is a permanent
+failure for that collection until it is reconfigured, logged once with the
+variable's name or the host; a search that needs it answers `500 misconfigured`.
+Every configure and disable writes an audit record with the provider kind, the
+endpoint host or profile name, and the key variable's name.
 
 `local` is rejected at configuration time in a default build rather than
 failing later on the first write — a misconfiguration should surface when you

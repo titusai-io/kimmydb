@@ -1,0 +1,16 @@
+[package]
+name = "kimmy-egress"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Where the KimmyDB node may issue an outbound HTTP request: the address policy shared by webhooks and embedding providers"
+
+[dependencies]
+reqwest.workspace = true
+tokio = { workspace = true, features = ["net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

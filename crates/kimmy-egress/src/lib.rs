@@ -1,20 +1,27 @@
-//! Which URLs a webhook may be pointed at.
+//! Which addresses the node may issue an outbound HTTP request to.
 //!
 //! # The hazard
 //!
-//! A webhook makes the *node* issue an outbound HTTP request to an address a
-//! user supplied. Without a policy that is a server-side request forgery
-//! primitive: a principal who can register one can make the database probe
-//! anything the node can reach — other services on the private network, an
-//! admin port bound to loopback, and above all the cloud metadata endpoint at
-//! `169.254.169.254`, which on most providers hands out credentials to whoever
-//! asks from the instance.
+//! Two features make the *node* issue an outbound HTTP request to an address
+//! a user supplied: a webhook, and an embedding provider named in a
+//! collection's vector configuration. Without a policy either is a
+//! server-side request forgery primitive: a principal who can register one can
+//! make the database probe anything the node can reach — other services on the
+//! private network, an admin port bound to loopback, and above all the cloud
+//! metadata endpoint at `169.254.169.254`, which on most providers hands out
+//! credentials to whoever asks from the instance.
+//!
+//! One policy for both, in one crate, because two copies of an address
+//! denylist are two places for the next reserved range to be missing from.
+//! The webhook and provider subsystems differ only in the wording of a
+//! refusal — which noun, and which setting an operator adds a host to — and
+//! that is what [`Purpose`] carries.
 //!
 //! # The policy
 //!
 //! Loopback, link-local, private and other non-public ranges are refused unless
 //! an operator has explicitly allowed the host. Public addresses work with no
-//! configuration, which is what keeps the feature usable out of the box.
+//! configuration, which is what keeps the features usable out of the box.
 //!
 //! # Checking the resolved address, not the name
 //!
@@ -22,26 +29,57 @@
 //! address when a webhook is registered and to `169.254.169.254` an hour later
 //! — the classic DNS rebinding shape. So the name is resolved and **every**
 //! address it resolves to is checked, at registration *and* again before each
-//! delivery. Checking once, at registration, would validate a promise the DNS
+//! request. Checking once, at registration, would validate a promise the DNS
 //! can withdraw.
 //!
 //! Redirects are refused for the same reason: a permitted host that answers
 //! `302 http://169.254.169.254/` would otherwise walk the request straight
-//! through the policy.
+//! through the policy. That part is the client's to enforce, and every client
+//! built over [`CheckedResolver`] sets `redirect::Policy::none()`.
 
 use std::net::IpAddr;
 
+/// What an egress policy guards, for the wording of a refusal.
+///
+/// The address rules are the same for every outbound request the node makes;
+/// what differs is how a refusal reads. A person who pointed a webhook at a
+/// private host needs to be told about `webhooks.allowed_hosts`, and a person
+/// who pointed an embedding provider there about the provider setting — the
+/// same message naming the wrong setting sends them to edit the wrong line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Purpose {
+    /// The requests being policed, plural, as they read mid-sentence:
+    /// `"webhooks"`, `"embedding providers"`.
+    pub noun: &'static str,
+    /// The setting an operator adds a host to.
+    pub setting: &'static str,
+}
+
+impl Purpose {
+    pub const fn new(noun: &'static str, setting: &'static str) -> Self {
+        Self { noun, setting }
+    }
+}
+
 /// What an operator has permitted beyond the public internet.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct EgressPolicy {
+    purpose: Purpose,
     /// Hosts exempt from the address checks, matched case-insensitively on the
     /// URL's host. Empty means "public addresses only".
     allowed_hosts: Vec<String>,
 }
 
-/// Why a URL was refused.
+/// Why a URL was refused, and for which purpose.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum EgressError {
+pub struct EgressError {
+    pub purpose: Purpose,
+    pub refusal: Refusal,
+}
+
+/// The rule a URL failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
     NotHttp(String),
     NoHost,
     Unresolvable(String),
@@ -50,20 +88,21 @@ pub enum EgressError {
 
 impl std::fmt::Display for EgressError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            EgressError::NotHttp(scheme) => {
-                write!(f, "webhook URLs must be http or https, got {scheme:?}")
+        let Purpose { noun, setting } = self.purpose;
+        match &self.refusal {
+            Refusal::NotHttp(scheme) => {
+                write!(f, "{noun} must use http or https URLs, got {scheme:?}")
             }
-            EgressError::NoHost => write!(f, "webhook URL has no host"),
-            EgressError::Unresolvable(host) => {
+            Refusal::NoHost => write!(f, "{noun} need a URL with a host"),
+            Refusal::Unresolvable(host) => {
                 write!(f, "cannot resolve {host:?}")
             }
-            EgressError::Blocked { host, addr } => write!(
+            Refusal::Blocked { host, addr } => write!(
                 f,
-                "{host:?} resolves to {addr}, which is not a public address. Webhooks may not \
-                 reach loopback, link-local or private ranges — that would let a webhook probe \
-                 this node's own network and its cloud metadata endpoint. Add the host to \
-                 webhooks.allowed_hosts if this is intended"
+                "{host:?} resolves to {addr}, which is not a public address, and {noun} may not \
+                 reach loopback, link-local or private ranges — that would let one probe this \
+                 node's own network and its cloud metadata endpoint. Add the host to {setting} \
+                 if this is intended"
             ),
         }
     }
@@ -71,9 +110,42 @@ impl std::fmt::Display for EgressError {
 
 impl std::error::Error for EgressError {}
 
+/// The host of an `http(s)` URL, with userinfo, port and path stripped.
+///
+/// `None` when the URL has no scheme separator or no host. Hand-rolled rather
+/// than a URL crate because the shape needed is small and the one thing that
+/// must not go wrong — reading the userinfo as the host — is easier to see in
+/// ten lines than to trust to a parser's defaults.
+pub fn host_of(url: &str) -> Option<&str> {
+    let (_, rest) = url.split_once("://")?;
+    // Authority ends at the first `/`, `?` or `#`.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // Strip userinfo and any port. An IPv6 literal is bracketed, so the
+    // port separator is the colon *after* the closing bracket.
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match authority.strip_prefix('[') {
+        Some(rest) => rest.split(']').next().unwrap_or(""),
+        None => authority.split(':').next().unwrap_or(""),
+    };
+    (!host.is_empty()).then_some(host)
+}
+
 impl EgressPolicy {
-    pub fn new(allowed_hosts: Vec<String>) -> Self {
-        Self { allowed_hosts: allowed_hosts.iter().map(|h| h.to_lowercase()).collect() }
+    pub fn new(purpose: Purpose, allowed_hosts: Vec<String>) -> Self {
+        Self { purpose, allowed_hosts: allowed_hosts.iter().map(|h| h.to_lowercase()).collect() }
+    }
+
+    /// Public addresses only, for the given purpose.
+    pub fn public_only(purpose: Purpose) -> Self {
+        Self::new(purpose, Vec::new())
+    }
+
+    pub fn purpose(&self) -> Purpose {
+        self.purpose
+    }
+
+    fn refuse(&self, refusal: Refusal) -> EgressError {
+        EgressError { purpose: self.purpose, refusal }
     }
 
     fn permits_host(&self, host: &str) -> bool {
@@ -88,24 +160,12 @@ impl EgressPolicy {
     /// before anything touches DNS — and so a test can exercise the address
     /// rules without a resolver.
     pub fn check_shape<'a>(&self, url: &'a str) -> Result<&'a str, EgressError> {
-        let (scheme, rest) = url.split_once("://").ok_or(EgressError::NoHost)?;
+        let (scheme, _) = url.split_once("://").ok_or_else(|| self.refuse(Refusal::NoHost))?;
         let scheme = scheme.to_lowercase();
         if scheme != "http" && scheme != "https" {
-            return Err(EgressError::NotHttp(scheme));
+            return Err(self.refuse(Refusal::NotHttp(scheme)));
         }
-        // Authority ends at the first `/`, `?` or `#`.
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-        // Strip userinfo and any port. An IPv6 literal is bracketed, so the
-        // port separator is the colon *after* the closing bracket.
-        let authority = authority.rsplit('@').next().unwrap_or(authority);
-        let host = match authority.strip_prefix('[') {
-            Some(rest) => rest.split(']').next().unwrap_or(""),
-            None => authority.split(':').next().unwrap_or(""),
-        };
-        if host.is_empty() {
-            return Err(EgressError::NoHost);
-        }
-        Ok(host)
+        host_of(url).ok_or_else(|| self.refuse(Refusal::NoHost))
     }
 
     /// Whether an address may be dialled.
@@ -116,7 +176,7 @@ impl EgressPolicy {
         if is_public(addr) {
             return Ok(());
         }
-        Err(EgressError::Blocked { host: host.to_string(), addr })
+        Err(self.refuse(Refusal::Blocked { host: host.to_string(), addr }))
     }
 
     /// Full check: shape, then every address the host resolves to.
@@ -137,11 +197,11 @@ impl EgressPolicy {
         use std::net::ToSocketAddrs;
         let resolved: Vec<IpAddr> = (host, 80u16)
             .to_socket_addrs()
-            .map_err(|_| EgressError::Unresolvable(host.to_string()))?
+            .map_err(|_| self.refuse(Refusal::Unresolvable(host.to_string())))?
             .map(|sa| sa.ip())
             .collect();
         if resolved.is_empty() {
-            return Err(EgressError::Unresolvable(host.to_string()));
+            return Err(self.refuse(Refusal::Unresolvable(host.to_string())));
         }
         self.permits_addrs(host, &resolved)
     }
@@ -155,7 +215,7 @@ impl EgressPolicy {
     /// not accepted on the strength of whichever happened to come first.
     pub fn permits_addrs(&self, host: &str, resolved: &[IpAddr]) -> Result<(), EgressError> {
         if resolved.is_empty() {
-            return Err(EgressError::Unresolvable(host.to_string()));
+            return Err(self.refuse(Refusal::Unresolvable(host.to_string())));
         }
         for addr in resolved {
             self.permits_addr(host, *addr)?;
@@ -164,7 +224,7 @@ impl EgressPolicy {
     }
 }
 
-/// A DNS resolver for the delivery client that checks what it resolves.
+/// A DNS resolver for an outbound client that checks what it resolves.
 ///
 /// [`EgressPolicy::check`] resolves a hostname and checks every address — but
 /// the connection is then made by the HTTP client, which resolves *again*, and
@@ -174,7 +234,7 @@ impl EgressPolicy {
 /// closes that window: the addresses checked are, by construction, the
 /// addresses dialled.
 ///
-/// The pre-delivery [`EgressPolicy::check`] stays. It is what refuses literal
+/// The up-front [`EgressPolicy::check`] stays. It is what refuses literal
 /// addresses — which never reach a resolver — and it fails fast without
 /// waiting for a connection attempt.
 pub struct CheckedResolver {
@@ -243,8 +303,14 @@ fn is_public(addr: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    const WEBHOOKS: Purpose = Purpose::new("webhooks", "webhooks.allowed_hosts");
+
     fn open() -> EgressPolicy {
-        EgressPolicy::default()
+        EgressPolicy::public_only(WEBHOOKS)
+    }
+
+    fn allowing(hosts: &[&str]) -> EgressPolicy {
+        EgressPolicy::new(WEBHOOKS, hosts.iter().map(|h| h.to_string()).collect())
     }
 
     #[test]
@@ -262,8 +328,31 @@ mod tests {
         // The single most valuable target: on most providers it hands out
         // credentials to anything that asks from the instance.
         let err = open().check("http://169.254.169.254/latest/meta-data/").unwrap_err();
-        assert!(matches!(err, EgressError::Blocked { .. }), "{err:?}");
+        assert!(matches!(err.refusal, Refusal::Blocked { .. }), "{err:?}");
         assert!(err.to_string().contains("metadata"), "the error should say why: {err}");
+    }
+
+    #[test]
+    fn a_refusal_names_the_callers_noun_and_setting() {
+        // The one thing that differs between the subsystems sharing this
+        // policy is which line an operator has to edit. A provider refusal
+        // that told them about the webhook setting would send them to the
+        // wrong one.
+        let providers = EgressPolicy::public_only(Purpose::new(
+            "embedding providers",
+            "vector.provider.allowed_hosts",
+        ));
+        let err = providers.check("http://10.0.0.5/v1/embeddings").unwrap_err().to_string();
+        assert!(err.contains("embedding providers may not reach"), "{err}");
+        assert!(err.contains("vector.provider.allowed_hosts"), "{err}");
+        assert!(!err.contains("webhook"), "{err}");
+
+        let err = open().check("http://10.0.0.5/hook").unwrap_err().to_string();
+        assert!(err.contains("webhooks may not reach"), "{err}");
+        assert!(err.contains("webhooks.allowed_hosts"), "{err}");
+
+        let err = providers.check("ftp://x/").unwrap_err().to_string();
+        assert!(err.starts_with("embedding providers must use http or https"), "{err}");
     }
 
     #[test]
@@ -307,7 +396,7 @@ mod tests {
             let err = policy
                 .permits_addrs("mixed.example", &pair)
                 .expect_err("a private address anywhere in the answer must refuse the host");
-            assert!(matches!(err, EgressError::Blocked { .. }), "{err:?}");
+            assert!(matches!(err.refusal, Refusal::Blocked { .. }), "{err:?}");
         }
     }
 
@@ -316,7 +405,7 @@ mod tests {
         // Not silently allowed: an empty answer means the destination is
         // unknown, and unknown is not the same as safe.
         let err = open().permits_addrs("void.example", &[]).unwrap_err();
-        assert!(matches!(err, EgressError::Unresolvable(_)), "{err:?}");
+        assert!(matches!(err.refusal, Refusal::Unresolvable(_)), "{err:?}");
     }
 
     #[test]
@@ -331,7 +420,7 @@ mod tests {
     fn an_operator_can_allow_a_specific_host() {
         // The escape hatch, for a webhook that genuinely targets something on
         // the private network.
-        let policy = EgressPolicy::new(vec!["internal.corp".into()]);
+        let policy = allowing(&["internal.corp"]);
         policy.check("http://internal.corp:9000/hook").expect("allowlisted host");
         // ...and only that host.
         assert!(policy.check("http://10.0.0.5/hook").is_err());
@@ -341,14 +430,15 @@ mod tests {
     fn the_allowlist_is_case_insensitive() {
         // Hostnames are, so a policy that was not would be bypassable by
         // typing a capital letter.
-        let policy = EgressPolicy::new(vec!["Internal.Corp".into()]);
+        let policy = allowing(&["Internal.Corp"]);
         policy.check("http://INTERNAL.corp/hook").expect("case must not matter");
     }
 
     #[test]
     fn only_http_and_https_are_accepted() {
         for url in ["file:///etc/passwd", "gopher://x/", "ftp://x/"] {
-            assert!(matches!(open().check(url), Err(EgressError::NotHttp(_))), "{url}");
+            let err = open().check(url).unwrap_err();
+            assert!(matches!(err.refusal, Refusal::NotHttp(_)), "{url}: {err:?}");
         }
     }
 
@@ -362,6 +452,10 @@ mod tests {
         // before `@` is credentials, and the destination is what follows.
         assert_eq!(p.check_shape("https://user:pass@169.254.169.254/").unwrap(), "169.254.169.254");
         assert!(p.check("https://user:pass@169.254.169.254/").is_err());
+        // The bare host reader agrees, and says nothing about the scheme.
+        assert_eq!(host_of("https://user:pass@169.254.169.254/"), Some("169.254.169.254"));
+        assert_eq!(host_of("notaurl"), None);
+        assert_eq!(host_of("https:///path"), None);
     }
 
     #[test]
@@ -379,7 +473,7 @@ mod tests {
         // the name that "resolves inward" — and the refusal must come from the
         // resolver inside the client, because nothing else here checks it.
         let client = reqwest::Client::builder()
-            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(EgressPolicy::default())))
+            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(open())))
             .build()
             .unwrap();
         let err = client.get("http://localhost:9/").send().await.unwrap_err();
@@ -396,9 +490,8 @@ mod tests {
         // then fail every delivery. Port 1 is expected to refuse the
         // connection — what matters is that the failure is a socket error, not
         // the policy.
-        let policy = EgressPolicy::new(vec!["localhost".into()]);
         let client = reqwest::Client::builder()
-            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(policy)))
+            .dns_resolver(std::sync::Arc::new(CheckedResolver::new(allowing(&["localhost"]))))
             .build()
             .unwrap();
         let err = client.get("http://localhost:1/").send().await.unwrap_err();

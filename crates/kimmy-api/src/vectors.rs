@@ -27,14 +27,35 @@ pub async fn configure_vectors(
     JsonBody(body): JsonBody<VectorConfig>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Ddl, &db, Some(&coll))?;
+    admit_provider(&state, &body.provider)?;
     let meta = state.engine.configure_vectors(&db, &coll, body)?;
     // A changed dimension or metric makes any cached graph meaningless.
     invalidate_index(&state, &db, &coll);
+    crate::audit::record_vectors(
+        auth.principal(),
+        "ConfigureVectors",
+        &db,
+        &coll,
+        meta.vector.as_ref().map(|v| &v.provider),
+    );
     Ok(Json(json!({
         "collection": meta.name,
         "vector": meta.vector,
         "shadow": kimmy_core::vector_meta::shadow_name(&meta.name),
     })))
+}
+
+/// This node's provider policy, asked before a configuration is stored.
+///
+/// Asked here, while the person who typed it is watching, and again when the
+/// provider is built — the second because a configuration also arrives by
+/// replication. A refusal is a `400` naming the variable or the host, never
+/// a value: the policy refuses the *name* before anything reads it (ADR-115).
+fn admit_provider(
+    state: &SharedState,
+    provider: &kimmy_core::ProviderConfig,
+) -> Result<(), ApiError> {
+    state.providers.check_configure(provider).map_err(|e| ApiError::bad_request(e.to_string()))
 }
 
 pub async fn get_vector_config(
@@ -67,6 +88,9 @@ pub async fn disable_vectors(
     let disabled = state.engine.disable_vectors(&db, &coll, q.drop_vectors)?;
     if let Some(id) = shadow {
         state.vectors.invalidate(id);
+    }
+    if disabled {
+        crate::audit::record_vectors(auth.principal(), "DisableVectors", &db, &coll, None);
     }
     Ok(Json(json!({ "disabled": disabled, "droppedVectors": q.drop_vectors })))
 }
@@ -369,7 +393,7 @@ pub async fn run_vector_search(
     body: &SearchRequest,
 ) -> Result<Value, ApiError> {
     let (source, shadow, config, options) = prepare(state, auth, db, coll, body)?;
-    let query = resolve_query_vector(&config, body).await?;
+    let query = resolve_query_vector(state, &config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
     let hits = knn(state, &shadow, &config, &query, &options, allowed.as_ref())?;
@@ -446,7 +470,7 @@ pub async fn run_hybrid_search(
 
     let (weights, min_overlap) = fusion_controls(body)?;
 
-    let query = resolve_query_vector(&config, body).await?;
+    let query = resolve_query_vector(state, &config, body).await?;
     let allowed = allowed_ids(state, auth, db, coll, body.filter.as_ref())?;
 
     // Each half is retrieved wider than k, so fusion has enough to work with:
@@ -545,6 +569,7 @@ fn only_live(
 
 /// Turn the request into a query vector.
 async fn resolve_query_vector(
+    state: &SharedState,
     config: &VectorConfig,
     body: &SearchRequest,
 ) -> Result<Vec<f32>, ApiError> {
@@ -571,7 +596,10 @@ async fn resolve_query_vector(
         ));
     }
 
-    let provider = kimmy_vector::build(&config.provider, config.dim).map_err(vector_error)?;
+    // Under this node's policy, as the worker builds it: the configuration
+    // may have arrived by replication and never passed this node's API.
+    let provider = kimmy_vector::build(&config.provider, config.dim, &state.providers)
+        .map_err(vector_error)?;
     // The query prefix is applied here and nowhere else: a caller-supplied
     // vector was embedded by the caller, prefix and all, or not at all.
     let text = match &config.query_prefix {
@@ -743,7 +771,11 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         V::LocalUnavailable | V::ModelUnavailable { .. } => {
             ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, e.to_string())
         }
-        V::MissingApiKey { .. } => ApiError::new(
+        // A stored configuration this node's policy refuses, or a profile it
+        // does not define, is the deployment's to fix, not the caller's: the
+        // configuration passed some member's API, and this member's policy or
+        // profiles differ from that one's.
+        V::MissingApiKey { .. } | V::PolicyRefused(_) | V::UnknownProfile { .. } => ApiError::new(
             StatusCode::INTERNAL_SERVER_ERROR,
             ErrorCode::Misconfigured,
             e.to_string(),
@@ -771,19 +803,113 @@ mod tests {
     use super::*;
 
     fn live_state(dir: &tempfile::TempDir) -> SharedState {
+        live_state_with(dir, kimmy_vector::ProviderPolicy::default())
+    }
+
+    fn live_state_with(
+        dir: &tempfile::TempDir,
+        providers: kimmy_vector::ProviderPolicy,
+    ) -> SharedState {
         let engine = std::sync::Arc::new(
             kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
         );
         let tokens =
             kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret-of-32", 3600).unwrap();
-        crate::state_with_egress(
+        crate::state_with_policies(
             engine,
             tokens,
             false,
             crate::RateLimits::disabled(),
-            crate::egress::EgressPolicy::default(),
+            crate::egress::EgressPolicy::public_only(crate::egress::WEBHOOKS),
+            providers,
         )
         .unwrap()
+    }
+
+    fn openai(endpoint: Option<&str>, api_key_env: &str) -> ProviderConfig {
+        ProviderConfig::OpenAi {
+            model: "text-embedding-3-small".into(),
+            endpoint: endpoint.map(Into::into),
+            api_key_env: api_key_env.into(),
+            dimensions: None,
+        }
+    }
+
+    #[test]
+    fn configure_time_refuses_a_node_secret_and_a_private_endpoint_by_name() {
+        // The finding, at the door: a `400` that names the variable or the
+        // host and the setting that governs it, so the person who typed the
+        // configuration learns why while they are still watching.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+
+        for var in [
+            "KIMMY_JWT_SECRET",
+            "KIMMY_CLUSTER_SECRET",
+            "KIMMY_ROOT_PASSWORD",
+            "KIMMY_JWT_PREVIOUS_SECRET",
+        ] {
+            let err =
+                admit_provider(&state, &openai(Some("https://93.184.216.34"), var)).expect_err(var);
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert!(err.message.contains(var), "{var}: {}", err.message);
+            assert!(err.message.contains("api_key_env"), "{}", err.message);
+        }
+
+        let err = admit_provider(&state, &openai(None, "SOMEBODY_ELSES_KEY")).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("SOMEBODY_ELSES_KEY"), "{}", err.message);
+        assert!(err.message.contains("vector.provider.allowed_key_env"), "{}", err.message);
+
+        let lan =
+            ProviderConfig::Ollama { model: "m".into(), endpoint: "http://10.0.0.5:11434".into() };
+        let err = admit_provider(&state, &lan).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("10.0.0.5"), "{}", err.message);
+        assert!(err.message.contains("vector.provider.allowed_hosts"), "{}", err.message);
+
+        // The defaults, and the provider namespace, pass with nothing set.
+        admit_provider(&state, &openai(None, "OPENAI_API_KEY")).unwrap();
+        admit_provider(&state, &openai(Some("https://93.184.216.34"), "KIMMY_PROVIDER_ACME"))
+            .unwrap();
+        admit_provider(&state, &ProviderConfig::Byo).unwrap();
+    }
+
+    #[test]
+    fn a_locked_node_accepts_only_profiles_byo_and_local() {
+        let mut profiles = std::collections::BTreeMap::new();
+        profiles.insert(
+            "corp".to_string(),
+            openai(Some("https://93.184.216.34"), "KIMMY_PROVIDER_CORP"),
+        );
+        let policy = kimmy_vector::ProviderPolicy::new(
+            kimmy_vector::policy::default_allowed_key_env(),
+            Vec::new(),
+            true,
+            profiles,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_with(&dir, policy);
+
+        let err = admit_provider(&state, &openai(None, "OPENAI_API_KEY")).unwrap_err();
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("endpoints_locked"), "{}", err.message);
+
+        admit_provider(&state, &ProviderConfig::Profile { name: "corp".into() }).unwrap();
+        admit_provider(&state, &ProviderConfig::Byo).unwrap();
+        let err =
+            admit_provider(&state, &ProviderConfig::Profile { name: "nope".into() }).unwrap_err();
+        assert!(err.message.contains("vector.providers.nope"), "{}", err.message);
+
+        // The accepted configuration stores the profile's *name* and reads
+        // back as it was written; the operator's endpoint stays theirs.
+        state.engine.create_collection("app", "docs").unwrap();
+        let mut c = config();
+        c.provider = ProviderConfig::Profile { name: "corp".into() };
+        let meta = state.engine.configure_vectors("app", "docs", c).unwrap();
+        let stored = serde_json::to_value(meta.vector.unwrap().provider).unwrap();
+        assert_eq!(stored, json!({ "kind": "profile", "name": "corp" }));
     }
 
     fn config() -> VectorConfig {

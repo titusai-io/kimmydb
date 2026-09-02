@@ -32,6 +32,11 @@ pub struct AppState {
     /// Where a webhook may be pointed. Held in state rather than read per
     /// request so the policy cannot differ between two calls.
     pub egress: crate::egress::EgressPolicy,
+    /// What an embedding provider may be handed and where it may be sent
+    /// (ADR-115). Consulted when a collection's vector configuration is
+    /// accepted and again when a search embeds a query; the worker holds the
+    /// same policy for the documents.
+    pub providers: kimmy_vector::ProviderPolicy,
     /// Whether a token is still good beyond its signature: the user still
     /// exists, is still enabled, and has not had its tokens invalidated.
     /// Cached, and kept honest by an oplog consumer (ADR-052).
