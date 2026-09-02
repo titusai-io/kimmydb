@@ -23,6 +23,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `allowed_key_env` explicitly are unaffected; the setting replaces the
   default rather than extending it. ADR-115, amended.
 
+### Fixed
+
+- **The server is no longer several times slower under concurrent clients
+  than the same code linked against glibc.** Every release binary is a static
+  musl build, and since 0.17.0 the container ships that same file; a musl
+  binary that sets no allocator runs on musl's malloc, which serialises every
+  allocation on one lock. Measured against the glibc build the container
+  shipped before 0.17.0, at eight clients a paged `find` ran at 477 requests a
+  second instead of 6,381, `count` at 19 instead of 171 and point reads at
+  18,345 instead of 45,116, with p99 latencies three to eight times longer;
+  at one client the gap was within 30%. `kimmyd` now sets mimalloc as its
+  global allocator on every target, which recovers all of it and passes the
+  glibc figures (8,289, 201 and 48,217 in the same cells). The cost is
+  resident memory: under a burst of concurrent writes the node's peak was
+  about twice the glibc binary's and four times the musl binary's, retained
+  rather than in use, so a container sized tightly to the old peak wants
+  headroom — `docs/operations.md` has the figure. ADR-117; the table and its
+  conditions are in `docs/benchmarks.md`.
+
 ## 0.19.0 - 2026-09-01
 
 A minor when it ships, not a patch. Nothing changes on the wire, on disk or

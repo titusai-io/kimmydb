@@ -42,6 +42,12 @@ opentelemetry_sdk.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry-semantic-conventions.workspace = true
 tracing-opentelemetry.workspace = true
+# The global allocator (ADR-117). Here and in no library crate: the binary is
+# the one place a `#[global_allocator]` belongs, because a library that sets
+# one sets it for every program that links it. Without this the static musl
+# binary runs on musl's malloc, which serialises concurrent allocation -- the
+# workspace manifest has the numbers.
+mimalloc.workspace = true
 
 [dev-dependencies]
 rcgen.workspace = true
