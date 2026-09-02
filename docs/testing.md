@@ -1228,9 +1228,11 @@ PROPTEST_CASES=10000 cargo test -p kimmy-core   # deeper property search
 
 CI runs fmt, clippy, and tests, with the cluster harness and the vector
 reachability check in their own jobs. A `build` job compiles `kimmyd` and the
-Rust conformance driver once, in release, and uploads them as a one-day
-artifact; the Python client, Go client, conformance, and Docker jobs download
-that binary rather than each compiling their own. The Docker job passes
+Rust conformance driver once — as the release does, the static musl binary
+under dist's profile and flags, so the dependency cache it saves from `main`
+is the one a tag's release build restores (ADR-118) — and uploads them as a
+one-day artifact; the Python client, Go client, conformance, and Docker jobs
+download that binary rather than each compiling their own. The Docker job passes
 `KIMMYD_SOURCE=prebuilt` so the Dockerfile copies the binary in instead of
 building it, then smoke-tests the image with `check-config`.
 
@@ -1249,9 +1251,10 @@ exported by `type=gha`**. Compiled in-container on CI, the `cargo build
 --release` layer missed on every run — `COPY crates ./crates` changes with
 every commit — and was a cold nine-minute build, the slowest thing in the
 workflow. Compiling once against the warm Rust cache and handing the binary to
-the image sidesteps that entirely. The release publish still compiles
-in-container, per platform, with the default stage. What the registry cache
-buys is the base images and the apt layer, which is why it is `mode=min`.
+the image sidesteps that entirely. The release publish does the same with the
+`prebuilt` stage, taking each architecture's binary from the release archive
+dist built (ADR-107). What the registry cache buys is the base images and the
+apt layer, which is why it is `mode=min`.
 
 ---
 

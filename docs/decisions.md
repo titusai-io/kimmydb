@@ -4256,7 +4256,7 @@ variable and the `client_secret` settings key they existed to consume. The
 CLI runs exactly two flows: a password login for a named local account, and
 the RFC 8628 device flow for everyone else. A script, a cron job or a
 healthcheck sets `KIMMY_TOKEN` (or the settings file's `token`) to a bearer
-token minted elsewhere — for example, a personal access token from the
+token minted elsewhere — a personal access token from the identity provider's
 console, audienced at the node — and every command works as it always did. A
 `client_secret` line left in an existing `.kimmy` is warned about and
 ignored rather than rejected; `kimmy init` drops it when it rewrites the
@@ -4281,7 +4281,7 @@ not about the readers.
 **Rejected: keep the flag and fix the documentation.** A documentation fix
 keeps the pull; it only adds a sign next to it. Nothing depends on the flag —
 no repository invokes it, and the one service that does use the grant (a
-sibling project's agents) has its own implementation and never shelled out to
+chat service's agents) has its own implementation and never shelled out to
 `kimmy`. Removal breaks nothing that exists, and pre-1.0 a `0.MINOR` may
 carry a breaking change that produces the better design.
 
@@ -4309,16 +4309,16 @@ implies it. `ddl` implies no data access and never reaches the system database.
 It maps through an identity provider like `read` and `write` do; the
 federation refusal stays exactly where it was, on `admin`.
 
-**What prompted it.** An agent connecting over MCP through an external
-identity provider — a federated principal — was told to `create_collection`
-before inserting, by the server's own instructions, and was refused: the tool
-needed `admin`, and ADR-067 forbids federating that. The instructions said one
-thing and the authorization model another, and the only ways to reconcile them
-without this change were to hide the tool (ADR-025 says why not), to hand the
-agent `allow_federated_admin` (a superuser with user management and backup, to
+**What prompted it.** An agent connecting over MCP through an OIDC provider — a
+federated principal — was told to `create_collection` before inserting, by the
+server's own instructions, and was refused: the tool needed `admin`, and
+ADR-067 forbids federating that. The instructions said one thing and the
+authorization model another, and the only ways to reconcile them without this
+change were to hide the tool (ADR-025 says why not), to hand the agent
+`allow_federated_admin` (a superuser with user management and backup, to
 create a collection), or to have a person create every collection an agent
-might want. None of those is the model; the model was wrong about what `admin`
-bundled.
+might want. None of those is the model; the model was wrong about what
+`admin` bundled.
 
 **Why a split rather than a flag.** `admin` conflated two things: shaping the
 *data* and administering the *server*. The break-glass argument in ADR-067 is
@@ -6035,7 +6035,7 @@ rather than a webhook, and authenticates as one person. Actions handles fork
 pull requests natively. The day this repository takes outside contributions is
 the day the gate comes back.
 
-**Alternatives.** *Move everything to Jenkins*, as a sibling project
+**Alternatives.** *Move everything to Jenkins*, as a sibling repository
 does: rejected for the three reasons above — that repository ships no macOS
 binaries, no multi-architecture artifacts and no attestations, so it pays none
 of the costs. *Leave everything on Actions and only reduce tag frequency*:
@@ -6270,5 +6270,252 @@ collects every value, and the expression's — and the doc comment on each
 names the other and the one place they disagree. The expression resolver
 clones the values it collects, as the previous one did for the single value
 it returned; nothing on the hot filter path changed.
+
+---
+
+## ADR-117 — `kimmyd` sets mimalloc as its global allocator
+
+**Decision.** `crates/kimmyd/src/main.rs` declares `mimalloc::MiMalloc` as the
+`#[global_allocator]`, with the crate's default features, on every target the
+binary is built for. It is set in the binary crate and nowhere else: a library
+that sets a global allocator sets it for every program that links it, and no
+library in this workspace may. `libmimalloc-sys` joins `cc` on
+`scripts/allowed-native-deps.txt`. Measured 2026-09-01; the full table and its
+conditions are in [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc).
+
+**Why.** Every release binary has been a static musl build since ADR-063, and
+ADR-107 made the container ship that same file instead of a glibc build of its
+own. ADR-107 named the one thing an operator could observe in the change —
+musl's malloc where glibc's had been, "slower under heavy multithreaded
+allocation" — and said that if a measurement showed it, the answer would be a
+global allocator in `kimmyd`. Nobody had measured it. This is the measurement,
+taken over a socket with the HTTP benchmark against three servers built from
+one commit inside one Linux arm64 container pinned to four cores and 4 GiB:
+the glibc binary the container used to ship, the musl binary it ships now, and
+the musl binary with mimalloc. One load generator, itself a glibc build, drove
+all three, so the client's allocator never moved. Plaintext, the better of two
+interleaved runs, requests per second with the p99 in milliseconds:
+
+| Scenario | Clients | glibc | musl | musl + mimalloc |
+|---|---:|---:|---:|---:|
+| point read by `_id` | 1 | 10,718 · 0.15 | 9,714 · 0.18 | 10,779 · 0.16 |
+| point read by `_id` | 8 | 45,116 · 0.28 | **18,345 · 0.78** | 48,217 · 0.28 |
+| point read by `_id` | 64 | 51,956 · 45 | **19,682 · 6.2** | 54,686 · 39 |
+| `find`, page of 100 | 1 | 1,576 · 0.77 | 1,111 · 1.19 | 2,012 · 0.70 |
+| `find`, page of 100 | 8 | 6,381 · 6.1 | **477 · 31** | 8,289 · 2.1 |
+| `find`, page of 100 | 64 | 6,257 · 23 | **537 · 239** | 8,304 · 21 |
+| `count`, whole collection | 8 | 171 · 70 | **19 · 547** | 201 · 59 |
+| `count`, whole collection | 64 | 174 · 728 | **20 · 5,223** | 211 · 540 |
+| bulk insert of 100 | 64 | 992 · 325 | **462 · 344** | 1,058 · 208 |
+| peak resident set, MB | | 273–300 | 125–147 | 546–576 |
+
+At one client the musl binary is within 10–30% of the glibc one. At eight it
+serves point reads at 0.4× the rate, a page of 100 documents at 0.07× and a
+`count` at 0.11×, and the ratio tracks how many allocations a request makes,
+not how many requests there are: a point read allocates a handful of times,
+decoding and re-encoding a page of a hundred documents allocates hundreds. musl's
+allocator serialises every allocation on one lock, so four tokio workers stand
+in one queue. The two runs of each configuration differed by 1–12% for glibc and
+mimalloc and by up to 23% for musl, against a gap of 2.5× to 13×. mimalloc recovers all of it
+and then passes glibc by 8–30% on reads, at one client too: the allocator is on
+the single-request path as well as the contended one. Writes barely move in
+any row, as they should — an insert is mostly fsync (the write gap, in
+Benchmarks) — except the bulk path, whose batch decode allocates.
+
+Every number on the benchmarks page before this one was taken from a glibc or
+macOS build, which is why none of them showed it. The shipped binary has been
+the slow one since 0.1.0 for anyone who downloaded a tarball and since 0.17.0
+for the container, and the page said 70,000 point reads a second the whole
+time.
+
+**What this does to ADR-016's rule.** The correction on ADR-016 says: the
+build pays for `ring`, so do not add a second native stack. This is a second
+native library in the default build, and it is accepted with that sentence in
+view rather than around it. It is different in kind from what the rule was
+written against. The rule's case is `aws-lc-rs`: a second implementation of
+primitives the tree already had, bringing CMake and a second build system for
+nothing the first stack did not provide. mimalloc is one vendored C library of
+a dozen files with no system dependency, no CMake, no `bindgen`, compiled by
+the `cc` crate the build already needs for `ring`, so no build or
+cross-compile needs a tool it did not need yesterday — the musl arm64 build
+in the container above used the toolchain `musl-tools` installs and nothing
+else. And it is not a second of anything: the tree had no allocator and took
+the platform's, and the platform's turned out to be the regression. The line it
+adds to the allowlist is the kind the allowlist's header says is right:
+deliberate, with a reason, in a diff. What the rule reads as from here is
+narrower and clearer for it — no second crypto stack, and no native dependency
+without a measurement that justifies it.
+
+**Alternatives.** *Leave the allocator alone.* The shipped binary would stay
+2.5–13× slower under any concurrency above one than the binary that shipped
+before ADR-107, on every channel; rejected because the one measurement ADR-107
+asked for is in and it is not close. *Ship a glibc build in the container.*
+ADR-107's reason for not doing that stands — two builds of one commit, one of
+them unverifiable against the published hash — and the tarballs would still be
+musl and still slow; a global allocator is one change that reaches every
+channel alike, which is what ADR-107 said the answer would be. *jemalloc, via
+`tikv-jemallocator`.* Not measured: it builds through autotools and a
+configure script rather than `cc` alone, it is a larger library, and mimalloc
+answered the question. The rule of thumb applied was one native addition, the
+smallest that closes the gap. *mimalloc's `v2` tree, offered as a crate
+feature.* Measured once: 3–15% above `v3` on throughput, inside the spread of
+the `v3` runs on most cells, with an equal or larger resident set (546–649 MB).
+One run inside the noise does not justify leaving the tree the crate's authors
+ship by default, so `v3` stays; the feature is there if a later measurement
+says otherwise.
+
+**Cost.** A second native build dependency, recorded above. Resident memory:
+under the benchmark's write burst — sixty-four clients each sending
+hundred-document batches — the node's high-water mark was 546–576 MB with
+mimalloc against 273–300 MB with glibc and 125–147 MB with musl. That is
+retained heap rather than live data, since musl's own figure bounds what was in
+use, and it is not the purge timer: `MIMALLOC_PURGE_DELAY=0` gave 608 MB. Where
+it goes was not chased further — mimalloc keeps a heap per thread and hands
+memory back in whole segments, and the burst has sixty-four requests in flight
+across every worker — but `docs/operations.md`'s resident-memory row now
+carries the figure, because a container sized tightly to the old peak wants
+headroom. The SBOM gains two crates, both MIT, a license already on
+`deny.toml`'s allowlist. And a benchmark page that quoted glibc numbers for a
+musl binary from 0.1.0 to 0.19.0 is a cost already paid; the section this ADR
+adds records the conditions under which every future number is taken.
+
+---
+
+## ADR-118 — The Linux release builds start from the cache `main` writes
+
+**Decision.** The two Linux entries of dist's `build-local-artifacts` restore,
+just before `dist build`, the rust-cache that CI saves from `main` for the same
+target — and never save one of their own. Three pieces make that true. The
+`build kimmyd` job in `ci.yml`, which every downstream job already took its
+binary from, now compiles `x86_64-unknown-linux-musl` the way dist does — the
+`dist` profile, `--workspace`, dist's musl RUSTFLAGS, dist's runner, the
+current stable — and saves under `shared-key:
+release-x86_64-unknown-linux-musl`. A new `build kimmyd (arm64)` job on
+`ubuntu-24.04-arm` does the same for `aarch64-unknown-linux-musl`, produces no
+artifact, and builds only when the cache has no entry under its exact key. And
+`github-build-setup` in `dist-workspace.toml` points dist at
+`.github/release-build-setup.yml`, two steps it inlines into the generated
+job: the same toolchain action CI uses, then a `Swatinem/rust-cache@v2` with
+`shared-key: release-${{ join(matrix.targets, '-') }}` and `save-if: false`.
+`release.yml` stays generated; dist's `cache-builds` stays off; targets,
+installers, publish jobs, the prebuilt-image flow and the SBOMs are untouched.
+This amends ADR-107, which evaluated `cache-builds` and left it off because no
+job on `main` built the release targets — a job does now, for the two Linux
+ones — and ADR-114, which recorded what a release costs on Actions.
+
+**Why.** Measured on the v0.17.0 release: `build-local-artifacts` took 9 m 24 s
+for `x86_64-unknown-linux-musl`, about 6.5 minutes for the arm64 target and
+about 5.5 for macOS, in a release of about eleven minutes in which everything
+else finished inside two. Every tag started from a cold cargo cache, and
+ADR-107 said why: a GitHub Actions cache is readable only from the ref that
+wrote it or from the default branch, and nothing on `main` compiled a musl
+target, so there was nothing a tag could read and no point writing what no
+later tag could read either. That analysis stands. What it left open was the
+other side of it — make `main` build what the tag builds — and the x86_64 half
+of that was almost free, because a job on `main` already compiled `kimmyd` in
+release for the Python, Go, conformance and docker jobs; it only compiled the
+wrong target. Pointing that job at the release target costs nothing it was not
+already paying, and its output is a better hand-off than before: the binary
+those jobs test and put in the image is now the static musl file a release
+ships, so the docker smoke test runs against the released kind of binary.
+
+**What has to stay aligned.** rust-cache's key is
+`v0-rust-<shared-key>-<os>-<arch>-<envhash>-<lockhash>`, and cargo has its own
+fingerprints beneath it, so a warm start needs both to match. Each input, and
+where it is held equal:
+
+- *`shared-key`.* Set by hand in `ci.yml` and derived from `matrix.targets` in
+  the setup file, so the release side cannot spell a target differently from
+  the target list.
+- *OS and architecture.* `Linux-x64` from `ubuntu-24.04` on both sides — the CI
+  job names dist's runner rather than `ubuntu-latest` so the two cannot drift
+  when the alias moves — and `Linux-arm64` from `ubuntu-24.04-arm` on both.
+- *The environment hash.* It covers the rustc release, host and commit hash,
+  and every `CARGO*`, `CC*`, `CFLAGS*`, `CXX*`, `CMAKE*` and `RUST*` variable
+  the rust-cache step can see. Both sides install Rust with the same
+  `dtolnay/rust-toolchain@stable` step, which gives the same stable at the
+  same moment (a bare dist job would use whatever rustc the runner image
+  shipped, which lags) and exports the same `CARGO_HOME`, `CARGO_INCREMENTAL=0`
+  and `CARGO_TERM_COLOR=always`. `ci.yml`'s `RUSTFLAGS: -D warnings` and
+  `CARGO_PROFILE_TEST_DEBUG: 0` moved from the workflow level to the four
+  gate jobs, because the release job has neither; and the musl RUSTFLAGS are
+  set on the cargo step alone, which is where dist sets them — on cargo's
+  process, not the job — so neither rust-cache step sees a `RUSTFLAGS` at all.
+- *The lockfile hash.* Over `Cargo.toml`, `Cargo.lock` and the toolchain and
+  cargo config files. A tag is pushed at the commit `main` last built (the
+  release pull request merges, `main` builds, the tag follows), so the two are
+  equal. When they are not, rust-cache falls back to the newest entry of the
+  family — the previous lockfile's set — and cargo reuses every dependency the
+  change did not touch.
+- *Cargo's fingerprints.* Same profile (`--profile dist`; `[profile.dist]` in
+  `Cargo.toml` is what makes dist use it), same target directory
+  (`target/<triple>/dist` under the checkout — rust-cache recognises the
+  per-triple directory as a nested target and keeps its `deps`), same package
+  selection (`--workspace`, dist's default, so every dependency is compiled
+  once with the workspace's unioned features), same RUSTFLAGS — for a musl
+  target dist 0.32.0 appends `-Ctarget-feature=+crt-static
+  -Clink-self-contained=yes` to whatever the environment holds, which here is
+  nothing — and the same `CARGO_INCREMENTAL`.
+
+With those equal the tag's key is `main`'s key. When something is not equal
+the cost is what every tag paid before, a cold build, and never a failure:
+rust-cache restores nothing or restores a set cargo mostly rebuilds, and the
+release proceeds. The case that will happen: a stable Rust released between
+`main`'s last build and the tag changes the environment hash, and the fallback
+cannot bridge that, so that one release builds cold; the next push to `main`
+writes the new key — the arm64 job builds because its lookup misses — and the
+tag after it is warm again. The macOS build has no cache at all, since no job
+on `main` builds that target, and runs cold as it always has; with the Linux
+builds warm it becomes the phase's long pole, at about five and a half minutes.
+
+**The budget.** Measured locally on a `dist`-profile build of this workspace:
+`deps` is 725 MiB on disk, of which about 100 MiB is the workspace's own
+crates, which rust-cache drops before saving; the remainder with `.fingerprint`
+and `build` compresses to about 207 MiB under zstd, which is what the cache
+uses, and the registry index and `.crate` files add at most another 100 MiB.
+Call it 300 MiB per family, nearer 350 for x86_64 where the conformance
+driver's dev-dependencies add a few feature variants — against the roughly
+1 GiB each of the existing debug-profile families. Two families, so 0.6 to
+0.7 GiB of a 10 GiB limit. One of them replaces rather than adds: the `build`
+job's old native family is written by nothing now and ages out under the
+seven-day rule, or can be deleted by hand. The keys,
+`v0-rust-release-<target>-Linux-<arch>-<envhash>-<lockhash>`, end in the lock
+hash like every other rust-cache key, so `cache-cleanup.yml`'s family rule —
+strip the trailing segment — groups them as it groups the rest and keeps one
+entry per family. A new rustc opens a new family under a new environment hash;
+the old one is read by nothing and ages out.
+
+**Alternatives.** `cache-builds = true` in dist: it is a rust-cache in the same
+place, keyed on the generated job's name, so it would look for
+`v0-rust-build-local-artifacts-…`, find nothing, and save a set per tag that no
+later tag could read, exactly as ADR-107 said. sccache with the GitHub cache
+backend: it lives under the same visibility rule, so it too can only be fed
+from `main`, and it adds a compiler wrapper and a second cache format for the
+same effect the artifact cache gives directly. Building the release targets on
+every pull request, so a tag could read a fresher cache: every PR pays two
+musl builds so that a tag, which comes after a merge to `main` anyway, saves
+nothing more than it already does — the caches are readable from `main`, and
+`main` is where they are written. Gating the arm64 job on a diff of
+`Cargo.lock` between the push's `before` and `after`: it says nothing about a
+toolchain change or an evicted entry, both of which leave the tag cold until
+the next dependency change, whereas the exact-key lookup is the condition
+rust-cache itself uses to decide whether saving would write anything. Keeping
+`-D warnings` and giving it to the release build too, to avoid moving the
+variable: it changes no byte of the binary and gives a release one more way to
+fail — a warning a newer stable introduces — which is the wrong trade.
+
+**Cost.** The `build kimmyd` job installs `musl-tools` and a target before it
+starts, a few seconds, and what it compiles is what it compiled before under
+another name (`[profile.dist]` inherits `release` unchanged). The arm64 job is
+new: a checkout and a restore per push to `main`, about a minute when the key
+exists; a full build, six to seven minutes, when it does not — and the release
+pull request's version bump changes `Cargo.lock`, so that is at least once per
+release, which is the point. Four jobs now carry two environment lines that
+the workflow carried once. The setup file is a second place where release
+steps are written; dist copies it into `release.yml`, so the `plan` job's drift
+check covers it, and the comment at the top of the file says so. And the
+alignment above is silent when it breaks — a cold release, no red job — so the
+place to look after a tag is the `build-local-artifacts` log for the Linux
+targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---

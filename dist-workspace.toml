@@ -26,12 +26,16 @@ tap = "titusai-io/homebrew-tap"
 # image job can take the Linux archives from the run's own workflow artifacts
 # (`artifacts-build-local-<target>`) rather than compiling again (ADR-107).
 publish-jobs = ["homebrew", "./publish-ghcr"]
-# `cache-builds` (a rust-cache in build-local-artifacts) stays off. A cache is
-# readable only from the ref that wrote it or from the default branch; no job
-# on main builds the musl targets, so a tag would never find a cache to read
-# and would write a set — a gigabyte or more per release — that no later tag
-# can read either, against the 10 GiB budget CI already had to be pruned back
-# under. Enable it only if main starts building the release targets.
+# The Linux builds start from the dependency cache CI writes on main. dist's
+# own `cache-builds` stays off: it keys a rust-cache on this workflow's job
+# name, and a cache is readable only from the ref that wrote it or from the
+# default branch, so a tag could never read what a previous tag wrote and
+# would write a gigabyte per release that nothing reads. Instead the steps in
+# .github/release-build-setup.yml are inlined into `build-local-artifacts`
+# just before `dist build`: they restore, and never save, the cache that the
+# `build kimmyd` jobs in ci.yml write from main for the same target under the
+# same `shared-key` (ADR-118). The macOS build finds no cache and runs cold.
+github-build-setup = "../release-build-setup.yml"
 # Target platforms to build apps for (Rust target-triple syntax).
 #
 # musl rather than gnu for Linux, deliberately: the result is a static binary

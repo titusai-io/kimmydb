@@ -28,10 +28,14 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  # Debug info roughly doubles CI build time and nothing here reads a backtrace
-  # symbol table.
-  CARGO_PROFILE_TEST_DEBUG: 0
-  RUSTFLAGS: -D warnings
+
+# `RUSTFLAGS: -D warnings` and `CARGO_PROFILE_TEST_DEBUG: 0` are set on the
+# four jobs that compile the gate, not here, because the two `build kimmyd`
+# jobs at the end must carry exactly the environment the release build has.
+# rust-cache hashes every `CARGO_*` and `RUST*` variable it can see into its
+# key, and cargo fingerprints every artifact with the RUSTFLAGS it was built
+# under, so one extra variable here would make the cache those jobs write
+# unreadable, or unusable, on a tag (ADR-118).
 
 jobs:
   # The pull-request gate is two jobs so that the cheap verdicts arrive first:
@@ -45,6 +49,11 @@ jobs:
   lint:
     name: fmt, clippy
     runs-on: ubuntu-latest
+    env:
+      # Debug info roughly doubles CI build time and nothing here reads a
+      # backtrace symbol table.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -85,6 +94,11 @@ jobs:
   test:
     name: test
     runs-on: ubuntu-latest
+    env:
+      # Debug info roughly doubles CI build time and nothing here reads a
+      # backtrace symbol table.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -120,6 +134,11 @@ jobs:
     name: cluster harness
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    env:
+      # Debug info roughly doubles CI build time and nothing here reads a
+      # backtrace symbol table.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -145,6 +164,11 @@ jobs:
     name: vector reachability
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    env:
+      # Debug info roughly doubles CI build time and nothing here reads a
+      # backtrace symbol table.
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v7
 
@@ -169,40 +193,134 @@ jobs:
           --ignored --exact
           index::tests::a_healthy_graph_at_a_realistic_width_is_not_rebuilt
 
-  # One release build of `kimmyd`, shared. The Python, Go, conformance, and
-  # docker jobs all drive a real server, and each used to compile its own —
-  # four identical `cargo build --release` runs per push, the docker one from
-  # cold inside BuildKit where no Rust cache reaches. Now this job builds once
-  # against the warm cache and the others download the result. The artifact
-  # is deleted after a day: it is a hand-off between jobs, not a release.
+  # One build of `kimmyd`, shared — and it is the build the release makes.
+  #
+  # Shared: the Python, Go, conformance, and docker jobs all drive a real
+  # server, and each used to compile its own — four identical release builds
+  # per push, the docker one from cold inside BuildKit where no Rust cache
+  # reaches. This job builds once against the warm cache and the others
+  # download the result. The artifact is deleted after a day: it is a
+  # hand-off between jobs, not a release.
+  #
+  # The release's build: the same target, profile, toolchain, RUSTFLAGS and
+  # runner as dist's `build-local-artifacts` for x86_64-unknown-linux-musl
+  # (ADR-118). That is what makes the cache this job saves readable by a tag —
+  # a cache is readable from the ref that wrote it or from the default branch,
+  # and this is the only job on main that compiles what a tag compiles. The
+  # `shared-key` names the target rather than this job so the differently
+  # named job in release.yml restores it (.github/release-build-setup.yml).
+  # Every input rust-cache or cargo keys on has to match at both ends, and
+  # each is called out below. A mismatch is not a failure, only a cold build,
+  # which is what every tag paid before.
+  #
+  # A side effect the downstream jobs get for free: the binary they test and
+  # put in the image is now the static musl binary a release ships, not a
+  # glibc one, so the docker smoke test exercises the released kind of file.
   build:
     name: build kimmyd
-    runs-on: ubuntu-latest
+    # dist's runner for this target (dist-workspace.toml), named rather than
+    # `ubuntu-latest` so the two cannot drift apart when the alias moves.
+    runs-on: ubuntu-24.04
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v7
+
+      # The same action the release setup runs: it installs the current
+      # stable — the key hashes the rustc version — and exports `CARGO_HOME`,
+      # `CARGO_INCREMENTAL=0` and `CARGO_TERM_COLOR=always`, which the key
+      # hashes too.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      # What dist installs for this target (`packages_install` in the plan):
+      # ring's C code needs a compiler that targets musl.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      # Save only from main — see the note on the `lint` job above. This step
+      # must not see RUSTFLAGS: the release job's copy of it does not either,
+      # and the variable is part of the key.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-x86_64-unknown-linux-musl
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      # Exactly dist's cargo invocation: `--profile dist` (Cargo.toml defines
+      # it, so dist uses it), `--workspace` (dist's default, so every
+      # dependency is compiled once with the workspace's unioned features),
+      # and the RUSTFLAGS dist sets for a musl target, on this step only.
+      # Cargo records RUSTFLAGS in every artifact's fingerprint, so a
+      # dependency built without them is a dependency the tag rebuilds. The
+      # second command adds the conformance driver, still workspace-wide so
+      # the feature set stays the same.
+      - name: Build the server and the Rust conformance driver
+        env:
+          RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
+        run: |
+          cargo build --profile dist --target x86_64-unknown-linux-musl --workspace
+          cargo build --profile dist --target x86_64-unknown-linux-musl --workspace --example conformance
+
+      # The artifact's root is the paths' common ancestor, so this unpacks as
+      # `kimmyd` and `examples/conformance` — the layout the jobs below
+      # download into `target/release`, unchanged from when the build was a
+      # native one.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kimmyd
+          path: |
+            target/x86_64-unknown-linux-musl/dist/kimmyd
+            target/x86_64-unknown-linux-musl/dist/examples/conformance
+          if-no-files-found: error
+          retention-days: 1
+
+  # The arm64 counterpart, for its cache alone: no job downloads anything
+  # from it. It exists so the aarch64-unknown-linux-musl release build starts
+  # warm too, on the same terms as the job above — same target, profile,
+  # toolchain, RUSTFLAGS and runner as dist's, and a `shared-key` the release
+  # setup restores.
+  #
+  # Gated on the cache lookup, not on the push: rust-cache saves dependency
+  # artifacts under a key made of the toolchain, the environment and the
+  # lockfile, and it declines to save at all when that exact key already
+  # exists. So when the restore is an exact hit, a build here would write
+  # nothing new, and the job ends after the restore. It builds when the key
+  # is new — a Cargo.lock or Cargo.toml change, a new stable rustc — and when
+  # the entry has aged out, which a diff of Cargo.lock could not tell.
+  build-arm64:
+    name: build kimmyd (arm64)
+    runs-on: ubuntu-24.04-arm
     if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
 
       # Save only from main — see the note on the `lint` job above.
-      - uses: Swatinem/rust-cache@v2
+      - id: cache
+        uses: Swatinem/rust-cache@v2
         with:
+          shared-key: release-aarch64-unknown-linux-musl
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
-      - name: Build the server and the Rust conformance driver
+      - name: Install dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          cargo build --release --bin kimmyd
-          cargo build --release --example conformance -p kimmy-client
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
-      - uses: actions/upload-artifact@v7
-        with:
-          name: kimmyd
-          path: |
-            target/release/kimmyd
-            target/release/examples/conformance
-          if-no-files-found: error
-          retention-days: 1
+      # dist's invocation, as in the job above.
+      - name: Build the workspace
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          RUSTFLAGS: -Ctarget-feature=+crt-static -Clink-self-contained=yes
+        run: cargo build --profile dist --target aarch64-unknown-linux-musl --workspace
 
   python-client:
     name: python client
