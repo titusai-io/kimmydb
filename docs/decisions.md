@@ -6143,7 +6143,11 @@ again when the provider is built:
   `allowed_key_env` entry that would reach one (`KIMMY_JWT_SECRET`, `KIMMY_*`,
   `K*`) is a startup error. Then `vector.provider.allowed_key_env`: exact names
   or a prefix with one trailing `*`, defaulting to `OPENAI_API_KEY`,
-  `COHERE_API_KEY`, `GEMINI_API_KEY` and `KIMMY_PROVIDER_*`.
+  `COHERE_API_KEY`, `GEMINI_API_KEY` and `KIMMY_PROVIDER_*`. *(Amended the
+  same day, one release later: `DEEPINFRA_API_KEY` joined the default list —
+  DeepInfra is a documented host of the `open_ai` dialect, and a default that
+  admits the dialects' own variables but not the documented host's is a
+  default that does not match the documentation.)*
 - **Endpoints.** The address policy webhooks have had since their SSRF fix,
   moved whole into a new `kimmy-egress` crate so both use one denylist: public
   addresses only unless the host is in `vector.provider.allowed_hosts`; the

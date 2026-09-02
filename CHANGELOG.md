@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **`DEEPINFRA_API_KEY` is on the default provider key allowlist.** 0.19.0's
+  `vector.provider.allowed_key_env` defaulted to the three dialects' own
+  variables and `KIMMY_PROVIDER_*`, which left out the variable the docs use
+  for DeepInfra — a documented host of the `open_ai` dialect — so a collection
+  configured the way `docs/vectors.md` shows was refused by name unless the
+  operator listed it. The default now admits it too. Operators who set
+  `allowed_key_env` explicitly are unaffected; the setting replaces the
+  default rather than extending it. ADR-115, amended.
+
 ## 0.19.0 - 2026-09-01
 
 A minor when it ships, not a patch. Nothing changes on the wire, on disk or
