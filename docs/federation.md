@@ -2,7 +2,7 @@
 
 KimmyDB can delegate authentication to any standards-conformant OAuth 2.0 /
 OpenID Connect provider — Entra ID, Okta, Keycloak, Auth0, or a self-hosted
-service — while authorization stays local: your provider says
+OAuth2/OIDC provider — while authorization stays local: your provider says
 **who** the caller is, and this database's role mappings say what they may do.
 Local user accounts keep working alongside it, unchanged — and
 `auth.local.login` decides from where they may still log in, so the
@@ -98,6 +98,7 @@ answers how it is *now*, never what it was before.
 
 | Provider | Roles claim | Device flow | Notes |
 |---|---|---|---|
+| Self-hosted provider that maps a `roles` claim | `roles` (a small fixed set, e.g. `admin\|developer\|user`) | ✅ where implemented | Register the node as a resource server; bound the CLI client's allowed resources to it |
 | Microsoft Entra ID | app roles land in `roles`; group IDs in `groups` | ✅ | Access tokens are `typ: JWT`, not `at+jwt` — leave `require_at_jwt` off. Default audiences are `api://<guid>`; a legal opaque audience, publishes no metadata |
 | Okta | group names in `groups` | ✅ enable per auth server | Custom claim if you want role names rather than group IDs |
 | Keycloak | realm/client roles via a mapper into `roles` | ✅ | Built the mapper or the claim will not exist — a silent zero-grants cause |
@@ -132,8 +133,8 @@ a `kid` anywhere.
 ## The role mapping cookbook
 
 `claim_value` is **the provider's vocabulary**, not this database's — providers
-typically enforce a small fixed set at registration (for example
-`admin|developer|user`). All granularity lives on the KimmyDB side, in either form:
+typically enforce a small fixed set at registration (`admin|developer|user` is
+a common one). All granularity lives on the KimmyDB side, in either form:
 
 ```jsonc
 // Inline grants (ADR-066): reviewed in a diff, changed with a restart.

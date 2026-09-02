@@ -145,8 +145,8 @@ for byte:
 
 | Where | What |
 |---|---|
-| The provider's list of resource servers | e.g. `oauth.protected_resources` |
-| The client registration asking for a token | e.g. `allowed_resources` |
+| The provider's list of resource servers | however the provider names it — its registry of resource servers it will issue tokens for |
+| The client registration asking for a token | the client registration's allowed resources |
 | This node | `auth.oidc.audience` |
 
 Get one of them wrong and the provider answers `invalid_target`, or issues a
@@ -435,9 +435,8 @@ export KIMMY_OIDC_CLIENT_ID=kimmy-cli
 export KIMMY_TOKEN=$(kimmy login)   # RFC 8628 device flow, the default
 
 # A script or a service is not a person and does not log in. It sets
-# KIMMY_TOKEN to a token minted elsewhere — for example, a personal
-access
-# token from the console, audienced at the node (ADR-089).
+# KIMMY_TOKEN to a token minted elsewhere — with a self-hosted provider, a
+# personal access token from its console, audienced at the node (ADR-089).
 export KIMMY_TOKEN=<personal access token>
 ```
 
