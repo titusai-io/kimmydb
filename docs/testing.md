@@ -1251,9 +1251,10 @@ exported by `type=gha`**. Compiled in-container on CI, the `cargo build
 --release` layer missed on every run — `COPY crates ./crates` changes with
 every commit — and was a cold nine-minute build, the slowest thing in the
 workflow. Compiling once against the warm Rust cache and handing the binary to
-the image sidesteps that entirely. The release publish still compiles
-in-container, per platform, with the default stage. What the registry cache
-buys is the base images and the apt layer, which is why it is `mode=min`.
+the image sidesteps that entirely. The release publish does the same with the
+`prebuilt` stage, taking each architecture's binary from the release archive
+dist built (ADR-107). What the registry cache buys is the base images and the
+apt layer, which is why it is `mode=min`.
 
 ---
 
