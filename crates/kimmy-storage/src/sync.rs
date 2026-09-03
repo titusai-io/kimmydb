@@ -17,11 +17,17 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
-use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, VersionVector};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
 use tracing::{debug, warn};
 
-use crate::engine::Engine;
+use crate::docs::RemoteApplied;
+use crate::engine::{Engine, WriteTxn};
 use crate::error::Result;
+use crate::index::UniqueViolation;
+use crate::meta::CollectionMeta;
 
 /// What applying a batch of replicated entries did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -186,18 +192,19 @@ impl Engine {
     /// the batch proved about coverage.
     ///
     /// The single path the replication transport uses for a served batch:
-    /// [`Self::apply_batch`] for the entries, then the witnessed vector raised
-    /// by [`coverage_after_batch`]. `limit` is the batch size that was asked
-    /// for, which is what decides whether the peer's tail was reached.
+    /// [`Self::apply_batch`] for the entries, with the witnessed vector raised
+    /// by [`coverage_after_batch`] in the same transaction as the batch's last
+    /// run of documents — so a round with no schema changes in it is one
+    /// commit and one fsync, not one per entry plus two (ADR-119). `limit` is
+    /// the batch size that was asked for, which is what decides whether the
+    /// peer's tail was reached.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
         entries: &[OplogEntry],
         limit: usize,
     ) -> Result<SyncOutcome> {
-        let outcome = self.apply_batch(entries)?;
-        self.absorb_witnessed(&coverage_after_batch(theirs, entries, limit))?;
-        Ok(outcome)
+        self.apply_batch_absorbing(entries, Some(&coverage_after_batch(theirs, entries, limit)))
     }
 
     /// Entries at or after `from`, for a peer that asked to catch up.
@@ -220,26 +227,95 @@ impl Engine {
 
     /// Merge a batch of entries received from a peer.
     ///
-    /// Each entry goes through `apply_remote`, so last-writer-wins decides
-    /// per document and re-delivery is harmless. Ordering within the batch does
-    /// not matter — that is the point of LWW, and it is what lets a peer send
-    /// a range without coordinating.
+    /// Each document entry goes through `apply_remote_in_txn`, so
+    /// last-writer-wins decides per document and re-delivery is harmless.
+    /// Ordering within the batch does not matter to the *result* — that is the
+    /// point of LWW, and it is what lets a peer send a range without
+    /// coordinating — but the entries are applied in the order given, which is
+    /// stamp order, so every per-entry check sees what the entries before it
+    /// did.
+    ///
+    /// One transaction per **run** of consecutive document entries, and one
+    /// commit per run; a batch with no schema change in it is exactly one
+    /// commit. See [`Self::apply_batch_absorbing`] for the shape.
     pub fn apply_batch(&self, entries: &[OplogEntry]) -> Result<SyncOutcome> {
+        self.apply_batch_absorbing(entries, None)
+    }
+
+    /// [`Self::apply_batch`], also raising the witnessed vector by `extra`
+    /// inside the batch's final transaction.
+    ///
+    /// The shape, and why (ADR-119). Before this, every entry in a batch was
+    /// its own transaction: a client bulk insert of 1,000 documents was one
+    /// commit on the node that accepted it and about 1,000 commits — each an
+    /// fsync under `durable` — on every node that replicated it, plus one for
+    /// the witnessed vector and one more for the coverage vector. Measured on
+    /// a three-member cluster: `kimmy_commits` and `kimmy_fsyncs` rose one per
+    /// replicated document, a 1,024-entry batch took about 145 s to apply, and
+    /// replication ran at 8–13 documents a second.
+    ///
+    /// Now consecutive document entries share one write transaction, a *run*.
+    /// A DDL entry ends the run — commit, apply the schema change through
+    /// [`Self::apply_ddl`], which commits transactions of its own because the
+    /// collection, index and vector `_inner` functions do, then start the next
+    /// run — so a batch is one commit per run rather than per entry. The
+    /// witnessed vector for the whole batch, and `extra` with it, is raised
+    /// in the last run's transaction, so nothing is committed separately for
+    /// bookkeeping. A run that fails to commit fails the round, as a failed
+    /// entry did before; the next round re-delivers it, and re-delivery is
+    /// idempotent.
+    ///
+    /// The per-entry checks are unchanged and still run per entry, in stamp
+    /// order: a node's own `UniqueViolation` is refused, a drop tombstone or an
+    /// incarnation floor supersedes what predates it, an unknown collection is
+    /// counted. They read collection metadata through read transactions,
+    /// which see the state *before* the open run — safe, because a run holds
+    /// no schema change (a DDL entry ends it) and the one piece of metadata a
+    /// document write does touch, the multikey flag, is re-read through the
+    /// write transaction by `index::maintain_remote` and `index::mark_multikey`
+    /// themselves.
+    ///
+    /// What waits for the commit: publishing to change streams, and recording
+    /// a unique violation, which mints a local entry in a transaction of its
+    /// own. Both are done once per run, after it commits, in entry order.
+    ///
+    /// The per-entry checks resolve their collection through a memo that
+    /// lives for the batch: `collection_by_id` scans every database's
+    /// collection list in read transactions of its own, and a run holds the
+    /// writer while it does, so without the memo a 1,024-entry batch paid
+    /// about 1,024 × (2 + databases) read transactions under the writer for
+    /// answers that cannot change until the next schema change. The memo is
+    /// cleared at every DDL entry, which is the only thing in a batch that can
+    /// change them.
+    fn apply_batch_absorbing(
+        &self,
+        entries: &[OplogEntry],
+        extra: Option<&VersionVector>,
+    ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
-        let mut witnessed = kimmy_core::VersionVector::new();
+        let mut witnessed = extra.cloned().unwrap_or_default();
+        let mut run = Run::default();
+        let mut memo = Memo::default();
 
         for entry in entries {
-            self.apply_one(entry, &mut outcome)?;
             // **Every** entry that was processed, on every path — applied,
             // superseded, DDL, or skipped by design. Doing this per branch is
             // exactly how the hole appeared: three of them forgot, and the
             // node then re-requested those entries on every round forever.
             // See ADR-054.
             witnessed.observe(entry.stamp);
+            self.apply_one(entry, &mut run, &mut memo, &mut outcome)?;
         }
-        // One transaction for the batch rather than one per entry: a batch is
-        // up to `MAX_BATCH` entries and this is on the sync path.
-        self.absorb_witnessed(&witnessed)?;
+
+        // The witnessed vector rides in the last run's transaction. A batch
+        // that ended in a schema change has no open run, so one is opened for
+        // the vector alone — that is the one case a batch costs a commit of
+        // bookkeeping, and it used to cost it every time.
+        if !witnessed.is_empty() {
+            let txn = self.run_txn(&mut run)?;
+            Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
+        }
+        self.commit_run(&mut run)?;
 
         if outcome.unknown_collection > 0 {
             warn!(
@@ -258,6 +334,118 @@ impl Engine {
         );
         Ok(outcome)
     }
+
+    /// The run's transaction, opened on first use.
+    ///
+    /// Opened lazily rather than at the start of the batch so that a batch
+    /// which turns out to hold only schema changes, or nothing this node
+    /// keeps, does not hold redb's single writer for the duration.
+    fn run_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
+        if run.txn.is_none() {
+            run.txn = Some(self.begin_write()?);
+        }
+        Ok(run.txn.as_ref().expect("opened just above"))
+    }
+
+    /// Commit the open run, if there is one, then do what had to wait for
+    /// the commit: record each applied entry's unique violations and publish
+    /// the run to change streams, in entry order.
+    ///
+    /// A commit that fails propagates and drops the pending work with it —
+    /// nothing is published for a run that did not land, and the entries come
+    /// again next round. A failure *after* the commit is different: the run
+    /// is durable and witnessed, so a re-delivery of its entries is superseded
+    /// and silent, and an entry whose report was skipped would never publish
+    /// and never mint its `UniqueViolation` — the hole ADR-029 exists to
+    /// close. So every pending entry is reported regardless, the run's
+    /// publishes go out in full, and the first error is returned afterwards.
+    fn commit_run(&self, run: &mut Run<'_>) -> Result<()> {
+        let Some(txn) = run.txn.take() else {
+            debug_assert!(run.pending.is_empty(), "applied entries without a transaction");
+            return Ok(());
+        };
+        txn.commit()?;
+        let mut published = Vec::with_capacity(run.pending.len());
+        let mut failed = None;
+        for Pending { collection, entry, id, violations } in run.pending.drain(..) {
+            match self.report_remote_write(&collection, &entry, &id, &violations) {
+                Ok(entries) => published.extend(entries),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.publish(published);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The collection an entry names, as this batch last saw it.
+    ///
+    /// `None` is memoised too: a batch for a collection this node lacks would
+    /// otherwise rescan every database once per entry.
+    fn memo_collection(
+        &self,
+        memo: &mut Memo,
+        id: CollectionId,
+    ) -> Result<Option<Arc<CollectionMeta>>> {
+        if let Some(found) = memo.collections.get(&id) {
+            return Ok(found.clone());
+        }
+        let found = self.collection_by_id(id)?.map(Arc::new);
+        memo.collections.insert(id, found.clone());
+        Ok(found)
+    }
+
+    /// When the collection was dropped, as this batch last saw it.
+    fn memo_dropped_at(&self, memo: &mut Memo, id: CollectionId) -> Result<Option<Stamp>> {
+        if let Some(found) = memo.dropped.get(&id) {
+            return Ok(*found);
+        }
+        let found = self.collection_dropped_at(id)?;
+        memo.dropped.insert(id, found);
+        Ok(found)
+    }
+}
+
+/// Collection metadata as resolved during one batch.
+///
+/// Valid until the next schema change, which is the only thing in a batch
+/// that can create, drop or recreate a collection — a document run cannot —
+/// so it is cleared at every DDL entry and nowhere else. An entry's own
+/// write may set an index's multikey flag, which the memoised copy will not
+/// show; nothing here reads it (the index paths re-read the definition
+/// through the write transaction), and `collection_by_id` returned the
+/// pre-run copy before the memo existed too.
+#[derive(Default)]
+struct Memo {
+    collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>>,
+    dropped: HashMap<CollectionId, Option<Stamp>>,
+}
+
+/// A run of consecutive document entries sharing one transaction.
+///
+/// `txn` is `None` between runs and before the first document entry.
+/// `pending` is what each applied entry left for after the commit; it is
+/// empty whenever `txn` is.
+#[derive(Default)]
+struct Run<'e> {
+    txn: Option<WriteTxn<'e>>,
+    pending: Vec<Pending>,
+}
+
+/// An entry applied into the open run, with what its commit owes.
+///
+/// One copy of the entry per applied entry until the run commits, bounded by
+/// the batch size the transport asks for; the collection is shared with the
+/// batch's memo rather than copied.
+struct Pending {
+    collection: Arc<CollectionMeta>,
+    entry: OplogEntry,
+    id: DocId,
+    violations: Vec<UniqueViolation>,
 }
 
 /// Turn "that collection is not here" into `None` rather than an error.
@@ -290,20 +478,19 @@ fn gone<T>(result: Result<T>) -> Result<Option<T>> {
 }
 
 impl Engine {
-    /// Apply a replicated schema change.
-    ///
-    /// Every arm is idempotent, because a peer resending an overlapping range
-    /// is the normal case rather than an error. Idempotency is expressed as
-    /// "is the world already like this?" rather than "have I seen this entry?"
-    /// — the second would need per-entry bookkeeping that the oplog already
-    /// provides, and would be wrong after a rebuild.
-    ///
-    /// The originating entry is appended either way, so this node's version
-    /// vector advances and further peers learn of the change from it. That is
-    /// the same rule `apply_remote` follows for documents.
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
-    fn apply_one(&self, entry: &OplogEntry, outcome: &mut SyncOutcome) -> Result<()> {
+    ///
+    /// A document entry is written into `run`'s transaction, opening one if
+    /// none is open; a schema change first commits the run, because the DDL
+    /// path commits transactions of its own and redb has one writer.
+    fn apply_one<'e>(
+        &'e self,
+        entry: &OplogEntry,
+        run: &mut Run<'e>,
+        memo: &mut Memo,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
         // A node's own observation of a broken constraint is not a fact
         // about the data; refuse it even if a peer sends one.
         if entry.kind == OpKind::UniqueViolation {
@@ -311,8 +498,14 @@ impl Engine {
         }
 
         // Schema changes come first in stamp order, so a collection exists
-        // by the time documents for it arrive.
+        // by the time documents for it arrive. One ends the current run:
+        // the documents before it must be durable before the DDL path opens
+        // its own transactions, and the ones after it start a new run.
         if entry.kind.is_ddl() {
+            self.commit_run(run)?;
+            // Whatever the batch knew about collections may be wrong after
+            // this, whether or not the change turns out to apply.
+            *memo = Memo::default();
             if self.apply_ddl(entry)? {
                 outcome.ddl += 1;
             } else {
@@ -330,14 +523,14 @@ impl Engine {
         // the documents it is still replaying. Checked by id, because a
         // node that dropped the collection can no longer resolve that id
         // to a name.
-        if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
+        if let Some(dropped_at) = self.memo_dropped_at(memo, entry.collection)?
             && entry.stamp < dropped_at
         {
             outcome.superseded += 1;
             return Ok(());
         }
 
-        let Some(collection) = self.collection_by_id(entry.collection)? else {
+        let Some(collection) = self.memo_collection(memo, entry.collection)? else {
             outcome.unknown_collection += 1;
             return Ok(());
         };
@@ -359,14 +552,35 @@ impl Engine {
             return Ok(());
         }
 
-        if self.apply_remote(&collection, entry)? {
-            outcome.applied += 1;
-        } else {
-            outcome.superseded += 1;
+        let txn = self.run_txn(run)?;
+        match self.apply_remote_in_txn(txn, &collection, entry)? {
+            RemoteApplied::Applied { id, violations } => {
+                outcome.applied += 1;
+                run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
+            }
+            // Nothing was written, so the run's transaction is exactly as it
+            // was; the next entry carries on in it.
+            RemoteApplied::Superseded => outcome.superseded += 1,
         }
         Ok(())
     }
 
+    /// Apply a replicated schema change.
+    ///
+    /// Every arm is idempotent, because a peer resending an overlapping range
+    /// is the normal case rather than an error. Idempotency is expressed as
+    /// "is the world already like this?" rather than "have I seen this entry?"
+    /// — the second would need per-entry bookkeeping that the oplog already
+    /// provides, and would be wrong after a rebuild.
+    ///
+    /// The originating entry is appended either way, so this node's version
+    /// vector advances and further peers learn of the change from it. That is
+    /// the same rule `apply_remote` follows for documents.
+    ///
+    /// Commits transactions of its own — the collection, index and vector
+    /// `_inner` functions each do — which is why a batch's document run is
+    /// committed before one of these is applied (ADR-119).
+    ///
     /// Returns whether the change was applied. `false` means it named a
     /// collection this node no longer has, which is history rather than an
     /// error — see [`gone`].
@@ -1102,6 +1316,180 @@ mod tests {
         let cb = b.get_collection("shop", "orders").expect("the collection must exist on b");
         assert_eq!(cb.id, ca.id, "and address the same storage");
         assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_replicated_batch_is_one_commit_however_many_entries_it_holds() {
+        // The replica's half of
+        // `a_batch_is_one_commit_however_many_documents_it_holds` (ADR-119). A
+        // bulk insert is one commit where it was accepted; before this it was
+        // one commit *per document* on every node that replicated it, each an
+        // fsync under `durable` — measured on a three-member cluster at 8–13
+        // documents a second.
+        const N: usize = 200;
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        let batch: Vec<_> = (0..N as i64).map(|n| doc! { "_id": n, "n": n }).collect();
+        a.insert_many(&ca, batch).unwrap();
+
+        // Only the documents: the creation entry is a schema change, which
+        // ends a run by design and is measured separately below.
+        let theirs = a.version_vector().unwrap();
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        assert_eq!(entries.len(), N);
+
+        let (commits, fsyncs) = (b.commits(), b.fsyncs());
+        let outcome = b.apply_peer_batch(&theirs, &entries, BATCH).unwrap();
+        assert_eq!(outcome.applied, N);
+        assert_eq!(
+            b.commits() - commits,
+            1,
+            "{N} replicated documents, the witnessed vector and the coverage vector \
+             must be one commit"
+        );
+        assert_eq!(b.fsyncs() - fsyncs, 1, "and so one fsync");
+        assert_eq!(b.count(&cb).unwrap() as usize, N, "every document landed");
+        assert!(
+            b.witnessed_vector().unwrap().covers(&theirs),
+            "and the round's coverage was recorded in that same commit"
+        );
+    }
+
+    #[test]
+    fn a_schema_change_mid_batch_splits_it_into_runs_that_commit_once_each() {
+        // A DDL entry commits transactions of its own, so it cannot share the
+        // documents' transaction: the documents before it are one run, the
+        // ones after it another, and both sides of it must land.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders_a = a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        for n in 0..3_i64 {
+            a.insert(&orders_a, doc! { "_id": n }).unwrap();
+        }
+        let items_a = a.create_collection("shop", "items").unwrap();
+        for n in 0..3_i64 {
+            a.insert(&items_a, doc! { "_id": n }).unwrap();
+        }
+        // Stamp order: three documents, the creation of `items`, three more.
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document() || e.collection == items_a.id)
+            .collect();
+        assert_eq!(entries.len(), 7);
+        assert!(entries[3].kind.is_ddl(), "the schema change sits between the two runs");
+
+        // What the schema change costs on its own, on a third engine: its
+        // transactions plus one for the witnessed vector, which a batch with
+        // no document run has to commit by itself.
+        let (c, _dc) = engine();
+        let before = c.commits();
+        c.apply_batch(&entries[3..4]).unwrap();
+        let ddl_alone = c.commits() - before;
+
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!((outcome.applied, outcome.ddl), (6, 1), "{outcome:?}");
+        // Two runs, one commit each; the schema change's own commits are the
+        // same as on `c`, and its witnessed-vector commit there stands in for
+        // the second run here, which carries the vector.
+        assert_eq!(
+            b.commits() - before,
+            ddl_alone + 1,
+            "one commit per run of documents, not per document"
+        );
+
+        let orders_b = b.get_collection("shop", "orders").unwrap();
+        let items_b = b.get_collection("shop", "items").expect("created mid-batch");
+        assert_eq!(b.count(&orders_b).unwrap(), 3, "the run before the schema change landed");
+        assert_eq!(b.count(&items_b).unwrap(), 3, "and the run after it");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    #[test]
+    fn a_superseded_entry_mid_batch_does_not_stop_the_rest_of_the_run() {
+        // A losing entry used to abort its own transaction; in a shared one it
+        // must simply write nothing, and the entries after it in the same
+        // transaction must still land. And it is still witnessed (ADR-054).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        for n in 1..=3_i64 {
+            a.insert(&ca, doc! { "_id": n, "who": "a" }).unwrap();
+        }
+        // B writes _id 2 later, so A's version of it loses.
+        b.insert(&cb, doc! { "_id": 2, "who": "b" }).unwrap();
+
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!((outcome.applied, outcome.superseded), (2, 1), "{outcome:?}");
+        assert_eq!(b.commits() - before, 1, "still one commit for the run");
+
+        for (id, who) in [(1, "a"), (2, "b"), (3, "a")] {
+            let got = b.get(&cb, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(got.get_str("who").unwrap(), who, "_id {id}");
+        }
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "the discarded entry is covered, so it is never asked for again"
+        );
+    }
+
+    #[test]
+    fn a_unique_violation_mid_batch_is_still_recorded_and_the_batch_still_commits() {
+        // Recording a violation mints a local entry in its own transaction,
+        // which cannot happen while the run's transaction is open. It waits
+        // for the commit and must still happen — a converged write with an
+        // unreported violation is the failure ADR-029 exists to prevent.
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+
+        let origin = kimmy_core::NodeId::generate();
+        let remote = |ms: u64, id: &str, email: &str| OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin),
+            kind: OpKind::Insert,
+            collection: cb.id,
+            doc_id: Some(DocId::String(id.into())),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": id, "email": email }).unwrap()),
+        };
+        let entries = vec![
+            remote(9_000, "before", "a@x"),
+            remote(9_001, "remote", "clash@x"),
+            remote(9_002, "after", "c@x"),
+        ];
+
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!(outcome.applied, 3, "the colliding write is merged, not refused: {outcome:?}");
+        assert_eq!(b.commits() - before, 2, "the run, then the violation's own entry after it");
+        assert_eq!(b.unique_violations(), 1);
+        assert_eq!(b.count(&cb).unwrap(), 4, "every document is present, the collision included");
+        let recorded = b
+            .read_oplog_from(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == OpKind::UniqueViolation)
+            .count();
+        assert_eq!(recorded, 1, "a `UniqueViolation` entry exists for change streams");
     }
 
     #[test]

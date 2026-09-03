@@ -749,20 +749,24 @@ impl Engine {
             return Ok(());
         }
         let txn = self.begin_write()?;
-        {
-            let mut table = txn.open_table(tables::OPLOG_WITNESSED)?;
-            for (node, hlc) in seen.iter() {
-                let key = node.to_bytes();
-                let higher = match table.get(key.as_slice())? {
-                    Some(current) => hlc > decode_hlc(current.value())?,
-                    None => true,
-                };
-                if higher {
-                    table.insert(key.as_slice(), hlc.to_bytes().as_slice())?;
-                }
-            }
-        }
+        Self::absorb_witnessed_in_txn(&txn, seen)?;
         txn.commit()?;
+        Ok(())
+    }
+
+    /// [`Self::absorb_witnessed`] inside a transaction the caller owns.
+    ///
+    /// A sync batch raises its witnessed vector in the same transaction that
+    /// holds the batch's last run of documents, so a DDL-free batch is one
+    /// commit rather than one plus one (ADR-119). Same rule as the wrapper:
+    /// an origin only ever moves up.
+    pub(crate) fn absorb_witnessed_in_txn(
+        txn: &redb::WriteTransaction,
+        seen: &kimmy_core::VersionVector,
+    ) -> Result<()> {
+        for (node, hlc) in seen.iter() {
+            raise_version(txn, tables::OPLOG_WITNESSED, &Stamp::new(hlc, node))?;
+        }
         Ok(())
     }
 

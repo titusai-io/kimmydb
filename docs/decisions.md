@@ -6519,3 +6519,103 @@ place to look after a tag is the `build-local-artifacts` log for the Linux
 targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---
+
+## ADR-119 — A replica applies a peer batch in one transaction
+
+**Decision.** `Engine::apply_batch` applies a batch of replicated entries in
+**runs**: every maximal sequence of consecutive document entries goes into one
+write transaction, opened through `Engine::begin_write` on the first document
+and committed once. A DDL entry ends the run — the run commits, the schema
+change goes through `apply_ddl` as before, and the next document entry opens
+the next run. The batch's witnessed vector, and for `apply_peer_batch` the
+coverage vector `coverage_after_batch` computes, are raised inside the last
+run's transaction rather than in transactions of their own. So a batch with no
+schema change in it is exactly one commit and, under `durable`, one fsync.
+`apply_remote` is split into `apply_remote_in_txn`, which writes into a caller's
+transaction and writes nothing when the entry loses, and `report_remote_write`,
+which does what has to follow the commit: counting and recording unique
+violations, and returning the entries to publish. The public `apply_remote` is
+the two around a transaction of its own, for snapshot restore and for tests.
+Defended by `a_replicated_batch_is_one_commit_however_many_entries_it_holds`.
+
+**Why.** Measured on a three-member cluster running 0.19.1. A client bulk
+insert of 1,000 documents is one commit on the node that accepts it —
+`insert_in_txn`, pinned by
+`a_batch_is_one_commit_however_many_documents_it_holds` — and was about 1,000
+commits on every node that replicated it:
+`apply_batch` called `apply_one` per entry, `apply_one` called `apply_remote`,
+and `apply_remote` opened and committed its own transaction. `apply_ddl`
+committed once more for the originating entry it appends, `absorb_witnessed`
+once for the batch's witnessed vector, and `apply_peer_batch` once again for
+the coverage vector: a DDL-free batch of N entries cost about N + 2 commits.
+Under `durable` every commit is an fsync, so `kimmy_commits` and
+`kimmy_fsyncs` rose one for one per replicated document, a 1,024-entry sync
+batch took about 145 s to apply, and replication ran at 8–13 documents a
+second — 1,000 documents converged in 78.7 s, 4,000 in 492.6 s, 500 in 61 s.
+The writer's side had been fixed for exactly this reason; the replica's side
+had never been measured, and nothing counted it, because `kimmy_commits` is
+read against `kimmy_requests_total` and a replica's commits answer no request.
+
+**What a run holds fixed.** Every per-entry check is unchanged and still runs
+per entry, in stamp order: a peer's `UniqueViolation` is refused, the drop
+tombstone and the incarnation floor supersede what predates them, an unknown
+collection is counted. Those checks read collection metadata through read
+transactions, which see the state before the open run — which is safe,
+because a run contains no schema change by construction. The one piece of
+metadata a document write does touch, an index's multikey flag, is re-read
+through the write transaction by `index::maintain_remote` and
+`index::mark_multikey` themselves, so an entry that flips it is seen by the
+next entry in the same run. A losing entry writes nothing and the run carries
+on; it is still witnessed (ADR-054). The unique-violation entry is minted after
+the run commits, in its own transaction, as it was — the merge must not fail
+because the report did (ADR-029) — and the run is published once, after its
+commit, in entry order, so nothing reaches a change stream before it is
+durable.
+
+**Why DDL ends a run.** `apply_ddl` reaches the collection, index and vector
+`_inner` functions, each of which opens and commits transactions of its own,
+and redb has one writer: the run has to be committed before any of them can
+begin. Threading a transaction through every `_inner` would make this the
+change that touches every DDL path in the engine for the sake of a case that
+is rare in a batch — schema changes are a handful of entries in a log of
+documents — and would give up the property that a replicated schema change is
+applied exactly as a local one is. Splitting at the DDL keeps the DDL path
+untouched and costs one extra commit per schema change in a batch.
+
+**Alternatives.** *Leave the per-entry transaction and rely on `coalesced`.*
+It shares the fsync but not the commit: redb still serialises N transactions
+through its single writer, each waiting at the barrier, and the default class
+is `durable`. *Open one transaction for the whole batch and apply DDL inside
+it.* Rejected above. *Commit per run and per entry for the witnessed vector as
+well.* The vector is derived bookkeeping and rides in whatever transaction
+commits last; there is no reason it should ever be a commit of its own when a
+run is open. *Batch the coverage vector separately in `apply_peer_batch`, as
+before.* One more commit per round for nothing; `coverage_after_batch` is pure,
+so folding it into the last run is free.
+
+**Cost.** A run holds redb's single writer for as long as its entries take to
+apply — up to a full batch of 1,024 entries — where before it was released
+between entries. A local write on a replica waits for the run rather than for
+one entry; at the measured rate that is milliseconds of CPU rather than the
+seconds of fsync it used to wait behind, but it is a longer *single* wait,
+and `kimmy_runtime_stall_seconds` is where it would show. A run that fails to
+commit loses the whole run rather than one entry; the round fails as it did
+before, the next round re-delivers, and re-delivery is idempotent. On a
+replica `kimmy_commits` and `kimmy_fsyncs` now rise per batch rather than per
+document, so any dashboard that read a replica's commit rate as its document
+rate reads a much smaller number; `kimmy_replication_lag_seconds` and the
+`cluster.sync` span's `applied` are the document-rate figures. A run publishes
+its entries to change streams in one burst after its commit rather than one
+at a time as each committed, and the live feed's ring holds 1,024 events —
+the same as `MAX_BATCH` — so a full batch that also mints a `UniqueViolation`
+entry can overrun a subscriber that is not keeping up in one go. That is lag,
+not loss: a subscriber that falls behind the ring resumes from the oplog,
+which is what `a_lagging_consumer_recovers_from_the_oplog_without_losing_events`
+defends, and the entries are durable before any of them is published. A run
+also holds a second copy of each applied entry until it commits — the
+`Pending` list carries the entry and the document id, with the collection
+metadata shared through the batch's memo rather than copied — bounded by the
+batch size, 1,024 entries. Snapshot restore still applies one document per
+transaction; it is a one-time path and is left as it is.
+
+---

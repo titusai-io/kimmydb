@@ -265,6 +265,7 @@ pub fn next_index_id(&self) -> u32 {
 | `update` / `delete` with `multi: true` | **Chunked**: one transaction per `storage.multi_chunk_docs` documents (default 1,000), each chunk all or nothing, the writer released between chunks (ADR-086) |
 | Crash mid-request | Every chunk that committed stays; the chunk in flight is lost whole; the oplog reflects exactly what landed, and the response's `commits` says how many chunks did |
 | `insert_many` | One transaction; all or nothing |
+| A sync batch from a peer | One transaction per run of consecutive document entries, the witnessed vector in the last one; a schema change in the batch ends a run. A DDL-free batch is one commit and one fsync on the replica, as the bulk insert it carries was on the writer (ADR-119) |
 
 > **Sharp edge.** A `multi: true` update or delete is atomic per *chunk*, not
 > per request: a failure in the third chunk leaves the first two committed and
