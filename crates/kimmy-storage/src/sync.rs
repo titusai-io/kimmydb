@@ -327,11 +327,15 @@ impl Engine {
         let mut memo = Memo::default();
 
         for entry in entries {
-            // **Every** entry that was processed, on every path — applied,
-            // superseded, DDL, or skipped by design. Doing this per branch is
+            // **Every** entry the batch takes, on every path — applied,
+            // superseded, DDL, or skipped by design — is observed here, once,
+            // before `apply_one` branches on it. Doing this per branch is
             // exactly how the hole appeared: three of them forgot, and the
             // node then re-requested those entries on every round forever.
-            // See ADR-054.
+            // Observing before applying is safe: an error from `apply_one`
+            // fails the whole batch, and the vector is dropped with it, so no
+            // stamp is recorded for an entry that was not applied. See
+            // ADR-054.
             witnessed.observe(entry.stamp);
             self.apply_one(entry, &mut run, &mut memo, &mut outcome)?;
         }

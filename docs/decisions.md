@@ -6617,7 +6617,10 @@ also holds a second copy of each applied entry until it commits — the
 metadata shared through the batch's memo rather than copied — bounded by the
 batch size, 1,024 entries. Snapshot restore still applies one document per
 transaction; it is a one-time path and is left as it is.
-## ADR-120 — JSON object key order is preserved through the HTTP boundary
+
+---
+
+## ADR-120 — JSON object key order is preserved through the HTTP and MCP boundary
 
 **Decision.** The workspace's `serde_json` is built with `preserve_order`, so
 `serde_json::Map` keeps insertion order — the order the keys arrived in the
@@ -6754,6 +6757,9 @@ pass over the source document's top-level keys per result to reorder, and
 `shift_remove` on the picked document, which is small. Two orders of stored
 document now coexist on a node that was upgraded, and the comparison case
 above is the only place that shows.
+
+---
+
 ## ADR-121 — A request body with a field the route does not define is refused
 
 **Decision.** Every request shape the API deserializes carries
@@ -6850,9 +6856,14 @@ nothing the server does not define; a third-party client that hand-rolls a
 body with an extra field meets a `422` that names it. The MCP `hybrid_search`
 arguments spell out the search fields rather than flattening
 `vector_search`'s, because serde cannot refuse unknown fields across a
-flatten; the schema the model reads is the same. One more contract test, and
-the closed-schema test now distinguishes a component only a request reaches
-from one a response does.
+flatten; the schema the model reads is the same. Two more contract tests,
+`every_request_shape_is_closed` and
+`every_operation_with_a_query_parameter_documents_the_400`, and the
+closed-schema test now distinguishes a component only a request reaches from
+one a response does.
+
+---
+
 ## ADR-122 — The replication lag gauge measures age behind, not the span of missing history
 
 **Decision.** `kimmy_replication_lag_seconds` is how far behind in time this

@@ -12,17 +12,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-A minor when it ships, not a patch. Nothing changes on disk or between
-members: a node of this version and a 0.19.1 node replicate to each other.
-But three things a 0.19.1 node accepted are refused or answered differently
-now, and the pre-1.0 policy puts them behind a `0.MINOR` bump: a request body
-or query string carrying a field the route does not define is refused; a
-`$$variable` string in a `$lookup` sub-pipeline `$match` is refused instead of
-matching nothing; and JSON object key order now survives the boundary, so
-update operators apply in the order written and a document keeps the field
-order it was stored with. The replication lag gauge also changes what it
-measures, which matters to anyone alerting on it. All five entries below come
-from one test round against a three-member cluster running 0.19.1.
+A minor when it ships, not a patch. Nothing changes on the wire between
+members, a 0.19.1 node reads everything this one writes, and the two replicate
+to each other. But three things a 0.19.1 node accepted are refused or answered
+differently now, and the pre-1.0 policy puts them behind a `0.MINOR` bump: a
+request body or query string carrying a field the route does not define is
+refused; a `$$variable` string in a `$lookup` sub-pipeline `$match` is refused
+instead of matching nothing; and JSON object key order now survives the
+boundary, so update operators apply in the order written and a document keeps
+the field order it was stored with. The replication lag gauge also changes
+what it measures, which matters to anyone alerting on it. All five entries
+below come from one test round against a three-member cluster running 0.19.1.
 
 ### Changed
 
@@ -94,9 +94,10 @@ from one test round against a three-member cluster running 0.19.1.
   span's `applied` are the document-rate figures — and a local write on a
   replica may wait for a whole batch to apply rather than for one entry. A
   replica also publishes a batch to change streams in one burst after it
-  commits, so a subscriber that is not keeping up can fall behind the live
-  feed's 1,024-event ring in one batch; it resumes from the oplog and loses
-  nothing. ADR-119.
+  commits, and the live feed's ring holds 1,024 events — the same as a full
+  batch — so a full batch that also mints a unique-violation entry can overrun
+  a subscriber that is not keeping up in one go; it resumes from the oplog and
+  loses nothing. ADR-119.
 
 - **A `let` variable written into a `$lookup` sub-pipeline `$match` is now
   refused instead of silently matching nothing.** `docs/aggregation.md` said
@@ -112,6 +113,7 @@ from one test round against a three-member cluster running 0.19.1.
   filter are unchanged as well: there `"$$oid"` is the literal string a
   stored document may hold. Write the correlation as the docs show — bind the
   variable in an `$addFields` stage and `$match` on the computed field.
+  `docs/deviations.md`.
 
 - **Update operators apply in the order the request wrote them, and a
   document's fields are stored in the order they arrived.** The query
