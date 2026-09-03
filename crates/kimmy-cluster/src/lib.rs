@@ -29,5 +29,8 @@ pub mod transport;
 pub use discovery::{DEFAULT_CLUSTER_PORT, ResolveError, SeedSource};
 pub use health::{DEFAULT_FANOUT, MAX_BACKOFF, PeerHealth, WARN_INTERVAL};
 pub use membership::{Member, Members, SeedFeed};
-pub use peers::{DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ReplicationConfig, replicate};
+pub use peers::{
+    DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ReplicationConfig, RoundHook, RoundReport,
+    replicate,
+};
 pub use transport::{serve, sync_once};

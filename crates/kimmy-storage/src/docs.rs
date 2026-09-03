@@ -746,6 +746,72 @@ impl Engine {
         }
         Ok(published)
     }
+
+    /// The part of a replicated unique index's build that must follow its
+    /// commit: count and record each key the existing documents already
+    /// shared, and publish the `UniqueViolation` entries minted for them.
+    ///
+    /// The backfill equivalent of [`Self::report_remote_write`], and the
+    /// entries it mints are read by the same route: `live_unique_violations`
+    /// groups a record by index and id set and re-checks its members against
+    /// the documents as they are now, so a record here names every holder of
+    /// the key, exactly as a merged write's does. What that route keeps as
+    /// recorded is `merged`, the document whose arrival revealed the
+    /// collision. A backfill has no arrival; the holder the scan met last is
+    /// named, because it is the one whose presence turned a key with one
+    /// holder into a collision — the same role the merged write plays.
+    ///
+    /// The count and the log are per key, as for a merged write, so a build
+    /// over three documents sharing one value is one violation, not three.
+    ///
+    /// The shape is `commit_run`'s in `sync.rs`, for the hole it documents:
+    /// the index is already committed when this runs, so a re-delivery of the
+    /// create meets the same-definition short-circuit and never reaches the
+    /// backfill again. A failure recording violation *k* that returned at
+    /// once would discard the entries already minted for 1..k-1 unpublished
+    /// and never record k+1..n — collisions lost for good, since nothing
+    /// will find them a second time. So every violation is reported
+    /// regardless, everything that was minted is published, and the first
+    /// error is returned afterwards. The failure is not injectable from a
+    /// test — recording fails only when the store itself does — which is
+    /// why this says so rather than proving it.
+    pub(crate) fn report_index_backfill_violations(
+        &self,
+        coll: &CollectionMeta,
+        violations: &[index::UniqueViolation],
+    ) -> Result<()> {
+        let mut published = Vec::with_capacity(violations.len());
+        let mut failed = None;
+        for violation in violations {
+            let Some(last) = violation.holders.last() else { continue };
+            let revealed_by = match self.document_at_key(coll, last) {
+                Ok(Some(id)) => id,
+                Ok(None) => continue,
+                Err(e) => {
+                    failed.get_or_insert(e);
+                    continue;
+                }
+            };
+            self.count_unique_violation();
+            warn!(
+                index = %violation.index,
+                holders = violation.holders.len(),
+                collection = %coll.name,
+                "a replicated unique index was built over documents that already share a key"
+            );
+            match self.log_unique_violation(coll, &revealed_by, violation) {
+                Ok(entry) => published.push(entry),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.publish(published);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
 }
 
 /// What [`Engine::apply_remote_in_txn`] decided, and what it left for after

@@ -186,11 +186,46 @@ little space and removes the hole.
 encode identically, so a lookup for `5` finds a document that stored `5.0`. See
 [Key Encoding](key-encoding.md).
 
-### Compound indexes over two arrays are rejected
+### Compound indexes over two arrays are rejected — per document, at write time
 
 A compound index spanning two array fields would write the cartesian product —
-`|a| × |b|` entries for a single document. Mongo rejects this; so does KimmyDB,
-with a hard cap of 1,000 keys per document as a backstop.
+`|a| × |b|` entries for a single document. Mongo rejects this ("cannot index
+parallel arrays"); so does KimmyDB, with a hard cap of 1,000 keys per document
+as a backstop.
+
+**When the rule bites.** The check runs on each document as its keys are
+computed, because that is the only moment the store knows what the document
+holds. So:
+
+- Creating a compound index over a collection in which **no** document holds
+  arrays at two of its paths succeeds, and is marked `multikey` if any document
+  holds one.
+- A later write of a document that holds arrays at two of the index's paths is
+  **refused with `400`**, naming the index.
+- Creating the index over a collection that **already** holds such a document
+  is refused, naming the index.
+
+A schemaless store cannot refuse the definition at creation without refusing
+every compound index: nothing says the two fields will never both be arrays,
+and nothing says they ever will be. The rule is a property of the pair
+(definition, document), and it is checked where the pair meets.
+
+**On a replica.** A definition replicates as an operation, and the replica
+builds it over *its own* documents. If those cannot be indexed under it — a
+two-array document written legally once the index had been dropped on the
+origin, say, and re-served with the creation in an overlapping window — the
+replica **skips the definition**, logs a warning naming the index and the
+reason, and counts it in `kimmy_sync_ddl_refused_total`. The round goes on,
+the entries behind it arrive, and the definition stands on the members that
+could build it. It does not fail the round: the refusal is a fact about the
+replica's data, and retrying the same entry could never succeed.
+
+**A dropped index leaves a tombstone.** Like a dropped collection, an index
+drop is recorded in `indexes_dropped` under the drop's stamp and kept for
+`tombstone_retention_secs`, so a creation re-served or replayed after the drop
+— which anti-entropy does routinely — reads as history and does not rebuild
+it. Creating an index of the same name again, stamped after the drop, is a new
+index and wins. See [ADR-123](decisions.md).
 
 ---
 

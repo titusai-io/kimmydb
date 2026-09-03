@@ -69,6 +69,7 @@ const T_OPLOG_ARRIVAL: u8 = 7;
 const T_OPLOG_ARRIVAL_SEQ: u8 = 8;
 const T_COLLECTIONS_DROPPED: u8 = 9;
 const T_OPLOG_VERSIONS: u8 = 10;
+const T_INDEXES_DROPPED: u8 = 11;
 
 /// What a backup or restore moved.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -169,6 +170,14 @@ impl Engine {
             .to_be_bytes()
             .to_vec());
         simple!(T_OPLOG_VERSIONS, tables::OPLOG_VERSIONS, <[u8]>::to_vec);
+        // An index tombstone travels for the reason a collection's does: a
+        // restore that forgot it would rebuild the index on the next replay
+        // of its creation (ADR-123).
+        simple!(T_INDEXES_DROPPED, tables::INDEXES_DROPPED, |k: (u64, u32)| {
+            let mut out = k.0.to_be_bytes().to_vec();
+            out.extend_from_slice(&k.1.to_be_bytes());
+            out
+        });
 
         // Value types that are not `&[u8]` need their own arm.
         match txn.open_table(tables::OPLOG_ARRIVAL_SEQ) {
@@ -301,6 +310,7 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
             let mut arrival_seq = txn.open_table(tables::OPLOG_ARRIVAL_SEQ)?;
             let mut dropped = txn.open_table(tables::COLLECTIONS_DROPPED)?;
             let mut versions = txn.open_table(tables::OPLOG_VERSIONS)?;
+            let mut indexes_dropped = txn.open_table(tables::INDEXES_DROPPED)?;
 
             loop {
                 let mut tag = [0u8; 1];
@@ -362,6 +372,14 @@ pub fn restore(path: &Path, input: &mut impl Read) -> Result<BackupInfo> {
                     }
                     T_OPLOG_VERSIONS => {
                         versions.insert(key.as_slice(), value.as_slice())?;
+                    }
+                    T_INDEXES_DROPPED => {
+                        let (coll, rest) = split_u64(&key)?;
+                        if rest.len() != 4 {
+                            return Err(StorageError::Database("bad index tombstone key".into()));
+                        }
+                        let index_id = u32::from_be_bytes(rest.try_into().expect("4 bytes"));
+                        indexes_dropped.insert((coll, index_id), value.as_slice())?;
                     }
                     // A tag this build does not know means the backup came from
                     // a newer version. Skipping it would restore a database
@@ -434,6 +452,9 @@ mod tests {
         // A dropped collection, so its tombstone is as well.
         engine.create_collection("shop", "scratch").unwrap();
         engine.drop_collection("shop", "scratch").unwrap();
+        // And a dropped index, so its tombstone is too.
+        engine.create_index("shop", "orders", vec![field("qty")], false, None).unwrap();
+        engine.drop_index("shop", "orders", "qty_1").unwrap();
         (engine, dir)
     }
 
@@ -501,6 +522,32 @@ mod tests {
         assert!(
             restored.get_collection("shop", "scratch").is_err(),
             "a dropped collection must not come back"
+        );
+    }
+
+    #[test]
+    fn a_dropped_index_stays_dropped_after_a_restore() {
+        // The tombstone is the only thing standing between a restored node
+        // and a replayed `CreateIndex` rebuilding the index over documents
+        // the definition can no longer be built on (ADR-123).
+        let (engine, _dir) = populated();
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let index_id = kimmy_core::IndexMeta::derive_id("qty_1");
+        let dropped_at = engine.index_dropped_at(coll.id, index_id).unwrap().expect("recorded");
+        let mut buf = Vec::new();
+        engine.backup_to(&mut buf).unwrap();
+
+        let dest = tempfile::tempdir().unwrap();
+        let path = dest.path().join("restored.redb");
+        restore(&path, &mut buf.as_slice()).unwrap();
+
+        let restored = Engine::open(&path).unwrap();
+        let rcoll = restored.get_collection("shop", "orders").unwrap();
+        assert!(rcoll.index("qty_1").is_none(), "the index itself must stay dropped");
+        assert_eq!(
+            restored.index_dropped_at(rcoll.id, index_id).unwrap(),
+            Some(dropped_at),
+            "the index tombstone must survive a restore, stamp and all"
         );
     }
 

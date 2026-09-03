@@ -475,10 +475,13 @@ where
             }
         };
 
-        let applied = engine
+        let page_outcome = engine
             .apply_snapshot_page(&page)
             .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        outcome.applied += applied;
+        outcome.applied += page_outcome.applied;
+        // Counted where a refusal reached through the oplog is, so the
+        // metric and the round report do not depend on the route (ADR-123).
+        outcome.ddl_refused += page_outcome.ddl_refused;
 
         match page.next {
             Some(next) => cursor = Some(next),
