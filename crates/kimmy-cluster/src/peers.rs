@@ -57,7 +57,8 @@ pub struct ReplicationConfig {
     /// answered. Discovery remains the bootstrap and the fallback.
     pub members: Option<Members>,
     /// Called after each sync round with the round's worst replication lag,
-    /// in seconds.
+    /// in seconds: how far behind in time this node is against the peers it
+    /// reached (ADR-122).
     ///
     /// A callback rather than a metrics handle: the peer's version vector —
     /// the only thing lag can honestly be computed from — exists nowhere but

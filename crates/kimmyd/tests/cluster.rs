@@ -377,9 +377,10 @@ async fn replication_converges_through_gossip_discovered_peers() {
     .await;
 
     // A converged cluster must read zero replication lag on every node — the
-    // gauge measures unapplied peer history, and there is none left. This is
-    // asserted after convergence rather than before because the gauge only
-    // updates when a sync round reaches a peer.
+    // gauge measures how far behind a node is where a peer holds newer, and
+    // no peer holds anything newer. This is asserted after convergence rather
+    // than before because the gauge only updates when a sync round reaches a
+    // peer.
     eventually("every node to report zero replication lag", || {
         let client = &client;
         let nodes = [&a, &b, &c];

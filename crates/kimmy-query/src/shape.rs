@@ -159,19 +159,49 @@ pub fn project(projection: Option<&Projection>, doc: &Document) -> Document {
             out
         }
         Some(Projection::Include(paths)) => {
-            let mut out = Document::new();
+            let mut picked = Document::new();
             for p in paths {
                 // Take the first match: a projection names one destination, so
                 // fanning an array traversal out would change the shape.
                 if let Some(value) = path::resolve(doc, p).first() {
                     // Ignore errors: a path that cannot be written (e.g. into
                     // an array without an index) simply is not projected.
-                    let _ = path::set(&mut out, p, (*value).clone());
+                    let _ = path::set(&mut picked, p, (*value).clone());
                 }
             }
-            out
+            in_document_order(picked, doc)
         }
     }
+}
+
+/// Reorder an inclusion projection's output to the source document's field
+/// order, at every level the projection reached into.
+///
+/// Walking the projection's paths builds the output in *specification* order —
+/// `{alpha: 1, zeta: 1}` over `{_id, zeta, alpha}` gave `{alpha, zeta, _id}`,
+/// with `_id` last because the parser appends the implicit `_id` to the list.
+/// That was invisible while the JSON boundary sorted every object (ADR-120)
+/// and wrong once it stopped: MongoDB returns projected fields in the order
+/// the document holds them, `_id` first, and `docs/compatibility.md` now says
+/// a client may rely on stored order. The picking is left as it was and the
+/// result is reordered afterwards, so the array and dotted-path rules above
+/// are untouched; a field that was picked but has no counterpart at this
+/// level of the source (a path set through an array, say) keeps its place at
+/// the end.
+fn in_document_order(mut picked: Document, source: &Document) -> Document {
+    let mut out = Document::new();
+    for (key, original) in source {
+        let Some(value) = picked.remove(key) else { continue };
+        let value = match (value, original) {
+            (Bson::Document(inner), Bson::Document(from)) => {
+                Bson::Document(in_document_order(inner, from))
+            }
+            (value, _) => value,
+        };
+        out.insert(key.clone(), value);
+    }
+    out.extend(picked);
+    out
 }
 
 #[cfg(test)]
@@ -189,6 +219,28 @@ mod tests {
     fn projected(spec: Document, doc: Document) -> Document {
         let p = parse_projection(&spec).unwrap();
         project(p.as_ref(), &doc)
+    }
+
+    fn keys(doc: &Document) -> Vec<&str> {
+        doc.keys().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn an_inclusion_projection_keeps_the_document_field_order() {
+        // The specification names the fields in the opposite order to the
+        // document, and leaves `_id` implicit, which the parser appends last.
+        let doc = doc! { "_id": 1, "zeta": 1, "alpha": { "y": 2, "x": 1 }, "mid": 3 };
+        let out = projected(doc! { "alpha": 1, "zeta": 1 }, doc.clone());
+        assert_eq!(keys(&out), ["_id", "zeta", "alpha"]);
+
+        // Reaching into a sub-document keeps that level's order too.
+        let out = projected(doc! { "alpha.x": 1, "alpha.y": 1, "zeta": 1 }, doc.clone());
+        assert_eq!(keys(&out), ["_id", "zeta", "alpha"]);
+        assert_eq!(keys(out.get_document("alpha").unwrap()), ["y", "x"]);
+
+        // An explicit `_id: 0` removes it rather than moving it.
+        let out = projected(doc! { "mid": 1, "zeta": 1, "_id": 0 }, doc);
+        assert_eq!(keys(&out), ["zeta", "mid"]);
     }
 
     #[test]

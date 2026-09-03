@@ -75,7 +75,14 @@ async-trait = "0.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `preserve_order` is load-bearing, not a convenience. Without it
+# `serde_json::Map` is a BTreeMap and every object that crosses the HTTP or MCP
+# boundary has its keys sorted alphabetically before the query language sees
+# them: `{"$set": {"a": 1}, "$inc": {"a": 5}}` applied as `$inc` then `$set`,
+# a stored document's fields reordered, a sort document's keys reordered. The
+# parsers all iterate the BSON document in order and were right; the boundary
+# was throwing the order away (ADR-120).
+serde_json = { version = "1", features = ["preserve_order"] }
 # Encodes a `Vec<u8>` as BSON binary rather than as an array of int32s, which is
 # what serde does by default and what made every replicated document twelve times
 # its own size on the wire. Pure Rust, and already in the tree under `bson`.

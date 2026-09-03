@@ -17,11 +17,17 @@
 //! Both directions run the same exchange, which is why one round converges both
 //! ways rather than only pushing.
 
-use kimmy_core::{Hlc, NodeId, OpKind, OplogEntry, VersionVector};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
 use tracing::{debug, warn};
 
-use crate::engine::Engine;
+use crate::docs::RemoteApplied;
+use crate::engine::{Engine, WriteTxn};
 use crate::error::Result;
+use crate::index::UniqueViolation;
+use crate::meta::CollectionMeta;
 
 /// What applying a batch of replicated entries did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -42,43 +48,72 @@ pub struct SyncOutcome {
     pub unknown_collection: usize,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
-    /// How far the peer trails *this* node, in milliseconds — the mirror of
-    /// `lag_ms`, counted only at origins where the peer also lacks an entry
-    /// retention has removed here. Above tombstone retention it names a stale
-    /// rejoiner (ADR-085); zero for a peer that can still be served every
-    /// entry it lacks, however wide the gap (ADR-097). See
-    /// [`lag_beyond_horizon_ms`].
+    /// How far the peer trails *this* node, in milliseconds of history —
+    /// the span between its coverage and ours, counted only at origins where
+    /// the peer also lacks an entry retention has removed here. Above
+    /// tombstone retention it names a stale rejoiner (ADR-085); zero for a
+    /// peer that can still be served every entry it lacks, however wide the
+    /// gap (ADR-097). A different question from `lag_ms`, and a different
+    /// measure. See [`lag_beyond_horizon_ms`].
     pub behind_ms: u64,
-    /// Milliseconds of the peer's history still unapplied after this round.
+    /// How far behind in time this node is after the round, in milliseconds:
+    /// the age of the newest entry it has applied from an origin a peer holds
+    /// newer entries of, worst origin.
     ///
-    /// Zero when caught up; non-zero when the peer holds more than one batch
-    /// of backlog. Measured from the entries' own timestamps — the age span
-    /// of undelivered work — not from any cursor. See [`lag_behind_ms`].
+    /// Zero when caught up. Grows with the wall clock while a backlog is
+    /// being drained, which is what an operator alerts on; the span of the
+    /// history still missing does not, and read 0 for a bulk insert whose
+    /// stamps all lie within a second (ADR-122). See [`lag_behind_ms`].
     pub lag_ms: u64,
 }
 
-/// How far `mine` trails `theirs`, in milliseconds of history.
+/// How far behind in time `mine` is against `theirs`, in milliseconds, as of
+/// `now_ms`.
 ///
-/// For every origin where the peer's coverage is ahead, the gap between the
-/// two wall clocks is the span of that origin's entries this node has not
-/// applied; the maximum over origins is what an operator alerts on.
+/// For every origin where the peer's coverage is ahead, the answer is how
+/// long ago the newest entry this node has applied from that origin was
+/// written: `now − held`. The maximum over origins is what an operator
+/// alerts on. A node thirty seconds into draining a backlog reads thirty
+/// seconds; caught up, it reads zero; holding everything but an entry written
+/// two seconds ago, it reads two seconds, which is the truth.
+///
+/// Not the span between the two heads, `theirs − held`, which is what this
+/// measured before ADR-122. That is the width of the window of history still
+/// missing, and a bulk insert mints all its stamps within a few hundred
+/// milliseconds: on a three-member cluster a replica that held 351 of a
+/// peer's 1,000 documents for 78 seconds, and later trailed by 4,000 for
+/// 492 seconds, read 0 throughout, and only rose once several writers had
+/// spread their writes over many minutes. The gauge answered "how wide is
+/// the window I lack", and nobody asks that.
+///
+/// The known limit, which the span had too: an origin quiet for hours that
+/// then writes once leaves every peer reading the length of the silence for
+/// one round, until the entry is pulled. The peer's head vector carries no
+/// oldest-unapplied stamp that would say the gap holds one entry a second
+/// old, so nothing here can tell that spike from a real backlog. The
+/// stale-rejoiner verdict, which cannot afford the spike, does not use this
+/// measure at all; see [`lag_beyond_horizon_ms`].
+///
+/// The measure crosses clocks: `held.wall_ms` is the origin's HLC wall time,
+/// `now_ms` this node's. A peer whose clock runs ahead of this node's makes
+/// an origin this node genuinely trails saturate to zero, and the gauge
+/// under-reports by the skew; a peer whose clock runs behind adds it. The
+/// span did not have this problem, comparing two stamps of one origin. The
+/// error is bounded by the skew the HLC already tolerates between members,
+/// and under-reporting by a few seconds is a smaller lie than reading zero
+/// through a backlog that lasts minutes.
 ///
 /// An origin this node has **never** seen contributes nothing: with only the
 /// peer's *newest* timestamp to hand, the honest gap would need the oldest,
-/// and `newest − zero` is the age of the epoch, not of the backlog. A joining
+/// and `now − zero` is the age of the epoch, not of the backlog. A joining
 /// node's lag becomes meaningful with its first applied batch — moments in —
 /// rather than starting at a fifty-year lie.
-/// Symmetric in its arguments' roles, so `lag_behind_ms(theirs, mine)` is how
-/// far the *peer* trails this node — what decides whether it has been away
-/// longer than tombstone retention. Origins the trailing side has never seen
-/// at all do not count: a brand-new member holds nothing old enough to
-/// resurrect, and treating it as stale would flag every join.
-pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector) -> u64 {
+pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector, now_ms: u64) -> u64 {
     theirs
         .iter()
         .filter_map(|(node, hlc)| {
             let held = mine.get(node);
-            (held > Hlc::ZERO && hlc > held).then(|| hlc.wall_ms.saturating_sub(held.wall_ms))
+            (held > Hlc::ZERO && hlc > held).then(|| now_ms.saturating_sub(held.wall_ms))
         })
         .max()
         .unwrap_or(0)
@@ -105,12 +140,12 @@ pub fn lacks_collected(
 /// How far `theirs` trails `mine` at the origins where it also lacks an
 /// entry retention has removed here; zero when it lacks nothing collected.
 ///
-/// [`lag_behind_ms`] with its roles swapped is what names a stale rejoiner
-/// (ADR-085): a peer more than tombstone retention behind may hold documents
-/// whose deletes it never saw and whose tombstones are gone. But the span
-/// between two stamps is the age of the *gap*, not of anything in it. An
-/// origin that wrote nothing for longer than retention and then wrote once
-/// leaves every peer a gap as wide as its silence holding one entry a few
+/// The span between the two heads, roles swapped, is what named a stale
+/// rejoiner (ADR-085): a peer more than tombstone retention behind may hold
+/// documents whose deletes it never saw and whose tombstones are gone. But
+/// the span between two stamps is the age of the *gap*, not of anything in
+/// it. An origin that wrote nothing for longer than retention and then wrote
+/// once leaves every peer a gap as wide as its silence holding one entry a few
 /// seconds old, which each peer pulls on its next round — and a peer that can
 /// still be served every entry it lacks has nothing to resurrect. So the
 /// verdict requires both: the span, and something in it that retention has
@@ -186,18 +221,19 @@ impl Engine {
     /// the batch proved about coverage.
     ///
     /// The single path the replication transport uses for a served batch:
-    /// [`Self::apply_batch`] for the entries, then the witnessed vector raised
-    /// by [`coverage_after_batch`]. `limit` is the batch size that was asked
-    /// for, which is what decides whether the peer's tail was reached.
+    /// [`Self::apply_batch`] for the entries, with the witnessed vector raised
+    /// by [`coverage_after_batch`] in the same transaction as the batch's last
+    /// run of documents — so a round with no schema changes in it is one
+    /// commit and one fsync, not one per entry plus two (ADR-119). `limit` is
+    /// the batch size that was asked for, which is what decides whether the
+    /// peer's tail was reached.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
         entries: &[OplogEntry],
         limit: usize,
     ) -> Result<SyncOutcome> {
-        let outcome = self.apply_batch(entries)?;
-        self.absorb_witnessed(&coverage_after_batch(theirs, entries, limit))?;
-        Ok(outcome)
+        self.apply_batch_absorbing(entries, Some(&coverage_after_batch(theirs, entries, limit)))
     }
 
     /// Entries at or after `from`, for a peer that asked to catch up.
@@ -220,26 +256,99 @@ impl Engine {
 
     /// Merge a batch of entries received from a peer.
     ///
-    /// Each entry goes through `apply_remote`, so last-writer-wins decides
-    /// per document and re-delivery is harmless. Ordering within the batch does
-    /// not matter — that is the point of LWW, and it is what lets a peer send
-    /// a range without coordinating.
+    /// Each document entry goes through `apply_remote_in_txn`, so
+    /// last-writer-wins decides per document and re-delivery is harmless.
+    /// Ordering within the batch does not matter to the *result* — that is the
+    /// point of LWW, and it is what lets a peer send a range without
+    /// coordinating — but the entries are applied in the order given, which is
+    /// stamp order, so every per-entry check sees what the entries before it
+    /// did.
+    ///
+    /// One transaction per **run** of consecutive document entries, and one
+    /// commit per run; a batch with no schema change in it is exactly one
+    /// commit. See [`Self::apply_batch_absorbing`] for the shape.
     pub fn apply_batch(&self, entries: &[OplogEntry]) -> Result<SyncOutcome> {
+        self.apply_batch_absorbing(entries, None)
+    }
+
+    /// [`Self::apply_batch`], also raising the witnessed vector by `extra`
+    /// inside the batch's final transaction.
+    ///
+    /// The shape, and why (ADR-119). Before this, every entry in a batch was
+    /// its own transaction: a client bulk insert of 1,000 documents was one
+    /// commit on the node that accepted it and about 1,000 commits — each an
+    /// fsync under `durable` — on every node that replicated it, plus one for
+    /// the witnessed vector and one more for the coverage vector. Measured on
+    /// a three-member cluster: `kimmy_commits` and `kimmy_fsyncs` rose one per
+    /// replicated document, a 1,024-entry batch took about 145 s to apply, and
+    /// replication ran at 8–13 documents a second.
+    ///
+    /// Now consecutive document entries share one write transaction, a *run*.
+    /// A DDL entry ends the run — commit, apply the schema change through
+    /// [`Self::apply_ddl`], which commits transactions of its own because the
+    /// collection, index and vector `_inner` functions do, then start the next
+    /// run — so a batch is one commit per run rather than per entry. The
+    /// witnessed vector for the whole batch, and `extra` with it, is raised
+    /// in the last run's transaction, so nothing is committed separately for
+    /// bookkeeping. A run that fails to commit fails the round, as a failed
+    /// entry did before; the next round re-delivers it, and re-delivery is
+    /// idempotent.
+    ///
+    /// The per-entry checks are unchanged and still run per entry, in stamp
+    /// order: a node's own `UniqueViolation` is refused, a drop tombstone or an
+    /// incarnation floor supersedes what predates it, an unknown collection is
+    /// counted. They read collection metadata through read transactions,
+    /// which see the state *before* the open run — safe, because a run holds
+    /// no schema change (a DDL entry ends it) and the one piece of metadata a
+    /// document write does touch, the multikey flag, is re-read through the
+    /// write transaction by `index::maintain_remote` and `index::mark_multikey`
+    /// themselves.
+    ///
+    /// What waits for the commit: publishing to change streams, and recording
+    /// a unique violation, which mints a local entry in a transaction of its
+    /// own. Both are done once per run, after it commits, in entry order.
+    ///
+    /// The per-entry checks resolve their collection through a memo that
+    /// lives for the batch: `collection_by_id` scans every database's
+    /// collection list in read transactions of its own, and a run holds the
+    /// writer while it does, so without the memo a 1,024-entry batch paid
+    /// about 1,024 × (2 + databases) read transactions under the writer for
+    /// answers that cannot change until the next schema change. The memo is
+    /// cleared at every DDL entry, which is the only thing in a batch that can
+    /// change them.
+    fn apply_batch_absorbing(
+        &self,
+        entries: &[OplogEntry],
+        extra: Option<&VersionVector>,
+    ) -> Result<SyncOutcome> {
         let mut outcome = SyncOutcome::default();
-        let mut witnessed = kimmy_core::VersionVector::new();
+        let mut witnessed = extra.cloned().unwrap_or_default();
+        let mut run = Run::default();
+        let mut memo = Memo::default();
 
         for entry in entries {
-            self.apply_one(entry, &mut outcome)?;
-            // **Every** entry that was processed, on every path — applied,
-            // superseded, DDL, or skipped by design. Doing this per branch is
+            // **Every** entry the batch takes, on every path — applied,
+            // superseded, DDL, or skipped by design — is observed here, once,
+            // before `apply_one` branches on it. Doing this per branch is
             // exactly how the hole appeared: three of them forgot, and the
             // node then re-requested those entries on every round forever.
-            // See ADR-054.
+            // Observing before applying is safe: an error from `apply_one`
+            // fails the whole batch, and the vector is dropped with it, so no
+            // stamp is recorded for an entry that was not applied. See
+            // ADR-054.
             witnessed.observe(entry.stamp);
+            self.apply_one(entry, &mut run, &mut memo, &mut outcome)?;
         }
-        // One transaction for the batch rather than one per entry: a batch is
-        // up to `MAX_BATCH` entries and this is on the sync path.
-        self.absorb_witnessed(&witnessed)?;
+
+        // The witnessed vector rides in the last run's transaction. A batch
+        // that ended in a schema change has no open run, so one is opened for
+        // the vector alone — that is the one case a batch costs a commit of
+        // bookkeeping, and it used to cost it every time.
+        if !witnessed.is_empty() {
+            let txn = self.run_txn(&mut run)?;
+            Engine::absorb_witnessed_in_txn(txn, &witnessed)?;
+        }
+        self.commit_run(&mut run)?;
 
         if outcome.unknown_collection > 0 {
             warn!(
@@ -258,6 +367,118 @@ impl Engine {
         );
         Ok(outcome)
     }
+
+    /// The run's transaction, opened on first use.
+    ///
+    /// Opened lazily rather than at the start of the batch so that a batch
+    /// which turns out to hold only schema changes, or nothing this node
+    /// keeps, does not hold redb's single writer for the duration.
+    fn run_txn<'r, 'e>(&'e self, run: &'r mut Run<'e>) -> Result<&'r WriteTxn<'e>> {
+        if run.txn.is_none() {
+            run.txn = Some(self.begin_write()?);
+        }
+        Ok(run.txn.as_ref().expect("opened just above"))
+    }
+
+    /// Commit the open run, if there is one, then do what had to wait for
+    /// the commit: record each applied entry's unique violations and publish
+    /// the run to change streams, in entry order.
+    ///
+    /// A commit that fails propagates and drops the pending work with it —
+    /// nothing is published for a run that did not land, and the entries come
+    /// again next round. A failure *after* the commit is different: the run
+    /// is durable and witnessed, so a re-delivery of its entries is superseded
+    /// and silent, and an entry whose report was skipped would never publish
+    /// and never mint its `UniqueViolation` — the hole ADR-029 exists to
+    /// close. So every pending entry is reported regardless, the run's
+    /// publishes go out in full, and the first error is returned afterwards.
+    fn commit_run(&self, run: &mut Run<'_>) -> Result<()> {
+        let Some(txn) = run.txn.take() else {
+            debug_assert!(run.pending.is_empty(), "applied entries without a transaction");
+            return Ok(());
+        };
+        txn.commit()?;
+        let mut published = Vec::with_capacity(run.pending.len());
+        let mut failed = None;
+        for Pending { collection, entry, id, violations } in run.pending.drain(..) {
+            match self.report_remote_write(&collection, &entry, &id, &violations) {
+                Ok(entries) => published.extend(entries),
+                Err(e) => {
+                    failed.get_or_insert(e);
+                }
+            }
+        }
+        self.publish(published);
+        match failed {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    /// The collection an entry names, as this batch last saw it.
+    ///
+    /// `None` is memoised too: a batch for a collection this node lacks would
+    /// otherwise rescan every database once per entry.
+    fn memo_collection(
+        &self,
+        memo: &mut Memo,
+        id: CollectionId,
+    ) -> Result<Option<Arc<CollectionMeta>>> {
+        if let Some(found) = memo.collections.get(&id) {
+            return Ok(found.clone());
+        }
+        let found = self.collection_by_id(id)?.map(Arc::new);
+        memo.collections.insert(id, found.clone());
+        Ok(found)
+    }
+
+    /// When the collection was dropped, as this batch last saw it.
+    fn memo_dropped_at(&self, memo: &mut Memo, id: CollectionId) -> Result<Option<Stamp>> {
+        if let Some(found) = memo.dropped.get(&id) {
+            return Ok(*found);
+        }
+        let found = self.collection_dropped_at(id)?;
+        memo.dropped.insert(id, found);
+        Ok(found)
+    }
+}
+
+/// Collection metadata as resolved during one batch.
+///
+/// Valid until the next schema change, which is the only thing in a batch
+/// that can create, drop or recreate a collection — a document run cannot —
+/// so it is cleared at every DDL entry and nowhere else. An entry's own
+/// write may set an index's multikey flag, which the memoised copy will not
+/// show; nothing here reads it (the index paths re-read the definition
+/// through the write transaction), and `collection_by_id` returned the
+/// pre-run copy before the memo existed too.
+#[derive(Default)]
+struct Memo {
+    collections: HashMap<CollectionId, Option<Arc<CollectionMeta>>>,
+    dropped: HashMap<CollectionId, Option<Stamp>>,
+}
+
+/// A run of consecutive document entries sharing one transaction.
+///
+/// `txn` is `None` between runs and before the first document entry.
+/// `pending` is what each applied entry left for after the commit; it is
+/// empty whenever `txn` is.
+#[derive(Default)]
+struct Run<'e> {
+    txn: Option<WriteTxn<'e>>,
+    pending: Vec<Pending>,
+}
+
+/// An entry applied into the open run, with what its commit owes.
+///
+/// One copy of the entry per applied entry until the run commits, bounded by
+/// the batch size the transport asks for; the collection is shared with the
+/// batch's memo rather than copied.
+struct Pending {
+    collection: Arc<CollectionMeta>,
+    entry: OplogEntry,
+    id: DocId,
+    violations: Vec<UniqueViolation>,
 }
 
 /// Turn "that collection is not here" into `None` rather than an error.
@@ -290,20 +511,19 @@ fn gone<T>(result: Result<T>) -> Result<Option<T>> {
 }
 
 impl Engine {
-    /// Apply a replicated schema change.
-    ///
-    /// Every arm is idempotent, because a peer resending an overlapping range
-    /// is the normal case rather than an error. Idempotency is expressed as
-    /// "is the world already like this?" rather than "have I seen this entry?"
-    /// — the second would need per-entry bookkeeping that the oplog already
-    /// provides, and would be wrong after a rebuild.
-    ///
-    /// The originating entry is appended either way, so this node's version
-    /// vector advances and further peers learn of the change from it. That is
-    /// the same rule `apply_remote` follows for documents.
     /// Process one replicated entry. Witnessing is the caller's job, so that
     /// no branch here can forget it.
-    fn apply_one(&self, entry: &OplogEntry, outcome: &mut SyncOutcome) -> Result<()> {
+    ///
+    /// A document entry is written into `run`'s transaction, opening one if
+    /// none is open; a schema change first commits the run, because the DDL
+    /// path commits transactions of its own and redb has one writer.
+    fn apply_one<'e>(
+        &'e self,
+        entry: &OplogEntry,
+        run: &mut Run<'e>,
+        memo: &mut Memo,
+        outcome: &mut SyncOutcome,
+    ) -> Result<()> {
         // A node's own observation of a broken constraint is not a fact
         // about the data; refuse it even if a peer sends one.
         if entry.kind == OpKind::UniqueViolation {
@@ -311,8 +531,14 @@ impl Engine {
         }
 
         // Schema changes come first in stamp order, so a collection exists
-        // by the time documents for it arrive.
+        // by the time documents for it arrive. One ends the current run:
+        // the documents before it must be durable before the DDL path opens
+        // its own transactions, and the ones after it start a new run.
         if entry.kind.is_ddl() {
+            self.commit_run(run)?;
+            // Whatever the batch knew about collections may be wrong after
+            // this, whether or not the change turns out to apply.
+            *memo = Memo::default();
             if self.apply_ddl(entry)? {
                 outcome.ddl += 1;
             } else {
@@ -330,14 +556,14 @@ impl Engine {
         // the documents it is still replaying. Checked by id, because a
         // node that dropped the collection can no longer resolve that id
         // to a name.
-        if let Some(dropped_at) = self.collection_dropped_at(entry.collection)?
+        if let Some(dropped_at) = self.memo_dropped_at(memo, entry.collection)?
             && entry.stamp < dropped_at
         {
             outcome.superseded += 1;
             return Ok(());
         }
 
-        let Some(collection) = self.collection_by_id(entry.collection)? else {
+        let Some(collection) = self.memo_collection(memo, entry.collection)? else {
             outcome.unknown_collection += 1;
             return Ok(());
         };
@@ -359,14 +585,35 @@ impl Engine {
             return Ok(());
         }
 
-        if self.apply_remote(&collection, entry)? {
-            outcome.applied += 1;
-        } else {
-            outcome.superseded += 1;
+        let txn = self.run_txn(run)?;
+        match self.apply_remote_in_txn(txn, &collection, entry)? {
+            RemoteApplied::Applied { id, violations } => {
+                outcome.applied += 1;
+                run.pending.push(Pending { collection, entry: entry.clone(), id, violations });
+            }
+            // Nothing was written, so the run's transaction is exactly as it
+            // was; the next entry carries on in it.
+            RemoteApplied::Superseded => outcome.superseded += 1,
         }
         Ok(())
     }
 
+    /// Apply a replicated schema change.
+    ///
+    /// Every arm is idempotent, because a peer resending an overlapping range
+    /// is the normal case rather than an error. Idempotency is expressed as
+    /// "is the world already like this?" rather than "have I seen this entry?"
+    /// — the second would need per-entry bookkeeping that the oplog already
+    /// provides, and would be wrong after a rebuild.
+    ///
+    /// The originating entry is appended either way, so this node's version
+    /// vector advances and further peers learn of the change from it. That is
+    /// the same rule `apply_remote` follows for documents.
+    ///
+    /// Commits transactions of its own — the collection, index and vector
+    /// `_inner` functions each do — which is why a batch's document run is
+    /// committed before one of these is applied (ADR-119).
+    ///
     /// Returns whether the change was applied. `false` means it named a
     /// collection this node no longer has, which is history rather than an
     /// error — see [`gone`].
@@ -592,7 +839,8 @@ mod tests {
                 let entries = from.entries_for_peer(start, limit).unwrap();
                 let outcome = into.apply_peer_batch(&theirs, &entries, limit).unwrap();
                 let mine = into.witnessed_vector().unwrap();
-                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs), ..outcome }
+                let now = crate::engine::physical_now_ms();
+                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs, now), ..outcome }
             }
             None => SyncOutcome::default(),
         }
@@ -744,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn lag_is_the_span_of_unapplied_history() {
+    fn lag_is_how_long_ago_the_newest_applied_entry_was_written() {
         use kimmy_core::{NodeId, Stamp};
 
         let origin = NodeId::generate();
@@ -753,9 +1001,35 @@ mod tests {
         let mut theirs = VersionVector::new();
         theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin));
 
-        assert_eq!(lag_behind_ms(&mine, &theirs), 7_500, "7.5s of that origin is unapplied");
-        assert_eq!(lag_behind_ms(&theirs, &mine), 0, "being ahead is not lag");
-        assert_eq!(lag_behind_ms(&mine, &mine), 0, "caught up is zero");
+        // The peer holds newer, and the newest we have is 12 s old.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 22_000), 12_000, "12 s behind the clock");
+        // It keeps growing while nothing arrives: the backlog is the same
+        // width, the node is further behind.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 40_000), 30_000);
+        assert_eq!(lag_behind_ms(&theirs, &mine, 40_000), 0, "being ahead is not lag");
+        assert_eq!(lag_behind_ms(&mine, &mine, 40_000), 0, "caught up is zero");
+    }
+
+    #[test]
+    fn a_bulk_backlog_reads_the_time_since_it_started_not_the_width_of_its_stamps() {
+        // The finding ADR-122 fixes: a bulk insert mints its stamps within a
+        // few hundred milliseconds, so the span of history a replica lacks
+        // is under a second however many minutes it takes to drain. Held at
+        // the bulk's first stamp, the peer at its last, thirty seconds on.
+        use kimmy_core::{NodeId, Stamp};
+
+        let origin = NodeId::generate();
+        let first = Hlc::new(1_000_000, 0);
+        let last = Hlc::new(1_000_300, 0);
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(first, origin));
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(last, origin));
+        let now = first.wall_ms + 30_000;
+
+        let span = last.wall_ms - first.wall_ms;
+        assert_eq!(span, 300, "the old formula read the width of the stamps: 0 s on the gauge");
+        assert_eq!(lag_behind_ms(&mine, &theirs, now), 30_000, "the node is 30 s behind");
     }
 
     #[test]
@@ -765,14 +1039,21 @@ mod tests {
         let (a, b) = (NodeId::generate(), NodeId::generate());
         let mut mine = VersionVector::new();
         mine.observe(Stamp::new(Hlc::new(1_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(1_000, 0), b));
+        mine.observe(Stamp::new(Hlc::new(8_000, 0), b));
         let mut theirs = mine.clone();
         theirs.observe(Stamp::new(Hlc::new(2_000, 0), a));
         theirs.observe(Stamp::new(Hlc::new(9_000, 0), b));
 
         // An alert cares how far behind the worst origin is; summing origins
-        // would report a cluster-wide write burst as one enormous lag.
-        assert_eq!(lag_behind_ms(&mine, &theirs), 8_000);
+        // would report a cluster-wide write burst as one enormous lag. At
+        // 10 s, `a` was last applied 9 s ago and `b` 2 s ago.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 10_000), 9_000);
+
+        // An origin the peer is level on does not count, whatever its age:
+        // catch up on `a` and only `b` is left.
+        let mut level = mine.clone();
+        level.observe(Stamp::new(Hlc::new(2_000, 0), a));
+        assert_eq!(lag_behind_ms(&level, &theirs, 10_000), 2_000);
     }
 
     #[test]
@@ -818,7 +1099,11 @@ mod tests {
             "B is not behind A any more; a second round would be pointless"
         );
         assert_eq!(
-            lag_behind_ms(&witnessed, &a.version_vector().unwrap()),
+            lag_behind_ms(
+                &witnessed,
+                &a.version_vector().unwrap(),
+                crate::engine::physical_now_ms()
+            ),
             0,
             "and the gauge must read caught-up, because it is"
         );
@@ -855,10 +1140,10 @@ mod tests {
 
         // The peer's vector holds only the *newest* stamp per origin, so an
         // origin this node has never seen has no honest gap to report —
-        // `newest − zero` would be the age of the epoch, a fifty-year lie a
+        // `now − zero` would be the age of the epoch, a fifty-year lie a
         // joining node would alert on. Its lag becomes real with the first
         // applied batch.
-        assert_eq!(lag_behind_ms(&VersionVector::new(), &theirs), 0);
+        assert_eq!(lag_behind_ms(&VersionVector::new(), &theirs, 1_786_000_005_000), 0);
     }
 
     #[test]
@@ -871,8 +1156,10 @@ mod tests {
         }
         sync(&a, &b);
         let (va, vb) = (a.version_vector().unwrap(), b.version_vector().unwrap());
-        assert_eq!(lag_behind_ms(&vb, &va), 0, "a caught-up pair must read zero");
-        assert_eq!(lag_behind_ms(&va, &vb), 0);
+        // Long after the writes: caught up is zero however much time passes.
+        let later = crate::engine::physical_now_ms() + DAY * 1_000;
+        assert_eq!(lag_behind_ms(&vb, &va, later), 0, "a caught-up pair must read zero");
+        assert_eq!(lag_behind_ms(&va, &vb, later), 0);
     }
 
     #[test]
@@ -1102,6 +1389,180 @@ mod tests {
         let cb = b.get_collection("shop", "orders").expect("the collection must exist on b");
         assert_eq!(cb.id, ca.id, "and address the same storage");
         assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_replicated_batch_is_one_commit_however_many_entries_it_holds() {
+        // The replica's half of
+        // `a_batch_is_one_commit_however_many_documents_it_holds` (ADR-119). A
+        // bulk insert is one commit where it was accepted; before this it was
+        // one commit *per document* on every node that replicated it, each an
+        // fsync under `durable` — measured on a three-member cluster at 8–13
+        // documents a second.
+        const N: usize = 200;
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        let batch: Vec<_> = (0..N as i64).map(|n| doc! { "_id": n, "n": n }).collect();
+        a.insert_many(&ca, batch).unwrap();
+
+        // Only the documents: the creation entry is a schema change, which
+        // ends a run by design and is measured separately below.
+        let theirs = a.version_vector().unwrap();
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        assert_eq!(entries.len(), N);
+
+        let (commits, fsyncs) = (b.commits(), b.fsyncs());
+        let outcome = b.apply_peer_batch(&theirs, &entries, BATCH).unwrap();
+        assert_eq!(outcome.applied, N);
+        assert_eq!(
+            b.commits() - commits,
+            1,
+            "{N} replicated documents, the witnessed vector and the coverage vector \
+             must be one commit"
+        );
+        assert_eq!(b.fsyncs() - fsyncs, 1, "and so one fsync");
+        assert_eq!(b.count(&cb).unwrap() as usize, N, "every document landed");
+        assert!(
+            b.witnessed_vector().unwrap().covers(&theirs),
+            "and the round's coverage was recorded in that same commit"
+        );
+    }
+
+    #[test]
+    fn a_schema_change_mid_batch_splits_it_into_runs_that_commit_once_each() {
+        // A DDL entry commits transactions of its own, so it cannot share the
+        // documents' transaction: the documents before it are one run, the
+        // ones after it another, and both sides of it must land.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orders_a = a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        for n in 0..3_i64 {
+            a.insert(&orders_a, doc! { "_id": n }).unwrap();
+        }
+        let items_a = a.create_collection("shop", "items").unwrap();
+        for n in 0..3_i64 {
+            a.insert(&items_a, doc! { "_id": n }).unwrap();
+        }
+        // Stamp order: three documents, the creation of `items`, three more.
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document() || e.collection == items_a.id)
+            .collect();
+        assert_eq!(entries.len(), 7);
+        assert!(entries[3].kind.is_ddl(), "the schema change sits between the two runs");
+
+        // What the schema change costs on its own, on a third engine: its
+        // transactions plus one for the witnessed vector, which a batch with
+        // no document run has to commit by itself.
+        let (c, _dc) = engine();
+        let before = c.commits();
+        c.apply_batch(&entries[3..4]).unwrap();
+        let ddl_alone = c.commits() - before;
+
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!((outcome.applied, outcome.ddl), (6, 1), "{outcome:?}");
+        // Two runs, one commit each; the schema change's own commits are the
+        // same as on `c`, and its witnessed-vector commit there stands in for
+        // the second run here, which carries the vector.
+        assert_eq!(
+            b.commits() - before,
+            ddl_alone + 1,
+            "one commit per run of documents, not per document"
+        );
+
+        let orders_b = b.get_collection("shop", "orders").unwrap();
+        let items_b = b.get_collection("shop", "items").expect("created mid-batch");
+        assert_eq!(b.count(&orders_b).unwrap(), 3, "the run before the schema change landed");
+        assert_eq!(b.count(&items_b).unwrap(), 3, "and the run after it");
+        assert!(b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()));
+    }
+
+    #[test]
+    fn a_superseded_entry_mid_batch_does_not_stop_the_rest_of_the_run() {
+        // A losing entry used to abort its own transaction; in a shared one it
+        // must simply write nothing, and the entries after it in the same
+        // transaction must still land. And it is still witnessed (ADR-054).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        for n in 1..=3_i64 {
+            a.insert(&ca, doc! { "_id": n, "who": "a" }).unwrap();
+        }
+        // B writes _id 2 later, so A's version of it loses.
+        b.insert(&cb, doc! { "_id": 2, "who": "b" }).unwrap();
+
+        let entries: Vec<_> = a
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!((outcome.applied, outcome.superseded), (2, 1), "{outcome:?}");
+        assert_eq!(b.commits() - before, 1, "still one commit for the run");
+
+        for (id, who) in [(1, "a"), (2, "b"), (3, "a")] {
+            let got = b.get(&cb, &DocId::Int64(id)).unwrap().unwrap();
+            assert_eq!(got.get_str("who").unwrap(), who, "_id {id}");
+        }
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "the discarded entry is covered, so it is never asked for again"
+        );
+    }
+
+    #[test]
+    fn a_unique_violation_mid_batch_is_still_recorded_and_the_batch_still_commits() {
+        // Recording a violation mints a local entry in its own transaction,
+        // which cannot happen while the run's transaction is open. It waits
+        // for the commit and must still happen — a converged write with an
+        // unreported violation is the failure ADR-029 exists to prevent.
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+
+        let origin = kimmy_core::NodeId::generate();
+        let remote = |ms: u64, id: &str, email: &str| OplogEntry {
+            stamp: kimmy_core::Stamp::new(Hlc::new(ms, 0), origin),
+            kind: OpKind::Insert,
+            collection: cb.id,
+            doc_id: Some(DocId::String(id.into())),
+            body: Some(bson::serialize_to_vec(&doc! { "_id": id, "email": email }).unwrap()),
+        };
+        let entries = vec![
+            remote(9_000, "before", "a@x"),
+            remote(9_001, "remote", "clash@x"),
+            remote(9_002, "after", "c@x"),
+        ];
+
+        let before = b.commits();
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!(outcome.applied, 3, "the colliding write is merged, not refused: {outcome:?}");
+        assert_eq!(b.commits() - before, 2, "the run, then the violation's own entry after it");
+        assert_eq!(b.unique_violations(), 1);
+        assert_eq!(b.count(&cb).unwrap(), 4, "every document is present, the collision included");
+        let recorded = b
+            .read_oplog_from(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == OpKind::UniqueViolation)
+            .count();
+        assert_eq!(recorded, 1, "a `UniqueViolation` entry exists for change streams");
     }
 
     #[test]
@@ -1581,10 +2042,12 @@ mod tests {
     }
 
     #[test]
-    fn the_same_lag_measure_reversed_says_how_far_a_peer_trails_us() {
-        // What the stale-rejoiner check runs on (ADR-085): how far the peer
-        // is behind *this* node, per origin, ignoring origins it has never
-        // seen at all.
+    fn the_same_lag_measure_reversed_says_how_long_ago_a_peer_last_saw_us() {
+        // Roles swapped, the measure is how long ago the peer last applied
+        // an entry of an origin *this* node is ahead on, per origin, ignoring
+        // origins it has never seen at all. Not what the stale-rejoiner
+        // verdict runs on — that is `lag_beyond_horizon_ms` — but the same
+        // rules about which origins count.
         use kimmy_core::{NodeId, Stamp};
         let a = NodeId::from_bytes([1; 16]);
         let b = NodeId::from_bytes([2; 16]);
@@ -1600,11 +2063,16 @@ mod tests {
         theirs.observe(Stamp::new(Hlc::new(10_000, 0), a));
         theirs.observe(Stamp::new(Hlc::new(90_000, 0), b));
 
-        assert_eq!(lag_behind_ms(&theirs, &mine), 90_000, "90 s behind on `a`; `c` does not count");
-        assert_eq!(lag_behind_ms(&mine, &theirs), 0, "and we trail it by nothing");
+        let now = 100_000;
+        assert_eq!(
+            lag_behind_ms(&theirs, &mine, now),
+            90_000,
+            "90 s behind on `a`; `c` does not count"
+        );
+        assert_eq!(lag_behind_ms(&mine, &theirs, now), 0, "and we trail it by nothing");
 
         // A fresh member trails nobody: it holds nothing old enough to resurrect.
-        assert_eq!(lag_behind_ms(&VersionVector::default(), &mine), 0);
+        assert_eq!(lag_behind_ms(&VersionVector::default(), &mine, now), 0);
     }
 
     const HOUR_MS: u64 = 60 * 60 * 1000;
@@ -1623,7 +2091,12 @@ mod tests {
         let mut mine = VersionVector::new();
         mine.insert(a, second);
 
-        assert_eq!(lag_behind_ms(&theirs, &mine), 36 * HOUR_MS, "the bare span is the silence");
+        // Five seconds after the second write, the age-behind measure reads
+        // the whole silence too: the one-round spike ADR-122 keeps, because
+        // the head vector cannot say the gap holds one entry five seconds
+        // old. The verdict below cannot afford that, and does not use it.
+        let now = second.wall_ms + 5_000;
+        assert_eq!(lag_behind_ms(&theirs, &mine, now), 36 * HOUR_MS + 5_000);
 
         let mut collected = VersionVector::new();
         collected.insert(a, first);

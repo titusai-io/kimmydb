@@ -164,10 +164,34 @@ pub fn parse(pipeline: &[Document]) -> Result<Vec<Stage>> {
     parse_with_vars(pipeline, &[])
 }
 
-/// Parse a pipeline whose expressions may read `vars` — a `$lookup`
-/// sub-pipeline, with the names its `let` binds.
+/// Parse a pipeline whose expressions may read `vars`, at top-level
+/// placement.
+///
+/// A `$lookup` sub-pipeline is not parsed through here: `parse_lookup` parses
+/// it internally, with the outer names and its own `let` in scope and at
+/// [`Placement::SubPipeline`], which is where the `$match` variable refusal
+/// applies. This entry point exists for a caller that has names bound by
+/// some other means and wants the top-level rules.
 pub fn parse_with_vars(pipeline: &[Document], vars: &[String]) -> Result<Vec<Stage>> {
-    pipeline.iter().map(|stage| parse_stage(stage, vars)).collect()
+    parse_pipeline(pipeline, vars, Placement::TopLevel)
+}
+
+/// Where a pipeline sits, for the one rule that depends on it.
+///
+/// A `$match` reads the same filter language in both places; the difference
+/// is what a `"$$name"` string value most likely means there. At the top
+/// level there is no `let` for it to refer to, so it is the literal string a
+/// stored document may hold. Inside a `$lookup` sub-pipeline it is almost
+/// certainly a variable the author expected the filter to substitute, and
+/// the filter never will — see [`refuse_variables_in_match`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Placement {
+    TopLevel,
+    SubPipeline,
+}
+
+fn parse_pipeline(pipeline: &[Document], vars: &[String], at: Placement) -> Result<Vec<Stage>> {
+    pipeline.iter().map(|stage| parse_stage(stage, vars, at)).collect()
 }
 
 /// The `$match` stages a pipeline *begins* with, merged into one filter, and
@@ -198,7 +222,7 @@ pub fn leading_match(stages: &[Stage]) -> Option<(Filter, usize)> {
     }
 }
 
-fn parse_stage(stage: &Document, vars: &[String]) -> Result<Stage> {
+fn parse_stage(stage: &Document, vars: &[String], at: Placement) -> Result<Stage> {
     if stage.len() != 1 {
         return Err(Error::InvalidQuery(format!(
             "a pipeline stage must have exactly one key naming the operator, found {}",
@@ -208,7 +232,13 @@ fn parse_stage(stage: &Document, vars: &[String]) -> Result<Stage> {
     let (name, value) = stage.iter().next().expect("length checked above");
 
     match name.as_str() {
-        "$match" => Ok(Stage::Match(Box::new(filter::parse(as_document(name, value)?)?))),
+        "$match" => {
+            let raw = as_document(name, value)?;
+            if at == Placement::SubPipeline {
+                refuse_variables_in_match(raw)?;
+            }
+            Ok(Stage::Match(Box::new(filter::parse(raw)?)))
+        }
         "$project" => parse_project(as_document(name, value)?, vars),
         "$addFields" | "$set" => {
             Ok(Stage::AddFields(parse_computed(name, as_document(name, value)?, vars)?))
@@ -235,6 +265,46 @@ fn parse_stage(stage: &Document, vars: &[String]) -> Result<Stage> {
              $replaceRoot, $sort, $limit, $skip, $unwind, $group, $count, $lookup"
         ))),
     }
+}
+
+/// Refuse a `"$$name"` string value anywhere in a sub-pipeline `$match`.
+///
+/// The filter language has no variables. `filter::parse` reads `"$$oid"` as
+/// the five-character string it is, so `{$match: {_id: "$$oid"}}` in a
+/// `$lookup` sub-pipeline matched nothing, and the join came back as an empty
+/// array on every document with no error — a wrong answer that looks exactly
+/// like a right one, which is the kind this codebase refuses hardest. Inside
+/// a sub-pipeline a `$$` string can only be a `let` name the author expected
+/// to be substituted (or `$$ROOT`, which a filter has no use for either), so
+/// it is refused with the idiom that works. The rule is deliberately scoped:
+/// a top-level `$match` and `find` keep the literal reading, because a stored
+/// document may hold that string and there is no `let` to confuse it with.
+///
+/// The walk covers every value at every depth — a plain equality, an
+/// operator document (`$eq`, `$in: [...]`, `$not`), `$elemMatch`, the arrays
+/// under `$and`/`$or`/`$nor` — and skips the subtree under `$expr`, which is
+/// the expression parser's: it resolves variables itself and already refuses
+/// an unbound one. `$regex` and `$options` strings are values like any other
+/// and are not special-cased, so a pattern beginning with `$$` is refused
+/// too; nothing meaningful is lost, since `$` anchors and a pattern that
+/// opens with two of them can match nothing a `$$`-free one cannot.
+fn refuse_variables_in_match(doc: &Document) -> Result<()> {
+    fn walk_doc(doc: &Document) -> Result<()> {
+        doc.iter().filter(|(key, _)| key.as_str() != "$expr").try_for_each(|(_, value)| walk(value))
+    }
+    fn walk(value: &Bson) -> Result<()> {
+        match value {
+            Bson::String(s) if s.starts_with("$$") => Err(Error::InvalidQuery(format!(
+                "{s} is not available in a $match: the filter language has no variables; bind \
+                 it in an $addFields stage and $match on the computed field, or use $expr once \
+                 it composes with let"
+            ))),
+            Bson::Document(doc) => walk_doc(doc),
+            Bson::Array(items) => items.iter().try_for_each(walk),
+            _ => Ok(()),
+        }
+    }
+    walk_doc(doc)
 }
 
 /// `{field: <expression>, ...}` — every value is an expression.
@@ -482,7 +552,9 @@ fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
             // outer `let`.
             let mut in_scope = vars.to_vec();
             in_scope.extend(let_vars.iter().map(|(name, _)| name.clone()));
-            let stages = parse_with_vars(&raw_stages, &in_scope)?;
+            // A sub-pipeline is one whether or not this `$lookup` has a
+            // `let`, and wherever the `$lookup` itself sits.
+            let stages = parse_pipeline(&raw_stages, &in_scope, Placement::SubPipeline)?;
             Join::Pipeline { vars: let_vars, stages }
         }
     };
@@ -1575,6 +1647,89 @@ mod tests {
             }}])
             .is_ok()
         );
+    }
+
+    /// The other way to write the same mistake: `{_id: "$$oid"}`, which
+    /// parsed as the literal string, matched nothing, and returned an empty
+    /// join with no error. A `$$` string value anywhere in a sub-pipeline
+    /// `$match` is refused now, naming the variable and the idiom.
+    #[test]
+    fn a_variable_string_in_a_sub_pipeline_match_is_refused() {
+        let refused = |stage: Document| {
+            let err = parse(&[doc! {"$lookup": {
+                "from": "a", "let": {"oid": "$_id"}, "pipeline": [stage], "as": "x"
+            }}])
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("$$oid"), "{err}");
+            assert!(err.contains("$addFields"), "{err}");
+            err
+        };
+        // The finding's exact pipeline.
+        let err = refused(doc! {"$match": {"_id": "$$oid"}});
+        assert!(err.contains("no variables"), "{err}");
+        // Inside an operator document, an array operator, a negation.
+        refused(doc! {"$match": {"_id": {"$eq": "$$oid"}}});
+        refused(doc! {"$match": {"_id": {"$in": ["$$oid"]}}});
+        refused(doc! {"$match": {"_id": {"$nin": ["$$oid"]}}});
+        refused(doc! {"$match": {"tags": {"$all": ["$$oid"]}}});
+        refused(doc! {"$match": {"_id": {"$not": {"$gt": "$$oid"}}}});
+        // Nested through `$elemMatch` and the logical operators.
+        refused(doc! {"$match": {"lines": {"$elemMatch": {"order": "$$oid"}}}});
+        refused(doc! {"$match": {"$or": [{"a": 1}, {"$and": [{"order": "$$oid"}]}]}});
+        // A regex pattern is a value too and is not special-cased.
+        refused(doc! {"$match": {"name": {"$regex": "$$oid"}}});
+
+        // `$expr` is the expression parser's subtree and keeps its own,
+        // more specific, refusal.
+        let err = parse(&[doc! {"$lookup": {
+            "from": "a", "let": {"oid": "$_id"},
+            "pipeline": [{"$match": {"$expr": {"$eq": ["$_id", "$$oid"]}}}], "as": "x"
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("unknown variable"), "{err}");
+
+        // A sub-pipeline `$match` with no `$$` value is unchanged, `$$ROOT`
+        // under `$expr` included.
+        assert!(
+            parse(&[doc! {"$lookup": {
+                "from": "a", "let": {"oid": "$_id"},
+                "pipeline": [{"$match": {"kind": "line", "qty": {"$gt": 1}, "tag": "$plain",
+                                         "$expr": {"$gt": ["$$ROOT.qty", 0]}}}],
+                "as": "x"
+            }}])
+            .is_ok()
+        );
+        // No `let` does not make it a top-level `$match`.
+        let err = parse(&[doc! {"$lookup": {
+            "from": "a", "pipeline": [{"$match": {"_id": "$$oid"}}], "as": "x"
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("$$oid"), "{err}");
+        // Nor does a `$lookup` one level down.
+        let err = parse(&[doc! {"$lookup": {
+            "from": "a", "let": {"oid": "$_id"},
+            "pipeline": [{"$lookup": {
+                "from": "b", "pipeline": [{"$match": {"_id": "$$oid"}}], "as": "y"
+            }}],
+            "as": "x"
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("$$oid"), "{err}");
+    }
+
+    /// The refusal is scoped to sub-pipelines: at the top level there is no
+    /// `let` a `$$` string could mean, and a stored document may hold one.
+    #[test]
+    fn a_top_level_match_still_reads_a_variable_string_literally() {
+        let stages = parse(&[doc! {"$match": {"category": "$$oid"}}]).unwrap();
+        let input =
+            docs(vec![doc! {"_id": 1, "category": "$$oid"}, doc! {"_id": 2, "category": "oid"}]);
+        let out = apply(&stages[0], input, &Limits::default()).unwrap();
+        assert_eq!(out, docs(vec![doc! {"_id": 1, "category": "$$oid"}]));
     }
 
     /// The executor's loop, in miniature: bind the `let` per input document

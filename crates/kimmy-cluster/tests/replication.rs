@@ -893,12 +893,16 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
     for peer in [&b, &c] {
         // The bare span is the incident's number: A's new write against the
         // peer's coverage of A, which is A's write from before the silence.
-        let raw = kimmy_storage::lag_behind_ms(
-            &peer.engine.version_vector().unwrap(),
-            &a.engine.witnessed_vector().unwrap(),
-        );
+        let a_id = a.engine.node_id();
+        let raw = a
+            .engine
+            .witnessed_vector()
+            .unwrap()
+            .get(a_id)
+            .wall_ms
+            .saturating_sub(peer.engine.version_vector().unwrap().get(a_id).wall_ms);
         assert!(raw > DAY_SECS * 1_000, "the scenario must reproduce the raw gap: {raw} ms");
-        assert_eq!(peer.engine.version_vector().unwrap().get(a.engine.node_id()), a_last);
+        assert_eq!(peer.engine.version_vector().unwrap().get(a_id), a_last);
 
         let outcome = sync_once(&a.engine, peer.addr, SECRET).await.unwrap();
         assert_eq!(

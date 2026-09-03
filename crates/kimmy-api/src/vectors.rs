@@ -69,7 +69,7 @@ pub async fn get_vector_config(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DisableQuery {
     /// Discard the stored vectors as well as the configuration.
     drop_vectors: bool,
@@ -79,7 +79,7 @@ pub async fn disable_vectors(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    axum::extract::Query(q): axum::extract::Query<DisableQuery>,
+    crate::json::QueryParams(q): crate::json::QueryParams<DisableQuery>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Ddl, &db, Some(&coll))?;
     // Resolved *before* the call: dropping the vectors also drops the shadow
@@ -101,6 +101,7 @@ pub async fn disable_vectors(
 
 /// One chunk of a document, embedded by the client.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChunkInput {
     /// Chunk number within the document, in split order.
     pub chunk: u32,
@@ -270,7 +271,7 @@ fn authorize_write(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchRequest {
     /// Query text. Embedded server-side, so it needs an embedding provider.
     pub query: Option<String>,
@@ -297,7 +298,7 @@ pub struct SearchRequest {
 /// weights — plain reciprocal rank fusion, which is what every request got
 /// before the field existed.
 #[derive(Deserialize, Clone, Copy, Debug, PartialEq)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FusionWeights {
     pub dense: f64,
     pub lexical: f64,

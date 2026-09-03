@@ -10,6 +10,140 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch. Nothing changes on the wire between
+members, a 0.19.1 node reads everything this one writes, and the two replicate
+to each other. But three things a 0.19.1 node accepted are refused or answered
+differently now, and the pre-1.0 policy puts them behind a `0.MINOR` bump: a
+request body or query string carrying a field the route does not define is
+refused; a `$$variable` string in a `$lookup` sub-pipeline `$match` is refused
+instead of matching nothing; and JSON object key order now survives the
+boundary, so update operators apply in the order written and a document keeps
+the field order it was stored with. The replication lag gauge also changes
+what it measures, which matters to anyone alerting on it. All five entries
+below come from one test round against a three-member cluster running 0.19.1.
+
+### Changed
+
+- **A request body with a field the route does not define is refused.**
+  `find`, `count`, `aggregate`, `update`, `delete`, `find_and_modify`, index
+  creation, collection creation, login, the user, role and webhook routes,
+  vector upload and both searches all accepted `{"limitt": 5}`, or
+  `{"explain": true}` on `aggregate`, and answered `200` having ignored it;
+  only the vector configuration route refused. Every request shape is closed
+  now: a field the reference does not list, at the top level or inside a
+  nested shape such as an index's `fields` entry or a search's `weights`, is
+  `422 bad_request`, and the message names the field and lists the ones the
+  route takes. A grant inside a user or role body is closed too, and that is
+  the case that mattered most: `collection` defaults to `*`, so a misspelt
+  `colection` was not dropped but widened the grant to every collection in
+  the database. Query strings are held to the same rule at `400`: `?limt=5`
+  on `GET .../docs` is refused by name, and `?limit=abc` — which was bare
+  text with no `error` code — is now in the envelope. Document bodies —
+  insert, replace, bulk — are content and take any field, as before.
+  **Breaking for a client that sends a field or query parameter the route
+  does not define.** The Rust, Python and Go clients, the CLI, the
+  conformance scenarios and every documented example were audited and send
+  none. The MCP tools refuse an unknown argument the same way, as the tool's
+  error result naming it, and their schemas declare
+  `additionalProperties: false`. No switch to accept and ignore is offered: a
+  field the server does not read is a request it cannot honour, and answering
+  as if it had is the bug this removes. ADR-121.
+
+- **`kimmy_replication_lag_seconds` now measures how far behind in time a
+  node is, not the width of the history it lacks.** It used to be the span of
+  origin timestamps between the newest entry this node had applied and the
+  newest a peer held, worst origin. A bulk insert mints all its stamps within
+  a fraction of a second, so a replica minutes into draining one read 0 the
+  whole way through; on a three-member cluster the gauge stayed at 0 across a
+  78-second, 1,000-document backlog and a 492-second, 4,000-document one, and
+  only climbed once writes were spread over many minutes. It is now the
+  seconds since the newest entry this node has applied from any origin a peer
+  holds newer entries of, worst peer in the last round: about 30 seconds
+  into a backlog, climbing until it drains, 0 when caught up. What an
+  operator watching it will see differently: a backlog now shows up and grows
+  while it lasts, so an alert threshold is reached by any backlog that
+  outlives it rather than only by long-spread writes; the caught-up reading,
+  the hold-last-value-through-an-outage behaviour and the stale-rejoiner
+  verdict are unchanged. One reading is worth knowing: an origin quiet for
+  hours that then writes once shows the length of that silence for a single
+  round on each peer, until the entry is pulled — the old measure spiked the
+  same way. The `# HELP` text on `/metrics` and the OpenTelemetry description
+  say the new thing. ADR-122.
+
+### Fixed
+
+- **A replica applies a sync batch in one transaction, not one per
+  document.** A client bulk insert was one commit on the node that accepted
+  it and about one commit *per document* on every node that replicated it,
+  plus two for the batch's bookkeeping, each an fsync under the default
+  `durable` class. Measured on a three-member cluster running 0.19.1:
+  `kimmy_commits` and `kimmy_fsyncs` rose one for one per replicated
+  document, a 1,024-entry sync batch took about 145 s to apply, and
+  replication ran at 8–13 documents a second — 1,000 documents converged in
+  78.7 s, 4,000 in 492.6 s. Consecutive document entries in a batch now share
+  one write transaction, and the witnessed and coverage vectors are raised in
+  that same transaction, so a batch with no schema change in it is one commit
+  and one fsync; a schema change in a batch ends the transaction and the
+  documents after it start another. Replication throughput is no longer bound
+  by one fsync per document. What an operator sees: on replicas
+  `kimmy_commits` and `kimmy_fsyncs` rise per batch rather than per document,
+  so a dashboard that read a replica's commit rate as its document rate reads a
+  much smaller number — `kimmy_replication_lag_seconds` and the `cluster.sync`
+  span's `applied` are the document-rate figures — and a local write on a
+  replica may wait for a whole batch to apply rather than for one entry. A
+  replica also publishes a batch to change streams in one burst after it
+  commits, and the live feed's ring holds 1,024 events — the same as a full
+  batch — so a full batch that also mints a unique-violation entry can overrun
+  a subscriber that is not keeping up in one go; it resumes from the oplog and
+  loses nothing. ADR-119.
+
+- **A `let` variable written into a `$lookup` sub-pipeline `$match` is now
+  refused instead of silently matching nothing.** `docs/aggregation.md` said
+  a `$$oid` in a sub-pipeline `$match` was refused; in fact
+  `{$match: {_id: "$$oid"}}` was read as the literal five-character string,
+  matched no document, and the join came back as an empty array on every
+  input with a 200 — an empty result indistinguishable from a real one. Any
+  string value beginning with `$$`, at any depth of a sub-pipeline `$match`
+  (a plain equality, `$in`, `$elemMatch`, `$and`/`$or`/`$nor`, a `$regex`
+  pattern), is now a 400 `bad_request` naming the variable, with or without a
+  `let`, and in a nested `$lookup` too. The subtree under `$expr` is unchanged
+  — it already refused an unknown variable. A top-level `$match` and a `find`
+  filter are unchanged as well: there `"$$oid"` is the literal string a
+  stored document may hold. Write the correlation as the docs show — bind the
+  variable in an `$addFields` stage and `$match` on the computed field.
+  `docs/deviations.md`.
+
+- **Update operators apply in the order the request wrote them, and a
+  document's fields are stored in the order they arrived.** The query
+  language promised that two operators on one path apply in the order
+  written and the last one wins, and its parser did that — but every request
+  body was decoded into a JSON map that sorted its keys, so over HTTP and MCP
+  the operators ran alphabetically whatever the body said: `{"$set": {"a":
+  1}, "$inc": {"a": 5}}` on `a: 0` left `1` when it should leave `6`, and
+  `{"$min": {"a": 3}, "$max": {"a": 10}}` on `a: 5` left `3` instead of `10`.
+  The same sort was applied to every stored document's fields, so `{"zeta":
+  1, "alpha": 2}` read back as `{"alpha": 2, "zeta": 1}`, and to a sort
+  document's keys, so `{"sort": {"b": 1, "a": 1}}` sorted by `a` first. The
+  JSON boundary now keeps the key order it is given, as MongoDB does. What
+  changes for a client: an update that names one path twice gets the order it
+  wrote, not the alphabetical one; a multi-key sort written out of
+  alphabetical order now means what it says; documents written from this
+  release on keep their field order, with `_id` first whatever the body said
+  (a replace used to put it last), while documents stored earlier keep the
+  sorted order they were written with until they are rewritten; and an
+  inclusion projection answers in the document's field order, as MongoDB
+  does, rather than the projection's. Whole-document comparison — `{"a":
+  {"x": 1, "y": 2}}` as an equality filter, `$in` over documents — is
+  field-order sensitive as it always was in the comparator and as it is in
+  MongoDB; before, both sides had been sorted, so it was order-insensitive by
+  accident, and a document stored before this release matches such a filter
+  only when the filter is spelled in alphabetical order.
+  A client whose JSON encoder does not preserve insertion order gets whichever
+  order its encoder emitted; `docs/deviations.md` says how to serialise
+  deliberately. ADR-120.
+
 ## 0.19.1 - 2026-09-02
 
 ### Changed

@@ -1161,6 +1161,303 @@ async fn a_bulk_insert_that_is_not_an_array_reports_a_stable_error_code() {
     assert!(res.body.get("error").is_some(), "every failure carries an error code: {:?}", res.body);
 }
 
+/// Every route that takes a request shape refuses a field it does not
+/// define, and says which one.
+///
+/// ADR-121. Before it, `{"limitt": 5}` on `find` answered `200` and ignored
+/// the field, while the same typo in a vector configuration was a `422`: one
+/// struct carried `deny_unknown_fields` and the rest did not. Each case below
+/// sends a valid body with one extra top-level field and expects the refusal;
+/// then, where the route is cheap to set up for, sends the same body without
+/// it and expects success — so what is being refused is shown to be the
+/// field, not the body around it.
+#[tokio::test]
+async fn a_request_field_the_route_does_not_define_is_refused_by_name() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "qty": 5})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/vector",
+            Some(&token),
+            json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .put(
+            "/v1/db/shop/coll/orders/docs/1/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a small blue widget" }]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    // (method, path, needs a token, valid body, also run without the extra
+    // field). Webhook registration is refused before its URL is checked, and
+    // a URL that passes the egress policy needs a resolvable public host,
+    // which a unit test does not get to assume.
+    let cases: Vec<(&str, &str, bool, Value, bool)> = vec![
+        ("POST", "/v1/auth/login", false, json!({"user": "root", "password": ROOT_PASSWORD}), true),
+        ("POST", "/v1/db/shop/collections", true, json!({"name": "other"}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find",
+            true,
+            json!({"filter": {"qty": 5}, "limit": 1}),
+            true,
+        ),
+        ("POST", "/v1/db/shop/coll/orders/count", true, json!({"filter": {}}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/aggregate",
+            true,
+            json!({"pipeline": [{"$match": {"qty": 5}}]}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            true,
+            json!({"filter": {"_id": 1}, "update": {"$set": {"qty": 6}}}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            true,
+            json!({"filter": {"_id": 1}, "update": {"$set": {"qty": 7}}, "returnDocument": "after"}),
+            true,
+        ),
+        ("POST", "/v1/db/shop/coll/orders/delete", true, json!({"filter": {"_id": 999}}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/indexes",
+            true,
+            json!({"fields": [{"path": "qty"}]}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/vector_search",
+            true,
+            json!({"vector": [1.0, 0.0, 0.0], "k": 1}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/hybrid_search",
+            true,
+            json!({"query": "blue widget", "vector": [1.0, 0.0, 0.0], "weights": {"dense": 1.0}}),
+            true,
+        ),
+        (
+            "PUT",
+            "/v1/db/shop/coll/orders/docs/1/vectors",
+            true,
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a small blue widget" }]),
+            true,
+        ),
+        ("POST", "/v1/users", true, json!({"user": "alice", "password": "alice-password"}), true),
+        ("POST", "/v1/users/alice/password", true, json!({"password": "another-password"}), true),
+        ("POST", "/v1/users/alice/grants", true, json!({"grants": []}), true),
+        ("POST", "/v1/users/alice/disabled", true, json!({"disabled": false}), true),
+        ("POST", "/v1/users/alice/roles", true, json!({"roles": []}), true),
+        ("POST", "/v1/roles", true, json!({"name": "analyst"}), true),
+        ("POST", "/v1/roles/analyst/grants", true, json!({"grants": []}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/webhooks",
+            true,
+            json!({"url": "https://hooks.example/orders"}),
+            false,
+        ),
+    ];
+
+    for (method, path, needs_token, body, run_valid) in cases {
+        let auth = needs_token.then_some(token.as_str());
+        let url = format!("{}{path}", server.base);
+
+        // An array body carries the extra field inside its first element,
+        // since the elements are the shapes.
+        let mut with_extra = body.clone();
+        match &mut with_extra {
+            Value::Array(items) => {
+                items[0]["zzz"] = json!(1);
+            }
+            other => {
+                other["zzz"] = json!(1);
+            }
+        }
+        let res = server.client.request(method, &url, auth, Some(with_extra)).await;
+        assert_eq!(res.status, 422, "{method} {path} accepted an unknown field: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "no", "{method} {path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unknown field `zzz`"),
+            "{method} {path} must name the field it refused: {message}"
+        );
+
+        if run_valid {
+            let res = server.client.request(method, &url, auth, Some(body)).await;
+            assert!(
+                (200..300).contains(&res.status),
+                "{method} {path} without the extra field should succeed: {} {:?}",
+                res.status,
+                res.body
+            );
+        }
+    }
+
+    // A nested request shape is closed too: the field list of an index, the
+    // weights of a hybrid search.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "qty", "descnding": true}]}),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("`descnding`"));
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/hybrid_search",
+            Some(&token),
+            json!({"query": "blue", "vector": [1.0, 0.0, 0.0], "weights": {"dens": 2.0}}),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("`dens`"));
+}
+
+/// A grant inside a user or role body is closed too, and this is the case
+/// the rule exists for: `collection` defaults to `*`, so a misspelt
+/// `colection` did not drop a field — it widened the grant to every
+/// collection in the database, and the response showed a grant that looked
+/// deliberate. The persisted `Grant` stays open (it must keep reading under a
+/// later version); the request carries a closed mirror of it.
+#[tokio::test]
+async fn a_misspelt_grant_field_is_refused_rather_than_widening_the_grant() {
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    let typo = json!({ "db": "shop", "colection": "orders", "actions": ["read"] });
+    let good = json!({ "db": "shop", "collection": "orders", "actions": ["read"] });
+
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "/v1/users",
+            json!({ "user": "bob", "password": "bob-password", "grants": [typo] }),
+            json!({ "user": "bob", "password": "bob-password", "grants": [good] }),
+        ),
+        ("/v1/users/bob/grants", json!({ "grants": [typo] }), json!({ "grants": [good] })),
+        (
+            "/v1/roles",
+            json!({ "name": "clerk", "grants": [typo] }),
+            json!({ "name": "clerk", "grants": [good] }),
+        ),
+        ("/v1/roles/clerk/grants", json!({ "grants": [typo] }), json!({ "grants": [good] })),
+    ];
+    for (path, with_typo, well_formed) in cases {
+        let res = server.post(path, Some(&token), with_typo).await;
+        assert_eq!(res.status, 422, "{path} accepted a misspelt grant field: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("unknown field `colection`"), "{path}: {message}");
+
+        let res = server.post(path, Some(&token), well_formed).await;
+        assert!(
+            (200..300).contains(&res.status),
+            "{path} well-formed: {} {:?}",
+            res.status,
+            res.body
+        );
+    }
+
+    // And what was stored is the grant that was sent, not a widened one.
+    let res = server.get("/v1/users/bob", Some(&token)).await;
+    assert_eq!(res.body["grants"][0]["collection"], "orders", "{:?}", res.body);
+}
+
+/// A query string is held to the same rule, at `400` rather than `422`: it is
+/// part of the request line, not a body the server could not process, and
+/// `400` is what axum answered before the envelope was added. Before this,
+/// `?limt=5` returned the default page and `?limit=abc` was bare text with no
+/// `error` code — the one refusal on a `GET` a client could not branch on.
+#[tokio::test]
+async fn a_query_parameter_the_route_does_not_define_is_refused_by_name() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for id in 1..=3 {
+        server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({ "_id": id })).await;
+    }
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limt=5", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("`limt`"), "must name the parameter: {message}");
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limit=abc", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["error"], "bad_request",
+        "a bad value is still in the envelope: {:?}",
+        res.body
+    );
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limit=1", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+
+    // The other query-string routes carry the same extractor.
+    for (method, path) in [
+        ("GET", "/v1/db/shop/coll/orders/describe?sampel=3"),
+        ("GET", "/v1/db/shop/coll/orders/violations?indx=x"),
+        ("PUT", "/v1/db/shop/coll/orders/docs/1?upsrt=true"),
+        ("DELETE", "/v1/db/shop/coll/orders/docs/1?ifstamp=x"),
+        ("DELETE", "/v1/db/shop/coll/orders/vector?drop=true"),
+    ] {
+        let url = format!("{}{path}", server.base);
+        let body = (method == "PUT").then(|| json!({ "_id": 1 }));
+        let res = server.client.request(method, &url, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{method} {path}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+    }
+}
+
+/// A document body is content, not a request shape, and stays open.
+///
+/// The names a request shape reserves — `filter`, `limit`, `update` — are
+/// perfectly good field names for a document, and refusing them on insert
+/// would make the store's schemalessness a lie (ADR-055).
+#[tokio::test]
+async fn a_document_body_may_carry_any_field() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let document = json!({ "_id": 1, "zzz": 1, "filter": {"a": 1}, "limit": 3, "update": [] });
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), document.clone()).await;
+    assert_eq!(res.status, 200, "insert: {:?}", res.body);
+
+    let res = server
+        .put("/v1/db/shop/coll/orders/docs/1", Some(&token), json!({ "zzz": 2, "explain": true }))
+        .await;
+    assert_eq!(res.status, 200, "replace: {:?}", res.body);
+
+    let res = server
+        .post("/v1/db/shop/coll/orders/bulk", Some(&token), json!([{ "zzz": 3, "pipeline": [] }]))
+        .await;
+    assert_eq!(res.status, 200, "bulk: {:?}", res.body);
+    assert_eq!(res.body["inserted"], 1);
+}
+
 #[tokio::test]
 async fn queries_filter_sort_and_project() {
     let server = Server::start().await;
@@ -1317,6 +1614,149 @@ async fn updates_apply_operators() {
 
     let res = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
     assert_eq!(res.body["n"], 15);
+}
+
+/// Two operators on one path apply in the order their keys arrive, and the
+/// last one wins — the promise `docs/query-language.md` makes. The parser
+/// kept it from the start; the boundary broke it, because a `serde_json::Map`
+/// built without `preserve_order` is a `BTreeMap` and sorted every object's
+/// keys before the parser saw them, so both orders below ran `$inc` first
+/// and both left `1`. Driven over HTTP on purpose: a `doc!`-built test in the
+/// parser never crossed the boundary and never saw the defect (ADR-120).
+#[tokio::test]
+async fn update_operators_apply_in_the_order_the_request_wrote_them() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    // The bodies are written as text, not with `json!`, so the key order on
+    // the wire is exactly the order that appears here.
+    async fn apply(server: &Server, token: &str, update: &str) -> Value {
+        server.post("/v1/db/shop/coll/c/docs", Some(token), json!({"_id":1,"a":0})).await;
+        let body = format!(r#"{{"filter":{{"_id":1}},"update":{update}}}"#);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let res = server.post("/v1/db/shop/coll/c/update", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let res = server.get("/v1/db/shop/coll/c/docs/1", Some(token)).await;
+        let value = res.body["a"].clone();
+        server.delete("/v1/db/shop/coll/c/docs/1", Some(token)).await;
+        value
+    }
+
+    assert_eq!(apply(&server, &token, r#"{"$set":{"a":1},"$inc":{"a":5}}"#).await, 6);
+    assert_eq!(apply(&server, &token, r#"{"$inc":{"a":5},"$set":{"a":1}}"#).await, 1);
+    assert_eq!(apply(&server, &token, r#"{"$set":{"a":7},"$mul":{"a":10}}"#).await, 70);
+    assert_eq!(apply(&server, &token, r#"{"$mul":{"a":10},"$set":{"a":7}}"#).await, 7);
+
+    // `$min` then `$max` on 5: 3, then 10. The reverse: 10, then 3.
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"a":5})).await;
+    let body: Value =
+        serde_json::from_str(r#"{"filter":{"_id":2},"update":{"$min":{"a":3},"$max":{"a":10}}}"#)
+            .unwrap();
+    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
+    let res = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await;
+    assert_eq!(res.body["a"], 10, "$min then $max on 5: {:?}", res.body);
+
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":3,"a":5})).await;
+    let body: Value =
+        serde_json::from_str(r#"{"filter":{"_id":3},"update":{"$max":{"a":10},"$min":{"a":3}}}"#)
+            .unwrap();
+    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
+    let res = server.get("/v1/db/shop/coll/c/docs/3", Some(&token)).await;
+    assert_eq!(res.body["a"], 3, "$max then $min on 5: {:?}", res.body);
+}
+
+/// A sort document's key order is its precedence, and it too crossed the
+/// sorted-map boundary: `{"b": 1, "a": 1}` used to sort by `a` first. The
+/// data is arranged so the two orders give opposite results.
+#[tokio::test]
+async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"a":1,"b":2})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"a":2,"b":1})).await;
+
+    async fn order(server: &Server, token: &str, sort: &str) -> Vec<i64> {
+        let body: Value = serde_json::from_str(&format!(r#"{{"sort":{sort}}}"#)).unwrap();
+        let res = server.post("/v1/db/shop/coll/c/find", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    assert_eq!(order(&server, &token, r#"{"a":1,"b":1}"#).await, vec![1, 2]);
+    assert_eq!(order(&server, &token, r#"{"b":1,"a":1}"#).await, vec![2, 1]);
+}
+
+/// A stored document's fields come back in the order they were written, as
+/// BSON keeps them and MongoDB returns them. The test client parses the body
+/// into a `serde_json::Value`, which since ADR-120 keeps the text's key order,
+/// so `keys()` here is the order of the JSON text on the wire; rendering the
+/// value back to text pins the same thing a client's raw reader would see.
+#[tokio::test]
+async fn a_document_reads_back_with_its_fields_in_the_order_they_were_written() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let body: Value = serde_json::from_str(r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    let keys: Vec<&str> = res.body.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["_id", "zeta", "alpha", "mid"], "{:?}", res.body);
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#);
+
+    // The same document through `find`, which renders through a different
+    // handler but the same `document_to_json`.
+    let res = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({})).await;
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#);
+
+    // An inclusion projection answers in the document's order, not the
+    // specification's, and `_id` stays first rather than landing where the
+    // parser appends it. Checked through `find` and the `$project` stage, the
+    // two renderers that share `shape::project`.
+    let body: Value = serde_json::from_str(r#"{"projection":{"alpha":1,"zeta":1}}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/find", Some(&token), body).await;
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+    let body: Value =
+        serde_json::from_str(r#"{"pipeline":[{"$project":{"alpha":1,"zeta":1}}]}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/aggregate", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+}
+
+/// A replace stores `_id` first like an insert does. The storage layer used
+/// to append it to a body that left it out, which nobody could see while the
+/// boundary sorted every object; a `PUT` and a `POST` of the same body now
+/// read back identically.
+#[tokio::test]
+async fn a_replaced_document_reads_back_with_its_id_first() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    // Created through the upsert, which is the replace path too.
+    let body: Value = serde_json::from_str(r#"{"zeta":1,"alpha":2}"#).unwrap();
+    let res = server.put("/v1/db/shop/coll/c/docs/x?upsert=true", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["upserted"], true, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+
+    // Replacing an existing document, and one whose body carries `_id`
+    // somewhere other than first, land the same way.
+    let body: Value = serde_json::from_str(r#"{"zeta":3,"_id":"x","alpha":4}"#).unwrap();
+    let res = server.put("/v1/db/shop/coll/c/docs/x", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":3,"alpha":4}"#);
 }
 
 /// `modified` counts documents **written**, not documents changed, so it equals
@@ -3676,10 +4116,15 @@ async fn hybrid_fusion_controls_default_to_the_previous_ranking() {
     let order: Vec<&str> = ranking.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(order, vec!["z", "y", "x"], "{:?}", implicit.body);
 
-    // The response shape is the one every client already parses.
+    // The response shape is the one every client already parses. The set of
+    // keys is the shape; their order is not part of it (`docs/compatibility.md`
+    // tells clients not to depend on envelope field order), and the alphabetical
+    // order this once asserted was the sorted map the JSON layer used before
+    // ADR-120, not a choice.
     assert_eq!(explicit.body["count"], 3);
     for m in explicit.body["matches"].as_array().unwrap() {
-        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["_id", "chunk", "score", "text"], "response shape changed: {m}");
     }
 }
@@ -5805,6 +6250,32 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
     let body = format!("{:?}", res.body);
     assert!(body.contains("$bucketAuto"), "the error must name what was rejected: {body}");
     assert!(body.contains("$group"), "and list what is supported: {body}");
+}
+
+#[tokio::test]
+async fn a_let_variable_in_a_sub_pipeline_match_is_a_bad_request() {
+    // On 0.19.1 this was a 200 with `x: []` on every document: the filter
+    // read `"$$oid"` as a literal string and matched nothing. It is refused
+    // before any document is read, naming the variable.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"a"})).await;
+    server.post("/v1/db/shop/coll/a/docs", Some(&token), json!({"_id": 1})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/a/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$lookup": {"from": "a", "let": {"oid": "$_id"},
+                             "pipeline": [{"$match": {"_id": "$$oid"}}], "as": "x"}},
+                {"$limit": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    assert!(format!("{:?}", res.body).contains("$$oid"), "{:?}", res.body);
 }
 
 #[tokio::test]

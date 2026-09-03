@@ -6519,3 +6519,420 @@ place to look after a tag is the `build-local-artifacts` log for the Linux
 targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---
+
+## ADR-119 — A replica applies a peer batch in one transaction
+
+**Decision.** `Engine::apply_batch` applies a batch of replicated entries in
+**runs**: every maximal sequence of consecutive document entries goes into one
+write transaction, opened through `Engine::begin_write` on the first document
+and committed once. A DDL entry ends the run — the run commits, the schema
+change goes through `apply_ddl` as before, and the next document entry opens
+the next run. The batch's witnessed vector, and for `apply_peer_batch` the
+coverage vector `coverage_after_batch` computes, are raised inside the last
+run's transaction rather than in transactions of their own. So a batch with no
+schema change in it is exactly one commit and, under `durable`, one fsync.
+`apply_remote` is split into `apply_remote_in_txn`, which writes into a caller's
+transaction and writes nothing when the entry loses, and `report_remote_write`,
+which does what has to follow the commit: counting and recording unique
+violations, and returning the entries to publish. The public `apply_remote` is
+the two around a transaction of its own, for snapshot restore and for tests.
+Defended by `a_replicated_batch_is_one_commit_however_many_entries_it_holds`.
+
+**Why.** Measured on a three-member cluster running 0.19.1. A client bulk
+insert of 1,000 documents is one commit on the node that accepts it —
+`insert_in_txn`, pinned by
+`a_batch_is_one_commit_however_many_documents_it_holds` — and was about 1,000
+commits on every node that replicated it:
+`apply_batch` called `apply_one` per entry, `apply_one` called `apply_remote`,
+and `apply_remote` opened and committed its own transaction. `apply_ddl`
+committed once more for the originating entry it appends, `absorb_witnessed`
+once for the batch's witnessed vector, and `apply_peer_batch` once again for
+the coverage vector: a DDL-free batch of N entries cost about N + 2 commits.
+Under `durable` every commit is an fsync, so `kimmy_commits` and
+`kimmy_fsyncs` rose one for one per replicated document, a 1,024-entry sync
+batch took about 145 s to apply, and replication ran at 8–13 documents a
+second — 1,000 documents converged in 78.7 s, 4,000 in 492.6 s, 500 in 61 s.
+The writer's side had been fixed for exactly this reason; the replica's side
+had never been measured, and nothing counted it, because `kimmy_commits` is
+read against `kimmy_requests_total` and a replica's commits answer no request.
+
+**What a run holds fixed.** Every per-entry check is unchanged and still runs
+per entry, in stamp order: a peer's `UniqueViolation` is refused, the drop
+tombstone and the incarnation floor supersede what predates them, an unknown
+collection is counted. Those checks read collection metadata through read
+transactions, which see the state before the open run — which is safe,
+because a run contains no schema change by construction. The one piece of
+metadata a document write does touch, an index's multikey flag, is re-read
+through the write transaction by `index::maintain_remote` and
+`index::mark_multikey` themselves, so an entry that flips it is seen by the
+next entry in the same run. A losing entry writes nothing and the run carries
+on; it is still witnessed (ADR-054). The unique-violation entry is minted after
+the run commits, in its own transaction, as it was — the merge must not fail
+because the report did (ADR-029) — and the run is published once, after its
+commit, in entry order, so nothing reaches a change stream before it is
+durable.
+
+**Why DDL ends a run.** `apply_ddl` reaches the collection, index and vector
+`_inner` functions, each of which opens and commits transactions of its own,
+and redb has one writer: the run has to be committed before any of them can
+begin. Threading a transaction through every `_inner` would make this the
+change that touches every DDL path in the engine for the sake of a case that
+is rare in a batch — schema changes are a handful of entries in a log of
+documents — and would give up the property that a replicated schema change is
+applied exactly as a local one is. Splitting at the DDL keeps the DDL path
+untouched and costs one extra commit per schema change in a batch.
+
+**Alternatives.** *Leave the per-entry transaction and rely on `coalesced`.*
+It shares the fsync but not the commit: redb still serialises N transactions
+through its single writer, each waiting at the barrier, and the default class
+is `durable`. *Open one transaction for the whole batch and apply DDL inside
+it.* Rejected above. *Commit per run and per entry for the witnessed vector as
+well.* The vector is derived bookkeeping and rides in whatever transaction
+commits last; there is no reason it should ever be a commit of its own when a
+run is open. *Batch the coverage vector separately in `apply_peer_batch`, as
+before.* One more commit per round for nothing; `coverage_after_batch` is pure,
+so folding it into the last run is free.
+
+**Cost.** A run holds redb's single writer for as long as its entries take to
+apply — up to a full batch of 1,024 entries — where before it was released
+between entries. A local write on a replica waits for the run rather than for
+one entry; at the measured rate that is milliseconds of CPU rather than the
+seconds of fsync it used to wait behind, but it is a longer *single* wait,
+and `kimmy_runtime_stall_seconds` is where it would show. A run that fails to
+commit loses the whole run rather than one entry; the round fails as it did
+before, the next round re-delivers, and re-delivery is idempotent. On a
+replica `kimmy_commits` and `kimmy_fsyncs` now rise per batch rather than per
+document, so any dashboard that read a replica's commit rate as its document
+rate reads a much smaller number; `kimmy_replication_lag_seconds` and the
+`cluster.sync` span's `applied` are the document-rate figures. A run publishes
+its entries to change streams in one burst after its commit rather than one
+at a time as each committed, and the live feed's ring holds 1,024 events —
+the same as `MAX_BATCH` — so a full batch that also mints a `UniqueViolation`
+entry can overrun a subscriber that is not keeping up in one go. That is lag,
+not loss: a subscriber that falls behind the ring resumes from the oplog,
+which is what `a_lagging_consumer_recovers_from_the_oplog_without_losing_events`
+defends, and the entries are durable before any of them is published. A run
+also holds a second copy of each applied entry until it commits — the
+`Pending` list carries the entry and the document id, with the collection
+metadata shared through the batch's memo rather than copied — bounded by the
+batch size, 1,024 entries. Snapshot restore still applies one document per
+transaction; it is a one-time path and is left as it is.
+
+---
+
+## ADR-120 — JSON object key order is preserved through the HTTP and MCP boundary
+
+**Decision.** The workspace's `serde_json` is built with `preserve_order`, so
+`serde_json::Map` keeps insertion order — the order the keys arrived in the
+bytes — instead of sorting them. Every JSON object that crosses into the
+server (a request body over HTTP, a tool argument over MCP, which shares the
+same `exec` layer and the same `Value` type) becomes a BSON document with the
+same key order, and every document that leaves is rendered in the order BSON
+holds it. Two places that had been shaping output in an order of their own,
+invisibly, are brought into line with it: an inclusion projection answers in
+the document's field order rather than the projection's, and every write path
+stores `_id` first. Nothing else changes: the parsers in `kimmy-query` already
+iterated their documents in order, and the storage layer already kept it.
+
+**Why.** Found on 0.19.1 over HTTP. `docs/query-language.md` and
+`docs/deviations.md` say that two update operators writing the same path apply
+in the order written and the last one wins, and `update::parse_with_filters`
+does exactly that; its tests, built with `doc!`, pass. Over the wire the order
+was ignored: `{"$set": {"a": 1}, "$inc": {"a": 5}}` on `a: 0` gave `1`,
+`{"$min": {"a": 3}, "$max": {"a": 10}}` on `a: 5` gave `3`, and `{"$set":
+{"a": 7}, "$mul": {"a": 10}}` gave `7` — six operator pairs, both orders each,
+always the alphabetical result. The cause was the boundary, not the parser.
+Every request body is deserialised as `serde_json::Value` and converted with
+`json::json_to_bson`, and without the `preserve_order` feature `serde_json::Map`
+is a `BTreeMap`: the keys of every object were sorted before the query language
+saw them. `cargo tree -e features -i serde_json` confirmed nothing in the graph
+enabled the feature. The same sort was silently applied to every stored
+document's fields, to the keys of every filter, projection and sort document —
+`{"sort": {"b": 1, "a": 1}}` sorted by `a` first — and, on the way out, to the
+fields of every document rendered back. MongoDB preserves field order in all
+of those places; BSON is an ordered sequence of elements, and its document
+comparison and equality are field-order sensitive because of it.
+
+The fix belongs at the boundary rather than in the parsers because the parsers
+were right: they read a `bson::Document`, which is ordered, and the tests that
+pin the ordered semantics were passing against it. Teaching each parser to
+sort would have been the wrong direction — it would have made the wire order
+irrelevant everywhere and contradicted MongoDB — and there is no way to
+recover an order from a map that has already forgotten it. The only place the
+order was lost is the `serde_json` map, and the feature flag is the whole of
+that fix. It is set once in the workspace `Cargo.toml` so that every crate
+that touches a `serde_json::Value` — the API, the MCP server, the CLI, the
+client library, the fuzz harness — sees the same map type; features are
+unified per build, so a crate could not opt out even if one wanted to.
+`preserve_order` pulls in `indexmap`, pure Rust, already in the graph through
+other dependencies.
+
+The two follow-on changes exist because the sorted map had been hiding them.
+`shape::project` built an inclusion projection's output by walking the
+specification's paths, with the implicit `_id` appended last by the parser,
+so `{"alpha": 1, "zeta": 1}` over `{_id, zeta, alpha}` produced `{alpha,
+zeta, _id}`; MongoDB answers in document order with `_id` first, and once
+order is visible the two disagree. The picking is unchanged and the result is
+reordered to the source document's order afterwards, at every level the
+projection reached into, so the array and dotted-path rules stay as they
+were; `find`, `findAndModify` and the `$project` stage all go through it. And
+`replace_if` appended `_id` to a body that left it out, while the insert path
+put a generated `_id` first and a client-supplied one wherever it was; both
+now go through one helper that stores `_id` first whatever the body said,
+which is MongoDB's rule too, and keeps the client's value as written so an
+`Int32` id does not come back an `Int64`.
+
+**Alternatives.** *Deserialise request bodies straight into `bson::Document`
+through `bson`'s own serde support and skip `serde_json::Value`.* That
+preserves order too, but it discards the Extended JSON layer in `json.rs` —
+`{"$oid": …}`, `{"$date": …}`, whole numbers as `Int32` — which is a contract
+`docs/http-api.md` makes and the fuzz harness checks; rebuilding it on the
+BSON side is the same code in a second place. *Sort every document
+canonically on write, and document that field order is not preserved.* That
+is a deviation from MongoDB with no benefit: a client that writes `{"zeta":
+1, "alpha": 2}` and reads back `{"alpha": 2, "zeta": 1}` has been told
+something it did not say, and the update-operator promise cannot be kept at
+all under it. *Leave projections in specification order.* That is an order a
+client could in principle want, but it is not MongoDB's, it contradicts the
+promise `docs/compatibility.md` now makes about stored order, and `_id`
+landing last was never a choice anyone made.
+
+**Consequence.**
+
+- *Update operators apply in wire order.* `{"$set": {"a": 1}, "$inc": {"a":
+  5}}` on `a: 0` leaves `6`; the reverse order leaves `1`. A client whose JSON
+  encoder does not preserve insertion order gets whichever order its encoder
+  emitted; `docs/deviations.md` says so and tells such a caller to serialise
+  deliberately. The deviation itself — that the pair is not refused as
+  MongoDB refuses it — stands.
+- *Sort documents mean what they say.* `{"b": 1, "a": 1}` sorts by `b` first.
+  Before, it sorted by `a` first; a client that wrote a multi-key sort in
+  non-alphabetical order was being answered in a different order than it
+  asked for, and now is not.
+- *Stored documents keep the order they were written in, `_id` first.* A
+  document written before this release was stored with its fields sorted
+  alphabetically and stays that way; one written after keeps the order it
+  arrived in. Nothing rewrites the old ones, and a collection may hold both.
+  Field order is not visible to a path lookup, so `find`, `count`, projection
+  and every operator that addresses a field by name behave the same over both.
+- *Whole-document comparison is field-order sensitive, as in BSON.*
+  `canonical_cmp` compares documents element by element and has since M1, so
+  `{"a": {"x": 1, "y": 2}}` as a filter matches a stored `a` of `{x: 1, y:
+  2}` and not `{y: 2, x: 1}` — which is MongoDB's rule. Before this release
+  both sides of that comparison had been sorted, so the comparison was
+  order-insensitive by accident. The one visible change: a document whose
+  embedded field was stored before this release is in sorted order, and a
+  filter that spells the embedded document in another order no longer matches
+  it. The same holds for `$in` over documents, `$eq` inside `$expr`, and the
+  order two document-valued keys take in an index or a sort. Rewriting such a
+  document — a replace, or any update — stores the order the request carried.
+- *Responses render in stored order.* Every `documents` array, `explain` and
+  the MCP tool text now show fields as stored, and an envelope built with
+  `json!` renders in the order the source writes it. `describe` is the
+  exception and deliberately so: its field list is a `BTreeMap` keyed by path
+  and stays alphabetical, which is the right order for a summary; only the
+  sample documents it returns changed. The audit that went with the change
+  ran the whole suite under the new map: one test had asserted the key order
+  of a `hybrid_search` match — `_id`, `chunk`, `score`, `text` — as the
+  "response shape", and that order was the sorted map's, not a choice; it
+  compares the key set now. Every other test compares `serde_json::Value`s,
+  whose equality ignores order, and none compares rendered text or a golden
+  JSON file; `/metrics` is Prometheus text and untouched.
+- *`serde_json::Map::remove` is now a swap-remove.* Under `preserve_order`
+  the map is an `IndexMap` and `remove` moves the last entry into the hole,
+  which disturbs the order of everything after it. Production code must not
+  use it to reshape a response or a document — `bson::Document::remove` is
+  the order-preserving one, and reshaping belongs on the BSON side anyway.
+  Today only tests call it, on values whose order they do not then assert.
+
+**Cost.** A behaviour change in a `0.MINOR`, recorded in the changelog: a
+client that relied on the accidental alphabetical application of update
+operators — writing `$inc` and `$set` on one path and getting `$set`'s value
+regardless of order — gets the order it wrote now, and a client that read
+projected fields positionally, in specification order, reads them in document
+order. `indexmap` replaces `BTreeMap` behind every `serde_json::Map`; lookups
+are hashed rather than tree-walked and iteration is a vector scan, which is
+not slower on any path this server takes. An inclusion projection pays one
+pass over the source document's top-level keys per result to reorder, and
+`shift_remove` on the picked document, which is small. Two orders of stored
+document now coexist on a node that was upgraded, and the comparison case
+above is the only place that shows.
+
+---
+
+## ADR-121 — A request body with a field the route does not define is refused
+
+**Decision.** Every request shape the API deserializes carries
+`#[serde(deny_unknown_fields)]`: the bodies of `find`, `count`, `aggregate`,
+`update`, `delete`, `find_and_modify`, index creation, collection creation,
+login, the user, role and webhook routes, vector upload and both searches, and
+the shapes nested inside them — an index's field entry, a search's fusion
+weights. A field the route does not define is refused `422` with the
+`bad_request` code in the standard envelope, and the message is serde's, which
+names the field and lists the ones the route takes. The rule is stated once,
+on `JsonBody<T>`, the extractor every request body passes through. A document
+body — insert, replace, bulk — is content, not a shape, and is not held to it.
+A grant inside a user or role body arrives as `GrantInput`, a closed mirror of
+`kimmy-auth`'s `Grant` that converts into it, so the persisted type stays open
+and the request does not. Query strings are held to the same rule through
+`QueryParams<T>`, a wrapper over axum's `Query<T>` whose rejection is the
+envelope: `?limt=5` is refused by name and `?limit=abc` is no longer bare
+text. The status there is `400`, not `422` — a query string is part of the
+request line, not an entity the server failed to process, and `400` is what
+axum already answered — so nothing a client had learned to expect on a `GET`
+changes but the envelope.
+
+The MCP tools' argument structs carry the same attribute: rmcp deserializes
+them with serde and returns a failure as the tool's error result with the text
+intact, so the refusal reaches the model by name, and schemars turns the
+attribute into `additionalProperties: false` in every tool's schema.
+`docs/openapi.yaml` says the same of every request schema, and the contract
+test that keeps response schemas open now also insists that request shapes are
+closed.
+
+**Why.** `POST .../find` with `{"limitt": 5}` answered `200` and returned the
+default page. `{"explain": true}` on `aggregate` answered `200` without a
+plan. A misspelt `if_stamp` on `update` made a conditional write an
+unconditional one, which is the opposite of what the field is for. Each of
+these is a typo on exactly the field where a silent no-op costs the most, and
+none of them could be seen from the response. One route refused the same
+thing: `POST .../vector`, because `VectorConfig` and `ProviderConfig` in
+`kimmy-core` carried the attribute since they were written, so a client met a
+`422` for an unknown field on one route and a `200` on every other. The
+reference documented neither. The compatibility page described the refusal as
+the behaviour a client should expect from an older node — "several request
+bodies reject unknown fields deliberately" — which was true of two structs.
+Making it true of all of them is making the documented contract the actual
+one.
+
+The argument for refusing is the same one ADR-057 made for the error envelope:
+a client can only act on what it can see. A field the server does not read is
+a request the server cannot honour; answering as though it had is the one
+failure a client cannot detect, test for, or retry. A refusal that names the
+field is a fix in one edit. And the cost of refusing falls only on a request
+that was already wrong.
+
+**Alternatives.**
+
+- *Warn, or accept and report the ignored fields in the response.* Rejected.
+  A warning field is one more thing a client must know to read, and the
+  clients most likely to send a typo are the ones least likely to read it.
+  The pre-1.0 policy allows a tightening behind a `0.MINOR` bump with a
+  release note, which this is; a deprecation window would be a release of
+  silent no-ops nobody asked for, and the project does not ship
+  compatibility shims (ADR-058).
+- *Leaving query strings open.* Rejected, though it was the first draft.
+  Axum's `Query<T>` rejects as bare text outside the envelope, so closing the
+  structs alone would have made an unknown parameter the one refusal a client
+  cannot branch on — the defect `JsonBody` was written to remove. The fix was
+  the same one: an extractor of our own with the envelope as its rejection,
+  after which the rule costs nothing to apply. Answering `422` there, to match
+  bodies, was considered and dropped: it would change a status clients had
+  seen since the routes existed for no gain, and the envelope is what a
+  client branches on.
+- *Closing `Grant` itself.* Rejected. A grant is a request shape inside the
+  user and role bodies, but it is also the persisted, replicated form and the
+  shape every response that lists grants returns; a stored record must keep
+  reading under a later version that adds a field, and a rolling upgrade
+  cannot afford an older member refusing what a newer one wrote. But leaving
+  the request side open was the worst case of the whole finding: `collection`
+  defaults to `*`, so a misspelt `colection` did not lose a field, it granted
+  every collection in the database and returned a grant that looked
+  deliberate. A request-only mirror in `kimmy-api` closes the boundary
+  without touching the type.
+- *Closing `VectorConfig` in the specification.* Not done, for the mirror
+  reason: `GET .../vector` and `describe` return it, and a response schema
+  must stay open so a new response field is additive. The server refuses an
+  unknown field in it — it always did — and the request body says so in
+  prose.
+
+**Cost.** Breaking for a client that sends a field or a query parameter the
+route does not define, and a `0.MINOR` bump for it. One more shape to keep in
+step with `Grant` — three fields and a `From` — and a second extractor beside
+`JsonBody`. The first-party Rust, Python and Go clients, the CLI, the MCP
+server, the conformance scenarios, the examples and every request example in
+the documentation were audited against the server's field lists and send
+nothing the server does not define; a third-party client that hand-rolls a
+body with an extra field meets a `422` that names it. The MCP `hybrid_search`
+arguments spell out the search fields rather than flattening
+`vector_search`'s, because serde cannot refuse unknown fields across a
+flatten; the schema the model reads is the same. Two more contract tests,
+`every_request_shape_is_closed` and
+`every_operation_with_a_query_parameter_documents_the_400`, and the
+closed-schema test now distinguishes a component only a request reaches from
+one a response does.
+
+---
+
+## ADR-122 — The replication lag gauge measures age behind, not the span of missing history
+
+**Decision.** `kimmy_replication_lag_seconds` is how far behind in time this
+node is: for every origin where a peer's head is ahead of what this node has
+applied, the time since the newest entry this node *has* applied from that
+origin was written, `now − held`; the maximum over origins and over the peers
+reached in the round. `lag_behind_ms` in `crates/kimmy-storage/src/sync.rs`
+takes the current wall time and computes exactly that; the transport passes
+the same physical clock the engine stamps with. Zero when no peer holds
+anything newer; an origin this node has never seen contributes nothing, as
+before. The stale-rejoiner verdict (`behind_ms`, `lag_beyond_horizon_ms`,
+ADR-085 and ADR-097) is a different question and is not touched. The `HELP`
+text, the golden `/metrics` tests, the OpenTelemetry description and the
+operations table all say the new thing.
+
+**Why.** On a three-member cluster running 0.19.1, the gauge read 0.0 on
+every member for the whole of a 78-second window in which one replica held
+351 of the 1,000 documents a peer had, and again for a later 492-second window
+in which it trailed by 4,000. It only rose — to 697 s, then 1,496 s — once
+several writers had spread their writes over many minutes. The formula was
+`theirs.wall_ms − held.wall_ms` per origin: the span of origin wall-clock
+time between the newest entry this node had applied and the peer's newest. A
+bulk insert of 1,000 documents mints all its stamps within a few hundred
+milliseconds, so a 900-document backlog of it is "0.3 s of history", and the
+gauge read 0 however many minutes the replica took to drain it. The transport
+also measures against the peer's vector as of the round's start, which makes
+the number a floor; that is not the cause and is unchanged.
+
+**Alternatives.** Two measures were on the table, and each answers a real
+question. *The span of missing history*, `theirs − held`: how wide is the
+window of the origin's timeline this node still lacks. It is what the gauge
+was, it is exact from the two head vectors alone, and it does not move
+between rounds. But its width says nothing about how long the node has been
+lacking it, which is what an operator alerting on "replication lag" wants to
+know, and for the write pattern that produces a backlog in the first place —
+a burst — it is a fraction of a second by construction. *Age behind*,
+`now − held`: how long ago the newest thing this node has from the origin was
+written, given a peer has newer. At thirty seconds into a bulk backlog it
+reads about 30 s where the span read 0; caught up it reads 0; holding
+everything but an entry written two seconds ago that has not been pulled
+yet, it reads about 2 s, which is the truth. Chosen. *Age of the oldest
+unapplied entry* would be more precise still, but the peer advertises only
+its head per origin, and carrying an oldest-unapplied stamp per origin per
+peer is a wire change for a number the age-behind measure approximates from
+above; not done. *Keep the span and add a second gauge for age* was rejected
+because nobody was found who asks the span's question, and two gauges called
+lag invite alerting on the wrong one.
+
+**Cost.** The number changes meaning, and anyone alerting on it
+should know: it now grows with the clock while a backlog drains, so an alert
+threshold that used to be reached only by long-spread writes is reached by
+any backlog that outlives the threshold, which is the behaviour the threshold
+was written for. A known limit, stated plainly: an origin that is quiet for
+hours and then writes once shows the length of that silence for one round on
+each peer, until the entry is pulled. The span had the same one-round spike —
+ADR-097 records it being mistaken for a stale rejoiner — so this is not a
+regression, and the head vector carries no oldest-unapplied stamp that would
+remove it; the doc comment on `lag_behind_ms` says so. The measure now reads
+the wall clock, which the old one did not; it is the same clock the engine
+stamps with, and a clock stepped backwards saturates to zero rather than
+wrapping. It also crosses clocks, which the span never did: `held` is a
+remote origin's HLC wall time and `now` is this node's, so a peer whose clock
+runs ahead of this node's makes an origin this node genuinely trails saturate
+to zero and the gauge under-reports by the skew, and one running behind adds
+it. The error is bounded by the skew members already tolerate in their HLCs,
+and under-reporting by seconds is a smaller lie than reading zero through a
+backlog that lasts minutes. Every unit test that called `lag_behind_ms` passes a time and
+asserts the new meaning, and one reproduces the finding: stamps spanning
+300 ms, held at the first, the peer at the last, thirty seconds on — 30,000
+where the span gave 300.
+
+---

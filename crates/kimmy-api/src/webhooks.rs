@@ -122,6 +122,7 @@ impl Subscription {
 
 /// What a caller sends to register one.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RegisterRequest {
     pub url: String,
     #[serde(default)]

@@ -9,13 +9,13 @@
 //! Events reach live subscribers only *after* the commit succeeds, so a
 //! subscriber can never observe a change that was rolled back.
 
-use bson::Document;
+use bson::{Bson, Document};
 use kimmy_core::{DocId, DocRecord, Error as CoreError, OpKind, OplogEntry, Stamp, keyenc};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
 use crate::codec;
-use crate::engine::{Engine, append_oplog, doc_range_after};
+use crate::engine::{Engine, WriteTxn, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
@@ -291,21 +291,19 @@ impl Engine {
         &self,
         txn: &redb::WriteTransaction,
         coll: &CollectionMeta,
-        mut doc: Document,
+        doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
-        let id = match doc.get(ID_FIELD) {
-            Some(value) => DocId::try_from_bson(value)?,
+        // The value the client wrote is kept as written, so an `Int32` id
+        // stays an `Int32` rather than passing through `DocId` and back.
+        let (id, id_value) = match doc.get(ID_FIELD) {
+            Some(value) => (DocId::try_from_bson(value)?, value.clone()),
             None => {
                 let id = DocId::generate();
-                // Store `_id` first so the stored document round-trips with the
-                // field present, as clients expect.
-                let mut with_id = Document::new();
-                with_id.insert(ID_FIELD, id.to_bson());
-                with_id.extend(doc);
-                doc = with_id;
-                id
+                let value = id.to_bson();
+                (id, value)
             }
         };
+        let doc = with_id_first(doc, id_value);
 
         let key = doc_key(&id)?;
         let body = bson::serialize_to_vec(&doc)?;
@@ -369,13 +367,13 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         id: &DocId,
-        mut doc: Document,
+        doc: Document,
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
         // The id is part of the document's identity, not its content: a replace
         // must not be able to move a document to a different key.
-        doc.insert(ID_FIELD, id.to_bson());
+        let doc = with_id_first(doc, id.to_bson());
 
         let key = doc_key(id)?;
         let body = bson::serialize_to_vec(&doc)?;
@@ -588,11 +586,63 @@ impl Engine {
     /// original position — which may be *behind* the local tail. Change-stream
     /// subscribers that have already read past that point will not see it; the
     /// cluster work in M4 addresses that.
+    ///
+    /// One entry, one transaction. A sync batch does not come through here:
+    /// it applies a whole run of entries into one transaction with
+    /// [`Self::apply_remote_in_txn`] and commits once (ADR-119). This is the
+    /// single-entry form for snapshot restore and for tests that manufacture
+    /// a replicated write by hand.
     pub fn apply_remote(&self, coll: &CollectionMeta, entry: &OplogEntry) -> Result<bool> {
+        if entry.doc_id.is_none() {
+            // Collection-level operations carry no document to merge, and
+            // nothing to write: decided before the writer is taken.
+            self.witness(&entry.stamp);
+            return Ok(false);
+        }
+        let txn = self.begin_write()?;
+        let RemoteApplied::Applied { id, violations } =
+            self.apply_remote_in_txn(&txn, coll, entry)?
+        else {
+            // Nothing was written, so nothing is committed — a superseded
+            // entry must not cost an fsync.
+            txn.abort()?;
+            return Ok(false);
+        };
+        txn.commit()?;
+        let published = self.report_remote_write(coll, entry, &id, &violations)?;
+        self.publish(published);
+        Ok(true)
+    }
+
+    /// The body of [`Self::apply_remote`], inside a transaction the caller
+    /// owns.
+    ///
+    /// Writes the document, its index entries and its oplog entry into `txn`
+    /// when the entry wins, and writes **nothing** when it loses — an equal
+    /// stamp means this exact write is already here, and peers resend
+    /// overlapping ranges by design — so the caller can keep applying further
+    /// entries into the same transaction either way. The local clock is
+    /// advanced past the stamp in both cases, so a subsequent local write is
+    /// ordered after it.
+    ///
+    /// What cannot happen here is anything that needs the write to be
+    /// durable: publishing to change streams, and recording a unique
+    /// violation, which mints a local entry in a transaction of its own.
+    /// Those come back in the result for [`Self::report_remote_write`] to do
+    /// once the caller has committed. The split exists so that a sync batch
+    /// can be one commit rather than one per entry (ADR-119); on a
+    /// three-member cluster the per-entry form replicated at 8–13 documents
+    /// a second under `durable`, one fsync each.
+    pub(crate) fn apply_remote_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+    ) -> Result<RemoteApplied> {
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
             self.witness(&entry.stamp);
-            return Ok(false);
+            return Ok(RemoteApplied::Superseded);
         };
 
         let key = doc_key(&id)?;
@@ -601,9 +651,7 @@ impl Engine {
             None => DocRecord::tombstone(entry.stamp),
         };
 
-        let txn = self.begin_write()?;
-        let violations;
-        let applied = {
+        let violations = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let existing = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => Some(codec::decode_doc_record(raw.value())?),
@@ -620,10 +668,8 @@ impl Engine {
             };
 
             if !wins {
-                drop(docs);
-                txn.abort()?;
                 self.witness(&entry.stamp);
-                return Ok(false);
+                return Ok(RemoteApplied::Superseded);
             }
 
             // The previous image is needed to remove the index entries it
@@ -646,26 +692,49 @@ impl Engine {
             // are on the local path: an index that does not see a replicated
             // write leaves an index-backed query unable to find a document that
             // demonstrably exists. Same transaction, so the two cannot disagree.
+            //
+            // Both calls read the index definitions through `txn`, not from
+            // `coll`, which is why a run of entries can share a transaction: a
+            // multikey flag an earlier entry set is seen by the next one even
+            // though `coll` was resolved from the last committed state.
             let next = winner.document()?;
-            let newly_multikey;
-            (violations, newly_multikey) =
-                index::maintain_remote(&txn, coll, previous.as_ref(), next.as_ref(), &key)?;
+            let (violations, newly_multikey) =
+                index::maintain_remote(txn, coll, previous.as_ref(), next.as_ref(), &key)?;
             // A replicated array write makes this node's index multikey exactly
             // as a local one would — the planner here answers queries over the
             // merged data, wherever it was written.
-            index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
-            true
+            index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+            violations
         };
 
-        append_oplog(&txn, entry)?;
-        txn.commit()?;
+        append_oplog(txn, entry)?;
 
         // Advance the local clock past what we just accepted, so a subsequent
         // local write is ordered after it.
         self.witness(&entry.stamp);
 
-        let mut published = vec![entry.clone()];
-        for violation in &violations {
+        Ok(RemoteApplied::Applied { id, violations })
+    }
+
+    /// The part of a replicated write that must follow its commit: count and
+    /// record its unique violations, and return what to publish, in order —
+    /// the entry, then one `UniqueViolation` entry per constraint it broke.
+    ///
+    /// After the commit and not before, because recording a violation mints a
+    /// local entry in its own transaction (see [`Self::log_unique_violation`]
+    /// for why it is separate), and redb has one writer. The caller publishes
+    /// the result, which keeps the rule that nothing reaches a subscriber
+    /// before it is durable.
+    pub(crate) fn report_remote_write(
+        &self,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+        id: &DocId,
+        violations: &[index::UniqueViolation],
+    ) -> Result<Vec<OplogEntry>> {
+        let mut published = Vec::with_capacity(1 + violations.len());
+        published.push(entry.clone());
+        for violation in violations {
             self.count_unique_violation();
             warn!(
                 index = %violation.index,
@@ -673,13 +742,30 @@ impl Engine {
                 collection = %coll.name,
                 "a merged write broke a unique constraint"
             );
-            published.push(self.log_unique_violation(coll, &id, violation)?);
+            published.push(self.log_unique_violation(coll, id, violation)?);
         }
-
-        self.publish(published);
-
-        Ok(applied)
+        Ok(published)
     }
+}
+
+/// What [`Engine::apply_remote_in_txn`] decided, and what it left for after
+/// the commit.
+#[derive(Debug)]
+pub(crate) enum RemoteApplied {
+    /// The entry won its conflict and was written into the transaction.
+    Applied {
+        /// The document it wrote — carried here so the post-commit report
+        /// does not have to re-derive from the entry what the write already
+        /// knew.
+        id: DocId,
+        /// Unique constraints the merged write broke. Neither counted nor
+        /// recorded yet: [`Engine::report_remote_write`] does both once the
+        /// write is durable.
+        violations: Vec<index::UniqueViolation>,
+    },
+    /// The entry lost, or named no document. The transaction is exactly as
+    /// it was.
+    Superseded,
 }
 
 /// A group's identity for deduplication: its ids, order-free.
@@ -858,6 +944,29 @@ impl Engine {
             None => Ok(None),
         }
     }
+}
+
+/// The document as it will be stored: `_id` first, carrying `id`, and every
+/// other field in the order it arrived.
+///
+/// BSON keeps field order, and since ADR-120 so does everything between the
+/// client and this table, so where `_id` lands is visible. MongoDB stores it
+/// first whatever the client wrote, and both write paths here do the same.
+/// Before this shared helper the insert path put a generated `_id` first but
+/// left a client-supplied one where it was, and `replace_if` appended `_id`
+/// to a body that lacked it — so a `PUT` of `{"zeta": 1, "alpha": 2}` read
+/// back with `_id` last while the same body inserted read back with it first.
+/// A body whose `_id` is already first is patched in place rather than
+/// rebuilt; `Document::insert` on a present key keeps its position.
+fn with_id_first(mut doc: Document, id: Bson) -> Document {
+    if doc.keys().next().is_some_and(|key| key == ID_FIELD) {
+        doc.insert(ID_FIELD, id);
+        return doc;
+    }
+    let mut out = Document::new();
+    out.insert(ID_FIELD, id);
+    out.extend(doc.into_iter().filter(|(key, _)| key != ID_FIELD));
+    out
 }
 
 /// The storage key for a document id.
@@ -1208,6 +1317,32 @@ mod tests {
 
         let found = engine.get(&coll, &id).unwrap().unwrap();
         assert_eq!(DocId::try_from_bson(found.get(ID_FIELD).unwrap()).unwrap(), id);
+    }
+
+    /// `_id` is stored first on every write path, so a replace and an insert
+    /// of the same body read back the same. Before ADR-120 made field order
+    /// visible, `replace_if` appended `_id` to a body that lacked it.
+    #[test]
+    fn every_write_path_stores_id_first() {
+        let (engine, coll, _dir) = engine();
+        let keys = |doc: &Document| doc.keys().cloned().collect::<Vec<_>>();
+
+        let id = engine.insert(&coll, doc! { "zeta": 1, "alpha": 2 }).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
+
+        // A client-supplied `_id` moves to the front, as MongoDB moves it, and
+        // its value is stored as written rather than through `DocId`.
+        let id = engine.insert(&coll, doc! { "zeta": 1, "_id": 7_i32, "alpha": 2 }).unwrap();
+        let found = engine.get(&coll, &id).unwrap().unwrap();
+        assert_eq!(keys(&found), ["_id", "zeta", "alpha"]);
+        assert_eq!(found.get(ID_FIELD), Some(&Bson::Int32(7)));
+
+        engine.replace(&coll, &id, doc! { "zeta": 3, "alpha": 4 }, false).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
+
+        let id = DocId::Int64(8);
+        engine.replace(&coll, &id, doc! { "zeta": 1, "alpha": 2 }, true).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
     }
 
     #[test]

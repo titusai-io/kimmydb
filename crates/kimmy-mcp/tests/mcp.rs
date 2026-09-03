@@ -847,6 +847,56 @@ async fn a_write_tool_actually_writes() {
     assert_eq!(counted["count"], 4);
 }
 
+/// Tool arguments arrive as JSON like an HTTP body does and reach the same
+/// `exec` layer, so the MCP boundary keeps operator order exactly as the HTTP
+/// one does (ADR-120). Pinned here rather than assumed: the changelog says
+/// both boundaries were affected and both are fixed. The argument is parsed
+/// from text so the key order on the wire is the order written here.
+#[tokio::test]
+async fn the_update_tool_applies_operators_in_the_order_written() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    server
+        .call_ok(
+            &token,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"o","a":0}}),
+        )
+        .await;
+
+    let args: Value = serde_json::from_str(
+        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
+            "update":{"$set":{"a":1},"$inc":{"a":5}}}"#,
+    )
+    .unwrap();
+    server.call_ok(&token, "update", args).await;
+    let found = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0]["a"], 6, "$set then $inc: {found}");
+
+    let args: Value = serde_json::from_str(
+        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
+            "update":{"$inc":{"a":5},"$set":{"a":1}}}"#,
+    )
+    .unwrap();
+    server.call_ok(&token, "update", args).await;
+    let found = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0]["a"], 1, "$inc then $set: {found}");
+}
+
 #[tokio::test]
 async fn a_malformed_filter_is_reported_to_the_caller() {
     // An agent that can read the reason can correct itself; an opaque failure
@@ -864,6 +914,59 @@ async fn a_malformed_filter_is_reported_to_the_caller() {
         .await;
     let message = body["error"]["message"].as_str().unwrap_or_default();
     assert!(message.contains("$nope"), "the message must name the problem: {body}");
+}
+
+#[tokio::test]
+async fn an_argument_the_tool_does_not_define_is_refused_by_name() {
+    // ADR-121, the tool side. A model that misspells `limit` and is answered
+    // with every document has no way to notice; one told the name it used is
+    // wrong corrects itself, as it does for a rejected filter.
+    let server = Server::start().await;
+    seed(&server);
+    seed_vectors(&server);
+    let token = server.root();
+
+    // rmcp reports an argument it could not deserialize as the tool's own
+    // error result rather than a protocol error, so the text is where a
+    // model reads a tool's answer.
+    let body = server
+        .call(&token, "find", json!({"database":"sales","collection":"orders","limt":5}))
+        .await;
+    assert_eq!(body["result"]["isError"], json!(true), "an unknown argument must not run: {body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(message.contains("`limt`"), "the message must name the field: {body}");
+
+    // hybrid_search carries its search fields itself rather than flattening
+    // the vector_search arguments, because serde cannot refuse unknown fields
+    // across a flatten; this is the case that would regress if it did.
+    let body = server
+        .call(
+            &token,
+            "hybrid_search",
+            json!({"database":"sales","collection":"orders","query":"widget","min_overlp":2}),
+        )
+        .await;
+    assert_eq!(body["result"]["isError"], json!(true), "an unknown argument must not run: {body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(message.contains("`min_overlp`"), "the message must name the field: {body}");
+
+    // The schema the model reads says so up front. A tool that takes no
+    // arguments has rmcp's empty schema rather than one of ours, and there is
+    // nothing for it to refuse.
+    let (_, listed) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        if tool["inputSchema"]["properties"].as_object().is_none_or(|p| p.is_empty()) {
+            continue;
+        }
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(false),
+            "{} does not declare itself closed: {}",
+            tool["name"],
+            tool["inputSchema"]
+        );
+    }
 }
 
 #[tokio::test]

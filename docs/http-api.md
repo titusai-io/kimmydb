@@ -497,7 +497,9 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/indexes/item_qty -H "$A"
 
 `fields` is an **array**, not a `{field: 1}` object: field order decides which
 queries a compound index can answer, and JSON object key order is not something
-a client can rely on.
+a client can rely on its own encoder to keep. The server keeps whatever order
+arrives (see [The JSON boundary](#the-json-boundary)); the array is insurance
+against the client side, where a language with unordered maps may not.
 
 A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 `"enforcement": "coordinated"` returns **501** until clustering lands — a
@@ -656,6 +658,33 @@ round-trips exactly, and there is a test pinning it.
 **Non-finite doubles** come back as `{"$numberDouble": "NaN"}` rather than
 `null`, so a number never silently becomes a missing value.
 
+**Every request body is closed.** A field the route does not define — a
+misspelt `limitt`, an `explain` on `aggregate`, anything the route's section
+does not list — is refused `422 bad_request`, and the message names the field
+and lists the ones the route takes ([ADR-121](decisions.md)). Nested shapes
+are closed too: an entry in an index's `fields`, a search's `weights`, a
+vector configuration's `provider`, a grant inside a user or role body — where
+a misspelt `collection` used to default to `*` and widen the grant. A document
+body is content, not a shape: insert, replace and bulk take any field, because
+`limit` and `filter` are perfectly good names for a document's own fields.
+
+**Query strings are held to the same rule, at `400`.** `?limt=5` on
+`GET .../docs`, or `?limit=abc`, is `400 bad_request` with the parameter
+named. The status differs from a body's `422` because a query string is part
+of the request line rather than an entity the server could not process; the
+envelope is the same.
+
+**Object key order is preserved** through the boundary and into the stored
+document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
+`zeta` first, as BSON keeps it, and the same holds for the keys of a filter,
+sort or update document, where the order carries meaning — a sort document's
+first key is its primary key, and update operators apply in the order they
+arrive (ADR-120). An inclusion projection answers in the document's order,
+not the projection's. This is the server's end of the wire; the other end is
+the client's JSON encoder, and the index route's `fields` array exists because
+that end is the one a client cannot always vouch for (see
+[Indexes](#indexes)).
+
 ---
 
 ## Tokens
@@ -802,8 +831,8 @@ failure cannot appear without its retry class being decided in the same commit.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents |
-| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse ([ADR-121](decisions.md)) |
+| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
 | 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |

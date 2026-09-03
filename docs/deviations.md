@@ -237,14 +237,62 @@ parser: `filter::matches_element` already answers one, against the element.
 
 ---
 
+## 🟡 A `$$` string in a `$lookup` sub-pipeline `$match` is refused, where MongoDB reads it as a literal
+
+**Raised 2026-09-02, fixing a documented refusal that did not happen.**
+`docs/aggregation.md` had said a `$$oid` in a sub-pipeline `$match` was
+refused. It was not: the filter language has no variables, so
+`{$match: {_id: "$$oid"}}` was the five-character string, matched nothing,
+and the join came back as an empty array on every input with a 200. The
+refusal now exists, and it is stricter than MongoDB.
+
+**The rule.** Inside a `$lookup` sub-pipeline — with or without a `let`, at
+any nesting depth — any string value beginning with `$$`, at any depth of a
+`$match` (a plain equality, `$eq`/`$ne`/`$gt`, `$in`/`$nin`/`$all`, `$not`,
+`$elemMatch`, the arrays under `$and`/`$or`/`$nor`, a `$regex` pattern), is
+a 400 naming the variable and the idiom that works: bind it in an
+`$addFields` stage and `$match` on the computed field. The subtree under
+`$expr` is exempt; the expression parser owns variables there and refuses an
+unbound one by its own rule.
+
+**What that costs.** MongoDB does not substitute variables in a sub-pipeline
+`$match` either — `{_id: "$$oid"}` matches nothing there too — but it accepts
+the string as a literal, so a stored value that begins with `$$` *can* be
+matched from inside a sub-pipeline. Here it cannot: **there is no literal
+escape inside a sub-pipeline `$match`.** A top-level `$match` and a `find`
+filter keep the literal reading, so such a document is still reachable; it is
+only from within a `$lookup` pipeline that it is not.
+
+**Why the stricter side.** The two readings of `"$$oid"` inside a
+sub-pipeline are a `let` name the author expected substituted and a literal
+that happens to look like one, and the first is overwhelmingly the one
+written. Under the lenient reading the first produces an empty join with no
+error — a result indistinguishable from a correct one, which is the worse
+failure. Closing this would mean an escape syntax for a literal `$$` string
+in a sub-pipeline filter, which the filter language has nowhere else; not
+planned until someone stores such a value and needs to join on it.
+
+---
+
 ## 🟡 Update operators are not checked for conflicting paths, except `$setOnInsert`
 
 **Raised 2026-08-30, while adding `$setOnInsert` and the `$push` modifiers.**
 MongoDB rejects any update in which two operators write the same path, or one
 writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails with *"Updating
 the path 'a' would create a conflict at 'a'"*. Here the operators apply in the
-order written and the last one wins, which is what the parser has done since
-the update language existed and what its tests pin.
+order their keys arrive on the wire and the last one wins: `{"$set": {"a": 1},
+"$inc": {"a": 5}}` on `a: 0` leaves `6`, and `{"$inc": {"a": 5}, "$set": {"a":
+1}}` leaves `1`. That is what the parser has done since the update language
+existed and what its tests pin — but before the release that records ADR-120
+it was not what a client saw. Every request body was decoded into a JSON map
+that sorted its keys, so the operators ran in alphabetical order whatever the
+body said — `$inc` before `$set` — and the two updates above both left `1`.
+The boundary now keeps the order it is given (ADR-120). "The order written"
+means the order the bytes arrive in: a client whose JSON encoder does not
+preserve insertion order — a language whose maps are unordered, or a library
+that sorts keys on output — gets whichever order its encoder produced, so a
+caller who depends on the last operator winning should serialise the update
+deliberately rather than trust a map.
 
 **`$setOnInsert` is the exception, and it is checked.** An update that sets a
 path on insert and also `$set`s, `$inc`s, `$unset`s or `$rename`s onto it (or a

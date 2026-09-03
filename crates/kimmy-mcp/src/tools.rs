@@ -62,15 +62,27 @@ impl KimmyMcp {
 // Defined here rather than reused from the HTTP layer because a tool schema is
 // a contract an agent reads: every field carries a doc comment, and that
 // comment becomes the description the model sees.
+//
+// Every one of them refuses an argument it does not define, as the HTTP
+// request bodies do (ADR-121). rmcp deserializes arguments with serde and
+// hands a failure back as the tool's error result with serde's text intact,
+// so a misspelt `limt` is reported by name instead of being dropped — the
+// same self-correction a rejected filter gets — and schemars turns the
+// attribute into `additionalProperties: false`, so the schema the model reads
+// says so too. `HybridSearchArgs` spells its search fields out rather than
+// flattening `SearchArgs`, because serde cannot refuse unknown fields across
+// a flatten.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DatabaseArgs {
     /// Database name.
     pub database: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DescribeArgs {
     /// Database name.
     pub database: String,
@@ -82,6 +94,7 @@ pub struct DescribeArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FindArgs {
     /// Database name.
     pub database: String,
@@ -113,6 +126,7 @@ pub struct FindArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CountArgs {
     /// Database name.
     pub database: String,
@@ -124,6 +138,7 @@ pub struct CountArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct AggregateArgs {
     /// Database name.
     pub database: String,
@@ -134,6 +149,7 @@ pub struct AggregateArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SearchArgs {
     /// Database name.
     pub database: String,
@@ -160,6 +176,7 @@ pub struct SearchArgs {
 /// fused. Only the ratio matters. Leave both out for plain reciprocal rank
 /// fusion, which is the default.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FusionWeightsArgs {
     /// Weight of the dense (vector) rank. At least 0; defaults to 1.
     #[serde(default = "one")]
@@ -175,9 +192,25 @@ fn one() -> f64 {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HybridSearchArgs {
-    #[serde(flatten)]
-    pub search: SearchArgs,
+    /// Database name.
+    pub database: String,
+    /// Collection name.
+    pub collection: String,
+    /// Text to search for. The server embeds it, and the keyword half needs
+    /// the words, so this is required in practice.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// A pre-computed query vector, for a collection whose provider is `byo`.
+    #[serde(default)]
+    pub vector: Option<Vec<f32>>,
+    /// Restrict results to documents matching this filter.
+    #[serde(default)]
+    pub filter: Option<Value>,
+    /// How many results to return. Defaults to 10.
+    #[serde(default)]
+    pub k: Option<usize>,
     /// How much each half counts in fusion: the score is
     /// `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`. Each at
     /// least 0, not both zero. Defaults to equal weights.
@@ -194,6 +227,7 @@ pub struct HybridSearchArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct InsertArgs {
     /// Database name.
     pub database: String,
@@ -204,6 +238,7 @@ pub struct InsertArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BulkInsertArgs {
     /// Database name.
     pub database: String,
@@ -214,6 +249,7 @@ pub struct BulkInsertArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateArgs {
     /// Database name.
     pub database: String,
@@ -237,6 +273,7 @@ pub struct UpdateArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteArgs {
     /// Database name.
     pub database: String,
@@ -252,6 +289,7 @@ pub struct DeleteArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateCollectionArgs {
     /// Database name. Created if it does not exist.
     pub database: String,
@@ -260,6 +298,7 @@ pub struct CreateCollectionArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IndexFieldArgs {
     /// Dotted field path, for example `customer.id`.
     pub path: String,
@@ -269,6 +308,7 @@ pub struct IndexFieldArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CreateIndexArgs {
     /// Database name.
     pub database: String,
@@ -458,7 +498,14 @@ impl KimmyMcp {
         ctx: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, ErrorData> {
         let auth = principal(&ctx)?;
-        let (db, coll, mut request) = search_request(args.search);
+        let (db, coll, mut request) = search_request(SearchArgs {
+            database: args.database,
+            collection: args.collection,
+            query: args.query,
+            vector: args.vector,
+            filter: args.filter,
+            k: args.k,
+        });
         request.weights =
             args.weights.map(|w| vectors::FusionWeights { dense: w.dense, lexical: w.lexical });
         request.min_overlap = args.min_overlap;

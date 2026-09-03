@@ -1,7 +1,7 @@
 //! The change-stream WebSocket endpoint.
 
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::response::Response;
 use kimmy_auth::Action;
 use kimmy_core::{Hlc, ResumeToken};
@@ -11,11 +11,11 @@ use serde_json::{Value, json};
 use tracing::debug;
 
 use crate::error::ApiError;
-use crate::json::document_to_json;
+use crate::json::{QueryParams, document_to_json};
 use crate::state::{Auth, SharedState};
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WatchQuery {
     /// Resume immediately after this token.
     pub resume_after: Option<String>,
@@ -29,7 +29,7 @@ pub async fn watch_collection(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Query(q): Query<WatchQuery>,
+    QueryParams(q): QueryParams<WatchQuery>,
     // Taken as a `Result` so a request that is not an upgrade is refused with
     // the same envelope as every other route. Left to axum it renders bare
     // text with no `error` code, which made this the one refusal a client

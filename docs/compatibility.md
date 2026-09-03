@@ -45,8 +45,12 @@ will do:
   value as `no`.
 - **Treat an unknown capability as one it does not use**, and a *missing*
   capability as a feature to avoid — never as an error.
-- **Not depend on field order, on the absence of a field, or on a message
-  string.** `message` is prose for a human and changes freely.
+- **Not depend on field order in the envelope, on the absence of a field, or
+  on a message string.** `message` is prose for a human and changes freely.
+  This is about the response's own fields — `count`, `documents`, `error` —
+  not the documents inside it: a stored document's fields come back in the
+  order they were written, as BSON keeps them (ADR-120), and a client may rely
+  on that.
 
 A client that does these things is what "does not break" is measured against.
 One that does not is outside the promise, and no versioning scheme can rescue
@@ -108,10 +112,10 @@ follow from the rules above rather than adding to them:
 - **Ask each node.** `/v1/version` describes the node that answered it, and the
   answer is worth caching per node rather than per cluster.
 - **A request using a field an older node does not know is refused**, with
-  `422` and `bad_request` — several request bodies reject unknown fields
-  deliberately, so a typo is an error rather than a silent no-op. That refusal
-  is *correct*, and it is why capability discovery exists: check first, do not
-  send and hope.
+  `422` and `bad_request` — every request body rejects unknown fields
+  ([ADR-121](decisions.md)), so a typo is an error rather than a silent
+  no-op. That refusal is *correct*, and it is why capability discovery
+  exists: check first, do not send and hope.
 - **Failover does not paper over this.** A `retry: elsewhere` failure means the
   node was unable; it does not mean the next node is newer. A client that
   retries a capability-dependent request around the cluster will get the same
@@ -190,6 +194,10 @@ this project has been wrong before about claims nothing checked.
   today's document still validates tomorrow's responses — which is what makes
   "a new response field is additive" true rather than merely intended.
 - Every documented operation still answers with the shape it declares.
+- Every request shape is closed — the "every request body rejects unknown
+  fields" claim above — so a client validating against the document before
+  sending is told what the server will refuse
+  (`every_request_shape_is_closed`).
 
 **Written down and not checked:**
 
@@ -213,6 +221,7 @@ two requests.
 |---|---|---|---|
 | `POST .../docs`, `PUT .../docs/{id}`, `DELETE .../docs/{id}` | Atomic and durable at commit: the document, its index entries and its oplog entry land together or not at all; the commit is an fsync — its own under `durable`, a shared one it waited for under `coalesced` (ADR-088) | One write transaction in `docs.rs` (`insert`, `replace`, `delete_guarded`) | `one_insert_is_one_commit` |
 | `POST .../bulk` (`insert_many`) | **All or nothing.** A duplicate `_id` anywhere in the batch inserts nothing, mints no oplog entry, and does not move the clock | One transaction for the whole batch (`insert_in_txn`) | `a_batch_is_one_commit_however_many_documents_it_holds`, `a_bulk_insert_with_a_duplicate_id_inserts_nothing` |
+| A sync batch arriving from a peer | **One commit per run** of consecutive document entries: the run's documents, index entries, oplog entries and the batch's witnessed vector land together; a schema change in the batch ends one run and starts the next, so a DDL-free batch is one commit and one fsync (ADR-119). Last-writer-wins per document inside the run; a losing entry writes nothing and the run continues | `sync.rs` `apply_batch` → `apply_remote_in_txn` | `a_replicated_batch_is_one_commit_however_many_entries_it_holds`, `a_schema_change_mid_batch_splits_it_into_runs_that_commit_once_each`, `a_superseded_entry_mid_batch_does_not_stop_the_rest_of_the_run` |
 | `find`, `count`, `GET .../docs/{id}`, aggregation | Snapshot-isolated per request: one read transaction, so a query never sees half a write | redb read transaction per query | Snapshot isolation is redb's; the executor opens exactly one read transaction per request |
 | `find_and_modify` | Atomic claim-and-return: filter, sort, operators and write inside one write transaction; two callers never claim the same document | `modify.rs` `find_and_modify` → `modify_in_txn` | `concurrent_claims_never_hand_out_the_same_job_twice` |
 | `update` / `delete` by filter, single document | Atomic read-modify-write on the accepting node: the operators run on the image the write transaction holds, so concurrent `$inc`s all land (ADR-083) | `modify.rs` `modify_where` — the same body as `find_and_modify` | `concurrent_increments_through_update_are_all_kept`, `concurrent_increments_are_all_kept` |
