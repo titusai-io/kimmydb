@@ -12,10 +12,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
-A minor when it ships, not a patch: one thing a 0.19.1 node accepted is
-refused now (a request field the route does not define), and the pre-1.0
-policy puts that behind a `0.MINOR` bump. Nothing changes on the wire between
-members or on disk; members of this version and 0.19.1 replicate to each other.
+A minor when it ships, not a patch. Nothing changes on disk or between
+members: a node of this version and a 0.19.1 node replicate to each other.
+But three things a 0.19.1 node accepted are refused or answered differently
+now, and the pre-1.0 policy puts them behind a `0.MINOR` bump: a request body
+or query string carrying a field the route does not define is refused; a
+`$$variable` string in a `$lookup` sub-pipeline `$match` is refused instead of
+matching nothing; and JSON object key order now survives the boundary, so
+update operators apply in the order written and a document keeps the field
+order it was stored with. The replication lag gauge also changes what it
+measures, which matters to anyone alerting on it. All five entries below come
+from one test round against a three-member cluster running 0.19.1.
 
 ### Changed
 
