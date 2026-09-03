@@ -204,6 +204,25 @@ indexes during a partition both keep theirs — see [ADR-033](decisions.md).
 received; minting a local one would send the change back to the peer, which
 would apply it and mint another, trading the same change forever.
 
+**A drop outlives its entry.** `DropCollection` and `DropIndex` each leave a
+tombstone — `collections_dropped` and `indexes_dropped`, see
+[Storage](storage.md#tombstones) — kept for `tombstone_retention_secs` rather
+than `oplog_retention_secs`. A creation stamped before the tombstone is
+history and is not applied, however many times a peer re-serves the window
+holding it; without the tombstone the drop's own entry was the only record,
+and a create replayed after it aged out rebuilt what it removed. For an index
+the rebuild also backfills over this node's current documents, which is why
+the tombstone was needed before retention ever ran (ADR-034, ADR-123).
+
+**One that cannot be applied is skipped, not retried.** A replicated index
+definition this node's documents cannot be built under, or a name already
+taken here by a different definition, is refused by this node's own data, and
+re-delivering the entry unchanged could never succeed. So the entry is
+witnessed, not appended, counted in `kimmy_sync_ddl_refused_total`, and
+logged at warning with the reason; the round goes on. Any *other* error
+still fails the round — a round that skips what it cannot understand is how
+corruption becomes convergence ([ADR-123](decisions.md)).
+
 The older payload-free `Collection` kind is still decoded so existing oplogs
 load, but is never written and cannot be applied — it names nothing.
 

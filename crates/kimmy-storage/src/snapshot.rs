@@ -33,7 +33,7 @@ use kimmy_core::{
 };
 use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::codec;
 use crate::engine::Engine;
@@ -84,6 +84,18 @@ pub struct SnapshotDoc {
     /// thing the cluster ever sends.
     #[serde(with = "serde_bytes")]
     pub body: Option<Vec<u8>>,
+}
+
+/// What applying one snapshot page did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SnapshotApplied {
+    /// Documents the page wrote — those that won last-writer-wins here.
+    pub applied: usize,
+    /// Index definitions on the page this node's documents refused and it
+    /// skipped (ADR-123). Folded into `SyncOutcome::ddl_refused` by the
+    /// transport, so a refusal reached through a snapshot is counted where
+    /// one reached through the oplog is.
+    pub ddl_refused: usize,
 }
 
 /// One page of a snapshot.
@@ -187,9 +199,10 @@ impl Engine {
     }
 
     /// Apply one page of a peer's snapshot.
-    pub fn apply_snapshot_page(&self, page: &SnapshotPage) -> Result<usize> {
+    pub fn apply_snapshot_page(&self, page: &SnapshotPage) -> Result<SnapshotApplied> {
+        let mut ddl_refused = 0usize;
         for state in &page.collections {
-            self.restore_collection(state)?;
+            ddl_refused += self.restore_collection(state)?;
         }
 
         let mut applied = 0usize;
@@ -222,21 +235,33 @@ impl Engine {
             self.absorb_version_vector(&page.versions)?;
             info!("snapshot complete");
         }
-        Ok(applied)
+        Ok(SnapshotApplied { applied, ddl_refused })
     }
 
     /// Recreate a collection and its indexes from a snapshot.
-    fn restore_collection(&self, state: &CollectionState) -> Result<()> {
+    ///
+    /// Returns how many of its index definitions this node's documents
+    /// refused. A snapshot is served to exactly the peer most likely to hold
+    /// documents a definition cannot be built under — one that was away
+    /// long enough to write on its own past the origin's retention — and a
+    /// bare error here failed the whole snapshot round, the same wedge as a
+    /// replayed `CreateIndex` reached through the other route. So the
+    /// definitions go through the same classification as replicated DDL
+    /// (`sync::settle`, ADR-123): a refused one is warned and counted, and
+    /// the restore goes on to the documents; any other error still fails
+    /// the page.
+    fn restore_collection(&self, state: &CollectionState) -> Result<usize> {
         if self.get_collection(&state.db, &state.name).is_err() {
             self.create_collection_inner(&state.db, &state.name, false, None)?;
         }
 
+        let mut refused = 0usize;
         for index in &state.indexes {
             let existing = self.get_collection(&state.db, &state.name)?;
             if existing.index(&index.name).is_some() {
                 continue;
             }
-            self.create_index_inner(
+            let created = self.create_index_inner(
                 &state.db,
                 &state.name,
                 index.fields.clone(),
@@ -248,7 +273,34 @@ impl Engine {
                 index.expire_after_secs,
                 index.partial_filter.clone(),
                 false,
-            )?;
+            );
+            match crate::sync::settle(created)? {
+                crate::sync::Ddl::Applied((_, violations)) => {
+                    // A replicated definition is built over whatever this
+                    // node already holds, collisions reported rather than
+                    // refused (ADR-020, ADR-123). Usually nothing: the
+                    // indexes are restored before the documents.
+                    if !violations.is_empty() {
+                        self.report_index_backfill_violations(&existing, &violations)?;
+                    }
+                }
+                // The collection was created or found moments ago; gone now
+                // means a concurrent local drop, and the rest of its indexes
+                // have nowhere to go.
+                crate::sync::Ddl::Gone => break,
+                crate::sync::Ddl::Refused(reason) => {
+                    refused += 1;
+                    warn!(
+                        db = %state.db,
+                        collection = %state.name,
+                        index = %index.name,
+                        reason = %reason,
+                        "skipped an index in a snapshot this node cannot build; the \
+                         definition stands on its peers and the divergence is counted in \
+                         kimmy_sync_ddl_refused_total"
+                    );
+                }
+            }
         }
 
         if let Some(config) = &state.vector {
@@ -257,7 +309,7 @@ impl Engine {
                 self.configure_vectors_inner(&state.db, &state.name, config.clone(), false)?;
             }
         }
-        Ok(())
+        Ok(refused)
     }
 
     /// Whether a peer asking from `from` can be served from the oplog.
@@ -316,7 +368,7 @@ mod tests {
         let mut applied = 0;
         loop {
             let page = from.snapshot_page(cursor.clone()).unwrap();
-            applied += into.apply_snapshot_page(&page).unwrap();
+            applied += into.apply_snapshot_page(&page).unwrap().applied;
             match page.next {
                 Some(next) => cursor = Some(next),
                 None => break,
@@ -377,6 +429,36 @@ mod tests {
         assert_eq!(b.count(&cb).unwrap(), 10);
         let index = cb.indexes.iter().find(|i| i.name == "item_1").expect("the index must arrive");
         assert!(index.unique);
+    }
+
+    #[test]
+    fn a_snapshot_index_this_node_cannot_build_is_skipped_and_the_documents_restore() {
+        // The same wedge as a replayed create, reached through the route
+        // that is served to exactly the peer most likely to hold divergent
+        // documents. B wrote a two-array document while away; A's snapshot
+        // carries a compound index over those two fields. The definition is
+        // refused by B's data, counted, and the documents still arrive.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("tags"), field("cats")], false, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1", "tags": ["x"] }).unwrap();
+        a.insert(&ca, doc! { "_id": "a-2", "cats": ["p"] }).unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+        let page = a.snapshot_page(None).unwrap();
+        let outcome = b.apply_snapshot_page(&page).expect("a refused index must not fail the page");
+        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 2, "the documents restore: {outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+            "the definition this node's documents cannot be built under is skipped"
+        );
+        for id in ["a-1", "a-2", "both"] {
+            assert!(b.get(&cb, &DocId::String(id.into())).unwrap().is_some(), "{id}");
+        }
     }
 
     #[test]

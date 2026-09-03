@@ -82,7 +82,8 @@ impl Engine {
         let outcome = GcOutcome {
             oplog_removed: self.collect_oplog(cutoff(now_ms, policy.oplog_secs))?,
             tombstones_removed: self.collect_tombstones(tombstone_cutoff)?
-                + self.collect_dropped_collections(tombstone_cutoff)?,
+                + self.collect_dropped_collections(tombstone_cutoff)?
+                + self.collect_dropped_indexes(tombstone_cutoff)?,
         };
 
         if !outcome.is_empty() {
@@ -230,6 +231,33 @@ impl Engine {
         Ok(removed)
     }
 
+    /// Drop index tombstones older than `cutoff`.
+    ///
+    /// Counted with the other tombstones for the reason collection tombstones
+    /// are: the question is the same — "was this dropped more recently than
+    /// the creation a peer is replaying?" — and so is the window in which the
+    /// answer can be trusted (ADR-123).
+    fn collect_dropped_indexes(&self, cutoff: Hlc) -> Result<usize> {
+        let txn = self.begin_write()?;
+        let mut removed = 0usize;
+        {
+            let mut dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+            dropped.retain(|_, value| {
+                let Ok(stamp) = codec::decode_oplog_key(value) else {
+                    warn!("undecodable index tombstone retained");
+                    return true;
+                };
+                let expired = stamp.hlc < cutoff;
+                if expired {
+                    removed += 1;
+                }
+                !expired
+            })?;
+        }
+        txn.commit()?;
+        Ok(removed)
+    }
+
     /// The newest stamp in the oplog.
     fn oplog_tail(&self) -> Result<Option<kimmy_core::Stamp>> {
         let txn = self.db().begin_read()?;
@@ -309,6 +337,32 @@ mod tests {
         // The live document is untouched, however old it is.
         assert!(engine.get(&meta, &DocId::String("b".into())).unwrap().is_some());
         assert!(engine.get(&meta, &DocId::String("a".into())).unwrap().is_none());
+    }
+
+    #[test]
+    fn an_index_tombstone_is_collected_on_the_tombstone_window() {
+        // Same window as a document's or a collection's tombstone: the
+        // creation it exists to outrank ages out of the oplog under
+        // `oplog_retention_secs`, and the tombstone has to outlive that.
+        let (engine, _dir) = engine();
+        let meta = engine.create_collection("db", "c").unwrap();
+        engine
+            .create_index("db", "c", vec![kimmy_core::IndexField::ascending("a")], false, None)
+            .unwrap();
+        engine.drop_index("db", "c", "a_1").unwrap();
+        let index_id = kimmy_core::IndexMeta::derive_id("a_1");
+        assert!(engine.index_dropped_at(meta.id, index_id).unwrap().is_some());
+
+        let early = engine.collect_garbage(policy()).unwrap();
+        assert_eq!(early.tombstones_removed, 0, "not before its time");
+        assert!(engine.index_dropped_at(meta.id, index_id).unwrap().is_some());
+
+        let outcome = engine.collect_garbage_at(much_later(), policy()).unwrap();
+        assert_eq!(outcome.tombstones_removed, 1, "{outcome:?}");
+        assert!(
+            engine.index_dropped_at(meta.id, index_id).unwrap().is_none(),
+            "an expired index tombstone must be collected"
+        );
     }
 
     #[test]

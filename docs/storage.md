@@ -78,6 +78,7 @@ erDiagram
 | `oplog_arrival_seq` | oplog key | `u64` |
 | `oplog_versions` | node id (16 bytes) | highest `Hlc` covered from that node — **not** purely oplog-derived; a snapshot grants coverage too |
 | `collections_dropped` | collection id | `Stamp` of the drop |
+| `indexes_dropped` | `(u64, u32)` — (collection id, index id) | `Stamp` of the drop |
 
 ### Why the keys are shaped this way
 
@@ -219,10 +220,22 @@ by collection id and collected on the same window. Without one, the
 partitioned across that window rejoined and the whole collection came back,
 documents included. See [ADR-034](decisions.md).
 
+**Dropped indexes leave one as well**, in `indexes_dropped`, keyed by
+collection id and index id — the id is derived from the index name, so the
+`DropIndex` entry, which carries only the name, and the `CreateIndex` entry,
+which carries the definition, compute the same key — and collected on the same
+window. The `DropIndex` entry was the only record of the drop, and a peer
+re-serves the window holding the creation as a matter of course, so once the
+drop had aged out every replay rebuilt the index; and the rebuild backfills
+over this node's *current* documents, which may hold what the definition
+forbids, so it did not merely resurrect the index — it failed the round, for
+ever. A creation stamped before the tombstone is history; one stamped after it
+is a new index. See [ADR-123](decisions.md).
+
 > **Sharp edge.** The retention window must exceed the longest partition you are
 > willing to tolerate. If a partitioned peer rejoins after tombstones have been
-> collected here, documents it deleted — and collections it dropped — will
-> resurrect. This is inherent to tombstone-based deletion in an
+> collected here, documents it deleted — and collections and indexes it
+> dropped — will resurrect. This is inherent to tombstone-based deletion in an
 > eventually-consistent store, not a bug to be fixed later.
 
 ---

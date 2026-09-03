@@ -6936,3 +6936,200 @@ asserts the new meaning, and one reproduces the finding: stamps spanning
 where the span gave 300.
 
 ---
+
+## ADR-123 — A dropped index leaves a tombstone, and a schema change a replica cannot apply is skipped, counted and exported
+
+**Decision.** Three things, one finding. *First*, dropping an index records a
+tombstone: `indexes_dropped`, keyed by collection id and index id, holding the
+drop's originating stamp, kept for `tombstone_retention_secs` beside the
+document and collection tombstones, carried by backups under a new tag, and
+consulted by `apply_remote_index` — a `CreateIndex` stamped before the
+tombstone is history: counted as applied, not built, and **not appended**,
+exactly as a `CreateCollection` is against `collections_dropped` (ADR-034),
+so this node does not re-serve onward an entry it has decided is history;
+the drop's own entry, appended when it applies, is what carries the ordering
+to a third member. `drop_index_inner` takes the
+originating stamp when replicated and mints one when local, and the same
+parameter decides whether to log and which stamp the tombstone records; the
+replicated path records the tombstone even when the index is not here to
+drop, and even when the collection is gone. *Second*, `apply_ddl` sorts the
+result of a replicated `CreateIndex`, `DropIndex` or `ConfigureVectors` into
+applied, gone, or **refused**: a refusal is `InvalidQuery`, `IndexExists` or
+`Unsupported` — a refusal of the request, decided by this node's data — and
+is skipped, logged at warning with the database, collection, index and
+reason, counted in `SyncOutcome::ddl_refused`, witnessed but not appended;
+every other error still fails the round. The snapshot route applies the same
+classification: `restore_collection` runs each index definition on a page
+through `settle`, a refused one is warned and counted in
+`SnapshotApplied::ddl_refused`, which the transport folds into the round's
+`SyncOutcome::ddl_refused`, and the documents on the page still restore. A
+snapshot is served to exactly the peer most likely to hold documents a
+definition cannot be built under — one that was away long enough to write
+on its own past the origin's retention — so leaving that route on a bare
+error would have kept the wedge open where it was likeliest. A replicated
+unique index whose
+backfill finds keys already shared is built in full and its collisions are
+recorded as a merged write's are. *Third*, the replication loop reports every
+tick through a new `on_round` hook — `RoundReport { failed, backing_off,
+ddl_refused }` — and the daemon maps it to `kimmy_sync_failures_total`,
+`kimmy_sync_peers_backing_off` and `kimmy_sync_ddl_refused_total`, with
+OpenTelemetry observers and rows in the operations table. `on_lag` is
+unchanged.
+
+**Why.** Observed on a three-member cluster running 0.20.0. A member created
+a compound index over two array fields on a collection in which no document
+held both — accepted, `multikey: true` — and dropped it 28 seconds later.
+Both replicated. A document with arrays at both paths was then inserted,
+which is legal once the index is gone. From then on, every anti-entropy round
+that re-served the window holding the `CreateIndex` entry — windows overlap
+by design, because `entries_for_peer` serves in global stamp order from a
+single threshold — rebuilt the index through `apply_remote_index`, whose
+backfill met the two-array document and raised `index_keys_observed`'s
+"cannot be built for this document" error. That error is not
+`CollectionNotFound`, so `gone()` did not absorb it; `apply_one` propagated
+it; `apply_batch_absorbing` abandoned the run and its witnessed vector;
+coverage never advanced; and the identical window was re-requested for ever
+with backoff to 300 s. The `DropIndex` later in the same window was never
+reached. A second instance minutes later: a unique index created and dropped
+a second apart, whose replayed create collided on the puller's copy
+("existing documents already violate it"). Throughout,
+`kimmy_replication_lag_seconds` read 0, because `on_lag` is called only
+after a round that succeeded, and `/v1/topology` showed every member live.
+Writes on one member never reached the others again.
+
+**Why the tombstone, and why it was needed before retention ran.** ADR-034
+gave collections a tombstone because the `DropCollection` entry aged out and
+a rejoining peer recreated the collection. An index had the same gap and a
+worse consequence: the entry did not need to age out, because overlapping
+windows replay the create routinely, and a replayed create is not merely a
+resurrection — it *backfills over the current documents*, which may by then
+hold exactly what the definition forbids, and the backfill's failure took
+the round down with it. The tombstone makes the replay history; the refusal
+class makes the round survive it; each is needed without the other. Keyed by
+the id derived from the name, so the drop — which carries only the name —
+and the create — which carries the definition — compute the same key.
+Snapshots carry no collection tombstones today and carry no index
+tombstones either; a node restored from a snapshot has the state as of the
+snapshot and no history to replay against, and the case where it later
+receives an aged-out create from a peer is the case ADR-034 already accepts
+for collections. Not extended here.
+
+**Why a refusal is skipped and everything else still fails the round.**
+`gone()`'s stance — a round that quietly skips what it cannot understand is
+how corruption becomes convergence — stands, and the refusal class is
+defined so as not to breach it. A refusal is a deterministic function of the
+definition and this node's data: `InvalidQuery` from the backfill (a
+compound index a document here spans two arrays of; a document that would
+fan out to more than 1,000 entries; the TTL and partial-filter shape checks),
+`IndexExists` (the name is taken here by a different definition, because two
+members created it concurrently), `Unsupported` (an enforcement mode this
+build does not implement). Re-delivering the entry unchanged can never
+succeed, so failing the round buys the wedge and nothing else. Skipping is
+safe on three conditions, all met: the entry is witnessed by
+`apply_batch_absorbing`, so it is not re-served; it is not appended, so this
+node does not propagate a definition it does not hold; and the skip is
+counted, logged with the reason, and exported, so the divergence is a
+visible state rather than a silent one. A storage error — redb, I/O, a record
+that will not decode — is a failure of the node rather than of the request,
+may succeed on retry, and still fails the round.
+
+**Why a two-array compound index is not refused at creation.** It was
+considered and rejected. The rule — "a compound index may span at most one
+array field", MongoDB's "cannot index parallel arrays" — is a property of a
+(definition, document) pair, and a schemaless store holds no fact about
+documents it has not seen. Refusing the definition at creation whenever two
+of its paths *could* hold arrays would refuse every compound index. So the
+check runs where the pair meets: creating over a collection with no such
+document succeeds; a later write of such a document is refused `400`, naming
+the index; a create over an existing such document is refused. On a replica
+the same check runs over the replica's documents, and a definition the
+origin accepted can be one the replica cannot build — which is the refusal
+class above, not a reason to move the check. `docs/indexes.md` now says when
+the rule bites.
+
+**Why a colliding unique backfill is built rather than refused, on the
+replicated path only.** ADR-020: uniqueness is not I-confluent, so a
+replicated write that breaks it converges with the violation recorded rather
+than diverging by being refused. A replicated *definition* is the same
+choice one level up. Refusing it leaves this node without an index every peer
+holds, for ever: writes the peers check go unchecked here, and index-backed
+queries answer differently on different members — a divergence that is
+permanent and, without this ADR's counter, silent. Building it in full,
+every entry added, keeps queries complete (the reason `maintain_remote` adds
+the colliding entry rather than skipping it), keeps the constraint live for
+every later local write, and reports the keys already shared through the
+same machinery a merged write uses: counted in `kimmy_unique_violations`,
+warned, minted as `UniqueViolation` entries (ADR-029) that
+`live_unique_violations` reads (ADR-087), naming every holder of the key.
+The record's `merged` field names the holder the backfill met last, which is
+the document whose presence turned a key with one holder into a collision —
+the role the merged write plays. The local path is unchanged: a client
+creating a unique index over data that violates it is told so, because it
+is there to be told.
+
+**What is left as a counted divergence.** Two members creating the same
+index name with different definitions during a partition. Neither is wrong;
+the second to arrive is refused with `IndexExists`, counted, and named in the
+log, and each member keeps its own. A "newer definition wins" rule would
+resolve it, but needs a creation stamp on `IndexMeta` to compare, which the
+definition does not carry and which would change what `CreateIndex` puts on
+the wire; not done here. The same gap shows on a replayed *drop* that arrives
+after a newer creation of the same name: with no creation stamp to compare,
+the drop applies. The tombstone it records is older than the creation, so a
+replay of the creation rebuilds it — but only where the creation can be
+replayed. A node never replays its own oplog into itself, so when the newer
+creation is this node's own, the index stays dropped here until a third
+member that holds the creation re-serves it, or until someone recreates it
+explicitly; the pair does not converge on its own. Accepted for the same
+reason: the fix is the creation stamp, and the case needs a drop from before
+a recreation to arrive after it, which is a re-served window across a
+recreation on the same name.
+
+**Why a counter, not a zero lag, is the failure signal.** ADR-122 stands: an
+unreachable cluster has *unknown* lag, and `on_lag` is not called for a tick
+that reached nobody, because overwriting the last reading with zero reports
+the outage as health. That is the right rule for the gauge and it is why the
+gauge cannot carry this signal — a round that fails leaves the gauge exactly
+where the last good round put it, which for a cluster that was caught up
+when it wedged is 0. A counter of failed rounds has no last-good-value
+problem: it rises on every failure, from any cause, and a counter rising
+while the gauge sits at 0 is precisely the shape of the wedge. `on_round` is
+called every tick, reached peers or not, for the same reason `on_lag` is
+not.
+
+**Alternatives.** *Widen `gone()` to swallow every error.* Rejected; that
+is the convergence-by-corruption `gone()` was written not to be. *Retry the
+refused entry on the next round.* It cannot succeed, and retrying it is the
+wedge. *Append the originating entry on refusal, so the version vector
+advances.* It would propagate through this node a definition this node
+does not hold, and the witnessed vector already stops the re-request
+(ADR-054). *Have the origin refuse the two-array compound index at
+creation.* Rejected above. *Refuse the colliding unique backfill on the
+replicated path as on the local one.* Rejected above, by ADR-020's own
+argument. *Carry the tombstone in the `DropIndex` entry's lifetime alone.*
+That is what was there. *Put the failure signal into the lag gauge as a
+sentinel value.* A dashboard cannot alert on "0 means healthy or wedged",
+which is the finding.
+
+**Cost.** One more tombstone table, one more backup tag (11; never reused),
+one more retention pass over a table that holds one row per dropped index.
+`drop_index_inner`'s signature changes from a `log` flag to an
+`Option<Stamp>`, as `drop_collection_inner`'s did, and `create_index_inner`
+returns the collisions it found beside the definition; the local wrapper
+asserts the list is empty. The replicated backfill of a unique index keeps
+every key's holders in memory for the length of the build — one document
+key per key more than the local build, which keeps its `HashSet` of keys and
+pays nothing new. `apply_snapshot_page` returns `SnapshotApplied` rather
+than a count. Recording a backfill's violations follows `commit_run`'s
+shape — every violation reported, everything minted published, the first
+error returned afterwards — because the index is committed by then and a
+re-delivery would not find the collisions again. A replica can now hold a unique index over data
+that violates it, as it already could through merged writes, and the
+violations route says so. A refused definition is a divergence the cluster
+does not repair on its own; the counter and the warning make it an
+operator's decision rather than an outage. Three new series on `/metrics`,
+pinned by the golden tests. `SyncOutcome` and `RoundReport` gain a field
+each. A local drop of an index that is not there still records nothing — it
+mints no entry, so a tombstone would be a decision no peer hears of.
+
+---

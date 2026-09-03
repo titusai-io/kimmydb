@@ -1116,6 +1116,21 @@ async fn spawn_cluster(
                 let state = state.clone();
                 move |node, behind_ms| state.report_peer_staleness(node, behind_ms)
             })),
+            // What the loop saw that lag cannot say: rounds that failed,
+            // peers backed off, schema changes refused. Pushed after every
+            // tick, reached peers or not, because a tick in which every
+            // round failed is the one that leaves the lag gauge at its last
+            // value and the cluster looking healthy (ADR-123).
+            on_round: Some(std::sync::Arc::new({
+                let state = state.clone();
+                move |report: kimmy_cluster::RoundReport| {
+                    state.metrics.record_sync_round(
+                        report.failed as u64,
+                        report.backing_off as u64,
+                        report.ddl_refused as u64,
+                    );
+                }
+            })),
             // The replication loop is the only place a peer's version vector
             // exists, so lag is pushed from there into the gauge (ADR-046).
             on_lag: Some(std::sync::Arc::new(move |secs| {

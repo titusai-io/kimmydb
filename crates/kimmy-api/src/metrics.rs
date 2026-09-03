@@ -61,6 +61,12 @@ pub struct MetricsSnapshot {
     pub webhook_backlog_secs: u64,
     pub cluster_members: u64,
     pub replication_lag_secs: u64,
+    /// Anti-entropy rounds that failed, peers currently backed off, and
+    /// replicated schema changes skipped (ADR-123). The failure signals the
+    /// lag gauge cannot carry: a failed round reports no lag.
+    pub sync_failures: u64,
+    pub sync_peers_backing_off: u64,
+    pub sync_ddl_refused: u64,
     /// Worst runtime scheduling delay since the last scrape, microseconds.
     pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
@@ -93,6 +99,13 @@ pub struct Metrics {
     latency_sum_us: AtomicU64,
     latency_count: AtomicU64,
     replication_lag_secs: AtomicU64,
+    /// Pushed by the replication loop after every sync tick (ADR-123): two
+    /// counters and a level. What a wedged round looks like from outside,
+    /// which the lag gauge — set only by a round that succeeded — cannot
+    /// show.
+    sync_failures: AtomicU64,
+    sync_peers_backing_off: AtomicU64,
+    sync_ddl_refused: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
@@ -137,6 +150,9 @@ impl Default for Metrics {
             latency_sum_us: AtomicU64::new(0),
             latency_count: AtomicU64::new(0),
             replication_lag_secs: AtomicU64::new(0),
+            sync_failures: AtomicU64::new(0),
+            sync_peers_backing_off: AtomicU64::new(0),
+            sync_ddl_refused: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
@@ -276,6 +292,22 @@ impl Metrics {
         self.replication_lag_secs.store(secs, Ordering::Relaxed);
     }
 
+    /// One sync tick of the replication loop: how many rounds failed, how
+    /// many peers are now being backed off, and how many replicated schema
+    /// changes were refused and skipped (ADR-123).
+    ///
+    /// Pushed after every tick, reached peers or not — unlike the lag gauge,
+    /// which a tick that reached nobody leaves alone. The two counters
+    /// accumulate; the backoff figure is a level and replaces the last one.
+    /// A rising failure count against a lag gauge that reads 0 is exactly
+    /// the shape of a replication wedge that reads as healthy everywhere
+    /// else.
+    pub fn record_sync_round(&self, failed: u64, backing_off: u64, ddl_refused: u64) {
+        self.sync_failures.fetch_add(failed, Ordering::Relaxed);
+        self.sync_peers_backing_off.store(backing_off, Ordering::Relaxed);
+        self.sync_ddl_refused.fetch_add(ddl_refused, Ordering::Relaxed);
+    }
+
     /// How many peers this node's SWIM instance currently considers alive.
     ///
     /// The observable the cluster harness asserts gossip *formed* with —
@@ -382,6 +414,9 @@ impl Metrics {
             webhook_backlog_secs: self.get(&self.webhook_backlog_secs),
             cluster_members: self.get(&self.cluster_members),
             replication_lag_secs: self.get(&self.replication_lag_secs),
+            sync_failures: self.get(&self.sync_failures),
+            sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
+            sync_ddl_refused: self.get(&self.sync_ddl_refused),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -495,6 +530,15 @@ impl Metrics {
              # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
              # TYPE kimmy_replication_lag_seconds gauge\n\
              kimmy_replication_lag_seconds {lag}\n\
+             # HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising while kimmy_replication_lag_seconds sits at 0 is a wedged peer, not a healthy one - a failed round reports no lag.\n\
+             # TYPE kimmy_sync_failures_total counter\n\
+             kimmy_sync_failures_total {sync_failures}\n\
+             # HELP kimmy_sync_peers_backing_off Peers this node is currently backing off from after failed rounds. 0 when every peer answered its last round or clustering is off.\n\
+             # TYPE kimmy_sync_peers_backing_off gauge\n\
+             kimmy_sync_peers_backing_off {sync_backing_off}\n\
+             # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.\n\
+             # TYPE kimmy_sync_ddl_refused_total counter\n\
+             kimmy_sync_ddl_refused_total {sync_ddl_refused}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
@@ -553,6 +597,9 @@ impl Metrics {
             wh_backlog = self.get(&self.webhook_backlog_secs),
             cluster = self.get(&self.cluster_members),
             lag = self.get(&self.replication_lag_secs),
+            sync_failures = self.get(&self.sync_failures),
+            sync_backing_off = self.get(&self.sync_peers_backing_off),
+            sync_ddl_refused = self.get(&self.sync_ddl_refused),
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
             embed_docs = embed_docs,
@@ -637,6 +684,11 @@ mod tests {
         m.set_webhook_gauges(15, 16, 17);
         m.set_cluster_members(18);
         m.set_replication_lag_secs(19);
+        // Two ticks: the counters accumulate, the backoff level is replaced.
+        // A render that printed the first tick's level, or a level that
+        // accumulated, would not match.
+        m.record_sync_round(20, 99, 21);
+        m.record_sync_round(3, 24, 4);
         for _ in 0..20 {
             m.record_tls_reload(true);
         }
@@ -726,6 +778,15 @@ kimmy_cluster_members 18
 # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.
 # TYPE kimmy_replication_lag_seconds gauge
 kimmy_replication_lag_seconds 19
+# HELP kimmy_sync_failures_total Anti-entropy rounds against a peer that failed, any cause: unreachable, refused, or a batch this node could not apply. Rising while kimmy_replication_lag_seconds sits at 0 is a wedged peer, not a healthy one - a failed round reports no lag.
+# TYPE kimmy_sync_failures_total counter
+kimmy_sync_failures_total 23
+# HELP kimmy_sync_peers_backing_off Peers this node is currently backing off from after failed rounds. 0 when every peer answered its last round or clustering is off.
+# TYPE kimmy_sync_peers_backing_off gauge
+kimmy_sync_peers_backing_off 24
+# HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.
+# TYPE kimmy_sync_ddl_refused_total counter
+kimmy_sync_ddl_refused_total 25
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
 # TYPE kimmy_tls_reloads_total counter
 kimmy_tls_reloads_total{outcome=\"ok\"} 20
@@ -825,6 +886,9 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_webhook_backlog_seconds {}\n", s.webhook_backlog_secs));
         expect(&format!("kimmy_cluster_members {}\n", s.cluster_members));
         expect(&format!("kimmy_replication_lag_seconds {}\n", s.replication_lag_secs));
+        expect(&format!("kimmy_sync_failures_total {}\n", s.sync_failures));
+        expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
+        expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
             "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
@@ -895,8 +959,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 31 scalar series plus the histogram: 12 buckets, +Inf, sum, count.
-        assert_eq!(samples, 51, "expected one sample per series: {out}");
+        // 39 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // count.
+        assert_eq!(samples, 54, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -981,6 +1046,8 @@ kimmy_request_duration_seconds_count 3
         let m = Metrics::default();
         m.set_replication_lag_secs(7);
         m.set_cluster_members(2);
+        m.record_sync_round(1, 1, 0);
+        m.record_sync_round(2, 0, 3);
         m.record_tls_reload(true);
         m.record_tls_reload(false);
         m.record_tls_reload(false);
@@ -991,6 +1058,11 @@ kimmy_request_duration_seconds_count 3
         let out = m.render();
         assert!(out.contains("kimmy_replication_lag_seconds 7"), "{out}");
         assert!(out.contains("kimmy_cluster_members 2"), "{out}");
+        // The failure signals are pushed per tick: counters accumulate across
+        // ticks, the backoff level is the latest tick's (ADR-123).
+        assert!(out.contains("kimmy_sync_failures_total 3"), "{out}");
+        assert!(out.contains("kimmy_sync_peers_backing_off 0"), "{out}");
+        assert!(out.contains("kimmy_sync_ddl_refused_total 3"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"failed\"} 2"), "{out}");
         // A node that stops being able to reach its identity provider keeps

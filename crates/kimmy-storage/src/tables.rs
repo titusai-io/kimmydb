@@ -82,6 +82,34 @@ pub const OPLOG_ARRIVAL_SEQ: TableDefinition<&[u8], u64> =
 pub const COLLECTIONS_DROPPED: TableDefinition<u64, &[u8]> =
     TableDefinition::new("collections_dropped");
 
+/// `(collection id, index id) -> the Stamp of the drop that removed the index`.
+///
+/// The index equivalent of [`COLLECTIONS_DROPPED`], and it exists because the
+/// `DropIndex` entry was the only record of the drop. A peer re-serves the
+/// window holding the `CreateIndex` entry as a matter of course — windows
+/// overlap, because `entries_for_peer` serves in global stamp order from one
+/// threshold — and once the drop ages out of the oplog nothing here said the
+/// index was gone, so every replay rebuilt it. That is a resurrection, as a
+/// replayed `CreateCollection` was before ADR-034, and it was worse than one:
+/// the rebuild backfills over *this* node's current documents, which may by
+/// then hold what the definition forbids (a document with arrays at two of a
+/// compound index's paths, written legally once the index was gone; two
+/// documents sharing a key the index calls unique), and the backfill's error
+/// aborted the round, so the same window was re-requested for ever. Observed on
+/// a three-member cluster running 0.20.0: one member's writes never reached the
+/// others again, while the lag gauge read 0 and every member showed as live.
+///
+/// Keyed by the index **id**, which is derived from the index name
+/// (`IndexMeta::derive_id`), so a `DropIndex` entry — which carries only the
+/// name — and a `CreateIndex` entry — which carries the definition — compute
+/// the same key. Keyed under the collection id for the same reason the
+/// collection tombstone is: it is what a replicated entry names.
+///
+/// Collected under `tombstone_retention_secs`, alongside the other tombstones,
+/// because it answers the same question over the same window. See ADR-123.
+pub const INDEXES_DROPPED: TableDefinition<(u64, u32), &[u8]> =
+    TableDefinition::new("indexes_dropped");
+
 /// `node id (16 bytes) -> highest Hlc held from that node`.
 ///
 /// The version vector, maintained incrementally rather than computed. Deriving

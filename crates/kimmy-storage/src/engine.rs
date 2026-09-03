@@ -252,6 +252,7 @@ impl Engine {
             let _ = txn.open_table(tables::OPLOG_VERSIONS)?;
             let _ = txn.open_table(tables::OPLOG_WITNESSED)?;
             let _ = txn.open_table(tables::COLLECTIONS_DROPPED)?;
+            let _ = txn.open_table(tables::INDEXES_DROPPED)?;
             let _ = txn.open_table(tables::OPLOG_COLLECTED)?;
         }
         txn.commit()?;
@@ -590,6 +591,65 @@ impl Engine {
                 dropped.insert(id.0, codec::oplog_key(&stamp).as_slice())?;
             }
         }
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// When an index on this collection was dropped, if a tombstone still
+    /// records it.
+    ///
+    /// `None` means never dropped or already collected, indistinguishably, as
+    /// for [`Self::collection_dropped_at`]. `index_id` is the id derived from
+    /// the index name, which is what both the create and the drop entry can
+    /// compute (ADR-123).
+    pub fn index_dropped_at(
+        &self,
+        collection: CollectionId,
+        index_id: u32,
+    ) -> Result<Option<Stamp>> {
+        let txn = self.db.begin_read()?;
+        let dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+        match dropped.get((collection.0, index_id))? {
+            Some(raw) => Ok(Some(codec::decode_oplog_key(raw.value())?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record that an index was dropped at `stamp`, if that is newer, in the
+    /// caller's transaction.
+    ///
+    /// In-transaction because a local drop records its tombstone in the same
+    /// transaction that removes the entries and mints the drop entry: there
+    /// must be no instant in which the index is gone with no record that it
+    /// was dropped, exactly as `drop_collection_inner` keeps for collections.
+    pub(crate) fn record_index_drop_in_txn(
+        txn: &redb::WriteTransaction,
+        collection: CollectionId,
+        index_id: u32,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let mut dropped = txn.open_table(tables::INDEXES_DROPPED)?;
+        let newer = match dropped.get((collection.0, index_id))? {
+            Some(existing) => stamp > codec::decode_oplog_key(existing.value())?,
+            None => true,
+        };
+        if newer {
+            dropped.insert((collection.0, index_id), codec::oplog_key(&stamp).as_slice())?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::record_index_drop_in_txn`] in a transaction of its own, for the
+    /// replicated path when there is nothing else to write: a drop for an
+    /// index this node does not hold, or for a collection it no longer has.
+    pub(crate) fn record_index_drop(
+        &self,
+        collection: CollectionId,
+        index_id: u32,
+        stamp: Stamp,
+    ) -> Result<()> {
+        let txn = self.begin_write()?;
+        Self::record_index_drop_in_txn(&txn, collection, index_id, stamp)?;
         txn.commit()?;
         Ok(())
     }
