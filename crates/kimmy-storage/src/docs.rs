@@ -9,7 +9,7 @@
 //! Events reach live subscribers only *after* the commit succeeds, so a
 //! subscriber can never observe a change that was rolled back.
 
-use bson::Document;
+use bson::{Bson, Document};
 use kimmy_core::{DocId, DocRecord, Error as CoreError, OpKind, OplogEntry, Stamp, keyenc};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
@@ -291,21 +291,19 @@ impl Engine {
         &self,
         txn: &redb::WriteTransaction,
         coll: &CollectionMeta,
-        mut doc: Document,
+        doc: Document,
     ) -> Result<(DocId, OplogEntry)> {
-        let id = match doc.get(ID_FIELD) {
-            Some(value) => DocId::try_from_bson(value)?,
+        // The value the client wrote is kept as written, so an `Int32` id
+        // stays an `Int32` rather than passing through `DocId` and back.
+        let (id, id_value) = match doc.get(ID_FIELD) {
+            Some(value) => (DocId::try_from_bson(value)?, value.clone()),
             None => {
                 let id = DocId::generate();
-                // Store `_id` first so the stored document round-trips with the
-                // field present, as clients expect.
-                let mut with_id = Document::new();
-                with_id.insert(ID_FIELD, id.to_bson());
-                with_id.extend(doc);
-                doc = with_id;
-                id
+                let value = id.to_bson();
+                (id, value)
             }
         };
+        let doc = with_id_first(doc, id_value);
 
         let key = doc_key(&id)?;
         let body = bson::serialize_to_vec(&doc)?;
@@ -369,13 +367,13 @@ impl Engine {
         &self,
         coll: &CollectionMeta,
         id: &DocId,
-        mut doc: Document,
+        doc: Document,
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
         // The id is part of the document's identity, not its content: a replace
         // must not be able to move a document to a different key.
-        doc.insert(ID_FIELD, id.to_bson());
+        let doc = with_id_first(doc, id.to_bson());
 
         let key = doc_key(id)?;
         let body = bson::serialize_to_vec(&doc)?;
@@ -948,6 +946,29 @@ impl Engine {
     }
 }
 
+/// The document as it will be stored: `_id` first, carrying `id`, and every
+/// other field in the order it arrived.
+///
+/// BSON keeps field order, and since ADR-120 so does everything between the
+/// client and this table, so where `_id` lands is visible. MongoDB stores it
+/// first whatever the client wrote, and both write paths here do the same.
+/// Before this shared helper the insert path put a generated `_id` first but
+/// left a client-supplied one where it was, and `replace_if` appended `_id`
+/// to a body that lacked it — so a `PUT` of `{"zeta": 1, "alpha": 2}` read
+/// back with `_id` last while the same body inserted read back with it first.
+/// A body whose `_id` is already first is patched in place rather than
+/// rebuilt; `Document::insert` on a present key keeps its position.
+fn with_id_first(mut doc: Document, id: Bson) -> Document {
+    if doc.keys().next().is_some_and(|key| key == ID_FIELD) {
+        doc.insert(ID_FIELD, id);
+        return doc;
+    }
+    let mut out = Document::new();
+    out.insert(ID_FIELD, id);
+    out.extend(doc.into_iter().filter(|(key, _)| key != ID_FIELD));
+    out
+}
+
 /// The storage key for a document id.
 pub(crate) fn doc_key(id: &DocId) -> Result<Vec<u8>> {
     Ok(keyenc::encode(&id.to_bson())?)
@@ -1296,6 +1317,32 @@ mod tests {
 
         let found = engine.get(&coll, &id).unwrap().unwrap();
         assert_eq!(DocId::try_from_bson(found.get(ID_FIELD).unwrap()).unwrap(), id);
+    }
+
+    /// `_id` is stored first on every write path, so a replace and an insert
+    /// of the same body read back the same. Before ADR-120 made field order
+    /// visible, `replace_if` appended `_id` to a body that lacked it.
+    #[test]
+    fn every_write_path_stores_id_first() {
+        let (engine, coll, _dir) = engine();
+        let keys = |doc: &Document| doc.keys().cloned().collect::<Vec<_>>();
+
+        let id = engine.insert(&coll, doc! { "zeta": 1, "alpha": 2 }).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
+
+        // A client-supplied `_id` moves to the front, as MongoDB moves it, and
+        // its value is stored as written rather than through `DocId`.
+        let id = engine.insert(&coll, doc! { "zeta": 1, "_id": 7_i32, "alpha": 2 }).unwrap();
+        let found = engine.get(&coll, &id).unwrap().unwrap();
+        assert_eq!(keys(&found), ["_id", "zeta", "alpha"]);
+        assert_eq!(found.get(ID_FIELD), Some(&Bson::Int32(7)));
+
+        engine.replace(&coll, &id, doc! { "zeta": 3, "alpha": 4 }, false).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
+
+        let id = DocId::Int64(8);
+        engine.replace(&coll, &id, doc! { "zeta": 1, "alpha": 2 }, true).unwrap();
+        assert_eq!(keys(&engine.get(&coll, &id).unwrap().unwrap()), ["_id", "zeta", "alpha"]);
     }
 
     #[test]

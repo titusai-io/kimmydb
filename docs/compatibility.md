@@ -45,8 +45,12 @@ will do:
   value as `no`.
 - **Treat an unknown capability as one it does not use**, and a *missing*
   capability as a feature to avoid — never as an error.
-- **Not depend on field order, on the absence of a field, or on a message
-  string.** `message` is prose for a human and changes freely.
+- **Not depend on field order in the envelope, on the absence of a field, or
+  on a message string.** `message` is prose for a human and changes freely.
+  This is about the response's own fields — `count`, `documents`, `error` —
+  not the documents inside it: a stored document's fields come back in the
+  order they were written, as BSON keeps them (ADR-120), and a client may rely
+  on that.
 
 A client that does these things is what "does not break" is measured against.
 One that does not is outside the promise, and no versioning scheme can rescue

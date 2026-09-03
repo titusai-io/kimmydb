@@ -293,7 +293,9 @@ A `$setOnInsert` path that another operator in the same update also writes —
 the same path, or one inside the other, counting a `$rename`'s destination — is
 **rejected at parse time**, as MongoDB rejects it: the two would disagree about
 the inserted document. Other operator pairs are not checked against each other
-and apply in the order written (see [Deviations](deviations.md)).
+and apply in the order written — the order the keys arrive in the request body,
+so an encoder that reorders map keys decides it (see
+[Deviations](deviations.md)).
 
 ### Positional updates
 

@@ -1616,6 +1616,149 @@ async fn updates_apply_operators() {
     assert_eq!(res.body["n"], 15);
 }
 
+/// Two operators on one path apply in the order their keys arrive, and the
+/// last one wins — the promise `docs/query-language.md` makes. The parser
+/// kept it from the start; the boundary broke it, because a `serde_json::Map`
+/// built without `preserve_order` is a `BTreeMap` and sorted every object's
+/// keys before the parser saw them, so both orders below ran `$inc` first
+/// and both left `1`. Driven over HTTP on purpose: a `doc!`-built test in the
+/// parser never crossed the boundary and never saw the defect (ADR-120).
+#[tokio::test]
+async fn update_operators_apply_in_the_order_the_request_wrote_them() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    // The bodies are written as text, not with `json!`, so the key order on
+    // the wire is exactly the order that appears here.
+    async fn apply(server: &Server, token: &str, update: &str) -> Value {
+        server.post("/v1/db/shop/coll/c/docs", Some(token), json!({"_id":1,"a":0})).await;
+        let body = format!(r#"{{"filter":{{"_id":1}},"update":{update}}}"#);
+        let body: Value = serde_json::from_str(&body).unwrap();
+        let res = server.post("/v1/db/shop/coll/c/update", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        let res = server.get("/v1/db/shop/coll/c/docs/1", Some(token)).await;
+        let value = res.body["a"].clone();
+        server.delete("/v1/db/shop/coll/c/docs/1", Some(token)).await;
+        value
+    }
+
+    assert_eq!(apply(&server, &token, r#"{"$set":{"a":1},"$inc":{"a":5}}"#).await, 6);
+    assert_eq!(apply(&server, &token, r#"{"$inc":{"a":5},"$set":{"a":1}}"#).await, 1);
+    assert_eq!(apply(&server, &token, r#"{"$set":{"a":7},"$mul":{"a":10}}"#).await, 70);
+    assert_eq!(apply(&server, &token, r#"{"$mul":{"a":10},"$set":{"a":7}}"#).await, 7);
+
+    // `$min` then `$max` on 5: 3, then 10. The reverse: 10, then 3.
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"a":5})).await;
+    let body: Value =
+        serde_json::from_str(r#"{"filter":{"_id":2},"update":{"$min":{"a":3},"$max":{"a":10}}}"#)
+            .unwrap();
+    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
+    let res = server.get("/v1/db/shop/coll/c/docs/2", Some(&token)).await;
+    assert_eq!(res.body["a"], 10, "$min then $max on 5: {:?}", res.body);
+
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":3,"a":5})).await;
+    let body: Value =
+        serde_json::from_str(r#"{"filter":{"_id":3},"update":{"$max":{"a":10},"$min":{"a":3}}}"#)
+            .unwrap();
+    server.post("/v1/db/shop/coll/c/update", Some(&token), body).await;
+    let res = server.get("/v1/db/shop/coll/c/docs/3", Some(&token)).await;
+    assert_eq!(res.body["a"], 3, "$max then $min on 5: {:?}", res.body);
+}
+
+/// A sort document's key order is its precedence, and it too crossed the
+/// sorted-map boundary: `{"b": 1, "a": 1}` used to sort by `a` first. The
+/// data is arranged so the two orders give opposite results.
+#[tokio::test]
+async fn a_sort_document_keeps_the_precedence_it_was_written_in() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"a":1,"b":2})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"a":2,"b":1})).await;
+
+    async fn order(server: &Server, token: &str, sort: &str) -> Vec<i64> {
+        let body: Value = serde_json::from_str(&format!(r#"{{"sort":{sort}}}"#)).unwrap();
+        let res = server.post("/v1/db/shop/coll/c/find", Some(token), body).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body["documents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["_id"].as_i64().unwrap())
+            .collect()
+    }
+
+    assert_eq!(order(&server, &token, r#"{"a":1,"b":1}"#).await, vec![1, 2]);
+    assert_eq!(order(&server, &token, r#"{"b":1,"a":1}"#).await, vec![2, 1]);
+}
+
+/// A stored document's fields come back in the order they were written, as
+/// BSON keeps them and MongoDB returns them. The test client parses the body
+/// into a `serde_json::Value`, which since ADR-120 keeps the text's key order,
+/// so `keys()` here is the order of the JSON text on the wire; rendering the
+/// value back to text pins the same thing a client's raw reader would see.
+#[tokio::test]
+async fn a_document_reads_back_with_its_fields_in_the_order_they_were_written() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    let body: Value = serde_json::from_str(r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/docs", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    let keys: Vec<&str> = res.body.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, vec!["_id", "zeta", "alpha", "mid"], "{:?}", res.body);
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#);
+
+    // The same document through `find`, which renders through a different
+    // handler but the same `document_to_json`.
+    let res = server.post("/v1/db/shop/coll/c/find", Some(&token), json!({})).await;
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2,"mid":3}"#);
+
+    // An inclusion projection answers in the document's order, not the
+    // specification's, and `_id` stays first rather than landing where the
+    // parser appends it. Checked through `find` and the `$project` stage, the
+    // two renderers that share `shape::project`.
+    let body: Value = serde_json::from_str(r#"{"projection":{"alpha":1,"zeta":1}}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/find", Some(&token), body).await;
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+    let body: Value =
+        serde_json::from_str(r#"{"pipeline":[{"$project":{"alpha":1,"zeta":1}}]}"#).unwrap();
+    let res = server.post("/v1/db/shop/coll/c/aggregate", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["documents"][0].to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+}
+
+/// A replace stores `_id` first like an insert does. The storage layer used
+/// to append it to a body that left it out, which nobody could see while the
+/// boundary sorted every object; a `PUT` and a `POST` of the same body now
+/// read back identically.
+#[tokio::test]
+async fn a_replaced_document_reads_back_with_its_id_first() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+
+    // Created through the upsert, which is the replace path too.
+    let body: Value = serde_json::from_str(r#"{"zeta":1,"alpha":2}"#).unwrap();
+    let res = server.put("/v1/db/shop/coll/c/docs/x?upsert=true", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["upserted"], true, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":1,"alpha":2}"#);
+
+    // Replacing an existing document, and one whose body carries `_id`
+    // somewhere other than first, land the same way.
+    let body: Value = serde_json::from_str(r#"{"zeta":3,"_id":"x","alpha":4}"#).unwrap();
+    let res = server.put("/v1/db/shop/coll/c/docs/x", Some(&token), body).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/c/docs/x", Some(&token)).await;
+    assert_eq!(res.body.to_string(), r#"{"_id":"x","zeta":3,"alpha":4}"#);
+}
+
 /// `modified` counts documents **written**, not documents changed, so it equals
 /// `matched` even when the operators moved nothing. This is the deliberate
 /// deviation in `docs/deviations.md`, and `docs/openapi.yaml` stated the
@@ -3973,10 +4116,15 @@ async fn hybrid_fusion_controls_default_to_the_previous_ranking() {
     let order: Vec<&str> = ranking.iter().map(|(id, _)| id.as_str()).collect();
     assert_eq!(order, vec!["z", "y", "x"], "{:?}", implicit.body);
 
-    // The response shape is the one every client already parses.
+    // The response shape is the one every client already parses. The set of
+    // keys is the shape; their order is not part of it (`docs/compatibility.md`
+    // tells clients not to depend on envelope field order), and the alphabetical
+    // order this once asserted was the sorted map the JSON layer used before
+    // ADR-120, not a choice.
     assert_eq!(explicit.body["count"], 3);
     for m in explicit.body["matches"].as_array().unwrap() {
-        let keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        let mut keys: Vec<&str> = m.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
         assert_eq!(keys, vec!["_id", "chunk", "score", "text"], "response shape changed: {m}");
     }
 }

@@ -31,7 +31,9 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/indexes/item_qty -H "$A"
 
 `fields` is an **array**, not a `{field: 1}` object, deliberately: field order
 decides which queries a compound index can answer, and JSON object key order is
-not something a client can rely on surviving serialization.
+not something a client can rely on surviving its own serialization. The server
+keeps the order it receives — `docs/http-api.md`, "The JSON boundary" — so the
+array guards the client end of the wire, not this one.
 
 Creating and dropping require the `admin` action; listing requires `read`.
 

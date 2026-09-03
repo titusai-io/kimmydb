@@ -280,8 +280,19 @@ planned until someone stores such a value and needs to join on it.
 MongoDB rejects any update in which two operators write the same path, or one
 writes inside the other — `{$set: {a: 1}, $inc: {a: 1}}` fails with *"Updating
 the path 'a' would create a conflict at 'a'"*. Here the operators apply in the
-order written and the last one wins, which is what the parser has done since
-the update language existed and what its tests pin.
+order their keys arrive on the wire and the last one wins: `{"$set": {"a": 1},
+"$inc": {"a": 5}}` on `a: 0` leaves `6`, and `{"$inc": {"a": 5}, "$set": {"a":
+1}}` leaves `1`. That is what the parser has done since the update language
+existed and what its tests pin — but before the release that records ADR-120
+it was not what a client saw. Every request body was decoded into a JSON map
+that sorted its keys, so the operators ran in alphabetical order whatever the
+body said — `$inc` before `$set` — and the two updates above both left `1`.
+The boundary now keeps the order it is given (ADR-120). "The order written"
+means the order the bytes arrive in: a client whose JSON encoder does not
+preserve insertion order — a language whose maps are unordered, or a library
+that sorts keys on output — gets whichever order its encoder produced, so a
+caller who depends on the last operator winning should serialise the update
+deliberately rather than trust a map.
 
 **`$setOnInsert` is the exception, and it is checked.** An update that sets a
 path on insert and also `$set`s, `$inc`s, `$unset`s or `$rename`s onto it (or a
