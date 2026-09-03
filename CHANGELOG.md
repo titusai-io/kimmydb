@@ -10,6 +10,17 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch: one thing a 0.19.1 node accepted is
+refused now (a request field the route does not define), and the pre-1.0
+policy puts that behind a `0.MINOR` bump. Nothing changes on the wire between
+members or on disk; members of this version and 0.19.1 replicate to each other.
+
+### Changed
+
+### Fixed
+
 ## 0.19.1 - 2026-09-02
 
 ### Changed
