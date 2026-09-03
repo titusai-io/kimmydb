@@ -15,7 +15,7 @@ use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
 use crate::codec;
-use crate::engine::{Engine, append_oplog, doc_range_after};
+use crate::engine::{Engine, WriteTxn, append_oplog, doc_range_after};
 use crate::error::{Result, StorageError};
 use crate::index;
 use crate::meta::CollectionMeta;
@@ -588,11 +588,63 @@ impl Engine {
     /// original position — which may be *behind* the local tail. Change-stream
     /// subscribers that have already read past that point will not see it; the
     /// cluster work in M4 addresses that.
+    ///
+    /// One entry, one transaction. A sync batch does not come through here:
+    /// it applies a whole run of entries into one transaction with
+    /// [`Self::apply_remote_in_txn`] and commits once (ADR-119). This is the
+    /// single-entry form for snapshot restore and for tests that manufacture
+    /// a replicated write by hand.
     pub fn apply_remote(&self, coll: &CollectionMeta, entry: &OplogEntry) -> Result<bool> {
+        if entry.doc_id.is_none() {
+            // Collection-level operations carry no document to merge, and
+            // nothing to write: decided before the writer is taken.
+            self.witness(&entry.stamp);
+            return Ok(false);
+        }
+        let txn = self.begin_write()?;
+        let RemoteApplied::Applied { id, violations } =
+            self.apply_remote_in_txn(&txn, coll, entry)?
+        else {
+            // Nothing was written, so nothing is committed — a superseded
+            // entry must not cost an fsync.
+            txn.abort()?;
+            return Ok(false);
+        };
+        txn.commit()?;
+        let published = self.report_remote_write(coll, entry, &id, &violations)?;
+        self.publish(published);
+        Ok(true)
+    }
+
+    /// The body of [`Self::apply_remote`], inside a transaction the caller
+    /// owns.
+    ///
+    /// Writes the document, its index entries and its oplog entry into `txn`
+    /// when the entry wins, and writes **nothing** when it loses — an equal
+    /// stamp means this exact write is already here, and peers resend
+    /// overlapping ranges by design — so the caller can keep applying further
+    /// entries into the same transaction either way. The local clock is
+    /// advanced past the stamp in both cases, so a subsequent local write is
+    /// ordered after it.
+    ///
+    /// What cannot happen here is anything that needs the write to be
+    /// durable: publishing to change streams, and recording a unique
+    /// violation, which mints a local entry in a transaction of its own.
+    /// Those come back in the result for [`Self::report_remote_write`] to do
+    /// once the caller has committed. The split exists so that a sync batch
+    /// can be one commit rather than one per entry (ADR-119); on a
+    /// three-member cluster the per-entry form replicated at 8–13 documents
+    /// a second under `durable`, one fsync each.
+    pub(crate) fn apply_remote_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+    ) -> Result<RemoteApplied> {
         let Some(id) = entry.doc_id.clone() else {
             // Collection-level operations carry no document to merge.
             self.witness(&entry.stamp);
-            return Ok(false);
+            return Ok(RemoteApplied::Superseded);
         };
 
         let key = doc_key(&id)?;
@@ -601,9 +653,7 @@ impl Engine {
             None => DocRecord::tombstone(entry.stamp),
         };
 
-        let txn = self.begin_write()?;
-        let violations;
-        let applied = {
+        let violations = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let existing = match docs.get((coll.id.0, key.as_slice()))? {
                 Some(raw) => Some(codec::decode_doc_record(raw.value())?),
@@ -620,10 +670,8 @@ impl Engine {
             };
 
             if !wins {
-                drop(docs);
-                txn.abort()?;
                 self.witness(&entry.stamp);
-                return Ok(false);
+                return Ok(RemoteApplied::Superseded);
             }
 
             // The previous image is needed to remove the index entries it
@@ -646,26 +694,49 @@ impl Engine {
             // are on the local path: an index that does not see a replicated
             // write leaves an index-backed query unable to find a document that
             // demonstrably exists. Same transaction, so the two cannot disagree.
+            //
+            // Both calls read the index definitions through `txn`, not from
+            // `coll`, which is why a run of entries can share a transaction: a
+            // multikey flag an earlier entry set is seen by the next one even
+            // though `coll` was resolved from the last committed state.
             let next = winner.document()?;
-            let newly_multikey;
-            (violations, newly_multikey) =
-                index::maintain_remote(&txn, coll, previous.as_ref(), next.as_ref(), &key)?;
+            let (violations, newly_multikey) =
+                index::maintain_remote(txn, coll, previous.as_ref(), next.as_ref(), &key)?;
             // A replicated array write makes this node's index multikey exactly
             // as a local one would — the planner here answers queries over the
             // merged data, wherever it was written.
-            index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
-            true
+            index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
+            violations
         };
 
-        append_oplog(&txn, entry)?;
-        txn.commit()?;
+        append_oplog(txn, entry)?;
 
         // Advance the local clock past what we just accepted, so a subsequent
         // local write is ordered after it.
         self.witness(&entry.stamp);
 
-        let mut published = vec![entry.clone()];
-        for violation in &violations {
+        Ok(RemoteApplied::Applied { id, violations })
+    }
+
+    /// The part of a replicated write that must follow its commit: count and
+    /// record its unique violations, and return what to publish, in order —
+    /// the entry, then one `UniqueViolation` entry per constraint it broke.
+    ///
+    /// After the commit and not before, because recording a violation mints a
+    /// local entry in its own transaction (see [`Self::log_unique_violation`]
+    /// for why it is separate), and redb has one writer. The caller publishes
+    /// the result, which keeps the rule that nothing reaches a subscriber
+    /// before it is durable.
+    pub(crate) fn report_remote_write(
+        &self,
+        coll: &CollectionMeta,
+        entry: &OplogEntry,
+        id: &DocId,
+        violations: &[index::UniqueViolation],
+    ) -> Result<Vec<OplogEntry>> {
+        let mut published = Vec::with_capacity(1 + violations.len());
+        published.push(entry.clone());
+        for violation in violations {
             self.count_unique_violation();
             warn!(
                 index = %violation.index,
@@ -673,13 +744,30 @@ impl Engine {
                 collection = %coll.name,
                 "a merged write broke a unique constraint"
             );
-            published.push(self.log_unique_violation(coll, &id, violation)?);
+            published.push(self.log_unique_violation(coll, id, violation)?);
         }
-
-        self.publish(published);
-
-        Ok(applied)
+        Ok(published)
     }
+}
+
+/// What [`Engine::apply_remote_in_txn`] decided, and what it left for after
+/// the commit.
+#[derive(Debug)]
+pub(crate) enum RemoteApplied {
+    /// The entry won its conflict and was written into the transaction.
+    Applied {
+        /// The document it wrote — carried here so the post-commit report
+        /// does not have to re-derive from the entry what the write already
+        /// knew.
+        id: DocId,
+        /// Unique constraints the merged write broke. Neither counted nor
+        /// recorded yet: [`Engine::report_remote_write`] does both once the
+        /// write is durable.
+        violations: Vec<index::UniqueViolation>,
+    },
+    /// The entry lost, or named no document. The transaction is exactly as
+    /// it was.
+    Superseded,
 }
 
 /// A group's identity for deduplication: its ids, order-free.

@@ -21,6 +21,30 @@ members or on disk; members of this version and 0.19.1 replicate to each other.
 
 ### Fixed
 
+- **A replica applies a sync batch in one transaction, not one per
+  document.** A client bulk insert was one commit on the node that accepted
+  it and about one commit *per document* on every node that replicated it,
+  plus two for the batch's bookkeeping, each an fsync under the default
+  `durable` class. Measured on a three-member cluster running 0.19.1:
+  `kimmy_commits` and `kimmy_fsyncs` rose one for one per replicated
+  document, a 1,024-entry sync batch took about 145 s to apply, and
+  replication ran at 8–13 documents a second — 1,000 documents converged in
+  78.7 s, 4,000 in 492.6 s. Consecutive document entries in a batch now share
+  one write transaction, and the witnessed and coverage vectors are raised in
+  that same transaction, so a batch with no schema change in it is one commit
+  and one fsync; a schema change in a batch ends the transaction and the
+  documents after it start another. Replication throughput is no longer bound
+  by one fsync per document. What an operator sees: on replicas
+  `kimmy_commits` and `kimmy_fsyncs` rise per batch rather than per document,
+  so a dashboard that read a replica's commit rate as its document rate reads a
+  much smaller number — `kimmy_replication_lag_seconds` and the `cluster.sync`
+  span's `applied` are the document-rate figures — and a local write on a
+  replica may wait for a whole batch to apply rather than for one entry. A
+  replica also publishes a batch to change streams in one burst after it
+  commits, so a subscriber that is not keeping up can fall behind the live
+  feed's 1,024-event ring in one batch; it resumes from the oplog and loses
+  nothing. ADR-119.
+
 ## 0.19.1 - 2026-09-02
 
 ### Changed
