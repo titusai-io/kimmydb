@@ -847,6 +847,56 @@ async fn a_write_tool_actually_writes() {
     assert_eq!(counted["count"], 4);
 }
 
+/// Tool arguments arrive as JSON like an HTTP body does and reach the same
+/// `exec` layer, so the MCP boundary keeps operator order exactly as the HTTP
+/// one does (ADR-120). Pinned here rather than assumed: the changelog says
+/// both boundaries were affected and both are fixed. The argument is parsed
+/// from text so the key order on the wire is the order written here.
+#[tokio::test]
+async fn the_update_tool_applies_operators_in_the_order_written() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    server
+        .call_ok(
+            &token,
+            "insert",
+            json!({"database":"sales","collection":"orders","document":{"_id":"o","a":0}}),
+        )
+        .await;
+
+    let args: Value = serde_json::from_str(
+        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
+            "update":{"$set":{"a":1},"$inc":{"a":5}}}"#,
+    )
+    .unwrap();
+    server.call_ok(&token, "update", args).await;
+    let found = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0]["a"], 6, "$set then $inc: {found}");
+
+    let args: Value = serde_json::from_str(
+        r#"{"database":"sales","collection":"orders","filter":{"_id":"o"},
+            "update":{"$inc":{"a":5},"$set":{"a":1}}}"#,
+    )
+    .unwrap();
+    server.call_ok(&token, "update", args).await;
+    let found = server
+        .call_ok(
+            &token,
+            "find",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"o"}}),
+        )
+        .await;
+    assert_eq!(found["documents"][0]["a"], 1, "$inc then $set: {found}");
+}
+
 #[tokio::test]
 async fn a_malformed_filter_is_reported_to_the_caller() {
     // An agent that can read the reason can correct itself; an opaque failure

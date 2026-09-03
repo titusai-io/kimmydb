@@ -6519,3 +6519,143 @@ place to look after a tag is the `build-local-artifacts` log for the Linux
 targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---
+
+## ADR-120 — JSON object key order is preserved through the HTTP boundary
+
+**Decision.** The workspace's `serde_json` is built with `preserve_order`, so
+`serde_json::Map` keeps insertion order — the order the keys arrived in the
+bytes — instead of sorting them. Every JSON object that crosses into the
+server (a request body over HTTP, a tool argument over MCP, which shares the
+same `exec` layer and the same `Value` type) becomes a BSON document with the
+same key order, and every document that leaves is rendered in the order BSON
+holds it. Two places that had been shaping output in an order of their own,
+invisibly, are brought into line with it: an inclusion projection answers in
+the document's field order rather than the projection's, and every write path
+stores `_id` first. Nothing else changes: the parsers in `kimmy-query` already
+iterated their documents in order, and the storage layer already kept it.
+
+**Why.** Found on 0.19.1 over HTTP. `docs/query-language.md` and
+`docs/deviations.md` say that two update operators writing the same path apply
+in the order written and the last one wins, and `update::parse_with_filters`
+does exactly that; its tests, built with `doc!`, pass. Over the wire the order
+was ignored: `{"$set": {"a": 1}, "$inc": {"a": 5}}` on `a: 0` gave `1`,
+`{"$min": {"a": 3}, "$max": {"a": 10}}` on `a: 5` gave `3`, and `{"$set":
+{"a": 7}, "$mul": {"a": 10}}` gave `7` — six operator pairs, both orders each,
+always the alphabetical result. The cause was the boundary, not the parser.
+Every request body is deserialised as `serde_json::Value` and converted with
+`json::json_to_bson`, and without the `preserve_order` feature `serde_json::Map`
+is a `BTreeMap`: the keys of every object were sorted before the query language
+saw them. `cargo tree -e features -i serde_json` confirmed nothing in the graph
+enabled the feature. The same sort was silently applied to every stored
+document's fields, to the keys of every filter, projection and sort document —
+`{"sort": {"b": 1, "a": 1}}` sorted by `a` first — and, on the way out, to the
+fields of every document rendered back. MongoDB preserves field order in all
+of those places; BSON is an ordered sequence of elements, and its document
+comparison and equality are field-order sensitive because of it.
+
+The fix belongs at the boundary rather than in the parsers because the parsers
+were right: they read a `bson::Document`, which is ordered, and the tests that
+pin the ordered semantics were passing against it. Teaching each parser to
+sort would have been the wrong direction — it would have made the wire order
+irrelevant everywhere and contradicted MongoDB — and there is no way to
+recover an order from a map that has already forgotten it. The only place the
+order was lost is the `serde_json` map, and the feature flag is the whole of
+that fix. It is set once in the workspace `Cargo.toml` so that every crate
+that touches a `serde_json::Value` — the API, the MCP server, the CLI, the
+client library, the fuzz harness — sees the same map type; features are
+unified per build, so a crate could not opt out even if one wanted to.
+`preserve_order` pulls in `indexmap`, pure Rust, already in the graph through
+other dependencies.
+
+The two follow-on changes exist because the sorted map had been hiding them.
+`shape::project` built an inclusion projection's output by walking the
+specification's paths, with the implicit `_id` appended last by the parser,
+so `{"alpha": 1, "zeta": 1}` over `{_id, zeta, alpha}` produced `{alpha,
+zeta, _id}`; MongoDB answers in document order with `_id` first, and once
+order is visible the two disagree. The picking is unchanged and the result is
+reordered to the source document's order afterwards, at every level the
+projection reached into, so the array and dotted-path rules stay as they
+were; `find`, `findAndModify` and the `$project` stage all go through it. And
+`replace_if` appended `_id` to a body that left it out, while the insert path
+put a generated `_id` first and a client-supplied one wherever it was; both
+now go through one helper that stores `_id` first whatever the body said,
+which is MongoDB's rule too, and keeps the client's value as written so an
+`Int32` id does not come back an `Int64`.
+
+**Alternatives.** *Deserialise request bodies straight into `bson::Document`
+through `bson`'s own serde support and skip `serde_json::Value`.* That
+preserves order too, but it discards the Extended JSON layer in `json.rs` —
+`{"$oid": …}`, `{"$date": …}`, whole numbers as `Int32` — which is a contract
+`docs/http-api.md` makes and the fuzz harness checks; rebuilding it on the
+BSON side is the same code in a second place. *Sort every document
+canonically on write, and document that field order is not preserved.* That
+is a deviation from MongoDB with no benefit: a client that writes `{"zeta":
+1, "alpha": 2}` and reads back `{"alpha": 2, "zeta": 1}` has been told
+something it did not say, and the update-operator promise cannot be kept at
+all under it. *Leave projections in specification order.* That is an order a
+client could in principle want, but it is not MongoDB's, it contradicts the
+promise `docs/compatibility.md` now makes about stored order, and `_id`
+landing last was never a choice anyone made.
+
+**Consequence.**
+
+- *Update operators apply in wire order.* `{"$set": {"a": 1}, "$inc": {"a":
+  5}}` on `a: 0` leaves `6`; the reverse order leaves `1`. A client whose JSON
+  encoder does not preserve insertion order gets whichever order its encoder
+  emitted; `docs/deviations.md` says so and tells such a caller to serialise
+  deliberately. The deviation itself — that the pair is not refused as
+  MongoDB refuses it — stands.
+- *Sort documents mean what they say.* `{"b": 1, "a": 1}` sorts by `b` first.
+  Before, it sorted by `a` first; a client that wrote a multi-key sort in
+  non-alphabetical order was being answered in a different order than it
+  asked for, and now is not.
+- *Stored documents keep the order they were written in, `_id` first.* A
+  document written before this release was stored with its fields sorted
+  alphabetically and stays that way; one written after keeps the order it
+  arrived in. Nothing rewrites the old ones, and a collection may hold both.
+  Field order is not visible to a path lookup, so `find`, `count`, projection
+  and every operator that addresses a field by name behave the same over both.
+- *Whole-document comparison is field-order sensitive, as in BSON.*
+  `canonical_cmp` compares documents element by element and has since M1, so
+  `{"a": {"x": 1, "y": 2}}` as a filter matches a stored `a` of `{x: 1, y:
+  2}` and not `{y: 2, x: 1}` — which is MongoDB's rule. Before this release
+  both sides of that comparison had been sorted, so the comparison was
+  order-insensitive by accident. The one visible change: a document whose
+  embedded field was stored before this release is in sorted order, and a
+  filter that spells the embedded document in another order no longer matches
+  it. The same holds for `$in` over documents, `$eq` inside `$expr`, and the
+  order two document-valued keys take in an index or a sort. Rewriting such a
+  document — a replace, or any update — stores the order the request carried.
+- *Responses render in stored order.* Every `documents` array, `explain` and
+  the MCP tool text now show fields as stored, and an envelope built with
+  `json!` renders in the order the source writes it. `describe` is the
+  exception and deliberately so: its field list is a `BTreeMap` keyed by path
+  and stays alphabetical, which is the right order for a summary; only the
+  sample documents it returns changed. The audit that went with the change
+  ran the whole suite under the new map: one test had asserted the key order
+  of a `hybrid_search` match — `_id`, `chunk`, `score`, `text` — as the
+  "response shape", and that order was the sorted map's, not a choice; it
+  compares the key set now. Every other test compares `serde_json::Value`s,
+  whose equality ignores order, and none compares rendered text or a golden
+  JSON file; `/metrics` is Prometheus text and untouched.
+- *`serde_json::Map::remove` is now a swap-remove.* Under `preserve_order`
+  the map is an `IndexMap` and `remove` moves the last entry into the hole,
+  which disturbs the order of everything after it. Production code must not
+  use it to reshape a response or a document — `bson::Document::remove` is
+  the order-preserving one, and reshaping belongs on the BSON side anyway.
+  Today only tests call it, on values whose order they do not then assert.
+
+**Cost.** A behaviour change in a `0.MINOR`, recorded in the changelog: a
+client that relied on the accidental alphabetical application of update
+operators — writing `$inc` and `$set` on one path and getting `$set`'s value
+regardless of order — gets the order it wrote now, and a client that read
+projected fields positionally, in specification order, reads them in document
+order. `indexmap` replaces `BTreeMap` behind every `serde_json::Map`; lookups
+are hashed rather than tree-walked and iteration is a vector scan, which is
+not slower on any path this server takes. An inclusion projection pays one
+pass over the source document's top-level keys per result to reorder, and
+`shift_remove` on the picked document, which is small. Two orders of stored
+document now coexist on a node that was upgraded, and the comparison case
+above is the only place that shows.
+
+---

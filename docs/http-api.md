@@ -497,7 +497,9 @@ curl -XDELETE localhost:7878/v1/db/shop/coll/orders/indexes/item_qty -H "$A"
 
 `fields` is an **array**, not a `{field: 1}` object: field order decides which
 queries a compound index can answer, and JSON object key order is not something
-a client can rely on.
+a client can rely on its own encoder to keep. The server keeps whatever order
+arrives (see [The JSON boundary](#the-json-boundary)); the array is insurance
+against the client side, where a language with unordered maps may not.
 
 A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 `"enforcement": "coordinated"` returns **501** until clustering lands — a
@@ -655,6 +657,17 @@ round-trips exactly, and there is a test pinning it.
 
 **Non-finite doubles** come back as `{"$numberDouble": "NaN"}` rather than
 `null`, so a number never silently becomes a missing value.
+
+**Object key order is preserved** through the boundary and into the stored
+document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
+`zeta` first, as BSON keeps it, and the same holds for the keys of a filter,
+sort or update document, where the order carries meaning — a sort document's
+first key is its primary key, and update operators apply in the order they
+arrive (ADR-120). An inclusion projection answers in the document's order,
+not the projection's. This is the server's end of the wire; the other end is
+the client's JSON encoder, and the index route's `fields` array exists because
+that end is the one a client cannot always vouch for (see
+[Indexes](#indexes)).
 
 ---
 

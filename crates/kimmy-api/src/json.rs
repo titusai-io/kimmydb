@@ -354,6 +354,29 @@ mod tests {
     }
 
     #[test]
+    fn key_order_survives_the_boundary_in_both_directions() {
+        // Parsed from text rather than built with `json!`, because the text is
+        // what a request body is. Without `preserve_order` on `serde_json`
+        // the map sorted these on the way in and every update operator,
+        // sort key and stored field crossed the boundary in alphabetical
+        // order, whatever the client wrote (ADR-120).
+        let value: Value =
+            serde_json::from_str(r#"{"zeta":1,"alpha":{"y":2,"x":1},"mid":3}"#).unwrap();
+        let doc = json_to_document(&value).unwrap();
+        let keys: Vec<&str> = doc.keys().map(String::as_str).collect();
+        assert_eq!(keys, vec!["zeta", "alpha", "mid"]);
+        let inner: Vec<&str> =
+            doc.get_document("alpha").unwrap().keys().map(String::as_str).collect();
+        assert_eq!(inner, vec!["y", "x"]);
+
+        // And back out in the order BSON holds, which is what a client reads.
+        assert_eq!(
+            document_to_json(&doc).to_string(),
+            r#"{"zeta":1,"alpha":{"y":2,"x":1},"mid":3}"#
+        );
+    }
+
+    #[test]
     fn non_objects_are_rejected_where_a_document_is_required() {
         assert!(json_to_document(&json!([1, 2])).is_err());
         assert!(json_to_document(&json!("text")).is_err());

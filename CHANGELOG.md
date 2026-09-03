@@ -21,6 +21,35 @@ members or on disk; members of this version and 0.19.1 replicate to each other.
 
 ### Fixed
 
+- **Update operators apply in the order the request wrote them, and a
+  document's fields are stored in the order they arrived.** The query
+  language promised that two operators on one path apply in the order
+  written and the last one wins, and its parser did that — but every request
+  body was decoded into a JSON map that sorted its keys, so over HTTP and MCP
+  the operators ran alphabetically whatever the body said: `{"$set": {"a":
+  1}, "$inc": {"a": 5}}` on `a: 0` left `1` when it should leave `6`, and
+  `{"$min": {"a": 3}, "$max": {"a": 10}}` on `a: 5` left `3` instead of `10`.
+  The same sort was applied to every stored document's fields, so `{"zeta":
+  1, "alpha": 2}` read back as `{"alpha": 2, "zeta": 1}`, and to a sort
+  document's keys, so `{"sort": {"b": 1, "a": 1}}` sorted by `a` first. The
+  JSON boundary now keeps the key order it is given, as MongoDB does. What
+  changes for a client: an update that names one path twice gets the order it
+  wrote, not the alphabetical one; a multi-key sort written out of
+  alphabetical order now means what it says; documents written from this
+  release on keep their field order, with `_id` first whatever the body said
+  (a replace used to put it last), while documents stored earlier keep the
+  sorted order they were written with until they are rewritten; and an
+  inclusion projection answers in the document's field order, as MongoDB
+  does, rather than the projection's. Whole-document comparison — `{"a":
+  {"x": 1, "y": 2}}` as an equality filter, `$in` over documents — is
+  field-order sensitive as it always was in the comparator and as it is in
+  MongoDB; before, both sides had been sorted, so it was order-insensitive by
+  accident, and a document stored before this release matches such a filter
+  only when the filter is spelled in alphabetical order.
+  A client whose JSON encoder does not preserve insertion order gets whichever
+  order its encoder emitted; `docs/deviations.md` says how to serialise
+  deliberately. ADR-120.
+
 ## 0.19.1 - 2026-09-02
 
 ### Changed
