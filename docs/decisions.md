@@ -6519,3 +6519,105 @@ place to look after a tag is the `build-local-artifacts` log for the Linux
 targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---
+
+## ADR-121 — A request body with a field the route does not define is refused
+
+**Decision.** Every request shape the API deserializes carries
+`#[serde(deny_unknown_fields)]`: the bodies of `find`, `count`, `aggregate`,
+`update`, `delete`, `find_and_modify`, index creation, collection creation,
+login, the user, role and webhook routes, vector upload and both searches, and
+the shapes nested inside them — an index's field entry, a search's fusion
+weights. A field the route does not define is refused `422` with the
+`bad_request` code in the standard envelope, and the message is serde's, which
+names the field and lists the ones the route takes. The rule is stated once,
+on `JsonBody<T>`, the extractor every request body passes through. A document
+body — insert, replace, bulk — is content, not a shape, and is not held to it.
+A grant inside a user or role body arrives as `GrantInput`, a closed mirror of
+`kimmy-auth`'s `Grant` that converts into it, so the persisted type stays open
+and the request does not. Query strings are held to the same rule through
+`QueryParams<T>`, a wrapper over axum's `Query<T>` whose rejection is the
+envelope: `?limt=5` is refused by name and `?limit=abc` is no longer bare
+text. The status there is `400`, not `422` — a query string is part of the
+request line, not an entity the server failed to process, and `400` is what
+axum already answered — so nothing a client had learned to expect on a `GET`
+changes but the envelope.
+
+The MCP tools' argument structs carry the same attribute: rmcp deserializes
+them with serde and returns a failure as the tool's error result with the text
+intact, so the refusal reaches the model by name, and schemars turns the
+attribute into `additionalProperties: false` in every tool's schema.
+`docs/openapi.yaml` says the same of every request schema, and the contract
+test that keeps response schemas open now also insists that request shapes are
+closed.
+
+**Why.** `POST .../find` with `{"limitt": 5}` answered `200` and returned the
+default page. `{"explain": true}` on `aggregate` answered `200` without a
+plan. A misspelt `if_stamp` on `update` made a conditional write an
+unconditional one, which is the opposite of what the field is for. Each of
+these is a typo on exactly the field where a silent no-op costs the most, and
+none of them could be seen from the response. One route refused the same
+thing: `POST .../vector`, because `VectorConfig` and `ProviderConfig` in
+`kimmy-core` carried the attribute since they were written, so a client met a
+`422` for an unknown field on one route and a `200` on every other. The
+reference documented neither. The compatibility page described the refusal as
+the behaviour a client should expect from an older node — "several request
+bodies reject unknown fields deliberately" — which was true of two structs.
+Making it true of all of them is making the documented contract the actual
+one.
+
+The argument for refusing is the same one ADR-057 made for the error envelope:
+a client can only act on what it can see. A field the server does not read is
+a request the server cannot honour; answering as though it had is the one
+failure a client cannot detect, test for, or retry. A refusal that names the
+field is a fix in one edit. And the cost of refusing falls only on a request
+that was already wrong.
+
+**Alternatives.**
+
+- *Warn, or accept and report the ignored fields in the response.* Rejected.
+  A warning field is one more thing a client must know to read, and the
+  clients most likely to send a typo are the ones least likely to read it.
+  The pre-1.0 policy allows a tightening behind a `0.MINOR` bump with a
+  release note, which this is; a deprecation window would be a release of
+  silent no-ops nobody asked for, and the project does not ship
+  compatibility shims (ADR-058).
+- *Leaving query strings open.* Rejected, though it was the first draft.
+  Axum's `Query<T>` rejects as bare text outside the envelope, so closing the
+  structs alone would have made an unknown parameter the one refusal a client
+  cannot branch on — the defect `JsonBody` was written to remove. The fix was
+  the same one: an extractor of our own with the envelope as its rejection,
+  after which the rule costs nothing to apply. Answering `422` there, to match
+  bodies, was considered and dropped: it would change a status clients had
+  seen since the routes existed for no gain, and the envelope is what a
+  client branches on.
+- *Closing `Grant` itself.* Rejected. A grant is a request shape inside the
+  user and role bodies, but it is also the persisted, replicated form and the
+  shape every response that lists grants returns; a stored record must keep
+  reading under a later version that adds a field, and a rolling upgrade
+  cannot afford an older member refusing what a newer one wrote. But leaving
+  the request side open was the worst case of the whole finding: `collection`
+  defaults to `*`, so a misspelt `colection` did not lose a field, it granted
+  every collection in the database and returned a grant that looked
+  deliberate. A request-only mirror in `kimmy-api` closes the boundary
+  without touching the type.
+- *Closing `VectorConfig` in the specification.* Not done, for the mirror
+  reason: `GET .../vector` and `describe` return it, and a response schema
+  must stay open so a new response field is additive. The server refuses an
+  unknown field in it — it always did — and the request body says so in
+  prose.
+
+**Cost.** Breaking for a client that sends a field or a query parameter the
+route does not define, and a `0.MINOR` bump for it. One more shape to keep in
+step with `Grant` — three fields and a `From` — and a second extractor beside
+`JsonBody`. The first-party Rust, Python and Go clients, the CLI, the MCP
+server, the conformance scenarios, the examples and every request example in
+the documentation were audited against the server's field lists and send
+nothing the server does not define; a third-party client that hand-rolls a
+body with an extra field meets a `422` that names it. The MCP `hybrid_search`
+arguments spell out the search fields rather than flattening
+`vector_search`'s, because serde cannot refuse unknown fields across a
+flatten; the schema the model reads is the same. One more contract test, and
+the closed-schema test now distinguishes a component only a request reaches
+from one a response does.
+
+---

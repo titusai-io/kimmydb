@@ -26,6 +26,15 @@ use crate::error::ApiError;
 /// has to remember to write: `JsonBody<T>` cannot be used without it. Found by
 /// driving a real node, because every conformance scenario that exercised a
 /// wrong-shaped body happened to use the one route that had it right.
+///
+/// Every `T` that is a request shape — as opposed to a document, which is
+/// content — carries `#[serde(deny_unknown_fields)]`, so a field the route
+/// does not define is refused `422 bad_request` with the field named rather
+/// than dropped (ADR-121). Before that, `{"limitt": 5}` on `find` was a
+/// silent no-op while the same typo in a vector configuration was a `422`,
+/// because only that one struct carried the attribute; a typo was an error
+/// on one route and nothing on the rest. Serde's message names the field and
+/// lists the ones the route takes, and `From<JsonRejection>` keeps it.
 pub struct JsonBody<T>(pub T);
 
 impl<T, S> axum::extract::FromRequest<S> for JsonBody<T>
@@ -38,6 +47,34 @@ where
 
     async fn from_request(req: axum::extract::Request, state: &S) -> Result<Self, Self::Rejection> {
         let axum::Json(value) = axum::Json::<T>::from_request(req, state).await?;
+        Ok(Self(value))
+    }
+}
+
+/// A query string whose refusals are the API's error envelope.
+///
+/// The same shape as [`JsonBody`], for the same reason: axum's `Query<T>`
+/// answers a query string it cannot read with bare text, which left
+/// `?limit=abc` the one refusal on a `GET` that a client could not branch on.
+/// Every `T` carries `#[serde(deny_unknown_fields)]`, so `?limt=5` is refused
+/// by name rather than ignored (ADR-121). The status is `400`, not the `422`
+/// a body gets: a query string is part of the request line, not an entity the
+/// server could not process, and `400` is what axum already chose.
+pub struct QueryParams<T>(pub T);
+
+impl<T, S> axum::extract::FromRequestParts<S> for QueryParams<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        let axum::extract::Query(value) =
+            axum::extract::Query::<T>::from_request_parts(parts, state).await?;
         Ok(Self(value))
     }
 }

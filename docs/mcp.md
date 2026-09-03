@@ -322,6 +322,12 @@ fault — a rejected filter names the operator it did not recognize — so an ag
 can correct itself instead of retrying blindly. Storage faults return a generic
 message, as they do over REST.
 
+An argument a tool does not define is refused the same way, by name: `limt`
+where `limit` was meant is an error result that names the field and lists the
+ones the tool takes, not a call that ran without it. Each tool's `inputSchema`
+says so with `additionalProperties: false`, so a client that validates before
+calling learns it first ([ADR-121](decisions.md)).
+
 ---
 
 ## Next

@@ -108,10 +108,10 @@ follow from the rules above rather than adding to them:
 - **Ask each node.** `/v1/version` describes the node that answered it, and the
   answer is worth caching per node rather than per cluster.
 - **A request using a field an older node does not know is refused**, with
-  `422` and `bad_request` — several request bodies reject unknown fields
-  deliberately, so a typo is an error rather than a silent no-op. That refusal
-  is *correct*, and it is why capability discovery exists: check first, do not
-  send and hope.
+  `422` and `bad_request` — every request body rejects unknown fields
+  ([ADR-121](decisions.md)), so a typo is an error rather than a silent
+  no-op. That refusal is *correct*, and it is why capability discovery
+  exists: check first, do not send and hope.
 - **Failover does not paper over this.** A `retry: elsewhere` failure means the
   node was unable; it does not mean the next node is newer. A client that
   retries a capability-dependent request around the cluster will get the same
@@ -190,6 +190,10 @@ this project has been wrong before about claims nothing checked.
   today's document still validates tomorrow's responses — which is what makes
   "a new response field is additive" true rather than merely intended.
 - Every documented operation still answers with the shape it declares.
+- Every request shape is closed — the "every request body rejects unknown
+  fields" claim above — so a client validating against the document before
+  sending is told what the server will refuse
+  (`every_request_shape_is_closed`).
 
 **Written down and not checked:**
 

@@ -325,13 +325,147 @@ fn every_versioned_route_carries_the_protocol_major() {
 /// validating client, silently, and only for them.
 #[test]
 fn no_response_schema_forbids_the_fields_it_has_not_seen() {
+    let spec = spec();
     let mut closed = Vec::new();
-    find_closed_schemas(spec(), String::new(), &mut closed);
+    find_closed_schemas(&spec["paths"], "/paths".to_string(), &mut closed);
+    find_closed_schemas(
+        &spec["components"]["responses"],
+        "/components/responses".to_string(),
+        &mut closed,
+    );
+    // A component schema is a response schema if any response reaches it,
+    // directly or through another schema. One only request bodies refer to —
+    // `FindRequest`, `SearchRequest` — is a request shape and is closed on
+    // purpose (ADR-121); the test below insists on that.
+    for name in response_schemas(spec) {
+        find_closed_schemas(
+            &spec["components"]["schemas"][&name],
+            format!("/components/schemas/{name}"),
+            &mut closed,
+        );
+    }
     assert!(
         closed.is_empty(),
         "these schemas forbid unknown properties, which makes adding a response field \
          breaking for a validating client: {closed:#?}"
     );
+}
+
+/// Every request shape is closed: a field the route does not define is
+/// refused by the server (ADR-121), and a client validating against this
+/// document before sending must be told the same thing. A document body —
+/// insert, replace, bulk — is content, and stays open. The one shape that is
+/// both a request and a response, `VectorConfig`, keeps the response rule and
+/// says so at its request body.
+#[test]
+fn every_request_shape_is_closed() {
+    let spec = spec();
+    let responses = response_schemas(spec);
+    let mut open = Vec::new();
+    for (template, methods) in spec["paths"].as_object().expect("paths") {
+        for (method, operation) in methods.as_object().expect("methods") {
+            let Some(schema) = operation.pointer("/requestBody/content/application~1json/schema")
+            else {
+                continue;
+            };
+            let named = schema.get("$ref").and_then(Value::as_str);
+            let resolved = resolve(spec, schema);
+            // An array body is a batch of shapes; the element is the shape.
+            let (named, resolved) = if resolved["type"] == "array" {
+                let items = &resolved["items"];
+                (items.get("$ref").and_then(Value::as_str), resolve(spec, items))
+            } else {
+                (named, resolved)
+            };
+            let name = named.and_then(|r| r.strip_prefix("#/components/schemas/"));
+            let is_document = name == Some("Document");
+            let is_response_too = name.is_some_and(|n| responses.contains(n));
+            if is_document || is_response_too {
+                continue;
+            }
+            if resolved["additionalProperties"] != Value::Bool(false) {
+                open.push(format!("{} {template}", method.to_uppercase()));
+            }
+        }
+    }
+    assert!(
+        open.is_empty(),
+        "these request shapes do not declare `additionalProperties: false`, but the server \
+         refuses a field they do not define (ADR-121): {open:#?}"
+    );
+}
+
+/// Every operation that reads a query string documents the `400` a parameter
+/// it does not define, or cannot parse, is refused with (ADR-121). The gap
+/// this closes was found by review: one route's `400` was missed by a text
+/// search that matched a longer operation name.
+#[test]
+fn every_operation_with_a_query_parameter_documents_the_400() {
+    let spec = spec();
+    let is_query = |parameters: &Value| {
+        parameters
+            .as_array()
+            .is_some_and(|list| list.iter().any(|p| resolve(spec, p)["in"] == "query"))
+    };
+    let mut missing = Vec::new();
+    for (template, item) in spec["paths"].as_object().expect("paths") {
+        let path_level = is_query(&item["parameters"]);
+        for (method, operation) in item.as_object().expect("path item") {
+            if method == "parameters" {
+                continue;
+            }
+            if (path_level || is_query(&operation["parameters"]))
+                && operation["responses"].get("400").is_none()
+            {
+                missing.push(format!("{} {template}", method.to_uppercase()));
+            }
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "these operations take a query parameter but do not document the 400 its \
+         refusal carries: {missing:#?}"
+    );
+}
+
+/// The component schemas some response reaches, transitively.
+fn response_schemas(spec: &Value) -> BTreeSet<String> {
+    let mut reachable = BTreeSet::new();
+    collect_refs(&spec["paths"], false, &mut reachable);
+    collect_refs(&spec["components"]["responses"], true, &mut reachable);
+    loop {
+        let before = reachable.len();
+        for name in reachable.clone() {
+            collect_refs(&spec["components"]["schemas"][&name], true, &mut reachable);
+        }
+        if reachable.len() == before {
+            return reachable;
+        }
+    }
+}
+
+/// Collect the component schemas referenced under a `responses` key, or
+/// anywhere when `under_response` is already set.
+fn collect_refs(node: &Value, under_response: bool, refs: &mut BTreeSet<String>) {
+    match node {
+        Value::Object(map) => {
+            if under_response
+                && let Some(reference) = map.get("$ref").and_then(Value::as_str)
+                && let Some(name) = reference.strip_prefix("#/components/schemas/")
+            {
+                refs.insert(name.to_string());
+            }
+            for (key, value) in map {
+                collect_refs(value, under_response || key == "responses", refs);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_refs(item, under_response, refs);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn find_closed_schemas(node: &Value, path: String, closed: &mut Vec<String>) {
@@ -341,9 +475,9 @@ fn find_closed_schemas(node: &Value, path: String, closed: &mut Vec<String>) {
                 closed.push(path.clone());
             }
             for (key, value) in map {
-                // Request bodies are allowed to be strict — several reject
-                // unknown fields on purpose, so a typo is an error rather than
-                // a silent no-op. It is *responses* that must stay open.
+                // Request bodies are strict by rule (ADR-121), so a typo is an
+                // error rather than a silent no-op. It is *responses* that
+                // must stay open.
                 if key == "requestBody" {
                     continue;
                 }
