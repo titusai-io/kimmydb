@@ -488,6 +488,13 @@ at most one in-flight commit however many documents it carried, so a batch of
 recorded above, and which had made per-document encoding look like the wrong
 answer for the right reason.
 
+> **The second commit is gone.** The worker holds its position
+> and writes it by deadline — with a batch, or after at most one second —
+> rather than after every entry (ADR-125). The numbers in this section are
+> left as they were measured against the per-entry write; what replaces it is
+> one position checkpoint per second while entries arrive, however many
+> arrive, so a burst of N skipped entries is N commits plus one.
+
 #### The evidence
 
 **A running node reports it.** `kimmy_commits` on `/metrics`, over 200 inserts
@@ -559,10 +566,19 @@ pays the 100 anyway. Sustained ingest is bounded by the worker's per-document
 commit rate, not by the batch path — and this holds on every node, whether or
 not any collection uses vectors.
 
-**No fix is included here.** Making a consumer's position writes cheaper trades
+**No fix was included here.** Making a consumer's position writes cheaper trades
 a crash replaying a few idempotent entries for an fsync per write, which is a
-change to the oplog-consumer contract and is reserved for a decision. What
-this section changes is that the trade is now between two measured numbers.
+change to the oplog-consumer contract and was reserved for a decision. What
+this section changed is that the trade became one between two measured numbers.
+
+> **The decision was taken in ADR-125**, after the cluster form of the same
+> cost was measured on a three-member cluster running 0.20.0: a 1,000-document
+> bulk converged everywhere in 3–5 s and was followed by about 75 s of
+> committing at ~18/s on every member, the writer included — the worker
+> checkpointing once per replicated entry. The position is now held and
+> written by deadline, at most once a second, so the 4,000-document ingest
+> above would leave the node committing for about a second rather than twelve.
+> The figures in this section are not re-measured.
 
 Worth knowing before that decision: **the replication path already made the
 other choice.** `Sync::apply_batch` in `kimmy-storage/src/sync.rs` witnesses a

@@ -6936,3 +6936,420 @@ asserts the new meaning, and one reproduces the finding: stamps spanning
 where the span gave 300.
 
 ---
+
+## ADR-123 — A dropped index leaves a tombstone, and a schema change a replica cannot apply is skipped, counted and exported
+
+**Decision.** Three things, one finding. *First*, dropping an index records a
+tombstone: `indexes_dropped`, keyed by collection id and index id, holding the
+drop's originating stamp, kept for `tombstone_retention_secs` beside the
+document and collection tombstones, carried by backups under a new tag, and
+consulted by `apply_remote_index` — a `CreateIndex` stamped before the
+tombstone is history: counted as applied, not built, and **not appended**,
+exactly as a `CreateCollection` is against `collections_dropped` (ADR-034),
+so this node does not re-serve onward an entry it has decided is history;
+the drop's own entry, appended when it applies, is what carries the ordering
+to a third member. `drop_index_inner` takes the
+originating stamp when replicated and mints one when local, and the same
+parameter decides whether to log and which stamp the tombstone records; the
+replicated path records the tombstone even when the index is not here to
+drop, and even when the collection is gone. *Second*, `apply_ddl` sorts the
+result of a replicated `CreateIndex`, `DropIndex` or `ConfigureVectors` into
+applied, gone, or **refused**: a refusal is `InvalidQuery`, `IndexExists` or
+`Unsupported` — a refusal of the request, decided by this node's data — and
+is skipped, logged at warning with the database, collection, index and
+reason, counted in `SyncOutcome::ddl_refused`, witnessed but not appended;
+every other error still fails the round. The snapshot route applies the same
+classification: `restore_collection` runs each index definition on a page
+through `settle`, a refused one is warned and counted in
+`SnapshotApplied::ddl_refused`, which the transport folds into the round's
+`SyncOutcome::ddl_refused`, and the documents on the page still restore. A
+snapshot is served to exactly the peer most likely to hold documents a
+definition cannot be built under — one that was away long enough to write
+on its own past the origin's retention — so leaving that route on a bare
+error would have kept the wedge open where it was likeliest. A replicated
+unique index whose
+backfill finds keys already shared is built in full and its collisions are
+recorded as a merged write's are. *Third*, the replication loop reports every
+tick through a new `on_round` hook — `RoundReport { failed, backing_off,
+ddl_refused }` — and the daemon maps it to `kimmy_sync_failures_total`,
+`kimmy_sync_peers_backing_off` and `kimmy_sync_ddl_refused_total`, with
+OpenTelemetry observers and rows in the operations table. `on_lag` is
+unchanged.
+
+**Why.** Observed on a three-member cluster running 0.20.0. A member created
+a compound index over two array fields on a collection in which no document
+held both — accepted, `multikey: true` — and dropped it 28 seconds later.
+Both replicated. A document with arrays at both paths was then inserted,
+which is legal once the index is gone. From then on, every anti-entropy round
+that re-served the window holding the `CreateIndex` entry — windows overlap
+by design, because `entries_for_peer` serves in global stamp order from a
+single threshold — rebuilt the index through `apply_remote_index`, whose
+backfill met the two-array document and raised `index_keys_observed`'s
+"cannot be built for this document" error. That error is not
+`CollectionNotFound`, so `gone()` did not absorb it; `apply_one` propagated
+it; `apply_batch_absorbing` abandoned the run and its witnessed vector;
+coverage never advanced; and the identical window was re-requested for ever
+with backoff to 300 s. The `DropIndex` later in the same window was never
+reached. A second instance minutes later: a unique index created and dropped
+a second apart, whose replayed create collided on the puller's copy
+("existing documents already violate it"). Throughout,
+`kimmy_replication_lag_seconds` read 0, because `on_lag` is called only
+after a round that succeeded, and `/v1/topology` showed every member live.
+Writes on one member never reached the others again.
+
+**Why the tombstone, and why it was needed before retention ran.** ADR-034
+gave collections a tombstone because the `DropCollection` entry aged out and
+a rejoining peer recreated the collection. An index had the same gap and a
+worse consequence: the entry did not need to age out, because overlapping
+windows replay the create routinely, and a replayed create is not merely a
+resurrection — it *backfills over the current documents*, which may by then
+hold exactly what the definition forbids, and the backfill's failure took
+the round down with it. The tombstone makes the replay history; the refusal
+class makes the round survive it; each is needed without the other. Keyed by
+the id derived from the name, so the drop — which carries only the name —
+and the create — which carries the definition — compute the same key.
+Snapshots carry no collection tombstones today and carry no index
+tombstones either; a node restored from a snapshot has the state as of the
+snapshot and no history to replay against, and the case where it later
+receives an aged-out create from a peer is the case ADR-034 already accepts
+for collections. Not extended here.
+
+**Why a refusal is skipped and everything else still fails the round.**
+`gone()`'s stance — a round that quietly skips what it cannot understand is
+how corruption becomes convergence — stands, and the refusal class is
+defined so as not to breach it. A refusal is a deterministic function of the
+definition and this node's data: `InvalidQuery` from the backfill (a
+compound index a document here spans two arrays of; a document that would
+fan out to more than 1,000 entries; the TTL and partial-filter shape checks),
+`IndexExists` (the name is taken here by a different definition, because two
+members created it concurrently), `Unsupported` (an enforcement mode this
+build does not implement). Re-delivering the entry unchanged can never
+succeed, so failing the round buys the wedge and nothing else. Skipping is
+safe on three conditions, all met: the entry is witnessed by
+`apply_batch_absorbing`, so it is not re-served; it is not appended, so this
+node does not propagate a definition it does not hold; and the skip is
+counted, logged with the reason, and exported, so the divergence is a
+visible state rather than a silent one. A storage error — redb, I/O, a record
+that will not decode — is a failure of the node rather than of the request,
+may succeed on retry, and still fails the round.
+
+**Why a two-array compound index is not refused at creation.** It was
+considered and rejected. The rule — "a compound index may span at most one
+array field", MongoDB's "cannot index parallel arrays" — is a property of a
+(definition, document) pair, and a schemaless store holds no fact about
+documents it has not seen. Refusing the definition at creation whenever two
+of its paths *could* hold arrays would refuse every compound index. So the
+check runs where the pair meets: creating over a collection with no such
+document succeeds; a later write of such a document is refused `400`, naming
+the index; a create over an existing such document is refused. On a replica
+the same check runs over the replica's documents, and a definition the
+origin accepted can be one the replica cannot build — which is the refusal
+class above, not a reason to move the check. `docs/indexes.md` now says when
+the rule bites.
+
+**Why a colliding unique backfill is built rather than refused, on the
+replicated path only.** ADR-020: uniqueness is not I-confluent, so a
+replicated write that breaks it converges with the violation recorded rather
+than diverging by being refused. A replicated *definition* is the same
+choice one level up. Refusing it leaves this node without an index every peer
+holds, for ever: writes the peers check go unchecked here, and index-backed
+queries answer differently on different members — a divergence that is
+permanent and, without this ADR's counter, silent. Building it in full,
+every entry added, keeps queries complete (the reason `maintain_remote` adds
+the colliding entry rather than skipping it), keeps the constraint live for
+every later local write, and reports the keys already shared through the
+same machinery a merged write uses: counted in `kimmy_unique_violations`,
+warned, minted as `UniqueViolation` entries (ADR-029) that
+`live_unique_violations` reads (ADR-087), naming every holder of the key.
+The record's `merged` field names the holder the backfill met last, which is
+the document whose presence turned a key with one holder into a collision —
+the role the merged write plays. The local path is unchanged: a client
+creating a unique index over data that violates it is told so, because it
+is there to be told.
+
+**What is left as a counted divergence.** Two members creating the same
+index name with different definitions during a partition. Neither is wrong;
+the second to arrive is refused with `IndexExists`, counted, and named in the
+log, and each member keeps its own. A "newer definition wins" rule would
+resolve it, but needs a creation stamp on `IndexMeta` to compare, which the
+definition does not carry and which would change what `CreateIndex` puts on
+the wire; not done here. The same gap shows on a replayed *drop* that arrives
+after a newer creation of the same name: with no creation stamp to compare,
+the drop applies. The tombstone it records is older than the creation, so a
+replay of the creation rebuilds it — but only where the creation can be
+replayed. A node never replays its own oplog into itself, so when the newer
+creation is this node's own, the index stays dropped here until a third
+member that holds the creation re-serves it, or until someone recreates it
+explicitly; the pair does not converge on its own. Accepted for the same
+reason: the fix is the creation stamp, and the case needs a drop from before
+a recreation to arrive after it, which is a re-served window across a
+recreation on the same name.
+
+**Why a counter, not a zero lag, is the failure signal.** ADR-122 stands: an
+unreachable cluster has *unknown* lag, and `on_lag` is not called for a tick
+that reached nobody, because overwriting the last reading with zero reports
+the outage as health. That is the right rule for the gauge and it is why the
+gauge cannot carry this signal — a round that fails leaves the gauge exactly
+where the last good round put it, which for a cluster that was caught up
+when it wedged is 0. A counter of failed rounds has no last-good-value
+problem: it rises on every failure, from any cause, and a counter rising
+while the gauge sits at 0 is precisely the shape of the wedge. `on_round` is
+called every tick, reached peers or not, for the same reason `on_lag` is
+not.
+
+**Alternatives.** *Widen `gone()` to swallow every error.* Rejected; that
+is the convergence-by-corruption `gone()` was written not to be. *Retry the
+refused entry on the next round.* It cannot succeed, and retrying it is the
+wedge. *Append the originating entry on refusal, so the version vector
+advances.* It would propagate through this node a definition this node
+does not hold, and the witnessed vector already stops the re-request
+(ADR-054). *Have the origin refuse the two-array compound index at
+creation.* Rejected above. *Refuse the colliding unique backfill on the
+replicated path as on the local one.* Rejected above, by ADR-020's own
+argument. *Carry the tombstone in the `DropIndex` entry's lifetime alone.*
+That is what was there. *Put the failure signal into the lag gauge as a
+sentinel value.* A dashboard cannot alert on "0 means healthy or wedged",
+which is the finding.
+
+**Cost.** One more tombstone table, one more backup tag (11; never reused),
+one more retention pass over a table that holds one row per dropped index.
+`drop_index_inner`'s signature changes from a `log` flag to an
+`Option<Stamp>`, as `drop_collection_inner`'s did, and `create_index_inner`
+returns the collisions it found beside the definition; the local wrapper
+asserts the list is empty. The replicated backfill of a unique index keeps
+every key's holders in memory for the length of the build — one document
+key per key more than the local build, which keeps its `HashSet` of keys and
+pays nothing new. `apply_snapshot_page` returns `SnapshotApplied` rather
+than a count. Recording a backfill's violations follows `commit_run`'s
+shape — every violation reported, everything minted published, the first
+error returned afterwards — because the index is committed by then and a
+re-delivery would not find the collisions again. A replica can now hold a unique index over data
+that violates it, as it already could through merged writes, and the
+violations route says so. A refused definition is a divergence the cluster
+does not repair on its own; the counter and the warning make it an
+operator's decision rather than an outage. Three new series on `/metrics`,
+pinned by the golden tests. `SyncOutcome` and `RoundReport` gain a field
+each. A local drop of an index that is not there still records nothing — it
+mints no entry, so a tombstone would be a decision no peer hears of.
+## ADR-124 — A route that reads no query string refuses every query string
+
+**Decision.** One layer over the REST route table,
+`routes::refuse_unread_query_string`, answers `400 bad_request` in the
+envelope to any request whose query string is non-empty and whose
+`(method, matched route)` is not in `routes::QUERY_STRING_ROUTES` — the
+seven operations whose handlers take a `QueryParams<T>`: `GET .../docs`,
+`PUT` and `DELETE .../docs/{id}`, `GET .../describe`, `GET .../violations`,
+`DELETE .../vector` and `GET .../watch`. The message names the first
+parameter, percent-decoded, and says the route takes none, in the shape of
+the serde message `QueryParams<T>` refuses an unknown parameter with. A bare
+`?`, or a query string made only of separators, names nothing and passes.
+The layer is applied inside `routes`, to the merged timed and streaming
+tables, so `/mcp` — merged afterwards by `router_with_limits` — is outside
+it. It answers **before authentication**: it is a `Router::layer`, and
+authentication is the `Auth` extractor a handler takes, so
+`POST /v1/users?zz=1` with no token is `400`, not `401`. That is acceptable
+because nothing is learned and nothing is touched — the route templates are
+public in the specification, the message echoes only the caller's own
+input, and no handler runs. The second-order consequence is that a request
+the guard refuses never reaches the per-principal budget, which is spent
+inside `Auth` (`state.rs`), nor a login-attempt limiter, which is spent
+inside the login handler: harmless, since the guard is cheaper than either
+and examined no credential, and stated here the way ADR-099 stated where
+the deadline sits relative to the work it bounds. A test holds the
+placement, so it cannot drift to the other side of authentication without
+someone deciding it should. `docs/openapi.yaml` documents the shared `400` on every operation and
+states the rule in its preamble beside the body rule, and the contract tests
+hold the table equal to the set of operations the specification gives a
+query parameter, hold every operation to documenting the `400`, and drive
+`?zz=1` at every documented operation over a real socket.
+
+**Why.** ADR-121 closed query strings through `QueryParams<T>`, and its own
+motivating example was a misspelt `if_stamp` making a conditional write
+unconditional. But an extractor runs only on a handler that takes it, and a
+handler with no query parameters never looked at its query string at all —
+so the closure reached exactly the seven routes that already read one.
+`POST .../update?if_stamp=<stale stamp>` answered `200` and rewrote the
+document: `if_stamp` is a body field there, the parameter was never read,
+and the write the caller had made conditional was not. `?bogus=1` on
+`find`, `count` and `bulk`, and `?multi=true` on `update`, answered `200`
+having ignored the parameter, while `GET .../docs?limt=5` was the
+documented `400`. The reference said "query strings are held to the same
+rule", which was true of a quarter of the routes. Found by a test round
+against a three-member cluster running 0.20.0.
+
+The argument is ADR-121's, and it applies with more force here: a parameter
+the server does not read is a request the server cannot honour, and the one
+it did not read in this case was the condition on a write. A refusal that
+names the parameter is a fix in one edit; the `200` was a silent overwrite.
+
+**Alternatives.**
+
+- *A `QueryParams<NoParams>` on every handler that takes no parameters.*
+  Rejected, and it is the important rejection. It closes the routes that
+  have one today and leaves the next handler open, because forgetting it is
+  invisible — the route compiles, answers, and ignores. The two designs
+  differ only in what forgetting does: with an extractor per handler a
+  forgotten route is open, with a layer over the table and a list of what is
+  open a forgotten route is closed, refuses on the first request with a
+  parameter, and says why. Fail-closed by construction is the property that
+  makes ADR-121 hold without anyone remembering it.
+- *A table of routes that refuse a query string, rather than of routes that
+  read one.* Rejected for the same reason: a route absent from a deny-list is
+  open. The table lists what is opened, so an entry is only right beside a
+  `QueryParams<T>` that reads it, and the contract test holds the table
+  equal to the operations the specification documents a parameter on — a
+  parameter documented on a route the table does not open, or opened and
+  documented nowhere, is a failing test rather than a route that quietly
+  behaves otherwise.
+- *Deciding on the raw path rather than `MatchedPath`.* Rejected; it would
+  re-implement routing. The matched route template is what the table holds
+  and what axum has already decided, and it is what the request span is
+  named from for the same reason.
+- *Covering `/mcp` too.* Rejected. MCP is a separate transport with query
+  semantics of its own — the streamable HTTP specification, not this API —
+  and rmcp reads its requests; the REST rule has no standing there, and
+  `docs/openapi.yaml` already leaves it out for the same reason. The guard
+  is applied in `routes` rather than in `router_with_limits` so that the
+  merge order which puts `/mcp` inside the counter and outside the deadline
+  (ADR-099) also puts it outside this.
+- *`422`, to match bodies.* Rejected in ADR-121 and not reopened: a query
+  string is part of the request line, `400` is what the seven opened routes
+  already answer, and one status for "the query string was refused" is worth
+  more than symmetry with the body.
+- *Exempting the health probes.* Considered and not done. A probe with a
+  cache-busting parameter is refused like everything else; an exemption is
+  a route the rule does not reach, which is the shape of the defect this
+  closes, and a probe that needs a parameter has something to say that this
+  server should hear.
+
+**Cost.** Breaking for a client that sends a query parameter to a route
+that takes none, and a `0.MINOR` bump under the pre-1.0 policy. The
+first-party Rust, Python and Go clients, the CLI, the conformance scenarios,
+the examples and every request example in the documentation were audited
+and send a query string only to the seven routes that read one, with
+parameters those routes define; the MCP server calls the shared `exec`
+layer in-process and sends no HTTP at all. A health check configured with a
+cache-busting parameter now answers `400` and needs the parameter removed.
+One table to keep beside the route table, held by a contract test in both
+directions, and one string comparison per request that carries a query
+string. Because the layer wraps each route's method router, whose own
+fallback is the `405`, a wrong method on a guarded route *with* a query
+string answers `400` for the query string rather than `405` for the method;
+without one the `405` stands. A parameter with no name, `?=1`, is refused as
+malformed rather than named. Twenty-seven operations gained a documented `400` they could not
+answer before, and a contract test now insists every operation documents
+it.
+## ADR-125 — The embedding worker checkpoints its position by deadline, not per entry
+
+**Decision.** The embedding worker no longer writes its oplog position after
+every entry it has nothing to do with. The position is held in `Pending`,
+beside the batches, with the instant it was first held, and a new
+`POSITION_WAIT` of one second bounds how long it may wait. `Pending::deadline`
+is the earlier of the batch deadline — unchanged, `opened + max_wait` — and
+`held_since + POSITION_WAIT`, and `None` only when there is neither a batch nor
+a held position; the timed wait in `drive` and its timeout branch already
+flush on that deadline, and `flush` now clears both clocks. The deadline is
+also checked after every entry, not only when the timed wait elapses: the
+change stream returns without waiting while the arrival index has entries
+queued, so during a drain the timer never fires, and a deadline evaluated
+only there would hold the position for the whole backlog — a member coming
+back to an hour of entries would checkpoint nothing until it had caught up.
+Checked per entry, a held position is written at most `POSITION_WAIT` after it
+was first held whether the stream is quiet or draining, and a partial batch
+whose entries were slow to prepare goes at `max_wait` rather than past it; a
+full batch goes the moment it fills, as before. Every
+`Prepared::Done` outcome — a skip, a delete, a deferral, a backfill — holds the
+token instead of committing it; `Prepared::Embed` records it as before. So the
+position is written when a batch flushes, when a held position has waited
+`POSITION_WAIT`, at stream end, on invalidation, and before a
+`ConfigureVectors` backfill — never per entry. The constant is not a setting.
+Defended by
+`a_burst_of_writes_the_worker_skips_costs_one_position_write_not_one_each`,
+`a_lone_skipped_entrys_position_is_recorded_within_the_position_wait`,
+`a_burst_of_skipped_entries_does_not_delay_the_embeddable_document_behind_it`,
+`a_held_position_is_checkpointed_during_a_long_drain_not_only_after_it` and
+`the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait`.
+
+**Why.** Measured on a three-member cluster running 0.20.0. A 1,000-document
+bulk insert into a collection with no vector configuration converged on every
+member in 3–5 s: ADR-119 works, and the replica applies the batch in one
+transaction. But afterwards all three members — the writer included — kept
+committing and fsyncing at a steady ~18/s until each had added about 1.2–1.3
+commits per replicated document: roughly 1,320 commits over about 75 s per
+member for 1,000 documents, and for small bulks a replica paid exactly n + 1.
+The replication lag gauge read hundreds of seconds on the replicas while the
+trickle ran. The cause was one line in `drive`:
+`Prepared::Done(_) if pending.is_empty() => put_consumer_position(...)`. A
+document in a collection with no vector configuration is
+`Prepared::Done(Outcome::Skipped)`; `pending` is empty whenever nothing is
+being embedded; and `put_consumer_position` is `begin_write … commit` — one
+counted commit and one fsync per oplog entry. The worker runs on every member
+(`worker_enabled: true`, `WatchScope::Cluster`) and consumes the local arrival
+index, so it sees the member's own writes and every replicated one alike, and
+nothing throttles the stream: ~18/s is simply the single-writer fsync rate.
+ADR-119's claim that a replica's commit rate is not its document rate held
+only for the sync batch itself. On a cluster with the default worker a
+replica's commit rate *was* its document rate — it had moved from `apply_batch`
+to the worker, one transaction later, where nothing counted it against any
+request. The single-node form of the same cost was already known: the write
+gap measured in [Benchmarks](benchmarks.md) (2.00 commits per insert),
+pinned by a test whose comment said its passing was not an endorsement, and
+reserved as a decision in the roadmap because the oplog-consumer contract is
+where this project has had three separate bugs.
+
+**What the corrected cost is.** A replicated batch on a member now costs one
+commit per run of document entries (ADR-119) plus one position checkpoint per
+`POSITION_WAIT` while entries are arriving, however many arrive — a batch
+published in one burst is one checkpoint. A local bulk insert into a
+collection with no vector configuration is the same: its one commit plus one
+checkpoint. A lone entry's position lands within about a second. A steady
+trickle costs at most one checkpoint a second, on top of whatever the
+trickle's own commits are, where it cost one per entry. The position still
+never runs ahead of an entry whose vectors are not on disk: it is written by
+the same flush, after the batches.
+
+**Why one second.** A burst is coalesced by any wait at all; it is the trickle
+case that sets the bound, and one checkpoint a second is the amplification
+the trickle is allowed. What a longer wait would buy is fewer checkpoints
+under a trickle; what it would cost is the window a crash re-processes on
+restart, which is at most the held window plus a batch. Re-processing is safe
+— embedding is idempotent through `vectors_are_stale`, and skip, delete,
+defer and backfill are all re-derived from what is stored rather than from
+having seen the entry — but it is not free: it is storage reads, and on a
+member that owns a collection it is provider round trips for anything whose
+vectors did not land. A second of replay is a handful of either. It is not a
+configuration setting because nothing an operator knows would move it: the
+trade is between the worker's own restart replay and the worker's own commit
+amplification, and a second decides it the same way on every deployment.
+
+**Alternatives.** *Record the position only when there was work to do.*
+Rejected in the roadmap before this was measured, and still: a position that
+advances only on embedding work is stranded behind retention on a member
+whose owned collections are quiet, and the lost-position recovery is a full
+rescan. *Fold the position write into the batch flush only, with no deadline
+of its own.* The same failure in a different place — a member that embeds
+nothing never checkpoints — and a restart replays the whole retained log.
+*Write the position under the `coalesced` durability class.* It shares the
+fsync but not the commit: redb still serialises each one through its single
+writer in front of the next foreground write, and the default class is
+`durable`. *Make it a setting.* Rejected above. *Run the worker on the
+collection's owner only.* It would remove the replica's share of the cost and
+leave the writer's, and a non-owner has to see every entry anyway to defer
+it; the deadline removes the cost on every member at once.
+
+**Cost.** A restart re-processes up to a second of stream, plus a batch, that
+it used to skip; the replay costs reads, not writes, except where vectors
+never landed, where it costs the provider call that was owed anyway. The
+position now trails the newest entry by up to a second when the worker is
+otherwise idle, which changes what a test may assume: `worker_is_idle`'s
+notion of "started" now waits for that first checkpoint, and every test that
+measured commits around the worker was re-read for it. `kimmy_commits` on a
+member that only replicates is now dominated by the sync batches and one
+checkpoint a second under load; a dashboard that had, without knowing it,
+been reading the worker's trickle as the document rate reads a much smaller
+number, and the document-rate figures remain `kimmy_replication_lag_seconds`
+and the `cluster.sync` span's `applied`. The measured benchmark numbers in
+[Benchmarks](benchmarks.md) are left as they were taken, with a note that the
+second commit is gone.
+
+---

@@ -46,6 +46,15 @@ pub struct SyncOutcome {
     /// out of the peer's oplog — counted rather than silently dropped, because
     /// that case is a gap in coverage rather than convergence.
     pub unknown_collection: usize,
+    /// Replicated schema changes this node could not apply to its current
+    /// state and skipped: an index definition its documents cannot be built
+    /// under, or a name already taken by a different definition (ADR-123).
+    ///
+    /// Counted rather than failed, because the refusal is a fact about this
+    /// node's data and retrying the entry unchanged can never succeed; the
+    /// entry is witnessed so it is not re-served, and the divergence is
+    /// visible here, in the log, and on `/metrics`.
+    pub ddl_refused: usize,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds of history —
@@ -167,7 +176,7 @@ pub fn lag_beyond_horizon_ms(
 
 impl SyncOutcome {
     pub fn total(&self) -> usize {
-        self.applied + self.superseded + self.ddl + self.unknown_collection
+        self.applied + self.superseded + self.ddl + self.unknown_collection + self.ddl_refused
     }
 }
 
@@ -363,6 +372,7 @@ impl Engine {
             superseded = outcome.superseded,
             ddl = outcome.ddl,
             unknown_collection = outcome.unknown_collection,
+            ddl_refused = outcome.ddl_refused,
             "merged a batch from a peer"
         );
         Ok(outcome)
@@ -481,15 +491,44 @@ struct Pending {
     violations: Vec<UniqueViolation>,
 }
 
-/// Turn "that collection is not here" into `None` rather than an error.
+/// How one replicated schema change went against this node's state.
+pub(crate) enum Ddl<T> {
+    /// Applied, or the world was already like this.
+    Applied(T),
+    /// It named a collection this node no longer has.
+    Gone,
+    /// The definition cannot be applied to this node's current state.
+    Refused(kimmy_core::Error),
+}
+
+impl<T> Ddl<T> {
+    fn map<U>(self, f: impl FnOnce(T) -> U) -> Ddl<U> {
+        match self {
+            Ddl::Applied(value) => Ddl::Applied(f(value)),
+            Ddl::Gone => Ddl::Gone,
+            Ddl::Refused(e) => Ddl::Refused(e),
+        }
+    }
+}
+
+/// What a batch counts a schema change as, once [`Engine::apply_ddl`] has
+/// dealt with it.
+enum DdlOutcome {
+    Applied,
+    UnknownCollection,
+    Refused,
+}
+
+/// Sort a schema change's result into applied, gone, or refused, leaving
+/// every other error an error.
 ///
-/// A replicated schema change names its collection by *name*, so replaying one
-/// after the collection has been dropped locally raises `CollectionNotFound`.
-/// Before this existed that error travelled all the way out of `apply_batch`,
-/// which failed the whole round — and since the offending entry stays in the
-/// peer's oplog forever, the position never advanced and every later round
-/// died on the same entry. One dropped collection permanently stopped
-/// replication between two nodes.
+/// **Gone.** A replicated schema change names its collection by *name*, so
+/// replaying one after the collection has been dropped locally raises
+/// `CollectionNotFound`. Before this existed that error travelled all the way
+/// out of `apply_batch`, which failed the whole round — and since the
+/// offending entry stays in the peer's oplog forever, the position never
+/// advanced and every later round died on the same entry. One dropped
+/// collection permanently stopped replication between two nodes.
 ///
 /// Skipping is correct, not merely convenient: `apply_one` already treats a
 /// *document* for a missing collection this way, and a schema change for a
@@ -499,13 +538,48 @@ struct Pending {
 /// creation that aged out of the peer's oplog, which the caller already counts
 /// and warns about.
 ///
-/// Deliberately narrow: only `CollectionNotFound` is swallowed. Any other
-/// storage error still fails the round, because a round that quietly skips
-/// what it cannot understand is how corruption becomes convergence.
-fn gone<T>(result: Result<T>) -> Result<Option<T>> {
+/// **Refused.** The same wedge, from the other side (ADR-123). An index
+/// definition that cannot be built over this node's documents — a compound
+/// index where a document here holds arrays at two of its paths, or one that
+/// would fan out to more than 1,000 entries — raises `InvalidQuery` from the
+/// backfill; a name already taken here by a different definition, because two
+/// members created it concurrently, raises `IndexExists`; an enforcement mode
+/// this build does not implement raises `Unsupported`. None of these is
+/// `CollectionNotFound`, so each failed the round exactly as a dropped
+/// collection once did — observed on a three-member cluster running 0.20.0,
+/// where a replayed `CreateIndex` re-requested the same window with backoff
+/// to 300 s for the life of the process, the `DropIndex` behind it in the
+/// window never reached, and the lag gauge read 0 throughout because a failed
+/// round reports no lag.
+///
+/// This class is different from every other error, and that is why it is
+/// safe to skip: the refusal is a deterministic function of the definition
+/// and this node's data, so re-delivering the entry unchanged can never
+/// succeed, and failing the round buys nothing but the wedge. The entry is
+/// still witnessed by `apply_batch_absorbing`, so it is not re-served; it is
+/// not appended, so this node does not propagate a definition it does not
+/// hold; and the skip is counted (`SyncOutcome::ddl_refused`), logged at
+/// warning with the reason, and exported, so the divergence is a visible
+/// state rather than a silent one. A compound index refused here is usually
+/// followed in the same window by the drop that removed it on the origin —
+/// the definition was refused *because* the documents that arrived once it
+/// was gone are already here — and the drop still lands.
+///
+/// Deliberately narrow, in both directions. Only `CollectionNotFound` is
+/// gone, and only `InvalidQuery`, `IndexExists` and `Unsupported` are
+/// refusals: refusals of the *request*, decided by this node's state. A
+/// storage error — redb, I/O, a record that will not decode — is a failure of
+/// the *node*, may well succeed on retry, and still fails the round, because
+/// a round that quietly skips what it cannot understand is how corruption
+/// becomes convergence.
+pub(crate) fn settle<T>(result: Result<T>) -> Result<Ddl<T>> {
+    use kimmy_core::Error as Core;
     match result {
-        Ok(value) => Ok(Some(value)),
-        Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound { .. })) => Ok(None),
+        Ok(value) => Ok(Ddl::Applied(value)),
+        Err(crate::StorageError::Core(Core::CollectionNotFound { .. })) => Ok(Ddl::Gone),
+        Err(crate::StorageError::Core(
+            e @ (Core::InvalidQuery(_) | Core::IndexExists { .. } | Core::Unsupported(_)),
+        )) => Ok(Ddl::Refused(e)),
         Err(e) => Err(e),
     }
 }
@@ -539,10 +613,10 @@ impl Engine {
             // Whatever the batch knew about collections may be wrong after
             // this, whether or not the change turns out to apply.
             *memo = Memo::default();
-            if self.apply_ddl(entry)? {
-                outcome.ddl += 1;
-            } else {
-                outcome.unknown_collection += 1;
+            match self.apply_ddl(entry)? {
+                DdlOutcome::Applied => outcome.ddl += 1,
+                DdlOutcome::UnknownCollection => outcome.unknown_collection += 1,
+                DdlOutcome::Refused => outcome.ddl_refused += 1,
             }
             return Ok(());
         }
@@ -614,13 +688,15 @@ impl Engine {
     /// `_inner` functions each do — which is why a batch's document run is
     /// committed before one of these is applied (ADR-119).
     ///
-    /// Returns whether the change was applied. `false` means it named a
-    /// collection this node no longer has, which is history rather than an
-    /// error — see [`gone`].
-    fn apply_ddl(&self, entry: &OplogEntry) -> Result<bool> {
+    /// Returns what became of the change. `UnknownCollection` means it named
+    /// a collection this node no longer has, which is history rather than an
+    /// error; `Refused` means this node's current state cannot take the
+    /// definition, which is a divergence to count rather than a round to fail
+    /// — see [`settle`] for both. Neither appends the originating entry.
+    fn apply_ddl(&self, entry: &OplogEntry) -> Result<DdlOutcome> {
         let Some(body) = &entry.body else {
             // A legacy `Collection` entry, which names nothing.
-            return Ok(true);
+            return Ok(DdlOutcome::Applied);
         };
 
         match entry.kind {
@@ -638,7 +714,7 @@ impl Engine {
                         collection = %target.name,
                         "ignored a creation older than the drop that removed it"
                     );
-                    return Ok(true);
+                    return Ok(DdlOutcome::Applied);
                 }
 
                 match self.get_collection(&target.db, &target.name) {
@@ -687,7 +763,7 @@ impl Engine {
                             // moves backwards), so a straggling pre-drop write
                             // is superseded here as it would be anywhere else.
                             self.record_collection_drop(entry.collection, entry.stamp)?;
-                            return Ok(true);
+                            return Ok(DdlOutcome::Applied);
                         }
                     }
                     Err(crate::StorageError::Core(kimmy_core::Error::CollectionNotFound {
@@ -706,41 +782,108 @@ impl Engine {
             }
             OpKind::CreateIndex => {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
-                if gone(self.apply_remote_index(&target))?.is_none() {
-                    return Ok(false);
+                match settle(self.apply_remote_index(&target, entry.stamp))? {
+                    Ddl::Applied(true) => {}
+                    // History: older than the drop that removed the index.
+                    // Counted as applied and *not* appended, exactly as a
+                    // `CreateCollection` older than its drop is above — this
+                    // node does not re-serve onward an entry it has decided
+                    // is history. The drop's own entry, which is appended
+                    // when applied, is what carries the ordering to a third
+                    // member; nothing is lost by withholding the create.
+                    Ddl::Applied(false) => return Ok(DdlOutcome::Applied),
+                    Ddl::Gone => return Ok(DdlOutcome::UnknownCollection),
+                    Ddl::Refused(reason) => {
+                        // The operator's signal: this node now lacks an index
+                        // its peers hold, and nothing will retry it. Once per
+                        // delivery: the entry is witnessed, so it comes round
+                        // again only if a window is re-served for some other
+                        // reason, and then it is refused and warned again.
+                        warn!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            index = %target.index.name,
+                            reason = %reason,
+                            "skipped a replicated index this node cannot build; the \
+                             definition stands on its peers and the divergence is counted \
+                             in kimmy_sync_ddl_refused_total"
+                        );
+                        return Ok(DdlOutcome::Refused);
+                    }
                 }
             }
             OpKind::DropIndex => {
                 let target: kimmy_core::IndexDrop = bson::deserialize_from_slice(body)?;
-                let dropped =
-                    self.drop_index_inner(&target.db, &target.collection, &target.index, false);
-                if gone(dropped)?.is_none() {
-                    return Ok(false);
+                let dropped = self.drop_index_inner(
+                    &target.db,
+                    &target.collection,
+                    &target.index,
+                    Some(entry.stamp),
+                );
+                match settle(dropped)? {
+                    Ddl::Applied(_) => {}
+                    Ddl::Gone => {
+                        // The collection is gone, and with it the index; the
+                        // drop is history. The tombstone is still recorded,
+                        // for the reason the `DropCollection` arm records
+                        // its own on a node that never had the collection: a
+                        // replay of the create — after the collection has
+                        // itself been recreated, say — must find the index
+                        // already history here. The id is derived from the
+                        // name, which is all a drop carries.
+                        self.record_index_drop(
+                            entry.collection,
+                            kimmy_core::IndexMeta::derive_id(&target.index),
+                            entry.stamp,
+                        )?;
+                        return Ok(DdlOutcome::UnknownCollection);
+                    }
+                    Ddl::Refused(reason) => {
+                        warn!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            index = %target.index,
+                            reason = %reason,
+                            "skipped a replicated index drop this node could not apply"
+                        );
+                        return Ok(DdlOutcome::Refused);
+                    }
                 }
             }
             OpKind::ConfigureVectors => {
                 let target: kimmy_core::VectorSet = bson::deserialize_from_slice(body)?;
                 let applied = match target.config {
-                    Some(config) => gone(self.configure_vectors_inner(
+                    Some(config) => settle(self.configure_vectors_inner(
                         &target.db,
                         &target.collection,
                         config,
                         false,
                     ))?
-                    .is_some(),
+                    .map(|_| ()),
                     // Never `drop_vectors`: discarding a peer's stored
                     // vectors is not something a configuration change from
                     // elsewhere should decide.
-                    None => gone(self.disable_vectors_inner(
+                    None => settle(self.disable_vectors_inner(
                         &target.db,
                         &target.collection,
                         false,
                         false,
                     ))?
-                    .is_some(),
+                    .map(|_| ()),
                 };
-                if !applied {
-                    return Ok(false);
+                match applied {
+                    Ddl::Applied(()) => {}
+                    Ddl::Gone => return Ok(DdlOutcome::UnknownCollection),
+                    Ddl::Refused(reason) => {
+                        warn!(
+                            db = %target.db,
+                            collection = %target.collection,
+                            reason = %reason,
+                            "skipped a replicated vector configuration this node cannot apply; \
+                             the divergence is counted in kimmy_sync_ddl_refused_total"
+                        );
+                        return Ok(DdlOutcome::Refused);
+                    }
                 }
             }
             _ => {}
@@ -766,17 +909,49 @@ impl Engine {
         // looked the same. Found by the cluster harness, which is the only
         // thing that could have: a single node applies its own drop directly.
         self.publish(vec![entry.clone()]);
-        Ok(true)
+        Ok(DdlOutcome::Applied)
     }
 
-    /// Create a replicated index, tolerating one that is already there.
-    fn apply_remote_index(&self, target: &kimmy_core::IndexCreate) -> Result<()> {
+    /// Create a replicated index, stamped `stamp` at its origin.
+    ///
+    /// Idempotent through `create_index_inner`, which returns the existing
+    /// definition when it matches and `IndexExists` when the name is taken by
+    /// a different one — a concurrent creation on another member, which the
+    /// caller counts as a refusal rather than silently keeping whichever
+    /// arrived first (ADR-123).
+    ///
+    /// A unique index whose backfill finds keys already shared is built in
+    /// full and the collisions are recorded after the commit, the way a
+    /// merged write's are (`report_remote_write`, ADR-020, ADR-029): count,
+    /// warn, mint a `UniqueViolation` entry, publish.
+    ///
+    /// `Ok(false)` means the creation is older than the drop that removed
+    /// the index and nothing was done; the caller counts it as applied and
+    /// does not append it.
+    fn apply_remote_index(&self, target: &kimmy_core::IndexCreate, stamp: Stamp) -> Result<bool> {
         let meta = self.get_collection(&target.db, &target.collection)?;
-        if meta.index(&target.index.name).is_some() {
-            return Ok(());
+
+        // A creation older than the drop that removed the index is history,
+        // not an instruction — the same rule the `CreateCollection` arm
+        // applies against the collection tombstone, for the same reason: a
+        // re-served window, or a peer partitioned across the drop, would
+        // otherwise rebuild it. And a rebuild is not merely a resurrection
+        // here: it backfills over documents written legally once the index
+        // was gone, and fails on them (ADR-123).
+        let index_id = kimmy_core::IndexMeta::derive_id(&target.index.name);
+        if let Some(dropped_at) = self.index_dropped_at(meta.id, index_id)?
+            && stamp < dropped_at
+        {
+            debug!(
+                db = %target.db,
+                collection = %target.collection,
+                index = %target.index.name,
+                "ignored an index creation older than the drop that removed it"
+            );
+            return Ok(false);
         }
 
-        self.create_index_inner(
+        let (_, violations) = self.create_index_inner(
             &target.db,
             &target.collection,
             target.index.fields.clone(),
@@ -787,7 +962,10 @@ impl Engine {
             target.index.partial_filter.clone(),
             false,
         )?;
-        Ok(())
+        if !violations.is_empty() {
+            self.report_index_backfill_violations(&meta, &violations)?;
+        }
+        Ok(true)
     }
 }
 
@@ -1647,6 +1825,255 @@ mod tests {
             b.get_collection("shop", "orders").unwrap().indexes.is_empty(),
             "the drop must replicate too"
         );
+    }
+
+    /// An entry's kind, for picking a subset of a peer's oplog by hand.
+    fn only(entries: &[OplogEntry], kinds: &[OpKind]) -> Vec<OplogEntry> {
+        entries.iter().filter(|e| kinds.contains(&e.kind)).cloned().collect()
+    }
+
+    /// A compound index over two paths that may each hold an array.
+    fn two_array_index(engine: &Engine) {
+        engine
+            .create_index("shop", "orders", vec![field("tags"), field("cats")], false, None)
+            .expect("accepted: no document holds arrays at both paths yet");
+    }
+
+    #[test]
+    fn a_replayed_index_that_cannot_be_built_does_not_stop_the_entries_behind_it() {
+        // The finding ADR-123 fixes, at its smallest. A created a compound
+        // index over two array fields on a collection with no document holding
+        // both, dropped it, and then took a two-array document, which is legal
+        // once the index is gone. B, meanwhile, holds such a document of its
+        // own. Replaying A's history on B, the create's backfill meets B's
+        // document and cannot build the index — and before this that error
+        // failed the round, the witnessed vector was discarded, and the same
+        // window was re-requested for ever. The drop behind it in the same
+        // window was never reached, and so was nothing A wrote afterwards.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "both-a", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+        a.insert(&ca, doc! { "_id": "after" }).unwrap();
+
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both-b", "tags": ["x"], "cats": ["p"] }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.ddl_refused, 1, "the create is skipped and counted: {outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+            "the index must not exist on B — its documents cannot be indexed by it"
+        );
+        for id in ["both-a", "after"] {
+            assert!(
+                b.get(&cb, &DocId::String(id.into())).unwrap().is_some(),
+                "{id} must arrive: the refused create must not stop the entries behind it"
+            );
+        }
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and the window is not re-served");
+
+        // The peers converge on the documents, both ways.
+        sync(&a, &b);
+        assert_eq!(a.count(&ca).unwrap(), 3);
+        assert_eq!(b.count(&cb).unwrap(), 3);
+    }
+
+    #[test]
+    fn a_dropped_index_never_comes_back_through_a_replayed_create() {
+        // The first order: B took the create and the drop in one batch, and
+        // then the two-array document written once the index was gone. Peers
+        // re-serve overlapping windows as a matter of course, so the same
+        // batch arrives again — and without a tombstone the create would
+        // rebuild the index over a document it cannot be built for.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let first = b.apply_batch(&history).unwrap();
+        assert_eq!(first.ddl_refused, 0, "nothing to refuse the first time: {first:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(cb.index("tags_1_cats_1").is_none());
+        let index_id = kimmy_core::IndexMeta::derive_id("tags_1_cats_1");
+        assert!(
+            b.index_dropped_at(cb.id, index_id).unwrap().is_some(),
+            "the drop left a tombstone"
+        );
+
+        let again = b.apply_batch(&history).unwrap();
+        assert_eq!(again.ddl_refused, 0, "a create older than the drop is history, not a refusal");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+            "a dropped index must not come back through a replayed create"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_receives_the_drop_before_the_create_never_builds_the_index() {
+        // The second order: the drop arrives first, on a node that never held
+        // the index. The tombstone has to be recorded even though there was
+        // nothing to remove, or the create — arriving later from another
+        // peer, or as an aged-out window re-served — builds it.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+
+        b.apply_batch(&only(&history, &[OpKind::CreateCollection, OpKind::DropIndex])).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index_id = kimmy_core::IndexMeta::derive_id("tags_1_cats_1");
+        assert!(
+            b.index_dropped_at(cb.id, index_id).unwrap().is_some(),
+            "a drop for an index this node never held must still leave its tombstone"
+        );
+
+        b.apply_batch(&only(&history, &[OpKind::CreateIndex])).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+            "the create is older than the drop and must not build the index"
+        );
+    }
+
+    #[test]
+    fn a_drop_for_a_collection_this_node_no_longer_has_still_leaves_an_index_tombstone() {
+        // The `DropCollection` arm's reasoning applied to indexes: a node
+        // that dropped the collection cannot drop the index, but the
+        // tombstone is what a later replay of the create checks against.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+        b.drop_collection("shop", "orders").unwrap();
+
+        let outcome = pull(&b, &a);
+        assert!(outcome.unknown_collection > 0, "{outcome:?}");
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let index_id = kimmy_core::IndexMeta::derive_id("tags_1_cats_1");
+        assert!(b.index_dropped_at(id, index_id).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_locally_recreated_index_with_the_same_name_beats_the_tombstone() {
+        // A tombstone must not make a name permanently unusable: a creation
+        // stamped after the drop is a new index, not a resurrection — on the
+        // node that recreated it and on every peer that replays the three.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        let recreated = a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        assert!(recreated.unique, "the recreation is the new definition");
+        let ca = a.get_collection("shop", "orders").unwrap();
+        assert!(ca.index("email_1").is_some_and(|i| i.unique));
+
+        pull(&b, &a);
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.index("email_1").expect("the recreation must replicate");
+        assert!(index.unique, "and it is the recreated definition, not the dropped one");
+
+        // Re-served, the same history reaches the same state.
+        pull(&b, &a);
+        assert!(b.get_collection("shop", "orders").unwrap().index("email_1").is_some());
+    }
+
+    #[test]
+    fn a_replicated_unique_index_whose_backfill_collides_is_built_with_the_collision_recorded() {
+        // ADR-020 for a definition rather than a document: A created a unique
+        // index over its one document; B, partitioned, holds a document with
+        // the same value. When A's create reaches B the backfill finds the
+        // two sharing a key. Refusing the create would leave B without the
+        // index for ever — every later write A checks would go unchecked on
+        // B, and index-backed queries would answer differently on the two
+        // members — so the index is built in full and the collision is
+        // recorded, exactly as a merged write's is.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a", "email": "clash@x" }).unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "b", "email": "clash@x" }).unwrap();
+
+        let outcome = pull(&b, &a);
+        assert_eq!(outcome.ddl_refused, 0, "built, not refused: {outcome:?}");
+        assert_eq!(outcome.ddl, 2, "the collection and the index: {outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.index("email_1").expect("the unique index must exist on B");
+        assert!(index.unique);
+
+        // Built in full: both holders are in the index, so an index-backed
+        // query finds both.
+        let entries = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        assert_eq!(entries.len(), 2, "every document is indexed, the colliding one included");
+
+        // Recorded the way a merged write's collision is.
+        assert_eq!(b.unique_violations(), 1, "counted once per shared key");
+        let live = b.live_unique_violations(&cb).unwrap();
+        assert_eq!(live.len(), 1, "the violations route reports it: {live:?}");
+        assert_eq!(live[0].index, "email_1");
+        let mut ids: Vec<String> = live[0].ids.iter().map(|id| id.to_string()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b"], "naming every holder");
+        let recorded = b
+            .read_oplog_from(Hlc::ZERO, BATCH)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == OpKind::UniqueViolation)
+            .count();
+        assert_eq!(recorded, 1, "a `UniqueViolation` entry exists for change streams");
+
+        // And the constraint is live for what comes next: a local write
+        // through it is checked.
+        let refused = b.insert(&cb, doc! { "_id": "c", "email": "clash@x" });
+        assert!(
+            matches!(
+                refused,
+                Err(crate::StorageError::Core(kimmy_core::Error::UniqueViolation { .. }))
+            ),
+            "a later local write through the index must be checked: {refused:?}"
+        );
+        assert!(b.insert(&cb, doc! { "_id": "d", "email": "free@x" }).is_ok());
+    }
+
+    #[test]
+    fn a_concurrently_created_index_with_a_different_definition_is_refused_and_counted() {
+        // Two members create the same name with different definitions during
+        // a partition. Neither is wrong; the second to arrive cannot be
+        // applied without silently replacing the first, so it is skipped,
+        // counted, and left for an operator — not a failed round.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
+            .unwrap();
+        b.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "after" }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        assert!(
+            !b.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
+            "B keeps its own definition"
+        );
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(b.get(&cb, &DocId::String("after".into())).unwrap().is_some());
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "witnessed, not re-served");
     }
 
     #[test]

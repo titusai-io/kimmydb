@@ -777,6 +777,172 @@ async fn a_dropped_collection_does_not_come_back_through_replication() {
     );
 }
 
+/// A sender whose history holds an index definition the receiver's own
+/// documents cannot be built under.
+///
+/// A created a compound index over two array fields while no document held
+/// arrays at both paths, dropped it, and then took such a document, which is
+/// legal once the index is gone. B holds one of its own. Replaying A's create
+/// on B means backfilling over B's document, which the definition forbids.
+async fn sender_with_an_index_the_receiver_cannot_build() -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![
+                kimmy_core::IndexField::ascending("tags"),
+                kimmy_core::IndexField::ascending("cats"),
+            ],
+            false,
+            None,
+        )
+        .expect("accepted: no document holds arrays at both paths yet");
+    a.engine.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "both-a", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+    let cb = b.engine.create_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "both-b", "tags": ["x"], "cats": ["p"] }).unwrap();
+
+    (a, b)
+}
+
+#[tokio::test]
+async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
+    // The wedge ADR-123 fixes, over the wire. The create's backfill error is
+    // not `CollectionNotFound`, so it failed the round exactly as a dropped
+    // collection once did: the witnessed vector was discarded, the same
+    // window re-requested with backoff to 300 s for the life of the process,
+    // and the drop behind it in the window never reached. Observed on a
+    // three-member cluster running 0.20.0, with the lag gauge at 0 and every
+    // member live throughout.
+    let (a, b) = sender_with_an_index_the_receiver_cannot_build().await;
+
+    // Unrelated work recorded after all of that, which the round has to get
+    // past the refused entry to reach.
+    let live = a.engine.create_collection("shelf", "survivor").unwrap();
+    a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET)
+        .await
+        .expect("the round must not fail on an index this node cannot build");
+    assert_eq!(outcome.ddl_refused, 1, "skipped and counted: {outcome:?}");
+    assert!(
+        b.engine.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+        "the index must not exist on the receiver"
+    );
+
+    let coll = b
+        .engine
+        .get_collection("shelf", "survivor")
+        .expect("work recorded after the refused create must replicate");
+    assert!(
+        b.engine.get(&coll, &DocId::String("must-replicate".into())).unwrap().is_some(),
+        "a refused schema change must not block the entries behind it"
+    );
+    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    assert_eq!(second.total(), 0, "witnessed, so the window is not re-served: {second:?}");
+}
+
+#[tokio::test]
+async fn a_dropped_index_never_comes_back_through_replication() {
+    // The control, and the reason the index tombstone exists. B took A's
+    // create and drop in one round, then wrote a two-array document. A later
+    // round re-serves the window holding the create — here because A has
+    // since taken an entry from a third member C that B has never seen, so
+    // B's threshold against A falls to the beginning — and the create must
+    // read as history against the tombstone, not rebuild the index, and not
+    // fail the round trying.
+    let c = node().await;
+    let cc = c.engine.create_collection("shop", "orders").unwrap();
+    c.engine.insert(&cc, doc! { "_id": "c-early" }).unwrap();
+
+    let a = node().await;
+    let b = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![
+                kimmy_core::IndexField::ascending("tags"),
+                kimmy_core::IndexField::ascending("cats"),
+            ],
+            false,
+            None,
+        )
+        .unwrap();
+    a.engine.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
+    sync_once(&b.engine, a.addr, SECRET).await.expect("the create and the drop replicate");
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert!(cb.index("tags_1_cats_1").is_none());
+    b.engine.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+    // A learns of C; B has never heard of C, so its next round with A is
+    // served from the beginning of everything A holds.
+    sync_once(&a.engine, c.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET)
+        .await
+        .expect("a re-served create older than its drop must not fail the round");
+    assert_eq!(outcome.ddl_refused, 0, "history, not a refusal: {outcome:?}");
+    assert!(
+        b.engine.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
+        "a dropped index must not come back through replication"
+    );
+    assert!(
+        b.engine.get(&cb, &DocId::String("c-early".into())).unwrap().is_some(),
+        "and the entry that widened the window arrived"
+    );
+}
+
+#[tokio::test]
+async fn the_round_report_reaches_the_hook() {
+    // What the replication loop tells the caller after each tick, beyond
+    // lag: rounds that failed, peers it is backing off from, schema changes
+    // it refused. Each one exists because the lag gauge said nothing while a
+    // cluster was wedged (ADR-123). One peer that will refuse a connection,
+    // one whose history holds a definition this node cannot build.
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let (a, b) = sender_with_an_index_the_receiver_cannot_build().await;
+    // Bound and released: a port with nothing listening refuses at once.
+    let dead = {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        listener.local_addr().unwrap()
+    };
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr, dead])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let mut seen = RoundReport::default();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while seen.failed == 0 || seen.backing_off == 0 || seen.ddl_refused == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("no report carried every signal in time; saw {seen:?}"))
+            .expect("the loop must keep reporting");
+        seen.failed += report.failed;
+        seen.ddl_refused += report.ddl_refused;
+        seen.backing_off = seen.backing_off.max(report.backing_off);
+    }
+    looping.abort();
+
+    assert!(seen.failed >= 1, "the dead peer's rounds fail: {seen:?}");
+    assert!(seen.backing_off >= 1, "and it is backed off: {seen:?}");
+    assert_eq!(seen.ddl_refused, 1, "the refused create is counted exactly once: {seen:?}");
+}
+
 #[tokio::test]
 async fn a_peer_that_keeps_failing_is_reported_more_than_once() {
     // The wedge above was invisible as well as permanent: only the first

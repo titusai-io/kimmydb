@@ -238,6 +238,27 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.failures",
+            "{round}",
+            "Anti-entropy rounds against a peer that failed, any cause.",
+            sync_failures
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.peers_backing_off",
+            "{peer}",
+            "Peers this node is currently backing off from after failed rounds.",
+            sync_peers_backing_off
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.ddl_refused",
+            "{change}",
+            "Replicated schema changes this node could not apply to its own data and skipped.",
+            sync_ddl_refused
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.tls.reloads.ok",
             "{reload}",
             "Certificate reloads that succeeded.",

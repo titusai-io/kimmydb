@@ -1642,9 +1642,10 @@ and writes. Recorded rather than gated, like every benchmark here.
 
 ---
 
-## 🟡 A write costs twice as much through the daemon as at the engine — explained, not yet fixed
+## 🟢 A write no longer costs twice as much through the daemon as at the engine (was a 🟡 "explained, not yet fixed")
 
-**Raised 2026-08-14 by M10 task 7. Explained 2026-08-15 by M11 task 1.** A
+**Raised 2026-08-14 by M10 task 7. Explained 2026-08-15 by M11 task 1. Fixed
+by ADR-125, after the cluster form of it was measured.** A
 single insert was **7.0 ms** over HTTP against **~3.4 ms** for the same insert
 at the engine on the same machine, and the cause was recorded as unknown
 because a cause that has not been measured is not a cause.
@@ -1675,18 +1676,39 @@ another **12.3 s**, 4,041 commits in total. Bulk exists so that 100 documents
 cost one fsync instead of 100; the worker pays the 100 anyway, deferred. This
 holds on every node whether or not any collection uses vectors.
 
-**Still 🟡 because it is explained and not fixed.** The fix — coalescing a
+**Was 🟡 because it was explained and not fixed.** The fix — coalescing a
 consumer's position writes — trades a crash replaying a few idempotent entries
-for an fsync per write, which changes the oplog-consumer contract and is
-**reserved for a decision**. What has changed is that the trade is now between
-two measured numbers. It must not become "record only when there was work to
-do": a position that advances only on work is killed by retention.
+for an fsync per write, which changes the oplog-consumer contract and was
+**reserved for a decision**. It was not to become "record only when there was
+work to do": a position that advances only on work is killed by retention.
+
+**Now.** The decision was forced by the cluster form of the same cost,
+measured on a three-member cluster running 0.20.0: a 1,000-document bulk
+converged on every member in 3–5 s and then every member, the writer
+included, committed at a steady ~18/s for about 75 s — one checkpoint per
+replicated entry, on top of the one-transaction sync batch of ADR-119. The
+worker now holds its position beside its batches and writes it by deadline
+(ADR-125): with a batch, at stream end, before a reconfiguration's backfill,
+or after at most one second — and the deadline is checked per entry as well
+as on the idle timer, so it holds during a drain, not only once the stream
+goes quiet. A burst the worker has nothing to do with is one position write
+however many entries it holds; a lone entry's position lands within about a
+second; a steady trickle costs at most one checkpoint a second. A restart
+re-processes up to a second of the stream, which idempotent embedding makes
+a handful of reads. The measured numbers in [Benchmarks](benchmarks.md) are
+left as taken, with a note.
 
 **Pinned by tests rather than by this entry.**
-`kimmy-storage`'s `one_insert_is_one_commit` and `kimmy-vector`'s
-`a_write_the_worker_skips_still_costs_a_second_commit` fail if either number
-changes, and `commits_are_counted_at_one_chokepoint` fails if a new write path
-stops being counted.
+`kimmy-storage`'s `one_insert_is_one_commit` still fails if the engine's own
+cost changes, and `commits_are_counted_at_one_chokepoint` fails if a new
+write path stops being counted. `kimmy-vector`'s
+`a_burst_of_writes_the_worker_skips_costs_one_position_write_not_one_each`
+fails if the worker goes back to one commit per entry;
+`a_lone_skipped_entrys_position_is_recorded_within_the_position_wait` and
+`a_held_position_is_checkpointed_during_a_long_drain_not_only_after_it` fail
+if holding turns into never writing, on a quiet stream or during a backlog;
+`a_burst_of_skipped_entries_does_not_delay_the_embeddable_document_behind_it`
+fails if the held position ever delays an embed.
 
 ---
 

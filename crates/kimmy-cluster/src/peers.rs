@@ -30,6 +30,38 @@ pub const DEFAULT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(30);
 /// retention (`None` when within the window).
 pub type PeerStalenessHook = Arc<dyn Fn(NodeId, Option<u64>) + Send + Sync>;
 
+/// What one sync tick did, for the caller to count (ADR-123).
+///
+/// Everything here is a fact only the loop can see: which rounds failed,
+/// which peers it is leaving alone, and what the rounds that succeeded had
+/// to skip. Each is a number that says "something is wrong" when
+/// `kimmy_replication_lag_seconds` says nothing — a failed round reports no
+/// lag at all, by design (ADR-122), so a cluster wedged on a round that
+/// fails every time read 0 lag and every member live for as long as it was
+/// wedged.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoundReport {
+    /// Rounds in this tick that failed, whatever the cause: a peer that could
+    /// not be reached, a handshake that was refused, a batch that could not
+    /// be applied. One per peer attempted, so at most the fanout. A caller
+    /// adds this to a counter; a counter that keeps rising while the lag
+    /// gauge sits at 0 is the shape of the silent wedge.
+    pub failed: usize,
+    /// Peers this node is currently backing off from after failures, as of
+    /// the end of the tick: 0 when every known peer answered its last
+    /// round, or when there are no peers. A level, for a gauge.
+    pub backing_off: usize,
+    /// Replicated schema changes the rounds in this tick could not apply to
+    /// this node's state and skipped — `SyncOutcome::ddl_refused`, summed
+    /// over the peers reached. Each one is an index this node now lacks and
+    /// its peers hold, and nothing will retry it; the `warn!` at the time
+    /// names it.
+    pub ddl_refused: usize,
+}
+
+/// What the loop reports after every sync tick. See [`RoundReport`].
+pub type RoundHook = Arc<dyn Fn(RoundReport) + Send + Sync>;
+
 pub struct ReplicationConfig {
     pub seeds: Vec<SeedSource>,
     pub secret: String,
@@ -76,6 +108,13 @@ pub struct ReplicationConfig {
     /// `None` when it is within the window. Same shape as `on_lag`, for the
     /// same reason: the peer's vector exists nowhere but this loop.
     pub on_peer_staleness: Option<PeerStalenessHook>,
+    /// Called once after every sync tick, reached peers or not, with what
+    /// the tick did that `on_lag` cannot say: rounds that failed, peers
+    /// being backed off, schema changes refused (ADR-123). Same shape as
+    /// `on_lag`, for the same reason — this crate knows nothing about
+    /// metrics — and unlike `on_lag` it *is* called when no peer was
+    /// reached, because "every round failed" is precisely the report.
+    pub on_round: Option<RoundHook>,
 }
 
 impl ReplicationConfig {
@@ -94,6 +133,7 @@ impl ReplicationConfig {
             // its own, and zero disables the check.
             tombstone_retention: Duration::from_secs(24 * 60 * 60),
             on_peer_staleness: None,
+            on_round: None,
         }
     }
 }
@@ -146,6 +186,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // `None` when nothing answered, and then nothing is reported:
                 // an unreachable cluster has unknown lag, not zero lag.
                 let mut round_lag: Option<u64> = None;
+                let mut report = RoundReport::default();
                 for peer in health.select(&peers, Instant::now()) {
                     // One span per peer per round, not one per round: an
                     // anti-entropy round against three peers is three
@@ -177,6 +218,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             span.record("lag_ms", outcome.lag_ms as i64);
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
+                            report.ddl_refused += outcome.ddl_refused;
                             if let Some(node) = outcome.peer {
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);
@@ -219,9 +261,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             // bounded cadence, not once and never again: a peer
                             // that never recovers has to stay visible, or a
                             // half-converged cluster looks like a healthy one.
-                            let report = health.failed(peer, now);
+                            let due = health.failed(peer, now);
                             let failures = health.failures(peer);
-                            if report {
+                            report.failed += 1;
+                            if due {
                                 warn!(%peer, error = %e, failures, "sync round failed; backing off");
                             } else {
                                 debug!(%peer, error = %e, failures, "sync round failed");
@@ -231,6 +274,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms / 1_000);
+                }
+                // Reported whether or not anything was reached: the tick in
+                // which every round failed is the one an operator most needs
+                // to hear about, and it is the one `on_lag` says nothing for.
+                if let Some(on_round) = &config.on_round {
+                    report.backing_off = health.backing_off(Instant::now());
+                    on_round(report);
                 }
             }
         }

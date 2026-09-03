@@ -35,6 +35,8 @@ pub use gc::{GcOutcome, RetentionPolicy};
 pub use index::{CandidateOrder, IndexScan, IndexScanOutcome};
 pub use meta::{CollectionMeta, DatabaseMeta, Enforcement, IndexField, IndexMeta, VectorConfig};
 pub use modify::{Candidates, MAX_CANDIDATES, ModifyManyOutcome, ModifyOutcome, ModifySpec};
-pub use snapshot::{CollectionState, SNAPSHOT_PAGE, SnapshotCursor, SnapshotDoc, SnapshotPage};
+pub use snapshot::{
+    CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
+};
 pub use sync::{SyncOutcome, lacks_collected, lag_behind_ms, lag_beyond_horizon_ms};
 pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};

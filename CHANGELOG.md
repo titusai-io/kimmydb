@@ -10,6 +10,136 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+A minor when it ships, not a patch. Nothing changes on the wire between
+members and nothing on disk that a 0.20.0 node cannot read: the one new
+table is additive, and a node of this version and a 0.20.0 node replicate to
+each other. But one thing a 0.20.0 node accepted is refused now — a query
+string on a route that reads none — and the pre-1.0 policy puts that behind
+a `0.MINOR` bump. The other entries fix what a test round against a
+three-member cluster running 0.20.0 found: a replayed index definition that
+stopped replication for ever, and a per-document commit on every member
+that the one-transaction sync batch of 0.20.0 had moved rather than removed.
+
+### Added
+
+- **Three new series make a wedged peer visible.** `kimmy_sync_failures_total`
+  counts anti-entropy rounds that failed, any cause; `kimmy_sync_peers_backing_off`
+  is how many peers this node is currently leaving alone after failures;
+  `kimmy_sync_ddl_refused_total` counts replicated schema changes this node
+  skipped. All three are pushed by the replication loop after every tick,
+  reached peers or not, through a new `on_round` hook beside `on_lag`, and
+  bridged to OpenTelemetry. `kimmy_sync_failures_total` rising while
+  `kimmy_replication_lag_seconds` sits at 0 is exactly the shape of the wedge
+  under *Fixed* below; the operations table says to alert on it, and its lag
+  row now says that a failing round leaves the gauge where the last good
+  round put it. `on_lag` is unchanged: an unreachable cluster still has
+  unknown lag, not zero (ADR-122), which is why the counter and not the gauge
+  carries this signal. ADR-123.
+
+### Changed
+
+- **A replica builds a replicated unique index over data that already
+  violates it, and records the collision, rather than refusing the
+  definition.** A unique index created on one member and replayed on another
+  whose documents already share a key used to be refused by the backfill —
+  and, because that refusal failed the sync round, refused for ever. The
+  replica now builds the index in full, every entry added, so index-backed
+  queries stay complete and every later local write through it is checked,
+  and records one violation per shared key naming every holder, the way a
+  merged write's collision is recorded: counted in `kimmy_unique_violations`,
+  logged at warning, minted as a `UniqueViolation` entry for change streams
+  and reported by the violations route. This is ADR-020's rule applied to a
+  definition rather than a document; a *local* create over violating data is
+  still refused, because the client is there to be told. ADR-123.
+
+- **A query string on a route that takes no query parameters is refused.**
+  Only the routes that declare a parameter — `GET .../docs`, `PUT` and
+  `DELETE .../docs/{id}`, `GET .../describe`, `GET .../violations`,
+  `DELETE .../vector`, `GET .../watch` — ever read their query string, so
+  the closure of 0.20.0 reached them and nothing else: `POST
+  .../update?if_stamp=<stale stamp>` answered `200` and rewrote the
+  document, because `if_stamp` is a body field there and the parameter was
+  never read, while the same misspelling on `GET .../docs` was the
+  documented `400`. `?bogus=1` on `find`, `count` and `bulk`, and
+  `?multi=true` on `update`, answered `200` having ignored it. Every REST
+  route now refuses any query string it does not read, `400 bad_request` in
+  the envelope naming the first parameter and saying the route takes none;
+  the routes that read one still refuse an unknown parameter by name as
+  before. A bare `?` with nothing after it is not refused. `/mcp` is a
+  separate transport and is unaffected. **Breaking for a client that sends
+  a query parameter to a route that takes none** — including a health probe
+  with a cache-busting parameter — and a `0.MINOR` bump for it. The Rust,
+  Python and Go clients, the CLI, the conformance scenarios, the examples
+  and every documented request were audited and send none. Found by a test
+  round against a three-member cluster running 0.20.0. ADR-124.
+
+### Fixed
+
+- **A replayed index definition the replica could not build wedged
+  replication with that peer permanently, with the lag gauge at 0 and every
+  member live.** Observed on a three-member cluster running 0.20.0. A
+  compound index over two array fields was created on a collection with no
+  document holding both — accepted — and dropped 28 seconds later; both
+  replicated. A document with arrays at both paths was then inserted, which
+  is legal once the index is gone. Every later anti-entropy round that
+  re-served the window holding the `CreateIndex` entry (windows overlap by
+  design) rebuilt the index, and the rebuild's backfill met that document and
+  failed. The error was not the one the round knew how to skip, so the round
+  failed, its witnessed vector was discarded, coverage never advanced, and
+  the same window was re-requested for ever with backoff to 300 s; the
+  `DropIndex` behind it in the window was never reached. A second instance
+  minutes later replayed a unique index whose backfill collided on the
+  puller's copy. Writes on one member never reached the others again. Two
+  fixes. Dropping an index now leaves a tombstone (`indexes_dropped`, under
+  the drop's originating stamp, kept for `tombstone_retention_secs`, carried
+  by backups, recorded even on a member that never held the index), and a
+  creation older than the tombstone is history and is not applied — the rule
+  collections have had since ADR-034. And a replicated schema change this
+  node's own data refuses — an index its documents cannot be built under, an
+  index name already taken here by a different definition, an enforcement
+  mode this build does not implement — is skipped, logged once at warning
+  with the database, collection, index and reason, counted in
+  `SyncOutcome::ddl_refused`, and witnessed so it is not re-served; the
+  entries behind it arrive. The snapshot route — served to exactly the peer
+  most likely to hold such documents — classifies a definition the same way,
+  so a refused index on a snapshot page is skipped and counted while the
+  documents restore. Any other error still fails the round. Defended
+  by `a_replayed_index_that_cannot_be_built_does_not_stop_the_entries_behind_it`,
+  `a_dropped_index_never_comes_back_through_a_replayed_create`,
+  `a_peer_that_receives_the_drop_before_the_create_never_builds_the_index`
+  and their counterparts over real sockets. ADR-123.
+
+- **The embedding worker checkpoints its oplog position by deadline, not
+  once per entry.** The worker runs on every member and consumes the member's
+  own arrival index, so it sees every write — its own and every replicated
+  one — and it recorded its position after each entry it had nothing to do
+  with, in a write transaction of its own, which under the default `durable`
+  class is an fsync of its own. Measured on a three-member cluster running
+  0.20.0: a 1,000-document bulk insert into a collection with no vector
+  configuration converged on every member in 3–5 s, and then all three
+  members, the writer included, kept committing at a steady ~18/s for about
+  75 s until each had added roughly 1.2–1.3 commits per document — about
+  1,320 commits per member for 1,000 documents; small bulks cost a replica
+  exactly n + 1. The one-transaction sync batch of 0.20.0 had moved the
+  per-document commit one step downstream rather than removing it, and the
+  replication lag gauge read hundreds of seconds on the replicas while the
+  trickle ran. The position is now held with the batches and written by the
+  same flush — with a batch, at stream end, before a reconfiguration's
+  backfill, or after at most one second when there is nothing to embed — so
+  a replicated batch published in one burst, or a local bulk with no
+  vectors, costs one position write however many entries it holds, a lone
+  entry's position lands within about a second, and a steady trickle costs
+  at most one checkpoint a second. The single-node form of the same cost was
+  the measured two-commits-per-insert write gap in
+  [Benchmarks](docs/benchmarks.md); it is closed by the same change. What an
+  operator sees: `kimmy_commits` and `kimmy_fsyncs` no longer rise one for
+  one with documents on any member, and a restart re-processes up to a
+  second of the stream, which is safe because embedding is idempotent and
+  every other outcome is re-derived from what is stored. ADR-125.
+
+
 ## 0.20.0 - 2026-09-02
 
 A minor when it ships, not a patch. Nothing changes on the wire between

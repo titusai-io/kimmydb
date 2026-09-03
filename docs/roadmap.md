@@ -804,7 +804,7 @@ one.
 
 | # | Task | Notes |
 |---|---|---|
-| 1 | ✅ **Explain the daemon-versus-engine write gap** | Measured, not argued. The daemon spends **two durable commits** on an insert where the engine spends one: the embedding worker records its oplog position after every entry, including ones it skips, and redb's single writer puts that commit in front of the next write. `kimmy_commits` on `/metrics` is the instrument, and it found the larger problem behind the gap — the worker commits once per *document*, so 4,000 documents ingested in 0.39 s leave the node committing for 12.3 s. Numbers and method in [Benchmarks](benchmarks.md); the fix is reserved below |
+| 1 | ✅ **Explain the daemon-versus-engine write gap** | Measured, not argued. The daemon spends **two durable commits** on an insert where the engine spends one: the embedding worker records its oplog position after every entry, including ones it skips, and redb's single writer puts that commit in front of the next write. `kimmy_commits` on `/metrics` is the instrument, and it found the larger problem behind the gap — the worker commits once per *document*, so 4,000 documents ingested in 0.39 s leave the node committing for 12.3 s. Numbers and method in [Benchmarks](benchmarks.md). ✅ **Fixed** once the cluster form of it was measured on a three-member cluster running 0.20.0 — every member, the writer included, committed at ~18/s for about 75 s after a 1,000-document bulk had converged in 3–5 s, one checkpoint per replicated entry. The worker now holds its position and writes it by deadline, at most once a second ([ADR-125](decisions.md)) |
 | 2 | **`IndexPlan` carries the order it yields** | `kimmy-query/src/plan.rs` has no notion of output order today, which is the extension point. A plan that knows its order lets the executor skip the sort when the index already satisfies it |
 | 3 | **Index-ordered scans in storage** | Replace `sort`/`dedup` with a first-occurrence seen-set, so a scan yields index order and stays correct for multikey indexes and `$in` unions |
 | 4 | **Sorted `find` stops early** | With order from the index, `stop_after` applies to sorted queries too, and a sorted `find` stops reading at the limit instead of materialising every match |
@@ -812,14 +812,17 @@ one.
 
 ### Decisions reserved for the maintainer
 
-- **The write gap's fix** (from task 1). Coalescing a consumer's position writes
+- ✅ **The write gap's fix** (from task 1). Coalescing a consumer's position writes
   removes one fsync per write and costs a crash replaying a few idempotent
   entries. It changes the oplog-consumer contract, which is where this project
-  has had three separate bugs, so it is a decision rather than a follow-up
+  has had three separate bugs, so it was a decision rather than a follow-up
   commit. **Not** "record only when there was work to do" — a position that
   advances only on work is killed by retention. Note that `Sync::apply_batch`
   already coalesces witnessing across a batch for this exact reason, so the
   shape has precedent here rather than being invented for the occasion.
+  **Decided in [ADR-125](decisions.md)**: the position is pending work with
+  a deadline, like a partial batch — held, and written with a batch or after
+  at most one second, never per entry.
 - **The sorted cursor token's shape** (task 5). Public surface, and it must stay
   additive under [ADR-058](decisions.md). Settle it before task 5 starts.
 

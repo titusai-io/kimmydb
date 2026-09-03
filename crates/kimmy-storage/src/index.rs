@@ -10,7 +10,7 @@
 //! constraint.
 
 use bson::{Bson, Document};
-use kimmy_core::{CollectionId, DocId, Error as CoreError, keyenc, path};
+use kimmy_core::{CollectionId, DocId, Error as CoreError, Stamp, keyenc, path};
 use redb::{ReadableDatabase, ReadableTable};
 
 use crate::error::{Result, StorageError};
@@ -482,7 +482,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
     ) -> Result<IndexMeta> {
-        self.create_index_inner(
+        let (index, violations) = self.create_index_inner(
             db,
             collection,
             fields,
@@ -492,7 +492,12 @@ impl crate::Engine {
             expire_after_secs,
             partial_filter,
             true,
-        )
+        )?;
+        debug_assert!(
+            violations.is_empty(),
+            "a local backfill refuses a collision, never reports one"
+        );
+        Ok(index)
     }
 
     /// `log = false` when applying a replicated definition.
@@ -501,6 +506,21 @@ impl crate::Engine {
     /// entry is appended by the caller, and minting a second one under this
     /// node's stamp would send the same change back to the peer, which would
     /// apply it and mint another. That amplifies without bound.
+    ///
+    /// `log` also decides what a unique index's backfill does when the
+    /// existing documents already share a key, and the asymmetry is the one
+    /// between [`maintain`] and [`maintain_remote`] (ADR-020). A **local**
+    /// create is refused with `UniqueViolation`: the client is there to be
+    /// told, and an index that reports a constraint it does not hold is
+    /// worse than no index. A **replicated** create cannot be refused without
+    /// abandoning convergence — the definition exists on the peer, documents
+    /// written through it are on their way, and a node without the index
+    /// would neither check the writes it accepts nor answer index-backed
+    /// queries the way its peers do — so it is built in full, every entry
+    /// added, and every colliding key comes back as a [`UniqueViolation`]
+    /// naming all of its holders, for the caller to record once the build is
+    /// durable the way a merged write's collisions are (ADR-029, ADR-123).
+    /// The returned list is always empty on the local path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn create_index_inner(
         &self,
@@ -513,7 +533,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
         log: bool,
-    ) -> Result<IndexMeta> {
+    ) -> Result<(IndexMeta, Vec<UniqueViolation>)> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
@@ -580,7 +600,7 @@ impl crate::Engine {
             }
 
             if differs.is_empty() {
-                return Ok(existing.clone());
+                return Ok((existing.clone(), Vec::new()));
             }
             return Err(StorageError::Core(CoreError::IndexExists {
                 db: db.to_string(),
@@ -617,11 +637,19 @@ impl crate::Engine {
         // Scoped in a closure so every table borrow ends before the abort or
         // commit below, which need to move the transaction. Returns whether the
         // existing documents already make the index multikey — the backfill is
-        // the flag's only chance to see them.
-        let build = |index: &IndexMeta| -> Result<bool> {
+        // the flag's only chance to see them — and, for a replicated unique
+        // index, the keys the existing documents already share.
+        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>)> {
             let docs = txn.open_table(tables::DOCS)?;
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+            // What a unique index has filed so far. Locally only the keys
+            // matter, since the first repeat is a refusal; a replicated build
+            // also keeps who holds each key, in scan order, because that is
+            // what it reports — one document key per key more than the local
+            // build pays, and only on the path that needs it.
             let mut seen_unique: std::collections::HashSet<Vec<u8>> = Default::default();
+            let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
+                Default::default();
             let mut observed_multikey = false;
 
             for entry in docs.range(crate::engine::doc_range(meta.id))? {
@@ -633,30 +661,50 @@ impl crate::Engine {
                 let (keys, multikey) = index_keys_observed(index, &doc)?;
                 observed_multikey |= multikey;
                 for key in keys {
-                    // A unique index over data that already violates it must
-                    // not be created — it would report a constraint it does
-                    // not actually hold.
-                    if index.unique && !seen_unique.insert(key.clone()) {
-                        return Err(StorageError::Core(CoreError::UniqueViolation {
-                            index: index.name.clone(),
-                            detail: "existing documents already violate it, so it cannot be \
-                                     created"
-                                .into(),
-                        }));
+                    if index.unique && log {
+                        // A unique index over data that already violates it
+                        // must not be created *locally* — it would report a
+                        // constraint it does not actually hold.
+                        if !seen_unique.insert(key.clone()) {
+                            return Err(StorageError::Core(CoreError::UniqueViolation {
+                                index: index.name.clone(),
+                                detail: "existing documents already violate it, so it cannot \
+                                         be created"
+                                    .into(),
+                            }));
+                        }
+                    } else if index.unique {
+                        // Replicated, the build goes on and the collision is
+                        // reported; see the doc comment on this function.
+                        holders_by_key.entry(key.clone()).or_default().push(doc_key.to_vec());
                     }
                     entries.insert((meta.id.0, index.id, key.as_slice(), doc_key), ())?;
                 }
             }
-            Ok(observed_multikey)
+
+            // One violation per shared key, naming every holder, in the order
+            // the scan met them — so the last holder is the document that
+            // revealed the collision, which is what the report names as the
+            // one that was merged.
+            let mut violations: Vec<UniqueViolation> = holders_by_key
+                .into_iter()
+                .filter(|(_, holders)| holders.len() > 1)
+                .map(|(key, holders)| UniqueViolation { index: index.name.clone(), key, holders })
+                .collect();
+            violations.sort_by(|a, b| a.key.cmp(&b.key));
+            Ok((observed_multikey, violations))
         };
 
-        match build(&index) {
-            Ok(observed) => index.multikey = observed,
+        let violations = match build(&index) {
+            Ok((observed, violations)) => {
+                index.multikey = observed;
+                violations
+            }
             Err(e) => {
                 txn.abort()?;
                 return Err(e);
             }
-        }
+        };
 
         meta.indexes.push(index.clone());
         crate::Engine::put_collection_meta(&txn, &meta)?;
@@ -683,26 +731,50 @@ impl crate::Engine {
         }
 
         tracing::info!(db, collection, index = %index.name, unique, "created index");
-        Ok(index)
+        Ok((index, violations))
     }
 
     /// Drop an index and every entry it holds.
     pub fn drop_index(&self, db: &str, collection: &str, name: &str) -> Result<bool> {
-        self.drop_index_inner(db, collection, name, true)
+        self.drop_index_inner(db, collection, name, None)
     }
 
+    /// `replicated` is the originating stamp when applying a peer's drop, and
+    /// `None` for a local one, which mints its own entry. The same parameter
+    /// decides whether to log and which stamp the tombstone records, because
+    /// the two must agree — the rule `drop_collection_inner` follows, for the
+    /// reason ADR-034 records: a tombstone under a fresh local stamp lands
+    /// ahead of a recreation that legitimately followed the drop.
+    ///
+    /// The tombstone (`INDEXES_DROPPED`, ADR-123) is what stops a replayed or
+    /// aged-out `CreateIndex` from rebuilding the index. It is recorded even
+    /// when the index is not here to drop, on the replicated path: a node
+    /// that never held the index still needs to know the definition is
+    /// history, or a later replay of the create builds it. A *local* drop of
+    /// an index that is not there records nothing — it mints no entry, so a
+    /// tombstone would be a decision this node's peers never hear of, and it
+    /// would make this node refuse a definition every other member accepts.
     pub(crate) fn drop_index_inner(
         &self,
         db: &str,
         collection: &str,
         name: &str,
-        log: bool,
+        replicated: Option<Stamp>,
     ) -> Result<bool> {
         let mut meta = self.get_collection(db, collection)?;
+        // Derived from the name rather than read from the definition, so the
+        // key agrees with what a `CreateIndex` replay will compute whether or
+        // not the index is here.
+        let index_id = IndexMeta::derive_id(name);
         let Some(index) = meta.index(name).cloned() else {
+            if let Some(stamp) = replicated {
+                self.record_index_drop(meta.id, index_id, stamp)?;
+            }
             return Ok(false);
         };
 
+        let stamp = replicated.unwrap_or_else(|| self.next_stamp());
+        let log = replicated.is_none();
         let txn = self.begin_write()?;
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
@@ -713,10 +785,13 @@ impl crate::Engine {
         // receive the same derived id — it cannot inherit anything.
         meta.indexes.retain(|i| i.name != name);
         crate::Engine::put_collection_meta(&txn, &meta)?;
+        // Same transaction as the removal, so there is no instant in which the
+        // index is gone with no record that it was dropped.
+        crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
 
         let logged = if log {
             let entry = crate::engine::ddl_entry(
-                self.next_stamp(),
+                stamp,
                 kimmy_core::OpKind::DropIndex,
                 meta.id,
                 &kimmy_core::IndexDrop {

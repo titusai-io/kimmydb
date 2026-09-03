@@ -317,12 +317,37 @@ impl Server {
         Self::serve(state, Arc::clone(&self._dir), kimmy_api::RequestLimits::default()).await
     }
 
+    /// A server with a router merged beside the REST table, the way the daemon
+    /// merges `/mcp` — for the tests whose subject is what that position does
+    /// and does not put a route inside.
+    async fn start_with_extra(extra: axum::Router) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+        let users = kimmy_auth::UserStore::open(&engine).unwrap();
+        users.bootstrap_root(&engine, "root", ROOT_PASSWORD).unwrap();
+        let tokens = TokenIssuer::new(SECRET, 3600).unwrap();
+        let state =
+            kimmy_api::state(Arc::clone(&engine), tokens, false, kimmy_api::RateLimits::disabled())
+                .unwrap();
+        Self::serve_with(state, Arc::new(dir), kimmy_api::RequestLimits::default(), Some(extra))
+            .await
+    }
+
     async fn serve(
         state: kimmy_api::SharedState,
         dir: Arc<tempfile::TempDir>,
         request_limits: kimmy_api::RequestLimits,
     ) -> Self {
-        let app = kimmy_api::router_with_limits(Arc::clone(&state), None, request_limits);
+        Self::serve_with(state, dir, request_limits, None).await
+    }
+
+    async fn serve_with(
+        state: kimmy_api::SharedState,
+        dir: Arc<tempfile::TempDir>,
+        request_limits: kimmy_api::RequestLimits,
+        extra: Option<axum::Router>,
+    ) -> Self {
+        let app = kimmy_api::router_with_limits(Arc::clone(&state), extra, request_limits);
 
         // Port 0: let the OS pick, so parallel tests never collide.
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1429,6 +1454,270 @@ async fn a_query_parameter_the_route_does_not_define_is_refused_by_name() {
         assert_eq!(res.status, 400, "{method} {path}: {:?}", res.body);
         assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
     }
+}
+
+/// A query string on a route that reads none is refused, not ignored
+/// (ADR-124).
+///
+/// ADR-121 closed query strings through `QueryParams<T>`, and a handler
+/// without one never looked at its query string at all: `?if_stamp=<stale>`
+/// on `update` — a body field there — answered `200` and rewrote the
+/// document, which is the opposite of the condition the caller wrote. Found
+/// by a test round against a three-member cluster running 0.20.0.
+#[tokio::test]
+async fn a_query_string_on_a_route_that_takes_none_is_refused_rather_than_ignored() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    let inserted =
+        server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":1,"n":0})).await;
+    let first = stamp_of(&inserted.body);
+    // Move the document on, so `first` is stale.
+    server.put("/v1/db/shop/coll/orders/docs/1", Some(&token), json!({"n": 1})).await;
+    let commits_before = server.state.engine.commits();
+
+    // The case that mattered: a stale stamp on a route that takes it in the
+    // body, where it used to be read as nothing and the write went through.
+    let res = server
+        .post(
+            &format!("/v1/db/shop/coll/orders/update?if_stamp={first}"),
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$inc": {"n": 10}} }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("`if_stamp`"), "must name the parameter: {message}");
+    assert!(message.contains("takes none"), "and say the route takes none: {message}");
+    let doc = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(doc.body["n"], 1, "the refused write must not have touched the document");
+    assert_eq!(server.state.engine.commits(), commits_before, "a refused write commits nothing");
+
+    // A parameter that means something in the body is not read from the
+    // query string either; nor is one that means nothing anywhere.
+    for (path, body) in [
+        (
+            "/v1/db/shop/coll/orders/update?multi=true",
+            json!({ "filter": {}, "update": {"$set": {"n": 5}} }),
+        ),
+        ("/v1/db/shop/coll/orders/find?bogus=1", json!({ "filter": {} })),
+        ("/v1/db/shop/coll/orders/count?bogus=1", json!({ "filter": {} })),
+        ("/v1/db/shop/coll/orders/bulk?bogus=1", json!([{ "_id": 2 }])),
+    ] {
+        let res = server.post(path, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{path}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        let name = path.split('?').nth(1).unwrap().split('=').next().unwrap();
+        assert!(message.contains(&format!("`{name}`")), "{path}: {message}");
+    }
+    let doc = server.get("/v1/db/shop/coll/orders/docs/1", Some(&token)).await;
+    assert_eq!(doc.body["n"], 1, "none of the refused writes landed");
+    let res = server.post("/v1/db/shop/coll/orders/count", Some(&token), json!({})).await;
+    assert_eq!(res.body["count"], 1, "the refused bulk insert inserted nothing");
+
+    // A route that reads its query string still judges it for itself.
+    let res = server.get("/v1/db/shop/coll/orders/docs?limt=5", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("`limt`"), "{:?}", res.body);
+
+    // A bare `?` names nothing and is not a query string: some clients
+    // append one with nothing after it.
+    let res = server.post("/v1/db/shop/coll/orders/find?", Some(&token), json!({})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/coll/orders/docs?", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
+/// The guard answers before authentication, and the placement is held.
+///
+/// It is a `Router::layer`; authentication is the `Auth` extractor a handler
+/// takes. So a query string on a protected route is refused before any
+/// token is looked at — `400`, not `401` — which is acceptable because
+/// nothing is learned (the route templates are public in the specification
+/// and the message echoes only the caller's own input) and nothing is
+/// touched. It also means the refusal spends no per-principal budget and no
+/// login-attempt budget, since neither is reached (ADR-124).
+#[tokio::test]
+async fn a_query_string_is_refused_before_the_token_is_examined() {
+    let server = Server::start().await;
+    for (method, path, body) in [
+        ("POST", "/v1/users?zz=1", Some(json!({ "user": "x", "password": "x-password" }))),
+        ("GET", "/v1/databases?zz=1", None),
+        ("POST", "/v1/db/shop/coll/orders/find?zz=1", Some(json!({ "filter": {} }))),
+    ] {
+        let url = format!("{}{path}", server.base);
+        let res = server.client.request(method, &url, None, body).await;
+        assert_eq!(res.status, 400, "{method} {path} without a token: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+        assert!(
+            res.body["message"].as_str().unwrap_or_default().contains("`zz`"),
+            "{:?}",
+            res.body
+        );
+    }
+    // And with no query string the same request is the 401 it always was.
+    let res = server.get("/v1/databases", None).await;
+    assert_eq!(res.status, 401, "{:?}", res.body);
+}
+
+/// Every documented operation refuses a query parameter it does not read.
+///
+/// Walks `docs/openapi.yaml` rather than a list kept here, so an operation
+/// added to the specification is driven without anyone remembering to add
+/// it. The routes that read their query string refuse `zz` through
+/// `QueryParams<T>` (ADR-121), the rest through the guard over the table
+/// (ADR-124); a client sees the same status, code and named parameter
+/// either way. The path parameters are filled with things this test
+/// created, so a `404` cannot stand in for the `400`.
+#[tokio::test]
+async fn every_documented_operation_refuses_a_query_parameter_it_does_not_read() {
+    const SPEC: &str = include_str!("../../../docs/openapi.yaml");
+    let spec: Value = serde_norway::from_str(SPEC).expect("docs/openapi.yaml is valid YAML");
+
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    server
+        .post("/v1/db/shop/coll/orders/docs", Some(&token), json!({ "_id": "a", "note": "x" }))
+        .await;
+    let index = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "note" }] }),
+        )
+        .await;
+    let index_name = index.body["name"].as_str().expect("an index name").to_string();
+    server
+        .post(
+            "/v1/users",
+            Some(&token),
+            json!({ "user": "clerk", "password": "clerk-password", "grants": [] }),
+        )
+        .await;
+    server.post("/v1/roles", Some(&token), json!({ "name": "reader", "grants": [] })).await;
+    let hook = server
+        .post(
+            "/v1/db/shop/coll/orders/webhooks",
+            Some(&token),
+            json!({ "url": "https://example.com/hook", "operations": ["insert"] }),
+        )
+        .await;
+    let hook_id = hook.body["id"].as_str().expect("a subscription id").to_string();
+    server
+        .post(
+            "/v1/db/shop/coll/orders/vector",
+            Some(&token),
+            json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+
+    // The smallest body each bodied route accepts. Never read — the refusal
+    // comes first — but sent so that the request is one the route would
+    // otherwise answer, and the `400` is the query string's alone.
+    let body_for = |method: &str, template: &str| -> Option<Value> {
+        if !matches!(method, "POST" | "PUT") {
+            return None;
+        }
+        Some(match template.rsplit('/').next().unwrap_or_default() {
+            "login" => json!({ "user": "root", "password": ROOT_PASSWORD }),
+            "refresh" => return None,
+            "users" => json!({ "user": "temp", "password": "temp-password", "grants": [] }),
+            "password" => json!({ "password": "another-password" }),
+            "grants" => json!({ "grants": [] }),
+            "disabled" => json!({ "disabled": false }),
+            "roles" if template.starts_with("/v1/users") => json!({ "roles": [] }),
+            "roles" => json!({ "name": "temp", "grants": [] }),
+            "collections" => json!({ "name": "temp" }),
+            "docs" => json!({ "_id": "z" }),
+            "bulk" => json!([{ "_id": "z" }]),
+            "find" | "count" => json!({ "filter": {} }),
+            "aggregate" => json!({ "pipeline": [] }),
+            "update" | "find_and_modify" => {
+                json!({ "filter": { "_id": "a" }, "update": { "$set": { "note": "y" } } })
+            }
+            "delete" => json!({ "filter": { "_id": "z" } }),
+            "{id}" => json!({ "note": "y" }),
+            "indexes" => json!({ "fields": [{ "path": "other" }] }),
+            "vector" => json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 }),
+            "vectors" => json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "x" }]),
+            "vector_search" => json!({ "vector": [1.0, 0.0, 0.0], "k": 1 }),
+            "hybrid_search" => json!({ "query": "x", "vector": [1.0, 0.0, 0.0], "k": 1 }),
+            "webhooks" => json!({ "url": "https://example.com/hook", "operations": ["insert"] }),
+            other => panic!("no minimal body known for {method} {template} ({other})"),
+        })
+    };
+
+    let mut driven = 0;
+    for (template, item) in spec["paths"].as_object().expect("paths") {
+        for (method, _) in item.as_object().expect("a path item") {
+            if method == "parameters" {
+                continue;
+            }
+            let method = method.to_uppercase();
+            let name = if template.starts_with("/v1/users") {
+                "clerk"
+            } else if template.starts_with("/v1/roles") {
+                "reader"
+            } else {
+                index_name.as_str()
+            };
+            let id = if template.ends_with("/webhooks/{id}") { hook_id.as_str() } else { "a" };
+            let path = template
+                .replace("{db}", "shop")
+                .replace("{coll}", "orders")
+                .replace("{id}", id)
+                .replace("{name}", name)
+                .replace("{resource_path}", "nodes/one");
+            let url = format!("{}{path}?zz=1", server.base);
+            let body = body_for(&method, template);
+            let res = server.client.request(&method, &url, Some(&token), body).await;
+            assert_eq!(res.status, 400, "{method} {path}?zz=1: {:?}", res.body);
+            assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+            assert_eq!(res.body["retry"], "no", "{method} {path}: {:?}", res.body);
+            let message = res.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains("`zz`"),
+                "{method} {path}: must name the parameter: {message}"
+            );
+            driven += 1;
+        }
+    }
+    // A walk that matched nothing would pass vacuously.
+    assert!(driven > 50, "only {driven} operations were driven; the spec walk is broken");
+
+    // Nothing the walk sent was acted on: the fixtures it named still stand,
+    // and the document the bodied writes named is as it was.
+    let doc = server.get("/v1/db/shop/coll/orders/docs/a", Some(&token)).await;
+    assert_eq!(doc.body["note"], "x", "{:?}", doc.body);
+    let users = server.get("/v1/users", Some(&token)).await;
+    assert!(users.body.to_string().contains("clerk"), "{:?}", users.body);
+}
+
+/// A router merged beside the REST table keeps its own query semantics.
+///
+/// `/mcp` is merged through `router_with_limits` after `routes` has applied
+/// the guard, so it is outside it by construction — MCP is a separate
+/// transport, and what its query string means is rmcp's to decide (ADR-124).
+/// A stand-in rather than the real MCP router, because this crate does not
+/// depend on that one; `crates/kimmy-mcp` drives the real thing.
+#[tokio::test]
+async fn a_router_merged_beside_the_rest_table_is_outside_the_query_string_guard() {
+    use axum::routing::post;
+
+    let extra = axum::Router::new().route("/mcp", post(|| async { "answered" }));
+    let server = Server::start_with_extra(extra).await;
+    let token = server.root().await;
+
+    let res = server.post("/mcp?zz=1", Some(&token), json!({})).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    // While the table beside it is guarded on the same listener.
+    let res = server.post("/v1/db/shop/collections?zz=1", Some(&token), json!({})).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
 }
 
 /// A document body is content, not a request shape, and stays open.
@@ -6554,6 +6843,9 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_webhook_backlog_seconds",
             "kimmy_cluster_members",
             "kimmy_replication_lag_seconds",
+            "kimmy_sync_failures_total",
+            "kimmy_sync_peers_backing_off",
+            "kimmy_sync_ddl_refused_total",
             "kimmy_tls_reloads_total",
             "kimmy_tls_reloads_total",
             "kimmy_jwks_refresh_total",
