@@ -21,6 +21,21 @@ members or on disk; members of this version and 0.19.1 replicate to each other.
 
 ### Fixed
 
+- **A `let` variable written into a `$lookup` sub-pipeline `$match` is now
+  refused instead of silently matching nothing.** `docs/aggregation.md` said
+  a `$$oid` in a sub-pipeline `$match` was refused; in fact
+  `{$match: {_id: "$$oid"}}` was read as the literal five-character string,
+  matched no document, and the join came back as an empty array on every
+  input with a 200 — an empty result indistinguishable from a real one. Any
+  string value beginning with `$$`, at any depth of a sub-pipeline `$match`
+  (a plain equality, `$in`, `$elemMatch`, `$and`/`$or`/`$nor`, a `$regex`
+  pattern), is now a 400 `bad_request` naming the variable, with or without a
+  `let`, and in a nested `$lookup` too. The subtree under `$expr` is unchanged
+  — it already refused an unknown variable. A top-level `$match` and a `find`
+  filter are unchanged as well: there `"$$oid"` is the literal string a
+  stored document may hold. Write the correlation as the docs show — bind the
+  variable in an `$addFields` stage and `$match` on the computed field.
+
 ## 0.19.1 - 2026-09-02
 
 ### Changed

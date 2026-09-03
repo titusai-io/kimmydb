@@ -352,11 +352,21 @@ be used to occupy a node's memory by degrees.
 
 **Where `$match` meets `let`.** A `$match` inside the sub-pipeline is the
 ordinary filter language, and the filter language has no variables, so a
-`$$oid` in one is refused. Correlate in a computed field and `$match` on that,
-as the example does. `$expr` in a filter — which is the natural place for a
-correlation, `{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` — is a separate
-addition to the filter language and, once the two compose, will be the direct
-way to write it.
+`$$oid` in one is refused: any string value beginning with `$$`, anywhere in
+a sub-pipeline `$match` — a plain equality, inside `$in` or `$elemMatch`,
+under `$and`/`$or`/`$nor`, a `$regex` pattern — is a 400 naming it, whether
+or not the `$lookup` has a `let`. The one exception is the subtree under
+`$expr`, which the expression parser owns and checks by its own rule. The
+scope is the sub-pipeline: a top-level `$match`, and a `find` filter, read
+`"$$oid"` as the literal string a stored document may hold. There is no
+literal escape inside a sub-pipeline `$match` — a stored string that begins
+with `$$` cannot be matched there — and the register records that as a
+deliberate difference from MongoDB. Correlate in a computed field and
+`$match` on that, as the example does. `$expr` in a filter
+— which is the natural place for a correlation,
+`{$match: {$expr: {$eq: ["$order", "$$oid"]}}}` — is a separate addition to
+the filter language and, once the two compose, will be the direct way to
+write it.
 
 **No cross-collection snapshot.** A `$lookup` sees the foreign collection as of
 when the stage runs. There are no multi-document transactions in a leaderless

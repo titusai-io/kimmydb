@@ -5808,6 +5808,32 @@ async fn an_unknown_pipeline_stage_is_a_bad_request() {
 }
 
 #[tokio::test]
+async fn a_let_variable_in_a_sub_pipeline_match_is_a_bad_request() {
+    // On 0.19.1 this was a 200 with `x: []` on every document: the filter
+    // read `"$$oid"` as a literal string and matched nothing. It is refused
+    // before any document is read, naming the variable.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"a"})).await;
+    server.post("/v1/db/shop/coll/a/docs", Some(&token), json!({"_id": 1})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/a/aggregate",
+            Some(&token),
+            json!({"pipeline": [
+                {"$lookup": {"from": "a", "let": {"oid": "$_id"},
+                             "pipeline": [{"$match": {"_id": "$$oid"}}], "as": "x"}},
+                {"$limit": 1}
+            ]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    assert!(format!("{:?}", res.body).contains("$$oid"), "{:?}", res.body);
+}
+
+#[tokio::test]
 async fn mod_pull_all_and_type_conversion_work_over_http() {
     // The three additions through the edge, where Extended JSON is what
     // carries a date or an ObjectId in and out.
