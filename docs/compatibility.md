@@ -114,8 +114,10 @@ follow from the rules above rather than adding to them:
 - **A request using a field an older node does not know is refused**, with
   `422` and `bad_request` — every request body rejects unknown fields
   ([ADR-121](decisions.md)), so a typo is an error rather than a silent
-  no-op. That refusal is *correct*, and it is why capability discovery
-  exists: check first, do not send and hope.
+  no-op. A query string is held to the same rule at `400`: a parameter the
+  route does not define, or any query string on a route that takes none
+  ([ADR-124](decisions.md)). That refusal is *correct*, and it is why
+  capability discovery exists: check first, do not send and hope.
 - **Failover does not paper over this.** A `retry: elsewhere` failure means the
   node was unable; it does not mean the next node is newer. A client that
   retries a capability-dependent request around the cluster will get the same

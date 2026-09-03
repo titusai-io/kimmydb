@@ -91,7 +91,19 @@ pub fn router_with_limits(
 fn routes(state: SharedState, limits: RequestLimits) -> Router {
     let timed = timed_routes()
         .layer(axum::middleware::from_fn_with_state(limits, crate::limits::enforce_timeout));
-    Router::new().merge(timed).merge(streaming_routes()).with_state(state)
+    Router::new()
+        .merge(timed)
+        .merge(streaming_routes())
+        // Over the whole REST table, timed and streaming alike, and applied
+        // here rather than in `router_with_limits` so that `/mcp` — merged
+        // there, afterwards — stays outside it: MCP is a separate transport
+        // with query semantics of its own, and rmcp is the one that reads
+        // them (ADR-124). A layer applied to a router stays with the routes
+        // it was applied to when that router is merged into another, which
+        // is the property `router_with_limits` relies on in the other
+        // direction.
+        .layer(axum::middleware::from_fn(refuse_unread_query_string))
+        .with_state(state)
 }
 
 /// Routes whose response is a connection rather than a document, and which
@@ -196,6 +208,143 @@ fn timed_routes() -> Router<SharedState> {
         )
         .route("/v1/db/{db}/coll/{coll}/vector_search", post(crate::vectors::vector_search))
         .route("/v1/db/{db}/coll/{coll}/hybrid_search", post(crate::vectors::hybrid_search))
+}
+
+/// The routes that read their query string, as `(method, route template)`,
+/// each template exactly the literal it is registered with above.
+///
+/// **This table only opens routes; it never closes one.** The guard,
+/// [`refuse_unread_query_string`], answers `400` to any query string on a
+/// `(method, route)` that is not listed, so a route added above is closed to
+/// query strings until someone lists it here — and listing it is only right
+/// once its handler takes a `QueryParams<T>` that reads them. That is the
+/// direction that makes ADR-121 hold by construction rather than by
+/// diligence: forgetting a route produces one that refuses too much, which
+/// the first request with a parameter reports by name, instead of one that
+/// reads `?if_stamp=…` as nothing and rewrites the document (ADR-124).
+///
+/// Every handler that takes `QueryParams<T>` is here, and the contract test in
+/// `tests/openapi.rs` holds this table equal to the set of operations
+/// `docs/openapi.yaml` gives a query parameter, so a parameter documented on a
+/// route this table does not open, or opened here and documented nowhere, is
+/// a failing test rather than a route that quietly behaves otherwise.
+pub const QUERY_STRING_ROUTES: [(&str, &str); 7] = [
+    ("GET", "/v1/db/{db}/coll/{coll}/docs"),
+    ("PUT", "/v1/db/{db}/coll/{coll}/docs/{id}"),
+    ("DELETE", "/v1/db/{db}/coll/{coll}/docs/{id}"),
+    ("GET", "/v1/db/{db}/coll/{coll}/describe"),
+    ("GET", "/v1/db/{db}/coll/{coll}/violations"),
+    ("DELETE", "/v1/db/{db}/coll/{coll}/vector"),
+    ("GET", "/v1/db/{db}/coll/{coll}/watch"),
+];
+
+/// Refuse a query string on a route that does not read one.
+///
+/// ADR-121 closed query strings through `QueryParams<T>`, but an extractor
+/// only runs on a handler that takes it, and a handler with no query
+/// parameters never looked at its query string at all. So
+/// `POST .../update?if_stamp=<stale>` answered `200` and rewrote the document
+/// — `if_stamp` is a body field there, the parameter was never read, and the
+/// write the caller had made conditional was not — while the same typo on
+/// `GET .../docs` was the documented `400`. Found by a test round against a
+/// three-member cluster running 0.20.0.
+///
+/// A `QueryParams<NoParams>` on every handler would have closed the routes
+/// that have one today and left the next handler open, which is the failure
+/// mode this replaces. One layer over the table, deciding by the matched
+/// route against [`QUERY_STRING_ROUTES`], is closed for every route by
+/// default and open only for the ones the table names (ADR-124).
+///
+/// The decision is made on axum's `MatchedPath` — the route *template* —
+/// rather than the URI, for the reason `request_span` uses it: the template
+/// is what the table holds, and a comparison on the raw path would have to
+/// re-implement routing. A request that matched no route carries no
+/// `MatchedPath` and passes through to the `404` it is about to get; with
+/// `Router::layer` that request never reaches this layer at all, and the
+/// check is here so that the property does not depend on it.
+///
+/// The refusal names the first parameter and says the route takes none,
+/// after the shape of the serde message `QueryParams` answers with —
+/// `` unknown field `limt`, expected `limit` or `skip` `` — so a client sees
+/// the same kind of sentence whichever way its query string was refused. A
+/// bare `?` names nothing and is not a query string for this purpose; a
+/// parameter with no name, `?=1`, is called malformed rather than named.
+///
+/// # It answers before authentication
+///
+/// This is a `Router::layer`, and authentication is the `Auth` extractor a
+/// handler takes, so a query string is refused before any token is looked
+/// at: `POST /v1/users?zz=1` with no token is `400`, not `401`. That is
+/// acceptable because nothing is learned and nothing is touched — the route
+/// templates are public in `docs/openapi.yaml`, the message echoes only the
+/// caller's own input, and no handler runs. It also means a request the
+/// guard refuses never reaches the per-principal budget in
+/// [`crate::state`], which is spent inside `Auth`, nor a login limiter,
+/// which is spent inside the login handler: harmless, since the guard is
+/// cheaper than either and examined no credential, but an ordering fact
+/// worth stating, as ADR-099 stated the deadline's. A test in
+/// `tests/api.rs` holds the placement.
+pub async fn refuse_unread_query_string(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let Some(first) = request.uri().query().and_then(first_query_parameter) else {
+        return next.run(request).await;
+    };
+    let Some(route) = request.extensions().get::<axum::extract::MatchedPath>() else {
+        return next.run(request).await;
+    };
+    let method = request.method().as_str();
+    if QUERY_STRING_ROUTES.iter().any(|(m, r)| *m == method && *r == route.as_str()) {
+        return next.run(request).await;
+    }
+    let message = if first.is_empty() {
+        "malformed query string: a parameter with no name; this route takes none".to_string()
+    } else {
+        format!("unknown query parameter `{first}`; this route takes none")
+    };
+    ApiError::bad_request(message).into_response()
+}
+
+/// The name of the first parameter in a query string, percent-decoded, or
+/// `None` when the string carries no parameter at all — a bare `?`, or one
+/// made only of separators, names nothing. `?a` with no `=` is the parameter
+/// `a`; `?=1` is a parameter whose name is empty, and the caller says so.
+fn first_query_parameter(query: &str) -> Option<String> {
+    let pair = query.split('&').find(|pair| !pair.is_empty())?;
+    let name = pair.split('=').next().unwrap_or(pair);
+    Some(percent_decode(name))
+}
+
+/// Decode a query-string component: `%XX` to its byte, `+` to a space, and
+/// anything malformed left as written rather than refused — this is for a
+/// message that names the parameter, not for reading it.
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escaped = (bytes[i] == b'%' && i + 2 < bytes.len()).then(|| {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            u8::try_from((hi << 4) | lo).ok()
+        });
+        match (bytes[i], escaped.flatten()) {
+            (_, Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (b'+', None) => {
+                out.push(b' ');
+                i += 1;
+            }
+            (byte, None) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Count every response by status, and time the ones that are real traffic.
@@ -1198,3 +1347,107 @@ async fn drop_index(
 // three. The check that used to sit in this module matched `.route("` at the
 // start of a line, which silently skipped the registrations rustfmt breaks
 // across lines.
+
+#[cfg(test)]
+mod tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::routing::{get, post};
+    use tower::ServiceExt;
+
+    use super::*;
+
+    /// The REST table's shape in miniature: one route the table opens, one it
+    /// does not, under the same layer `routes` applies.
+    ///
+    /// The paths are real registered routes on purpose: the scanner in
+    /// `tests/openapi.rs` reads every `.route(` literal in this file, this
+    /// module included, and an invented path here would be reported as a
+    /// route the specification does not describe.
+    fn guarded() -> Router {
+        Router::new()
+            .route("/v1/db/{db}/coll/{coll}/docs", get(|| async { "listed" }))
+            .route("/v1/db/{db}/coll/{coll}/find", post(|| async { "found" }))
+            .layer(axum::middleware::from_fn(refuse_unread_query_string))
+    }
+
+    async fn send(method: &str, uri: &str) -> (u16, Value) {
+        let request = Request::builder().method(method).uri(uri).body(Body::empty()).unwrap();
+        let response = guarded().oneshot(request).await.unwrap();
+        let status = response.status().as_u16();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16).await.unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    }
+
+    #[tokio::test]
+    async fn a_query_string_on_a_route_outside_the_table_is_refused_by_name() {
+        let (status, body) = send("POST", "/v1/db/shop/coll/orders/find?bogus=1&limit=2").await;
+        assert_eq!(status, 400, "{body}");
+        assert_eq!(body["error"], "bad_request");
+        assert_eq!(body["retry"], "no");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`bogus`"), "the first parameter is named: {message}");
+        assert!(message.contains("takes none"), "and the route is said to take none: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_route_the_table_opens_reads_its_own_query_string() {
+        let (status, _) = send("GET", "/v1/db/shop/coll/orders/docs?limit=2").await;
+        assert_eq!(status, 200);
+        // Opened for its handler to judge, not for this layer to: a parameter
+        // the handler does not define is `QueryParams`'s refusal, not ours.
+        let (status, _) = send("GET", "/v1/db/shop/coll/orders/docs?limt=2").await;
+        assert_eq!(status, 200, "the layer defers to the handler on an opened route");
+    }
+
+    #[tokio::test]
+    async fn a_bare_question_mark_is_not_a_query_string() {
+        for uri in ["/v1/db/shop/coll/orders/find?", "/v1/db/shop/coll/orders/find?&&"] {
+            let (status, body) = send("POST", uri).await;
+            assert_eq!(status, 200, "{uri}: {body}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_parameter_without_a_value_is_still_a_parameter() {
+        let (status, body) = send("POST", "/v1/db/shop/coll/orders/find?a").await;
+        assert_eq!(status, 400, "{body}");
+        assert!(body["message"].as_str().unwrap().contains("`a`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_parameter_without_a_name_is_called_malformed_rather_than_named() {
+        let (status, body) = send("POST", "/v1/db/shop/coll/orders/find?=1").await;
+        assert_eq!(status, 400, "{body}");
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("malformed"), "{message}");
+        assert!(!message.contains("``"), "an empty name is not quoted: {message}");
+    }
+
+    #[tokio::test]
+    async fn a_wrong_method_with_a_query_string_is_refused_for_the_query_string() {
+        // The layer wraps the method router, whose own fallback is the 405,
+        // so the query string is judged first. Without one the 405 stands.
+        let (status, _) = send("PATCH", "/v1/db/shop/coll/orders/find?zz=1").await;
+        assert_eq!(status, 400);
+        let (status, _) = send("PATCH", "/v1/db/shop/coll/orders/find").await;
+        assert_eq!(status, 405);
+    }
+
+    #[tokio::test]
+    async fn the_named_parameter_is_percent_decoded() {
+        let (_, body) = send("POST", "/v1/db/shop/coll/orders/find?if%5Fstamp+x=1").await;
+        let message = body["message"].as_str().unwrap();
+        assert!(message.contains("`if_stamp x`"), "{message}");
+        // Malformed escapes are left as written rather than refused twice.
+        let (_, body) = send("POST", "/v1/db/shop/coll/orders/find?a%zz=1").await;
+        assert!(body["message"].as_str().unwrap().contains("`a%zz`"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_request_that_matched_no_route_is_left_to_the_fallback() {
+        let (status, _) = send("GET", "/nowhere?zz=1").await;
+        assert_eq!(status, 404);
+    }
+}

@@ -344,7 +344,10 @@ how many chunks landed ([ADR-086](decisions.md)).
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
-names one document.
+names one document. On these routes it is a **body** field: `?if_stamp=…` on
+the URL is refused `400`, as any query string on a route that takes none is
+(see [The JSON boundary](#the-json-boundary)), rather than being read as no
+condition at all.
 
 An update path may address array elements — `items.$[].qty` for every
 element, `items.$[line].qty` for the elements an `arrayFilters` entry
@@ -672,7 +675,16 @@ body is content, not a shape: insert, replace and bulk take any field, because
 `GET .../docs`, or `?limit=abc`, is `400 bad_request` with the parameter
 named. The status differs from a body's `422` because a query string is part
 of the request line rather than an entity the server could not process; the
-envelope is the same.
+envelope is the same. A route that takes no query parameters — every route
+other than `GET .../docs`, `PUT` and `DELETE .../docs/{id}`,
+`GET .../describe`, `GET .../violations`, `DELETE .../vector` and
+`GET .../watch` — refuses *any* query string at all, `400 bad_request`
+naming the first parameter and saying the route takes none
+([ADR-124](decisions.md)). So `if_stamp` on `update`, `delete` and
+`find_and_modify` is a body field a query string can never carry:
+`POST .../update?if_stamp=…` is refused rather than read as an unconditional
+write. A bare `?` with nothing after it names no parameter and is not
+refused.
 
 **Object key order is preserved** through the boundary and into the stored
 document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with

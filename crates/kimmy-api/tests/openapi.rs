@@ -86,7 +86,17 @@ fn documented_operations() -> BTreeSet<(String, String)> {
 /// `docs/mcp.md`.
 fn registered_operations() -> BTreeSet<(String, String)> {
     let mut out = BTreeSet::new();
-    let mut rest = ROUTER_SOURCE;
+    // Comments are dropped before the scan. A comment that mentions
+    // `.route("` — one in `routes.rs` does, about this very scanner — would
+    // otherwise be read as a registration whose path is whatever quoted text
+    // follows and whose methods are the next `get(` or `post(` in the file,
+    // which was harmless only while nothing followed it.
+    let source: String = ROUTER_SOURCE
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut rest = source.as_str();
 
     while let Some(at) = rest.find(".route(") {
         let open = at + ".route(".len();
@@ -395,36 +405,107 @@ fn every_request_shape_is_closed() {
     );
 }
 
-/// Every operation that reads a query string documents the `400` a parameter
-/// it does not define, or cannot parse, is refused with (ADR-121). The gap
-/// this closes was found by review: one route's `400` was missed by a text
-/// search that matched a longer operation name.
-#[test]
-fn every_operation_with_a_query_parameter_documents_the_400() {
+/// Every `(method, path)` the specification gives a query parameter, at the
+/// operation or at the path level.
+fn operations_with_a_query_parameter() -> BTreeSet<(String, String)> {
     let spec = spec();
     let is_query = |parameters: &Value| {
         parameters
             .as_array()
             .is_some_and(|list| list.iter().any(|p| resolve(spec, p)["in"] == "query"))
     };
-    let mut missing = Vec::new();
+    let mut out = BTreeSet::new();
     for (template, item) in spec["paths"].as_object().expect("paths") {
         let path_level = is_query(&item["parameters"]);
         for (method, operation) in item.as_object().expect("path item") {
             if method == "parameters" {
                 continue;
             }
-            if (path_level || is_query(&operation["parameters"]))
-                && operation["responses"].get("400").is_none()
-            {
+            if path_level || is_query(&operation["parameters"]) {
+                out.insert((method.to_uppercase(), template.clone()));
+            }
+        }
+    }
+    out
+}
+
+/// The routes the server opens to a query string are exactly the operations
+/// the specification gives a query parameter (ADR-124).
+///
+/// `QUERY_STRING_ROUTES` only opens routes: one absent from it refuses every
+/// query string, so a handler that gained a `QueryParams<T>` without an entry
+/// is a route that refuses what it documents, and an entry without a
+/// documented parameter is a route open to a query string nothing reads.
+/// Both directions are held here, against the document a client reads
+/// rather than against the handlers, because the document is the promise.
+/// The entries are also held to be registered routes, so a typo in a
+/// template cannot open nothing and pass.
+#[test]
+fn the_routes_that_read_a_query_string_are_the_ones_the_specification_gives_one() {
+    // The catch-all spelling differs between the two vocabularies; see
+    // `registered_operations`. No opened route carries one today, and the
+    // rewrite is here so that one which does compares correctly.
+    let opened: BTreeSet<(String, String)> = kimmy_api::routes::QUERY_STRING_ROUTES
+        .iter()
+        .map(|(method, template)| (method.to_string(), template.replace("{*", "{")))
+        .collect();
+    assert_eq!(
+        opened.len(),
+        kimmy_api::routes::QUERY_STRING_ROUTES.len(),
+        "QUERY_STRING_ROUTES lists a route twice"
+    );
+
+    let documented = operations_with_a_query_parameter();
+    let refused: Vec<_> = documented.difference(&opened).collect();
+    let undocumented: Vec<_> = opened.difference(&documented).collect();
+    assert!(
+        refused.is_empty(),
+        "docs/openapi.yaml gives these operations a query parameter, but the server refuses \
+         every query string on them because QUERY_STRING_ROUTES does not open them: {refused:#?}"
+    );
+    assert!(
+        undocumented.is_empty(),
+        "QUERY_STRING_ROUTES opens these operations to a query string, but docs/openapi.yaml \
+         documents no parameter on them: {undocumented:#?}"
+    );
+
+    let registered = registered_operations();
+    let unregistered: Vec<_> = opened.difference(&registered).collect();
+    assert!(
+        unregistered.is_empty(),
+        "QUERY_STRING_ROUTES names operations the router does not register: {unregistered:#?}"
+    );
+}
+
+/// Every operation documents the `400` a query string can draw.
+///
+/// This used to hold only the operations that take a query parameter, for
+/// the refusal `QueryParams<T>` makes of one the route does not define
+/// (ADR-121). With the guard over the whole table, any query string on any
+/// other REST route is the same `400` (ADR-124), so there is no longer an
+/// operation on which a client can be promised never to meet one — the
+/// health probes included, since a probe with a cache-busting parameter is
+/// refused like everything else. The gap the older check closed was found
+/// by review: one route's `400` was missed by a text search that matched a
+/// longer operation name.
+#[test]
+fn every_operation_documents_the_400_a_query_string_draws() {
+    let spec = spec();
+    let mut missing = Vec::new();
+    for (template, item) in spec["paths"].as_object().expect("paths") {
+        for (method, operation) in item.as_object().expect("path item") {
+            if method == "parameters" {
+                continue;
+            }
+            if operation["responses"].get("400").is_none() {
                 missing.push(format!("{} {template}", method.to_uppercase()));
             }
         }
     }
     assert!(
         missing.is_empty(),
-        "these operations take a query parameter but do not document the 400 its \
-         refusal carries: {missing:#?}"
+        "these operations do not document the 400 a query string is refused with, and every \
+         REST route refuses one it does not read (ADR-124): {missing:#?}"
     );
 }
 
@@ -1548,6 +1629,25 @@ async fn documented_refusals_use_the_documented_envelope() {
             .await;
         assert_eq!(refused["error"], "bad_request");
     }
+
+    // A query string on a route that reads none, and on one that needs no
+    // token at all: the guard over the table answers before anything else
+    // does (ADR-124), and what it answers with is validated here against the
+    // shared `BadRequest` response every operation now documents.
+    let guarded = c
+        .check(
+            "POST",
+            "/v1/db/{db}/coll/{coll}/find",
+            "/v1/db/shop/coll/orders/find?bogus=1",
+            Some(&root),
+            Some(json!({ "filter": {} })),
+            400,
+        )
+        .await;
+    assert_eq!(guarded["error"], "bad_request");
+    assert!(guarded["message"].as_str().is_some_and(|m| m.contains("`bogus`")), "{guarded}");
+    let probe = c.check("GET", "/healthz", "/healthz?zz=1", None, None, 400).await;
+    assert_eq!(probe["error"], "bad_request");
 
     // A wrong-shaped body on a route that is *not* `/bulk`. Until the
     // extractor carried the mapping, `/bulk` was the only one of nineteen

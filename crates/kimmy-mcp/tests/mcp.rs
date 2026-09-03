@@ -81,13 +81,19 @@ impl Server {
 
     /// POST one JSON-RPC message to `/mcp`.
     async fn rpc(&self, token: Option<&str>, body: Value) -> (u16, Value) {
+        self.rpc_at("/mcp", token, body).await
+    }
+
+    /// The same, at a request target of the test's choosing — for the one
+    /// test whose subject is the target rather than the message.
+    async fn rpc_at(&self, target: &str, token: Option<&str>, body: Value) -> (u16, Value) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
         let host = self.base.strip_prefix("http://").unwrap();
         let payload = body.to_string();
 
         let mut request = format!(
-            "POST /mcp HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
+            "POST {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\
              Content-Type: application/json\r\n\
              Accept: application/json, text/event-stream\r\n\
              Content-Length: {}\r\n",
@@ -317,6 +323,21 @@ async fn a_rejected_mcp_request_says_where_to_authenticate() {
         challenge.contains(r#"error="invalid_token""#),
         "a bad token is invalid_token: {challenge}"
     );
+}
+
+/// The REST table refuses a query string on a route that reads none
+/// (ADR-124). `/mcp` is merged beside that table, not into it, and MCP is a
+/// transport with query semantics of its own — so a query string here is
+/// rmcp's to judge, and it answers the request as though there were none.
+#[tokio::test]
+async fn a_query_string_on_mcp_is_not_refused_by_the_rest_tables_guard() {
+    let server = Server::start().await;
+    let root = server.root();
+    let (status, body) = server
+        .rpc_at("/mcp?zz=1", Some(&root), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}))
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert!(body["result"]["tools"].is_array(), "{body}");
 }
 
 #[tokio::test]

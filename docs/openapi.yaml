@@ -85,6 +85,24 @@ info:
     release time.** That is what makes adding a code additive rather than
     breaking.
 
+    ## Every request shape is closed
+
+    A request body with a field the route does not define is refused `422
+    bad_request`, and the message names the field and lists the ones the
+    route takes (ADR-121). Every request schema below says so with
+    `additionalProperties: false`; a document body — insert, replace, bulk —
+    is content rather than a shape and takes any field.
+
+    Query strings are held to the same rule, at `400`. On the operations that
+    declare a query parameter, one the route does not define, or cannot
+    parse, is refused with the parameter named. **On every other operation
+    any query string at all is refused `400 bad_request`**, naming the first
+    parameter and saying the route takes none (ADR-124) — so `if_stamp`,
+    which `update`, `delete` and `find_and_modify` take in the body, can
+    never be sent as a query parameter and silently ignored. A bare `?` with
+    nothing after it names no parameter and is not refused. `/mcp` is a
+    separate transport, outside this rule and outside this document.
+
     ## Paging
 
     **A `find` with no `limit` returns at most 100 documents, not all of them.**
@@ -186,6 +204,7 @@ paths:
                 properties:
                   status:
                     const: ok
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /readyz:
     get:
@@ -211,6 +230,7 @@ paths:
                   node:
                     type: string
                     description: This node's id.
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /metrics:
     get:
@@ -228,6 +248,7 @@ paths:
             text/plain:
               schema:
                 type: string
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /.well-known/oauth-protected-resource:
     get:
@@ -277,6 +298,7 @@ paths:
                     items:
                       type: string
                     description: Always `["header"]`.
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404":
           description: This node publishes no protected resource metadata.
           content:
@@ -324,6 +346,7 @@ paths:
                     type: array
                     items:
                       type: string
+        "400": { $ref: "#/components/responses/BadRequest" }
         "404":
           description: Not this node's resource.
           content:
@@ -369,6 +392,7 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Token"
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401":
           description: |
             Wrong password, or no such user. The two are indistinguishable by
@@ -458,6 +482,7 @@ paths:
                       at the cost of a few milliseconds of latency. A fact
                       about configuration rather than build, so a field
                       rather than a capability.
+        "400": { $ref: "#/components/responses/BadRequest" }
 
   /v1/auth/refresh:
     post:
@@ -569,6 +594,7 @@ paths:
                     items: { $ref: "#/components/schemas/Node" }
                   count:
                     type: integer
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /v1/auth/whoami:
@@ -619,6 +645,7 @@ paths:
                       matching a local account — and a federated principal has
                       no local record, so it cannot change a password or be
                       revoked from here.
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -642,6 +669,7 @@ paths:
                   users:
                     type: array
                     items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
@@ -704,6 +732,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/User" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -727,6 +756,7 @@ paths:
                 properties:
                   deleted:
                     type: boolean
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "409":
@@ -906,6 +936,7 @@ paths:
                   roles:
                     type: array
                     items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
@@ -973,6 +1004,7 @@ paths:
                   grants:
                     type: array
                     items: { $ref: "#/components/schemas/Grant" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1003,6 +1035,7 @@ paths:
                   invalidated:
                     type: integer
                     description: How many accounts had their tokens revoked.
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -1073,6 +1106,7 @@ paths:
                   databases:
                     type: array
                     items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
 
   /v1/db/{db}/collections:
@@ -1099,6 +1133,7 @@ paths:
                   collections:
                     type: array
                     items: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
     post:
@@ -1202,6 +1237,7 @@ paths:
                 properties:
                   dropped:
                     type: boolean
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -1735,6 +1771,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Document" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1913,6 +1950,7 @@ paths:
                   indexes:
                     type: array
                     items: { $ref: "#/components/schemas/Index" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2014,6 +2052,7 @@ paths:
                 properties:
                   dropped:
                     type: boolean
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2040,6 +2079,7 @@ paths:
                     oneOf:
                       - $ref: "#/components/schemas/VectorConfig"
                       - type: "null"
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2147,6 +2187,7 @@ paths:
                           type: array
                           items: { type: number }
                         text: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2222,6 +2263,7 @@ paths:
                 properties:
                   deleted:
                     type: integer
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2348,6 +2390,7 @@ paths:
                     items: { $ref: "#/components/schemas/Webhook" }
                   count:
                     type: integer
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
     post:
@@ -2437,6 +2480,7 @@ paths:
                 properties:
                   removed:
                     type: boolean
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2557,6 +2601,7 @@ paths:
               schema:
                 type: string
                 format: binary
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
 
@@ -2620,9 +2665,11 @@ components:
         The request could not be understood or is not answerable as asked.
         Also a query string the route cannot read — a parameter it does not
         define, or a value that is not the type it takes; the message names
-        the parameter (ADR-121). A query string is refused `400` where a body
-        of the wrong shape is `422`: it is part of the request line, not an
-        entity the server failed to process.
+        the parameter (ADR-121). On an operation that declares no query
+        parameter, any query string at all: the message names the first
+        parameter and says the route takes none (ADR-124). A query string is
+        refused `400` where a body of the wrong shape is `422`: it is part of
+        the request line, not an entity the server failed to process.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
