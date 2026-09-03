@@ -10,6 +10,33 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+_(preamble written at release time)_
+
+### Changed
+
+- **A query string on a route that takes no query parameters is refused.**
+  Only the routes that declare a parameter — `GET .../docs`, `PUT` and
+  `DELETE .../docs/{id}`, `GET .../describe`, `GET .../violations`,
+  `DELETE .../vector`, `GET .../watch` — ever read their query string, so
+  the closure of 0.20.0 reached them and nothing else: `POST
+  .../update?if_stamp=<stale stamp>` answered `200` and rewrote the
+  document, because `if_stamp` is a body field there and the parameter was
+  never read, while the same misspelling on `GET .../docs` was the
+  documented `400`. `?bogus=1` on `find`, `count` and `bulk`, and
+  `?multi=true` on `update`, answered `200` having ignored it. Every REST
+  route now refuses any query string it does not read, `400 bad_request` in
+  the envelope naming the first parameter and saying the route takes none;
+  the routes that read one still refuse an unknown parameter by name as
+  before. A bare `?` with nothing after it is not refused. `/mcp` is a
+  separate transport and is unaffected. **Breaking for a client that sends
+  a query parameter to a route that takes none** — including a health probe
+  with a cache-busting parameter — and a `0.MINOR` bump for it. The Rust,
+  Python and Go clients, the CLI, the conformance scenarios, the examples
+  and every documented request were audited and send none. Found by a test
+  round against a three-member cluster running 0.20.0. ADR-124.
+
 ## 0.20.0 - 2026-09-02
 
 A minor when it ships, not a patch. Nothing changes on the wire between

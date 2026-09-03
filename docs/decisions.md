@@ -6936,3 +6936,114 @@ asserts the new meaning, and one reproduces the finding: stamps spanning
 where the span gave 300.
 
 ---
+
+## ADR-124 — A route that reads no query string refuses every query string
+
+**Decision.** One layer over the REST route table,
+`routes::refuse_unread_query_string`, answers `400 bad_request` in the
+envelope to any request whose query string is non-empty and whose
+`(method, matched route)` is not in `routes::QUERY_STRING_ROUTES` — the
+seven operations whose handlers take a `QueryParams<T>`: `GET .../docs`,
+`PUT` and `DELETE .../docs/{id}`, `GET .../describe`, `GET .../violations`,
+`DELETE .../vector` and `GET .../watch`. The message names the first
+parameter, percent-decoded, and says the route takes none, in the shape of
+the serde message `QueryParams<T>` refuses an unknown parameter with. A bare
+`?`, or a query string made only of separators, names nothing and passes.
+The layer is applied inside `routes`, to the merged timed and streaming
+tables, so `/mcp` — merged afterwards by `router_with_limits` — is outside
+it. It answers **before authentication**: it is a `Router::layer`, and
+authentication is the `Auth` extractor a handler takes, so
+`POST /v1/users?zz=1` with no token is `400`, not `401`. That is acceptable
+because nothing is learned and nothing is touched — the route templates are
+public in the specification, the message echoes only the caller's own
+input, and no handler runs. The second-order consequence is that a request
+the guard refuses never reaches the per-principal budget, which is spent
+inside `Auth` (`state.rs`), nor a login-attempt limiter, which is spent
+inside the login handler: harmless, since the guard is cheaper than either
+and examined no credential, and stated here the way ADR-099 stated where
+the deadline sits relative to the work it bounds. A test holds the
+placement, so it cannot drift to the other side of authentication without
+someone deciding it should. `docs/openapi.yaml` documents the shared `400` on every operation and
+states the rule in its preamble beside the body rule, and the contract tests
+hold the table equal to the set of operations the specification gives a
+query parameter, hold every operation to documenting the `400`, and drive
+`?zz=1` at every documented operation over a real socket.
+
+**Why.** ADR-121 closed query strings through `QueryParams<T>`, and its own
+motivating example was a misspelt `if_stamp` making a conditional write
+unconditional. But an extractor runs only on a handler that takes it, and a
+handler with no query parameters never looked at its query string at all —
+so the closure reached exactly the seven routes that already read one.
+`POST .../update?if_stamp=<stale stamp>` answered `200` and rewrote the
+document: `if_stamp` is a body field there, the parameter was never read,
+and the write the caller had made conditional was not. `?bogus=1` on
+`find`, `count` and `bulk`, and `?multi=true` on `update`, answered `200`
+having ignored the parameter, while `GET .../docs?limt=5` was the
+documented `400`. The reference said "query strings are held to the same
+rule", which was true of a quarter of the routes. Found by a test round
+against a three-member cluster running 0.20.0.
+
+The argument is ADR-121's, and it applies with more force here: a parameter
+the server does not read is a request the server cannot honour, and the one
+it did not read in this case was the condition on a write. A refusal that
+names the parameter is a fix in one edit; the `200` was a silent overwrite.
+
+**Alternatives.**
+
+- *A `QueryParams<NoParams>` on every handler that takes no parameters.*
+  Rejected, and it is the important rejection. It closes the routes that
+  have one today and leaves the next handler open, because forgetting it is
+  invisible — the route compiles, answers, and ignores. The two designs
+  differ only in what forgetting does: with an extractor per handler a
+  forgotten route is open, with a layer over the table and a list of what is
+  open a forgotten route is closed, refuses on the first request with a
+  parameter, and says why. Fail-closed by construction is the property that
+  makes ADR-121 hold without anyone remembering it.
+- *A table of routes that refuse a query string, rather than of routes that
+  read one.* Rejected for the same reason: a route absent from a deny-list is
+  open. The table lists what is opened, so an entry is only right beside a
+  `QueryParams<T>` that reads it, and the contract test holds the table
+  equal to the operations the specification documents a parameter on — a
+  parameter documented on a route the table does not open, or opened and
+  documented nowhere, is a failing test rather than a route that quietly
+  behaves otherwise.
+- *Deciding on the raw path rather than `MatchedPath`.* Rejected; it would
+  re-implement routing. The matched route template is what the table holds
+  and what axum has already decided, and it is what the request span is
+  named from for the same reason.
+- *Covering `/mcp` too.* Rejected. MCP is a separate transport with query
+  semantics of its own — the streamable HTTP specification, not this API —
+  and rmcp reads its requests; the REST rule has no standing there, and
+  `docs/openapi.yaml` already leaves it out for the same reason. The guard
+  is applied in `routes` rather than in `router_with_limits` so that the
+  merge order which puts `/mcp` inside the counter and outside the deadline
+  (ADR-099) also puts it outside this.
+- *`422`, to match bodies.* Rejected in ADR-121 and not reopened: a query
+  string is part of the request line, `400` is what the seven opened routes
+  already answer, and one status for "the query string was refused" is worth
+  more than symmetry with the body.
+- *Exempting the health probes.* Considered and not done. A probe with a
+  cache-busting parameter is refused like everything else; an exemption is
+  a route the rule does not reach, which is the shape of the defect this
+  closes, and a probe that needs a parameter has something to say that this
+  server should hear.
+
+**Cost.** Breaking for a client that sends a query parameter to a route
+that takes none, and a `0.MINOR` bump under the pre-1.0 policy. The
+first-party Rust, Python and Go clients, the CLI, the conformance scenarios,
+the examples and every request example in the documentation were audited
+and send a query string only to the seven routes that read one, with
+parameters those routes define; the MCP server calls the shared `exec`
+layer in-process and sends no HTTP at all. A health check configured with a
+cache-busting parameter now answers `400` and needs the parameter removed.
+One table to keep beside the route table, held by a contract test in both
+directions, and one string comparison per request that carries a query
+string. Because the layer wraps each route's method router, whose own
+fallback is the `405`, a wrong method on a guarded route *with* a query
+string answers `400` for the query string rather than `405` for the method;
+without one the `405` stands. A parameter with no name, `?=1`, is refused as
+malformed rather than named. Twenty-seven operations gained a documented `400` they could not
+answer before, and a contract test now insists every operation documents
+it.
+
+---
