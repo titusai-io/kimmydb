@@ -494,8 +494,29 @@ Sorting by an array field uses its elements.
 ```
 
 Inclusion and exclusion cannot be mixed — the result would be ambiguous about
-unnamed fields — except for `_id`, the documented exception. Projection reaches
-nested paths (`"a.b": 1`).
+unnamed fields — with one exception, and it runs **one way only**: `_id` may
+be *excluded* beside inclusions (`{"item": 1, "_id": 0}`), because `_id` is
+included by default and this is how to turn that off. The other direction,
+`{"_id": 1, "note": 0}`, is refused — `a projection cannot mix inclusion and
+exclusion (except excluding _id)` — since an exclusion projection already
+keeps `_id`, and naming it adds an inclusion to a list of exclusions.
+Projection reaches nested paths (`"a.b": 1`).
+
+A value is read as a flag, not as the literal `0` or `1`: any non-zero number
+or `true` includes, `0`, `0.0` and `false` exclude, and a string, `null`, an
+array or a document is refused `400` — `projection value for "x" must be 0 or
+1`. A document whose key is an operator — `{"items": {"$slice": 3}}`,
+`{"items": {"$elemMatch": {…}}}` — is refused by name: `projection operator
+$slice is not supported for "items"; a projection value must be 0 or 1`. There
+are no projection operators; reshape an array in an
+[aggregation](aggregation.md) pipeline, where `$slice` exists as an expression.
+
+**`$` in a find projection path is not the positional operator.** A projection
+path is read literally, so `{"items.$": 1}` names a field called `$` inside
+`items`, finds none, and projects nothing: the request succeeds and the field
+is simply absent from the result. The refusal of `$` under [positional
+updates](#positional-updates) is a rule about *update* paths and does not
+reach projections.
 
 ---
 

@@ -75,6 +75,22 @@ that the one-transaction sync batch of 0.20.0 had moved rather than removed.
   and every documented request were audited and send none. Found by a test
   round against a three-member cluster running 0.20.0. ADR-124.
 
+- **`describe?sample=0` is refused.** `GET .../describe` answered `sample=0`
+  with `200 {"sampled": 1}`, clamping a value the specification declares
+  `minimum: 1` where every other query parameter a route cannot honour is a
+  `400`. It is now `400 bad_request` naming the parameter and the minimum. A
+  value above 1,000 is still clamped to 1,000, which the reference and the
+  specification now both say. Found by a test round against a three-member
+  cluster running 0.20.0.
+
+- **A projection operator is refused by name.** `{"items": {"$slice": 3}}`
+  or `$elemMatch` in a projection was refused with `projection value for
+  "items" must be 0 or 1`, which told a reader porting a query nothing about
+  why. The message now names it — `projection operator $slice is not
+  supported for "items"; a projection value must be 0 or 1` — and the
+  reference states the rule the value is read by. Status and code are
+  unchanged. Found by the same test round.
+
 ### Fixed
 
 - **A replayed index definition the replica could not build wedged
@@ -138,6 +154,15 @@ that the one-transaction sync batch of 0.20.0 had moved rather than removed.
   one with documents on any member, and a restart re-processes up to a
   second of the stream, which is safe because embedding is idempotent and
   every other outcome is re-derived from what is stored. ADR-125.
+
+- **`DELETE .../docs/{id}` reports the tombstone's stamp.** Every write
+  reports the version it produced, and `POST .../delete` of one document
+  did, but the by-id delete answered `{"deleted": 1}` alone — the one write
+  a client could not follow with the version it had just made. It now
+  carries `stamp` exactly when `deleted` is 1; a missing document is still
+  `{"deleted": 0}`. Additive, so a client that ignores the field sees no
+  change. Found by a test round against a three-member cluster running
+  0.20.0.
 
 
 ## 0.20.0 - 2026-09-02

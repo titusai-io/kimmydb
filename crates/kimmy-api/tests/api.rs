@@ -2578,6 +2578,42 @@ async fn describe_reports_the_node_durability_class() {
     assert_eq!(version.body["durability"], "coalesced", "one fact, two routes");
 }
 
+#[tokio::test]
+async fn describe_refuses_a_zero_sample_and_clamps_a_large_one() {
+    // `sample=0` used to answer `200 {"sampled": 1}` — a clamp that
+    // substituted a request the caller never made, against a specification
+    // declaring `minimum: 1`. Found by a test round against a three-member
+    // cluster running 0.20.0.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    for n in 0..3 {
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id": n, "n": n})).await;
+    }
+
+    let res = server.get("/v1/db/shop/coll/c/describe?sample=0", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    let message = res.body["message"].as_str().unwrap();
+    assert!(message.contains("`sample`"), "names the parameter: {message}");
+    assert!(message.contains("at least 1"), "states the minimum: {message}");
+
+    // One is the smallest sample there is.
+    let res = server.get("/v1/db/shop/coll/c/describe?sample=1", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["sampled"], 1);
+
+    // Above the ceiling is clamped, not refused: the caller asked for as
+    // many as the server will read, and three is all there are.
+    let res = server.get("/v1/db/shop/coll/c/describe?sample=5000", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["sampled"], 3);
+
+    // A value the parameter cannot hold at all is the ordinary parse refusal.
+    let res = server.get("/v1/db/shop/coll/c/describe?sample=-1", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+}
+
 /// Concurrent `$inc`s on one document must all land.
 ///
 /// Multi-threaded on purpose: the defect this pins was a read transaction
@@ -2667,6 +2703,46 @@ async fn a_read_by_id_carries_its_stamp_as_an_etag_and_find_can_return_stamps() 
         version.body
     );
     assert_eq!(version.body["durability"], "durable", "the class is queryable (ADR-088)");
+}
+
+#[tokio::test]
+async fn a_delete_by_id_reports_the_tombstone_stamp() {
+    // Every write reports the version it produced, and `POST .../delete` of
+    // one document already did; the by-id route answered `{"deleted": 1}`
+    // alone. Found by a test round against a three-member cluster running
+    // 0.20.0.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1,"n":0})).await;
+
+    let read = server.get("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    let before = read.header("etag").expect("a read by id carries an ETag");
+    let before = before.trim_matches('"').to_string();
+
+    let res = server.delete("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["deleted"], 1, "{:?}", res.body);
+    let stamp = stamp_of(&res.body);
+    let decoded = kimmy_core::Stamp::decode(&stamp).expect("the stamp parses");
+    assert_ne!(stamp, before, "the tombstone is a new version, not the one deleted");
+    assert!(decoded > kimmy_core::Stamp::decode(&before).unwrap(), "and a later one");
+
+    // Nothing to delete, nothing produced: `deleted` is 0 and there is no
+    // stamp to report — the field is present exactly when `deleted` is 1.
+    let res = server.delete("/v1/db/shop/coll/c/docs/1", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body, json!({"deleted": 0}));
+
+    // The conditional form reports it too.
+    let inserted =
+        server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":2,"n":0})).await;
+    let current = stamp_of(&inserted.body);
+    let res =
+        server.delete(&format!("/v1/db/shop/coll/c/docs/2?if_stamp={current}"), Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["deleted"], 1);
+    assert_ne!(stamp_of(&res.body), current);
 }
 
 #[tokio::test]

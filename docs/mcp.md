@@ -239,8 +239,9 @@ Points worth understanding:
 - **`presence` is a fraction of the sample, not of the collection**, and counts
   *documents* — a field absent from the sample may still exist. It is inference,
   not a schema, and nothing here is enforced.
-- **Recursion is bounded** at six levels, so one pathological document cannot
-  produce a field list longer than the documents it describes.
+- **Recursion is bounded**: fields are expanded six levels below the top-level
+  ones, so a path has at most seven components and one pathological document
+  cannot produce a field list longer than the documents it describes.
 - **`nodeDurability` is about the node, not the collection**: `durable` or
   `coalesced`, the class the node that answered commits under, the same value
   `GET /v1/version` reports. Both are durable when a write returns; it is here

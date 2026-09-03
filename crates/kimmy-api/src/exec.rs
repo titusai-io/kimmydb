@@ -873,8 +873,16 @@ pub fn delete_by_id(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let doc_id = parse_id(id)?;
     let expected = parse_if_stamp(if_stamp)?;
-    let deleted = state.engine.delete_if(&meta, &doc_id, expected)?;
-    Ok(json!({ "deleted": u8::from(deleted) }))
+    // The tombstone's stamp, reported as every other write reports the
+    // version it produced (ADR-084): `POST .../delete` of one document
+    // already did, and a by-id delete that said only `{"deleted": 1}` was the
+    // one write a client could not follow with the version it made.
+    let stamp = state.engine.delete_if(&meta, &doc_id, expected)?;
+    let mut body = json!({ "deleted": u8::from(stamp.is_some()) });
+    if let Some(stamp) = stamp {
+        body["stamp"] = json!(stamp.encode());
+    }
+    Ok(body)
 }
 
 /// A filtered write's parameters, mirroring [`FindParams`].

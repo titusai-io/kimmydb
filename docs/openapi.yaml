@@ -1260,7 +1260,10 @@ paths:
           in: query
           required: false
           schema: { type: integer, minimum: 1 }
-          description: Documents to sample. Defaults to a bounded sample.
+          description: |
+            Documents to sample. Defaults to 100. `0` is refused `400`
+            naming the parameter; a value above 1000 is clamped to 1000, and
+            `sampled` in the answer is how many were actually read.
         - name: examples
           in: query
           required: false
@@ -1852,7 +1855,11 @@ paths:
             `409 stale` and nothing is written.
       responses:
         "200":
-          description: 1 if a document was deleted, 0 if there was none.
+          description: |
+            1 if a document was deleted, 0 if there was none — a count, not
+            an error either way. When one was, `stamp` is the tombstone's
+            version, as every write reports the version it produced
+            (ADR-084).
           content:
             application/json:
               schema:
@@ -1862,6 +1869,11 @@ paths:
                   deleted:
                     type: integer
                     enum: [0, 1]
+                  stamp:
+                    allOf: [{ $ref: "#/components/schemas/Stamp" }]
+                    description: |
+                      The tombstone's version — what `POST .../delete` of one
+                      document reports. Present exactly when `deleted` is 1.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

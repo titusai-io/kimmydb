@@ -116,6 +116,17 @@ pub fn parse_projection(doc: &Document) -> Result<Option<Projection>> {
         let keep = match flag {
             Bson::Int32(0) | Bson::Int64(0) | Bson::Double(0.0) | Bson::Boolean(false) => false,
             Bson::Int32(_) | Bson::Int64(_) | Bson::Double(_) | Bson::Boolean(true) => true,
+            // `{items: {$slice: 3}}`, `{items: {$elemMatch: {...}}}`: a
+            // projection operator, which this projection language does not
+            // have. Named, so the refusal says what was asked for rather than
+            // leaving a reader to work out why an object is not "0 or 1".
+            Bson::Document(spec) if spec.keys().any(|k| k.starts_with('$')) => {
+                let operator = spec.keys().find(|k| k.starts_with('$')).expect("checked");
+                return Err(Error::InvalidQuery(format!(
+                    "projection operator {operator} is not supported for {path:?}; \
+                     a projection value must be 0 or 1"
+                )));
+            }
             _ => {
                 return Err(Error::InvalidQuery(format!(
                     "projection value for {path:?} must be 0 or 1"
@@ -327,6 +338,55 @@ mod tests {
         assert!(parse_projection(&doc! { "a": 1, "b": 0 }).is_err());
         // ...except for _id, which is the documented exception.
         assert!(parse_projection(&doc! { "a": 1, "_id": 0 }).is_ok());
+    }
+
+    #[test]
+    fn a_projection_operator_is_refused_by_name() {
+        // A client porting `$slice` or `$elemMatch` should be told which
+        // operator is missing, not that an object "must be 0 or 1".
+        let err = parse_projection(&doc! { "items": { "$slice": 3 } }).unwrap_err().to_string();
+        assert!(err.contains("projection operator $slice is not supported"), "{err}");
+        assert!(err.contains("\"items\""), "names the path: {err}");
+        assert!(err.contains("must be 0 or 1"), "and still states the rule: {err}");
+
+        let err = parse_projection(&doc! { "items": { "$elemMatch": { "qty": 1 } } })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("projection operator $elemMatch is not supported"), "{err}");
+
+        // A value that is neither a flag nor an operator keeps the plain
+        // message: there is no operator to name.
+        let err = parse_projection(&doc! { "items": "yes" }).unwrap_err().to_string();
+        assert_eq!(err, "invalid query: projection value for \"items\" must be 0 or 1");
+        let err = parse_projection(&doc! { "items": { "nested": 1 } }).unwrap_err().to_string();
+        assert!(err.contains("must be 0 or 1") && !err.contains("operator"), "{err}");
+    }
+
+    #[test]
+    fn projection_values_are_read_as_flags_not_as_the_literals_0_and_1() {
+        // Any non-zero number or `true` includes; 0, 0.0 and `false` exclude;
+        // everything else is refused. Documented in query-language.md, so a
+        // change here is a change there.
+        assert_eq!(
+            parse_projection(&doc! { "a": 2, "b": true, "c": 1.5 }).unwrap(),
+            Some(Projection::Include(vec!["a".into(), "b".into(), "c".into(), "_id".into()]))
+        );
+        assert_eq!(
+            parse_projection(&doc! { "a": 0.0, "b": false }).unwrap(),
+            Some(Projection::Exclude(vec!["a".into(), "b".into()]))
+        );
+        for bad in [doc! { "a": "1" }, doc! { "a": Bson::Null }, doc! { "a": [1] }] {
+            assert!(parse_projection(&bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn the_id_exception_is_one_directional() {
+        // `_id: 0` may sit beside inclusions; `_id: 1` beside exclusions is
+        // still a mix and is refused.
+        assert!(parse_projection(&doc! { "_id": 0, "note": 1 }).is_ok());
+        let err = parse_projection(&doc! { "_id": 1, "note": 0 }).unwrap_err().to_string();
+        assert!(err.contains("cannot mix inclusion and exclusion"), "{err}");
     }
 
     #[test]

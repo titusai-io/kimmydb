@@ -27,6 +27,9 @@ use crate::state::{Auth, SharedState};
 /// documents, small enough that describing a collection is not itself a scan
 /// worth worrying about.
 pub const DEFAULT_SAMPLE: usize = 100;
+/// The most documents one `describe` will read. A larger `sample` is clamped
+/// here rather than refused, as `find` clamps `limit`: the caller asked for
+/// "as many as you will give me", and this is the answer.
 pub const MAX_SAMPLE: usize = 1_000;
 
 /// Nesting depth beyond which paths are not expanded.
@@ -35,6 +38,24 @@ pub const MAX_SAMPLE: usize = 1_000;
 /// longer than the documents it describes — and an agent reading it would spend
 /// its context on structure it will never query.
 const MAX_DEPTH: usize = 6;
+
+/// How many documents to read for a requested `sample`.
+///
+/// `0` is refused rather than clamped to one: a sample of nothing cannot
+/// describe anything, and answering `{"sampled": 1}` to `sample=0` — which a
+/// build before this did — silently substituted a request the caller never
+/// made. The specification declares `minimum: 1`, and the rule for a query
+/// parameter the route cannot honour is `400` naming it. Above `MAX_SAMPLE`
+/// is clamped, as documented.
+fn sample_limit(requested: Option<usize>) -> Result<usize, ApiError> {
+    match requested {
+        None => Ok(DEFAULT_SAMPLE),
+        Some(0) => Err(ApiError::bad_request(
+            "query parameter `sample` must be at least 1: a sample of no documents describes nothing",
+        )),
+        Some(n) => Ok(n.min(MAX_SAMPLE)),
+    }
+}
 
 /// A field observed in the sample.
 struct FieldStats {
@@ -55,7 +76,7 @@ pub fn describe_collection(
     include_examples: bool,
 ) -> Result<Value, ApiError> {
     let meta = authorize(state, auth, Action::Read, db, coll)?;
-    let limit = sample_size.unwrap_or(DEFAULT_SAMPLE).clamp(1, MAX_SAMPLE);
+    let limit = sample_limit(sample_size)?;
 
     let mut fields: BTreeMap<String, FieldStats> = BTreeMap::new();
     let mut sampled = 0usize;
@@ -328,6 +349,17 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_sample_is_refused_and_a_large_one_is_clamped() {
+        assert_eq!(sample_limit(None).unwrap(), DEFAULT_SAMPLE);
+        assert_eq!(sample_limit(Some(1)).unwrap(), 1);
+        assert_eq!(sample_limit(Some(MAX_SAMPLE + 1)).unwrap(), MAX_SAMPLE);
+        let err = sample_limit(Some(0)).unwrap_err();
+        assert_eq!(err.status, axum::http::StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("`sample`"), "names the parameter: {}", err.message);
+        assert!(err.message.contains("at least 1"), "states the minimum: {}", err.message);
+    }
+
+    #[test]
     fn recursion_is_bounded() {
         // A self-similar document must not produce an unbounded field list.
         let mut doc = doc! { "leaf": 1 };
@@ -336,7 +368,10 @@ mod tests {
         }
         let fields = observed(&[doc]);
         let deepest = fields.keys().map(|k| k.matches('.').count()).max().unwrap();
-        assert!(deepest <= MAX_DEPTH + 1, "depth {deepest} escaped the bound");
+        // Exactly `MAX_DEPTH` dots: the top-level field plus six levels below
+        // it, seven components, which is what the reference promises. A
+        // looser bound would let an eighth level through unnoticed.
+        assert_eq!(deepest, MAX_DEPTH, "depth {deepest} is not the documented bound");
     }
 
     #[test]

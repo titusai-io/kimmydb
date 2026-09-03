@@ -451,21 +451,27 @@ impl Engine {
     /// arrives from a peer later; removing the key outright would make that
     /// insert look brand new and silently undo the delete.
     pub fn delete(&self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
-        self.delete_where(coll, id, |_, _| Ok(true))
+        Ok(self.delete_where(coll, id, |_, _| Ok(true))?.is_some())
     }
 
-    /// [`Engine::delete`], conditional on the document's current version.
+    /// [`Engine::delete`], conditional on the document's current version,
+    /// answering with the tombstone's stamp.
     ///
     /// The same contract as [`Engine::replace_if`]: a different version, or
     /// no live document, writes nothing and returns [`StorageError::Stale`].
+    /// Without a condition a missing document is not an error and the answer
+    /// is `None`. The stamp is the version the delete produced — what a
+    /// caller reports as `stamp`, the way every other write does (ADR-084);
+    /// the filter route already had it from `modify_where`, and this is the
+    /// by-id route's way to the same fact.
     pub fn delete_if(
         &self,
         coll: &CollectionMeta,
         id: &DocId,
         expected: Option<Stamp>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Stamp>> {
         let Some(expected) = expected else {
-            return self.delete(coll, id);
+            return self.delete_where(coll, id, |_, _| Ok(true));
         };
         // The absent case is decided here rather than in the guard, which
         // only ever sees a live document.
@@ -476,8 +482,8 @@ impl Engine {
                 Err(StorageError::Stale { current: Some(current) })
             }
         })? {
-            true => Ok(true),
-            false => Err(StorageError::Stale { current: None }),
+            Some(stamp) => Ok(Some(stamp)),
+            None => Err(StorageError::Stale { current: None }),
         }
     }
 
@@ -497,7 +503,7 @@ impl Engine {
         id: &DocId,
         guard: impl Fn(&Document) -> bool,
     ) -> Result<bool> {
-        self.delete_where(coll, id, |_, doc| Ok(guard(doc)))
+        Ok(self.delete_where(coll, id, |_, doc| Ok(guard(doc)))?.is_some())
     }
 
     /// One delete body, shared by `delete`, `delete_if` and `delete_guarded`:
@@ -508,12 +514,15 @@ impl Engine {
     /// transaction. `Ok(false)` declines quietly — nothing is written and no
     /// oplog entry is minted, so a refused expiry is invisible to replication
     /// and to change streams. An error aborts the same way and is returned.
+    ///
+    /// Answers with the tombstone's stamp when a document was removed, and
+    /// `None` when there was nothing to remove or the guard declined.
     fn delete_where(
         &self,
         coll: &CollectionMeta,
         id: &DocId,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Stamp>> {
         let key = doc_key(id)?;
         let stamp = self.next_stamp();
 
@@ -530,14 +539,14 @@ impl Engine {
             let Some(image) = previous.as_ref() else {
                 drop(docs);
                 txn.abort()?;
-                return Ok(false);
+                return Ok(None);
             };
             match guard(current, image) {
                 Ok(true) => {}
                 Ok(false) => {
                     drop(docs);
                     txn.abort()?;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(e) => {
                     drop(docs);
@@ -556,7 +565,6 @@ impl Engine {
         // would surface a candidate whose document no longer exists. A delete
         // writes no new image, so it can never flip the multikey flag.
         index::maintain(&txn, coll, previous.as_ref(), None, &key)?;
-        let existed = true;
 
         let entry = OplogEntry {
             stamp,
@@ -569,7 +577,7 @@ impl Engine {
         txn.commit()?;
         self.publish(vec![entry]);
 
-        Ok(existed)
+        Ok(Some(stamp))
     }
 
     // -----------------------------------------------------------------------
@@ -1950,12 +1958,15 @@ mod tests {
         assert_eq!(engine.commits() - before, 0);
         assert!(engine.get(&coll, &id).unwrap().is_some(), "a stale delete removes nothing");
 
-        assert!(engine.delete_if(&coll, &id, Some(second)).unwrap());
+        // The answer is the tombstone's version: newer than the one the
+        // condition named, and what the by-id route reports as `stamp`.
+        let tombstone = engine.delete_if(&coll, &id, Some(second)).unwrap().expect("deleted");
+        assert!(tombstone > second, "a delete moves the stamp");
         assert!(engine.get(&coll, &id).unwrap().is_none());
 
         // Gone now: expecting any version of it is stale, while an
-        // unconditional delete of a missing document is an ordinary `false`.
+        // unconditional delete of a missing document is an ordinary `None`.
         assert_eq!(stale_of(engine.delete_if(&coll, &id, Some(second)).unwrap_err()), None);
-        assert!(!engine.delete_if(&coll, &id, None).unwrap());
+        assert!(engine.delete_if(&coll, &id, None).unwrap().is_none());
     }
 }
