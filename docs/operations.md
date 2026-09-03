@@ -378,7 +378,8 @@ database is taken out of rotation rather than served traffic it cannot handle.
 
 Unauthenticated, like the health endpoints, and deliberately **counts only** —
 exposing collection *names* would leak your schema to anything that can reach the
-port.
+port. The table is grouped by topic rather than in the order `/metrics` emits
+the series; every series the endpoint exposes has a row.
 
 | Series | |
 |---|---|
@@ -387,6 +388,12 @@ port.
 | `kimmy_runtime_stall_seconds` | Worst delay a 250 ms timer on the async runtime saw since the last scrape, then reset. Tens of milliseconds is normal jitter; whole seconds means a worker thread was blocked — the storage lock or an fsync — and peers may have marked this node down in the meantime. **Alert on this** at 1 s |
 | `kimmy_embed_provider_requests_total` | Embedding provider calls answered — documents embedded by the worker and search queries embedded for `vector_search`/`hybrid_search` alike. Compare with the provider's own request count. One call carries many documents ([ADR-095](decisions.md)), so `kimmy_embed_chunks_total` over this is the batch size the worker is achieving; there is no separate batch-size series |
 | `kimmy_embed_provider_tokens_total` | Input tokens the provider reported billing for (`usage.prompt_tokens` and equivalents). The number a metered provider's invoice is made of; zero for providers that report none |
+| `kimmy_embed_documents_total` | Documents whose vectors this node wrote |
+| `kimmy_embed_chunks_total` | Provider inputs embedded — the closest proxy for provider spend. Over `kimmy_embed_provider_requests_total` it is the batch size the worker is achieving |
+| `kimmy_embed_deferred_total` | Documents written on another node that this node held for a later re-check rather than embedding on arrival |
+| `kimmy_embed_skipped_not_owned_total` | Documents this node dropped un-embedded because another node owns embedding for the collection ([Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster)). Each is a duplicate provider call not made: before ownership, every member embedded every document, and on a three-member cluster that was three calls for one |
+| `kimmy_embed_failures_total` | Failed provider calls, counting each retry. Climbing while `kimmy_embed_documents_total` stays flat is a provider outage |
+| `kimmy_embed_provider_errors_total{kind}` | Provider calls that failed before any response, by what failed: `connect` (DNS, TCP, TLS), `timeout`, `reset` (the far side closed an open connection), `other`. Where `kimmy_embed_failures_total` says a call failed, this says at which layer |
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
 | `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
@@ -397,8 +404,16 @@ port.
 | `kimmy_rate_limited_total` | Refused by a rate limit — the login limiters and the per-principal one together |
 | `kimmy_rate_limited_principal_total` | The part of that total refused by `server.rate_limit.per_principal`; the difference is the login limiters. Zero until the limit is set. A legitimate client appearing here is the measurement the number was waiting for ([ADR-099](decisions.md)) |
 | `kimmy_unique_violations` | Constraints broken by merging replicated writes |
+| `kimmy_fsyncs` | Times the disk was asked to make something durable: one per commit under `durable`, one per shared flush under `coalesced`. Equal to `kimmy_commits` under `durable`; under `coalesced` the gap between the two is what the class buys ([Storage](storage.md#durability-classes)) |
+| `kimmy_commits_grouped_total` | Commits made durable by a shared flush rather than an fsync of their own. Zero under `durable` |
 | `kimmy_commits` | Durable write transactions committed. redb has a single writer and every commit is an fsync, so this over `kimmy_requests_total` is what a write *costs* — a client-visible write that takes two commits costs twice one that takes one, and no latency figure tells you which is happening. This is the number that explained the daemon-versus-engine write gap; see [Benchmarks](benchmarks.md). On a replica a sync batch is one commit per run of document entries, not one per document (ADR-119), so a replica's commit rate is not its document rate — `applied` on the `cluster.sync` span is. End to end, a replicated batch costs a member one commit per run plus one embedding-worker position checkpoint per second while entries are arriving (ADR-125); before ADR-125 the worker checkpointed once per entry, on every member, and a replica's commit rate *was* its document rate — a 1,000-document bulk that converged in 3–5 s was followed by about 75 s of committing at ~18/s on every member |
 | `kimmy_backups_total` | Backups served |
+| `kimmy_ttl_expired_total` | Documents deleted by a TTL index |
+| `kimmy_ttl_skipped_total` | Expiry candidates the pass declined because the document was refreshed between the scan and the delete — a session heartbeat landing while the pass ran ([TTL indexes](indexes.md#ttl-indexes--expiring-documents)) |
+| `kimmy_webhook_deliveries_total{outcome}` | Webhook delivery attempts, `delivered` or `failed` |
+| `kimmy_webhook_events_total` | Change events pushed to endpoints |
+| `kimmy_webhook_subscriptions{state}` | Registered subscriptions as this node sees the registry: `active`, or `invalidated` after falling too far behind ([Webhooks](webhooks.md)) |
+| `kimmy_webhook_backlog_seconds` | Age of the oldest undelivered event across the subscriptions this node owns. Climbing means an endpoint this node delivers to is not taking events, and how long it has not been |
 | `kimmy_cluster_members` | Peers SWIM currently considers alive; 0 with clustering off. A formed three-node cluster reads 2 on every node |
 | `kimmy_replication_lag_seconds` | How far **behind in time** this node is: seconds since the newest entry it has applied from an origin a peer holds newer entries of, worst peer in the last sync round ([ADR-122](decisions.md)). **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch — a node thirty seconds into draining one reads about 30, and keeps climbing until it is through. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero — **and a round that fails does not move it either**: only a round that completed can measure how far behind it left the node, so a peer this node fails against every time reads as whatever the last good round said, usually 0. Pair it with `kimmy_sync_failures_total`, which is what rises in that case. Measured against what this node has processed rather than what it could re-serve, or entries it correctly discarded would pin it non-zero forever ([ADR-054](decisions.md)). One reading to know about: an origin that was quiet for hours and then writes once shows the length of that silence for one round on each peer, until the entry is pulled. Compares a peer's entry timestamps against this node's clock, so member clock skew shifts it by the skew — a peer running ahead makes it under-read |
 | `kimmy_sync_failures_total` | Anti-entropy rounds against a peer that failed, any cause: unreachable, handshake refused, a batch this node could not apply. **Alert on this** rising while `kimmy_replication_lag_seconds` sits at 0 — that pairing was exactly a silent wedge observed on a three-member cluster running 0.20.0, where a replayed index definition failed every round against one peer for the life of the process, the lag gauge read 0 throughout, and `/v1/topology` showed every member live ([ADR-123](decisions.md)). A peer rebooting produces a handful; a peer that never recovers produces one per backoff interval, up to every 300 s |
@@ -412,8 +427,8 @@ Counters render at zero before their first event, so a dashboard shows "nothing
 has gone wrong yet" rather than "no data".
 
 The two absences ADR-043 recorded — latency histograms and oplog lag — are
-filled by the last two rows, each on the terms that kept it out
-([ADR-046](decisions.md)).
+filled by `kimmy_request_duration_seconds` and `kimmy_replication_lag_seconds`,
+each on the terms that kept it out ([ADR-046](decisions.md)).
 
 ### Tracing
 

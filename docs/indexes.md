@@ -258,6 +258,7 @@ re-applied regardless.
 | `$ne` `$nin` `$not` | Describe what a document is *not* — no bounded range |
 | `$exists` `$regex` `$size` `$all` `$elemMatch` | Cannot be turned into a key range safely |
 | `$mod` | A remainder is not a range — every fourth key is not a contiguous run of them |
+| The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
 
 `$in` **is planned**, as a union of point probes — one per distinct value,
 deduplicated on the encoded key so `[5, 5.0]` probes once, each probe carrying
@@ -267,10 +268,12 @@ of these", which a union of index probes can answer. The probes are
 equalities, so they are sound on a multikey index — a document whose array
 holds two listed values is found by both probes, and the merge that reads
 them sees its key twice in a row and takes it once. `explain` reports the
-shape as `"strategy": "indexUnion"` with a
-`"probes"` count. An empty `$in` list plans an empty union: zero probes,
-zero candidates, no documents touched.
-| The **second end** of a two-sided range, on a **multikey** index only | See below — an array field can satisfy each bound with a *different element* |
+shape as `"strategy": "indexUnion"` with a `"probes"` count **when there are
+two or more probes**; a one-value `$in` is one probe and reports as
+`"strategy": "index"`, like the equality it is. An empty `$in` list plans an
+empty union — zero probes, zero candidates, no documents touched — and
+`explain` reports that as `"strategy": "index"` with `"documentsExamined": 0`
+and **no `probes` key**: the key appears only when there is more than one.
 
 Ranges on **descending** fields are planned like any other. The inverted
 encoding swaps which end each bound narrows — the value-space lower bound caps
@@ -529,10 +532,12 @@ and the mechanism, and it still answers ordinary queries.
   transactions, so the delete re-reads the document inside its write and
   declines if the date has moved on. Extending a session while the pass is
   running does not lose it.
-- **Changing the policy needs the index recreated.** Re-creating with the same
-  `expireAfterSeconds` is idempotent; a *different* value is a 409 rather than
-  a silent keep, because silently keeping it would leave documents living
-  longer than you just asked with a success in return.
+- **Changing the policy needs the index recreated.** Re-creating an index
+  under its existing name with an identical definition is idempotent; any
+  part differing — `expireAfterSeconds`, but equally the field list, `unique`
+  or `partialFilterExpression` — is a `409 conflict` naming what moved,
+  rather than a silent keep, because silently keeping the old TTL would leave
+  documents living longer than you just asked with a success in return.
 
 ### In a cluster
 

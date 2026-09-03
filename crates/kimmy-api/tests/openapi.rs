@@ -609,6 +609,56 @@ fn the_capability_set_is_the_documented_one() {
     }
 }
 
+/// The example under "Version and capabilities" in `docs/http-api.md` is the
+/// list the server emits, in the order it emits it.
+///
+/// The reference says that example is complete and ordered, and that a test
+/// holds it to the enum. This is that test. The list is read out of the
+/// section's first JSON block rather than searched for name by name, so a
+/// stale entry, a missing one or a reordering all fail — `conditional-writes`,
+/// `token-refresh` and `topology` were absent from the example for several
+/// releases while the specification's enum, which has its own test, was
+/// complete.
+#[test]
+fn the_capability_example_in_the_http_reference_is_the_list_the_server_emits() {
+    use kimmy_api::version::Capability;
+
+    const REFERENCE: &str = include_str!("../../../docs/http-api.md");
+
+    let section = REFERENCE
+        .split_once("## Version and capabilities")
+        .expect("http-api.md has a Version and capabilities section")
+        .1;
+    let json_block = section
+        .split_once("```json")
+        .expect("the section opens with a JSON example")
+        .1
+        .split_once("```")
+        .expect("the JSON example is closed")
+        .0;
+    let list = json_block
+        .split_once("\"capabilities\":")
+        .expect("the example carries a capabilities list")
+        .1
+        .split_once('[')
+        .expect("the list opens")
+        .1
+        .split_once(']')
+        .expect("the list closes")
+        .0;
+    let documented: Vec<&str> = list
+        .split(',')
+        .map(|entry| entry.trim().trim_matches('"'))
+        .filter(|entry| !entry.is_empty())
+        .collect();
+
+    let emitted: Vec<&str> = Capability::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(
+        documented, emitted,
+        "the capability example in docs/http-api.md is not the list the server emits, in order"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Schema validation
 // ---------------------------------------------------------------------------

@@ -234,6 +234,12 @@ are dropped — and `_id` always comes from the path, never the body.
 `200 {"matched": 0}` and nothing is written. A test built on the assumption
 that this creates the document writes nothing and passes.
 
+`DELETE` returns `{"deleted": 1, "stamp": "…"}` when it removed the document
+and `{"deleted": 0}` when there was none to remove — a count, like `PUT`, and
+not an error either way. The `stamp` is the **tombstone's** version, the one
+the delete produced, exactly as `POST .../delete` of one document reports it;
+it is present when and only when `deleted` is `1`.
+
 **Every write reports the version it produced**, as `stamp` — an opaque token
 — and a read by id carries the document's version as its `ETag`. Pass one
 back as `if_stamp` to make the next write conditional:
@@ -254,6 +260,12 @@ not "or create it". Re-read, decide again, and send a new request with the
 current stamp. This is check-then-act on one document, on one node, with no
 coordination ([ADR-084](decisions.md)); it says nothing about other nodes,
 where last-writer-wins still decides.
+
+The token is opaque, and the only place to get one is a `stamp`, `stamps` or
+`ETag` the server sent. An `if_stamp` that is not one — truncated, re-encoded,
+invented — is refused before anything is read, `400 bad_request` with the
+message `malformed stamp: pass back a stamp exactly as the server returned
+it`; it is not treated as "some other version" and answered `409 stale`.
 
 ### Find
 
@@ -384,13 +396,22 @@ curl "localhost:7878/v1/db/shop/coll/orders/describe?sample=200&examples=true" -
 
 | Query | |
 |---|---|
-| `sample` | Documents to inspect. Default 100, max 1000 |
+| `sample` | Documents to inspect. Default 100. `0` is refused `400` naming the parameter — a sample of nothing describes nothing — and a value above 1000 is clamped to 1000, as `find` clamps `limit`; `sampled` in the answer is how many were actually read |
 | `examples` | Include one example value per field |
 
 Array elements are reported under `path[]`, matching how a query on the field
 matches an *element*. `presence` is a fraction of the **sample**, counting
 documents — it is inference, not a schema, and a field missing from the sample
 may still exist.
+
+Nesting is expanded six levels below the top-level fields, so a reported path
+has at most seven components; whatever sits deeper is reported as an `object`
+or `array` at the last expanded level and not opened, which is what keeps one
+pathological document from producing a field list longer than the documents it
+describes. With `examples=true` an `example` is always a scalar: a field whose
+values are objects, arrays or `null` carries none, because the field list
+already says what they hold, and a string over 120 bytes is passed over in
+favour of a shorter occurrence.
 
 `nodeDurability` is the durability class of the node that answered —
 `durable` or `coalesced`, the same value `GET /v1/version` reports as
@@ -508,6 +529,21 @@ A duplicate against a `unique` index returns **409 `unique_violation`**. Setting
 `"enforcement": "coordinated"` returns **501** until clustering lands — a
 `local` unique index is a single-node guarantee. See [Indexes](indexes.md).
 
+**A document without the indexed field indexes as `null`**, so a unique index
+builds without complaint over documents that lack the field, and the *next*
+document that lacks it collides on `null` — `409 unique_violation` on an
+insert that named no such field. To constrain only the documents that carry
+it, create the index partial:
+`"partialFilterExpression": {"email": {"$exists": true}}`
+([partial indexes](indexes.md#partial-indexes--indexing-only-some-documents)).
+
+Creating an index under a name the collection already has is **idempotent
+when the definition is identical** and **409 `conflict`** when any part of it
+differs — the field list, `unique`, `expireAfterSeconds` or
+`partialFilterExpression` — with the message naming which part moved. Drop
+the old one first, or choose another name; the server never silently keeps
+the definition it had.
+
 Across nodes a collision is detected when the replicated write is merged, not
 prevented, and both documents stay. `GET …/violations` lists what still
 stands — counts per index, or with `?index=<name>` the colliding groups with
@@ -515,6 +551,9 @@ their documents — so the application can choose; a document deleted or
 rewritten out of the collision drops out of its group, and a group with one
 member left drops out of the report
 ([resolving a unique violation](indexes.md#resolving-a-unique-violation)).
+`?index=<name>` for an index with nothing standing — or a name no index on
+the collection has — is `200 {"index": "<name>", "count": 0, "groups": []}`,
+not a 404: the question was what collides there, and the answer is nothing.
 
 Add `"explain": true` to `find`, `count`, `update` or `delete` to see whether
 an index was used:
@@ -801,13 +840,33 @@ curl localhost:7878/v1/version
 
 ```json
 { "protocol": "v1",
-  "version": "0.1.0",
+  "version": "0.20.0",
+  "commit": "9f1c2ab",
   "node": "3e98120f-66df-4cf0-9fa0-690e3d57fcea",
-  "capabilities": ["aggregation", "backup", "bulk-insert", "change-streams",
+  "capabilities": ["aggregation", "bulk-insert", "backup", "change-streams",
                    "client-supplied-vectors", "cursor-paging", "find-and-modify",
-                   "hybrid-search", "partial-indexes", "ttl-indexes",
-                   "vector-search", "webhooks"] }
+                   "hybrid-search", "partial-indexes", "token-refresh", "topology",
+                   "ttl-indexes", "vector-search", "webhooks", "conditional-writes",
+                   "local-embeddings"],
+  "durability": "durable" }
 ```
+
+That is the complete list, in the order the server emits it. Every entry but
+one is constant for a build: `local-embeddings` is **the only conditional
+capability**, present on a build compiled with that feature and absent
+otherwise, so a `local` embedding provider is accepted on such a node and
+refused everywhere else. What each name entitles a client to is tabulated
+under `Capability` in [`openapi.yaml`](openapi.yaml), and a test holds the
+server's enum, that table and this list to one set.
+
+`commit` and `durability` are fields, not capabilities. `commit` is the short
+git commit the binary was built from — `unknown` for a build made without git,
+which is a supported build — and is for the operator staring at a
+half-upgraded cluster where two nodes claim the same `version`. `durability`
+is how this node makes a commit durable, `durable` or `coalesced`; both are
+durable when a write returns, and the value is a fact about the node's
+configuration rather than its build, which is why it is not in the capability
+list ([Storage](storage.md#durability-classes), [ADR-088](decisions.md)).
 
 **Branch on `capabilities`, not on `version`.** A version number only answers
 "can I use this" if the client also carries a table mapping versions to
@@ -815,10 +874,6 @@ features — the table this endpoint replaces. Nodes are upgraded one at a time,
 so a client that fails over between nodes can reach an older node right after a
 newer one; the answer describes *the node that answered* and is worth caching
 per node.
-
-`local-embeddings` appears only on a build compiled with that feature, which is
-what makes this a question rather than a constant: a `local` provider is
-accepted on such a node and refused everywhere else.
 
 Unauthenticated, so a client can negotiate before it holds a token. It names no
 database, collection or user.
@@ -843,15 +898,16 @@ failure cannot appear without its retry class being decided in the same commit.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse ([ADR-121](decisions.md)) |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it |
 | 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
 | 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |
-| 409 | `conflict` | no | Collection exists; last user; self-deletion |
+| 409 | `conflict` | no | Collection exists; an index name already taken by a different definition; last user; self-deletion |
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
-| 409 | `no_vectors` | no | A search against a collection whose vectors were never ingested. A refusal rather than an empty result, which would be indistinguishable from "nothing matched" |
+| 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
+| 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above: the two are different questions, and [Vectors](vectors.md#search) puts them side by side |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |

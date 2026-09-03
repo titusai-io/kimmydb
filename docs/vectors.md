@@ -380,10 +380,17 @@ pre-computed one. A `byo` collection must send `vector` — the server has no
 provider to embed the query with, and says so rather than returning an empty
 result that looks like "no matches".
 
-A collection with **no vectors stored at all** is refused with `409 no_vectors`
-rather than returning an empty result. Those two are indistinguishable to a
-caller, and the difference is between refining a query forever and learning that
-ingestion never happened.
+Two refusals look alike from a distance and answer different questions. A
+collection with **no vector configuration** — `POST …/vector` was never called
+on it — is refused **`400 bad_request`**, and the message names that route:
+no search can succeed there, however many documents it holds, until embedding
+is enabled. A collection that **is configured but has no vectors stored** —
+ingestion never ran, or has not caught up — is refused **`409 no_vectors`**
+rather than answered with an empty result: an empty result and "nothing
+matched" are indistinguishable to a caller, and the difference is between
+refining a query forever and learning that ingestion never happened. The first
+is fixed by configuring the collection; the second by letting the worker catch
+up or, on a `byo` collection, by supplying vectors.
 
 `filter` is an ordinary query-language document. It runs first, and its matching
 ids restrict the search — which is what lets semantic search compose with
