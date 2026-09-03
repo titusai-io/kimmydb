@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use axum::extract::{ConnectInfo, Path, Query, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
@@ -14,7 +14,7 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::error::ApiError;
 use crate::exec;
-use crate::json::JsonBody;
+use crate::json::{JsonBody, QueryParams};
 use crate::limits::RequestLimits;
 use crate::ratelimit::{self, Decision};
 use crate::state::{Auth, SharedState};
@@ -537,6 +537,7 @@ async fn readyz(State(state): State<SharedState>) -> Result<Json<Value>, ApiErro
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LoginRequest {
     user: String,
     password: String,
@@ -734,6 +735,7 @@ async fn list_collections(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateCollectionRequest {
     name: String,
 }
@@ -794,7 +796,7 @@ async fn bulk_insert_docs(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FindRequest {
     filter: Option<Value>,
     sort: Option<Value>,
@@ -825,7 +827,7 @@ impl From<FindRequest> for exec::FindParams {
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct FindQuery {
     limit: Option<usize>,
     skip: Option<usize>,
@@ -835,7 +837,7 @@ async fn find_docs(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Query(q): Query<FindQuery>,
+    QueryParams(q): QueryParams<FindQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let params = exec::FindParams { limit: q.limit, skip: q.skip, ..Default::default() };
     Ok(Json(exec::find(&state, &auth, &db, &coll, params)?))
@@ -860,6 +862,7 @@ async fn count_docs(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AggregateRequest {
     pipeline: Value,
 }
@@ -916,7 +919,7 @@ async fn get_doc(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ReplaceQuery {
     upsert: bool,
     /// Replace only if the document is at this stamp.
@@ -927,7 +930,7 @@ async fn replace_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
-    Query(q): Query<ReplaceQuery>,
+    QueryParams(q): QueryParams<ReplaceQuery>,
     JsonBody(body): JsonBody<Value>,
 ) -> Result<Json<Value>, ApiError> {
     let params = exec::ReplaceParams { upsert: q.upsert, if_stamp: q.if_stamp };
@@ -935,7 +938,7 @@ async fn replace_doc(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct DeleteQuery {
     /// Delete only if the document is at this stamp.
     if_stamp: Option<String>,
@@ -945,12 +948,13 @@ async fn delete_doc(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll, id)): Path<(String, String, String)>,
-    Query(q): Query<DeleteQuery>,
+    QueryParams(q): QueryParams<DeleteQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::delete_by_id(&state, &auth, &db, &coll, &id, q.if_stamp.as_deref())?))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct FindAndModifyRequest {
     #[serde(default)]
     filter: Option<Value>,
@@ -1009,6 +1013,7 @@ async fn find_and_modify(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct UpdateRequest {
     #[serde(default)]
     filter: Option<Value>,
@@ -1043,6 +1048,7 @@ async fn update_docs(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct DeleteRequest {
     #[serde(default)]
     filter: Option<Value>,
@@ -1077,7 +1083,7 @@ async fn delete_docs(
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct DescribeQuery {
     sample: Option<usize>,
     /// Include one example value per field.
@@ -1088,7 +1094,7 @@ async fn describe_collection(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Query(q): Query<DescribeQuery>,
+    QueryParams(q): QueryParams<DescribeQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(crate::schema::describe_collection(&state, &auth, &db, &coll, q.sample, q.examples)?))
 }
@@ -1103,6 +1109,7 @@ async fn describe_collection(
 /// decides which queries a compound index can answer, and JSON object key
 /// order is not something a client can rely on surviving serialization.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct IndexFieldSpec {
     path: String,
     #[serde(default)]
@@ -1110,6 +1117,7 @@ struct IndexFieldSpec {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateIndexRequest {
     fields: Vec<IndexFieldSpec>,
     #[serde(default)]
@@ -1160,7 +1168,7 @@ async fn list_indexes(
 }
 
 #[derive(Deserialize, Default)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct ViolationsQuery {
     /// Name the index to get its colliding groups rather than counts.
     index: Option<String>,
@@ -1170,7 +1178,7 @@ async fn list_violations(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    Query(q): Query<ViolationsQuery>,
+    QueryParams(q): QueryParams<ViolationsQuery>,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(exec::violations(&state, &auth, &db, &coll, q.index.as_deref())?))
 }

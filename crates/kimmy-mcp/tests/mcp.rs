@@ -867,6 +867,59 @@ async fn a_malformed_filter_is_reported_to_the_caller() {
 }
 
 #[tokio::test]
+async fn an_argument_the_tool_does_not_define_is_refused_by_name() {
+    // ADR-121, the tool side. A model that misspells `limit` and is answered
+    // with every document has no way to notice; one told the name it used is
+    // wrong corrects itself, as it does for a rejected filter.
+    let server = Server::start().await;
+    seed(&server);
+    seed_vectors(&server);
+    let token = server.root();
+
+    // rmcp reports an argument it could not deserialize as the tool's own
+    // error result rather than a protocol error, so the text is where a
+    // model reads a tool's answer.
+    let body = server
+        .call(&token, "find", json!({"database":"sales","collection":"orders","limt":5}))
+        .await;
+    assert_eq!(body["result"]["isError"], json!(true), "an unknown argument must not run: {body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(message.contains("`limt`"), "the message must name the field: {body}");
+
+    // hybrid_search carries its search fields itself rather than flattening
+    // the vector_search arguments, because serde cannot refuse unknown fields
+    // across a flatten; this is the case that would regress if it did.
+    let body = server
+        .call(
+            &token,
+            "hybrid_search",
+            json!({"database":"sales","collection":"orders","query":"widget","min_overlp":2}),
+        )
+        .await;
+    assert_eq!(body["result"]["isError"], json!(true), "an unknown argument must not run: {body}");
+    let message = body["result"]["content"][0]["text"].as_str().unwrap_or_default();
+    assert!(message.contains("`min_overlp`"), "the message must name the field: {body}");
+
+    // The schema the model reads says so up front. A tool that takes no
+    // arguments has rmcp's empty schema rather than one of ours, and there is
+    // nothing for it to refuse.
+    let (_, listed) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    for tool in listed["result"]["tools"].as_array().unwrap() {
+        if tool["inputSchema"]["properties"].as_object().is_none_or(|p| p.is_empty()) {
+            continue;
+        }
+        assert_eq!(
+            tool["inputSchema"]["additionalProperties"],
+            json!(false),
+            "{} does not declare itself closed: {}",
+            tool["name"],
+            tool["inputSchema"]
+        );
+    }
+}
+
+#[tokio::test]
 async fn tool_results_carry_both_text_and_structured_content() {
     // Not every client renders structured content, and an answer no client
     // shows is not an answer.

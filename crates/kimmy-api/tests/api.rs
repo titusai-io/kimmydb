@@ -1161,6 +1161,303 @@ async fn a_bulk_insert_that_is_not_an_array_reports_a_stable_error_code() {
     assert!(res.body.get("error").is_some(), "every failure carries an error code: {:?}", res.body);
 }
 
+/// Every route that takes a request shape refuses a field it does not
+/// define, and says which one.
+///
+/// ADR-121. Before it, `{"limitt": 5}` on `find` answered `200` and ignored
+/// the field, while the same typo in a vector configuration was a `422`: one
+/// struct carried `deny_unknown_fields` and the rest did not. Each case below
+/// sends a valid body with one extra top-level field and expects the refusal;
+/// then, where the route is cheap to set up for, sends the same body without
+/// it and expects success — so what is being refused is shown to be the
+/// field, not the body around it.
+#[tokio::test]
+async fn a_request_field_the_route_does_not_define_is_refused_by_name() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id": 1, "qty": 5})).await;
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/vector",
+            Some(&token),
+            json!({ "fields": ["note"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server
+        .put(
+            "/v1/db/shop/coll/orders/docs/1/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a small blue widget" }]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    // (method, path, needs a token, valid body, also run without the extra
+    // field). Webhook registration is refused before its URL is checked, and
+    // a URL that passes the egress policy needs a resolvable public host,
+    // which a unit test does not get to assume.
+    let cases: Vec<(&str, &str, bool, Value, bool)> = vec![
+        ("POST", "/v1/auth/login", false, json!({"user": "root", "password": ROOT_PASSWORD}), true),
+        ("POST", "/v1/db/shop/collections", true, json!({"name": "other"}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find",
+            true,
+            json!({"filter": {"qty": 5}, "limit": 1}),
+            true,
+        ),
+        ("POST", "/v1/db/shop/coll/orders/count", true, json!({"filter": {}}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/aggregate",
+            true,
+            json!({"pipeline": [{"$match": {"qty": 5}}]}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            true,
+            json!({"filter": {"_id": 1}, "update": {"$set": {"qty": 6}}}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            true,
+            json!({"filter": {"_id": 1}, "update": {"$set": {"qty": 7}}, "returnDocument": "after"}),
+            true,
+        ),
+        ("POST", "/v1/db/shop/coll/orders/delete", true, json!({"filter": {"_id": 999}}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/indexes",
+            true,
+            json!({"fields": [{"path": "qty"}]}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/vector_search",
+            true,
+            json!({"vector": [1.0, 0.0, 0.0], "k": 1}),
+            true,
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/hybrid_search",
+            true,
+            json!({"query": "blue widget", "vector": [1.0, 0.0, 0.0], "weights": {"dense": 1.0}}),
+            true,
+        ),
+        (
+            "PUT",
+            "/v1/db/shop/coll/orders/docs/1/vectors",
+            true,
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a small blue widget" }]),
+            true,
+        ),
+        ("POST", "/v1/users", true, json!({"user": "alice", "password": "alice-password"}), true),
+        ("POST", "/v1/users/alice/password", true, json!({"password": "another-password"}), true),
+        ("POST", "/v1/users/alice/grants", true, json!({"grants": []}), true),
+        ("POST", "/v1/users/alice/disabled", true, json!({"disabled": false}), true),
+        ("POST", "/v1/users/alice/roles", true, json!({"roles": []}), true),
+        ("POST", "/v1/roles", true, json!({"name": "analyst"}), true),
+        ("POST", "/v1/roles/analyst/grants", true, json!({"grants": []}), true),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/webhooks",
+            true,
+            json!({"url": "https://hooks.example/orders"}),
+            false,
+        ),
+    ];
+
+    for (method, path, needs_token, body, run_valid) in cases {
+        let auth = needs_token.then_some(token.as_str());
+        let url = format!("{}{path}", server.base);
+
+        // An array body carries the extra field inside its first element,
+        // since the elements are the shapes.
+        let mut with_extra = body.clone();
+        match &mut with_extra {
+            Value::Array(items) => {
+                items[0]["zzz"] = json!(1);
+            }
+            other => {
+                other["zzz"] = json!(1);
+            }
+        }
+        let res = server.client.request(method, &url, auth, Some(with_extra)).await;
+        assert_eq!(res.status, 422, "{method} {path} accepted an unknown field: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+        assert_eq!(res.body["retry"], "no", "{method} {path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("unknown field `zzz`"),
+            "{method} {path} must name the field it refused: {message}"
+        );
+
+        if run_valid {
+            let res = server.client.request(method, &url, auth, Some(body)).await;
+            assert!(
+                (200..300).contains(&res.status),
+                "{method} {path} without the extra field should succeed: {} {:?}",
+                res.status,
+                res.body
+            );
+        }
+    }
+
+    // A nested request shape is closed too: the field list of an index, the
+    // weights of a hybrid search.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({"fields": [{"path": "qty", "descnding": true}]}),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("`descnding`"));
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/hybrid_search",
+            Some(&token),
+            json!({"query": "blue", "vector": [1.0, 0.0, 0.0], "weights": {"dens": 2.0}}),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert!(res.body["message"].as_str().unwrap_or_default().contains("`dens`"));
+}
+
+/// A grant inside a user or role body is closed too, and this is the case
+/// the rule exists for: `collection` defaults to `*`, so a misspelt
+/// `colection` did not drop a field — it widened the grant to every
+/// collection in the database, and the response showed a grant that looked
+/// deliberate. The persisted `Grant` stays open (it must keep reading under a
+/// later version); the request carries a closed mirror of it.
+#[tokio::test]
+async fn a_misspelt_grant_field_is_refused_rather_than_widening_the_grant() {
+    let server = Server::start().await;
+    let token = server.root().await;
+
+    let typo = json!({ "db": "shop", "colection": "orders", "actions": ["read"] });
+    let good = json!({ "db": "shop", "collection": "orders", "actions": ["read"] });
+
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "/v1/users",
+            json!({ "user": "bob", "password": "bob-password", "grants": [typo] }),
+            json!({ "user": "bob", "password": "bob-password", "grants": [good] }),
+        ),
+        ("/v1/users/bob/grants", json!({ "grants": [typo] }), json!({ "grants": [good] })),
+        (
+            "/v1/roles",
+            json!({ "name": "clerk", "grants": [typo] }),
+            json!({ "name": "clerk", "grants": [good] }),
+        ),
+        ("/v1/roles/clerk/grants", json!({ "grants": [typo] }), json!({ "grants": [good] })),
+    ];
+    for (path, with_typo, well_formed) in cases {
+        let res = server.post(path, Some(&token), with_typo).await;
+        assert_eq!(res.status, 422, "{path} accepted a misspelt grant field: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{path}: {:?}", res.body);
+        let message = res.body["message"].as_str().unwrap_or_default();
+        assert!(message.contains("unknown field `colection`"), "{path}: {message}");
+
+        let res = server.post(path, Some(&token), well_formed).await;
+        assert!(
+            (200..300).contains(&res.status),
+            "{path} well-formed: {} {:?}",
+            res.status,
+            res.body
+        );
+    }
+
+    // And what was stored is the grant that was sent, not a widened one.
+    let res = server.get("/v1/users/bob", Some(&token)).await;
+    assert_eq!(res.body["grants"][0]["collection"], "orders", "{:?}", res.body);
+}
+
+/// A query string is held to the same rule, at `400` rather than `422`: it is
+/// part of the request line, not a body the server could not process, and
+/// `400` is what axum answered before the envelope was added. Before this,
+/// `?limt=5` returned the default page and `?limit=abc` was bare text with no
+/// `error` code — the one refusal on a `GET` a client could not branch on.
+#[tokio::test]
+async fn a_query_parameter_the_route_does_not_define_is_refused_by_name() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    for id in 1..=3 {
+        server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({ "_id": id })).await;
+    }
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limt=5", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("`limt`"), "must name the parameter: {message}");
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limit=abc", Some(&token)).await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(
+        res.body["error"], "bad_request",
+        "a bad value is still in the envelope: {:?}",
+        res.body
+    );
+
+    let res = server.get("/v1/db/shop/coll/orders/docs?limit=1", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(res.body["count"], 1);
+
+    // The other query-string routes carry the same extractor.
+    for (method, path) in [
+        ("GET", "/v1/db/shop/coll/orders/describe?sampel=3"),
+        ("GET", "/v1/db/shop/coll/orders/violations?indx=x"),
+        ("PUT", "/v1/db/shop/coll/orders/docs/1?upsrt=true"),
+        ("DELETE", "/v1/db/shop/coll/orders/docs/1?ifstamp=x"),
+        ("DELETE", "/v1/db/shop/coll/orders/vector?drop=true"),
+    ] {
+        let url = format!("{}{path}", server.base);
+        let body = (method == "PUT").then(|| json!({ "_id": 1 }));
+        let res = server.client.request(method, &url, Some(&token), body).await;
+        assert_eq!(res.status, 400, "{method} {path}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{method} {path}: {:?}", res.body);
+    }
+}
+
+/// A document body is content, not a request shape, and stays open.
+///
+/// The names a request shape reserves — `filter`, `limit`, `update` — are
+/// perfectly good field names for a document, and refusing them on insert
+/// would make the store's schemalessness a lie (ADR-055).
+#[tokio::test]
+async fn a_document_body_may_carry_any_field() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+
+    let document = json!({ "_id": 1, "zzz": 1, "filter": {"a": 1}, "limit": 3, "update": [] });
+    let res = server.post("/v1/db/shop/coll/orders/docs", Some(&token), document.clone()).await;
+    assert_eq!(res.status, 200, "insert: {:?}", res.body);
+
+    let res = server
+        .put("/v1/db/shop/coll/orders/docs/1", Some(&token), json!({ "zzz": 2, "explain": true }))
+        .await;
+    assert_eq!(res.status, 200, "replace: {:?}", res.body);
+
+    let res = server
+        .post("/v1/db/shop/coll/orders/bulk", Some(&token), json!([{ "zzz": 3, "pipeline": [] }]))
+        .await;
+    assert_eq!(res.status, 200, "bulk: {:?}", res.body);
+    assert_eq!(res.body["inserted"], 1);
+}
+
 #[tokio::test]
 async fn queries_filter_sort_and_project() {
     let server = Server::start().await;

@@ -19,6 +19,31 @@ members or on disk; members of this version and 0.19.1 replicate to each other.
 
 ### Changed
 
+- **A request body with a field the route does not define is refused.**
+  `find`, `count`, `aggregate`, `update`, `delete`, `find_and_modify`, index
+  creation, collection creation, login, the user, role and webhook routes,
+  vector upload and both searches all accepted `{"limitt": 5}`, or
+  `{"explain": true}` on `aggregate`, and answered `200` having ignored it;
+  only the vector configuration route refused. Every request shape is closed
+  now: a field the reference does not list, at the top level or inside a
+  nested shape such as an index's `fields` entry or a search's `weights`, is
+  `422 bad_request`, and the message names the field and lists the ones the
+  route takes. A grant inside a user or role body is closed too, and that is
+  the case that mattered most: `collection` defaults to `*`, so a misspelt
+  `colection` was not dropped but widened the grant to every collection in
+  the database. Query strings are held to the same rule at `400`: `?limt=5`
+  on `GET .../docs` is refused by name, and `?limit=abc` — which was bare
+  text with no `error` code — is now in the envelope. Document bodies —
+  insert, replace, bulk — are content and take any field, as before.
+  **Breaking for a client that sends a field or query parameter the route
+  does not define.** The Rust, Python and Go clients, the CLI, the
+  conformance scenarios and every documented example were audited and send
+  none. The MCP tools refuse an unknown argument the same way, as the tool's
+  error result naming it, and their schemas declare
+  `additionalProperties: false`. No switch to accept and ignore is offered: a
+  field the server does not read is a request it cannot honour, and answering
+  as if it had is the bug this removes. ADR-121.
+
 - **`kimmy_replication_lag_seconds` now measures how far behind in time a
   node is, not the width of the history it lacks.** It used to be the span of
   origin timestamps between the newest entry this node had applied and the

@@ -355,6 +355,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [user, password]
               properties:
                 user:
@@ -654,6 +655,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [user, password]
               properties:
                 user:
@@ -663,7 +665,7 @@ paths:
                   minLength: 8
                 grants:
                   type: array
-                  items: { $ref: "#/components/schemas/Grant" }
+                  items: { $ref: "#/components/schemas/GrantInput" }
       responses:
         "201":
           description: Created.
@@ -750,6 +752,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [password]
               properties:
                 password:
@@ -787,6 +790,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [disabled]
               properties:
                 disabled:
@@ -823,11 +827,12 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [grants]
               properties:
                 grants:
                   type: array
-                  items: { $ref: "#/components/schemas/Grant" }
+                  items: { $ref: "#/components/schemas/GrantInput" }
       responses:
         "200":
           description: Replaced.
@@ -863,6 +868,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [roles]
               properties:
                 roles:
@@ -913,13 +919,14 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [name]
               properties:
                 name:
                   type: string
                 grants:
                   type: array
-                  items: { $ref: "#/components/schemas/Grant" }
+                  items: { $ref: "#/components/schemas/GrantInput" }
       responses:
         "201":
           description: Created.
@@ -1021,11 +1028,12 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [grants]
               properties:
                 grants:
                   type: array
-                  items: { $ref: "#/components/schemas/Grant" }
+                  items: { $ref: "#/components/schemas/GrantInput" }
       responses:
         "200":
           description: Replaced.
@@ -1104,6 +1112,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [name]
               properties:
                 name:
@@ -1227,6 +1236,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/CollectionDescription" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1262,6 +1272,7 @@ paths:
           content:
             application/json:
               schema: { $ref: "#/components/schemas/FindResponse" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1432,6 +1443,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [pipeline]
               properties:
                 pipeline:
@@ -1487,6 +1499,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [update]
               properties:
                 filter: { $ref: "#/components/schemas/Document" }
@@ -1577,6 +1590,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 filter: { $ref: "#/components/schemas/Document" }
                 sort:
@@ -1654,6 +1668,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               properties:
                 filter: { $ref: "#/components/schemas/Document" }
                 multi:
@@ -1810,6 +1825,7 @@ paths:
                   deleted:
                     type: integer
                     enum: [0, 1]
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1871,6 +1887,7 @@ paths:
                       groups:
                         type: array
                         items: { $ref: "#/components/schemas/ViolationGroup" }
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -1922,6 +1939,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [fields]
               properties:
                 fields:
@@ -1934,6 +1952,7 @@ paths:
                     can rely on surviving serialization.
                   items:
                     type: object
+                    additionalProperties: false
                     required: [path]
                     properties:
                       path:
@@ -2039,6 +2058,11 @@ paths:
       x-kimmy-action: ddl
       requestBody:
         required: true
+        description: |
+          Closed, like every request shape (ADR-121): a field `VectorConfig`
+          or its `provider` and `chunk` objects do not define is refused
+          `422`. The schema itself is not marked so because `GET` and
+          `describe` return it, and a response schema stays open.
         content:
           application/json:
             schema: { $ref: "#/components/schemas/VectorConfig" }
@@ -2086,6 +2110,7 @@ paths:
                     type: boolean
                   droppedVectors:
                     type: boolean
+        "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
@@ -2150,6 +2175,7 @@ paths:
               type: array
               items:
                 type: object
+                additionalProperties: false
                 required: [chunk, vector]
                 properties:
                   chunk:
@@ -2346,6 +2372,7 @@ paths:
           application/json:
             schema:
               type: object
+              additionalProperties: false
               required: [url]
               properties:
                 url:
@@ -2589,7 +2616,13 @@ components:
 
   responses:
     BadRequest:
-      description: The request could not be understood or is not answerable as asked.
+      description: |
+        The request could not be understood or is not answerable as asked.
+        Also a query string the route cannot read — a parameter it does not
+        define, or a value that is not the type it takes; the message names
+        the parameter (ADR-121). A query string is refused `400` where a body
+        of the wrong shape is `422`: it is part of the request line, not an
+        entity the server failed to process.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -2605,9 +2638,12 @@ components:
     WrongShape:
       description: |
         The body is valid JSON but not the shape this route takes — an object
-        where an array is wanted, or a missing required field. Carries the
+        where an array is wanted, a missing required field, or a field the
+        route does not define (ADR-121; the message names it). Carries the
         `bad_request` code: the status distinguishes "not JSON" from "not this
-        JSON", and the code says what a client should do about either.
+        JSON", and the code says what a client should do about either. A
+        document body — insert, replace, bulk — is content and takes any
+        field.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -2828,11 +2864,35 @@ components:
       example:
         - { "line.sku": "gasket" }
 
+    GrantInput:
+      type: object
+      description: |
+        A grant as a request carries it: the same three fields as `Grant`,
+        closed (ADR-121). `collection` defaults to `*`, so a misspelt field
+        here would not be dropped but would widen the grant to every
+        collection in the database; it is refused `422` by name instead.
+        `Grant` itself is the persisted and returned form and stays open, as
+        every response schema does.
+      additionalProperties: false
+      required: [db, actions]
+      properties:
+        db:
+          type: string
+        collection:
+          type: string
+          default: "*"
+        actions:
+          type: array
+          items:
+            type: string
+            enum: [read, write, watch, search, webhook, ddl, admin]
+
     Grant:
       type: object
       description: |
         One grant: a set of actions over a database and a collection pattern.
         `*` matches anything; a collection pattern may end in a single `*`.
+        Returned wherever grants are listed; a request sends `GrantInput`.
       required: [db, actions]
       properties:
         db:
@@ -2955,6 +3015,7 @@ components:
 
     FindRequest:
       type: object
+      additionalProperties: false
       description: |
         Every read parameter. `filter`, `sort` and `projection` follow the
         query language in `docs/query-language.md`.
@@ -3288,6 +3349,7 @@ components:
 
     SearchRequest:
       type: object
+      additionalProperties: false
       properties:
         query:
           type: string
@@ -3309,6 +3371,7 @@ components:
           description: Chunks per document allowed into the results.
         weights:
           type: object
+          additionalProperties: false
           description: |
             `hybrid_search` only; `vector_search` ignores it. How much each
             half's rank counts in fusion: the score is

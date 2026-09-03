@@ -19,12 +19,46 @@ fn require_server_admin(auth: &Auth) -> Result<(), ApiError> {
     auth.require(Action::Admin, "*", None)
 }
 
+/// A grant as a request carries it.
+///
+/// A mirror of [`Grant`] rather than the type itself, because the two have
+/// different duties. `Grant` is persisted and replicated, and a stored record
+/// must keep reading under a later version that adds a field, so it cannot
+/// refuse unknown fields. A request can and must (ADR-121): `collection`
+/// defaults to `*`, so a misspelt `colection` in a grant was not a no-op but a
+/// silent widening to every collection in the database — the one place a
+/// dropped field changed what a principal may do.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrantInput {
+    db: String,
+    #[serde(default = "star")]
+    collection: String,
+    actions: Vec<Action>,
+}
+
+fn star() -> String {
+    "*".to_string()
+}
+
+impl From<GrantInput> for Grant {
+    fn from(input: GrantInput) -> Self {
+        Grant::new(input.db, input.collection, input.actions)
+    }
+}
+
+/// The persisted form of a request's grants.
+pub fn grants(inputs: Vec<GrantInput>) -> Vec<Grant> {
+    inputs.into_iter().map(Grant::from).collect()
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateUserRequest {
     user: String,
     password: String,
     #[serde(default)]
-    grants: Vec<Grant>,
+    grants: Vec<GrantInput>,
 }
 
 pub async fn create_user(
@@ -40,7 +74,8 @@ pub async fn create_user(
         return Err(ApiError::bad_request("password must be at least 8 characters"));
     }
 
-    let user = state.users.create(&state.engine, &body.user, &body.password, body.grants)?;
+    let user =
+        state.users.create(&state.engine, &body.user, &body.password, grants(body.grants))?;
     Ok((StatusCode::CREATED, Json(json!({ "user": user.name, "grants": user.grants }))))
 }
 
@@ -93,6 +128,7 @@ pub async fn delete_user(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PasswordRequest {
     password: String,
 }
@@ -118,8 +154,9 @@ pub async fn set_password(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsRequest {
-    grants: Vec<Grant>,
+    grants: Vec<GrantInput>,
 }
 
 pub async fn set_grants(
@@ -129,12 +166,13 @@ pub async fn set_grants(
     JsonBody(body): JsonBody<GrantsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
-    state.users.set_grants(&state.engine, &name, body.grants)?;
+    state.users.set_grants(&state.engine, &name, grants(body.grants))?;
     state.sessions.evict(&name);
     Ok(Json(json!({ "updated": name })))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DisabledRequest {
     disabled: bool,
 }

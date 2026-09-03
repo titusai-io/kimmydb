@@ -386,6 +386,18 @@ impl From<axum::extract::rejection::JsonRejection> for ApiError {
     }
 }
 
+/// A query string the route cannot read: a parameter it does not define, or
+/// one whose value is not the type it takes.
+///
+/// Axum's text is kept — it names the parameter, which is the whole point of
+/// refusing (ADR-121) — and only the envelope is added. Always `400`: unlike a
+/// body, a query string has no "not JSON" and "not this JSON" to tell apart.
+impl From<axum::extract::rejection::QueryRejection> for ApiError {
+    fn from(rejection: axum::extract::rejection::QueryRejection) -> Self {
+        Self::bad_request(rejection.body_text())
+    }
+}
+
 /// A request to `/watch` that is not a WebSocket upgrade.
 ///
 /// Same reasoning as the JSON rejection above, and found the same way — by

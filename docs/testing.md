@@ -741,6 +741,10 @@ Security properties are asserted as behaviour, not assumed:
 | Listing hides unreadable collections | `listing_hides_what_the_caller_cannot_read` |
 | `2^53 + 1` round-trips exactly | `extended_json_types_survive_the_boundary` |
 | The last user cannot be deleted | `the_last_user_cannot_be_deleted` |
+| A request field the route does not define is `422` naming it, on every route; the same body without it succeeds | `a_request_field_the_route_does_not_define_is_refused_by_name` |
+| A query parameter the route does not define, or cannot parse, is `400` in the envelope | `a_query_parameter_the_route_does_not_define_is_refused_by_name` |
+| A misspelt grant field is refused rather than widening the grant to `*` | `a_misspelt_grant_field_is_refused_rather_than_widening_the_grant` |
+| A document body takes any field — it is content, not a shape | `a_document_body_may_carry_any_field` |
 
 ### The protocol contract
 
@@ -762,6 +766,8 @@ a *document*.
 | A non-upgrade request to `/watch` carries the envelope | same test |
 | Every versioned route is under `/v1/`, and the server, the routes and `info.version` agree | `every_versioned_route_carries_the_protocol_major` |
 | No response schema forbids unknown properties, so adding a field stays additive | `no_response_schema_forbids_the_fields_it_has_not_seen` |
+| Every request shape in the specification is closed, as the server is (ADR-121) | `every_request_shape_is_closed` |
+| Every operation that reads a query string documents the `400` | `every_operation_with_a_query_parameter_documents_the_400` |
 | The advertised capabilities are the documented ones, each with an explanation | `the_capability_set_is_the_documented_one` |
 | Topology lists the answering node, which the member set never contains | `topology_lists_this_node_even_though_the_member_set_never_contains_it` |
 | A registered peer reads `unknown` until membership sees it | `a_registered_peer_is_reported_unknown_until_membership_sees_it` |

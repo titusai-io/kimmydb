@@ -23,13 +23,14 @@
 
 use axum::extract::{Path, State};
 use axum::{Json, http::StatusCode};
-use kimmy_auth::{Action, Grant};
+use kimmy_auth::Action;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::error::ApiError;
 use crate::json::JsonBody;
 use crate::state::{Auth, SharedState};
+use crate::users::{GrantInput, grants};
 
 /// The scope required to administer roles.
 fn require_server_admin(auth: &Auth) -> Result<(), ApiError> {
@@ -47,10 +48,11 @@ fn invalidate_holders(state: &SharedState, role: &str) -> Result<usize, ApiError
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateRoleRequest {
     name: String,
     #[serde(default)]
-    grants: Vec<Grant>,
+    grants: Vec<GrantInput>,
 }
 
 pub async fn create_role(
@@ -59,7 +61,7 @@ pub async fn create_role(
     JsonBody(body): JsonBody<CreateRoleRequest>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     require_server_admin(&auth)?;
-    let role = state.users.roles().create(&state.engine, &body.name, body.grants)?;
+    let role = state.users.roles().create(&state.engine, &body.name, grants(body.grants))?;
     Ok((StatusCode::CREATED, Json(json!({ "role": role.name, "grants": role.grants }))))
 }
 
@@ -98,8 +100,9 @@ pub async fn delete_role(
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantsRequest {
-    grants: Vec<Grant>,
+    grants: Vec<GrantInput>,
 }
 
 pub async fn set_role_grants(
@@ -109,12 +112,13 @@ pub async fn set_role_grants(
     JsonBody(body): JsonBody<GrantsRequest>,
 ) -> Result<Json<Value>, ApiError> {
     require_server_admin(&auth)?;
-    state.users.roles().set_grants(&state.engine, &name, body.grants)?;
+    state.users.roles().set_grants(&state.engine, &name, grants(body.grants))?;
     let invalidated = invalidate_holders(&state, &name)?;
     Ok(Json(json!({ "updated": name, "invalidated": invalidated })))
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RolesRequest {
     roles: Vec<String>,
 }
