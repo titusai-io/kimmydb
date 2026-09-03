@@ -6936,3 +6936,118 @@ asserts the new meaning, and one reproduces the finding: stamps spanning
 where the span gave 300.
 
 ---
+
+## ADR-125 — The embedding worker checkpoints its position by deadline, not per entry
+
+**Decision.** The embedding worker no longer writes its oplog position after
+every entry it has nothing to do with. The position is held in `Pending`,
+beside the batches, with the instant it was first held, and a new
+`POSITION_WAIT` of one second bounds how long it may wait. `Pending::deadline`
+is the earlier of the batch deadline — unchanged, `opened + max_wait` — and
+`held_since + POSITION_WAIT`, and `None` only when there is neither a batch nor
+a held position; the timed wait in `drive` and its timeout branch already
+flush on that deadline, and `flush` now clears both clocks. The deadline is
+also checked after every entry, not only when the timed wait elapses: the
+change stream returns without waiting while the arrival index has entries
+queued, so during a drain the timer never fires, and a deadline evaluated
+only there would hold the position for the whole backlog — a member coming
+back to an hour of entries would checkpoint nothing until it had caught up.
+Checked per entry, a held position is written at most `POSITION_WAIT` after it
+was first held whether the stream is quiet or draining, and a partial batch
+whose entries were slow to prepare goes at `max_wait` rather than past it; a
+full batch goes the moment it fills, as before. Every
+`Prepared::Done` outcome — a skip, a delete, a deferral, a backfill — holds the
+token instead of committing it; `Prepared::Embed` records it as before. So the
+position is written when a batch flushes, when a held position has waited
+`POSITION_WAIT`, at stream end, on invalidation, and before a
+`ConfigureVectors` backfill — never per entry. The constant is not a setting.
+Defended by
+`a_burst_of_writes_the_worker_skips_costs_one_position_write_not_one_each`,
+`a_lone_skipped_entrys_position_is_recorded_within_the_position_wait`,
+`a_burst_of_skipped_entries_does_not_delay_the_embeddable_document_behind_it`,
+`a_held_position_is_checkpointed_during_a_long_drain_not_only_after_it` and
+`the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait`.
+
+**Why.** Measured on a three-member cluster running 0.20.0. A 1,000-document
+bulk insert into a collection with no vector configuration converged on every
+member in 3–5 s: ADR-119 works, and the replica applies the batch in one
+transaction. But afterwards all three members — the writer included — kept
+committing and fsyncing at a steady ~18/s until each had added about 1.2–1.3
+commits per replicated document: roughly 1,320 commits over about 75 s per
+member for 1,000 documents, and for small bulks a replica paid exactly n + 1.
+The replication lag gauge read hundreds of seconds on the replicas while the
+trickle ran. The cause was one line in `drive`:
+`Prepared::Done(_) if pending.is_empty() => put_consumer_position(...)`. A
+document in a collection with no vector configuration is
+`Prepared::Done(Outcome::Skipped)`; `pending` is empty whenever nothing is
+being embedded; and `put_consumer_position` is `begin_write … commit` — one
+counted commit and one fsync per oplog entry. The worker runs on every member
+(`worker_enabled: true`, `WatchScope::Cluster`) and consumes the local arrival
+index, so it sees the member's own writes and every replicated one alike, and
+nothing throttles the stream: ~18/s is simply the single-writer fsync rate.
+ADR-119's claim that a replica's commit rate is not its document rate held
+only for the sync batch itself. On a cluster with the default worker a
+replica's commit rate *was* its document rate — it had moved from `apply_batch`
+to the worker, one transaction later, where nothing counted it against any
+request. The single-node form of the same cost was already known: the write
+gap measured in [Benchmarks](benchmarks.md) (2.00 commits per insert),
+pinned by a test whose comment said its passing was not an endorsement, and
+reserved as a decision in the roadmap because the oplog-consumer contract is
+where this project has had three separate bugs.
+
+**What the corrected cost is.** A replicated batch on a member now costs one
+commit per run of document entries (ADR-119) plus one position checkpoint per
+`POSITION_WAIT` while entries are arriving, however many arrive — a batch
+published in one burst is one checkpoint. A local bulk insert into a
+collection with no vector configuration is the same: its one commit plus one
+checkpoint. A lone entry's position lands within about a second. A steady
+trickle costs at most one checkpoint a second, on top of whatever the
+trickle's own commits are, where it cost one per entry. The position still
+never runs ahead of an entry whose vectors are not on disk: it is written by
+the same flush, after the batches.
+
+**Why one second.** A burst is coalesced by any wait at all; it is the trickle
+case that sets the bound, and one checkpoint a second is the amplification
+the trickle is allowed. What a longer wait would buy is fewer checkpoints
+under a trickle; what it would cost is the window a crash re-processes on
+restart, which is at most the held window plus a batch. Re-processing is safe
+— embedding is idempotent through `vectors_are_stale`, and skip, delete,
+defer and backfill are all re-derived from what is stored rather than from
+having seen the entry — but it is not free: it is storage reads, and on a
+member that owns a collection it is provider round trips for anything whose
+vectors did not land. A second of replay is a handful of either. It is not a
+configuration setting because nothing an operator knows would move it: the
+trade is between the worker's own restart replay and the worker's own commit
+amplification, and a second decides it the same way on every deployment.
+
+**Alternatives.** *Record the position only when there was work to do.*
+Rejected in the roadmap before this was measured, and still: a position that
+advances only on embedding work is stranded behind retention on a member
+whose owned collections are quiet, and the lost-position recovery is a full
+rescan. *Fold the position write into the batch flush only, with no deadline
+of its own.* The same failure in a different place — a member that embeds
+nothing never checkpoints — and a restart replays the whole retained log.
+*Write the position under the `coalesced` durability class.* It shares the
+fsync but not the commit: redb still serialises each one through its single
+writer in front of the next foreground write, and the default class is
+`durable`. *Make it a setting.* Rejected above. *Run the worker on the
+collection's owner only.* It would remove the replica's share of the cost and
+leave the writer's, and a non-owner has to see every entry anyway to defer
+it; the deadline removes the cost on every member at once.
+
+**Cost.** A restart re-processes up to a second of stream, plus a batch, that
+it used to skip; the replay costs reads, not writes, except where vectors
+never landed, where it costs the provider call that was owed anyway. The
+position now trails the newest entry by up to a second when the worker is
+otherwise idle, which changes what a test may assume: `worker_is_idle`'s
+notion of "started" now waits for that first checkpoint, and every test that
+measured commits around the worker was re-read for it. `kimmy_commits` on a
+member that only replicates is now dominated by the sync batches and one
+checkpoint a second under load; a dashboard that had, without knowing it,
+been reading the worker's trickle as the document rate reads a much smaller
+number, and the document-rate figures remain `kimmy_replication_lag_seconds`
+and the `cluster.sync` span's `applied`. The measured benchmark numbers in
+[Benchmarks](benchmarks.md) are left as they were taken, with a note that the
+second commit is gone.
+
+---

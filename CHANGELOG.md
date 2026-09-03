@@ -10,6 +10,40 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+_(preamble written at release time)_
+
+### Fixed
+
+- **The embedding worker checkpoints its oplog position by deadline, not
+  once per entry.** The worker runs on every member and consumes the member's
+  own arrival index, so it sees every write — its own and every replicated
+  one — and it recorded its position after each entry it had nothing to do
+  with, in a write transaction of its own, which under the default `durable`
+  class is an fsync of its own. Measured on a three-member cluster running
+  0.20.0: a 1,000-document bulk insert into a collection with no vector
+  configuration converged on every member in 3–5 s, and then all three
+  members, the writer included, kept committing at a steady ~18/s for about
+  75 s until each had added roughly 1.2–1.3 commits per document — about
+  1,320 commits per member for 1,000 documents; small bulks cost a replica
+  exactly n + 1. The one-transaction sync batch of 0.20.0 had moved the
+  per-document commit one step downstream rather than removing it, and the
+  replication lag gauge read hundreds of seconds on the replicas while the
+  trickle ran. The position is now held with the batches and written by the
+  same flush — with a batch, at stream end, before a reconfiguration's
+  backfill, or after at most one second when there is nothing to embed — so
+  a replicated batch published in one burst, or a local bulk with no
+  vectors, costs one position write however many entries it holds, a lone
+  entry's position lands within about a second, and a steady trickle costs
+  at most one checkpoint a second. The single-node form of the same cost was
+  the measured two-commits-per-insert write gap in
+  [Benchmarks](docs/benchmarks.md); it is closed by the same change. What an
+  operator sees: `kimmy_commits` and `kimmy_fsyncs` no longer rise one for
+  one with documents on any member, and a restart re-processes up to a
+  second of the stream, which is safe because embedding is idempotent and
+  every other outcome is re-derived from what is stored. ADR-125.
+
 ## 0.20.0 - 2026-09-02
 
 A minor when it ships, not a patch. Nothing changes on the wire between
