@@ -419,11 +419,15 @@ streaming path, and got it wrong in the one direction that hangs.
 
 #### Left alive, with reasons
 
-- **Provably equivalent (2).** `hlc > held` → `>=` in `lag_behind_ms`: when the
-  two are equal the term contributes `wall_ms − wall_ms` = 0, which cannot
-  change a `max()` over non-negative values that defaults to 0. And in
+- **Provably equivalent (1), and one that stopped being.** In
   `win_addr_conflict`, `self.incarnation > adversary.incarnation` → `>=` sits
-  behind a `!=` guard that already excludes equality. Neither can be killed.
+  behind a `!=` guard that already excludes equality; it cannot be killed.
+  `hlc > held` → `>=` in `lag_behind_ms` used to be its twin — equal heads
+  contributed `wall_ms − wall_ms` = 0, invisible to a `max()` that defaults
+  to 0 — until ADR-122 made the term `now − held.wall_ms`, which an equal head
+  would report as lag. It is killed now, by
+  `lag_is_how_long_ago_the_newest_applied_entry_was_written`, whose
+  `lag_behind_ms(&mine, &mine, now)` must read zero.
 - **Arbitrary by design (2).** The node-id tiebreak in `win_addr_conflict`
   flipped to `<` or `>=`. The direction is deliberately unspecified — what
   matters is that every node computes the *same* answer, which the test asserts

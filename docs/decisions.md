@@ -6519,3 +6519,76 @@ place to look after a tag is the `build-local-artifacts` log for the Linux
 targets, where rust-cache prints the key it restored, and the phase's time.
 
 ---
+
+## ADR-122 — The replication lag gauge measures age behind, not the span of missing history
+
+**Decision.** `kimmy_replication_lag_seconds` is how far behind in time this
+node is: for every origin where a peer's head is ahead of what this node has
+applied, the time since the newest entry this node *has* applied from that
+origin was written, `now − held`; the maximum over origins and over the peers
+reached in the round. `lag_behind_ms` in `crates/kimmy-storage/src/sync.rs`
+takes the current wall time and computes exactly that; the transport passes
+the same physical clock the engine stamps with. Zero when no peer holds
+anything newer; an origin this node has never seen contributes nothing, as
+before. The stale-rejoiner verdict (`behind_ms`, `lag_beyond_horizon_ms`,
+ADR-085 and ADR-097) is a different question and is not touched. The `HELP`
+text, the golden `/metrics` tests, the OpenTelemetry description and the
+operations table all say the new thing.
+
+**Why.** On a three-member cluster running 0.19.1, the gauge read 0.0 on
+every member for the whole of a 78-second window in which one replica held
+351 of the 1,000 documents a peer had, and again for a later 492-second window
+in which it trailed by 4,000. It only rose — to 697 s, then 1,496 s — once
+several writers had spread their writes over many minutes. The formula was
+`theirs.wall_ms − held.wall_ms` per origin: the span of origin wall-clock
+time between the newest entry this node had applied and the peer's newest. A
+bulk insert of 1,000 documents mints all its stamps within a few hundred
+milliseconds, so a 900-document backlog of it is "0.3 s of history", and the
+gauge read 0 however many minutes the replica took to drain it. The transport
+also measures against the peer's vector as of the round's start, which makes
+the number a floor; that is not the cause and is unchanged.
+
+**Alternatives.** Two measures were on the table, and each answers a real
+question. *The span of missing history*, `theirs − held`: how wide is the
+window of the origin's timeline this node still lacks. It is what the gauge
+was, it is exact from the two head vectors alone, and it does not move
+between rounds. But its width says nothing about how long the node has been
+lacking it, which is what an operator alerting on "replication lag" wants to
+know, and for the write pattern that produces a backlog in the first place —
+a burst — it is a fraction of a second by construction. *Age behind*,
+`now − held`: how long ago the newest thing this node has from the origin was
+written, given a peer has newer. At thirty seconds into a bulk backlog it
+reads about 30 s where the span read 0; caught up it reads 0; holding
+everything but an entry written two seconds ago that has not been pulled
+yet, it reads about 2 s, which is the truth. Chosen. *Age of the oldest
+unapplied entry* would be more precise still, but the peer advertises only
+its head per origin, and carrying an oldest-unapplied stamp per origin per
+peer is a wire change for a number the age-behind measure approximates from
+above; not done. *Keep the span and add a second gauge for age* was rejected
+because nobody was found who asks the span's question, and two gauges called
+lag invite alerting on the wrong one.
+
+**Cost.** The number changes meaning, and anyone alerting on it
+should know: it now grows with the clock while a backlog drains, so an alert
+threshold that used to be reached only by long-spread writes is reached by
+any backlog that outlives the threshold, which is the behaviour the threshold
+was written for. A known limit, stated plainly: an origin that is quiet for
+hours and then writes once shows the length of that silence for one round on
+each peer, until the entry is pulled. The span had the same one-round spike —
+ADR-097 records it being mistaken for a stale rejoiner — so this is not a
+regression, and the head vector carries no oldest-unapplied stamp that would
+remove it; the doc comment on `lag_behind_ms` says so. The measure now reads
+the wall clock, which the old one did not; it is the same clock the engine
+stamps with, and a clock stepped backwards saturates to zero rather than
+wrapping. It also crosses clocks, which the span never did: `held` is a
+remote origin's HLC wall time and `now` is this node's, so a peer whose clock
+runs ahead of this node's makes an origin this node genuinely trails saturate
+to zero and the gauge under-reports by the skew, and one running behind adds
+it. The error is bounded by the skew members already tolerate in their HLCs,
+and under-reporting by seconds is a smaller lie than reading zero through a
+backlog that lasts minutes. Every unit test that called `lag_behind_ms` passes a time and
+asserts the new meaning, and one reproduces the finding: stamps spanning
+300 ms, held at the first, the peer at the last, thirty seconds on — 30,000
+where the span gave 300.
+
+---
