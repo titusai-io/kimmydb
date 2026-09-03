@@ -48,43 +48,72 @@ pub struct SyncOutcome {
     pub unknown_collection: usize,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
-    /// How far the peer trails *this* node, in milliseconds — the mirror of
-    /// `lag_ms`, counted only at origins where the peer also lacks an entry
-    /// retention has removed here. Above tombstone retention it names a stale
-    /// rejoiner (ADR-085); zero for a peer that can still be served every
-    /// entry it lacks, however wide the gap (ADR-097). See
-    /// [`lag_beyond_horizon_ms`].
+    /// How far the peer trails *this* node, in milliseconds of history —
+    /// the span between its coverage and ours, counted only at origins where
+    /// the peer also lacks an entry retention has removed here. Above
+    /// tombstone retention it names a stale rejoiner (ADR-085); zero for a
+    /// peer that can still be served every entry it lacks, however wide the
+    /// gap (ADR-097). A different question from `lag_ms`, and a different
+    /// measure. See [`lag_beyond_horizon_ms`].
     pub behind_ms: u64,
-    /// Milliseconds of the peer's history still unapplied after this round.
+    /// How far behind in time this node is after the round, in milliseconds:
+    /// the age of the newest entry it has applied from an origin a peer holds
+    /// newer entries of, worst origin.
     ///
-    /// Zero when caught up; non-zero when the peer holds more than one batch
-    /// of backlog. Measured from the entries' own timestamps — the age span
-    /// of undelivered work — not from any cursor. See [`lag_behind_ms`].
+    /// Zero when caught up. Grows with the wall clock while a backlog is
+    /// being drained, which is what an operator alerts on; the span of the
+    /// history still missing does not, and read 0 for a bulk insert whose
+    /// stamps all lie within a second (ADR-122). See [`lag_behind_ms`].
     pub lag_ms: u64,
 }
 
-/// How far `mine` trails `theirs`, in milliseconds of history.
+/// How far behind in time `mine` is against `theirs`, in milliseconds, as of
+/// `now_ms`.
 ///
-/// For every origin where the peer's coverage is ahead, the gap between the
-/// two wall clocks is the span of that origin's entries this node has not
-/// applied; the maximum over origins is what an operator alerts on.
+/// For every origin where the peer's coverage is ahead, the answer is how
+/// long ago the newest entry this node has applied from that origin was
+/// written: `now − held`. The maximum over origins is what an operator
+/// alerts on. A node thirty seconds into draining a backlog reads thirty
+/// seconds; caught up, it reads zero; holding everything but an entry written
+/// two seconds ago, it reads two seconds, which is the truth.
+///
+/// Not the span between the two heads, `theirs − held`, which is what this
+/// measured before ADR-122. That is the width of the window of history still
+/// missing, and a bulk insert mints all its stamps within a few hundred
+/// milliseconds: on a three-member cluster a replica that held 351 of a
+/// peer's 1,000 documents for 78 seconds, and later trailed by 4,000 for
+/// 492 seconds, read 0 throughout, and only rose once several writers had
+/// spread their writes over many minutes. The gauge answered "how wide is
+/// the window I lack", and nobody asks that.
+///
+/// The known limit, which the span had too: an origin quiet for hours that
+/// then writes once leaves every peer reading the length of the silence for
+/// one round, until the entry is pulled. The peer's head vector carries no
+/// oldest-unapplied stamp that would say the gap holds one entry a second
+/// old, so nothing here can tell that spike from a real backlog. The
+/// stale-rejoiner verdict, which cannot afford the spike, does not use this
+/// measure at all; see [`lag_beyond_horizon_ms`].
+///
+/// The measure crosses clocks: `held.wall_ms` is the origin's HLC wall time,
+/// `now_ms` this node's. A peer whose clock runs ahead of this node's makes
+/// an origin this node genuinely trails saturate to zero, and the gauge
+/// under-reports by the skew; a peer whose clock runs behind adds it. The
+/// span did not have this problem, comparing two stamps of one origin. The
+/// error is bounded by the skew the HLC already tolerates between members,
+/// and under-reporting by a few seconds is a smaller lie than reading zero
+/// through a backlog that lasts minutes.
 ///
 /// An origin this node has **never** seen contributes nothing: with only the
 /// peer's *newest* timestamp to hand, the honest gap would need the oldest,
-/// and `newest − zero` is the age of the epoch, not of the backlog. A joining
+/// and `now − zero` is the age of the epoch, not of the backlog. A joining
 /// node's lag becomes meaningful with its first applied batch — moments in —
 /// rather than starting at a fifty-year lie.
-/// Symmetric in its arguments' roles, so `lag_behind_ms(theirs, mine)` is how
-/// far the *peer* trails this node — what decides whether it has been away
-/// longer than tombstone retention. Origins the trailing side has never seen
-/// at all do not count: a brand-new member holds nothing old enough to
-/// resurrect, and treating it as stale would flag every join.
-pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector) -> u64 {
+pub fn lag_behind_ms(mine: &VersionVector, theirs: &VersionVector, now_ms: u64) -> u64 {
     theirs
         .iter()
         .filter_map(|(node, hlc)| {
             let held = mine.get(node);
-            (held > Hlc::ZERO && hlc > held).then(|| hlc.wall_ms.saturating_sub(held.wall_ms))
+            (held > Hlc::ZERO && hlc > held).then(|| now_ms.saturating_sub(held.wall_ms))
         })
         .max()
         .unwrap_or(0)
@@ -111,12 +140,12 @@ pub fn lacks_collected(
 /// How far `theirs` trails `mine` at the origins where it also lacks an
 /// entry retention has removed here; zero when it lacks nothing collected.
 ///
-/// [`lag_behind_ms`] with its roles swapped is what names a stale rejoiner
-/// (ADR-085): a peer more than tombstone retention behind may hold documents
-/// whose deletes it never saw and whose tombstones are gone. But the span
-/// between two stamps is the age of the *gap*, not of anything in it. An
-/// origin that wrote nothing for longer than retention and then wrote once
-/// leaves every peer a gap as wide as its silence holding one entry a few
+/// The span between the two heads, roles swapped, is what named a stale
+/// rejoiner (ADR-085): a peer more than tombstone retention behind may hold
+/// documents whose deletes it never saw and whose tombstones are gone. But
+/// the span between two stamps is the age of the *gap*, not of anything in
+/// it. An origin that wrote nothing for longer than retention and then wrote
+/// once leaves every peer a gap as wide as its silence holding one entry a few
 /// seconds old, which each peer pulls on its next round — and a peer that can
 /// still be served every entry it lacks has nothing to resurrect. So the
 /// verdict requires both: the span, and something in it that retention has
@@ -806,7 +835,8 @@ mod tests {
                 let entries = from.entries_for_peer(start, limit).unwrap();
                 let outcome = into.apply_peer_batch(&theirs, &entries, limit).unwrap();
                 let mine = into.witnessed_vector().unwrap();
-                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs), ..outcome }
+                let now = crate::engine::physical_now_ms();
+                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs, now), ..outcome }
             }
             None => SyncOutcome::default(),
         }
@@ -958,7 +988,7 @@ mod tests {
     }
 
     #[test]
-    fn lag_is_the_span_of_unapplied_history() {
+    fn lag_is_how_long_ago_the_newest_applied_entry_was_written() {
         use kimmy_core::{NodeId, Stamp};
 
         let origin = NodeId::generate();
@@ -967,9 +997,35 @@ mod tests {
         let mut theirs = VersionVector::new();
         theirs.observe(Stamp::new(Hlc::new(17_500, 0), origin));
 
-        assert_eq!(lag_behind_ms(&mine, &theirs), 7_500, "7.5s of that origin is unapplied");
-        assert_eq!(lag_behind_ms(&theirs, &mine), 0, "being ahead is not lag");
-        assert_eq!(lag_behind_ms(&mine, &mine), 0, "caught up is zero");
+        // The peer holds newer, and the newest we have is 12 s old.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 22_000), 12_000, "12 s behind the clock");
+        // It keeps growing while nothing arrives: the backlog is the same
+        // width, the node is further behind.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 40_000), 30_000);
+        assert_eq!(lag_behind_ms(&theirs, &mine, 40_000), 0, "being ahead is not lag");
+        assert_eq!(lag_behind_ms(&mine, &mine, 40_000), 0, "caught up is zero");
+    }
+
+    #[test]
+    fn a_bulk_backlog_reads_the_time_since_it_started_not_the_width_of_its_stamps() {
+        // The finding ADR-122 fixes: a bulk insert mints its stamps within a
+        // few hundred milliseconds, so the span of history a replica lacks
+        // is under a second however many minutes it takes to drain. Held at
+        // the bulk's first stamp, the peer at its last, thirty seconds on.
+        use kimmy_core::{NodeId, Stamp};
+
+        let origin = NodeId::generate();
+        let first = Hlc::new(1_000_000, 0);
+        let last = Hlc::new(1_000_300, 0);
+        let mut mine = VersionVector::new();
+        mine.observe(Stamp::new(first, origin));
+        let mut theirs = VersionVector::new();
+        theirs.observe(Stamp::new(last, origin));
+        let now = first.wall_ms + 30_000;
+
+        let span = last.wall_ms - first.wall_ms;
+        assert_eq!(span, 300, "the old formula read the width of the stamps: 0 s on the gauge");
+        assert_eq!(lag_behind_ms(&mine, &theirs, now), 30_000, "the node is 30 s behind");
     }
 
     #[test]
@@ -979,14 +1035,21 @@ mod tests {
         let (a, b) = (NodeId::generate(), NodeId::generate());
         let mut mine = VersionVector::new();
         mine.observe(Stamp::new(Hlc::new(1_000, 0), a));
-        mine.observe(Stamp::new(Hlc::new(1_000, 0), b));
+        mine.observe(Stamp::new(Hlc::new(8_000, 0), b));
         let mut theirs = mine.clone();
         theirs.observe(Stamp::new(Hlc::new(2_000, 0), a));
         theirs.observe(Stamp::new(Hlc::new(9_000, 0), b));
 
         // An alert cares how far behind the worst origin is; summing origins
-        // would report a cluster-wide write burst as one enormous lag.
-        assert_eq!(lag_behind_ms(&mine, &theirs), 8_000);
+        // would report a cluster-wide write burst as one enormous lag. At
+        // 10 s, `a` was last applied 9 s ago and `b` 2 s ago.
+        assert_eq!(lag_behind_ms(&mine, &theirs, 10_000), 9_000);
+
+        // An origin the peer is level on does not count, whatever its age:
+        // catch up on `a` and only `b` is left.
+        let mut level = mine.clone();
+        level.observe(Stamp::new(Hlc::new(2_000, 0), a));
+        assert_eq!(lag_behind_ms(&level, &theirs, 10_000), 2_000);
     }
 
     #[test]
@@ -1032,7 +1095,11 @@ mod tests {
             "B is not behind A any more; a second round would be pointless"
         );
         assert_eq!(
-            lag_behind_ms(&witnessed, &a.version_vector().unwrap()),
+            lag_behind_ms(
+                &witnessed,
+                &a.version_vector().unwrap(),
+                crate::engine::physical_now_ms()
+            ),
             0,
             "and the gauge must read caught-up, because it is"
         );
@@ -1069,10 +1136,10 @@ mod tests {
 
         // The peer's vector holds only the *newest* stamp per origin, so an
         // origin this node has never seen has no honest gap to report —
-        // `newest − zero` would be the age of the epoch, a fifty-year lie a
+        // `now − zero` would be the age of the epoch, a fifty-year lie a
         // joining node would alert on. Its lag becomes real with the first
         // applied batch.
-        assert_eq!(lag_behind_ms(&VersionVector::new(), &theirs), 0);
+        assert_eq!(lag_behind_ms(&VersionVector::new(), &theirs, 1_786_000_005_000), 0);
     }
 
     #[test]
@@ -1085,8 +1152,10 @@ mod tests {
         }
         sync(&a, &b);
         let (va, vb) = (a.version_vector().unwrap(), b.version_vector().unwrap());
-        assert_eq!(lag_behind_ms(&vb, &va), 0, "a caught-up pair must read zero");
-        assert_eq!(lag_behind_ms(&va, &vb), 0);
+        // Long after the writes: caught up is zero however much time passes.
+        let later = crate::engine::physical_now_ms() + DAY * 1_000;
+        assert_eq!(lag_behind_ms(&vb, &va, later), 0, "a caught-up pair must read zero");
+        assert_eq!(lag_behind_ms(&va, &vb, later), 0);
     }
 
     #[test]
@@ -1969,10 +2038,12 @@ mod tests {
     }
 
     #[test]
-    fn the_same_lag_measure_reversed_says_how_far_a_peer_trails_us() {
-        // What the stale-rejoiner check runs on (ADR-085): how far the peer
-        // is behind *this* node, per origin, ignoring origins it has never
-        // seen at all.
+    fn the_same_lag_measure_reversed_says_how_long_ago_a_peer_last_saw_us() {
+        // Roles swapped, the measure is how long ago the peer last applied
+        // an entry of an origin *this* node is ahead on, per origin, ignoring
+        // origins it has never seen at all. Not what the stale-rejoiner
+        // verdict runs on — that is `lag_beyond_horizon_ms` — but the same
+        // rules about which origins count.
         use kimmy_core::{NodeId, Stamp};
         let a = NodeId::from_bytes([1; 16]);
         let b = NodeId::from_bytes([2; 16]);
@@ -1988,11 +2059,16 @@ mod tests {
         theirs.observe(Stamp::new(Hlc::new(10_000, 0), a));
         theirs.observe(Stamp::new(Hlc::new(90_000, 0), b));
 
-        assert_eq!(lag_behind_ms(&theirs, &mine), 90_000, "90 s behind on `a`; `c` does not count");
-        assert_eq!(lag_behind_ms(&mine, &theirs), 0, "and we trail it by nothing");
+        let now = 100_000;
+        assert_eq!(
+            lag_behind_ms(&theirs, &mine, now),
+            90_000,
+            "90 s behind on `a`; `c` does not count"
+        );
+        assert_eq!(lag_behind_ms(&mine, &theirs, now), 0, "and we trail it by nothing");
 
         // A fresh member trails nobody: it holds nothing old enough to resurrect.
-        assert_eq!(lag_behind_ms(&VersionVector::default(), &mine), 0);
+        assert_eq!(lag_behind_ms(&VersionVector::default(), &mine, now), 0);
     }
 
     const HOUR_MS: u64 = 60 * 60 * 1000;
@@ -2011,7 +2087,12 @@ mod tests {
         let mut mine = VersionVector::new();
         mine.insert(a, second);
 
-        assert_eq!(lag_behind_ms(&theirs, &mine), 36 * HOUR_MS, "the bare span is the silence");
+        // Five seconds after the second write, the age-behind measure reads
+        // the whole silence too: the one-round spike ADR-122 keeps, because
+        // the head vector cannot say the gap holds one entry five seconds
+        // old. The verdict below cannot afford that, and does not use it.
+        let now = second.wall_ms + 5_000;
+        assert_eq!(lag_behind_ms(&theirs, &mine, now), 36 * HOUR_MS + 5_000);
 
         let mut collected = VersionVector::new();
         collected.insert(a, first);

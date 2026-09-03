@@ -263,13 +263,15 @@ impl Metrics {
         self.latency_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Seconds of peer oplog history this node has not yet applied.
+    /// How far behind in time this node is: seconds since the newest entry
+    /// it has applied from an origin a peer holds newer entries of, worst
+    /// origin over the peers reached in the last round.
     ///
     /// Pushed by the replication loop after each round, because that is the
     /// only place a peer's version vector exists — the reason ADR-043 left
-    /// this out rather than guessing. Zero when caught up; measured from the
-    /// entries' own timestamps, so it is the age of undelivered work, not the
-    /// age of a cursor.
+    /// this out rather than guessing. Zero when caught up; grows with the
+    /// clock while a backlog drains, which the span of the missing history
+    /// did not (ADR-122).
     pub fn set_replication_lag_secs(&self, secs: u64) {
         self.replication_lag_secs.store(secs, Ordering::Relaxed);
     }
@@ -490,7 +492,7 @@ impl Metrics {
              # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.\n\
              # TYPE kimmy_cluster_members gauge\n\
              kimmy_cluster_members {cluster}\n\
-             # HELP kimmy_replication_lag_seconds Seconds of peer oplog history not yet applied locally, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
+             # HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.\n\
              # TYPE kimmy_replication_lag_seconds gauge\n\
              kimmy_replication_lag_seconds {lag}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
@@ -721,7 +723,7 @@ kimmy_webhook_backlog_seconds 17
 # HELP kimmy_cluster_members Peers this node's SWIM membership currently considers alive. 0 with clustering off.
 # TYPE kimmy_cluster_members gauge
 kimmy_cluster_members 18
-# HELP kimmy_replication_lag_seconds Seconds of peer oplog history not yet applied locally, max over peers in the last sync round. 0 when caught up or clustering is off.
+# HELP kimmy_replication_lag_seconds Seconds since the newest peer entry applied locally where a peer holds newer, max over peers in the last sync round. 0 when caught up or clustering is off.
 # TYPE kimmy_replication_lag_seconds gauge
 kimmy_replication_lag_seconds 19
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.

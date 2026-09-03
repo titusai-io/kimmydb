@@ -233,7 +233,7 @@ impl TelemetryGuard {
             u64_observable_gauge,
             "kimmy.replication.lag",
             "s",
-            "Peer oplog history not yet applied locally, worst peer in the last round.",
+            "Seconds since the newest peer entry applied locally where a peer holds newer, worst peer in the last round.",
             replication_lag_secs
         );
         observe!(

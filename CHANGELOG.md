@@ -19,6 +19,27 @@ members or on disk; members of this version and 0.19.1 replicate to each other.
 
 ### Changed
 
+- **`kimmy_replication_lag_seconds` now measures how far behind in time a
+  node is, not the width of the history it lacks.** It used to be the span of
+  origin timestamps between the newest entry this node had applied and the
+  newest a peer held, worst origin. A bulk insert mints all its stamps within
+  a fraction of a second, so a replica minutes into draining one read 0 the
+  whole way through; on a three-member cluster the gauge stayed at 0 across a
+  78-second, 1,000-document backlog and a 492-second, 4,000-document one, and
+  only climbed once writes were spread over many minutes. It is now the
+  seconds since the newest entry this node has applied from any origin a peer
+  holds newer entries of, worst peer in the last round: about 30 seconds
+  into a backlog, climbing until it drains, 0 when caught up. What an
+  operator watching it will see differently: a backlog now shows up and grows
+  while it lasts, so an alert threshold is reached by any backlog that
+  outlives it rather than only by long-spread writes; the caught-up reading,
+  the hold-last-value-through-an-outage behaviour and the stale-rejoiner
+  verdict are unchanged. One reading is worth knowing: an origin quiet for
+  hours that then writes once shows the length of that silence for a single
+  round on each peer, until the entry is pulled — the old measure spiked the
+  same way. The `# HELP` text on `/metrics` and the OpenTelemetry description
+  say the new thing. ADR-122.
+
 ### Fixed
 
 - **A replica applies a sync batch in one transaction, not one per

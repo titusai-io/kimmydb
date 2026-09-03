@@ -403,18 +403,23 @@ pub async fn sync_once(
             other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
         }?;
 
-        // What still trails after the round, measured against the vector the
-        // peer opened with. Zero in the caught-up steady state; non-zero
-        // exactly when the backlog exceeded one batch, which is the condition
-        // an operator wants a gauge for. `theirs` is a round old by now, so
-        // this is a floor — a peer that raced ahead during the round shows up
-        // next round.
+        // How far behind in time this node is after the round: the age of
+        // the newest entry it holds from any origin the peer, as of the vector
+        // it opened with, holds newer entries of. Zero in the caught-up steady
+        // state; while a backlog wider than one batch drains, it grows with
+        // the clock — which is what an operator wants a gauge for, and what
+        // the span of missing history did not do for a bulk insert whose
+        // stamps all lay within a second (ADR-122). `theirs` is a round old
+        // by now, so this is a floor — a peer that raced ahead during the
+        // round shows up next round.
         let mine =
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-        outcome.lag_ms = kimmy_storage::lag_behind_ms(&mine, &theirs);
-        // The same measure the other way round: how far the peer trails this
-        // node. A peer that is more than tombstone retention behind may be
-        // holding documents this node has deleted and already collected the
+        outcome.lag_ms =
+            kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
+        // The other direction is a different question: how far the peer
+        // trails this node, in history it can no longer be served. A peer
+        // that is more than tombstone retention behind may be holding
+        // documents this node has deleted and already collected the
         // tombstones for — the resurrection case (ADR-085). Reported, not
         // acted on: the loop decides what to say about it.
         outcome.behind_ms = behind_beyond_horizon(engine, &theirs, &mine)?;
