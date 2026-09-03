@@ -27,10 +27,56 @@ can answer it, which only a *leading* `$match` gets (see
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$sort` | The same sort language. Blocking |
 | `$skip`, `$limit` | Non-negative whole numbers |
-| `$unwind` | One output document per array element |
+| `$unwind` | One output document per array element. Below |
 | `$group` | Blocking. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+
+**Stage operands with a fixed key set are closed; field-path maps stay
+open.** `$unwind`'s document form, `$lookup`'s both forms and `$replaceRoot`
+refuse a key they do not define — `400`, naming it — the same closure
+[ADR-121](decisions.md) gives the request body and the shapes nested in it. A
+`$match` filter and a `$project` specification are **not** put through this:
+every key in either is a document field name the caller chose, not vocabulary
+this database defines, so there is no fixed list to check a key against —
+closing them would refuse ordinary pipelines rather than typos. See
+[ADR-129](decisions.md).
+
+### `$unwind`
+
+```json
+{ "$unwind": "$tags" }
+{ "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": true, "includeArrayIndex": "i" } }
+```
+
+The shorthand string form takes only a path. The document form takes:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | required | The field to expand, `"$"`-prefixed |
+| `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it |
+| `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out |
+
+**What each value at the path does:**
+
+| Value at `path` | Without `preserveNullAndEmptyArrays` | With it |
+|---|---|---|
+| A non-empty array | One row per element, `path` set to that element | Same |
+| Missing, `null`, or `[]` | Dropped | Kept once, `path` unset (removed) |
+| Any other scalar | One row, unchanged — the value unwinds to itself | Same |
+
+`includeArrayIndex` is `null` on every row in the second and third cases: a
+row that was not produced by an array element has no index to report.
+
+**A path that crosses an array is refused, not silently wrong.** `$unwind`
+names a single place to write the expanded element back to; a path like
+`x.b` where `x` itself holds several elements has no such place, and asking
+for it is a `400` naming `$unwind` and the path rather than a `200` with
+rows that look unwound but are not — see [ADR-130](decisions.md) and
+[Arrays](#arrays). A path that reaches a *scalar* through an array — `items.sku`
+where `items` is an array of `{sku, qty}` and the first element's `sku` is a
+string — is unaffected: it unwinds to itself, as any non-array value does,
+because there is no array there to expand or write back.
 
 ### Accumulators
 
@@ -207,6 +253,12 @@ nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
 an expression path and a filter path disagree — the filter language reads
 `items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
+**For `$unwind` this cuts both ways:** it reads the single value at the path,
+same as `$sort` and `$lookup`, but it also has to write each expanded element
+back to that same path, and a path crossing an array has no single place to
+write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is refused,
+`400`, rather than answering with rows that look unwound but are not (see
+[`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
