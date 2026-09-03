@@ -87,6 +87,38 @@ const DEFERRAL_MAX_AGE: Duration = Duration::from_secs(10 * 60);
 /// are arriving to wake it anyway.
 const DEFERRAL_TICK: Duration = Duration::from_secs(5);
 
+/// How long the worker may hold its oplog position before writing it.
+///
+/// The position is pending work with a deadline, exactly as a partial batch
+/// is (ADR-125). Every entry the worker sees moves the position, including
+/// the ones it has nothing to do with — a collection with no vector
+/// configuration, a document another node owns, a delete — and
+/// `put_consumer_position` is a write transaction of its own, so under
+/// `durable` it is an fsync of its own. Written per entry, that was one
+/// commit per oplog entry on every member, for the writer's own entries and
+/// the replicated ones alike: on a three-member cluster running 0.20.0 a
+/// 1,000-document bulk insert converged everywhere in 3–5 s and then every
+/// member, the writer included, committed at a steady ~18/s for about 75 s
+/// until it had added roughly 1.3 commits per document — the single-writer
+/// fsync rate, with nothing throttling the stream. Held instead, a burst of
+/// N entries is one position write however large N is; the burst is
+/// coalesced by any wait at all, so it is the *trickle* — one entry every
+/// so often — that sets this bound, at one commit per second at most.
+///
+/// What holding costs is the window a crash re-processes: at most this much
+/// of the stream, plus whatever a batch was holding. That is safe because
+/// embedding is idempotent — `vectors_are_stale` makes a replayed embed a
+/// no-op — and every other outcome an entry can have (skip, delete, defer,
+/// backfill) is re-derived from what is stored, not from having seen the
+/// entry. One second of replay on a restart is a handful of storage reads;
+/// one fsync per entry was a second copy of every write the cluster makes.
+///
+/// Not a setting. An operator knows nothing that would move it: it is the
+/// trade between restart replay and commit amplification, both of which
+/// are the worker's own, and a bound of a second decides that trade the
+/// same way on every deployment.
+const POSITION_WAIT: Duration = Duration::from_secs(1);
+
 /// The most documents held for a later re-check.
 ///
 /// Bounded because this is memory a burst of remote writes can grow. On
@@ -235,12 +267,15 @@ enum Prepared {
     Embed(Box<Item>),
 }
 
-/// What the streaming path holds between provider calls: the batches, the
-/// newest position seen, and when the oldest waiting job arrived.
+/// What the streaming path holds between flushes: the batches, the newest
+/// position seen, and when each began waiting.
 ///
-/// The position is recorded only when this is empty, so the recorded position
-/// never runs ahead of an entry whose vectors are still in a batch. The
-/// crash-replay guarantee is unchanged; it just covers a few entries at once.
+/// Two things wait here, each with its own deadline. A partial batch waits
+/// `max_wait` for company; a held position waits [`POSITION_WAIT`] for more
+/// entries to cover. The position is recorded only by a flush, after every
+/// batch has landed, so the recorded position never runs ahead of an entry
+/// whose vectors are still in a batch. The crash-replay guarantee is
+/// unchanged; it just covers a window of entries at once rather than one.
 #[derive(Default)]
 struct Pending {
     /// At most one per collection, in the order the collections first
@@ -249,18 +284,37 @@ struct Pending {
     /// The position of the newest entry seen since the last flush — the one
     /// to record once everything before it has landed.
     token: Option<kimmy_core::ResumeToken>,
+    /// When `token` went from none to some; the position wait is measured
+    /// from here, not from the newest entry, so a steady trickle still
+    /// checkpoints once per [`POSITION_WAIT`] rather than never.
+    held_since: Option<Instant>,
     /// When the first job now waiting arrived; the batch wait is measured
     /// from here.
     opened: Option<Instant>,
 }
 
 impl Pending {
-    fn is_empty(&self) -> bool {
-        self.batches.is_empty()
+    /// Note an entry's position as the newest to record.
+    fn hold(&mut self, token: kimmy_core::ResumeToken, now: Instant) {
+        self.token = Some(token);
+        self.held_since.get_or_insert(now);
     }
 
+    /// When whatever is waiting must go out: the earlier of the batch wait
+    /// and the position wait, or `None` when nothing is waiting at all — no
+    /// batch and no held position.
+    ///
+    /// The earlier, never the later: a batch's wait is the freshness a
+    /// document's vectors are promised, and a position that happens to be
+    /// waiting alongside it must not stretch that. It does not, because the
+    /// flush a batch deadline triggers writes the position too.
     fn deadline(&self, wait: Duration) -> Option<Instant> {
-        self.opened.map(|opened| opened + wait)
+        let batch = self.opened.map(|opened| opened + wait);
+        let position = self.held_since.map(|since| since + POSITION_WAIT);
+        match (batch, position) {
+            (Some(batch), Some(position)) => Some(batch.min(position)),
+            (batch, position) => batch.or(position),
+        }
     }
 
     /// Whether the item fits its collection's batch without a flush first.
@@ -570,16 +624,26 @@ impl EmbeddingWorker {
     /// full, when the oldest waiting job has waited `max_wait`, or when the
     /// stream ends. Everything else an entry can mean (a delete, a skip, a
     /// deferral, a configuration change) is handled the moment it arrives.
+    ///
+    /// The position is never written per entry. It is held with the batches
+    /// and written by the same flush: when a batch goes out, when a held
+    /// position has waited [`POSITION_WAIT`] — checked after every entry as
+    /// well as when the stream is idle, since a draining stream never idles —
+    /// when the stream ends or is invalidated, and before a configuration
+    /// change's backfill. A run of
+    /// entries the worker has nothing to do with — a replicated batch
+    /// published in one burst, a bulk insert into a collection with no
+    /// vector configuration — is one position write, not one per entry.
     async fn drive(&mut self, stream: &mut kimmy_storage::ChangeStream) -> Result<StreamEnd> {
         let mut pending = Pending::default();
         loop {
-            // Timed rather than a plain await, so a partial batch goes out on
-            // schedule and deferred documents are still re-checked on a
-            // cluster that has gone quiet. `next` is safe to cancel here: its
-            // only await is the wake-up channel, and it records where to
-            // resume *before* waiting, so a dropped future costs a
-            // notification and not a position. The re-read from the arrival
-            // index on the next call is what recovers it.
+            // Timed rather than a plain await, so a partial batch and a held
+            // position go out on schedule and deferred documents are still
+            // re-checked on a cluster that has gone quiet. `next` is safe to
+            // cancel here: its only await is the wake-up channel, and it
+            // records where to resume *before* waiting, so a dropped future
+            // costs a notification and not a position. The re-read from the
+            // arrival index on the next call is what recovers it.
             let wait = pending.deadline(self.batching.max_wait).map_or(DEFERRAL_TICK, |due| {
                 due.saturating_duration_since(Instant::now()).min(DEFERRAL_TICK)
             });
@@ -590,6 +654,8 @@ impl EmbeddingWorker {
                     return Ok(StreamEnd::Ended);
                 }
                 Err(_) => {
+                    // The combined deadline: whichever of the batch wait and
+                    // the position wait is due, one flush serves both.
                     let now = Instant::now();
                     if pending.deadline(self.batching.max_wait).is_some_and(|due| due <= now) {
                         self.flush(&mut pending).await?;
@@ -653,30 +719,45 @@ impl EmbeddingWorker {
             };
 
             match prepared {
-                // Only after the work is done, so a crash re-processes rather
+                // Held, not written: the position is recorded by a flush,
+                // only after the work is done, so a crash re-processes rather
                 // than skips. Re-processing is safe because embedding is
-                // idempotent. With a batch waiting, "done" is not yet true of
-                // everything before this entry, so the position waits with it.
-                Prepared::Done(_) if pending.is_empty() => {
-                    self.engine.put_consumer_position(CONSUMER, token)?;
-                }
-                Prepared::Done(_) => pending.token = Some(token),
+                // idempotent and every other outcome is re-derived. Writing
+                // it here instead — which this arm did until ADR-125 — cost
+                // one commit and one fsync per oplog entry on every member,
+                // for entries the worker had nothing to do with.
+                Prepared::Done(_) => pending.hold(token, Instant::now()),
                 Prepared::Embed(item) => {
                     if !pending.accepts(&item, &self.batching) {
                         self.flush(&mut pending).await?;
                     }
-                    let full = pending.push(*item, Instant::now(), &self.batching);
-                    pending.token = Some(token);
+                    let now = Instant::now();
+                    let full = pending.push(*item, now, &self.batching);
+                    pending.hold(token, now);
                     if full {
                         self.flush(&mut pending).await?;
                     }
                 }
             }
 
+            // The deadline is checked here as well as in the timeout branch,
+            // because the timeout never fires during a drain: `next` returns
+            // without waiting while the arrival index has entries queued, so
+            // on a backlog the timed wait above is never reached. Without
+            // this, a held position waited for the whole drain — a member
+            // coming back to an hour of entries would checkpoint nothing
+            // until it had caught up — and a partial batch whose entries
+            // were slow to prepare waited past `max_wait`. A batch that is
+            // full still goes the moment it fills, above.
+            let now = Instant::now();
+            if pending.deadline(self.batching.max_wait).is_some_and(|due| due <= now) {
+                self.flush(&mut pending).await?;
+            }
+
             // Also here, not only on the idle tick: a busy cluster may never
             // reach the timeout, and a deferral that is due should not have to
             // wait for a lull.
-            self.drain_deferred(Instant::now()).await;
+            self.drain_deferred(now).await;
         }
     }
 
@@ -686,12 +767,16 @@ impl EmbeddingWorker {
     /// Any batch here may span several collections' worth of entries in the
     /// stream, and the token recorded is the newest one seen: by the time it
     /// is written every entry before it has either been handled on arrival or
-    /// embedded just now.
+    /// embedded just now. There may be no batch at all — a position that has
+    /// waited [`POSITION_WAIT`] with nothing to embed flushes through here
+    /// too — in which case this is the one position write for however many
+    /// entries were held.
     async fn flush(&mut self, pending: &mut Pending) -> Result<()> {
         for batch in std::mem::take(&mut pending.batches) {
             self.embed_batch(batch).await;
         }
         pending.opened = None;
+        pending.held_since = None;
         if let Some(token) = pending.token.take() {
             self.engine.put_consumer_position(CONSUMER, token)?;
         }
@@ -2127,7 +2212,10 @@ mod tests {
     ///
     /// Quiet is defined on the commit counter rather than on a number of
     /// entries, so that a change to how many oplog entries the setup produces
-    /// makes this test *slower* rather than flaky.
+    /// makes this test *slower* rather than flaky. "Started" is a recorded
+    /// position, which lands up to [`POSITION_WAIT`] after the setup's last
+    /// entry now that the position is held rather than written per entry;
+    /// the poll allows several times that.
     async fn worker_is_idle(engine: &Engine) {
         let mut last = engine.commits();
         let mut stable = 0;
@@ -2164,49 +2252,261 @@ mod tests {
         panic!("the worker never recorded a position past {from:?}");
     }
 
-    /// The daemon-versus-engine write gap, as a test.
-    ///
-    /// A bare `Engine` spends one commit on an insert
-    /// (`kimmy_storage::docs::tests::one_insert_is_one_commit`). A daemon runs
-    /// this worker, which records its oplog position after **every** entry —
-    /// including the ones it has nothing to do with — and each of those is its
-    /// own write transaction and its own fsync. So an insert into a collection
-    /// with no vector configuration costs two commits on a daemon and one at
-    /// the engine, which is the write gap M10 task 7 measured and could not
-    /// explain.
-    ///
-    /// Nothing caught it because every other test in this file drives
-    /// `process` directly and never `run`, and `process` is not where the
-    /// position is recorded.
-    ///
-    /// **This test passing is not an endorsement.** It pins the current cost so
-    /// that a fix has to change it deliberately; if you are reading this
-    /// because you just made it fail, you are probably doing the right thing.
-    #[tokio::test]
-    async fn a_write_the_worker_skips_still_costs_a_second_commit() {
+    /// Wait for the worker's recorded position to reach exactly `stamp`, or
+    /// give up. The way to know the worker has nothing left to write for a
+    /// burst: its position covers the burst's last entry.
+    async fn position_reaches(engine: &Engine, stamp: kimmy_core::Stamp) {
+        for _ in 0..1_000 {
+            if engine.consumer_position(CONSUMER).unwrap().map(|t| t.to_stamp()) == Some(stamp) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("the worker never recorded a position at {stamp:?}");
+    }
+
+    /// An engine with a collection that has no vector configuration and a
+    /// worker running against it — so every entry the worker sees is an
+    /// `Outcome::Skipped`, and the only commits it can add are position
+    /// writes. Returned settled: the worker has recorded a position for
+    /// whatever creating the collection produced, so a measurement taken
+    /// after this covers the caller's writes and nothing else.
+    async fn setup_skipping_worker()
+    -> (Arc<Engine>, CollectionMeta, Option<kimmy_core::ResumeToken>, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
-        // No vector configuration, so every entry here is an `Outcome::Skipped`.
         let coll = engine.create_collection("app", "plain").unwrap();
 
         let mut worker = EmbeddingWorker::new(Arc::clone(&engine));
         tokio::spawn(async move { worker.run().await });
 
-        // Let it finish with whatever creating the collection produced, so the
-        // measurement below covers one insert and nothing else.
         worker_is_idle(&engine).await;
         let settled = engine.consumer_position(CONSUMER).unwrap();
+        (engine, coll, settled, dir)
+    }
 
+    /// The daemon-versus-engine write gap, closed.
+    ///
+    /// A bare `Engine` spends one commit on an insert
+    /// (`kimmy_storage::docs::tests::one_insert_is_one_commit`). A daemon runs
+    /// this worker, which used to record its oplog position after **every**
+    /// entry — including the ones it had nothing to do with — and each of
+    /// those was its own write transaction and its own fsync. So an insert
+    /// into a collection with no vector configuration cost two commits on a
+    /// daemon and one at the engine, which was the write gap M10 task 7
+    /// measured and could not explain; and on a cluster, where every member
+    /// runs the worker over its own arrival index, it was one commit per
+    /// replicated document on every member, on top of the one transaction
+    /// ADR-119 had just reduced the sync batch to.
+    ///
+    /// The position is held now and written by deadline (ADR-125), so a
+    /// burst of writes the worker skips costs the writes' own commits plus a
+    /// small constant of position writes — one, unless the burst straddles
+    /// a [`POSITION_WAIT`] boundary — and never one per write.
+    ///
+    /// Nothing caught the original because every other test in this file
+    /// drives `process` directly and never `run`, and `process` is not where
+    /// the position is recorded.
+    #[tokio::test]
+    async fn a_burst_of_writes_the_worker_skips_costs_one_position_write_not_one_each() {
+        let (engine, coll, _settled, _dir) = setup_skipping_worker().await;
+
+        let count = 50u64;
         let before = engine.commits();
+        for n in 0..count {
+            engine.insert(&coll, doc! { "n": n as i64 }).unwrap();
+        }
+        // Until the position covers the whole burst — not merely until it has
+        // moved, and not a quiet window on the commit counter either: a
+        // second held token can land after any fixed window on a loaded
+        // machine, and the count below has to be the whole cost.
+        position_reaches(&engine, last_entry(&engine).stamp).await;
+
+        let added = engine.commits() - before;
+        assert!(
+            added <= count + 2,
+            "{count} inserts the worker skips cost {added} commits; the worker may add a \
+             position write or two, not one per insert"
+        );
+        assert!(
+            added < 2 * count,
+            "{count} inserts cost {added} commits — one per insert for the position, which \
+             is the write gap this test exists to keep closed"
+        );
+        assert_eq!(
+            engine.consumer_position(CONSUMER).unwrap().map(|t| t.to_stamp()),
+            Some(last_entry(&engine).stamp),
+            "the one position write must cover the whole burst"
+        );
+    }
+
+    /// The other half of the trade: holding the position must not mean
+    /// never writing it. A lone entry nothing follows still gets its
+    /// position recorded, within about [`POSITION_WAIT`], so that a restart
+    /// resumes from near the end of the log rather than replaying all of it
+    /// — and so that retention, which collects what the position is behind,
+    /// never finds the position stranded.
+    #[tokio::test]
+    async fn a_lone_skipped_entrys_position_is_recorded_within_the_position_wait() {
+        let (engine, coll, settled, _dir) = setup_skipping_worker().await;
+
+        let started = Instant::now();
         engine.insert(&coll, doc! { "n": 1i64 }).unwrap();
         position_advances_past(&engine, settled).await;
+        let took = started.elapsed();
 
-        assert_eq!(
-            engine.commits() - before,
-            2,
-            "an insert the worker skips still costs the insert's commit plus the worker's \
-             position write — one write, two fsyncs"
+        // Generous — the test is that it lands on the position's own
+        // schedule, not the five-second deferral tick or the next write.
+        assert!(
+            took < POSITION_WAIT * 3,
+            "a lone skipped entry's position took {took:?} to land; it should have been \
+             written within about {POSITION_WAIT:?}"
         );
+        assert_eq!(
+            engine.consumer_position(CONSUMER).unwrap().map(|t| t.to_stamp()),
+            Some(last_entry(&engine).stamp),
+            "the recorded position must be the entry itself"
+        );
+    }
+
+    /// A held position must not delay embedding. The deadline the worker
+    /// waits on is the *earlier* of the batch wait and the position wait; if
+    /// it were the later, an embeddable document arriving behind a burst of
+    /// skipped entries would wait out the position's second instead of the
+    /// batch's `max_wait`.
+    #[tokio::test]
+    async fn a_burst_of_skipped_entries_does_not_delay_the_embeddable_document_behind_it() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let plain = engine.create_collection("app", "plain").unwrap();
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        worker.set_batching(BatchSettings {
+            max_wait: std::time::Duration::from_millis(50),
+            ..Default::default()
+        });
+        position_at_latest(&engine);
+        tokio::spawn(async move { worker.run().await });
+
+        // The burst: entries the worker holds a position for and nothing else.
+        for n in 0..20 {
+            engine.insert(&plain, doc! { "n": n as i64 }).unwrap();
+        }
+        // Then one document that needs a provider call.
+        let started = Instant::now();
+        engine.insert(&coll, doc! { "_id": 0i64, "title": "behind the burst" }).unwrap();
+        vectors_land(&engine, 1).await;
+        let took = started.elapsed();
+
+        assert!(
+            took < POSITION_WAIT,
+            "the document behind the burst waited {took:?} for its vectors; the batch wait \
+             should have sent it long before the held position's {POSITION_WAIT:?}"
+        );
+        assert_eq!(fake.sizes(), vec![1]);
+    }
+
+    /// The bound holds *during* a backlog, not only once the stream goes
+    /// quiet. `ChangeStream::next` returns without waiting while the arrival
+    /// index has entries queued, so the timed wait in `drive` never elapses
+    /// during a drain; the deadline has to be checked per entry as well, or
+    /// a held position waits for the whole drain — and a member coming back
+    /// to a long backlog would checkpoint nothing until it had caught up,
+    /// which is exactly the restart-replay window `POSITION_WAIT` bounds.
+    ///
+    /// The drain is slowed deterministically rather than by volume: the
+    /// owner check, which the worker asks once per embeddable entry, sleeps
+    /// on the calling thread and answers "not mine", so every entry is a
+    /// deferral the worker holds a position for and the backlog takes
+    /// several `POSITION_WAIT`s to cross. A second runtime thread keeps the
+    /// poll below running while the worker's thread sleeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_position_is_checkpointed_during_a_long_drain_not_only_after_it() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let count = 600usize;
+        let docs =
+            (0..count).map(|i| doc! { "_id": i as i64, "title": format!("doc {i}") }).collect();
+        engine.insert_many(&coll, docs).unwrap();
+        let last = last_entry(&engine).stamp;
+
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counting = Arc::clone(&handled);
+        worker.set_owner_check(Box::new(move |_| {
+            std::thread::sleep(Duration::from_millis(5));
+            counting.fetch_add(1, Ordering::SeqCst);
+            false
+        }));
+        tokio::spawn(async move { worker.run().await });
+
+        // Every distinct position recorded while the drain was still in
+        // progress. The position is read *before* the count, so a position
+        // paired with an incomplete count was recorded before the last entry
+        // was handled.
+        let mut during: Vec<kimmy_core::ResumeToken> = Vec::new();
+        let mut drained = 0;
+        for _ in 0..4_000 {
+            let position = engine.consumer_position(CONSUMER).unwrap();
+            drained = handled.load(Ordering::SeqCst);
+            if drained >= count {
+                break;
+            }
+            if let Some(position) = position
+                && during.last() != Some(&position)
+            {
+                during.push(position);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(drained >= count, "the drain never completed: {drained} of {count} handled");
+
+        assert!(
+            during.len() >= 2,
+            "a backlog that took about {:?} to drain saw {} position checkpoints while it was \
+             draining; one is due every {POSITION_WAIT:?} whether or not the stream goes quiet",
+            Duration::from_millis(5 * count as u64),
+            during.len()
+        );
+        for position in &during {
+            assert!(
+                position.to_stamp() < last,
+                "a position recorded mid-drain must trail the backlog, not lead it"
+            );
+        }
+
+        // Leave with the worker parked on its wake-up channel, not mid-poll:
+        // a runtime torn down under a task that is still polling — this one
+        // sleeps inside the owner check — trips tokio's own shutdown
+        // assertion on the next timer it touches, which would be noise on
+        // top of whatever this test had to say.
+        position_reaches(&engine, last).await;
+    }
+
+    /// The pure form of the rule above, with no clock to wait on.
+    #[test]
+    fn the_deadline_is_the_earlier_of_the_batch_wait_and_the_position_wait() {
+        let wait = Duration::from_millis(100);
+        let now = Instant::now();
+        let node = kimmy_core::NodeId::generate();
+        let token = kimmy_core::ResumeToken::new(Hlc::new(1, 1), node);
+
+        let mut pending = Pending::default();
+        assert_eq!(pending.deadline(wait), None, "nothing waiting, nothing due");
+
+        pending.hold(token, now);
+        assert_eq!(pending.deadline(wait), Some(now + POSITION_WAIT), "a held position alone");
+
+        // A batch opened later than the position was first held is still
+        // due sooner: `max_wait` is shorter than `POSITION_WAIT`.
+        pending.opened = Some(now + Duration::from_millis(500));
+        assert_eq!(pending.deadline(wait), Some(now + Duration::from_millis(600)));
+
+        // A position held almost a second ago is due before a batch just
+        // opened; it goes out first and the flush takes the batch with it.
+        pending.opened = Some(now + POSITION_WAIT - Duration::from_millis(10));
+        assert_eq!(pending.deadline(wait), Some(now + POSITION_WAIT));
+
+        // Holding a newer token does not restart the clock.
+        pending.hold(kimmy_core::ResumeToken::new(Hlc::new(2, 1), node), now + POSITION_WAIT);
+        assert_eq!(pending.held_since, Some(now));
     }
 
     // -----------------------------------------------------------------------

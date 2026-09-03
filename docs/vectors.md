@@ -226,8 +226,9 @@ the floor.
 
 What batching does not change: the storage write is still per document.
 `put_vectors` replaces one document's chunks, staleness is one document's
-HLC, and the oplog position is recorded once the batch has landed, so a crash
-replays rather than skips exactly as before. A document's chunks always share
+HLC, and the oplog position is recorded once the batch has landed — or, with
+no batch to land, after at most a second (ADR-125) — so a crash replays
+rather than skips exactly as before. A document's chunks always share
 one call, so a document larger than the token bound goes alone rather than
 being split. Only one collection's documents share a call, because the
 collection names the provider, the model and the prefix. A batch that fails
@@ -315,6 +316,18 @@ The worker records its oplog position **after** doing the work, never before.
 Crashing mid-embed replays the entry; crashing after writing vectors but before
 recording the position also replays it — and the HLC check makes that a no-op.
 Recording the position first would silently skip documents instead.
+
+It also records it **by deadline, not per entry** (ADR-125). The position is
+held alongside the batches and written with one — or, when there is nothing
+to embed, after at most one second. Every entry moves the position, including
+the ones the worker has nothing to do with: a collection with no vector
+configuration, a document another member owns, a delete. Written per entry,
+each of those was a commit and an fsync of its own on every member — a
+1,000-document bulk on a three-member cluster running 0.20.0 converged in
+3–5 s and then had every member committing at ~18/s for about 75 s. Held, a
+burst of any size is one position write. What holding costs is that a
+restart re-processes up to a second of the stream, which the idempotence
+above makes a handful of reads.
 
 A provider failure that could plausibly succeed on retry — a transport error, a
 rate limit — retries the same entry after a delay rather than advancing past it.
