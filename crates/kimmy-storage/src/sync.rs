@@ -246,6 +246,19 @@ impl Engine {
     /// commit and one fsync, not one per entry plus two (ADR-119).
     /// `scanned_to` and `exhausted` are the peer's report of where its window
     /// ended, which is what decides whether its tail was reached (ADR-127).
+    ///
+    /// **A window that is not a tail is clamped to what it actually carried.**
+    /// The window's end moved from something this node computes to something
+    /// the peer asserts, and an assertion crossing the wire is checked here or
+    /// nowhere: a sender that trimmed a batch in place but reported the end it
+    /// had scanned to would witness away every entry it dropped, which is
+    /// finding 14 from one wrong field. `Message::BatchTooLarge` tells a
+    /// sender not to do that, and this is the same rule as an invariant rather
+    /// than as prose. A correct sender is unaffected — its window stops on the
+    /// entry it last kept — so the clamp is a no-op today and a floor
+    /// afterwards. An *exhausted* window is exempt: it proves the peer's whole
+    /// tail by definition, and an empty one is the honest answer when
+    /// everything in range was withheld.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
@@ -253,6 +266,10 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
+        let scanned_to = match entries.last() {
+            Some(last) if !exhausted => scanned_to.min(last.stamp.hlc),
+            _ => scanned_to,
+        };
         self.apply_batch_absorbing(
             entries,
             Some(&coverage_after_batch(theirs, scanned_to, exhausted)),
@@ -1366,12 +1383,17 @@ mod tests {
         // the cluster. Observed as `applied=0, superseded=1021` every five
         // seconds, with the lag gauge reading the cluster's age.
         //
-        // The cure has two expressions now, and this fails if *both* are
-        // reverted: `coverage_after_batch` absorbs the peer's vector outright
-        // when its oplog was exhausted, and the window's end counts every
-        // entry the peer's scan examined, an entry it withheld included.
-        // `an_exhausted_window_proves_the_whole_advertised_vector` pins the
-        // first on its own.
+        // Converging is necessary but not sufficient to show the cure is
+        // there, and on its own it does not discriminate: once the scan
+        // reaches the violation at the oplog's head, `scanned_to` is the
+        // peer's newest stamp, so clipping each origin to it happens to give
+        // the same answer as absorbing the peer's vector. The two rules only
+        // differ where the peer advertises an origin **above** its own oplog
+        // head, which is not a hypothetical — a snapshot grants coverage for
+        // entries the node will never hold (ADR-036), and retention collects
+        // the log out from under a vector that persists (ADR-097). The last
+        // stage below puts the converged round's own window against exactly
+        // that vector.
         const LIMIT: usize = 8;
         const DOCS: usize = 3 * LIMIT + 1;
 
@@ -1410,9 +1432,10 @@ mod tests {
 
         let budget = DOCS / LIMIT + 6;
         let mut rounds = 0;
+        let mut last = OplogWindow::default();
         while rounds < budget {
             rounds += 1;
-            round(&b, &a, LIMIT);
+            last = round_window(&b, &a, LIMIT).1;
             if b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()) {
                 break;
             }
@@ -1430,6 +1453,82 @@ mod tests {
         );
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2, "and nothing was lost getting there");
+
+        // The discriminating half. The round that finished the catch-up ran
+        // off the end of A's oplog, and *that* is what proves coverage of
+        // everything A advertised — not the stamp the scan happened to stop
+        // on. Put the same window against a peer advertising an origin above
+        // its own log, the shape a snapshot or a retention pass leaves behind:
+        // absorbing answers `granted`, and clipping to the window's end
+        // answers `w.scanned_to`, which would pin `behind` at that origin's
+        // floor for ever — the livelock ADR-082 exists to prevent.
+        assert!(last.exhausted, "the round that caught B up must have reached A's tail");
+        let mut advertised = a.version_vector().unwrap();
+        let granted = kimmy_core::NodeId::generate();
+        let beyond = Hlc::new(last.scanned_to.wall_ms + 60_000, 0);
+        advertised.insert(granted, beyond);
+        assert!(beyond > last.scanned_to, "only above the window's end do the two rules differ");
+
+        let covered = coverage_after_batch(&advertised, last.scanned_to, last.exhausted);
+        assert_eq!(
+            covered.get(granted),
+            beyond,
+            "an exhausted window proves every origin the peer advertised, including one \
+             whose entries are not in its oplog at all"
+        );
+        assert_ne!(
+            covered.get(granted),
+            last.scanned_to,
+            "clipping to the window's end instead would leave that origin pinned"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_over_reports_its_window_claims_only_what_it_sent() {
+        // ADR-127 moved the window's end from something this node computes to
+        // something the peer asserts, and nothing on the wire is checked by
+        // being written down. A sender that trimmed a batch in place — the
+        // temptation the `Fits::Only` path creates — while reporting the end
+        // it had scanned to would hand the receiver finding 14 from one wrong
+        // field: the entries it dropped witnessed away, `behind` reporting
+        // nothing missing, and no round ever asking again.
+        const DOCS: usize = 20;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..DOCS {
+            a.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+        }
+
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        assert!(whole.exhausted);
+        let head = whole.scanned_to;
+
+        // Three entries — the collection and two documents — served with the
+        // oplog's head as the window's end.
+        let trimmed = &whole.entries[..3];
+        b.apply_peer_batch(&theirs, trimmed, head, false).unwrap();
+
+        let cb = b.get_collection("shop", "orders").expect("the creation was in the three");
+        assert_eq!(b.count(&cb).unwrap(), 2, "only two documents were actually sent");
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&theirs),
+            "so the peer's tail must still be outstanding, whatever the peer claimed"
+        );
+        assert_eq!(
+            witnessed_of(&b, &theirs),
+            trimmed.last().unwrap().stamp.hlc,
+            "the window is worth exactly what it carried"
+        );
+
+        // And the rest is still served, which is the point of refusing the claim.
+        let budget = DOCS + 2;
+        for _ in 0..budget {
+            round(&b, &a, 8);
+        }
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "every document arrives on a later round");
     }
 
     mod props {

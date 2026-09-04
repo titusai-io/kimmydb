@@ -123,7 +123,10 @@ pub enum Message {
     /// receiver would witness them without ever seeing them — the silent gap
     /// ADR-082, ADR-127 and `BeyondHorizon` all exist to prevent. Asking again
     /// for `fits` re-reads the window at the smaller limit, so the end it
-    /// reports matches the entries it sends.
+    /// reports matches the entries it sends. `Engine::apply_peer_batch` clamps
+    /// a non-exhausted window to its last delivered stamp, so a sender that
+    /// ignores this loses the claim rather than the receiver's data — but the
+    /// batch it trimmed is still short of what it said, so ask again instead.
     ///
     /// `fits` is zero when one entry alone exceeds the frame, which no limit can
     /// carry; the requester reports that rather than probing forever.
