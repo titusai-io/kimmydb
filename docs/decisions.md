@@ -7383,18 +7383,77 @@ The attribute is on every `Option<T>` field of every route struct behind
 `if_stamp`), `DeleteRequest` (`filter`, `if_stamp`), `CreateIndexRequest`
 (`name`, `enforcement`, `expireAfterSeconds`, `partialFilterExpression`),
 `webhooks::RegisterRequest` (`operations`), and `vectors::SearchRequest`
-(`query`, `vector`, `filter`, `k`, `per_document`, `weights`, `min_overlap`).
-No field opts into nullability today; one that genuinely needs to keep the
-bare `Option<T>` derive and says so where it is declared. Query-string
-structs are untouched: a query string cannot carry a JSON `null` — `?if_stamp=`
-is an empty string, refused already as a malformed stamp — so ADR-124's
-closure needed nothing here. Neither does a document body: `insert`,
-`replace` and bulk insert take `JsonBody<Value>` or `JsonBody<Vec<Value>>`
-directly, with no declared fields to hold this rule, and a document's own
-content, a filter's, or an update operator's operand is read straight into
-`Value`, which legitimately holds `null` — this rule reaches only a request
-shape's own declared fields, never what a `Value`-typed field's document
-holds.
+(`query`, `vector`, `filter`, `k`, `per_document`, `weights`, `min_overlap`) —
+every closed shape `find`, index creation, webhook registration and both
+searches, all of which ADR-121 names as closed, add to the four write shapes
+finding 12 itself demonstrated the hole on.
+
+`POST .../vector` is on that list too — ADR-121 names "a vector
+configuration's `provider`" as a nested shape it closes — but not by putting
+the attribute on `kimmy_core::VectorConfig`/`ProviderConfig` themselves. Those
+two are not only this route's request body; they are also the stored form,
+inside `CollectionMeta`, and the replicated one, inside `VectorSet`'s BSON —
+and several of their fields (`ProviderConfig::{OpenAi,Cohere,Gemini}`'s
+`endpoint`, `CustomHttp`'s `api_key_env`) have `#[serde(default)]` but no
+`skip_serializing_if`, unlike `dimensions` and `max_tokens` beside them, so an
+unset one has always serialized as a literal `null` rather than an absent
+key. Putting `non_null_field` on `VectorConfig` itself would refuse to load
+or replicate-apply exactly the records that shape has always produced by
+leaving a field at its default — turning an upgrade into a node that cannot
+read its own configuration. So the refusal lives on
+`kimmy_api::vectors::VectorConfigInput` — a request-only mirror of
+`VectorConfig`, with `ChunkConfigInput` and `ProviderConfigInput` mirroring
+its two nested shapes — deserialized from the fresh HTTP body and converted
+with `From` before anything stores or replicates it, exactly the shape
+ADR-121 already used for `GrantInput` over `kimmy_auth::Grant`, and for the
+same reason: a wire shape and a persisted one are not always the same
+closure, even when they are (there, and here until now) the same type.
+`kimmy-core/src/vector_meta.rs` carries a test,
+`a_null_endpoint_or_key_variable_still_decodes_as_absent`, pinning that the
+real type stays exactly as permissive as every version before this one.
+
+The MCP tools carry the same attribute on the same fields, named for
+`kimmy_api::json::non_null_field` rather than redefined: `DescribeArgs`
+(`sample`), `FindArgs` (`filter`, `sort`, `projection`, `limit`, `skip`),
+`CountArgs` (`filter`), `SearchArgs` (`query`, `vector`, `filter`, `k`),
+`HybridSearchArgs` (`query`, `vector`, `filter`, `k`, `weights`,
+`min_overlap`), `UpdateArgs` (`filter`), `DeleteArgs` (`filter`), and
+`CreateIndexArgs` (`name`) — the same `{"filter": null, "multi": true}`
+deletes-everything case, reachable through `delete`'s tool argument the same
+as through the REST body, since rmcp deserializes both with plain serde and
+neither the HTTP path nor the tool path is more closed than the other by
+right. `InsertArgs`'s `document`, `BulkInsertArgs`'s `documents` and
+`AggregateArgs`'s `pipeline` are content the same way a REST document body
+is, and are untouched for the same reason.
+
+No field opts into nullability today; one that genuinely would keep the bare
+`Option<T>` derive and say so where it is declared. Query-string structs are
+untouched: a query string cannot carry a JSON `null` — `?if_stamp=` is an
+empty string, refused already as a malformed stamp — so ADR-124's closure
+needed nothing here. Neither does a document body: `insert`, `replace` and
+bulk insert take `JsonBody<Value>` or `JsonBody<Vec<Value>>` directly, with no
+declared fields to hold this rule, and a document's own content, a filter's,
+or an update operator's operand is read straight into `Value`, which
+legitimately holds `null` — this rule reaches only a request shape's own
+declared fields, never what a `Value`-typed field's document holds. It also
+does not reach a field that is not itself optional: `update`'s `update` on
+`POST .../update` is a required `Value`, so `null` there becomes
+`Value::Null` and is refused downstream at `400`, by that field's own type,
+rather than by `non_null_field` — which only ever runs on a field the derive
+would otherwise default to `None`. Both are refused; only the status and the
+mechanism differ, and `a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field`
+pins the distinction so it reads as deliberate.
+
+A test in each of `kimmy-api` and `kimmy-mcp` enumerates every shape and
+field this decision claims and drives it over a real socket, asserting `422`
+(`kimmy-api`) or the tool's own `isError` (`kimmy-mcp`) for an explicit
+`null` and success for an absent key — the table-driven guard the review that
+returned this unit asked for, so a field added to a closed shape later
+without the attribute fails the suite rather than shipping quietly. Nothing
+shorter of a proc macro that refuses to compile a bare `Option<T>` on a
+closed shape is fully fail-closed by construction the way ADR-124's route
+table is; this is the nearest practical approximation, and is named as a
+residual below.
 
 **Why.** `{"if_stamp": null}` on `update`, `delete` or `find_and_modify`
 answered `200` and wrote unconditionally — the opposite of what the field is
@@ -7441,19 +7500,53 @@ aware of the other's result.
   generic: one function reused everywhere is worth more than wording tuned
   per call site, and "a non-null value" already says what a client needs to
   fix.
+- *Put `non_null_field` on `kimmy_core::VectorConfig`/`ProviderConfig`
+  directly, since deny_unknown_fields already lives there.* Rejected, for
+  the reason ADR-121 gave for leaving `VectorConfig` out of the
+  specification's closed-request treatment, one level more serious here: a
+  response schema staying open so a new field is additive is a documentation
+  concern, but a stored or replicated record decoding under a later version
+  is a durability one. `ProviderConfig::endpoint` already serializes an unset
+  value as a literal `null` and always has, so closing the type itself would
+  refuse to load metadata this exact version of the server wrote. `kimmy-core`
+  cannot depend on `kimmy-api` to reach `non_null_field` even if this were
+  safe, which is the surface version of the same problem: the type is used
+  where the rule must not reach.
+- *Move `non_null_field` down into `kimmy-core` so `VectorConfig` could use it
+  directly, gated some other way from the storage and replication paths.*
+  Rejected as more machinery for less clarity than a mirror: it would need a
+  second entry point, or a flag threaded through every deserialization call
+  site, to tell "this is a fresh request" from "this is a stored record" —
+  exactly the distinction `VectorConfigInput` draws for free by being a type
+  that only ever exists on the request path. `GrantInput` already established
+  the pattern for a request shape that happens to coincide with a persisted
+  one; reusing it costs a `From` impl, not a new mechanism.
 
 **Cost.** Breaking for a client relying on the bug: one that sends `null` for
 an unconditional write dressed as a conditional one, or a `null` filter
-meaning "everything", now meets a `422` instead of a silent write. A
-`0.MINOR` bump under the pre-1.0 policy, no compatibility shim — sending
-`null` was never documented to mean anything, and `openapi.yaml` already
-typed every one of these fields without a `null` branch, so the schema was
-already correct; only the server's behaviour was not. One helper function,
-reused wherever a field needs it, and one line per field naming it — the
-same shape of cost ADR-121's `deny_unknown_fields` attribute has today. The
-first-party Rust, Python and Go clients, the CLI, the MCP server, the
-conformance scenarios and every request example in the documentation omit an
-unset optional field rather than encoding it as `null`, so none of them are
-affected.
+meaning "everything", now meets a `422` (or, over MCP, the tool's own
+`isError`) instead of a silent write. A `0.MINOR` bump under the pre-1.0
+policy, no compatibility shim — sending `null` was never documented to mean
+anything, and `openapi.yaml` already typed every one of these fields without
+a `null` branch, so the schema was already correct; only the server's
+behaviour was not. One helper function, reused wherever a field needs it —
+kimmy-mcp names it from kimmy-api rather than redefining it — one line per
+field naming it, and one mirror type for `POST .../vector`'s three shapes:
+the same order of cost ADR-121's `deny_unknown_fields` attribute has today,
+plus what `GrantInput` already cost once. The first-party Rust and Python
+clients, the CLI, the MCP server's own use of these tools, the conformance
+scenarios and every request example in the documentation omit an unset
+optional field rather than encoding it as `null`, so none of them are
+affected. The Go client is not quite in that list: `Update`, `Delete`,
+`UpdateIf` and `DeleteIf`, and `UpdateOptions.body`, built their request body
+around whatever `filter` map the caller passed with no guard against `nil` —
+only `Count` turned a `nil` map into `{}` first — and Go's encoder marshals a
+`nil` map as `null`, so `Delete(ctx, db, coll, nil, true)` sent exactly
+`{"filter": null, "multi": true}`. Before this decision that emptied the
+collection silently; the fix in this repository turns it into a `422` the
+client's `*APIError` reports, which is already strictly better, but the five
+call sites now carry the same `nonNilFilter` guard `Count` always had, so a
+`nil` filter reads as `{}` — "no condition" — the way every other client's
+does, rather than reaching the server as `null` at all.
 
 ---

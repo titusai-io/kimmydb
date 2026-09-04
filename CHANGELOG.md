@@ -14,21 +14,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
-- **An explicit JSON `null` on a declared request field is refused `422`,
-  rather than read the same as the field being absent.** `Option<T>`'s
-  ordinary deserialization cannot tell a caller who never mentioned a field
-  from one who sent it as `null`, so `{"if_stamp": null}` on `update`,
-  `delete` or `find_and_modify` made a conditional write unconditional, and
-  `{"filter": null, "multi": true}` on `/delete` deleted every document in
-  the collection — the same on `/update` rewrote every one. Every other
-  malformed value of these fields was already refused; `null` was the one
-  hole. The refusal is stated once, at the `JsonBody<T>` extractor every
-  request body passes through, and applies to every declared optional field
-  of a closed request shape (ADR-121) — not an `if_stamp`-only patch. A
-  document body, a filter's contents, and an update operator's operand are
-  content, not a shape, and still take `null` freely. This tightens a
+- **An explicit JSON `null` on a declared request field is refused `422`
+  (or the tool's own error, over MCP), rather than read the same as the
+  field being absent.** `Option<T>`'s ordinary deserialization cannot tell a
+  caller who never mentioned a field from one who sent it as `null`, so
+  `{"if_stamp": null}` on `update`, `delete` or `find_and_modify` made a
+  conditional write unconditional, and `{"filter": null, "multi": true}` on
+  `/delete` deleted every document in the collection — the same on
+  `/update` rewrote every one, and the same shape reached the same result
+  through the `delete` and `update` MCP tools. Every other malformed value
+  of these fields was already refused; `null` was the one hole. The refusal
+  is stated once, at the `JsonBody<T>` extractor every REST request body
+  passes through, reused by name from the MCP tool arguments, and applies to
+  every declared optional field of every closed request shape (ADR-121) —
+  not an `if_stamp`-only patch, and not only the four write shapes finding 12
+  first showed it on: `find`, index creation, webhook registration, both
+  searches and `POST .../vector` are covered too. A document body, a
+  filter's contents, and an update operator's operand are content, not a
+  shape, and still take `null` freely, on both transports. This tightens a
   refusal and is breaking for a caller relying on the old behaviour: a
-  `0.MINOR` bump under the pre-1.0 policy, no compatibility shim. ADR-128.
+  `0.MINOR` bump under the pre-1.0 policy, no compatibility shim. The Go
+  client's `Update`, `Delete`, `UpdateIf`, `DeleteIf` and `UpdateOptions` now
+  turn a `nil` filter into `{}` before sending it, matching `Count`'s
+  existing guard, so a caller who passed `nil` meaning "no condition" keeps
+  getting exactly that rather than a new `422`. ADR-128.
 
 ## 0.21.0 - 2026-09-03
 
