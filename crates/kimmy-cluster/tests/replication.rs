@@ -1477,3 +1477,64 @@ async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() 
     looping.abort();
     writer.abort();
 }
+
+/// P6's own reproduction, at the network level: finding 14's more serious
+/// half was 500 and 517 documents missing from collections that existed,
+/// correctly named, on every member — the case a names-only check would
+/// have missed entirely, and the stated reason the count half of this check
+/// exists at all. It must confirm through the real `replicate()` loop even
+/// when this node holds several collections, so the probe rotation
+/// naturally cycles away from the divergent one between contacts — the
+/// exact shape that left the gauge structurally unable to move before this
+/// was fixed (see `DivergenceTracker::observe`'s own documentation).
+#[tokio::test]
+async fn a_count_divergence_confirms_through_the_real_loop_despite_other_collections() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let mut collections = Vec::new();
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        let c = a.engine.create_collection("shop", name).unwrap();
+        a.engine.insert(&c, doc! { "_id": "0" }).unwrap();
+        collections.push(c);
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await; // converged: every collection holds one document on both
+
+    // "gamma" grows further on A; B is made to believe it has already
+    // witnessed the growth without ever applying it -- a real count
+    // divergence B does not know about, on a collection whose name and
+    // existence agree everywhere.
+    let gamma = &collections[2];
+    for i in 1..=20 {
+        a.engine.insert(gamma, doc! { "_id": i.to_string() }).unwrap();
+    }
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the count divergence never confirmed through the real loop")
+            })
+            .expect("the loop must keep reporting");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "gamma's count divergence, despite alpha/beta/delta rotating through");
+    looping.abort();
+}
