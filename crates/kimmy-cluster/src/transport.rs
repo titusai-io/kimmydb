@@ -482,7 +482,23 @@ pub async fn sync_once(
                 // genuine signal into the same bucket as an unremarkable
                 // capped pull, and a failed round is exactly the shape
                 // `kimmy_sync_failures_total` exists to make visible.
-                if entries.is_empty() && !exhausted {
+                if is_unreachable_from_a_correct_sender(entries.len(), exhausted) {
+                    // Logged unconditionally, not left to the caller's
+                    // generic per-peer failure debounce: that debounce is
+                    // right for the ordinary noise of a peer going up and
+                    // down, and wrong here, because it can route this
+                    // occurrence's very first sighting to `debug` if the
+                    // same peer already had an unrelated failure recently —
+                    // leaving nothing but a bare counter increment for a
+                    // condition whose whole point is that it should never
+                    // occur at all. The counter says something is wrong;
+                    // this is what says what.
+                    warn!(
+                        %peer,
+                        ?from,
+                        "peer answered an empty batch while reporting its tail was not \
+                         reached; a correct sender cannot produce this, refusing the round"
+                    );
                     return Err(ProtocolError::Malformed(format!(
                         "peer at {peer} answered an empty batch from {from:?} while reporting \
                          its tail was not reached — a correct sender cannot produce this"
@@ -598,6 +614,23 @@ fn divergence_probe_for(
     if theirs.behind(mine).is_some() { None } else { probe }
 }
 
+/// Whether a peer's `Entries` answer combines a claim no correct sender can
+/// produce: an empty batch while also reporting its tail was not reached.
+///
+/// `read_oplog_from_where` only stops short of the batch limit by reaching
+/// the true end of the peer's oplog, and it never returns having kept zero
+/// entries without doing so — so `!exhausted` implies at least one entry,
+/// over every arrangement of withheld entries and every limit (U1's proof).
+/// Pulled out as its own function because the one-line condition it replaces
+/// is exactly what an incautious edit is likely to simplify: `!exhausted`
+/// alone reads as "the same thing, shorter" and is not — it would refuse
+/// every ordinary capped pull on a busy cluster, which is the overwhelming
+/// common case this function must leave alone. See the truth table in this
+/// function's own tests for the one cell that is actually the error.
+fn is_unreachable_from_a_correct_sender(entries_len: usize, exhausted: bool) -> bool {
+    entries_len == 0 && !exhausted
+}
+
 /// Ask the peer what it holds, and compare against what this node holds
 /// (ADR-133). One message each way, on the connection already open for this
 /// round.
@@ -708,4 +741,34 @@ where
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
     Ok(their_node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The truth table `is_unreachable_from_a_correct_sender` decides. Only
+    /// one of the four cells is the error; the other three are all ordinary
+    /// traffic, and the one an edit is most likely to break by accident —
+    /// a non-empty, non-exhausted batch, the shape of every capped pull on
+    /// a busy cluster — is asserted explicitly rather than left implied.
+    #[test]
+    fn only_an_empty_non_exhausted_batch_is_unreachable_from_a_correct_sender() {
+        assert!(
+            is_unreachable_from_a_correct_sender(0, false),
+            "the one cell that is the error: nothing shipped, tail not reached"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(0, true),
+            "an empty batch because the peer's whole tail really was empty"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(50, false),
+            "an ordinary capped pull -- the regression a `!exhausted` shortcut would introduce"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(50, true),
+            "a full batch that happened to reach the tail on its last entry"
+        );
+    }
 }
