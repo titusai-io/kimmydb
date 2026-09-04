@@ -175,15 +175,20 @@ boundary](http-api.md#the-json-boundary) for which one a plain JSON number
 becomes.
 
 **An unknown *code* is refused and an unknown *alias* is not.** `{"$type":
-999}` is `400 invalid query: unknown $type code 999`; `{"$type":
-"nosuchtype"}` is `200` with no matches, because any string is taken as a type
-name and no stored value ever reports that name. Names are **case-sensitive
-and exactly as spelled above**, so `"Int"`, `"bindata"` and `"boolean"` are
-each a `200` and an empty result rather than a refusal. A misspelt alias is
-therefore indistinguishable from a genuine "nothing is that type" — the one
-piece of this language's own vocabulary a filter takes without checking,
-where a misspelt *operator* is `unsupported operator "$typo"`. Send the code
-where the spelling is not being read by a person.
+999}` is a `400` — `unknown $type code 999`; `{"$type": "nosuchtype"}` is
+`200` with no matches, because any string is taken as a type name and no
+stored value ever reports that name. Names are **case-sensitive and exactly
+as spelled above**, so `"Int"`, `"bindata"` and `"boolean"` are each a `200`
+and an empty result rather than a refusal, indistinguishable from a genuine
+"nothing is that type".
+
+An alias is not the only word a filter takes without checking:
+[`$regex`'s `$options`](#regex-compatibility) drops a flag it does not know
+by the same rule and with the same consequence. Both are worth singling out
+because the general rule is refusal — a misspelt operator is `unsupported
+operator "$typo"`, a bad sort direction and a bad `$size` are each a `400` —
+so a `200` here reads as an answer rather than as a mistake. Send the code
+rather than the alias wherever the spelling is not being read by a person.
 
 **`$type` is applied to array elements as well as to the value**, which
 follows from [rule 2](#2-paths-traverse-into-arrays) and is the consequence
@@ -597,6 +602,15 @@ pathological pattern cannot become a denial of service against the database.
 
 An invalid pattern **matches nothing** rather than failing the query — a single
 bad pattern in an `$or` should not take down the whole request.
+
+**`$options` is read flag by flag, and a flag it does not know is dropped
+silently.** The four above are the whole set; anything else in the string is
+passed over and the pattern compiles without it. That is the same shape as a
+misspelt [`$type` alias](#type), and it bites the same way: `$options` is
+case-sensitive, so `"I"` is not `"i"` — `{"$regex": "S", "$options": "I"}`
+answers `200` having compiled a *case-sensitive* pattern, and finds none of
+the `"s"` a caller expected it to. `"iz"` sets `i` and swallows the `z`.
+There is no refusal to notice, so check the flags rather than the result.
 
 ---
 
