@@ -671,13 +671,20 @@ impl crate::Engine {
                     // moves and the lag gauge reads 0.
                     //
                     // It merges **forward**, by the comparison the conflict
-                    // arm uses. Every stamp in this subsystem is a
-                    // forward-only join — `record_index_drop_in_txn` and
-                    // `record_collection_drop` both refuse to move backwards
-                    // — and forward is what makes the merge idempotent under
-                    // re-delivery: a drop once declined stays declined, where
-                    // taking the earlier stamp would let a later-arriving
-                    // *older* creation make an already-declined drop apply.
+                    // arm uses, because that is what `created` means: the
+                    // incarnation standing under the name. Both members hold
+                    // an index that has existed continuously since the later
+                    // creation, and a drop stamped before it was aimed at
+                    // neither. The earlier stamp would converge just as well
+                    // and would let a drop older than the incarnation delete
+                    // it — the very residual the arm above exists to close,
+                    // reached through the merge instead. (It would also move
+                    // `created` backwards, which is true and is not the
+                    // reason: a declined drop leaves a tombstone, and
+                    // `apply_remote_index` turns away a creation older than
+                    // that before reaching here, so nothing old enough to
+                    // reopen a declined drop arrives at the merge at all.)
+                    //
                     // The originating entry is appended onward as it always
                     // was, so every member computes the same maximum whatever
                     // order the creations reach it in.
@@ -707,6 +714,12 @@ impl crate::Engine {
                         .find(|i| i.name == settled.name)
                         .expect("the index was found on this meta a moment ago")
                         .created = Some(merged);
+                    // Its own transaction, as every `_inner` on this path has
+                    // (ADR-119) — and safe to separate from the batch because
+                    // the merged stamp is derived from the arriving entry
+                    // alone and only moves forward: a batch that fails after
+                    // this commit leaves a value the same entry, re-delivered,
+                    // computes again and does not move.
                     let txn = self.begin_write()?;
                     crate::Engine::put_collection_meta(&txn, &meta)?;
                     txn.commit()?;

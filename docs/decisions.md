@@ -7524,25 +7524,45 @@ definition under two stamps answers one drop two ways and the members split.
 Both have already witnessed the other's create by then, so nothing re-serves
 it and the split is permanent; and the drop is `Applied` on both sides, so no
 counter moves and the lag gauge reads 0 — the exact signature this ADR exists
-to remove. The merge takes the **later** stamp because every stamp in this
-subsystem is a forward-only join (`record_index_drop_in_txn` and
-`record_collection_drop` both refuse to move backwards), and forward is what
-makes it idempotent under re-delivery: a drop once declined stays declined,
-whereas taking the earlier stamp would let a later-arriving *older* creation
-make an already-declined drop apply. An index holding no stamp adopts the
-peer's, which is the definition's true creation rather than an invented one,
-and ends the ambiguity without waiting for a recreation. A **local** create of
-a definition already present is untouched — it is idempotent and mints no
-entry, so moving the stamp there would be a decision no peer ever hears of.
+to remove. The merge takes the **later** stamp because that is what
+`created` means: the incarnation standing under the name. Both members hold an
+index that has existed continuously since the later creation, and a drop
+stamped before it was aimed at neither of them. Taking the earlier stamp would
+converge just as well and would let a drop older than the incarnation delete
+it — which is, verbatim, the residual this ADR exists to close, arrived at
+through the merge instead of through the absent stamp. The first rule above
+and this one are therefore one rule, not two that happen to agree.
+
+An index holding no stamp adopts the peer's, which is the definition's true
+creation rather than an invented one, and ends the ambiguity without waiting
+for a recreation. A **local** create of a definition already present is
+untouched — it is idempotent and mints no entry, so moving the stamp there
+would be a decision no peer ever hears of.
+
+*Not* the reason, though it is the first one that suggests itself: that the
+earlier stamp would move `created` **backwards** as older creations arrived.
+It would, and it costs nothing, because the tombstone that this ADR's own
+declined drop records bounds the merge from below — `apply_remote_index`
+turns away a creation older than the tombstone before
+`create_index_inner` is reached, so no creation old enough to reopen an
+already-declined drop reaches the merge at all. The two directions are
+indistinguishable under re-delivery. They differ on the drop's *first*
+delivery, and there the meaning of `created` decides it.
 
 **An index stored without a creation stamp reads as older than every drop and
-every rival.** A replayed drop removes it and a rival definition is refused
-and counted — which is ADR-123's behaviour exactly, so nothing a caller could
-predict from the reference before this changes for an index that already
-exists. It is deliberately not backfilled at open from a local clock: an
-invented stamp would sort after drops that genuinely superseded the index, and
-would win comparisons this node knows nothing about. The ambiguity ends the
-first time the index is recreated. Same `None`, and the same argument, as a
+every rival, until it learns one.** A replayed drop removes it and a rival
+definition is refused and counted — which is ADR-123's behaviour exactly, so
+nothing a caller could predict from the reference before this changes for an
+index that already exists. The exception is the merge above, and it is the
+only one: a peer holding the *same* definition with a stamp hands it over, and
+that stamp is the definition's own creation rather than an invented one, so
+the index stops being ambiguous without any operator action. Where no member
+has a stamp — an index every member created before this release — the sentence
+holds as written until someone recreates it. It is deliberately not backfilled
+at open from a local clock: an invented stamp would sort after drops that
+genuinely superseded the index, and would win comparisons this node knows
+nothing about. The ambiguity otherwise ends the first time the index is
+recreated. Same `None`, and the same argument, as a
 collection's `incarnation_floor` before ADR-081.
 
 **Why.** Both halves are the residuals ADR-123 recorded and left open, and the
@@ -7583,8 +7603,9 @@ backfill, and the three counters. `kimmy_sync_ddl_refused_total` keeps its
 meaning and its alert; what changes is that one of the three classes feeding
 it now mostly resolves instead of arriving.
 `a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace`
-is the regression test that keeps the guard honest: a definition that wins the comparison and still
-cannot be built is skipped, counted, and does not wedge the round — so this
+is the regression test that keeps the guard honest: a definition that wins
+the comparison and still cannot be built is skipped, counted, and does not
+wedge the round — so this
 fix cannot be made by reverting to "refuse every rival".
 
 **Why the resolution is not counted on `/metrics`.** It was considered. A
@@ -7619,25 +7640,36 @@ name is the identity — so there is no definition to compare. *Make the drop
 carry the creation stamp it was aimed at.* It would work for a drop minted
 after this change and not for one already in an oplog, and it puts the
 ordering fact in the entry that destroys state rather than on the state
-itself, so a snapshot would carry no answer at all. *Take the earliest creation stamp when two members create one identical
-definition, since that is when the index first existed anywhere.* It converges
-too, but it is not monotone: `created` would move backwards as older creations
-arrive, so a drop this node had already declined would begin to apply on
-re-delivery, and anti-entropy re-delivers by design. *Resolve concurrent
-definitions by merging them — keep the union of the fields, the stricter
-uniqueness.* A merged definition is one no member asked for, and it is not
-idempotent under re-delivery. *Backfill a creation stamp for stored indexes at
-open.* Rejected above. *Keep refusing, and add a repair command.* A schema
-that stays divergent until someone notices is what the round observed; the
+itself, so a snapshot would carry no answer at all. *Take the earliest
+creation stamp when two members create one identical definition, since that
+is when the index first existed anywhere.* It converges just as well, and it
+is wrong for the reason the first rule of this ADR is right: `created` names
+the incarnation standing under the name, and lowering it to a creation that
+incarnation succeeded lets a drop older than the incarnation delete it — the
+residual, reintroduced through the merge. Not rejected for
+non-monotonicity: `created` would indeed move backwards, but the declined
+drop's own tombstone stops any creation old enough to matter from
+reaching the merge, so re-delivery is idempotent either way. The two differ on
+the drop's first delivery, and that is the case that decides. *Resolve
+concurrent definitions by merging them — keep the union of the fields, the
+stricter uniqueness.* A merged definition is one no member asked for, and it
+is not idempotent under re-delivery. *Backfill a creation stamp for stored
+indexes at open.* Rejected above. *Keep refusing, and add a repair command.*
+A schema that stays divergent until someone notices is what the round
+observed; the
 counter made it visible and nobody was watching for four runs.
 
 **Cost.** One optional stamp per index, in the collection metadata and on the
-wire. A replicated create of a
-definition already present now writes the collection metadata where it used to
-return early, which is one small commit on a path that previously took none —
-only when the arriving stamp is the later one, so a settled cluster pays
-nothing. `create_index_inner` takes a `CreateOrigin` in place of its `log` flag
-—
+wire. A replicated create of a definition already present now writes the
+collection metadata where it used to return early, which is one small commit
+on a path that previously took none — only when the arriving stamp is the
+later one, so a settled cluster pays nothing. That commit is its own
+transaction rather than the batch's, as every `_inner` on the DDL path is
+(ADR-119), and it is sound to separate because the merged stamp is **monotone
+and derived from the arriving entry alone**: a batch that fails after it has
+committed leaves a value the same entry, re-delivered, computes again and does
+not move. It is the one write on this path with no state to reconcile on a
+retry. `create_index_inner` takes a `CreateOrigin` in place of its `log` flag —
 the change `drop_index_inner` made in ADR-123, for the same reason, widened
 only because a replicated *create* may carry no stamp — and returns an
 `IndexCreated` so that "a later definition is already here" is a decision the

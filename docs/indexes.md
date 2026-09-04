@@ -252,9 +252,12 @@ ordinary case.
 *Two identical definitions converge on one stamp.* Two members can also create
 the *same* definition independently, which is not a conflict — but the two
 creations carry different stamps, and after the rules above the stamp is what
-answers a drop. So the stamp converges as well: the later creation is the one
-that stands, on every member, and it only ever moves forward. Without that,
-one definition under two stamps would answer one drop two ways and the members
+answers a drop. So the stamp converges as well: the **later** creation is the
+one that stands, on every member. That is the same rule as the first one above
+rather than a second: the stamp names the index now standing under the name,
+both members have held one continuously since the later creation, and a drop
+stamped before it was aimed at neither. Without the convergence, one
+definition under two stamps would answer one drop two ways and the members
 would split with nothing left to re-serve.
 
 *Two definitions under one name settle on the later stamp.* Two members can
