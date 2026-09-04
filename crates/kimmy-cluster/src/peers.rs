@@ -378,7 +378,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
 /// A read failure is *not* an empty set standing in for one:
 /// `DivergenceTracker::advance_probe` sweeps its count-side confirmation
 /// state against whatever it is handed, on the premise that a collection
-/// absent from that set is provably gone this node no longer holds it
+/// absent from that set is provably gone: this node no longer holds it
 /// (ADR-133, defect 6). That premise holds for a genuine read and fails for
 /// a read that merely errored — a transient storage hiccup is not evidence
 /// this node suddenly holds zero collections, and reading it that way would
