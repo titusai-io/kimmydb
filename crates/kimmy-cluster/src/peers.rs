@@ -59,11 +59,17 @@ pub struct RoundReport {
     pub ddl_refused: usize,
     /// Collections the cross-member divergence check currently has confirmed
     /// against some peer (ADR-133): held there and not here, or held by
-    /// both with disagreeing document counts, seen on two consecutive ticks
-    /// running. A level, like `backing_off` — it falls back to 0 the moment
-    /// a tick no longer observes what an earlier one did, and it moves for
-    /// exactly the condition that left every other field in this report at
-    /// its healthiest value while the cluster silently lost data.
+    /// both with disagreeing document counts. A level, like `backing_off` —
+    /// but keyed per peer, and for the count half per collection *and* peer,
+    /// not per tick: a finding clears only when a later contact with the
+    /// specific peer that reported it (and, for a count finding, the same
+    /// probe of the same collection against that peer) no longer sees it,
+    /// never merely because some tick's union of every peer reached that
+    /// tick came up empty. See `DivergenceTracker::observe` for why a
+    /// per-tick reading would have left this permanently unable to confirm
+    /// past a handful of peers, or past one collection. It moves for exactly
+    /// the condition that left every other field in this report at its
+    /// healthiest value while the cluster silently lost data.
     pub divergent_collections: usize,
 }
 
@@ -274,9 +280,15 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 // reconciled, and `observe` treats "not
                                 // called" and "called with nothing found" as
                                 // the two different facts they are
-                                // (ADR-133).
-                                if let Some(seen) = outcome.divergent.take() {
-                                    divergence.observe(node, seen);
+                                // (ADR-133). `divergent` and `count_probe`
+                                // are always set together by `sync_once`, so
+                                // `divergent`'s presence alone gates both.
+                                if let Some(existence) = outcome.divergent.take() {
+                                    let findings = kimmy_storage::DivergenceFindings {
+                                        existence,
+                                        count: outcome.count_probe.take(),
+                                    };
+                                    divergence.observe(node, findings);
                                 }
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);
@@ -408,5 +420,55 @@ mod tests {
         let peers = resolve(&seeds, "127.0.0.1:7900".parse().unwrap()).await;
 
         assert_eq!(peers.len(), 1);
+    }
+
+    /// The fanout scaling defect, composed the way the real loop composes
+    /// it: `PeerHealth::select`'s own rotation feeding `DivergenceTracker`,
+    /// not a hand-written stand-in for either. `DivergenceTracker`'s unit
+    /// tests already pin that it confirms across non-adjacent contacts in
+    /// isolation; this is the piece that pins the *other* half actually
+    /// produces contacts shaped that way at a cluster size the default
+    /// fanout cannot cover in one pass, so a future change to either
+    /// `select`'s rotation policy or the tracker's keying cannot silently
+    /// re-break the composition while each component's own tests stay
+    /// green.
+    #[test]
+    fn a_peer_confirms_despite_a_fanout_smaller_than_the_cluster() {
+        use std::collections::HashMap;
+
+        let peers: BTreeSet<SocketAddr> =
+            (0..8).map(|i| format!("127.0.0.1:{}", 7900 + i).parse().unwrap()).collect();
+        // Stands in for the handshake's introduction in the real protocol,
+        // which is where a `SocketAddr` and a `NodeId` are actually paired.
+        let ids: HashMap<SocketAddr, NodeId> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, &addr)| (addr, NodeId::from_bytes((i as u128).to_be_bytes())))
+            .collect();
+        // Past the sixth of eight peers at the default fanout of 3 -- two
+        // ticks in a row cannot possibly both reach it by round-robin alone.
+        let divergent_peer = *peers.iter().nth(5).unwrap();
+        let divergent_collection = kimmy_core::CollectionId(1);
+
+        let mut health = PeerHealth::new(DEFAULT_FANOUT, Duration::from_secs(5));
+        let mut tracker = kimmy_storage::DivergenceTracker::new();
+        let now = Instant::now();
+
+        for _ in 0..40 {
+            for addr in health.select(&peers, now) {
+                health.succeeded(addr);
+                let existence = if addr == divergent_peer {
+                    BTreeSet::from([divergent_collection])
+                } else {
+                    BTreeSet::new()
+                };
+                let findings = kimmy_storage::DivergenceFindings { existence, count: None };
+                tracker.observe(ids[&addr], findings);
+            }
+            if tracker.confirmed_count() > 0 {
+                break;
+            }
+        }
+        assert_eq!(tracker.confirmed_count(), 1, "confirms at 8 peers despite fanout 3");
     }
 }

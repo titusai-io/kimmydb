@@ -407,11 +407,12 @@ pub async fn sync_once(
             // own, on a busy one; see the `exhausted` branch below for the
             // other place this check runs.
             let probe = divergence_probe_for(probe, &theirs, &mine);
-            let divergent = ask_divergence(engine, &mut stream, probe).await?;
+            let findings = ask_divergence(engine, &mut stream, probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
                 behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
-                divergent: Some(divergent),
+                divergent: Some(findings.existence),
+                count_probe: findings.count,
                 exhausted: true,
                 ..SyncOutcome::default()
             });
@@ -467,6 +468,26 @@ pub async fn sync_once(
             // (`coverage_after_batch`), where it is tested between engines
             // without a network.
             Message::Entries { entries, scanned_to, exhausted } => {
+                // A correct sender cannot produce an empty, non-exhausted
+                // window: `read_oplog_from_where` only stops short of the
+                // limit by reaching the true end of the oplog, and it never
+                // breaks without having pushed at least one kept entry
+                // first when it does not (U1's proof, over every withheld
+                // arrangement and limit). This combination is therefore not
+                // an ordinary capped pull with nothing new to offer — it is
+                // a peer claiming both "nothing here" and "more exists",
+                // which nothing downstream can safely read as convergence.
+                // Failed as a malformed round rather than silently treated
+                // as "not exhausted, do not check": that would fold a
+                // genuine signal into the same bucket as an unremarkable
+                // capped pull, and a failed round is exactly the shape
+                // `kimmy_sync_failures_total` exists to make visible.
+                if entries.is_empty() && !exhausted {
+                    return Err(ProtocolError::Malformed(format!(
+                        "peer at {peer} answered an empty batch from {from:?} while reporting \
+                         its tail was not reached — a correct sender cannot produce this"
+                    )));
+                }
                 window_exhausted = exhausted;
                 engine
                     .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
@@ -504,7 +525,9 @@ pub async fn sync_once(
         // which a continuous trickle of new writes can starve indefinitely.
         if window_exhausted {
             let probe = divergence_probe_for(probe, &theirs, &mine);
-            outcome.divergent = Some(ask_divergence(engine, &mut stream, probe).await?);
+            let findings = ask_divergence(engine, &mut stream, probe).await?;
+            outcome.divergent = Some(findings.existence);
+            outcome.count_probe = findings.count;
         }
         // The other direction is a different question: how far the peer
         // trails this node, in history it can no longer be served. A peer
@@ -582,7 +605,7 @@ async fn ask_divergence<S>(
     engine: &Engine,
     stream: &mut S,
     probe: Option<DivergenceProbe>,
-) -> Result<std::collections::BTreeSet<kimmy_core::CollectionId>, ProtocolError>
+) -> Result<kimmy_storage::DivergenceFindings, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
