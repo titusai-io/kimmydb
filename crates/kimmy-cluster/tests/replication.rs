@@ -121,7 +121,7 @@ async fn a_replicated_document_costs_about_its_own_size_on_the_wire() {
     let payload = "x".repeat(1024 * 1024);
     a.engine.insert(&ca, doc! { "_id": "d0", "blob": payload.clone() }).unwrap();
 
-    let entries = a.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap();
+    let entries = a.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 10).unwrap().entries;
     let insert =
         entries.iter().find(|e| e.kind == kimmy_core::OpKind::Insert).expect("the insert entry");
 

@@ -210,7 +210,7 @@ where
                 // an arbitrary one would let it ask for the whole oplog in a
                 // single frame.
                 let limit = limit.min(MAX_BATCH);
-                let entries = engine
+                let window = engine
                     .entries_for_peer(from, limit)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
@@ -220,8 +220,18 @@ where
                 // recover. Answer with the count that fits instead, and let the
                 // requester ask again; see `Message::BatchTooLarge` for why serving
                 // fewer entries unasked would be a silent gap rather than a kindness.
-                match how_many_fit(&entries) {
-                    Fits::All => write_frame(&mut stream, &Message::Entries(entries)).await?,
+                match how_many_fit(&window.entries) {
+                    Fits::All => {
+                        write_frame(
+                            &mut stream,
+                            &Message::Entries {
+                                entries: window.entries,
+                                scanned_to: window.scanned_to,
+                                exhausted: window.exhausted,
+                            },
+                        )
+                        .await?
+                    }
                     Fits::Only(fits) => {
                         warn!(%limit, %fits, "batch does not fit in a frame; asking the peer for fewer");
                         write_frame(&mut stream, &Message::BatchTooLarge { fits }).await?;
@@ -356,9 +366,9 @@ pub async fn sync_once(
 
         // Ask for a full batch; if the peer says that will not fit, ask again for the
         // number it named. At most one retry, because the peer answers with a count
-        // rather than a refusal. The limit actually settled on is what
-        // `apply_peer_batch` is told below, so a batch shorter than it still means
-        // "the peer's whole tail" and the coverage rules are untouched.
+        // rather than a refusal. The retry re-reads the window at the smaller limit,
+        // so the window end the peer reports matches the entries it sends and the
+        // coverage rules are untouched.
         //
         // The vector `from` came from travels with it, so the peer can judge
         // its horizon per origin rather than by the threshold alone.
@@ -383,17 +393,20 @@ pub async fn sync_once(
         }
 
         let mut outcome = match answer {
-            // The batch, and what it proved: a short one is the peer's whole
-            // tail, a full one a window ending at its last stamp. Either way
-            // the witnessed vector is raised for every origin the peer
-            // advertised, including stamps it holds but never ships — a
-            // `UniqueViolation` (ADR-029) — because otherwise such a stamp
+            // The batch, and what it proved: an exhausted window is the peer's
+            // whole tail, any other ends at the stamp the peer says it scanned
+            // to. Either way the witnessed vector is raised for every origin
+            // the peer advertised, including stamps it holds but never ships —
+            // a `UniqueViolation` (ADR-029) — because otherwise such a stamp
             // pins `behind` at its floor and the same window is re-served
-            // every round for the life of the cluster (ADR-082). The decision
-            // lives in storage (`coverage_after_batch`), where it is tested
-            // between engines without a network.
-            Message::Entries(entries) => engine
-                .apply_peer_batch(&theirs, &entries, limit)
+            // every round for the life of the cluster (ADR-082). The peer
+            // reports where its window ended rather than leaving it to be
+            // deduced from how many entries arrived, which a withheld entry
+            // could make a lie (ADR-127). The decision lives in storage
+            // (`coverage_after_batch`), where it is tested between engines
+            // without a network.
+            Message::Entries { entries, scanned_to, exhausted } => engine
+                .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
                 .map_err(|e| ProtocolError::Malformed(e.to_string())),
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
