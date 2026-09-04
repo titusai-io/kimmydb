@@ -28,8 +28,8 @@ pub mod vectors;
 pub mod watch;
 
 pub use divergence::{
-    DivergenceTracker, LocalState as DivergenceLocalState, PeerAnswer as DivergencePeerAnswer,
-    compare as compare_divergence, next_probe,
+    DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
+    PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
 };
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome};
 pub use engine::physical_now_ms;

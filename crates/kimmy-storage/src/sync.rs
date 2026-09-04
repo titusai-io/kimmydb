@@ -77,29 +77,54 @@ pub struct SyncOutcome {
     pub lag_ms: u64,
     /// Whether this round's pull reached the peer's true tail: the oplog
     /// window ended because the peer's log ran out, not because the batch
-    /// cap was spent (ADR-127's `exhausted`, carried through). `true` when
-    /// there was nothing to pull at all. This is a convergence claim
-    /// independent of the clock — the one signal that would have
-    /// contradicted `lag_ms == 0` during finding 14, since a round can be
-    /// mid-backlog with `lag_ms` still reading low for a bulk insert whose
-    /// stamps cluster within a second (ADR-122) while `exhausted` correctly
-    /// reads `false`. `false` on every path exercised by the network-free
-    /// tests in this module other than an explicit exhausted batch: this
-    /// field only carries the fact through, it does not compute it.
+    /// cap was spent (ADR-127's `exhausted`, carried through). This is a
+    /// convergence claim independent of the clock — the one signal that
+    /// would have contradicted `lag_ms == 0` during finding 14, since a
+    /// round can be mid-backlog with `lag_ms` still reading low for a bulk
+    /// insert whose stamps cluster within a second (ADR-122) while
+    /// `exhausted` correctly reads `false`.
+    ///
+    /// **Broader than [`crate::watch::OplogWindow::exhausted`], which this
+    /// field is not always a plain copy of.** `OplogWindow::exhausted`
+    /// answers one narrower question — did this particular oplog scan reach
+    /// the end — and says nothing when no scan happened at all. This field
+    /// is also `true` in two cases `OplogWindow` never covers: when there
+    /// was nothing to pull, so no `Entries` message was exchanged at all,
+    /// and when a `BeyondHorizon` snapshot pull completed (a full snapshot
+    /// is, by construction, everything the peer held as of the pull — the
+    /// snapshot's own version of "reached the tail"). Both are set by
+    /// `kimmy-cluster`'s `sync_once`, which owns this broader claim; nothing
+    /// in this module computes either. `false` on every path exercised by
+    /// the network-free tests in this module other than an explicit
+    /// exhausted batch.
     pub exhausted: bool,
-    /// Collections the cross-member divergence check found disagreeing
-    /// against this peer this round (ADR-133): held by the peer and not
-    /// here, or held by both with disagreeing document counts. `None` when
-    /// the check did not run this round at all — a round whose pull did not
-    /// reach the peer's tail (`exhausted == false`) skips it, because that
-    /// is precisely the state a truncated sync window can fake without
-    /// being true. `Some` (possibly holding an empty set) once it ran,
-    /// which is whenever `exhausted` is `true`. See
-    /// [`crate::divergence::compare`] for what it does and does not report.
+    /// The existence half of the cross-member divergence check (ADR-133):
+    /// collections the peer holds that this node does not, found this
+    /// round. `None` when the check did not run this round at all — a round
+    /// whose pull did not reach the peer's tail (`exhausted == false`) skips
+    /// it, because that is precisely the state a truncated sync window can
+    /// fake without being true. `Some` (possibly holding an empty set) once
+    /// it ran, which is whenever `exhausted` is `true`. See
+    /// [`crate::divergence::compare`] for what it does and does not report,
+    /// and why the count half below is carried separately rather than
+    /// folded into this set.
     /// `None` on every path exercised by the network-free tests in this
     /// module: the check itself lives in `kimmy-cluster`, which is the only
     /// place a peer's answer exists.
     pub divergent: Option<std::collections::BTreeSet<kimmy_core::CollectionId>>,
+    /// The count half: the collection probed for a document count this
+    /// round, and whether it disagreed. Carried apart from `divergent`
+    /// because the two halves confirm on different rhythms — the existence
+    /// half is checked in full every round the check runs at all, while
+    /// only one collection is probed per round, so folding a count finding
+    /// into the same set as existence findings is what made a count
+    /// divergence structurally unconfirmable on any node holding more than
+    /// one collection (see [`crate::divergence::DivergenceTracker::observe`]).
+    /// `None` under the same conditions as `divergent`, and additionally
+    /// whenever no collection was probed or the peer's answer for it was
+    /// judged untrustworthy this round (a lagging peer; see
+    /// `divergence_probe_for` in `kimmy-cluster`).
+    pub count_probe: Option<(kimmy_core::CollectionId, bool)>,
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of
