@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
-use crate::transport::sync_once;
+use crate::transport::{DivergenceProbe, sync_once};
 
 /// How often to run a round against every known peer.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -57,6 +57,14 @@ pub struct RoundReport {
     /// its peers hold, and nothing will retry it; the `warn!` at the time
     /// names it.
     pub ddl_refused: usize,
+    /// Collections the cross-member divergence check currently has confirmed
+    /// against some peer (ADR-133): held there and not here, or held by
+    /// both with disagreeing document counts, seen on two consecutive ticks
+    /// running. A level, like `backing_off` — it falls back to 0 the moment
+    /// a tick no longer observes what an earlier one did, and it moves for
+    /// exactly the condition that left every other field in this report at
+    /// its healthiest value while the cluster silently lost data.
+    pub divergent_collections: usize,
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -145,6 +153,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovery = tokio::time::interval(config.discovery_interval);
     let mut sync = tokio::time::interval(config.sync_interval);
 
+    // The cross-member divergence check (ADR-133): which collection this
+    // tick probes for a document count, and which findings have recurred
+    // often enough to confirm. Owned by the loop, not the engine — like
+    // `health` and `stale_peers` below, it is a fact about this process's
+    // ticks, not about the data.
+    let mut divergence = kimmy_storage::DivergenceTracker::new();
+
     // Peers currently flagged as stale rejoiners, so the warning fires on the
     // transition and not on every round they stay that way.
     let mut stale_peers: BTreeSet<NodeId> = BTreeSet::new();
@@ -187,6 +202,18 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // an unreachable cluster has unknown lag, not zero lag.
                 let mut round_lag: Option<u64> = None;
                 let mut report = RoundReport::default();
+
+                // This tick's turn in the divergence check's rotation
+                // (ADR-133): a fresh, cheap read of what this node holds —
+                // metadata only — and this node's own count of whichever
+                // collection is up next, computed once and reused against
+                // every peer this tick rather than once per peer.
+                let mine_collections = engine.all_collection_ids().unwrap_or_default();
+                let probe = divergence.advance_probe(&mine_collections).map(|id| {
+                    let mine_count = engine.count_by_id(id).ok().flatten();
+                    DivergenceProbe { id, mine_count }
+                });
+                let mut divergent_this_tick: BTreeSet<kimmy_core::CollectionId> = BTreeSet::new();
                 for peer in health.select(&peers, Instant::now()) {
                     // One span per peer per round, not one per round: an
                     // anti-entropy round against three peers is three
@@ -207,7 +234,10 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once(&engine, peer, &config.secret).instrument(span.clone()).await {
+                    match sync_once(&engine, peer, &config.secret, probe)
+                        .instrument(span.clone())
+                        .await
+                    {
                         Ok(outcome) => {
                             // `i64` throughout: `tracing-opentelemetry` has
                             // no `record_u64`, so an unsigned value is
@@ -219,6 +249,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
+                            divergent_this_tick.extend(outcome.divergent.iter().copied());
                             if let Some(node) = outcome.peer {
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);
@@ -275,6 +306,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms / 1_000);
                 }
+                // Advanced every tick regardless of whether anything reports
+                // it: the confirmation window this debounces (two ticks
+                // running against the same collection, see
+                // `DivergenceTracker`) must not depend on whether a caller
+                // wired up `on_round`.
+                report.divergent_collections = divergence.tick(divergent_this_tick);
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.

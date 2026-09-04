@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
-use kimmy_cluster::transport::{serve, sync_once};
-use kimmy_core::DocId;
+use kimmy_cluster::transport::{DivergenceProbe, serve, sync_once};
+use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -79,8 +79,8 @@ impl Node {
 
 /// Pull into `into` from `from`, both directions making a full round.
 async fn sync(a: &Node, b: &Node) {
-    sync_once(&a.engine, b.addr, SECRET).await.expect("a should pull from b");
-    sync_once(&b.engine, a.addr, SECRET).await.expect("b should pull from a");
+    sync_once(&a.engine, b.addr, SECRET, None).await.expect("a should pull from b");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("b should pull from a");
 }
 
 #[tokio::test]
@@ -173,7 +173,7 @@ async fn a_batch_of_large_entries_still_replicates() {
     // oversized frame for ever. Ten is generous and still bounded, so a regression
     // fails rather than hangs.
     for _ in 0..10 {
-        sync_once(&b.engine, a.addr, SECRET).await.expect("b should pull from a");
+        sync_once(&b.engine, a.addr, SECRET, None).await.expect("b should pull from a");
     }
 
     let cb = b.engine.get_collection("shop", "big").expect("the collection should have replicated");
@@ -228,7 +228,7 @@ async fn a_collection_and_its_index_replicate_over_the_network() {
     let ca = a.engine.get_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": 1, "email": "x@y" }).unwrap();
 
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
     let index = cb.indexes.iter().find(|i| i.name == "email_1").expect("the index must replicate");
@@ -246,7 +246,7 @@ async fn a_node_joining_an_existing_cluster_catches_up() {
 
     // b starts empty and knows nothing.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(b.engine.count(&cb).unwrap(), 200);
@@ -260,7 +260,7 @@ async fn a_converged_round_transfers_nothing() {
     a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
 
     sync(&a, &b).await;
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     assert_eq!(second.total(), 0, "a converged pair must exchange nothing: {second:?}");
 }
@@ -278,7 +278,7 @@ async fn a_peer_with_the_wrong_secret_is_refused() {
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": "secret" }).unwrap();
 
-    let err = sync_once(&intruder.engine, a.addr, "not-the-cluster-secret")
+    let err = sync_once(&intruder.engine, a.addr, "not-the-cluster-secret", None)
         .await
         .expect_err("a wrong secret must be refused");
 
@@ -337,7 +337,7 @@ async fn one_bad_connection_does_not_stop_the_listener() {
 
     // A well-behaved peer still works.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the listener must still be serving");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the listener must still be serving");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(b.engine.count(&cb).unwrap(), 1);
 }
@@ -350,7 +350,7 @@ async fn a_peer_that_hangs_up_mid_handshake_is_survivable() {
 
     let b = node().await;
     b.engine.create_collection("shop", "orders").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the listener must still be serving");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the listener must still be serving");
 }
 
 #[tokio::test]
@@ -365,9 +365,10 @@ async fn connecting_to_a_dead_peer_is_an_error_not_a_hang() {
     let dead = listener.local_addr().unwrap();
     drop(listener);
 
-    let result = tokio::time::timeout(Duration::from_secs(10), sync_once(&engine, dead, SECRET))
-        .await
-        .expect("must not hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(10), sync_once(&engine, dead, SECRET, None))
+            .await
+            .expect("must not hang");
     assert!(result.is_err());
 }
 
@@ -394,7 +395,7 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
 
     // B joins knowing nothing.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must arrive");
     assert_eq!(b.engine.count(&cb).unwrap(), 50, "every document must arrive");
@@ -404,7 +405,7 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
     );
 
     // And it must stop asking for history that no longer exists.
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
 }
 
@@ -436,12 +437,12 @@ async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
         .unwrap();
 
     let b = node().await;
-    let first = sync_once(&b.engine, a.addr, SECRET).await.expect("the snapshot must encode");
+    let first = sync_once(&b.engine, a.addr, SECRET, None).await.expect("the snapshot must encode");
     assert_eq!(first.applied, 50);
     let cb = b.engine.get_collection("shop", &name).expect("the collection must arrive");
     assert_eq!(b.engine.count(&cb).unwrap(), 50);
 
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
 }
 
@@ -456,7 +457,7 @@ async fn a_snapshot_is_only_used_when_the_oplog_cannot_serve() {
     }
 
     let b = node().await;
-    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     // An incremental round reports DDL separately; a snapshot reports only
     // applied documents, so a non-zero ddl count means the oplog served it.
@@ -484,14 +485,14 @@ async fn a_dead_peer_is_backed_off_rather_than_retried_every_round() {
     // First round: contacted, and it really does fail.
     let now = Instant::now();
     assert_eq!(health.select(&peers, now), vec![dead]);
-    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    assert!(sync_once(&node.engine, dead, SECRET, None).await.is_err());
     health.failed(dead, now);
 
     // A single failure is forgiven promptly — a blip should not cost a peer
     // several intervals of isolation.
     let next = now + Duration::from_secs(5);
     assert_eq!(health.select(&peers, next), vec![dead], "one failure should retry soon");
-    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    assert!(sync_once(&node.engine, dead, SECRET, None).await.is_err());
     health.failed(dead, next);
 
     // Repeated failure is what earns the backoff.
@@ -587,7 +588,7 @@ async fn a_man_in_the_middle_cannot_relay_the_handshake() {
     let (mitm_addr, _relayed) = man_in_the_middle(a.addr).await;
 
     let b = node().await;
-    let err = sync_once(&b.engine, mitm_addr, SECRET)
+    let err = sync_once(&b.engine, mitm_addr, SECRET, None)
         .await
         .expect_err("a relayed handshake must be refused");
 
@@ -617,7 +618,7 @@ async fn the_same_two_nodes_converge_when_nobody_is_in_the_middle() {
     a.engine.insert(&ca, doc! { "_id": "confidential" }).unwrap();
 
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("a direct round must succeed");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("a direct round must succeed");
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
     assert!(b.engine.get(&cb, &DocId::String("confidential".into())).unwrap().is_some());
@@ -655,9 +656,10 @@ async fn a_silent_peer_cannot_stall_a_sync_round() {
     let b = node().await;
 
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(30), sync_once(&b.engine, addr, SECRET))
-        .await
-        .expect("the dial must give up on its own rather than hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(30), sync_once(&b.engine, addr, SECRET, None))
+            .await
+            .expect("the dial must give up on its own rather than hang");
     let elapsed = started.elapsed();
 
     result.expect_err("a peer that never speaks cannot produce a successful round");
@@ -684,9 +686,10 @@ async fn an_unroutable_peer_cannot_stall_a_sync_round() {
     let b = node().await;
 
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(60), sync_once(&b.engine, addr, SECRET))
-        .await
-        .expect("the connect must give up on its own rather than hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(60), sync_once(&b.engine, addr, SECRET, None))
+            .await
+            .expect("the connect must give up on its own rather than hang");
     let elapsed = started.elapsed();
 
     result.expect_err("an unroutable address cannot produce a successful round");
@@ -721,7 +724,7 @@ async fn sender_and_a_receiver_that_dropped_it() -> (Node, Node) {
     let b = node().await;
 
     a.engine.create_collection("shelf", "doomed").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the create must replicate");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the create must replicate");
 
     // Recorded on the sender only -- the receiver has not seen it yet.
     a.engine.configure_vectors("shelf", "doomed", vector_config()).unwrap();
@@ -749,7 +752,7 @@ async fn a_dropped_collection_does_not_wedge_replication() {
     let live = a.engine.create_collection("shelf", "survivor").unwrap();
     a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
 
-    sync_once(&b.engine, a.addr, SECRET)
+    sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("the round must not fail on a schema change for a dropped collection");
 
@@ -769,7 +772,7 @@ async fn a_dropped_collection_does_not_come_back_through_replication() {
     // collection it names -- resurrecting a drop would be a worse bug than the
     // one being fixed.
     let (a, b) = sender_and_a_receiver_that_dropped_it().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the round must succeed");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the round must succeed");
 
     assert!(
         b.engine.get_collection("shelf", "doomed").is_err(),
@@ -827,7 +830,7 @@ async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
     let live = a.engine.create_collection("shelf", "survivor").unwrap();
     a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET)
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("the round must not fail on an index this node cannot build");
     assert_eq!(outcome.ddl_refused, 1, "skipped and counted: {outcome:?}");
@@ -844,7 +847,7 @@ async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
         b.engine.get(&coll, &DocId::String("must-replicate".into())).unwrap().is_some(),
         "a refused schema change must not block the entries behind it"
     );
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "witnessed, so the window is not re-served: {second:?}");
 }
 
@@ -877,15 +880,15 @@ async fn a_dropped_index_never_comes_back_through_replication() {
         )
         .unwrap();
     a.engine.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the create and the drop replicate");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the create and the drop replicate");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(cb.index("tags_1_cats_1").is_none());
     b.engine.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
     // A learns of C; B has never heard of C, so its next round with A is
     // served from the beginning of everything A holds.
-    sync_once(&a.engine, c.addr, SECRET).await.unwrap();
-    let outcome = sync_once(&b.engine, a.addr, SECRET)
+    sync_once(&a.engine, c.addr, SECRET, None).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("a re-served create older than its drop must not fail the round");
     assert_eq!(outcome.ddl_refused, 0, "history, not a refusal: {outcome:?}");
@@ -1070,7 +1073,7 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
         assert!(raw > DAY_SECS * 1_000, "the scenario must reproduce the raw gap: {raw} ms");
         assert_eq!(peer.engine.version_vector().unwrap().get(a_id), a_last);
 
-        let outcome = sync_once(&a.engine, peer.addr, SECRET).await.unwrap();
+        let outcome = sync_once(&a.engine, peer.addr, SECRET, None).await.unwrap();
         assert_eq!(
             outcome.behind_ms, 0,
             "a peer that can still be served everything it lacks is not a stale rejoiner: {outcome:?}"
@@ -1099,7 +1102,7 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
         "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
     );
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     // An incremental round re-serves the tail B already holds and reports it
     // superseded; a snapshot reports only what it applied. That is the tell.
     assert!(
@@ -1110,7 +1113,7 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(b.engine.get(&cb, &DocId::String("a-after-restart".into())).unwrap().is_some());
 
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "and B is then caught up: {second:?}");
 }
 
@@ -1129,7 +1132,7 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     b.engine.insert(&cb, doc! { "_id": "b-1" }).unwrap();
     b.engine.insert(&cb, doc! { "_id": "b-2" }).unwrap();
-    sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+    sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
 
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
     a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
@@ -1141,13 +1144,13 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
         .unwrap();
     a.engine.insert(&ca, doc! { "_id": "a-after" }).unwrap();
 
-    let outcome = sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
     assert!(
         outcome.behind_ms > DAY_SECS * 1_000,
         "B lacks a collected write of A's, 36 hours behind: it is stale: {outcome:?}"
     );
 
-    let pulled = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(pulled.superseded, 0, "served as a snapshot, not from the oplog: {pulled:?}");
     for id in ["a-missed", "a-after"] {
         assert!(
@@ -1155,6 +1158,132 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
             "{id} must arrive"
         );
     }
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "{second:?}");
+}
+
+// -----------------------------------------------------------------------
+// The cross-member divergence check (ADR-133)
+// -----------------------------------------------------------------------
+
+/// The load-bearing case: reproduce the *silence*, not just the divergence.
+///
+/// Finding 14's defect (fixed by ADR-126/127) is what made a node witness a
+/// peer's stamp without ever applying the entry behind it — but any future
+/// bug in the same class produces the identical outside-visible state, so
+/// this test manufactures that state directly with `apply_peer_batch`
+/// rather than depending on the now-fixed bug, and asserts the divergence
+/// check catches the *class*: a member whose witnessed vector claims to
+/// cover a peer's advertised one, while a collection that peer holds is
+/// simply missing here, and every ordinary sync signal reads healthy.
+#[tokio::test]
+async fn the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+
+    // B is made to believe it has witnessed everything A has advertised,
+    // without ever applying the entries that created the collection or its
+    // document — exactly what a truncated window's absorbed vector looked
+    // like from outside.
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.witnessed_vector().unwrap().behind(&theirs).is_none(), "the false belief");
+    assert!(b.engine.get_collection("shop", "stranded").is_err(), "and yet B does not have it");
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+
+    assert!(
+        outcome.divergent.contains(&ca.id),
+        "the check must catch what the witnessed vector hides: {outcome:?}"
+    );
+    // Every signal an operator already watches reads exactly as healthy as
+    // it did throughout finding 14: no lag, nothing pulled, nothing failed,
+    // nothing refused.
+    assert_eq!(outcome.lag_ms, 0, "the false belief reads as caught up");
+    assert_eq!(outcome.applied, 0);
+    assert_eq!(outcome.superseded, 0);
+    assert_eq!(outcome.ddl, 0);
+    assert_eq!(outcome.ddl_refused, 0);
+    assert_eq!(outcome.unknown_collection, 0);
+}
+
+/// A genuinely converged pair reports nothing divergent — the gauge's
+/// resting state.
+#[tokio::test]
+async fn a_converged_cluster_has_no_divergence() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "from-a" }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await; // both directions witness the other's tail
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: Some(1) });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(outcome.divergent.is_empty(), "{outcome:?}");
+}
+
+/// A member legitimately behind must not be reported as divergent — the
+/// check runs only when the round finds nothing left to pull, so ordinary
+/// catch-up never reaches it in the first place, however many rounds it
+/// takes.
+#[tokio::test]
+async fn a_member_legitimately_behind_is_never_reported_as_divergent() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..40 {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    // B is behind by everything above on the very first round it makes: the
+    // check must not fire here at all, not merely fire and clear.
+    let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
+    assert!(first.divergent.is_empty(), "behind is not divergent: {first:?}");
+
+    // Converged now; a further round finds nothing to pull and the check
+    // agrees with reality.
+    let second = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert_eq!(second.total(), 0);
+    assert!(second.divergent.is_empty(), "{second:?}");
+}
+
+/// The probed collection's count is the only document read this exchange
+/// performs — the bound `Engine::count_by_id` and `next_probe` exist to
+/// keep. A second, unprobed collection full of documents costs nothing:
+/// its existence is compared by id, never by walking it.
+#[tokio::test]
+async fn only_the_probed_collection_is_ever_counted() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "small").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+    let big = a.engine.create_collection("shop", "big").unwrap();
+    for i in 0..500 {
+        a.engine.insert(&big, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    // Only "small" is named as the probe; "big" is not, despite existing on
+    // both sides. A mismatched count planted on the *unprobed* collection
+    // must go unnoticed this round -- it is not this round's turn.
+    let cb_big = b.engine.get_collection("shop", "big").unwrap();
+    b.engine.insert(&cb_big, doc! { "_id": "extra-on-b" }).unwrap();
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: Some(1) });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(
+        outcome.divergent.is_empty(),
+        "the unprobed collection's count divergence is out of scope this round: {outcome:?}"
+    );
 }

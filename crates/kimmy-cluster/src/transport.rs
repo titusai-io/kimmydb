@@ -244,6 +244,29 @@ where
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
             }
+            Message::AskDivergence { probe } => {
+                // Metadata only, whatever `probe` is — see
+                // `Engine::all_collection_ids`.
+                let collections = engine
+                    .all_collection_ids()
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                // The one document read in this exchange, bounded to the
+                // single collection the requester named (ADR-133).
+                let probe_count = match probe {
+                    Some(id) => engine
+                        .count_by_id(id)
+                        .map_err(|e| ProtocolError::Malformed(e.to_string()))?,
+                    None => None,
+                };
+                write_frame(
+                    &mut stream,
+                    &Message::Divergence {
+                        collections: collections.into_iter().collect(),
+                        probe_count,
+                    },
+                )
+                .await?;
+            }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             // Anything else is a peer talking out of turn.
             other => {
@@ -293,11 +316,28 @@ where
     Ok(node)
 }
 
+/// The one collection this round wants a peer's document count for, and this
+/// node's own count of it — computed once by the caller so a tick contacting
+/// several peers pays for that collection's scan once, not once per peer
+/// (ADR-133).
+#[derive(Clone, Copy, Debug)]
+pub struct DivergenceProbe {
+    pub id: kimmy_core::CollectionId,
+    pub mine_count: Option<u64>,
+}
+
 /// Run one anti-entropy round against `peer`, pulling what this node lacks.
+///
+/// `probe` drives the cross-member divergence check (ADR-133): a message or
+/// two is spent on it only in the branch where the round finds nothing left
+/// to pull, since that is the one state a truncated sync window can fake —
+/// see `kimmy_storage::divergence` for what is compared and why only that
+/// branch is safe to check without flapping during ordinary catch-up.
 pub async fn sync_once(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
+    probe: Option<DivergenceProbe>,
 ) -> Result<SyncOutcome, ProtocolError> {
     let tcp =
         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await.map_err(|_| {
@@ -357,9 +397,19 @@ pub async fn sync_once(
             // Nothing to pull, but the peer's own position is still news:
             // how far *it* trails *us* is what says whether it has been
             // away longer than tombstone retention.
+            //
+            // It is also the one belief a truncated sync window can hold
+            // falsely without anything on the anti-entropy path noticing
+            // (ADR-133): `mine` already claims to cover every origin `theirs`
+            // advertised, which is exactly finding 14's signature. Asking the
+            // peer what it actually holds is cheap precisely because this
+            // branch is rare to have anything left to do — a converged
+            // cluster spends nearly every round here.
+            let divergent = ask_divergence(engine, &mut stream, probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
                 behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                divergent,
                 ..SyncOutcome::default()
             });
         };
@@ -465,6 +515,40 @@ fn behind_beyond_horizon(
     let collected =
         engine.oplog_collected().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     Ok(kimmy_storage::lag_beyond_horizon_ms(theirs, mine, &collected))
+}
+
+/// Ask the peer what it holds, and compare against what this node holds
+/// (ADR-133). One message each way, on the connection already open for this
+/// round.
+async fn ask_divergence<S>(
+    engine: &Engine,
+    stream: &mut S,
+    probe: Option<DivergenceProbe>,
+) -> Result<std::collections::BTreeSet<kimmy_core::CollectionId>, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let mine_collections =
+        engine.all_collection_ids().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+
+    write_frame(stream, &Message::AskDivergence { probe: probe.map(|p| p.id) }).await?;
+    let (peer_collections, probe_count) = match read_frame(stream).await? {
+        Message::Divergence { collections, probe_count } => (collections, probe_count),
+        Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+        other => {
+            return Err(ProtocolError::Malformed(format!("expected Divergence, got {other:?}")));
+        }
+    };
+
+    let mine = kimmy_storage::DivergenceLocalState {
+        collections: mine_collections,
+        probe: probe.map(|p| (p.id, p.mine_count)),
+    };
+    let peer = kimmy_storage::DivergencePeerAnswer {
+        collections: peer_collections.into_iter().collect(),
+        probe_count,
+    };
+    Ok(kimmy_storage::compare_divergence(&mine, &peer))
 }
 
 /// Pull a full snapshot, page by page, until the peer says it is complete.
