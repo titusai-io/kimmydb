@@ -291,10 +291,10 @@ an expression path and a filter path disagree — the filter language reads
 `items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
 **`$unwind` also has to write each expanded element back to its path**, not
-only read it, and a path crossing an array has no single place to write to —
-`$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is refused, `400`, on every
-such document, regardless of what `b` holds at any element (see
-[`$unwind`](#unwind) and [ADR-130](decisions.md)).
+only read it, and a path crossing an array by a named segment has no single
+place to write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is
+refused, `400`, on every such document, regardless of what `b` holds at any
+element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
