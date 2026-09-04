@@ -334,14 +334,23 @@ func (c *Client) Find(ctx context.Context, db, collection string, query Query) (
 	return c.request(ctx, http.MethodPost, path(db, collection, "find"), query.body(), idempotent)
 }
 
+// nonNilFilter turns a nil filter into an empty object rather than sending it
+// as literal JSON null: an unset Go map marshals to null, and the server
+// refuses an explicit null on these routes' filter field rather than reading
+// it as "no condition" — on a multi write, that used to mean every document.
+// An empty object is what "no filter" has always meant here.
+func nonNilFilter(filter map[string]any) map[string]any {
+	if filter == nil {
+		return map[string]any{}
+	}
+	return filter
+}
+
 // Count reports how many documents match. No page cap — a count sees
 // everything.
 func (c *Client) Count(ctx context.Context, db, collection string, filter map[string]any) (int64, error) {
-	if filter == nil {
-		filter = map[string]any{}
-	}
 	body, err := c.request(ctx, http.MethodPost, path(db, collection, "count"),
-		map[string]any{"filter": filter}, idempotent)
+		map[string]any{"filter": nonNilFilter(filter)}, idempotent)
 	if err != nil {
 		return 0, err
 	}
@@ -355,7 +364,7 @@ func (c *Client) Count(ctx context.Context, db, collection string, filter map[st
 // Update applies update operators to matching documents.
 func (c *Client) Update(ctx context.Context, db, collection string, filter, update map[string]any, multi bool) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "update"),
-		map[string]any{"filter": filter, "update": update, "multi": multi}, unsafeToRetry)
+		map[string]any{"filter": nonNilFilter(filter), "update": update, "multi": multi}, unsafeToRetry)
 }
 
 // UpdateOptions is everything the update route takes, for UpdateWith.
@@ -375,7 +384,7 @@ type UpdateOptions struct {
 }
 
 func (o UpdateOptions) body(filter, update map[string]any) map[string]any {
-	body := map[string]any{"filter": filter, "update": update, "multi": o.Multi}
+	body := map[string]any{"filter": nonNilFilter(filter), "update": update, "multi": o.Multi}
 	if o.IfStamp != "" {
 		body["if_stamp"] = o.IfStamp
 	}
@@ -396,7 +405,7 @@ func (c *Client) UpdateWith(ctx context.Context, db, collection string, filter, 
 // Delete removes matching documents.
 func (c *Client) Delete(ctx context.Context, db, collection string, filter map[string]any, multi bool) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "delete"),
-		map[string]any{"filter": filter, "multi": multi}, unsafeToRetry)
+		map[string]any{"filter": nonNilFilter(filter), "multi": multi}, unsafeToRetry)
 }
 
 // UpdateIf is Update for one document, conditional on its version.
@@ -407,13 +416,13 @@ func (c *Client) Delete(ctx context.Context, db, collection string, filter map[s
 // nothing was written, and the caller re-reads and decides again.
 func (c *Client) UpdateIf(ctx context.Context, db, collection string, filter, update map[string]any, ifStamp string) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "update"),
-		map[string]any{"filter": filter, "update": update, "if_stamp": ifStamp}, unsafeToRetry)
+		map[string]any{"filter": nonNilFilter(filter), "update": update, "if_stamp": ifStamp}, unsafeToRetry)
 }
 
 // DeleteIf is Delete for one document, conditional on its version — see UpdateIf.
 func (c *Client) DeleteIf(ctx context.Context, db, collection string, filter map[string]any, ifStamp string) (map[string]any, error) {
 	return c.request(ctx, http.MethodPost, path(db, collection, "delete"),
-		map[string]any{"filter": filter, "if_stamp": ifStamp}, unsafeToRetry)
+		map[string]any{"filter": nonNilFilter(filter), "if_stamp": ifStamp}, unsafeToRetry)
 }
 
 // Aggregate runs a pipeline.
