@@ -2893,6 +2893,47 @@ async fn if_stamp_refuses_multi_upsert_and_garbage() {
     assert_eq!(res.body["error"], "bad_request");
 }
 
+/// `explain: true` plans without checking any condition — it does not run
+/// the write at all — so combined with `if_stamp` it cannot honestly answer
+/// "would this write happen": the plan would report a document as touched
+/// that the real write, checking the very same stamp, would refuse `409` on.
+/// Refused instead, the same shape as `if_stamp` combined with `multi`
+/// above.
+#[tokio::test]
+async fn explain_refuses_if_stamp() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"cond"})).await;
+    let inserted = server.post("/v1/db/shop/coll/cond/docs", Some(&token), json!({"_id":1})).await;
+    let stamp = stamp_of(&inserted.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/cond/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"n": 1}}, "if_stamp": stamp,
+                    "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/cond/delete",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "if_stamp": stamp, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+
+    // The document is untouched either way — neither call was a write, and
+    // now neither is a misleading plan.
+    let doc = server.get("/v1/db/shop/coll/cond/docs/1", Some(&token)).await;
+    assert_eq!(doc.status, 200, "{:?}", doc.body);
+}
+
 /// The reason to have this at all: check-then-act on one document, with
 /// exactly one winner and no coordination.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3879,7 +3920,11 @@ async fn a_targeted_write_on_id_also_takes_the_fast_path() {
     assert_eq!(counted.body["count"], 1);
     assert_eq!(counted.body["explain"]["strategy"], "idLookup", "{:?}", counted.body);
 
-    let updated = server
+    // `explain: true` plans the write and reports it, exactly like `count`
+    // above, but must not perform it (ADR-131) — asserted here by a spent
+    // commit and a follow-up read, not left visible-but-unasserted.
+    let commits_before = server.state.engine.commits();
+    let planned_update = server
         .post(
             "/v1/db/shop/coll/control/update",
             Some(&token),
@@ -3890,28 +3935,201 @@ async fn a_targeted_write_on_id_also_takes_the_fast_path() {
             }),
         )
         .await;
+    assert_eq!(planned_update.body["matched"], 0, "{:?}", planned_update.body);
+    assert_eq!(planned_update.body["modified"], 0, "{:?}", planned_update.body);
+    assert_eq!(planned_update.body["commits"], 0, "{:?}", planned_update.body);
+    assert_eq!(planned_update.body["explain"]["strategy"], "idLookup", "{:?}", planned_update.body);
+    assert_eq!(planned_update.body["explain"]["documentsMatched"], 1, "{:?}", planned_update.body);
+    assert_eq!(
+        server.state.engine.commits(),
+        commits_before,
+        "an explained update spends no commit"
+    );
+    let still_unchanged = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    assert_ne!(still_unchanged.body["item"], "changed", "explain must not have written anything");
+
+    let updated = server
+        .post(
+            "/v1/db/shop/coll/control/update",
+            Some(&token),
+            json!({ "filter": { "_id": 5 }, "update": { "$set": { "item": "changed" } } }),
+        )
+        .await;
     assert_eq!(updated.body["matched"], 1, "{:?}", updated.body);
-    assert_eq!(updated.body["explain"]["strategy"], "idLookup", "{:?}", updated.body);
-    assert_eq!(updated.body["explain"]["documentsExamined"], 1, "{:?}", updated.body);
 
     let after = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
     assert_eq!(after.body["item"], "changed", "the write landed on the right document");
 
-    let deleted = server
+    let commits_before = server.state.engine.commits();
+    let planned_delete = server
         .post(
             "/v1/db/shop/coll/control/delete",
             Some(&token),
             json!({ "filter": { "_id": 5 }, "explain": true }),
         )
         .await;
+    assert_eq!(planned_delete.body["deleted"], 0, "{:?}", planned_delete.body);
+    assert_eq!(planned_delete.body["commits"], 0, "{:?}", planned_delete.body);
+    assert_eq!(planned_delete.body["explain"]["strategy"], "idLookup", "{:?}", planned_delete.body);
+    assert_eq!(planned_delete.body["explain"]["documentsMatched"], 1, "{:?}", planned_delete.body);
+    assert_eq!(
+        server.state.engine.commits(),
+        commits_before,
+        "an explained delete spends no commit"
+    );
+    let still_there = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
+    assert_eq!(still_there.status, 200, "explain must not have deleted anything");
+
+    let deleted = server
+        .post("/v1/db/shop/coll/control/delete", Some(&token), json!({ "filter": { "_id": 5 } }))
+        .await;
     assert_eq!(deleted.body["deleted"], 1, "{:?}", deleted.body);
-    assert_eq!(deleted.body["explain"]["strategy"], "idLookup", "{:?}", deleted.body);
 
     let gone = server.get("/v1/db/shop/coll/control/docs/5", Some(&token)).await;
     assert_eq!(gone.status, 404, "and only that document: {:?}", gone.body);
     let remaining =
         server.post("/v1/db/shop/coll/control/count", Some(&token), json!({ "filter": {} })).await;
     assert_eq!(remaining.body["count"], 59);
+}
+
+/// `explain: true` on `update` and `delete` plans the write; it does not
+/// perform it (ADR-131). Before this, `explain` on a `multi: true` `delete`
+/// destroyed the collection it was meant to let a caller inspect first —
+/// the worked example is reproduced here as the `multi` delete case. Each
+/// case is asserted by a follow-up read and by the engine's own commit
+/// counter, not left visible-but-unasserted as it was; `find`'s `explain` is
+/// the control, since a read was never at risk.
+#[tokio::test]
+async fn explain_plans_a_write_without_performing_it() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "zap"})).await;
+    let batch: Vec<Value> = (0..5).map(|i| json!({"_id": i, "zap": 0})).collect();
+    server.post("/v1/db/shop/coll/zap/bulk", Some(&token), json!(batch)).await;
+
+    // Control: `find`'s `explain` has always been read-only.
+    let commits_before = server.state.engine.commits();
+    let found = server
+        .post("/v1/db/shop/coll/zap/find", Some(&token), json!({"filter": {}, "explain": true}))
+        .await;
+    assert_eq!(found.body["count"], 5, "{:?}", found.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "find never writes");
+
+    // Single-document update.
+    let commits_before = server.state.engine.commits();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/zap/update",
+            Some(&token),
+            json!({"filter": {"_id": 0}, "update": {"$set": {"zap": 1}}, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 0, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    assert_eq!(res.body["commits"], 0, "{:?}", res.body);
+    assert!(res.body.get("stamp").is_none(), "nothing was written, so nothing has a new stamp");
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+    let doc = server.get("/v1/db/shop/coll/zap/docs/0", Some(&token)).await;
+    assert_eq!(doc.body["zap"], 0, "explain must not have written the document");
+
+    // Multi update — every document a candidate, none rewritten.
+    let commits_before = server.state.engine.commits();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/zap/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$set": {"zap": 2}}, "multi": true, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["matched"], 0, "{:?}", res.body);
+    assert_eq!(res.body["modified"], 0, "{:?}", res.body);
+    assert_eq!(res.body["explain"]["documentsMatched"], 5, "{:?}", res.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+    let untouched = server
+        .post("/v1/db/shop/coll/zap/count", Some(&token), json!({"filter": {"zap": 2}}))
+        .await;
+    assert_eq!(untouched.body["count"], 0, "explain must not have rewritten every document");
+
+    // Single-document delete.
+    let commits_before = server.state.engine.commits();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/zap/delete",
+            Some(&token),
+            json!({"filter": {"_id": 1}, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["deleted"], 0, "{:?}", res.body);
+    assert_eq!(res.body["commits"], 0, "{:?}", res.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+    let doc = server.get("/v1/db/shop/coll/zap/docs/1", Some(&token)).await;
+    assert_eq!(doc.status, 200, "explain must not have deleted the document");
+
+    // Multi delete — the finding's worked example: inspecting a `multi`
+    // delete must not perform it, however broad the filter.
+    let commits_before = server.state.engine.commits();
+    let res = server
+        .post(
+            "/v1/db/shop/coll/zap/delete",
+            Some(&token),
+            json!({"filter": {}, "multi": true, "explain": true}),
+        )
+        .await;
+    assert_eq!(res.body["deleted"], 0, "{:?}", res.body);
+    assert_eq!(res.body["explain"]["documentsMatched"], 5, "{:?}", res.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+    let survivors =
+        server.post("/v1/db/shop/coll/zap/count", Some(&token), json!({"filter": {}})).await;
+    assert_eq!(survivors.body["count"], 5, "explain must not have destroyed the collection");
+}
+
+/// `explain` plans the selection and the access path; it never runs the
+/// update operators. So `documentsMatched` under `explain: true` is the
+/// plan's selection, not a guarantee: the real write can still refuse a
+/// document it counted, when an operator cannot apply to that document's
+/// content. Delete has no operators to fail this way, so this is
+/// `update`-only.
+#[tokio::test]
+async fn explain_can_count_a_document_the_real_update_refuses() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "mixed"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/mixed/bulk",
+            Some(&token),
+            json!([{"_id": 1, "n": 1}, {"_id": 2, "n": "text"}, {"_id": 3, "n": 3}]),
+        )
+        .await;
+
+    let planned = server
+        .post(
+            "/v1/db/shop/coll/mixed/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$inc": {"n": 1}}, "multi": true, "explain": true}),
+        )
+        .await;
+    assert_eq!(planned.body["explain"]["documentsMatched"], 3, "{:?}", planned.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/mixed/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$inc": {"n": 1}}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("non-numeric"),
+        "{:?}",
+        res.body
+    );
+
+    // Neither call wrote anything.
+    let unchanged = server
+        .post("/v1/db/shop/coll/mixed/count", Some(&token), json!({"filter": {"n": {"$gt": 3}}}))
+        .await;
+    assert_eq!(unchanged.body["count"], 0, "{:?}", unchanged.body);
 }
 
 /// A `_id` the fast path cannot encode still finds its document, by scanning.
@@ -4832,6 +5050,31 @@ async fn paging_through_an_index_agrees_with_paging_through_a_scan() {
     assert_eq!(a, (0..200).filter(|i| i % 2 == 1).collect::<Vec<i64>>());
 }
 
+/// `limit: 0` is a legal request for an empty page, on every path a `find`
+/// can take — not just the sorted one, which held up under a heap of
+/// capacity zero while the unsorted and `_id`-ascending paths handed back
+/// one document whenever the very first candidate the scan examined
+/// happened to match. Every case here is exactly that: an empty filter over
+/// a non-empty collection, so the first document the scan sees matches.
+#[tokio::test]
+async fn a_page_of_zero_is_empty_on_every_path() {
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 10).await;
+
+    for (why, body) in [
+        ("unsorted", json!({"filter": {}, "limit": 0})),
+        ("_id ascending", json!({"filter": {}, "limit": 0, "sort": {"_id": 1}})),
+        ("_id descending", json!({"filter": {}, "limit": 0, "sort": {"_id": -1}})),
+        ("a non-_id sort", json!({"filter": {}, "limit": 0, "sort": {"parity": 1}})),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/find", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{why}: {:?}", res.body);
+        assert_eq!(res.body["documents"], json!([]), "{why}: {:?}", res.body);
+        assert_eq!(res.body["count"], 0, "{why}: {:?}", res.body);
+        assert!(res.body.get("nextCursor").is_none(), "{why}: {:?}", res.body);
+    }
+}
+
 #[tokio::test]
 async fn the_last_page_carries_no_cursor() {
     let server = Server::start().await;
@@ -5652,7 +5895,11 @@ async fn update_uses_an_index_when_one_applies() {
     let server = Server::start().await;
     let token = seeded(&server, "orders", true).await;
 
-    let res = server
+    // `explain: true` plans and reports the plan without writing (ADR-131):
+    // the count the index admits lives in `explain`, and the write-outcome
+    // fields stay at "nothing happened" — asserted by a follow-up count.
+    let commits_before = server.state.engine.commits();
+    let planned = server
         .post(
             "/v1/db/shop/coll/orders/update",
             Some(&token),
@@ -5665,11 +5912,30 @@ async fn update_uses_an_index_when_one_applies() {
         )
         .await;
 
-    assert_eq!(res.status, 200, "{:?}", res.body);
-    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
-    assert_eq!(res.body["explain"]["index"], "sku_1");
+    assert_eq!(planned.status, 200, "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["strategy"], "index", "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["index"], "sku_1");
     // Ten of the two hundred carry this sku, and only those were examined.
-    assert_eq!(res.body["explain"]["documentsExamined"], 10, "{:?}", res.body);
+    assert_eq!(planned.body["explain"]["documentsExamined"], 10, "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["documentsMatched"], 10, "{:?}", planned.body);
+    assert_eq!(planned.body["matched"], 0, "{:?}", planned.body);
+    assert_eq!(planned.body["modified"], 0, "{:?}", planned.body);
+    assert_eq!(planned.body["commits"], 0, "{:?}", planned.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+    let untouched = server
+        .post("/v1/db/shop/coll/orders/count", Some(&token), json!({"filter": {"n": 1}}))
+        .await;
+    assert_eq!(untouched.body["count"], 0, "explain must not have written anything");
+
+    // The same request without `explain` performs the write the plan
+    // described.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"sku": "sku-7"}, "update": {"$set": {"n": 1}}, "multi": true}),
+        )
+        .await;
     assert_eq!(res.body["matched"], 10);
     assert_eq!(res.body["modified"], 10);
 }
@@ -5679,7 +5945,8 @@ async fn delete_uses_an_index_when_one_applies() {
     let server = Server::start().await;
     let token = seeded(&server, "orders", true).await;
 
-    let res = server
+    let commits_before = server.state.engine.commits();
+    let planned = server
         .post(
             "/v1/db/shop/coll/orders/delete",
             Some(&token),
@@ -5687,10 +5954,22 @@ async fn delete_uses_an_index_when_one_applies() {
         )
         .await;
 
-    assert_eq!(res.status, 200, "{:?}", res.body);
-    assert_eq!(res.body["explain"]["strategy"], "index", "{:?}", res.body);
-    assert_eq!(res.body["explain"]["documentsExamined"], 10);
-    assert_eq!(res.body["deleted"], 10);
+    assert_eq!(planned.status, 200, "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["strategy"], "index", "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["documentsExamined"], 10);
+    assert_eq!(planned.body["explain"]["documentsMatched"], 10);
+    assert_eq!(planned.body["deleted"], 0, "{:?}", planned.body);
+    assert_eq!(planned.body["commits"], 0, "{:?}", planned.body);
+    assert_eq!(server.state.engine.commits(), commits_before, "explain must spend no commit");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/delete",
+            Some(&token),
+            json!({"filter": {"sku": "sku-3"}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.body["deleted"], 10, "explain must not have deleted anything: {:?}", res.body);
 }
 
 #[tokio::test]
@@ -5714,6 +5993,25 @@ async fn without_an_index_the_write_paths_still_scan_and_still_agree() {
     assert_eq!(b.body["explain"]["documentsExamined"], 200, "a scan examines everything");
 
     // Same answer either way, which is the whole point.
+    assert_eq!(a.body["explain"]["documentsMatched"], b.body["explain"]["documentsMatched"]);
+    assert_eq!(a.body["explain"]["documentsMatched"], 10);
+
+    // Neither wrote anything.
+    for (coll, token) in [("with_index", &indexed), ("no_index", &plain)] {
+        let res = server
+            .post(
+                &format!("/v1/db/shop/coll/{coll}/find"),
+                Some(token),
+                json!({"filter": {"n": 42}}),
+            )
+            .await;
+        assert_eq!(res.body["count"], 0, "{coll}: explain must not have written: {:?}", res.body);
+    }
+
+    // Run both for real: the two access paths must still agree once they do.
+    let body = json!({"filter": {"sku": "sku-11"}, "update": {"$set": {"n": 42}}, "multi": true});
+    let a = server.post("/v1/db/shop/coll/with_index/update", Some(&indexed), body.clone()).await;
+    let b = server.post("/v1/db/shop/coll/no_index/update", Some(&plain), body).await;
     assert_eq!(a.body["matched"], b.body["matched"]);
     assert_eq!(a.body["modified"], b.body["modified"]);
 
@@ -5735,16 +6033,27 @@ async fn a_single_update_still_touches_exactly_one_document() {
     let server = Server::start().await;
     let token = seeded(&server, "orders", true).await;
 
-    let res = server
+    let planned = server
         .post(
             "/v1/db/shop/coll/orders/update",
             Some(&token),
             json!({"filter": {"sku": "sku-5"}, "update": {"$set": {"n": 9}}, "explain": true}),
         )
         .await;
+    assert_eq!(planned.body["matched"], 0, "explain plans, it does not write: {:?}", planned.body);
+    assert_eq!(planned.body["modified"], 0);
+    assert_eq!(planned.body["explain"]["documentsMatched"], 1, "{:?}", planned.body);
+    assert_eq!(planned.body["explain"]["documentsExamined"], 1, "stopped at the first match");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/update",
+            Some(&token),
+            json!({"filter": {"sku": "sku-5"}, "update": {"$set": {"n": 9}}}),
+        )
+        .await;
     assert_eq!(res.body["matched"], 1, "{:?}", res.body);
     assert_eq!(res.body["modified"], 1);
-    assert_eq!(res.body["explain"]["documentsExamined"], 1, "stopped at the first match");
 
     let counted = server
         .post("/v1/db/shop/coll/orders/count", Some(&token), json!({"filter": {"n": 9}}))
@@ -5800,7 +6109,7 @@ async fn an_indexed_update_over_an_array_field_still_matches_every_document() {
         )
         .await;
 
-    let res = server
+    let planned = server
         .post(
             "/v1/db/shop/coll/tagged/update",
             Some(&token),
@@ -5814,7 +6123,19 @@ async fn an_indexed_update_over_an_array_field_still_matches_every_document() {
         .await;
 
     // Three documents carry "b"; _id 4 carries it twice and must be counted
-    // once, not twice — the union deduplicates by document key.
+    // once, not twice — the union deduplicates by document key. Reported by
+    // `explain` without writing (ADR-131).
+    assert_eq!(planned.body["explain"]["documentsMatched"], 3, "{:?}", planned.body);
+    assert_eq!(planned.body["matched"], 0, "{:?}", planned.body);
+    assert_eq!(planned.body["modified"], 0, "{:?}", planned.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/tagged/update",
+            Some(&token),
+            json!({"filter": {"tags": "b"}, "update": {"$set": {"seen": true}}, "multi": true}),
+        )
+        .await;
     assert_eq!(res.body["matched"], 3, "{:?}", res.body);
     assert_eq!(res.body["modified"], 3);
 

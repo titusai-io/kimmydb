@@ -1156,6 +1156,15 @@ turns "an index applies here now" from a sentence into something a test
 asserts and an operator can check — the standing lesson from ADR-016, where a
 claim nothing verified stayed false for two milestones.
 
+**"Mirroring `find`" was true of the output shape only, and not of the
+behaviour — until [ADR-131](decisions.md).** `explain: true` on `update` and
+`delete` still performed the write it described; `find`'s `explain` never
+writes anything, because `find` never does. A `multi: true` `delete` with
+`explain: true` deleted every document in the collection, which a 2026-09
+test round found. ADR-131 closes the gap by having `update` and `delete`
+run the same read-only scan `find` uses when `explain: true` is set, so the
+sentence above is now true of the behaviour as well as the shape.
+
 **A second, quieter bug went with it.** `update` counted `modified` by
 incrementing per target rather than reading the write's own answer, so a
 document deleted between the read pass and the write was still reported as

@@ -10,6 +10,42 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **`explain: true` on `update` and `delete` plans the write; it no longer
+  performs it.** Both routes previously executed the write regardless of
+  `explain`, using it only to attach a report of the plan afterward — so
+  `POST .../delete {"filter": {}, "multi": true, "explain": true}` deleted
+  every document in the collection, and the equivalent `update` rewrote
+  every one. `explain` on these two routes was never documented as
+  executing — `http-api.md` and the `Explain` schema only ever described
+  its output, in the past tense — so it now runs the same read-only scan
+  `find` and `count` already use. Nothing is written and no commit is
+  spent: `matched`, `modified`, `deleted` and `commits` all read `0` and
+  `stamp` is absent, identically to a write that matched nothing; what the
+  write *would* touch is `explain.documentsMatched`, the field `find`'s own
+  `explain` has always carried. `explain` cannot be combined with
+  `if_stamp` and is refused `400` with it — a plan checks no version, so it
+  cannot answer whether a *conditional* write would happen. `update` and
+  `delete` can now report `indexEntriesRead` in `explain`, which they could
+  not before: their `explain` used to be read back out of the write's own
+  bookkeeping, which does not track it. Breaking for a client that relied on
+  `explain: true` still performing the write, or on sending `if_stamp`
+  alongside it. ADR-131.
+
+### Fixed
+
+- **`find` with `limit: 0` returned one document instead of an empty page**,
+  on the unsorted path and on a `sort: {"_id": 1}` request, whenever the
+  first document the scan examined happened to match the filter — an empty
+  filter over a non-empty collection always qualifies. `limit: 0` is a
+  documented, legal request for an empty page (`FindRequest.limit` has
+  `minimum: 0`), and the sorted paths already honoured it; the unsorted scan
+  handed a match to the page before checking whether the page's bound had
+  already been reached. The bound is now checked first.
+
 ## 0.21.0 - 2026-09-03
 
 A minor when it ships, not a patch. Nothing changes on the wire between

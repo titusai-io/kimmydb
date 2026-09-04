@@ -295,7 +295,9 @@ so this is the cheap way to read one document *with* its version.
 
 **Default limit 100, maximum 10,000, and both are silent.** Omitting `limit`
 returns a page of 100 rather than the collection, and a larger `limit` is
-clamped rather than refused. To read everything, walk with a cursor:
+clamped rather than refused. `limit: 0` is legal and is an empty page —
+`{"documents": [], "count": 0}`, with no `nextCursor` — on every sort order.
+To read everything, walk with a cursor:
 
 ```json
 { "filter": {}, "limit": 100 }
@@ -356,9 +358,10 @@ how many chunks landed ([ADR-086](decisions.md)).
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
-names one document. On these routes it is a **body** field: `?if_stamp=…` on
-the URL is refused `400`, as any query string on a route that takes none is
-(see [The JSON boundary](#the-json-boundary)), rather than being read as no
+names one document — or with `explain`, below. On these routes it is a
+**body** field: `?if_stamp=…` on the URL is refused `400`, as any query
+string on a route that takes none is (see
+[The JSON boundary](#the-json-boundary)), rather than being read as no
 condition at all.
 
 An update path may address array elements — `items.$[].qty` for every
@@ -573,6 +576,29 @@ many entries as it returns, a range put in `_id` order reads the whole range.
 
 `count` visits every match and holds none of them: its cost is the time of
 the scan, not the memory of the result.
+
+**On `update` and `delete`, `explain: true` plans the write; it does not
+perform it** ([ADR-131](decisions.md)). It answers with the same
+`documentsExamined`/`documentsMatched`/`strategy` a real write would use, but
+writes nothing and spends no commit: `matched`, `modified`, `deleted` and
+`commits` all read `0`, and `stamp` is absent — exactly what those fields
+already say for a write that matched nothing. What the write *would* touch
+is `explain.documentsMatched`. Drop `explain` to perform the write the plan
+described.
+
+**On `update`, that count is the selection, not a guarantee.** `explain`
+plans which documents match and how they are found; it never runs the
+update operators, so the real write can still refuse a document `explain`
+reported as matched — a `$inc` on a field holding a string, for instance,
+answers `400` on the write and `200` with that document counted on the
+plan.
+
+**`explain` cannot be combined with `if_stamp`, and is refused `400` with
+it.** A plan never checks a document's version — that check only happens
+inside the write `explain` does not perform — so a plan cannot honestly
+answer "would this write happen" for a conditional write: the document it
+reports as matched may be exactly the one the real write, checking the same
+stamp, refuses `409 stale` on.
 
 ---
 

@@ -1531,6 +1531,20 @@ paths:
         An update path may address array elements: `items.$[].qty` reaches
         every element, and `items.$[line].qty` reaches the elements the
         `arrayFilters` entry for `line` selects (ADR-104).
+
+        **`explain: true` plans the update; it does not perform it**
+        (ADR-131). It answers with the same plan a real update would use —
+        `documentsExamined`, `documentsMatched`, and which index, if any —
+        but writes nothing and spends no commit: `matched`, `modified` and
+        `commits` all report zero, and `stamp` is absent, exactly as they
+        would for a write that touched nothing. What the update *would*
+        touch is `explain.documentsMatched` — but that count is the
+        selection, not a guarantee: `explain` never runs the update
+        operators, so the real write can still refuse a document it counted,
+        if an operator cannot apply to that document (a `$inc` on a
+        non-numeric field, say). Cannot be combined with `if_stamp`: a plan
+        checks no version, so it cannot answer whether a conditional update
+        would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1551,11 +1565,17 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                  description: |
+                    Plan the update and report the plan, without performing
+                    it. See the route description.
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Write only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional write would happen (ADR-131). `400` either
+                    way.
                 arrayFilters:
                   $ref: "#/components/schemas/ArrayFilters"
       responses:
@@ -1569,6 +1589,13 @@ paths:
                 properties:
                   matched:
                     type: integer
+                    description: |
+                      Documents the filter matched and the write acted on.
+                      Zero under `explain: true`, which plans and does not
+                      act on anything — see `explain.documentsMatched` for
+                      the selection the plan found, which the write may
+                      still refuse a document out of if an operator cannot
+                      apply to it (ADR-131).
                   modified:
                     type: integer
                     description: |
@@ -1589,14 +1616,16 @@ paths:
                     description: |
                       Write transactions the request cost — one per chunk of
                       `storage.multi_chunk_docs` documents, zero when nothing
-                      matched (ADR-086).
+                      matched (ADR-086) and zero under `explain: true`, which
+                      spends none (ADR-131).
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The version the write produced. Present only when the
                       request wrote exactly one document without `multi` — a
                       version names one document, and a multi write has no
-                      single one to name (ADR-084).
+                      single one to name (ADR-084). Always absent under
+                      `explain: true`, which writes nothing (ADR-131).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1700,6 +1729,13 @@ paths:
         `multi: true` commits in chunks of `storage.multi_chunk_docs` with the
         writer released between them, and `if_stamp` makes a single-document
         delete conditional on its version.
+
+        **`explain: true` plans the delete; it does not perform it**
+        (ADR-131). `deleted` and `commits` report zero and `stamp` is absent,
+        exactly as they would for a delete that matched nothing; what it
+        *would* delete is `explain.documentsMatched`. Cannot be combined
+        with `if_stamp`: a plan checks no version, so it cannot answer
+        whether a conditional delete would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1716,11 +1752,17 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                  description: |
+                    Plan the delete and report the plan, without performing
+                    it. See the route description.
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Delete only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional delete would happen (ADR-131). `400` either
+                    way.
       responses:
         "200":
           description: How many were deleted.
@@ -1732,14 +1774,22 @@ paths:
                 properties:
                   deleted:
                     type: integer
+                    description: |
+                      Documents deleted. Zero under `explain: true`, which
+                      plans and does not delete — see
+                      `explain.documentsMatched` for what would have been
+                      deleted (ADR-131).
                   commits:
                     type: integer
-                    description: Write transactions the request cost — one per chunk (ADR-086).
+                    description: |
+                      Write transactions the request cost — one per chunk
+                      (ADR-086), zero under `explain: true` (ADR-131).
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The tombstone's version. Present only when the request
                       deleted exactly one document without `multi` (ADR-084).
+                      Always absent under `explain: true`.
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -3173,7 +3223,12 @@ components:
 
     Explain:
       type: object
-      description: How a query was answered. Present only when `explain` was requested.
+      description: |
+        How a query was, or an update or a delete would be, answered. Present
+        only when `explain` was requested. On `find` and `count` this
+        describes the read that happened; on `update` and `delete` it
+        describes the read-only plan that ran *instead of* the write
+        (ADR-131) — the shape is identical either way.
       required: [strategy, index, indexFieldsUsed, documentsExamined, documentsMatched]
       properties:
         strategy:
@@ -3204,7 +3259,17 @@ components:
             consulted.
         indexFieldsUsed: { type: integer }
         documentsExamined: { type: integer }
-        documentsMatched: { type: integer }
+        documentsMatched:
+          type: integer
+          description: |
+            Documents the filter matched. On `update` and `delete` under
+            `explain: true`, this is the write's selection — the route's own
+            `matched`/`modified`/`deleted` stay zero, since nothing was
+            written (ADR-131). On `delete` that selection is exactly what a
+            real delete would remove; on `update` it is not a guarantee,
+            since `explain` never runs the update operators — a document
+            counted here can still be one the real write refuses, if an
+            operator cannot apply to it.
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.
@@ -3216,8 +3281,7 @@ components:
             examined: an equality on a complete key stopped by `limit` reads
             as many entries as it returns, while a range that had to be put
             in `_id` order reads the whole range however few documents it
-            returns. Absent for a collection scan, an `idLookup`, and for
-            `update` and `delete`.
+            returns. Absent for a collection scan and an `idLookup`.
 
     ViolationGroup:
       type: object
