@@ -75,15 +75,31 @@ pub struct SyncOutcome {
     /// history still missing does not, and read 0 for a bulk insert whose
     /// stamps all lie within a second (ADR-122). See [`lag_behind_ms`].
     pub lag_ms: u64,
+    /// Whether this round's pull reached the peer's true tail: the oplog
+    /// window ended because the peer's log ran out, not because the batch
+    /// cap was spent (ADR-127's `exhausted`, carried through). `true` when
+    /// there was nothing to pull at all. This is a convergence claim
+    /// independent of the clock — the one signal that would have
+    /// contradicted `lag_ms == 0` during finding 14, since a round can be
+    /// mid-backlog with `lag_ms` still reading low for a bulk insert whose
+    /// stamps cluster within a second (ADR-122) while `exhausted` correctly
+    /// reads `false`. `false` on every path exercised by the network-free
+    /// tests in this module other than an explicit exhausted batch: this
+    /// field only carries the fact through, it does not compute it.
+    pub exhausted: bool,
     /// Collections the cross-member divergence check found disagreeing
     /// against this peer this round (ADR-133): held by the peer and not
-    /// here, or held by both with disagreeing document counts. Populated
-    /// only when there was nothing to pull — see
-    /// [`crate::divergence::compare`] for why that gate matters and what it
-    /// deliberately does not report. Empty on every path exercised by the
-    /// network-free tests in this module: the check itself lives in
-    /// `kimmy-cluster`, which is the only place a peer's answer exists.
-    pub divergent: std::collections::BTreeSet<kimmy_core::CollectionId>,
+    /// here, or held by both with disagreeing document counts. `None` when
+    /// the check did not run this round at all — a round whose pull did not
+    /// reach the peer's tail (`exhausted == false`) skips it, because that
+    /// is precisely the state a truncated sync window can fake without
+    /// being true. `Some` (possibly holding an empty set) once it ran,
+    /// which is whenever `exhausted` is `true`. See
+    /// [`crate::divergence::compare`] for what it does and does not report.
+    /// `None` on every path exercised by the network-free tests in this
+    /// module: the check itself lives in `kimmy-cluster`, which is the only
+    /// place a peer's answer exists.
+    pub divergent: Option<std::collections::BTreeSet<kimmy_core::CollectionId>>,
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of
