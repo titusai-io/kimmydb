@@ -3127,6 +3127,146 @@ async fn a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field(
     assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
 }
 
+/// A table-driven guard for ADR-128: every optional field the decision
+/// claims, across every closed request shape behind `JsonBody<T>`, refuses
+/// an explicit `null` — so a field added to one of these structs later
+/// without `non_null_field` fails this suite rather than shipping quietly.
+/// Where it is cheap and side-effect-free, the same row also checks that
+/// *omitting* the field still succeeds, so the two are shown to differ only
+/// in the explicit `null`; a destructive or infrastructure-dependent field
+/// (a filter that would delete the fixture out from under a later row, an
+/// index name that would collide on a second create, a webhook URL that
+/// needs a resolvable host) checks only the refusal, which is the property
+/// that actually matters and is exercised for success elsewhere in this
+/// file.
+#[tokio::test]
+async fn every_optional_field_of_a_closed_request_shape_refuses_an_explicit_null() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server.post("/v1/db/shop/coll/orders/docs", Some(&token), json!({"_id":1,"qty":5})).await;
+    let search_token = fusion_fixture(&server).await;
+
+    // (method, path, token, base body, [(field, also check omission succeeds)])
+    type Case<'a> = (&'a str, &'a str, &'a str, Value, Vec<(&'a str, bool)>);
+    let cases: Vec<Case> = vec![
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find",
+            &token,
+            json!({}),
+            vec![
+                ("filter", true),
+                ("sort", true),
+                ("projection", true),
+                ("limit", true),
+                ("skip", true),
+                ("cursor", true),
+            ],
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/find_and_modify",
+            &token,
+            json!({"filter":{"_id":1},"update":{"$set":{"qty":6}}}),
+            vec![
+                ("filter", true),
+                ("sort", true),
+                ("returnDocument", true),
+                ("projection", true),
+                ("if_stamp", true),
+            ],
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/update",
+            &token,
+            json!({"filter":{"_id":1},"update":{"$set":{"qty":7}}}),
+            vec![("filter", true), ("if_stamp", true)],
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/indexes",
+            &token,
+            json!({"fields":[{"path":"qty"}]}),
+            vec![
+                ("name", false),
+                ("enforcement", false),
+                ("expireAfterSeconds", false),
+                ("partialFilterExpression", false),
+            ],
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/orders/webhooks",
+            &token,
+            json!({"url":"https://hooks.example/orders"}),
+            vec![("operations", false)],
+        ),
+        (
+            "POST",
+            "/v1/db/shop/coll/docs/hybrid_search",
+            &search_token,
+            json!({"query":"red blue","vector":[1.0,0.0,0.0],"k":5}),
+            // `query` and `vector` are checked for the refusal only: on a
+            // `byo` collection removing either leaves nothing to search
+            // with, which is a functional failure this table is not about.
+            vec![
+                ("query", false),
+                ("vector", false),
+                ("filter", true),
+                ("k", true),
+                ("per_document", true),
+                ("weights", true),
+                ("min_overlap", true),
+            ],
+        ),
+    ];
+
+    for (method, path, tok, base, fields) in cases {
+        for (field, check_omission) in fields {
+            let mut nulled = base.clone();
+            nulled[field] = Value::Null;
+            let url = format!("{}{path}", server.base);
+            let res = server.client.request(method, &url, Some(tok), Some(nulled)).await;
+            assert_eq!(
+                res.status, 422,
+                "{method} {path}: {field} = null must be refused: {:?}",
+                res.body
+            );
+            let message = res.body["message"].as_str().unwrap_or_default();
+            assert!(
+                message.contains(field),
+                "{method} {path}: the refusal must name {field}: {message}"
+            );
+
+            if check_omission {
+                let mut omitted = base.clone();
+                omitted.as_object_mut().unwrap().remove(field);
+                let res = server.client.request(method, &url, Some(tok), Some(omitted)).await;
+                assert!(
+                    (200..300).contains(&res.status),
+                    "{method} {path}: omitting {field} must still succeed: {} {:?}",
+                    res.status,
+                    res.body
+                );
+            }
+        }
+    }
+
+    // delete's `filter` and `if_stamp` are checked last and without the
+    // omission half: the field under test is the one this route's own
+    // destructive-case tests already exercise for real, and running the
+    // omission check here would consume the fixture document the null
+    // checks above still need.
+    for field in ["filter", "if_stamp"] {
+        let mut nulled = json!({"filter":{"_id":1}});
+        nulled[field] = Value::Null;
+        let res = server.post("/v1/db/shop/coll/orders/delete", Some(&token), nulled).await;
+        assert_eq!(res.status, 422, "delete: {field} = null must be refused: {:?}", res.body);
+    }
+}
+
 /// The reason to have this at all: check-then-act on one document, with
 /// exactly one winner and no coordination.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
