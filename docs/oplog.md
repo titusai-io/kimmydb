@@ -347,15 +347,21 @@ the last stamp its scan examined, an entry it withheld included — and
 raises its witnessed vector to the peer's whole advertised vector when the
 window was exhausted, and otherwise to `min(their_max, scanned_to)` per origin:
 never past what the peer holds, and never past what it read. It does **not**
-work this out from how many entries arrived. A window that is not a tail is
-also clamped to the last stamp it actually carried, so a sender that trimmed a
-batch in place could not witness away what it dropped — a no-op for a correct
-sender, and the reason `BatchTooLarge` is a retry rather than a short answer. That inference was true only while
+work this out from how many entries arrived. That inference was true only while
 nothing could shorten a batch for another reason, and when it stopped being
 true the receiver witnessed every entry behind a truncated window without ever
 applying one — silent, permanent divergence with every health signal reading
 normal ([ADR-127](decisions.md), and [ADR-082](decisions.md) for why an
 unshippable stamp must still be claimed).
+
+**A window's claim is worth no more than what it carried.** The end is now the
+sender's assertion rather than the receiver's deduction, so a window that is
+not a tail is clamped to the last stamp it delivered, and one that delivered
+nothing claims nothing. A sender that trimmed a batch in place therefore
+cannot witness away what it dropped, which is why `BatchTooLarge` is a retry
+rather than a short answer. The clamp is arithmetic that changes nothing for a
+correct sender. `exhausted` itself is not checkable — a node cannot know how
+much oplog its peer has — and is taken on trust.
 
 ### Past the horizon
 

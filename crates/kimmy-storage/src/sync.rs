@@ -247,18 +247,29 @@ impl Engine {
     /// `scanned_to` and `exhausted` are the peer's report of where its window
     /// ended, which is what decides whether its tail was reached (ADR-127).
     ///
-    /// **A window that is not a tail is clamped to what it actually carried.**
-    /// The window's end moved from something this node computes to something
-    /// the peer asserts, and an assertion crossing the wire is checked here or
-    /// nowhere: a sender that trimmed a batch in place but reported the end it
-    /// had scanned to would witness away every entry it dropped, which is
-    /// finding 14 from one wrong field. `Message::BatchTooLarge` tells a
-    /// sender not to do that, and this is the same rule as an invariant rather
-    /// than as prose. A correct sender is unaffected — its window stops on the
-    /// entry it last kept — so the clamp is a no-op today and a floor
-    /// afterwards. An *exhausted* window is exempt: it proves the peer's whole
-    /// tail by definition, and an empty one is the honest answer when
-    /// everything in range was withheld.
+    /// **A window that is not a tail is clamped to what it actually carried,
+    /// and one that carried nothing claims nothing.** The window's end moved
+    /// from something this node computes to something the peer asserts, and an
+    /// assertion crossing the wire is checked here or nowhere: a sender that
+    /// trimmed a batch in place but reported the end it had scanned to would
+    /// witness away every entry it dropped, which is finding 14 from one wrong
+    /// field. `Message::BatchTooLarge` tells a sender not to do that, and this
+    /// is the same rule as an invariant rather than as prose.
+    ///
+    /// A correct sender is unaffected, so the clamp is a no-op today and a
+    /// floor afterwards. That includes the empty case, which is why it is
+    /// clamped rather than exempted: `read_oplog_from_where` stops only after
+    /// keeping an entry, so `!exhausted` implies `entries.len() == limit`, and
+    /// a correct sender **cannot** emit an empty window that is not a tail. An
+    /// empty one that claims a stamp anyway is therefore always a broken or
+    /// hostile peer, and letting it through would absorb the peer's whole
+    /// vector in exchange for nothing — a worse form of the same defect than
+    /// a trimmed batch.
+    ///
+    /// An *exhausted* window is exempt, and cannot be checked: absorbing the
+    /// peer's advertised vector on exhaustion is ADR-082 itself, and this node
+    /// holds nothing to test the claim against. A peer that reports
+    /// `exhausted` falsely is trusted, necessarily.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
@@ -266,9 +277,10 @@ impl Engine {
         scanned_to: Hlc,
         exhausted: bool,
     ) -> Result<SyncOutcome> {
-        let scanned_to = match entries.last() {
-            Some(last) if !exhausted => scanned_to.min(last.stamp.hlc),
-            _ => scanned_to,
+        let scanned_to = if exhausted {
+            scanned_to
+        } else {
+            entries.last().map_or(Hlc::ZERO, |last| scanned_to.min(last.stamp.hlc))
         };
         self.apply_batch_absorbing(
             entries,
@@ -1122,10 +1134,17 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_window_that_is_not_the_tail_claims_only_what_it_scanned() {
-        // The shape a count can never express: nothing was shipped, and the
-        // peer still has more. Reading that as "the whole tail" is finding 14
-        // in one line, so the rule takes the peer's word instead (ADR-127).
+    fn a_window_short_of_the_tail_claims_only_what_it_scanned() {
+        // A window whose end lies far below what the peer advertises. Reading
+        // that as "the whole tail" — which counting entries did, for any batch
+        // under the limit — is finding 14 in one line, so the rule takes the
+        // peer's stated end instead (ADR-127).
+        //
+        // This is the rule as a pure function, given what it is told. What a
+        // *batch* is allowed to tell it is a separate question, decided in
+        // `apply_peer_batch` and pinned by
+        // `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
+        // `a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
         let origin = kimmy_core::NodeId::generate();
         let mut theirs = VersionVector::new();
         theirs.insert(origin, Hlc::new(9_000, 0));
@@ -1529,6 +1548,50 @@ mod tests {
             round(&b, &a, 8);
         }
         assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "every document arrives on a later round");
+    }
+
+    #[test]
+    fn a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing() {
+        // The worse half of the same hole, and the one the exemption used to
+        // let through: a peer that hands over *no* entries while naming a
+        // window end absorbs the receiver's whole view of it in exchange for
+        // nothing, and no later round asks again.
+        //
+        // A correct sender cannot produce this. `read_oplog_from_where` stops
+        // only after keeping an entry, so a window that is not exhausted holds
+        // exactly `limit` entries — never zero. So the state is always a
+        // broken or hostile peer, which is the argument for clamping it rather
+        // than for trusting it.
+        const DOCS: usize = 20;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..DOCS {
+            a.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+        }
+
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        assert!(whole.exhausted);
+
+        let outcome = b.apply_peer_batch(&theirs, &[], whole.scanned_to, false).unwrap();
+
+        assert_eq!(outcome, SyncOutcome::default(), "nothing was applied, because nothing came");
+        assert_eq!(witnessed_of(&b, &theirs), Hlc::ZERO, "and nothing may be claimed for it");
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&theirs),
+            "the peer's whole vector must not be absorbed in exchange for an empty batch"
+        );
+        assert!(b.get_collection("shop", "orders").is_err(), "nothing arrived to create it");
+
+        // Still fully servable afterwards, which is the property being bought.
+        let budget = DOCS + 2;
+        for _ in 0..budget {
+            round(&b, &a, 8);
+        }
+        let cb = b.get_collection("shop", "orders").expect("a later round creates it");
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "and every document arrives");
     }
 
     mod props {

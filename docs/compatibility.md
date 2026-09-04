@@ -133,16 +133,22 @@ the point: the internal wire is optimized for size and changed under an outage
 window; the client wire is optimized for not breaking anyone.
 
 **Replication frames are not SWIM datagrams, and break differently.** The
-replication protocol is BSON, which *is* self-describing, so a changed message
-shape is a decode error on arrival rather than a value misread as something
-else. The first such break — `Message::Entries` carrying where the sender's
-window ended ([ADR-127](decisions.md)) — is therefore the first cluster-wire
-change that is safe to **roll**: mixed members fail each other's sync rounds
-loudly, `kimmy_sync_failures_total` rises on both sides, membership and failure
-detection are untouched, and anti-entropy reconciles when the roll finishes.
-Loud failure is the property being bought here, and it is the reason this one
-does not join the stop-the-cluster list; a wire that failed quietly would not
-have earned it. Finish inside `storage.oplog_retention_secs` — see
+replication protocol is BSON, which *is* self-describing, so changing the
+*shape of a message variant* is a decode error on arrival rather than a value
+misread as something else. That is narrower than "this wire is safe": messages
+are plain serde with no `deny_unknown_fields`, so an **added optional field**
+crosses versions silently in both directions, which is exactly how
+`AskEntries::held` shipped ([ADR-097](decisions.md)). A change is loud only
+when it cannot be read as the old shape.
+
+The first break of that loud kind — `Message::Entries` becoming a struct
+variant to carry where the sender's window ended ([ADR-127](decisions.md)) — is
+therefore the first cluster-wire change that is safe to **roll**: mixed members
+fail each other's sync rounds, `kimmy_sync_failures_total` rises on both sides,
+membership and failure detection are untouched, and anti-entropy reconciles
+when the roll finishes. Being unreadable rather than misreadable is the
+property being bought, and it is why this one does not join the
+stop-the-cluster list. Finish inside `storage.oplog_retention_secs` — see
 [Operations](operations.md).
 
 ---

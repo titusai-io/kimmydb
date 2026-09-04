@@ -7404,9 +7404,9 @@ documents holding 1,518 on one member and 1,501 on another. The **500
 contiguous ids missing from the first are a subset of the 517 missing from the
 second** — one bulk insert, accepted on a third member, discarded from the
 window remainder by *both* pullers, with the second also missing a separate
-17-run. A second collection was missing five documents on one member and four
-of those same five on another. Settled and unchanging across three samples
-taken ninety seconds apart, with every health signal green. The overlap is the
+17-run. A second collection was missing five documents on each of two members,
+four of the five the same on both. Settled and unchanging across three samples
+spanning ninety seconds, with every health signal green. The overlap is the
 signature: independent losses would not share a run, and two pullers dropping
 the same remainder is what one truncated window on the origin produces.
 
@@ -7419,13 +7419,14 @@ nature and are a cluster with a much louder problem when they are not, and the
 scan is a range read that was happening anyway. Serving fewer entries than the
 limit while the tail is unreached, the alternative, is what caused this.
 
-**One other caller changed with it.** Webhook delivery (`dispatch::deliver`)
-reads through `entries_for_peer` for the same reason a peer does — it wants the
-oplog minus this node's own violation entries — and so now also gets a scan
-capped on what it keeps. It re-filters and re-caps what it gets, so the change
-is invisible to it beyond reading a slightly longer stretch of log; where it
-used to be handed a short page and quietly step over the difference, it is now
-handed the page it asked for.
+**One other caller changed with it.** Webhook delivery reads through
+`entries_for_peer` in `dispatch::dispatch_once`, for the same reason a peer
+does — it wants the oplog minus this node's own violation entries — and so now
+also gets a scan capped on what it keeps. It re-filters that page for the
+subscription's collection and operations and re-caps it, so the change is
+invisible beyond reading a slightly longer stretch of log to fill the page it
+asked for. Nothing was wrong there before: a shorter page was simply a shorter
+page, and progress advanced over exactly what it received.
 
 **Cost of the alternative considered: ship violations and have receivers drop
 them.** ADR-082 already declined it — it moves ADR-029's exclusion to the
@@ -7466,21 +7467,39 @@ which is a thing one line of arithmetic can check.
 **And it is checked, because an assertion on the wire is not a fact.** The
 window's end used to be something the receiver computed and is now something
 the peer states, so `apply_peer_batch` clamps it: a window that is **not**
-exhausted claims no more than the last stamp it actually carried. A correct
-sender is unaffected — its scan stops on the entry it last kept, so the clamp
-is arithmetic that changes nothing. What it forecloses is the one remaining
-route back to finding 14: a sender that trimmed a batch in place while
-reporting the end it had scanned to would witness away everything it dropped,
-and measured on this code before the clamp, three entries served with the
-oplog's head as the window's end left the receiver holding 2 documents of 20
-with `behind()` reporting nothing missing. `Message::BatchTooLarge`'s doc
-comment already told implementers not to do that; the clamp is that sentence
-as an invariant, and the `Fits::Only` path is exactly the place the temptation
+exhausted claims no more than the last stamp it actually carried, and one that
+carried nothing claims nothing at all. A correct sender is unaffected — its
+scan stops on the entry it last kept, so the clamp is arithmetic that changes
+nothing.
+
+What it forecloses is a sender that trimmed a batch in place while reporting
+the end it had scanned to, which would witness away everything it dropped.
+Measured on this code before the clamp: three entries served with the oplog's
+head as the window's end left the receiver holding 2 documents of 20 with
+`behind()` reporting nothing missing, and an **empty** batch served the same
+way absorbed the peer's entire vector in exchange for nothing — the same
+defect, with a worse exchange rate. `Message::BatchTooLarge`'s doc comment
+already told implementers not to trim in place; the clamp is that sentence as
+an invariant, and the `Fits::Only` path is exactly the place the temptation
 arises. `coverage_after_batch` stays a pure function of what it is told.
 
-It also expresses a state the count cannot: a window that shipped **nothing**
-and is still not the tail. Under the old rule an empty batch was necessarily
-"the whole tail"; under this one it claims only what the scan reached.
+**The empty case is clamped rather than exempted**, on the argument that makes
+it safe to clamp: `read_oplog_from_where` stops only after keeping an entry, so
+a window that is not exhausted holds exactly `limit` entries and a correct
+sender **cannot** emit an empty one. The state is therefore always a broken or
+hostile peer, and the honest answer to a claim with nothing behind it is to
+claim nothing. Exempting it left the clamp covering everything except the case
+it was written to defend against.
+
+**What cannot be checked, and is trusted.** `exhausted` itself. Absorbing the
+peer's advertised vector on exhaustion *is* ADR-082, and this node holds
+nothing to test the claim against — it cannot know how much oplog the peer has.
+A peer that reports `exhausted` falsely still absorbs the receiver's view of
+it, exactly as before this ADR. That residual is forced by the design rather
+than chosen: the alternative is to stop absorbing on exhaustion, which is the
+livelock ADR-082 exists to prevent. So the claim this ADR makes is bounded —
+the *window's end* is now stated and checked; whether the log ended is stated
+and taken on trust.
 
 **Why `scanned_to` counts entries the sender withheld.** The scan has read
 past them, and a stamp the receiver can never be sent must not be able to hold
@@ -7523,9 +7542,10 @@ to 1,024 oplog entries, plus one comparison per batch for the clamp.
 
 Defended by `an_exhausted_window_proves_the_whole_advertised_vector`,
 `a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached`,
-`an_empty_window_that_is_not_the_tail_claims_only_what_it_scanned`,
-`a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept`, and
-`a_peer_that_over_reports_its_window_claims_only_what_it_sent` for the clamp.
+`a_window_short_of_the_tail_claims_only_what_it_scanned`,
+`a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept`, and, for
+the clamp, `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
+`a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
 
 `a_violation_stamp_does_not_pin_behind_for_ever` keeps ADR-082's guard honest:
 this fix must not be reachable by reverting to "absorb only what was
