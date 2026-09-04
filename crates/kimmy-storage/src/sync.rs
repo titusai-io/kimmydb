@@ -28,6 +28,7 @@ use crate::engine::{Engine, WriteTxn};
 use crate::error::Result;
 use crate::index::UniqueViolation;
 use crate::meta::CollectionMeta;
+use crate::watch::OplogWindow;
 
 /// What applying a batch of replicated entries did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -189,38 +190,47 @@ impl SyncOutcome {
 /// way this node has now processed that window for **every origin the peer
 /// advertised** — not only the origins that happened to appear in it.
 ///
-/// - A **short** batch (fewer than `limit`) is the peer's whole tail, so the
-///   window runs to the end of everything it advertised: the answer is
-///   `theirs` itself.
-/// - A **full** batch was truncated at `limit`, so the window ends at the last
-///   delivered stamp. Each advertised origin is raised to the *lower* of that
-///   stamp and the peer's own coverage of it: never past what the peer holds,
-///   and never past what was served. Ties at the last stamp from origins with
-///   a higher node id sort after it and were not served — they are re-served
-///   next round, because the range read is inclusive at the stamp asked for.
+/// The window's end is the peer's own answer, not a deduction from the batch:
+/// `scanned_to` is the last stamp the peer's scan examined, and `exhausted`
+/// says whether it stopped there because the oplog ended (ADR-127).
 ///
-/// Why the full-batch case exists at all: an advertised stamp this node can
+/// - An **exhausted** window is the peer's whole tail, so it runs to the end of
+///   everything the peer advertised: the answer is `theirs` itself.
+/// - A window that stopped at the batch limit ends at `scanned_to`. Each
+///   advertised origin is raised to the *lower* of that stamp and the peer's
+///   own coverage of it: never past what the peer holds, and never past what it
+///   read. Ties at that stamp from origins with a higher node id sort after it
+///   and were not served — they are re-served next round, because the range
+///   read is inclusive at the stamp asked for.
+///
+/// Why the second case exists at all: an advertised stamp this node can
 /// never receive — a violation, a stamp whose entry sits behind the window —
 /// otherwise pins `VersionVector::behind` at that origin's floor, and once the
 /// peer holds a full batch after that floor, every round re-serves the same
 /// already-witnessed window forever. Observed as a cluster whose sync log read
 /// `applied=0, superseded=1021` every five seconds for the life of the
 /// cluster, and whose lag gauge read the cluster's age. See ADR-082.
+///
+/// Why the peer reports the end rather than the receiver counting entries: the
+/// count was a *proxy* for "the tail was reached", and it stopped being a true
+/// one the moment anything was dropped from a window after the limit was
+/// spent. A `UniqueViolation` inside a window truncated at 1,024 made a
+/// 1,019-entry batch, which read as the whole tail, so every entry past the
+/// window was witnessed without ever being applied and nothing re-served it —
+/// silent, permanent divergence with every health signal green. ADR-126 takes
+/// the cap after the filter so the count is honest again; this rule no longer
+/// depends on the count at all, so the next filter cannot reopen the hole.
 pub fn coverage_after_batch(
     theirs: &VersionVector,
-    entries: &[OplogEntry],
-    limit: usize,
+    scanned_to: Hlc,
+    exhausted: bool,
 ) -> VersionVector {
-    if entries.len() < limit {
+    if exhausted {
         return theirs.clone();
     }
-    let Some(last) = entries.last() else {
-        return theirs.clone();
-    };
-    let window_end = last.stamp.hlc;
     let mut covered = VersionVector::new();
     for (node, their_max) in theirs.iter() {
-        covered.insert(node, their_max.min(window_end));
+        covered.insert(node, their_max.min(scanned_to));
     }
     covered
 }
@@ -233,19 +243,53 @@ impl Engine {
     /// [`Self::apply_batch`] for the entries, with the witnessed vector raised
     /// by [`coverage_after_batch`] in the same transaction as the batch's last
     /// run of documents — so a round with no schema changes in it is one
-    /// commit and one fsync, not one per entry plus two (ADR-119). `limit` is
-    /// the batch size that was asked for, which is what decides whether the
-    /// peer's tail was reached.
+    /// commit and one fsync, not one per entry plus two (ADR-119).
+    /// `scanned_to` and `exhausted` are the peer's report of where its window
+    /// ended, which is what decides whether its tail was reached (ADR-127).
+    ///
+    /// **A window that is not a tail is clamped to what it actually carried,
+    /// and one that carried nothing claims nothing.** The window's end moved
+    /// from something this node computes to something the peer asserts, and an
+    /// assertion crossing the wire is checked here or nowhere: a sender that
+    /// trimmed a batch in place but reported the end it had scanned to would
+    /// witness away every entry it dropped, which is finding 14 from one wrong
+    /// field. `Message::BatchTooLarge` tells a sender not to do that, and this
+    /// is the same rule as an invariant rather than as prose.
+    ///
+    /// A correct sender is unaffected, so the clamp is a no-op today and a
+    /// floor afterwards. That includes the empty case, which is why it is
+    /// clamped rather than exempted: `read_oplog_from_where` stops only after
+    /// keeping an entry, so `!exhausted` implies `entries.len() == limit`, and
+    /// a correct sender **cannot** emit an empty window that is not a tail. An
+    /// empty one that claims a stamp anyway is therefore always a broken or
+    /// hostile peer, and letting it through would absorb the peer's whole
+    /// vector in exchange for nothing — a worse form of the same defect than
+    /// a trimmed batch.
+    ///
+    /// An *exhausted* window is exempt, and cannot be checked: absorbing the
+    /// peer's advertised vector on exhaustion is ADR-082 itself, and this node
+    /// holds nothing to test the claim against. A peer that reports
+    /// `exhausted` falsely is trusted, necessarily.
     pub fn apply_peer_batch(
         &self,
         theirs: &VersionVector,
         entries: &[OplogEntry],
-        limit: usize,
+        scanned_to: Hlc,
+        exhausted: bool,
     ) -> Result<SyncOutcome> {
-        self.apply_batch_absorbing(entries, Some(&coverage_after_batch(theirs, entries, limit)))
+        let scanned_to = if exhausted {
+            scanned_to
+        } else {
+            entries.last().map_or(Hlc::ZERO, |last| scanned_to.min(last.stamp.hlc))
+        };
+        self.apply_batch_absorbing(
+            entries,
+            Some(&coverage_after_batch(theirs, scanned_to, exhausted)),
+        )
     }
 
-    /// Entries at or after `from`, for a peer that asked to catch up.
+    /// The window at or after `from` a peer that asked to catch up may be
+    /// served, with the stamp its scan reached and whether the oplog ran out.
     ///
     /// Stamp order, not arrival order: a peer's question is "what do you hold
     /// after this logical time", which is about origin stamps. Change streams
@@ -255,12 +299,14 @@ impl Engine {
     /// observed when it merged, and every node observes the same collision
     /// independently — shipping them would report one violation once per node.
     /// See [ADR-029](../../../docs/decisions.md).
-    pub fn entries_for_peer(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
-        Ok(self
-            .read_oplog_from(from, limit)?
-            .into_iter()
-            .filter(|entry| entry.kind != OpKind::UniqueViolation)
-            .collect())
+    ///
+    /// `limit` counts the entries that survive that exclusion, not the entries
+    /// read: a window truncated at the cap holds `limit` shippable entries, so
+    /// a shorter one really is the end of the oplog. Spending the cap first and
+    /// filtering afterwards is what let a withheld violation disguise a
+    /// truncated window as a tail (ADR-126).
+    pub fn entries_for_peer(&self, from: Hlc, limit: usize) -> Result<OplogWindow> {
+        self.read_oplog_from_where(from, limit, |entry| entry.kind != OpKind::UniqueViolation)
     }
 
     /// Merge a batch of entries received from a peer.
@@ -992,7 +1038,7 @@ mod tests {
         let theirs = from.version_vector().unwrap();
         match mine.behind(&theirs) {
             Some(start) => {
-                let entries = from.entries_for_peer(start, BATCH).unwrap();
+                let entries = from.entries_for_peer(start, BATCH).unwrap().entries;
                 into.apply_batch(&entries).unwrap()
             }
             None => SyncOutcome::default(),
@@ -1010,32 +1056,64 @@ mod tests {
     /// the witnessed vector and records what the batch proved, so it can show
     /// a round making progress — or failing to.
     fn round(into: &Engine, from: &Engine, limit: usize) -> SyncOutcome {
+        round_window(into, from, limit).0
+    }
+
+    /// [`round`], also handing back the window the peer served, for tests that
+    /// assert on where it ended rather than on what it carried.
+    fn round_window(into: &Engine, from: &Engine, limit: usize) -> (SyncOutcome, OplogWindow) {
         let mine = into.witnessed_vector().unwrap();
         let theirs = from.version_vector().unwrap();
         match mine.behind(&theirs) {
             Some(start) => {
-                let entries = from.entries_for_peer(start, limit).unwrap();
-                let outcome = into.apply_peer_batch(&theirs, &entries, limit).unwrap();
+                let window = from.entries_for_peer(start, limit).unwrap();
+                let outcome = into
+                    .apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)
+                    .unwrap();
                 let mine = into.witnessed_vector().unwrap();
                 let now = crate::engine::physical_now_ms();
-                SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs, now), ..outcome }
+                (SyncOutcome { lag_ms: lag_behind_ms(&mine, &theirs, now), ..outcome }, window)
             }
-            None => SyncOutcome::default(),
+            None => (SyncOutcome::default(), OplogWindow { exhausted: true, ..Default::default() }),
         }
     }
 
-    #[test]
-    fn a_short_batch_proves_the_whole_advertised_vector() {
-        let mut theirs = VersionVector::new();
-        let origin = kimmy_core::NodeId::generate();
-        theirs.insert(origin, Hlc::new(5_000, 0));
-        let entries = vec![entry_from(origin, Hlc::new(1_000, 0))];
-        assert_eq!(coverage_after_batch(&theirs, &entries, 8), theirs);
-        assert_eq!(coverage_after_batch(&theirs, &[], 8), theirs, "an empty tail too");
+    /// The highest stamp `into` has witnessed at any origin the peer
+    /// advertised — what "the witness has not advanced past the window" is
+    /// asserted against.
+    ///
+    /// Origins the peer never named are excluded deliberately: merging a
+    /// colliding write mints the receiver's *own* `UniqueViolation` entry
+    /// (ADR-029), stamped now, and that stamp is the receiver's business
+    /// rather than anything the peer's window claimed.
+    fn witnessed_of(into: &Engine, theirs: &VersionVector) -> Hlc {
+        let mine = into.witnessed_vector().unwrap();
+        theirs.iter().map(|(node, _)| mine.get(node)).max().unwrap_or(Hlc::ZERO)
+    }
+
+    /// A stamp just above everything `engine` holds.
+    ///
+    /// An injected entry has to sort *after* the collection it belongs to, or
+    /// a peer reads it before it has the collection and counts it as an
+    /// unknown one instead of applying it — which would make a document go
+    /// missing for a reason that has nothing to do with what is under test.
+    fn just_above(engine: &Engine) -> Hlc {
+        let head =
+            engine.version_vector().unwrap().iter().map(|(_, hlc)| hlc).max().unwrap_or(Hlc::ZERO);
+        Hlc::new(head.wall_ms + 1, 0)
     }
 
     #[test]
-    fn a_full_batch_proves_every_origin_up_to_its_last_stamp() {
+    fn an_exhausted_window_proves_the_whole_advertised_vector() {
+        let mut theirs = VersionVector::new();
+        let origin = kimmy_core::NodeId::generate();
+        theirs.insert(origin, Hlc::new(5_000, 0));
+        assert_eq!(coverage_after_batch(&theirs, Hlc::new(1_000, 0), true), theirs);
+        assert_eq!(coverage_after_batch(&theirs, Hlc::ZERO, true), theirs, "an empty tail too");
+    }
+
+    #[test]
+    fn a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached() {
         // Three advertised origins: one whose coverage ends before the window
         // does, one inside it, one beyond. Only the last is clipped.
         let early = kimmy_core::NodeId::generate();
@@ -1045,19 +1123,35 @@ mod tests {
         theirs.insert(early, Hlc::new(1_000, 0));
         theirs.insert(inside, Hlc::new(2_500, 0));
         theirs.insert(beyond, Hlc::new(9_000, 0));
-        // A full batch of two, ending at 3_000 — from an origin that is not
-        // even advertised, which must make no difference.
         let stranger = kimmy_core::NodeId::generate();
-        let entries = vec![
-            entry_from(stranger, Hlc::new(2_000, 0)),
-            entry_from(stranger, Hlc::new(3_000, 0)),
-        ];
 
-        let covered = coverage_after_batch(&theirs, &entries, 2);
+        // A window the peer stopped scanning at 3_000 because its batch filled.
+        let covered = coverage_after_batch(&theirs, Hlc::new(3_000, 0), false);
         assert_eq!(covered.get(early), Hlc::new(1_000, 0), "never past what the peer holds");
         assert_eq!(covered.get(inside), Hlc::new(2_500, 0));
         assert_eq!(covered.get(beyond), Hlc::new(3_000, 0), "clipped to the window end");
         assert_eq!(covered.get(stranger), Hlc::ZERO, "an unadvertised origin is not claimed");
+    }
+
+    #[test]
+    fn a_window_short_of_the_tail_claims_only_what_it_scanned() {
+        // A window whose end lies far below what the peer advertises. Reading
+        // that as "the whole tail" — which counting entries did, for any batch
+        // under the limit — is finding 14 in one line, so the rule takes the
+        // peer's stated end instead (ADR-127).
+        //
+        // This is the rule as a pure function, given what it is told. What a
+        // *batch* is allowed to tell it is a separate question, decided in
+        // `apply_peer_batch` and pinned by
+        // `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
+        // `a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
+        let origin = kimmy_core::NodeId::generate();
+        let mut theirs = VersionVector::new();
+        theirs.insert(origin, Hlc::new(9_000, 0));
+
+        let covered = coverage_after_batch(&theirs, Hlc::new(2_000, 0), false);
+        assert_eq!(covered.get(origin), Hlc::new(2_000, 0));
+        assert_ne!(covered, theirs, "an empty batch must not absorb the peer's vector");
     }
 
     fn entry_from(node: kimmy_core::NodeId, hlc: Hlc) -> OplogEntry {
@@ -1082,9 +1176,12 @@ mod tests {
         // every window served from that floor is full of entries B has seen,
         // and the violation that would end the window sits beyond it.
         //
-        // The order matters: a violation *inside* the raw window shortens the
-        // batch (the limit is applied before the filter) and the short-batch
-        // cure fires. The pin needs the unshippable stamp past a full window.
+        // The order matters for the *shape* of the reproduction, not for the
+        // rule any more: the pin needs the unshippable stamp past a window the
+        // batch limit truncates. A violation inside the window no longer
+        // shortens the batch — the cap is spent after the filter (ADR-126) —
+        // and the window's end is the peer's own report rather than a
+        // deduction from the count (ADR-127).
         const LIMIT: usize = 8;
         const DOCS: usize = 3 * LIMIT + 1;
 
@@ -1129,7 +1226,7 @@ mod tests {
         assert_eq!(a.unique_violations(), 1);
         let a_adv = a.version_vector().unwrap();
         assert!(a_adv.get(a.node_id()) > c.version_vector().unwrap().get(c.node_id()));
-        let shippable = a.entries_for_peer(floor, usize::MAX).unwrap();
+        let shippable = a.entries_for_peer(floor, usize::MAX).unwrap().entries;
         assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
 
         // B trails A, and the floor it would resume from is under all of it.
@@ -1161,6 +1258,432 @@ mod tests {
         // rejected (ADR-029), so it is a document on every node.
         let cb = b.get_collection("shop", "orders").unwrap();
         assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2);
+    }
+
+    /// A peer holding a withheld `UniqueViolation` near the head of its oplog,
+    /// with `docs` ordinary documents behind it: finding 14's preconditions,
+    /// at engine scale.
+    ///
+    /// The oplog it leaves, in stamp order, is the merged colliding write, the
+    /// collection, the index, the local document, **the violation**, and then
+    /// the documents — so a window of eight or so entries read from the start
+    /// contains the violation and is still truncated by the cap.
+    fn peer_with_a_violation_in_its_first_window(a: &Engine, docs: usize) -> CollectionMeta {
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+
+        // A merged write that collides on the unique index. It is applied like
+        // any other — a violation is reported, not refused — and this node
+        // mints its own `UniqueViolation` entry for it, which it will never
+        // ship to a peer (ADR-029).
+        let clash = OplogEntry {
+            stamp: kimmy_core::Stamp::new(just_above(a), kimmy_core::NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: ca.id,
+            doc_id: Some(DocId::String("remote".into())),
+            body: Some(
+                bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
+            ),
+        };
+        a.apply_remote(&ca, &clash).unwrap();
+        assert_eq!(a.unique_violations(), 1, "the collision must have been recorded");
+
+        for i in 0..docs {
+            a.insert(&ca, doc! { "_id": format!("d{i}"), "email": format!("{i}@d") }).unwrap();
+        }
+        ca
+    }
+
+    #[test]
+    fn a_withheld_violation_does_not_make_a_truncated_window_look_like_a_tail() {
+        // Finding 14, at its smallest. The peer holds more than one window of
+        // shippable entries and a withheld violation inside the first one.
+        //
+        // Spending the cap on entries that are then dropped made that first
+        // window return `limit - 1`, and a batch shorter than the limit was
+        // read as "the peer's whole tail" — so the receiver absorbed the
+        // peer's entire vector, witnessing every entry behind the window
+        // without applying one of them, and nothing ever re-served them.
+        // Nothing errored, so no counter moved and no line was logged.
+        const LIMIT: usize = 8;
+        const DOCS: usize = 20;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = peer_with_a_violation_in_its_first_window(&a, DOCS);
+        let theirs = a.version_vector().unwrap();
+
+        // The first window, truncated at the cap.
+        let (_, window) = round_window(&b, &a, LIMIT);
+        assert_eq!(
+            window.entries.len(),
+            LIMIT,
+            "the cap must be spent on entries that ship, not on one that is withheld"
+        );
+        assert!(!window.exhausted, "the peer's oplog is nowhere near its end");
+        let delivered = window.entries.last().unwrap().stamp.hlc;
+
+        assert!(
+            witnessed_of(&b, &theirs) <= delivered,
+            "the witness must not advance past the last stamp the window delivered"
+        );
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&theirs),
+            "and the peer's tail must still be outstanding"
+        );
+
+        // The remainder arrives on the rounds that follow.
+        let budget = (DOCS / LIMIT) + 4;
+        for _ in 0..budget {
+            round(&b, &a, LIMIT);
+        }
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "B never caught up with A in {budget} rounds"
+        );
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(
+            b.count(&cb).unwrap() as usize,
+            DOCS + 2,
+            "every document, the local one and the merged collision included"
+        );
+        assert_eq!(a.count(&ca).unwrap(), b.count(&cb).unwrap(), "and the members agree");
+    }
+
+    #[test]
+    fn a_collection_created_inside_a_truncated_window_reaches_every_member() {
+        // The end-to-end shape of finding 14 as it was observed: a collection
+        // created on a member its peers were more than one batch behind, with
+        // a violation already in the window. It existed on its origin holding
+        // documents and answered 404 on the other two members forty-five
+        // minutes later, which never list it — replication healthy throughout,
+        // lag 0, every sync counter unmoved.
+        const LIMIT: usize = 8;
+        const DOCS: usize = 20;
+        const LATE: usize = 3;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        peer_with_a_violation_in_its_first_window(&a, DOCS);
+
+        // Created while the peer is behind by more than one window, so the
+        // entry lands in the remainder the receiver used to witness away.
+        let late = a.create_collection("shop", "late").unwrap();
+        for i in 0..LATE {
+            a.insert(&late, doc! { "_id": format!("n{i}") }).unwrap();
+        }
+
+        let budget = ((DOCS + LATE) / LIMIT) + 6;
+        for _ in 0..budget {
+            round(&b, &a, LIMIT);
+        }
+
+        let on_b = b
+            .get_collection("shop", "late")
+            .expect("the collection created behind the window must exist on the peer");
+        assert_eq!(on_b.id, late.id, "and address the same storage");
+        assert_eq!(b.count(&on_b).unwrap() as usize, LATE, "with the documents written into it");
+        assert!(
+            b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()),
+            "and the round has converged rather than merely got lucky"
+        );
+    }
+
+    #[test]
+    fn a_violation_stamp_does_not_pin_behind_for_ever() {
+        // ADR-082's guard, kept honest. The fix above must not be reached by
+        // reverting to "absorb only what was delivered": a stamp the peer
+        // advertises and can never ship — its own `UniqueViolation` (ADR-029)
+        // — would then pin `VersionVector::behind` at that origin's floor, and
+        // once a full window of other entries sits after that floor every
+        // round re-serves the same already-witnessed window for the life of
+        // the cluster. Observed as `applied=0, superseded=1021` every five
+        // seconds, with the lag gauge reading the cluster's age.
+        //
+        // Converging is necessary but not sufficient to show the cure is
+        // there, and on its own it does not discriminate: once the scan
+        // reaches the violation at the oplog's head, `scanned_to` is the
+        // peer's newest stamp, so clipping each origin to it happens to give
+        // the same answer as absorbing the peer's vector. The two rules only
+        // differ where the peer advertises an origin **above** its own oplog
+        // head, which is not a hypothetical — a snapshot grants coverage for
+        // entries the node will never hold (ADR-036), and retention collects
+        // the log out from under a vector that persists (ADR-097). The last
+        // stage below puts the converged round's own window against exactly
+        // that vector.
+        const LIMIT: usize = 8;
+        const DOCS: usize = 3 * LIMIT + 1;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "local", "email": "clash@x" }).unwrap();
+        for i in 0..DOCS {
+            a.insert(&ca, doc! { "_id": format!("d{i}"), "email": format!("{i}@d") }).unwrap();
+        }
+
+        // A's newest own stamp: minted now, so it sits after every entry above
+        // and more than one window of shippable entries lies under it.
+        let clash = OplogEntry {
+            stamp: kimmy_core::Stamp::new(just_above(&a), kimmy_core::NodeId::generate()),
+            kind: OpKind::Insert,
+            collection: ca.id,
+            doc_id: Some(DocId::String("remote".into())),
+            body: Some(
+                bson::serialize_to_vec(&doc! { "_id": "remote", "email": "clash@x" }).unwrap(),
+            ),
+        };
+        a.apply_remote(&ca, &clash).unwrap();
+        assert_eq!(a.unique_violations(), 1);
+
+        let pinning = a.version_vector().unwrap().get(a.node_id());
+        let shippable = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap().entries;
+        assert!(shippable.len() > LIMIT, "more than one full window lies under the violation");
+        assert!(
+            shippable.iter().all(|e| e.stamp.hlc < pinning),
+            "the stamp that pins is the one A never ships"
+        );
+
+        let budget = DOCS / LIMIT + 6;
+        let mut rounds = 0;
+        let mut last = OplogWindow::default();
+        while rounds < budget {
+            rounds += 1;
+            last = round_window(&b, &a, LIMIT).1;
+            if b.witnessed_vector().unwrap().covers(&a.version_vector().unwrap()) {
+                break;
+            }
+        }
+
+        assert_eq!(
+            b.witnessed_vector().unwrap().get(a.node_id()),
+            pinning,
+            "B must absorb the advertised stamp it can never be sent, or it asks for ever"
+        );
+        assert_eq!(
+            round(&b, &a, LIMIT),
+            SyncOutcome::default(),
+            "a further round transfers nothing"
+        );
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS + 2, "and nothing was lost getting there");
+
+        // The discriminating half. The round that finished the catch-up ran
+        // off the end of A's oplog, and *that* is what proves coverage of
+        // everything A advertised — not the stamp the scan happened to stop
+        // on. Put the same window against a peer advertising an origin above
+        // its own log, the shape a snapshot or a retention pass leaves behind:
+        // absorbing answers `granted`, and clipping to the window's end
+        // answers `w.scanned_to`, which would pin `behind` at that origin's
+        // floor for ever — the livelock ADR-082 exists to prevent.
+        assert!(last.exhausted, "the round that caught B up must have reached A's tail");
+        let mut advertised = a.version_vector().unwrap();
+        let granted = kimmy_core::NodeId::generate();
+        let beyond = Hlc::new(last.scanned_to.wall_ms + 60_000, 0);
+        advertised.insert(granted, beyond);
+        assert!(beyond > last.scanned_to, "only above the window's end do the two rules differ");
+
+        let covered = coverage_after_batch(&advertised, last.scanned_to, last.exhausted);
+        assert_eq!(
+            covered.get(granted),
+            beyond,
+            "an exhausted window proves every origin the peer advertised, including one \
+             whose entries are not in its oplog at all"
+        );
+        assert_ne!(
+            covered.get(granted),
+            last.scanned_to,
+            "clipping to the window's end instead would leave that origin pinned"
+        );
+    }
+
+    #[test]
+    fn a_peer_that_over_reports_its_window_claims_only_what_it_sent() {
+        // ADR-127 moved the window's end from something this node computes to
+        // something the peer asserts, and nothing on the wire is checked by
+        // being written down. A sender that trimmed a batch in place — the
+        // temptation the `Fits::Only` path creates — while reporting the end
+        // it had scanned to would hand the receiver finding 14 from one wrong
+        // field: the entries it dropped witnessed away, `behind` reporting
+        // nothing missing, and no round ever asking again.
+        const DOCS: usize = 20;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..DOCS {
+            a.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+        }
+
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        assert!(whole.exhausted);
+        let head = whole.scanned_to;
+
+        // Three entries — the collection and two documents — served with the
+        // oplog's head as the window's end.
+        let trimmed = &whole.entries[..3];
+        b.apply_peer_batch(&theirs, trimmed, head, false).unwrap();
+
+        let cb = b.get_collection("shop", "orders").expect("the creation was in the three");
+        assert_eq!(b.count(&cb).unwrap(), 2, "only two documents were actually sent");
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&theirs),
+            "so the peer's tail must still be outstanding, whatever the peer claimed"
+        );
+        assert_eq!(
+            witnessed_of(&b, &theirs),
+            trimmed.last().unwrap().stamp.hlc,
+            "the window is worth exactly what it carried"
+        );
+
+        // And the rest is still served, which is the point of refusing the claim.
+        let budget = DOCS + 2;
+        for _ in 0..budget {
+            round(&b, &a, 8);
+        }
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "every document arrives on a later round");
+    }
+
+    #[test]
+    fn a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing() {
+        // The worse half of the same hole, and the one the exemption used to
+        // let through: a peer that hands over *no* entries while naming a
+        // window end absorbs the receiver's whole view of it in exchange for
+        // nothing, and no later round asks again.
+        //
+        // A correct sender cannot produce this. `read_oplog_from_where` stops
+        // only after keeping an entry, so a window that is not exhausted holds
+        // exactly `limit` entries — never zero. So the state is always a
+        // broken or hostile peer, which is the argument for clamping it rather
+        // than for trusting it.
+        const DOCS: usize = 20;
+
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        for i in 0..DOCS {
+            a.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+        }
+
+        let theirs = a.version_vector().unwrap();
+        let whole = a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap();
+        assert!(whole.exhausted);
+
+        let outcome = b.apply_peer_batch(&theirs, &[], whole.scanned_to, false).unwrap();
+
+        assert_eq!(outcome, SyncOutcome::default(), "nothing was applied, because nothing came");
+        assert_eq!(witnessed_of(&b, &theirs), Hlc::ZERO, "and nothing may be claimed for it");
+        assert!(
+            !b.witnessed_vector().unwrap().covers(&theirs),
+            "the peer's whole vector must not be absorbed in exchange for an empty batch"
+        );
+        assert!(b.get_collection("shop", "orders").is_err(), "nothing arrived to create it");
+
+        // Still fully servable afterwards, which is the property being bought.
+        let budget = DOCS + 2;
+        for _ in 0..budget {
+            round(&b, &a, 8);
+        }
+        let cb = b.get_collection("shop", "orders").expect("a later round creates it");
+        assert_eq!(b.count(&cb).unwrap() as usize, DOCS, "and every document arrives");
+    }
+
+    mod props {
+        use proptest::prelude::*;
+
+        use super::*;
+
+        proptest! {
+            // Each case builds two real engines and runs a round per window,
+            // so the count is modest; the deterministic tests above carry the
+            // named shapes.
+            #![proptest_config(ProptestConfig::with_cases(16))]
+
+            /// However a peer's oplog mixes shippable entries with withheld
+            /// ones, and whatever the batch limit, a window that did **not**
+            /// exhaust the peer's oplog must never leave the receiver
+            /// witnessing a stamp past the last one it was actually handed.
+            ///
+            /// That is the invariant finding 14 broke, stated without
+            /// reference to how many entries happened to arrive — which is
+            /// the whole point of ADR-127.
+            #[test]
+            fn a_window_that_is_not_a_tail_never_witnesses_past_what_it_delivered(
+                collides in prop::collection::vec(any::<bool>(), 1..24),
+                limit in 2usize..9,
+            ) {
+                let (a, _da) = engine();
+                let (b, _db) = engine();
+                a.create_collection("shop", "orders").unwrap();
+                a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+                let ca = a.get_collection("shop", "orders").unwrap();
+                a.insert(&ca, doc! { "_id": "seed", "email": "clash@x" }).unwrap();
+
+                // `true` merges a colliding write, which appends the write and
+                // then this node's withheld violation entry after it; `false`
+                // is an ordinary local insert. So the withheld entries land
+                // wherever the generator put them.
+                let origin = kimmy_core::NodeId::generate();
+                for (i, collides) in collides.iter().enumerate() {
+                    if *collides {
+                        let id = format!("r{i}");
+                        let entry = OplogEntry {
+                            stamp: kimmy_core::Stamp::new(just_above(&a), origin),
+                            kind: OpKind::Insert,
+                            collection: ca.id,
+                            doc_id: Some(DocId::String(id.clone())),
+                            body: Some(
+                                bson::serialize_to_vec(
+                                    &doc! { "_id": id, "email": "clash@x" },
+                                )
+                                .unwrap(),
+                            ),
+                        };
+                        a.apply_batch(&[entry]).unwrap();
+                    } else {
+                        a.insert(&ca, doc! { "_id": format!("l{i}"), "email": format!("{i}@l") })
+                            .unwrap();
+                    }
+                }
+
+                // A is quiet from here, so the vector it advertises is fixed
+                // for every round below.
+                let theirs = a.version_vector().unwrap();
+                let budget = collides.len() * 2 + 8;
+                let mut rounds = 0;
+                while b.witnessed_vector().unwrap().behind(&theirs).is_some() {
+                    rounds += 1;
+                    prop_assert!(rounds <= budget, "B never converged in {budget} rounds");
+
+                    let (_, window) = round_window(&b, &a, limit);
+                    if window.exhausted {
+                        continue;
+                    }
+                    let delivered = window
+                        .entries
+                        .last()
+                        .expect("a window that stopped at the cap shipped entries")
+                        .stamp
+                        .hlc;
+                    prop_assert!(
+                        witnessed_of(&b, &theirs) <= delivered,
+                        "witnessed past the window: {:?} > {:?}",
+                        witnessed_of(&b, &theirs),
+                        delivered,
+                    );
+                }
+
+                // And the point of the invariant: nothing was witnessed away.
+                let cb = b.get_collection("shop", "orders").unwrap();
+                prop_assert_eq!(b.count(&cb).unwrap(), a.count(&ca).unwrap());
+            }
+        }
     }
 
     #[test]
@@ -1249,7 +1772,7 @@ mod tests {
         a.insert(&coll_a, doc! { "_id": 1, "v": "from-a" }).unwrap();
         b.insert(&coll_b, doc! { "_id": 1, "v": "from-b" }).unwrap();
 
-        let losing = a.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        let losing = a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
         let outcome = b.apply_batch(&losing).unwrap();
         assert_eq!(outcome.applied, 0, "A's write must lose");
         assert!(outcome.superseded > 0);
@@ -1297,7 +1820,7 @@ mod tests {
         let (b, _db) = engine();
         a.create_collection("db", "c").unwrap();
 
-        let ddl = a.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        let ddl = a.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
         assert!(!ddl.is_empty(), "creating a collection logs an entry");
         let outcome = b.apply_batch(&ddl).unwrap();
         assert!(outcome.ddl > 0);
@@ -1543,7 +2066,7 @@ mod tests {
         a.apply_remote(&ca, &entry).unwrap();
         assert_eq!(a.unique_violations(), 1, "the collision must have been recorded");
 
-        let outgoing = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let outgoing = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
         assert!(
             outgoing.iter().all(|e| e.kind != OpKind::UniqueViolation),
             "a violation entry must not be replicated"
@@ -1591,13 +2114,15 @@ mod tests {
         let entries: Vec<_> = a
             .entries_for_peer(Hlc::ZERO, BATCH)
             .unwrap()
+            .entries
             .into_iter()
             .filter(|e| e.kind.is_document())
             .collect();
         assert_eq!(entries.len(), N);
 
         let (commits, fsyncs) = (b.commits(), b.fsyncs());
-        let outcome = b.apply_peer_batch(&theirs, &entries, BATCH).unwrap();
+        let end = entries.last().unwrap().stamp.hlc;
+        let outcome = b.apply_peer_batch(&theirs, &entries, end, true).unwrap();
         assert_eq!(outcome.applied, N);
         assert_eq!(
             b.commits() - commits,
@@ -1633,6 +2158,7 @@ mod tests {
         let entries: Vec<_> = a
             .entries_for_peer(Hlc::ZERO, BATCH)
             .unwrap()
+            .entries
             .into_iter()
             .filter(|e| e.kind.is_document() || e.collection == items_a.id)
             .collect();
@@ -1684,6 +2210,7 @@ mod tests {
         let entries: Vec<_> = a
             .entries_for_peer(Hlc::ZERO, BATCH)
             .unwrap()
+            .entries
             .into_iter()
             .filter(|e| e.kind.is_document())
             .collect();
@@ -1897,7 +2424,7 @@ mod tests {
         let ca = a.get_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
         let first = b.apply_batch(&history).unwrap();
         assert_eq!(first.ddl_refused, 0, "nothing to refuse the first time: {first:?}");
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -1927,7 +2454,7 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         two_array_index(&a);
         a.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
-        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
 
         b.apply_batch(&only(&history, &[OpKind::CreateCollection, OpKind::DropIndex])).unwrap();
         let cb = b.get_collection("shop", "orders").unwrap();
@@ -2107,7 +2634,7 @@ mod tests {
         a.create_collection("shop", "orders").unwrap();
         a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
 
-        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap();
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
         b.apply_batch(&entries).unwrap();
         b.apply_batch(&entries).unwrap();
 
@@ -2295,10 +2822,10 @@ mod tests {
         // Re-deliver A's whole history to B, and B's whole history to A,
         // twice: the old drop rides along both times.
         for _ in 0..2 {
-            let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+            let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
             assert!(everything.iter().any(|e| e.kind == OpKind::DropCollection));
             b.apply_batch(&everything).unwrap();
-            let everything = b.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+            let everything = b.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
             a.apply_batch(&everything).unwrap();
         }
 
@@ -2319,7 +2846,7 @@ mod tests {
         let recreated = a.create_collection("shop", "orders").unwrap();
         a.insert(&recreated, doc! { "_id": "kept" }).unwrap();
 
-        let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap();
+        let everything = a.entries_for_peer(Hlc::new(0, 0), BATCH).unwrap().entries;
         let old_drop =
             everything.iter().find(|e| e.kind == OpKind::DropCollection).cloned().unwrap();
         let after_the_drop: Vec<_> =

@@ -220,6 +220,20 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > ownership of a share of the webhook subscriptions it could not deliver. Roll
 > the secret with the cluster stopped, not one node at a time.
 
+> **Upgrading a cluster to a version whose batch answer reports the window's
+> end.** Replication's `Entries` message gained `scanned_to` and `exhausted`
+> and changed shape to carry them ([ADR-127](decisions.md)), so a node of the
+> new version and one of the old fail each other's sync rounds as a malformed
+> frame. Unlike the three above, this needs **no** stop: membership, failure
+> detection and webhook ownership are untouched, so roll the members one at a
+> time as usual. What to expect while the roll is in progress is
+> `kimmy_sync_failures_total` rising on both sides of every not-yet-matched
+> pair and `kimmy_sync_peers_backing_off` above zero; both settle once the
+> last member is rolled, and anti-entropy then reconciles everything written
+> during the window. Finish the roll well inside `storage.oplog_retention_secs`
+> — a member left behind longer than retention falls past the horizon and pays
+> for a snapshot instead.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback

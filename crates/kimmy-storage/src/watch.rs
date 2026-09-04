@@ -328,20 +328,72 @@ impl Engine {
     /// origin stamps. Change streams use [`Self::read_arrival_from`] instead —
     /// see [`tables::OPLOG_ARRIVAL`] for why the two differ.
     pub fn read_oplog_from(&self, from: Hlc, limit: usize) -> Result<Vec<OplogEntry>> {
+        Ok(self.read_oplog_from_where(from, limit, |_| true)?.entries)
+    }
+
+    /// [`Self::read_oplog_from`], counting only the entries `keep` retains
+    /// towards `limit`, and reporting where the scan stopped.
+    ///
+    /// **The cap is spent on what is actually returned.** Reading `limit`
+    /// entries and filtering afterwards makes a window that was *truncated* at
+    /// the cap indistinguishable from one that ran off the end of the oplog,
+    /// and the receiver's coverage rule reads the difference as "I have the
+    /// peer's whole tail" — so it witnesses everything past the window without
+    /// ever being sent it. Counting after the predicate removes the ambiguity
+    /// at its source (ADR-126). The scan may read past `limit` raw entries to
+    /// fill the window; the excess is exactly the entries `keep` rejects, on a
+    /// range read that was happening anyway.
+    ///
+    /// `scanned_to` and `exhausted` say the same thing directly rather than by
+    /// inference, which is what the coverage rule now runs on (ADR-127).
+    pub fn read_oplog_from_where(
+        &self,
+        from: Hlc,
+        limit: usize,
+        keep: impl Fn(&OplogEntry) -> bool,
+    ) -> Result<OplogWindow> {
         let txn = self.db().begin_read()?;
         let oplog = txn.open_table(tables::OPLOG)?;
         let lower = codec::oplog_key_lower_bound(from);
 
-        let mut out = Vec::new();
+        // Exhausted until something stops the scan short: an empty range is the
+        // end of the oplog as much as a range that runs out is.
+        let mut window = OplogWindow { exhausted: true, ..OplogWindow::default() };
         for entry in oplog.range(lower.as_slice()..)? {
             let (_, value) = entry?;
-            out.push(codec::decode_oplog_entry(value.value())?);
-            if out.len() >= limit {
-                break;
+            let entry = codec::decode_oplog_entry(value.value())?;
+            // Every entry the scan *examines* moves the window's end, kept or
+            // not: the peer has read past it either way, and a stamp it will
+            // never ship must not be able to hold the window open.
+            window.scanned_to = entry.stamp.hlc;
+            if keep(&entry) {
+                window.entries.push(entry);
+                if window.entries.len() >= limit {
+                    window.exhausted = false;
+                    break;
+                }
             }
         }
-        Ok(out)
+        Ok(window)
     }
+}
+
+/// One window of the oplog, read from a starting stamp: what the caller keeps,
+/// how far the scan reached, and whether it ran out of oplog or out of budget.
+///
+/// The last two are facts the *reading* side knows exactly and the receiving
+/// side used to guess at from the number of entries that arrived. See
+/// [`crate::sync::coverage_after_batch`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OplogWindow {
+    /// The entries the predicate retained, in stamp order.
+    pub entries: Vec<OplogEntry>,
+    /// The stamp of the last entry the scan examined — retained or skipped —
+    /// or `Hlc::ZERO` when it examined none.
+    pub scanned_to: Hlc,
+    /// Whether the scan reached the end of the oplog rather than stopping
+    /// because the window was full.
+    pub exhausted: bool,
 }
 
 /// A gap-free stream of changes.
@@ -575,6 +627,42 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), all.len(), "each reason needs its own name");
+    }
+
+    #[test]
+    fn a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept() {
+        // `scanned_to` counts entries the predicate rejects. That is the whole
+        // reason it is a separate fact from "the last entry returned": a stamp
+        // this node holds and will never ship — a `UniqueViolation` (ADR-029)
+        // — must not be able to hold the window open, or it pins the reader's
+        // `behind` at that origin's floor for ever (ADR-082, ADR-127).
+        //
+        // Only visible when the rejected entry is the *last* one read. While
+        // the scan stops on a kept entry the two coincide, which is why this
+        // needs a test of its own rather than falling out of the sync suite.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2 }).unwrap();
+        let tail = engine.read_oplog_from(Hlc::ZERO, 100).unwrap();
+        let last = tail.last().expect("the oplog holds entries").stamp;
+
+        let window =
+            engine.read_oplog_from_where(Hlc::ZERO, 100, |entry| entry.stamp != last).unwrap();
+
+        assert!(window.exhausted, "the scan ran to the end of the oplog");
+        assert!(
+            !window.entries.iter().any(|e| e.stamp == last),
+            "the predicate withheld the last entry"
+        );
+        assert_eq!(window.entries.len(), tail.len() - 1);
+        assert_eq!(
+            window.scanned_to, last.hlc,
+            "the window still ends where the scan read to, not where it last kept something"
+        );
+        assert!(
+            window.scanned_to > window.entries.last().unwrap().stamp.hlc,
+            "which is strictly past the last entry delivered"
+        );
     }
 
     /// Collect the next `n` *document* changes, failing rather than hanging.
