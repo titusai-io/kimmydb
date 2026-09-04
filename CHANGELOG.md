@@ -34,16 +34,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   line on the members that lost the data. Observed on a three-member cluster
   running 0.21.0: two collections held documents on the member that created
   them and answered `404` on both peers forty-five minutes later, and a full
-  `_id` comparison found one collection missing 500 contiguous ids on one
-  member and a different 517 on another — the shape of one bulk insert each.
-  The preconditions are ordinary: a member more than one batch behind, and one
-  cross-member unique collision anywhere inside the window.
+  `_id` comparison found a 2,018-document collection holding 1,518 on one
+  member and 1,501 on another — a contiguous run of 500 ids missing from both,
+  plus a further 17 missing from the second. One bulk insert, discarded from
+  the window remainder by both pullers. The preconditions are ordinary: a
+  member more than one batch behind, and one cross-member unique collision
+  anywhere inside the window.
 
   **If you have been running a cluster under load with unique indexes, assume
   members may already disagree.** This release stops the divergence; it does not
   repair one that has already happened. Compare collection lists and document
   counts across members directly — lag 0 and quiet counters are precisely this
-  defect's signature, not evidence of convergence. ADR-126, ADR-127.
+  defect's signature, not evidence of convergence. Expect the losses to
+  **overlap** rather than be disjoint: one lost window on an origin is missing
+  from every member that was behind it, so a member-by-member count is not the
+  sum of what went missing, and repairing from a member that has one run does
+  not tell you the others are whole. Compare `_id` sets, not counts alone.
+  ADR-126, ADR-127.
 
 ### Changed
 

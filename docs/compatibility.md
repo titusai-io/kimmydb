@@ -132,6 +132,19 @@ The client protocol deliberately has the opposite property, and the contrast is
 the point: the internal wire is optimized for size and changed under an outage
 window; the client wire is optimized for not breaking anyone.
 
+**Replication frames are not SWIM datagrams, and break differently.** The
+replication protocol is BSON, which *is* self-describing, so a changed message
+shape is a decode error on arrival rather than a value misread as something
+else. The first such break — `Message::Entries` carrying where the sender's
+window ended ([ADR-127](decisions.md)) — is therefore the first cluster-wire
+change that is safe to **roll**: mixed members fail each other's sync rounds
+loudly, `kimmy_sync_failures_total` rises on both sides, membership and failure
+detection are untouched, and anti-entropy reconciles when the roll finishes.
+Loud failure is the property being bought here, and it is the reason this one
+does not join the stop-the-cluster list; a wire that failed quietly would not
+have earned it. Finish inside `storage.oplog_retention_secs` — see
+[Operations](operations.md).
+
 ---
 
 ## Release versioning — what the build number promises
