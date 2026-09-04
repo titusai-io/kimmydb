@@ -7504,10 +7504,12 @@ defect 5 below). No document or collection name appears in the metric — the
 gauge is a bare count, holding `/metrics`' standing property that a name
 never crosses that boundary.
 
-This ADR went through two rounds of review. The first found four defects in
-the first cut, three of them gauge-defeating; the second, re-running every
-probe against the fix rather than reading an account of it, found a fifth in
-exactly the half the first round's fixes did not touch. What follows is the
+This ADR went through three rounds of review, each re-running every probe
+against the fix rather than reading an account of it. The first found four
+defects in the first cut, three of them gauge-defeating; the second found a
+fifth in exactly the half the first round's fixes did not touch; the third
+found a sixth in exactly the case the second round's fix did not sweep for.
+What follows is the
 corrected design; the defects and the reasoning behind each fix are recorded
 under their own headings because each is a decision worth being able to find
 again, not just a bug that got fixed.
@@ -7586,6 +7588,19 @@ indistinguishable from an unremarkable one. `sync_once` treats it as a
 malformed round instead — the same failure class `expected Entries, got
 ...` already is — so it surfaces in `kimmy_sync_failures_total`, not as a
 silent skip and not as a clean reading.
+
+The counter alone is not the whole answer, though: the generic per-peer
+failure debounce that decides whether a round failure is worth a `warn!`
+line can route this occurrence's first sighting to `debug` if the same peer
+already had an unrelated failure recently, leaving a bare counter increment
+with nothing explaining it — for a condition whose entire premise is that it
+should never happen at all. `sync_once` logs it at `warn!`, unconditionally,
+at the point of detection, rather than leaving it to that debounce. The
+predicate this depends on — `entries.is_empty() && !exhausted` — is a named,
+tested function (`is_unreachable_from_a_correct_sender`) rather than an
+inline condition, specifically because the shortcut `!exhausted` reads as
+equivalent and is not: it would refuse every ordinary capped pull on a busy
+cluster, the common case this state must be kept apart from.
 
 **Defect 2: a peer merely behind was flagged, and the two-contact
 confirmation does not filter it out.** The gate above protects this node's
@@ -7739,6 +7754,49 @@ drives the real `advance_probe` against the real tracker, and `peers.rs`'s
 `a_count_divergence_confirms_through_the_real_loop_despite_other_collections`,
 which reproduces the original P6 probe end to end against the real
 `replicate()` loop with four collections in rotation.
+
+**Defect 6: a confirmed count finding against a since-dropped collection
+never clears.** A third round of review, verifying the defect 5 fix rather
+than reading the account of it, found the one case its own design left
+uncovered: drop the divergent collection, and the gauge stays at its
+confirmed value for the rest of the process, a hundred clean ticks later. The
+cause is a straightforward asymmetry, not a new mechanism. `observe`'s
+existence half is recomputed from a fresh `existence` set on every contact —
+`confirmed_for_peer.retain(|id| existence.contains(id))` — so a collection
+absent from that set is dropped immediately, no matter why it is absent. The
+count half has no equivalent: it only ever mutates inside `if let Some((id,
+mismatched)) = count`, so once `advance_probe` stops naming a dropped
+collection, nothing ever touches its `count_pending` or `count_confirmed`
+entry again — not a peer going quiet, which is genuine silence the design
+deliberately does not read as reconciliation, but a fact this node already
+knows for certain, in the same set `advance_probe` is handed fresh every
+tick.
+
+This mattered more than its size suggested, because the realistic trigger is
+an operator following the gauge's own advice: it fires, they investigate,
+they remediate the way `operations.md` says to — reset or recreate the
+collection — and the alert they just resolved never goes out. Both this ADR
+and `operations.md` promise the opposite in as many words: *"a resolved
+divergence stops moving it rather than leaving a permanent scar."* An alert
+that cannot be cleared by fixing the thing it reported is the one an
+operator disables, which is precisely the argument defect 2's fix already
+made at length.
+
+**Fix: `advance_probe` sweeps both count structures against `mine` before
+choosing the next probe.** It already receives the full, current set of
+collections this node holds on every call; a collection missing from that
+set is provably gone, not merely unheard from, so `count_pending` and
+`count_confirmed` are filtered against it unconditionally, every tick,
+regardless of whether that tick's probe lands on the affected collection at
+all. The same sweep closes a second, subtler case: `CollectionId` is derived
+from `(db, name)`, so a drop followed by a recreation of the same name
+reuses the identical id, and without the sweep a *pending* (not yet
+confirmed) mismatch against the old incarnation could combine with one
+mismatched probe of the new incarnation to falsely confirm on what is really
+each incarnation's first sighting.
+
+Pinned by `divergence.rs`'s `a_confirmed_count_divergence_clears_when_its_collection_is_dropped`
+and `a_pending_count_mismatch_does_not_survive_a_drop_and_recreate`.
 
 **Confirmed on two consecutive checks, not one — "consecutive" meaning a
 different thing for each half, per defect 5.** The gates above already rule

@@ -246,7 +246,11 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > reaches the branch that sends `AskDivergence` does it start failing, every
 > time, against the not-yet-rolled peer. `kimmy_sync_failures_total` and
 > `kimmy_sync_peers_backing_off` are what to watch, same as above; both settle
-> once the last member is rolled.
+> once the last member is rolled. A genuinely malfunctioning peer (an empty
+> batch claiming its tail was not reached, below) fails a round the same way
+> and adds to the same counter, so during a roll a real fault could plausibly
+> be blamed on the upgrade — the `warn!` line at the point of detection is
+> what tells the two apart; a version-mismatch failure has none.
 
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
