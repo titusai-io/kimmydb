@@ -67,6 +67,12 @@ pub struct MetricsSnapshot {
     pub sync_failures: u64,
     pub sync_peers_backing_off: u64,
     pub sync_ddl_refused: u64,
+    /// Collections the cross-member divergence check currently has confirmed
+    /// (ADR-133): held by a peer and not here, or held by both with
+    /// disagreeing document counts, seen on two ticks running. Moves for a
+    /// divergence none of the three counters above can express, because
+    /// nothing about it fails a round.
+    pub sync_divergent_collections: u64,
     /// Worst runtime scheduling delay since the last scrape, microseconds.
     pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
@@ -106,6 +112,7 @@ pub struct Metrics {
     sync_failures: AtomicU64,
     sync_peers_backing_off: AtomicU64,
     sync_ddl_refused: AtomicU64,
+    sync_divergent_collections: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
@@ -153,6 +160,7 @@ impl Default for Metrics {
             sync_failures: AtomicU64::new(0),
             sync_peers_backing_off: AtomicU64::new(0),
             sync_ddl_refused: AtomicU64::new(0),
+            sync_divergent_collections: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
@@ -293,19 +301,30 @@ impl Metrics {
     }
 
     /// One sync tick of the replication loop: how many rounds failed, how
-    /// many peers are now being backed off, and how many replicated schema
-    /// changes were refused and skipped (ADR-123).
+    /// many peers are now being backed off, how many replicated schema
+    /// changes were refused and skipped (ADR-123), and how many collections
+    /// the cross-member divergence check currently has confirmed (ADR-133).
     ///
     /// Pushed after every tick, reached peers or not — unlike the lag gauge,
-    /// which a tick that reached nobody leaves alone. The two counters
-    /// accumulate; the backoff figure is a level and replaces the last one.
-    /// A rising failure count against a lag gauge that reads 0 is exactly
-    /// the shape of a replication wedge that reads as healthy everywhere
-    /// else.
-    pub fn record_sync_round(&self, failed: u64, backing_off: u64, ddl_refused: u64) {
+    /// which a tick that reached nobody leaves alone. The first and third
+    /// counters accumulate; the backoff figure and the divergence count are
+    /// each a level and replace the last one. A rising failure count against
+    /// a lag gauge that reads 0 is one shape of a replication wedge that
+    /// reads as healthy everywhere else; a divergent-collections count above
+    /// 0 against the *same* healthy reading is another, and it is the one
+    /// none of the other three can express, because nothing about it fails a
+    /// round.
+    pub fn record_sync_round(
+        &self,
+        failed: u64,
+        backing_off: u64,
+        ddl_refused: u64,
+        divergent_collections: u64,
+    ) {
         self.sync_failures.fetch_add(failed, Ordering::Relaxed);
         self.sync_peers_backing_off.store(backing_off, Ordering::Relaxed);
         self.sync_ddl_refused.fetch_add(ddl_refused, Ordering::Relaxed);
+        self.sync_divergent_collections.store(divergent_collections, Ordering::Relaxed);
     }
 
     /// How many peers this node's SWIM instance currently considers alive.
@@ -417,6 +436,7 @@ impl Metrics {
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
+            sync_divergent_collections: self.get(&self.sync_divergent_collections),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -539,6 +559,9 @@ impl Metrics {
              # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.\n\
              # TYPE kimmy_sync_ddl_refused_total counter\n\
              kimmy_sync_ddl_refused_total {sync_ddl_refused}\n\
+             # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
+             # TYPE kimmy_sync_divergent_collections gauge\n\
+             kimmy_sync_divergent_collections {sync_divergent}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
@@ -600,6 +623,7 @@ impl Metrics {
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
+            sync_divergent = self.get(&self.sync_divergent_collections),
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
             embed_docs = embed_docs,
@@ -684,11 +708,11 @@ mod tests {
         m.set_webhook_gauges(15, 16, 17);
         m.set_cluster_members(18);
         m.set_replication_lag_secs(19);
-        // Two ticks: the counters accumulate, the backoff level is replaced.
-        // A render that printed the first tick's level, or a level that
-        // accumulated, would not match.
-        m.record_sync_round(20, 99, 21);
-        m.record_sync_round(3, 24, 4);
+        // Two ticks: the counters accumulate, the backoff level and the
+        // divergence count are each replaced. A render that printed the
+        // first tick's level, or a level that accumulated, would not match.
+        m.record_sync_round(20, 99, 21, 12);
+        m.record_sync_round(3, 24, 4, 5);
         for _ in 0..20 {
             m.record_tls_reload(true);
         }
@@ -787,6 +811,9 @@ kimmy_sync_peers_backing_off 24
 # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.
 # TYPE kimmy_sync_ddl_refused_total counter
 kimmy_sync_ddl_refused_total 25
+# HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
+# TYPE kimmy_sync_divergent_collections gauge
+kimmy_sync_divergent_collections 5
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
 # TYPE kimmy_tls_reloads_total counter
 kimmy_tls_reloads_total{outcome=\"ok\"} 20
@@ -889,6 +916,7 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_sync_failures_total {}\n", s.sync_failures));
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
+        expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
             "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
@@ -959,9 +987,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 39 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // 40 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 54, "expected one sample per series: {out}");
+        assert_eq!(samples, 55, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -1046,8 +1074,8 @@ kimmy_request_duration_seconds_count 3
         let m = Metrics::default();
         m.set_replication_lag_secs(7);
         m.set_cluster_members(2);
-        m.record_sync_round(1, 1, 0);
-        m.record_sync_round(2, 0, 3);
+        m.record_sync_round(1, 1, 0, 0);
+        m.record_sync_round(2, 0, 3, 6);
         m.record_tls_reload(true);
         m.record_tls_reload(false);
         m.record_tls_reload(false);
@@ -1063,6 +1091,10 @@ kimmy_request_duration_seconds_count 3
         assert!(out.contains("kimmy_sync_failures_total 3"), "{out}");
         assert!(out.contains("kimmy_sync_peers_backing_off 0"), "{out}");
         assert!(out.contains("kimmy_sync_ddl_refused_total 3"), "{out}");
+        assert!(
+            out.contains("kimmy_sync_divergent_collections 6"),
+            "a level, not accumulated: {out}"
+        );
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"failed\"} 2"), "{out}");
         // A node that stops being able to reach its identity provider keeps

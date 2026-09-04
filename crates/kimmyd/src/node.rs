@@ -1128,6 +1128,7 @@ async fn spawn_cluster(
                         report.failed as u64,
                         report.backing_off as u64,
                         report.ddl_refused as u64,
+                        report.divergent_collections as u64,
                     );
                 }
             })),

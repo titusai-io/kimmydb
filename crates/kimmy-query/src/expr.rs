@@ -673,12 +673,7 @@ impl Expr {
     }
 
     fn parse_switch(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
-        let Bson::Document(spec) = raw else {
-            return Err(Error::InvalidQuery(format!(
-                "$switch takes a document, found {}",
-                type_name(raw)
-            )));
-        };
+        let spec = Self::named_spec("$switch", raw, &["branches", "default"])?;
         let Some(Bson::Array(raw_branches)) = spec.get("branches") else {
             return Err(Error::InvalidQuery("$switch needs a `branches` array".into()));
         };
@@ -688,12 +683,7 @@ impl Expr {
 
         let mut branches = Vec::with_capacity(raw_branches.len());
         for branch in raw_branches {
-            let Bson::Document(b) = branch else {
-                return Err(Error::InvalidQuery(format!(
-                    "each $switch branch is a document, found {}",
-                    type_name(branch)
-                )));
-            };
+            let b = Self::named_spec("a $switch branch", branch, &["case", "then"])?;
             let (Some(case), Some(then)) = (b.get("case"), b.get("then")) else {
                 return Err(Error::InvalidQuery(
                     "each $switch branch needs `case` and `then`".into(),
@@ -710,12 +700,7 @@ impl Expr {
     }
 
     fn parse_date_to_string(raw: &Bson, declared: &mut Vec<String>) -> Result<Self> {
-        let Bson::Document(spec) = raw else {
-            return Err(Error::InvalidQuery(format!(
-                "$dateToString takes a document, found {}",
-                type_name(raw)
-            )));
-        };
+        let spec = Self::named_spec("$dateToString", raw, &["date", "format"])?;
         let Some(date) = spec.get("date") else {
             return Err(Error::InvalidQuery("$dateToString needs a `date`".into()));
         };
@@ -2603,6 +2588,26 @@ mod tests {
         assert!(Expr::parse(&doc! {"$switch": {"default": 1}}.into()).is_err());
     }
 
+    #[test]
+    fn switch_refuses_an_unknown_key_at_the_top_level_and_in_a_branch() {
+        // Same closure `$filter`/`$map`/`$reduce`/`$let` already have via
+        // `named_spec`, and the same hazard finding 11 named: an unrecognized
+        // key silently ignored is a typo that quietly changes the result.
+        let err = Expr::parse(
+            &doc! {"$switch": {"branches": [{"case": true, "then": 1}], "bogus": 1}}.into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus"), "{err}");
+
+        let err = Expr::parse(
+            &doc! {"$switch": {"branches": [{"case": true, "then": 1, "bogus": 1}]}}.into(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus"), "{err}");
+    }
+
     // -- comparison and boolean -------------------------------------------
 
     #[test]
@@ -2707,6 +2712,18 @@ mod tests {
             on(doc! {"$dateToString": {"date": "$t"}}.into(), doc! {"t": dt(0)}),
             Bson::String("1970-01-01T00:00:00.000Z".into())
         );
+    }
+
+    #[test]
+    fn date_to_string_refuses_an_unknown_key() {
+        // `{"formt": "%Y"}` — the finding's own shape (11), moved to a
+        // second operand this codebase already had: before this fix it
+        // silently kept the default ISO-8601 format in every row rather than
+        // naming the typo.
+        let err = Expr::parse(&doc! {"$dateToString": {"date": "$t", "formt": "%Y"}}.into())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("formt"), "{err}");
     }
 
     #[test]

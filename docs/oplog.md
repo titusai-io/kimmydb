@@ -188,7 +188,7 @@ Five kinds carry schema changes between nodes:
 |---|---|
 | `CreateCollection` | `{ db, name }` |
 | `DropCollection` | `{ db, name }` |
-| `CreateIndex` | the full `IndexMeta`, including its derived id |
+| `CreateIndex` | the full `IndexMeta`, including its derived id and its creation stamp |
 | `DropIndex` | `{ db, collection, index }` |
 | `ConfigureVectors` | `{ db, collection, config }` — `config: null` disables |
 
@@ -198,7 +198,9 @@ meeting a collection for the first time could not otherwise learn what to call
 it.
 
 They are *operations*, not a metadata snapshot, so two nodes adding different
-indexes during a partition both keep theirs — see [ADR-033](decisions.md).
+indexes during a partition both keep theirs — see [ADR-033](decisions.md). Two
+nodes adding a different definition under the *same name* is the other case,
+and is settled by the creation stamp below.
 
 **Applying one must not log a new entry.** The originating entry is appended as
 received; minting a local one would send the change back to the peer, which
@@ -214,14 +216,29 @@ and a create replayed after it aged out rebuilt what it removed. For an index
 the rebuild also backfills over this node's current documents, which is why
 the tombstone was needed before retention ever ran (ADR-034, ADR-123).
 
+**A drop knows which index it was aimed at.** The tombstone records when an
+index was *dropped*; the index's own `created` stamp records when the one now
+standing under that name began. A `DropIndex` older than that is history: it
+leaves its tombstone and leaves the index alone, so a window re-served across
+a recreation of the same name stops removing an index nobody dropped. The
+`DropCollection` arm's incarnation rule, one level down (ADR-081,
+[ADR-132](decisions.md)).
+
+**Two definitions under one name settle on the later creation stamp**, on
+every member, the way two concurrent writes to one document do — the loser's
+entries are removed in the transaction that builds the winner. Where either
+definition carries no creation stamp there is nothing to compare, and the
+arrival is refused as below.
+
 **One that cannot be applied is skipped, not retried.** A replicated index
-definition this node's documents cannot be built under, or a name already
-taken here by a different definition, is refused by this node's own data, and
-re-delivering the entry unchanged could never succeed. So the entry is
-witnessed, not appended, counted in `kimmy_sync_ddl_refused_total`, and
-logged at warning with the reason; the round goes on. Any *other* error
-still fails the round — a round that skips what it cannot understand is how
-corruption becomes convergence ([ADR-123](decisions.md)).
+definition this node's documents cannot be built under, or a name taken here
+by a different definition that cannot be settled against a stamp, is refused
+by this node's own data, and re-delivering the entry unchanged could never
+succeed. So the entry is witnessed, not appended, counted in
+`kimmy_sync_ddl_refused_total`, and logged at warning with the reason; the
+round goes on. Any *other* error still fails the round — a round that skips
+what it cannot understand is how corruption becomes convergence
+([ADR-123](decisions.md)).
 
 The older payload-free `Collection` kind is still decoded so existing oplogs
 load, but is never written and cannot be applied — it names nothing.
@@ -316,7 +333,10 @@ Two peers exchange vectors and each works out what to ask for:
 
 ```rust
 match mine.behind(&theirs) {
-    Some(from) => apply_batch(&peer.entries_for_peer(from, limit)?)?,
+    Some(from) => {
+        let window = peer.entries_for_peer(from, limit)?;
+        apply_peer_batch(&theirs, &window.entries, window.scanned_to, window.exhausted)?
+    }
     None => { /* already covered */ }
 }
 ```
@@ -333,7 +353,32 @@ entry is compared and discarded without touching the document or republishing an
 event.
 
 **Unique-violation entries are never sent.** They record what one node observed
-when it merged, and every node observes the same collision independently.
+when it merged, and every node observes the same collision independently. The
+batch limit counts the entries that survive that exclusion, not the entries
+read, so a window truncated at the limit really does carry `limit` entries
+([ADR-126](decisions.md)).
+
+**The sender says where its window ended.** A batch answers with `scanned_to` —
+the last stamp its scan examined, an entry it withheld included — and
+`exhausted`, whether it stopped there because the oplog ran out. The receiver
+raises its witnessed vector to the peer's whole advertised vector when the
+window was exhausted, and otherwise to `min(their_max, scanned_to)` per origin:
+never past what the peer holds, and never past what it read. It does **not**
+work this out from how many entries arrived. That inference was true only while
+nothing could shorten a batch for another reason, and when it stopped being
+true the receiver witnessed every entry behind a truncated window without ever
+applying one — silent, permanent divergence with every health signal reading
+normal ([ADR-127](decisions.md), and [ADR-082](decisions.md) for why an
+unshippable stamp must still be claimed).
+
+**A window's claim is worth no more than what it carried.** The end is now the
+sender's assertion rather than the receiver's deduction, so a window that is
+not a tail is clamped to the last stamp it delivered, and one that delivered
+nothing claims nothing. A sender that trimmed a batch in place therefore
+cannot witness away what it dropped, which is why `BatchTooLarge` is a retry
+rather than a short answer. The clamp is arithmetic that changes nothing for a
+correct sender. `exhausted` itself is not checkable — a node cannot know how
+much oplog its peer has — and is taken on trust.
 
 ### Past the horizon
 
@@ -384,7 +429,7 @@ sequenceDiagram
     A->>B: SWIM message + version vector
     Note over B: B sees A has entries B lacks
     B->>A: open TCP, request range (from_hlc, limit)
-    A-->>B: oplog entries
+    A-->>B: oplog entries + (scanned_to, exhausted)
     loop each entry
         B->>B: apply_remote() ✅ implemented
         Note right of B: compare stamps via merge();<br/>strictly-greater wins;<br/>witness() advances the clock

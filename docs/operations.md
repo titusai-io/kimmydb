@@ -220,6 +220,38 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > ownership of a share of the webhook subscriptions it could not deliver. Roll
 > the secret with the cluster stopped, not one node at a time.
 
+> **Upgrading a cluster to a version whose batch answer reports the window's
+> end.** Replication's `Entries` message gained `scanned_to` and `exhausted`
+> and changed shape to carry them ([ADR-127](decisions.md)), so a node of the
+> new version and one of the old fail each other's sync rounds as a malformed
+> frame. Unlike the three above, this needs **no** stop: membership, failure
+> detection and webhook ownership are untouched, so roll the members one at a
+> time as usual. What to expect while the roll is in progress is
+> `kimmy_sync_failures_total` rising on both sides of every not-yet-matched
+> pair and `kimmy_sync_peers_backing_off` above zero; both settle once the
+> last member is rolled, and anti-entropy then reconciles everything written
+> during the window. Finish the roll well inside `storage.oplog_retention_secs`
+> — a member left behind longer than retention falls past the horizon and pays
+> for a snapshot instead.
+
+> **Upgrading a cluster to a version with the divergence check.** A second new
+> message pair, `AskDivergence`/`Divergence` ([ADR-133](decisions.md)), on the
+> same connection anti-entropy already opens. No stop needed, same as the
+> `Entries` change above — roll the members one at a time. An old peer cannot
+> decode `AskDivergence` and the round fails the same way an `Entries` mismatch
+> does — a malformed frame, counted in `kimmy_sync_failures_total` — but **only
+> on a round that would have run the check**: one that finds nothing left to
+> pull, or whose own pull is not truncated by the batch cap. A freshly mixed
+> pair still actively catching up looks completely healthy; only once a round
+> reaches the branch that sends `AskDivergence` does it start failing, every
+> time, against the not-yet-rolled peer. `kimmy_sync_failures_total` and
+> `kimmy_sync_peers_backing_off` are what to watch, same as above; both settle
+> once the last member is rolled. A genuinely malfunctioning peer (an empty
+> batch claiming its tail was not reached, below) fails a round the same way
+> and adds to the same counter, so during a roll a real fault could plausibly
+> be blamed on the upgrade — the `warn!` line at the point of detection is
+> what tells the two apart; a version-mismatch failure has none.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback
@@ -418,7 +450,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_replication_lag_seconds` | How far **behind in time** this node is: seconds since the newest entry it has applied from an origin a peer holds newer entries of, worst peer in the last sync round ([ADR-122](decisions.md)). **Alert on this**: 0 is the caught-up steady state, and it climbing means the backlog exceeds a sync batch — a node thirty seconds into draining one reads about 30, and keeps climbing until it is through. Holds its last value while no peer is reachable — an outage has *unknown* lag, not zero — **and a round that fails does not move it either**: only a round that completed can measure how far behind it left the node, so a peer this node fails against every time reads as whatever the last good round said, usually 0. Pair it with `kimmy_sync_failures_total`, which is what rises in that case. Measured against what this node has processed rather than what it could re-serve, or entries it correctly discarded would pin it non-zero forever ([ADR-054](decisions.md)). One reading to know about: an origin that was quiet for hours and then writes once shows the length of that silence for one round on each peer, until the entry is pulled. Compares a peer's entry timestamps against this node's clock, so member clock skew shifts it by the skew — a peer running ahead makes it under-read |
 | `kimmy_sync_failures_total` | Anti-entropy rounds against a peer that failed, any cause: unreachable, handshake refused, a batch this node could not apply. **Alert on this** rising while `kimmy_replication_lag_seconds` sits at 0 — that pairing was exactly a silent wedge observed on a three-member cluster running 0.20.0, where a replayed index definition failed every round against one peer for the life of the process, the lag gauge read 0 throughout, and `/v1/topology` showed every member live ([ADR-123](decisions.md)). A peer rebooting produces a handful; a peer that never recovers produces one per backoff interval, up to every 300 s |
 | `kimmy_sync_peers_backing_off` | Peers this node is currently leaving alone after failed rounds, as of the last tick. 0 when every known peer answered its last round, or with clustering off. Non-zero for longer than a restart takes is a peer that is down or one this node cannot sync with; the `sync round failed` warning names it |
-| `kimmy_sync_ddl_refused_total` | Replicated schema changes this node could not apply to its own data and skipped: an index definition its documents cannot be built under, or an index name already taken here by a different definition. **Alert on this**: each one is an index the peers hold and this node does not, nothing will retry it, and the warning logged at the time names the database, collection, index and reason. Resolve by dropping the definition on the origin, or by making this node's documents fit it and recreating it ([ADR-123](decisions.md)) |
+| `kimmy_sync_ddl_refused_total` | Replicated schema changes this node could not apply to its own data and skipped: an index definition its documents cannot be built under, or an index name held here by a different definition that no creation stamp can settle. **Alert on this**: each one is an index the peers hold and this node does not, nothing will retry it, and the warning logged at the time names the database, collection, index and reason. Resolve by dropping the definition on the origin, or by making this node's documents fit it and recreating it ([ADR-123](decisions.md)). It does **not** rise for two members creating one name with different definitions, which now settle on the later creation stamp and log a warning on the member whose definition lost ([ADR-132](decisions.md)) |
+| `kimmy_sync_divergent_collections` | Collections a periodic cross-member check currently finds disagreeing with a peer, confirmed on two checks running: held there and not here, or held by both with a different document count. 0 on a converged cluster. **Alert on this above 0**: it is the one series in this table that moves for a divergence the other three cannot — no round fails, the lag gauge reads 0, nothing is refused — see [below](#the-divergence-check) for what it compares, how often, and what it cannot catch ([ADR-133](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 | `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
@@ -429,6 +462,132 @@ has gone wrong yet" rather than "no data".
 The two absences ADR-043 recorded — latency histograms and oplog lag — are
 filled by `kimmy_request_duration_seconds` and `kimmy_replication_lag_seconds`,
 each on the terms that kept it out ([ADR-046](decisions.md)).
+
+### The divergence check
+
+Anti-entropy converges by folding entries into a version vector, and that
+path cannot see a divergence it produced itself — a member can end up
+believing it has witnessed everything a peer holds while a collection, or a
+run of documents, that peer has is simply missing here, with
+`kimmy_replication_lag_seconds` at 0 and `kimmy_sync_failures_total`,
+`kimmy_sync_peers_backing_off` and `kimmy_sync_ddl_refused_total` all
+unmoved, because nothing about it fails a round ([ADR-133](decisions.md)).
+`kimmy_sync_divergent_collections` exists because that state is otherwise
+invisible.
+
+**What runs, and when.** Every anti-entropy round whose pull reaches the
+peer's true tail also asks that peer what it holds, on the same connection —
+whether the round found nothing left to pull, or the round pulled something
+and this round's own batch was not truncated by the 1,024-entry cap. A round
+whose pull *is* truncated by the cap skips the check entirely: that is
+precisely the state a truncated window can fake without it being true, and
+checking on the strength of a truncated pull would reopen the same hole one
+level up. There is no separate interval to configure; the check rides
+`cluster.sync_interval_secs` (default 5 s) via the anti-entropy round itself,
+and it runs on nearly every round of a converged cluster and on most rounds
+of a modestly busy one — a handful of writes between rounds still leaves a
+round's own pull comfortably under the cap.
+
+**What a `0` reading means, and does not.** On a cluster whose backlog stays
+deeper than one batch on *every* round — sustained write volume the cluster
+cannot currently drain within a batch — the check does not run at all, and
+the gauge holds its last value rather than climbing or falling. A `0` during
+that state means *not checked*, not *not divergent*. This is a real limit,
+not a rounding error: do not read a quiet gauge as proof of convergence
+during a period of sustained heavy write load: pair it with
+`kimmy_replication_lag_seconds` and the sync counters the way any of them
+should be read, and treat a long stretch of unmoving `kimmy_sync_divergent_collections`
+under heavy load as *unknown* rather than *clean*.
+
+One case is not "skipped" at all: a peer that answers with zero entries
+while also reporting its tail was not reached. A correct peer cannot produce
+this — the scan behind a truncated window always ships at least one entry
+before it stops short — so this is a malfunctioning or misbehaving peer, not
+an ordinary capped pull. It fails the round as a malformed frame rather than
+being read as either a clean check or a skipped one, so it shows up in
+`kimmy_sync_failures_total` like any other malformed round.
+
+**What is compared.** Two things, deliberately not everything a full
+reconciliation would:
+
+- **Which collections exist**, on this node and on the peer. Metadata only —
+  a scan of the database and collection tables, never a document — so it
+  costs the same regardless of how much data a collection holds and runs
+  whenever the check does.
+- **One collection's live document count**, chosen in turn from this node's
+  own collection list so a check pays for at most one collection's scan
+  rather than the whole database. Reaching every collection again after one
+  has had its turn takes as many *checked* rounds as there are collections —
+  not wall-clock rounds, if some rounds are skipped per the paragraph above.
+
+A finding is confirmed, and counted in the gauge, only once seen twice
+running — but "twice running" means something different for each half, and
+conflating them is a defect this section used to have. **Existence** is
+checked in full on every contact with a peer, so confirming it needs two
+consecutive *contacts with the same peer* — not necessarily two consecutive
+rounds of the whole loop, since a cluster larger than about twice
+`cluster.fanout` does not contact every peer every round. **Count** examines
+only whichever one collection the rotation lands on that contact, so
+confirming it needs two consecutive *probes of that same collection*
+against that same peer — which, once this node holds more than one
+collection, are not the same two contacts. A collection probed once every
+lap of the rotation and found mismatched every time still confirms; it just
+needs its collection's turn to come round twice in a row, not the peer's.
+Each half clears the moment its own next relevant check — a contact, for
+existence; a probe of that collection, for count — no longer finds it. A
+peer simply not contacted, or a contact that probed a *different*
+collection, leaves the untouched finding exactly where it was: silence is
+not evidence of reconciliation, for either half. The gauge is a level, not a
+counter, and a resolved divergence stops moving it rather than leaving a
+permanent scar.
+
+**The count half trusts a peer's answer only when the peer is not itself
+behind this node.** A peer that has simply not yet pulled this node's own
+recent writes answers a probe with a stale, lower count for any collection
+those writes touched — ordinary replication lag, not divergence — and a
+count comparison alone cannot tell the two apart. Before trusting a count,
+this node checks the peer's advertised version vector against its own: if
+the peer has not yet witnessed something this node has, the count is
+dropped for that contact and only the existence half runs. Without this a
+cluster running with any steady per-peer lag — the round that produced
+finding 14 measured 130–260 s between some pairs — would see the gauge
+firing continuously on ordinary catch-up, which is worse than not having the
+gauge at all: an alert that cries wolf on a healthy cluster is the one an
+operator disables, landing back in the exact blind spot this gauge exists to
+close.
+
+**What it cannot catch.** A document present in equal numbers on every
+member but with different content — a lost update that still counts, rather
+than a lost document. **A count divergence until its collection has been
+probed twice running against the same peer** — reaching its turn once
+detects it but does not confirm it and does not move the gauge; nothing
+about a different collection being probed against that peer in between
+resets or advances that count, only a clean probe of the *same* collection
+does. **A round whose pull did not reach the peer's tail — see "what a `0`
+reading means" above.** Anything on a peer this node is not
+currently paired with in a round (`cluster.fanout` bounds the peers contacted
+each round, the same bound anti-entropy itself is subject to). A collection
+this node holds that a peer does not — the reverse direction is the peer's
+own discovery to make when its own loop pulls from this node, so a collection
+created moments ago and not yet replicated outward is never flagged from this
+side either. And a vector index's own shadow storage: excluded from both
+halves of the comparison because its lifecycle deliberately trails the
+collection it serves, so a genuine divergence there is as invisible to this
+check as it is to the collection listing routes.
+
+**This is observability, not repair.** The check reports a divergence; it
+never resolves one. Recovering a member found to hold less than its peers is
+an operator decision — reset it and let anti-entropy or a snapshot refill it
+— the same as any other divergence this cluster can report.
+
+**A second wire change in this release.** `AskDivergence`/`Divergence` are
+new cluster-protocol messages, alongside the `Entries` shape change this
+release also ships ([ADR-127](decisions.md)) — neither a collection list nor
+a document count is derivable from the existing version-vector or entry
+exchange, so this could not ride the existing wire. See the "Upgrading a
+cluster to a version with the divergence check" callout further up this page
+for the rollout shape, which differs from `Entries`' in when the failure
+surfaces.
 
 ### Tracing
 

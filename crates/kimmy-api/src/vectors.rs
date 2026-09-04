@@ -5,7 +5,7 @@ use std::collections::HashSet;
 use axum::extract::{Path, State};
 use axum::{Json, http::StatusCode};
 use kimmy_auth::Action;
-use kimmy_core::{DocId, VectorConfig};
+use kimmy_core::{ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig};
 use kimmy_vector::Access;
 use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
@@ -20,13 +20,164 @@ use crate::state::{Auth, SharedState};
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// A request-only mirror of [`VectorConfig`], for the same reason
+/// `GrantInput` mirrors `kimmy_auth::Grant`: `VectorConfig` is not only the
+/// request body here, it is also the stored and replicated form — carried
+/// through `CollectionMeta` on disk (JSON) and through `VectorSet` on the
+/// wire (BSON) — and several of its fields have always serialized an unset
+/// `None` as an explicit `null` rather than omitting the key, because they
+/// predate ADR-128 and were never given `skip_serializing_if`. Applying
+/// [`crate::json::non_null_field`] to `VectorConfig` itself would refuse to
+/// load or apply exactly the records this field's own absence already
+/// produced — turning an upgrade into a node that cannot read its own
+/// configuration. So the refusal lives here instead, on a type this route
+/// alone deserializes from a fresh HTTP body, and converts into the real
+/// type afterwards; the stored and replicated form is untouched.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VectorConfigInput {
+    fields: Vec<String>,
+    provider: ProviderConfigInput,
+    dim: usize,
+    #[serde(default)]
+    metric: Metric,
+    #[serde(default)]
+    chunk: ChunkConfigInput,
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
+    document_prefix: Option<String>,
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
+    query_prefix: Option<String>,
+}
+
+impl From<VectorConfigInput> for VectorConfig {
+    fn from(input: VectorConfigInput) -> Self {
+        VectorConfig {
+            fields: input.fields,
+            provider: input.provider.into(),
+            dim: input.dim,
+            metric: input.metric,
+            chunk: input.chunk.into(),
+            document_prefix: input.document_prefix,
+            query_prefix: input.query_prefix,
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChunkConfigInput {
+    max_chars: usize,
+    overlap: usize,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
+    max_tokens: Option<usize>,
+}
+
+impl Default for ChunkConfigInput {
+    fn default() -> Self {
+        let d = ChunkConfig::default();
+        Self { max_chars: d.max_chars, overlap: d.overlap, max_tokens: d.max_tokens }
+    }
+}
+
+impl From<ChunkConfigInput> for ChunkConfig {
+    fn from(input: ChunkConfigInput) -> Self {
+        ChunkConfig {
+            max_chars: input.max_chars,
+            overlap: input.overlap,
+            max_tokens: input.max_tokens,
+        }
+    }
+}
+
+fn default_openai_key_env() -> String {
+    "OPENAI_API_KEY".to_string()
+}
+
+fn default_cohere_key_env() -> String {
+    "COHERE_API_KEY".to_string()
+}
+
+fn default_gemini_key_env() -> String {
+    "GEMINI_API_KEY".to_string()
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProviderConfigInput {
+    Byo,
+    OpenAi {
+        model: String,
+        #[serde(default, deserialize_with = "crate::json::non_null_field")]
+        endpoint: Option<String>,
+        #[serde(default = "default_openai_key_env")]
+        api_key_env: String,
+        #[serde(default, deserialize_with = "crate::json::non_null_field")]
+        dimensions: Option<usize>,
+    },
+    Ollama {
+        model: String,
+        endpoint: String,
+    },
+    CustomHttp {
+        endpoint: String,
+        #[serde(default, deserialize_with = "crate::json::non_null_field")]
+        api_key_env: Option<String>,
+    },
+    Cohere {
+        model: String,
+        #[serde(default, deserialize_with = "crate::json::non_null_field")]
+        endpoint: Option<String>,
+        #[serde(default = "default_cohere_key_env")]
+        api_key_env: String,
+    },
+    Gemini {
+        model: String,
+        #[serde(default, deserialize_with = "crate::json::non_null_field")]
+        endpoint: Option<String>,
+        #[serde(default = "default_gemini_key_env")]
+        api_key_env: String,
+    },
+    Local {
+        model: String,
+    },
+    Profile {
+        name: String,
+    },
+}
+
+impl From<ProviderConfigInput> for ProviderConfig {
+    fn from(input: ProviderConfigInput) -> Self {
+        match input {
+            ProviderConfigInput::Byo => ProviderConfig::Byo,
+            ProviderConfigInput::OpenAi { model, endpoint, api_key_env, dimensions } => {
+                ProviderConfig::OpenAi { model, endpoint, api_key_env, dimensions }
+            }
+            ProviderConfigInput::Ollama { model, endpoint } => {
+                ProviderConfig::Ollama { model, endpoint }
+            }
+            ProviderConfigInput::CustomHttp { endpoint, api_key_env } => {
+                ProviderConfig::CustomHttp { endpoint, api_key_env }
+            }
+            ProviderConfigInput::Cohere { model, endpoint, api_key_env } => {
+                ProviderConfig::Cohere { model, endpoint, api_key_env }
+            }
+            ProviderConfigInput::Gemini { model, endpoint, api_key_env } => {
+                ProviderConfig::Gemini { model, endpoint, api_key_env }
+            }
+            ProviderConfigInput::Local { model } => ProviderConfig::Local { model },
+            ProviderConfigInput::Profile { name } => ProviderConfig::Profile { name },
+        }
+    }
+}
+
 pub async fn configure_vectors(
     State(state): State<SharedState>,
     auth: Auth,
     Path((db, coll)): Path<(String, String)>,
-    JsonBody(body): JsonBody<VectorConfig>,
+    JsonBody(body): JsonBody<VectorConfigInput>,
 ) -> Result<Json<Value>, ApiError> {
     auth.require(Action::Ddl, &db, Some(&coll))?;
+    let body: VectorConfig = body.into();
     admit_provider(&state, &body.provider)?;
     let meta = state.engine.configure_vectors(&db, &coll, body)?;
     // A changed dimension or metric makes any cached graph meaningless.
@@ -274,20 +425,27 @@ fn authorize_write(
 #[serde(default, deny_unknown_fields)]
 pub struct SearchRequest {
     /// Query text. Embedded server-side, so it needs an embedding provider.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub query: Option<String>,
     /// A pre-computed query vector. Required when the provider is `byo`.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub vector: Option<Vec<f32>>,
     /// Restrict results to documents matching this filter.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub filter: Option<Value>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub k: Option<usize>,
     /// Chunks per document allowed into the results.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub per_document: Option<usize>,
     /// How much each half of `hybrid_search` counts in fusion (ADR-094).
     /// Ignored by `vector_search`, which has one half.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub weights: Option<FusionWeights>,
     /// Distinct query terms a chunk must share with the query to count as
     /// lexical evidence in `hybrid_search` (ADR-094). Ignored by
     /// `vector_search`.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub min_overlap: Option<usize>,
 }
 

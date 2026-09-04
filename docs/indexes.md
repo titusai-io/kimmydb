@@ -203,7 +203,10 @@ holds. So:
 - A later write of a document that holds arrays at two of the index's paths is
   **refused with `400`**, naming the index.
 - Creating the index over a collection that **already** holds such a document
-  is refused, naming the index.
+  is **refused with `400`** too, naming the index — the same status and the
+  same message, `index "a_b" cannot be built for this document: a compound
+  index may span at most one array field`, because it is the same check
+  meeting the same pair from the other side.
 
 A schemaless store cannot refuse the definition at creation without refusing
 every compound index: nothing says the two fields will never both be arrays,
@@ -211,21 +214,96 @@ and nothing says they ever will be. The rule is a property of the pair
 (definition, document), and it is checked where the pair meets.
 
 **On a replica.** A definition replicates as an operation, and the replica
-builds it over *its own* documents. If those cannot be indexed under it — a
-two-array document written legally once the index had been dropped on the
-origin, say, and re-served with the creation in an overlapping window — the
-replica **skips the definition**, logs a warning naming the index and the
-reason, and counts it in `kimmy_sync_ddl_refused_total`. The round goes on,
-the entries behind it arrive, and the definition stands on the members that
-could build it. It does not fail the round: the refusal is a fact about the
-replica's data, and retrying the same entry could never succeed.
+builds it over *its own* documents, which are not the origin's. If those
+cannot be indexed under it, the replica **skips the definition**, logs a
+warning naming the index and the reason, and counts it in
+`kimmy_sync_ddl_refused_total`. The round goes on, the entries behind it
+arrive, and the definition stands on the members that could build it. It does
+not fail the round: the refusal is a fact about the replica's data, and
+retrying the same entry could never succeed.
 
-**A dropped index leaves a tombstone.** Like a dropped collection, an index
-drop is recorded in `indexes_dropped` under the drop's stamp and kept for
-`tombstone_retention_secs`, so a creation re-served or replayed after the drop
-— which anti-entropy does routinely — reads as history and does not rebuild
-it. Creating an index of the same name again, stamped after the drop, is a new
-index and wins. See [ADR-123](decisions.md).
+What reaches it is a member that wrote a document the origin never had —
+while it was behind, or partitioned — and then receives a `CreateIndex` the
+origin still holds, whose backfill meets that document. Two more refusals are
+in the same class: an `enforcement` mode this build does not implement, and a
+rival definition arriving against a name this member holds **without a
+creation stamp**, which the conflict rule below has nothing to compare and so
+cannot resolve. Two *stamped* definitions under one name are resolved rather
+than refused, and the resolution itself is counted nowhere; the stamp rules
+below say how, and what is counted when the winning definition turns out to
+be one this member cannot build. A snapshot page carrying a definition this
+member cannot build is classified the same way as the first case, and the
+page's documents still restore.
+
+**A dropped index leaves a tombstone**, and it is why the counter does *not*
+move for the sequence ADR-123 was written about. Like a dropped collection, an
+index drop is recorded in `indexes_dropped` under the drop's stamp and kept
+for `tombstone_retention_secs`. So a creation re-served or replayed after the
+drop — which anti-entropy does routinely, and which is how the original wedge
+kept rebuilding an index over a two-array document written legally once the
+index was gone — reads as **history**: it is counted as applied and never
+backfilled, so nothing can be refused and the counter stays where it was.
+That is the fix working, not a signal missing. Creating an index of the same
+name again, stamped after the drop, is a new index and wins. See
+[ADR-123](decisions.md).
+
+**Every index carries the stamp of its creation**, and two questions are
+answered by comparing against it.
+
+*A drop older than the index it names is history.* A name that has been
+created, dropped and created again derives the same id each time, and
+anti-entropy re-serves overlapping windows as a matter of course — so the drop
+between the two creations arrives again after the recreation. It records its
+tombstone, which never moves backwards, and leaves the newer index alone. A
+drop stamped **after** the index it names still removes it, which is the
+ordinary case.
+
+> **A replicated drop cannot remove an index whose creation stamp is ahead of
+> it.** Ordinarily that is the rule doing its job on a re-served window, and
+> it is logged at debug and counted nowhere, because it happens routinely. But
+> a member whose clock ran far ahead when it created the index will decline
+> *every* drop for that name, indefinitely, with no default-level signal — the
+> drops keep arriving and keep being declined. The escape hatch is a local
+> `DELETE /v1/db/{db}/coll/{coll}/indexes/{name}` on that member: a **local**
+> drop does not consult the creation stamp, removes the index, and mints a
+> drop entry under the member's own current stamp, which is ahead of the
+> creation and so removes it on every other member too.
+
+*Two identical definitions converge on one stamp.* Two members can also create
+the *same* definition independently, which is not a conflict — but the two
+creations carry different stamps, and after the rules above the stamp is what
+answers a drop. So the stamp converges as well: the **later** creation is the
+one that stands, on every member. That is the same rule as the first one above
+rather than a second: the stamp names the index now standing under the name,
+both members have held one continuously since the later creation, and a drop
+stamped before it was aimed at neither. Without the convergence, one
+definition under two stamps would answer one drop two ways and the members
+would split with nothing left to re-serve.
+
+*Two definitions under one name settle on the later stamp.* Two members can
+create the same index name with different definitions while they cannot see
+each other; neither is wrong, and neither can be kept without the cluster
+holding two schemas indefinitely. The later creation stamp wins on every
+member — the same rule, and the same stamp comparison, that settles two
+concurrent writes to one document. The member whose definition loses logs a
+warning naming the index and which parts of the definition moved, and rebuilds
+the name under the winner. Nothing is counted for this: it is the conflict
+rule working, not a divergence. **Creating a conflicting definition through
+the API is unaffected** — a client is refused `409 conflict`, naming what
+differs, because a client is there to be told.
+
+Where the winning definition cannot be built over the receiving member's own
+documents, the whole replacement is abandoned: that member keeps the index it
+already had, the refusal is counted in `kimmy_sync_ddl_refused_total` and
+logged, and the round goes on.
+
+**An index created before this version carries no creation stamp**, and reads
+as *older* than every drop and every rival: a replayed drop removes it, and a
+rival definition is refused and counted rather than resolved. That is exactly
+the behaviour of the version before it. It ends as soon as the index is
+recreated — or sooner, on its own: a member holding the same definition *with*
+a stamp hands it over on the next round, which is the true creation stamp
+rather than an invented one. See [ADR-132](decisions.md).
 
 ---
 

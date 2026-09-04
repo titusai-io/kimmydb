@@ -27,10 +27,87 @@ can answer it, which only a *leading* `$match` gets (see
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$sort` | The same sort language. Blocking |
 | `$skip`, `$limit` | Non-negative whole numbers |
-| `$unwind` | One output document per array element |
+| `$unwind` | One output document per array element. Below |
 | `$group` | Blocking. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+
+**Stage operands with a fixed key set are closed; field-path maps stay
+open.** `$unwind`'s document form, `$lookup`'s both forms and `$replaceRoot`
+refuse a key they do not define — `400`, naming it — the same closure
+[ADR-121](decisions.md) gives the request body and the shapes nested in it. A
+`$match` filter and a `$project` specification are **not** put through this:
+every key in either is a document field name the caller chose, not vocabulary
+this database defines, so there is no fixed list to check a key against —
+closing them would refuse ordinary pipelines rather than typos. See
+[ADR-129](decisions.md).
+
+### `$unwind`
+
+```json
+{ "$unwind": "$tags" }
+{ "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": true, "includeArrayIndex": "i" } }
+```
+
+The shorthand string form takes only a path. The document form takes:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | required | The field to expand, `"$"`-prefixed |
+| `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it. Wrong-typed is a `400`, not read as `false` |
+| `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out. Cannot begin with `$` (this language cannot read such a field back) or name `path` itself (it would overwrite the unwound element) |
+
+**A path that crosses an array *by name* is refused outright, before
+anything at the far end of it is even read — see [ADR-130](decisions.md) and
+[Arrays](#arrays).** `$unwind` needs a single place to write the expanded
+element back to. Whenever a non-terminal segment of `path` is itself an
+array on a given document, and the segment after it **names a field rather
+than a numeric position** — `x.b` where `x` holds an array, at any length
+down to one — there is no such place, and the request is refused, `400`,
+naming `$unwind` and the path. This holds regardless of what that array
+turns out to contain: a scalar, another array, an empty array, nothing —
+none of it changes the answer, because the refusal is decided by the
+document's *shape* along the path, before `$unwind` looks at what is there
+to unwind.
+
+**A numeric segment addresses a position instead, and is not refused.**
+`$unwind: "$a.0"` writes into element `0` of `a` directly — a single place,
+the same as any array write by index — and reads it the same way `find` and
+every other field-path option here does: a numeric segment is read as
+*both* an index and a field literally named that number ([Arrays](#arrays)
+has the full rule and the one place it disagrees with an expression path).
+So `$unwind: "$a.0.b"` over `a: [{b: [1, 2]}, {b: [3]}]` does not cross
+anything by this rule — it finds `a.0.b` as `[1, 2]` (element `0`'s `b`) and
+unwinds it into **two rows, `a[0].b` replaced by `1` then by `2`, with the
+rest of `a` untouched** — `[{b: 1}, {b: [3]}]`, then `[{b: 2}, {b: [3]}]`.
+This is a genuine difference from a computed expression over the identical
+path: `{$addFields: {r: "$a.0.b"}}` reads `"0"` as a field name only, finds
+no element actually named `"0"`, and gives `r: []`.
+
+**This makes the refusal data-dependent: whether a pipeline is legal at all
+depends on the documents it meets, not on the pipeline text.** The same
+`{"$unwind": "$a.b"}` answers `200` for every document where `a` is a plain
+subdocument and `400` for any document where `a` is an array — a schemaless
+collection can hold both shapes under the same field name, so a pipeline
+that has run correctly for months can start answering `400` the day an
+ordinary write adds one document shaped that way, with nothing about the
+pipeline having changed. And it fails **the whole request**, not just the
+offending document: one such document among a thousand others refuses
+every row, because the refusal is a stage-level error, not a per-document
+skip. A field a pipeline unwinds should be one every document in the
+collection either holds as a plain field or never holds as an array at all.
+
+For every document where `path` does not cross an array this way, what is
+found there decides what happens:
+
+| Value at `path` | Without `preserveNullAndEmptyArrays` | With it |
+|---|---|---|
+| A non-empty array | One row per element, `path` set to that element | Same |
+| Missing, `null`, or `[]` | Dropped | Kept once, `path` unset (removed) |
+| Any other scalar | One row, unchanged — the value unwinds to itself | Same |
+
+`includeArrayIndex` is `null` on every row in the second and third cases: a
+row that was not produced by an array element has no index to report.
 
 ### Accumulators
 
@@ -47,6 +124,40 @@ can answer it, which only a *leading* `$match` gets (see
 ```
 
 `{"_id": null}` groups everything into one bucket.
+
+**A missing field is `null` to every accumulator**, not a value they never
+see — a missing field is null everywhere in this language — so what each one
+does with `null` is also what it does with a field half the collection lacks.
+That is where they differ, and the differences are the ones a report gets
+wrong quietly:
+
+| | Over non-numeric values | Over `null` and missing | When nothing was usable |
+|---|---|---|---|
+| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind | Ignored | `0` |
+| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean | Ignored | `null` |
+| `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
+| `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
+| `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them | — nothing is unusable |
+
+Two consequences worth spelling out. **`$sum` and `$avg` disagree about a
+group with nothing to work on**: `0` against `null`, because a total of
+nothing is zero and a mean of nothing is not a number — so a `$sum` reading
+`0` cannot be told apart from a genuine total of zero, where `$avg` says
+plainly that it had nothing. And **`$min`/`$max` over a mixed-type field
+answer across types rather than refusing**, so the maximum of a field holding
+integers, strings, arrays and booleans is a boolean — the highest rank in the
+order, not the largest number. Neither is a bug to work around; both are
+reasons to `$match` the type you mean first, or to `$group` after a
+`{"$type": …}` filter.
+
+`$sum` **stays integral** while every value it has seen is an integer,
+promoting to a double only when a double arrives or an `i64` sum would
+overflow. `$avg` is a double whenever it has an answer at all — it never
+returns an integer, and the one thing it returns that is not a double is the
+`null` above. `$addToSet` compares elements **structurally**, not by the
+canonical order `$group`'s own `_id` uses, so
+`5`, `5.0` and `{"$numberLong": "5"}` are one bucket as a grouping key and
+three distinct members of a set.
 
 ---
 
@@ -78,6 +189,12 @@ field path.
       "month": { "$dateToString": { "date": "$placed", "format": "%Y-%m" } } } },
   { "$group": { "_id": "$month", "revenue": { "$sum": "$value" } } } ]
 ```
+
+**The named-argument operators are closed the same way stage operands are**
+(see [Stages](#stages)): `$filter`, `$map`, `$reduce`, `$let`, `$convert`,
+`$switch` (and each of its branches) and `$dateToString` refuse a key they do
+not define — `{"input": "$items", "condition": …}` inside `$filter` is a
+`400` naming `condition`, not a silently unfiltered array.
 
 ### How a value is read
 
@@ -207,6 +324,11 @@ nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
 an expression path and a filter path disagree — the filter language reads
 `items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
+**`$unwind` also has to write each expanded element back to its path**, not
+only read it, and a path crossing an array by a named segment has no single
+place to write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is
+refused, `400`, on every such document, regardless of what `b` holds at any
+element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
@@ -305,6 +427,33 @@ around the single authorization point ([ADR-024](decisions.md)).
 **The foreign collection is scanned once**, not once per input document. A
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
+
+**`localField` and `foreignField` name one value each, and a path that
+crosses an array reads only the first element's.** They are field paths, not
+expressions, and the join needs one key per document on each side, so
+`localField: "items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` joins on
+`"a"` and never on `"b"` — a stage that looked like it attached every line's
+product attaches the first line's. The same rule reads the foreign side, so
+the two always agree about what a key is. A field that simply *holds* an
+array is a different case and is not affected: `localField: "tags"` over
+`tags: ["a", "b"]` joins on the whole array `["a", "b"]`, matching a foreign
+document whose `foreignField` is that same array and not one whose field is
+`"a"`.
+
+Join on a scalar key. Where the key really is one per array element,
+`$unwind` the array first and join each row, which is a stage more and says
+what it means; the register records the difference from MongoDB, which fans
+a crossed `localField` out and joins on every element
+([Deviations](deviations.md)).
+
+**A key is a value, so a missing key is not `null` here.** An input document
+that lacks `localField` gets an empty `as` and joins nothing, and a foreign
+document that lacks `foreignField` is never a candidate — an explicit `null`
+on both sides joins, an absent field on either does not. The [filter rule
+that `null` matches a missing
+field](query-language.md#1-null-matches-missing-fields) does not reach here:
+that rule is about selecting documents, and a join is about matching two
+stored values to each other.
 
 ### The `let` / `pipeline` form
 
@@ -446,7 +595,8 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$zip`, `$objectToArray`, `$arrayToObject`, `$sortArray` | Not built |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$convert` to `decimal`, and `$toDecimal` | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse with a pointer to `double` or `long` |
+| `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
+| `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "unknown expression operator \"$toDecimal\""` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |

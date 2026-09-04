@@ -62,7 +62,7 @@ Top-level fields are implicitly `$and`-ed.
 | Operator | Meaning |
 |---|---|
 | `$exists` | Field is present (an explicit `null` counts as present) |
-| `$type` | BSON type, by alias (`"string"`) or numeric code (`2`) |
+| `$type` | BSON type, by alias (`"string"`), numeric code (`2`), or an array of either — see [`$type`](#type) |
 | `$regex` / `$options` | Pattern match against string values |
 
 ### Array
@@ -143,6 +143,68 @@ tested:
 `$mod` is never index-eligible. A remainder is not a range, so the planner
 leaves it to the residual re-check every candidate goes through; an equality or
 range beside it still uses the index.
+
+### `$type`
+
+```javascript
+{ "mixed": { "$type": "int" } }
+{ "mixed": { "$type": 16 } }                  // the same, by code
+{ "mixed": { "$type": ["int", "string"] } }   // either — the array unions
+```
+
+The argument is an **alias, a numeric BSON code, or an array of them**. An
+array is a union: the document matches when the value is any one of the listed
+types, and aliases and codes may be mixed in it. An empty array lists no type
+and so matches nothing. Anything else — a double, a bool, a nested array — is
+a `400` at parse.
+
+| Kind | Alias and code |
+|---|---|
+| Numbers | `int` 16, `long` 18, `double` 1, `decimal` 19 |
+| Text and bytes | `string` 2, `binData` 5 |
+| Structure | `object` 3, `array` 4 |
+| Identity and time | `objectId` 7, `date` 9, `timestamp` 17 |
+| Other | `bool` 8, `null` 10, `regex` 11, `javascript` 13, `undefined` 6, `minKey` −1, `maxKey` 127 |
+
+`javascript` covers both code forms; `symbol` and `dbPointer` are accepted as
+names for the two legacy types that have no code here. There is no `number`
+meta-alias covering the numeric types — list them: `["int", "long",
+"double"]`. And **`int` and `long` are different types**, so a value written
+as `{"$numberLong": "42"}` is not matched by `{"$type": "int"}`; see [The JSON
+boundary](http-api.md#the-json-boundary) for which one a plain JSON number
+becomes.
+
+**An unknown *code* is refused and an unknown *alias* is not.** `{"$type":
+999}` is a `400` — `unknown $type code 999`; `{"$type": "nosuchtype"}` is
+`200` with no matches, because any string is taken as a type name and no
+stored value ever reports that name. Names are **case-sensitive and exactly
+as spelled above**, so `"Int"`, `"bindata"` and `"boolean"` are each a `200`
+and an empty result rather than a refusal, indistinguishable from a genuine
+"nothing is that type".
+
+An alias is not the only word a filter takes without checking:
+[`$regex`'s `$options`](#regex-compatibility) drops a flag it does not know
+by the same rule and with the same consequence. Both are worth singling out
+because the general rule is refusal — a misspelt operator is `unsupported
+operator "$typo"`, a bad sort direction and a bad `$size` are each a `400` —
+so a `200` here reads as an answer rather than as a mistake. Send the code
+rather than the alias wherever the spelling is not being read by a person.
+
+**`$type` is applied to array elements as well as to the value**, which
+follows from [rule 2](#2-paths-traverse-into-arrays) and is the consequence
+worth stating: `{"mixed": [1, 2, 3]}` matches `{"$type": "array"}` **and**
+`{"$type": "int"}` at once. So `$type` does not partition a collection —
+summing the counts of every type over a field double-counts every
+array-valued document. The descent is one level: an element of an element is
+not examined, so `{"mixed": [[1]]}` is an `array` and not an `int`. Use
+`$elemMatch` when the question is about one element rather than any of them.
+
+A **missing** field matches no type at all, `"null"` included; `{"$type":
+"null"}` is how an explicit `null` is told apart from an absent field, where
+`{"mixed": null}` matches both ([rule 1](#1-null-matches-missing-fields)).
+
+`$type` is never index-eligible — a type is not a key range — so it is left
+to the residual re-check, exactly as `$mod` is.
 
 ---
 
@@ -483,9 +545,14 @@ access path was chosen.
 { "sort": { "qty": -1, "name": 1 } }
 ```
 
-`1` ascending, `-1` descending; anything else is rejected. A missing field sorts
-as `null`, putting absent values at one end rather than in arbitrary positions.
-Sorting by an array field uses its elements.
+`1` ascending, `-1` descending; anything else is rejected — `sort direction
+for "qty" must be 1 or -1`. A direction is read as a **number**, the same way a
+projection value is (below), so a whole double equal to either passes: `1.0`
+and `-1.0` sort exactly as `1` and `-1` do, which is what an encoder that
+renders every JSON number as a float produces. `1.5`, `2`, `true` and the
+string `"1"` are all refused. A missing field sorts as `null`, putting absent
+values at one end rather than in arbitrary positions. Sorting by an array
+field uses its elements.
 
 ```javascript
 { "projection": { "item": 1, "qty": 1 } }          // inclusion (+ _id)
@@ -536,6 +603,15 @@ pathological pattern cannot become a denial of service against the database.
 An invalid pattern **matches nothing** rather than failing the query — a single
 bad pattern in an `$or` should not take down the whole request.
 
+**`$options` is read flag by flag, and a flag it does not know is dropped
+silently.** The four above are the whole set; anything else in the string is
+passed over and the pattern compiles without it. That is the same shape as a
+misspelt [`$type` alias](#type), and it bites the same way: `$options` is
+case-sensitive, so `"I"` is not `"i"` — `{"$regex": "S", "$options": "I"}`
+answers `200` having compiled a *case-sensitive* pattern, and finds none of
+the `"s"` a caller expected it to. `"iz"` sets `i` and swallows the `z`.
+There is no refusal to notice, so check the flags rather than the result.
+
 ---
 
 ## Not implemented
@@ -564,7 +640,9 @@ and asking for more than 10,000 is *clamped rather than refused* — the request
 succeeds and returns fewer than were asked for. A client that reads an
 unlimited `find` as "the whole collection" processes a prefix and is told
 nothing. `count` has no cap, because a count that stopped early would be a
-wrong number rather than a short list.
+wrong number rather than a short list. `limit: 0` is a **window of nothing**,
+not a request for the default: an empty page with no `nextCursor`, on every
+access path and every sort order.
 
 ```json
 { "filter": {}, "limit": 50, "skip": 100 }
@@ -635,7 +713,12 @@ rather than quadratic in it.
 - **Not a snapshot.** A document inserted ahead of the cursor is seen; one
   inserted behind it is not. What is guaranteed is that a document present for
   the whole walk is returned exactly once — never skipped, never repeated.
-- **`skip` and `cursor` cannot be combined**; both claim to say where to resume.
+- **`skip` and `cursor` cannot be combined**; both claim to say where to
+  resume. A page reached by a non-zero `skip` also carries **no
+  `nextCursor`**, full or not: `skip` is for jumping to an offset and a
+  cursor is for walking, and a client that mixed the two would be paging
+  from a position it did not choose. Start a walk at `skip: 0`, or jump with
+  `skip` and treat that page as a one-off.
 - **A position, not a query.** The token encodes a key, so sending it with a
   *different* filter resumes that filter after the same key. The server does
   not check that a token came from the query it is used with, and a client
@@ -643,8 +726,9 @@ rather than quadratic in it.
 - **It does not expire**, and nothing on the server holds it. There is no
   session to keep alive and none to lose.
 
-`nextCursor` appears when the page filled *and* the query is one a cursor can
-continue.
+`nextCursor` appears when the page filled, `skip` is `0`, *and* the query is
+one a cursor can continue — no sort, or `{"_id": 1}`. All three: a full page
+in `_id` order asked for with `skip: 5` carries no token.
 
 > **End the walk on a short or empty page, not on a missing token.** A
 > collection of exactly 200 documents read 100 at a time hands back a token on

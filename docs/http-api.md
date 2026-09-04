@@ -295,7 +295,9 @@ so this is the cheap way to read one document *with* its version.
 
 **Default limit 100, maximum 10,000, and both are silent.** Omitting `limit`
 returns a page of 100 rather than the collection, and a larger `limit` is
-clamped rather than refused. To read everything, walk with a cursor:
+clamped rather than refused. `limit: 0` is legal and is an empty page —
+`{"documents": [], "count": 0}`, with no `nextCursor` — on every sort order.
+To read everything, walk with a cursor:
 
 ```json
 { "filter": {}, "limit": 100 }
@@ -334,7 +336,11 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
   -d '{"filter":{"qty":{"$lt":1}},"multi":true}'
 ```
 
-`multi` defaults to `false` — without it, one document is affected.
+`multi` defaults to `false` — without it, one document is affected. An
+omitted `filter`, or `{}`, matches every document — combined with
+`multi: true` that is the deliberate way to affect the whole collection. An
+explicit `filter: null` is not the same as omitting it: it is refused `422`,
+not read as "no filter" ([The JSON boundary](#the-json-boundary)).
 
 > **`modified` counts documents written, not documents changed.** A `$set` to
 > the value a field already holds is still a write, so it still counts —
@@ -356,10 +362,12 @@ how many chunks landed ([ADR-086](decisions.md)).
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
-names one document. On these routes it is a **body** field: `?if_stamp=…` on
-the URL is refused `400`, as any query string on a route that takes none is
-(see [The JSON boundary](#the-json-boundary)), rather than being read as no
-condition at all.
+names one document — or with `explain`, below. On these routes it is a
+**body** field: `?if_stamp=…` on the URL is refused `400`, as any query
+string on a route that takes none is (see
+[The JSON boundary](#the-json-boundary)), rather than being read as no
+condition at all — and `"if_stamp": null` in the body is refused `422` for
+the same reason, rather than making the write unconditional.
 
 An update path may address array elements — `items.$[].qty` for every
 element, `items.$[line].qty` for the elements an `arrayFilters` entry
@@ -411,7 +419,13 @@ pathological document from producing a field list longer than the documents it
 describes. With `examples=true` an `example` is always a scalar: a field whose
 values are objects, arrays or `null` carries none, because the field list
 already says what they hold, and a string over 120 bytes is passed over in
-favour of a shorter occurrence.
+favour of a shorter occurrence. Scalar there means *BSON* scalar, so a date,
+an ObjectId or a binary value is an example and arrives in its
+[Extended JSON](#the-json-boundary) form — `"example": {"$date":
+1754006400000}` is a scalar example, not a container one. A field is left
+without an example when no occurrence in the sample qualifies, which for a
+field whose every value is a long string means none at all: the key is
+absent rather than `null`.
 
 `nodeDurability` is the durability class of the node that answered —
 `durable` or `coalesced`, the same value `GET /v1/version` reports as
@@ -574,6 +588,29 @@ many entries as it returns, a range put in `_id` order reads the whole range.
 `count` visits every match and holds none of them: its cost is the time of
 the scan, not the memory of the result.
 
+**On `update` and `delete`, `explain: true` plans the write; it does not
+perform it** ([ADR-131](decisions.md)). It answers with the same
+`documentsExamined`/`documentsMatched`/`strategy` a real write would use, but
+writes nothing and spends no commit: `matched`, `modified`, `deleted` and
+`commits` all read `0`, and `stamp` is absent — exactly what those fields
+already say for a write that matched nothing. What the write *would* touch
+is `explain.documentsMatched`. Drop `explain` to perform the write the plan
+described.
+
+**On `update`, that count is the selection, not a guarantee.** `explain`
+plans which documents match and how they are found; it never runs the
+update operators, so the real write can still refuse a document `explain`
+reported as matched — a `$inc` on a field holding a string, for instance,
+answers `400` on the write and `200` with that document counted on the
+plan.
+
+**`explain` cannot be combined with `if_stamp`, and is refused `400` with
+it.** A plan never checks a document's version — that check only happens
+inside the write `explain` does not perform — so a plan cannot honestly
+answer "would this write happen" for a conditional write: the document it
+reports as matched may be exactly the one the real write, checking the same
+stamp, refuses `409 stale` on.
+
 ---
 
 ## Change streams
@@ -710,6 +747,53 @@ a misspelt `collection` used to default to `*` and widen the grant. A document
 body is content, not a shape: insert, replace and bulk take any field, because
 `limit` and `filter` are perfectly good names for a document's own fields.
 
+**An explicit `null` on a declared *optional* field is refused `422
+bad_request`, not read as absent.** An optional field you omit still means
+what it always meant; the same field sent as `"field": null` is refused by
+name, in the same envelope and message shape as any other wrong-typed value.
+`Option<T>`'s ordinary deserialization cannot tell "you never mentioned this"
+from "you sent `null`", and the two are not the same request:
+`{"if_stamp": null}` on `update`, `delete` or `find_and_modify` is not the
+same as leaving `if_stamp` out, and `{"filter": null, "multi": true}` on
+`delete` is not the same as `{"filter": {}, "multi": true}` — the latter is
+the documented, deliberate way to match every document; the former is
+refused rather than silently meaning the same thing ([ADR-128](decisions.md)).
+This is about a request shape's own declared fields, not what is inside
+them: a filter, an update operator's operand, or a stored document may hold
+a genuine `null` value anywhere, and none of that is touched by this rule.
+A *required* field sent as `null` was already refused before this rule
+existed — it fails its own type, downstream of the field being present at
+all — but by whatever status and message that field's own validation
+answers with; `update`'s `update` on `POST .../update` is `400 "expected a
+JSON object"`, for instance, not this `422`. This rule is what closes the
+one gap: an *optional* field's `null`, which nothing refused before.
+
+**One nested shape does not name the field inside it: a tagged `provider`
+object.** `{"provider": {"kind": "open_ai", "endpoint": null, …}}` is
+refused, but the message reads `"provider: invalid type: null, expected a
+non-null value"` — it names `provider`, not `provider.endpoint`. This is not
+particular to `null`: `{"provider": {"kind": "open_ai", "dimensions":
+"nine"}}` is refused the same truncated way, and always has been. Once the
+`kind` tag is matched, the value is re-read through a second, unrelated
+deserializer, and the path tracker that otherwise names a nested field —
+`chunk.max_tokens` reports its full path correctly, being an ordinary struct
+rather than a tagged one — cannot see across that seam. The status and the
+refusal are both right; only the name is short.
+
+**An aggregation stage operand is closed too, but at `400`, not `422`.**
+`$unwind`'s document form (`path`, `preserveNullAndEmptyArrays`,
+`includeArrayIndex`), `$lookup`'s both forms, and `$replaceRoot` refuse a key
+they do not define, naming it — the same closure, deliberately at a different
+status ([ADR-129](decisions.md)). The `422` above is `JsonBody<T>`'s status
+for a *serde-typed* shape the request extractor itself rejects; a pipeline's
+`pipeline` array is untyped JSON at that layer — which stage a document
+names, and therefore which keys are legal, is not decided until
+`kimmy-query` parses it — so its refusal lands where every other
+malformed-pipeline error already does: `400 bad_request`, the same status
+`$group`'s unknown-accumulator refusal has always used. `$match` filters and
+`$project` specifications are **not** closed: every key in either is a
+document field name the caller chose, not vocabulary this server defines.
+
 **Query strings are held to the same rule, at `400`.** `?limt=5` on
 `GET .../docs`, or `?limit=abc`, is `400 bad_request` with the parameter
 named. The status differs from a body's `422` because a query string is part
@@ -722,8 +806,13 @@ naming the first parameter and saying the route takes none
 ([ADR-124](decisions.md)). So `if_stamp` on `update`, `delete` and
 `find_and_modify` is a body field a query string can never carry:
 `POST .../update?if_stamp=…` is refused rather than read as an unconditional
-write. A bare `?` with nothing after it names no parameter and is not
-refused.
+write. A query string that names **nothing** is not refused: a bare `?`, and
+one made only of `&` separators — `?&`, `?&&&` — pass on every route,
+because there is no parameter in either to reject and a client that appended
+an empty one has asked for nothing. `?=` and `?;` do name something — an
+empty name, and a parameter whose name is `;` — and both are refused, the
+first as a malformed query string and the second as an unknown parameter,
+each saying the route takes none ([ADR-124](decisions.md)).
 
 **Object key order is preserved** through the boundary and into the stored
 document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
@@ -731,10 +820,14 @@ document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
 sort or update document, where the order carries meaning — a sort document's
 first key is its primary key, and update operators apply in the order they
 arrive (ADR-120). An inclusion projection answers in the document's order,
-not the projection's. This is the server's end of the wire; the other end is
-the client's JSON encoder, and the index route's `fields` array exists because
-that end is the one a client cannot always vouch for (see
-[Indexes](#indexes)).
+not the projection's. **An update keeps the order it found and appends what
+it adds:** a `$set` of a field the document already has rewrites it in place,
+and a `$set` of a new one puts it last, so `[_id, zeta, alpha]` becomes
+`[_id, zeta, alpha, beta]`. `_id` comes first because that is where a stored
+document keeps it, whatever position it held in the body that wrote it. This
+is the server's end of the wire; the other end is the client's JSON encoder,
+and the index route's `fields` array exists because that end is the one a
+client cannot always vouch for (see [Indexes](#indexes)).
 
 ---
 
@@ -898,8 +991,8 @@ failure cannot appear without its retry class being decided in the same commit.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it |
-| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)) |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
+| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, a field the route does not define, or an explicit `null` on a declared *optional* field that does not accept one; the message names it ([ADR-121](decisions.md), [ADR-128](decisions.md)). A `null` sent for a *required* field is refused too, but by that field's own type — see [The JSON boundary](#the-json-boundary) — and is not always this status. **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
 | 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |
@@ -907,7 +1000,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
-| 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above: the two are different questions, and [Vectors](vectors.md#search) puts them side by side |
+| 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |
@@ -916,7 +1009,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
 | 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)) |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
-| 500 | `misconfigured` | elsewhere | This node lacks something it needs, such as an API key its vector configuration names |
+| 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |
 
 **`retry` is three-valued because KimmyDB is leaderless.** Every node accepts

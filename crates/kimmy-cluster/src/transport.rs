@@ -210,7 +210,7 @@ where
                 // an arbitrary one would let it ask for the whole oplog in a
                 // single frame.
                 let limit = limit.min(MAX_BATCH);
-                let entries = engine
+                let window = engine
                     .entries_for_peer(from, limit)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
@@ -220,8 +220,18 @@ where
                 // recover. Answer with the count that fits instead, and let the
                 // requester ask again; see `Message::BatchTooLarge` for why serving
                 // fewer entries unasked would be a silent gap rather than a kindness.
-                match how_many_fit(&entries) {
-                    Fits::All => write_frame(&mut stream, &Message::Entries(entries)).await?,
+                match how_many_fit(&window.entries) {
+                    Fits::All => {
+                        write_frame(
+                            &mut stream,
+                            &Message::Entries {
+                                entries: window.entries,
+                                scanned_to: window.scanned_to,
+                                exhausted: window.exhausted,
+                            },
+                        )
+                        .await?
+                    }
                     Fits::Only(fits) => {
                         warn!(%limit, %fits, "batch does not fit in a frame; asking the peer for fewer");
                         write_frame(&mut stream, &Message::BatchTooLarge { fits }).await?;
@@ -233,6 +243,29 @@ where
                     .snapshot_page(after)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Snapshot(Box::new(page))).await?;
+            }
+            Message::AskDivergence { probe } => {
+                // Metadata only, whatever `probe` is — see
+                // `Engine::all_collection_ids`.
+                let collections = engine
+                    .all_collection_ids()
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                // The one document read in this exchange, bounded to the
+                // single collection the requester named (ADR-133).
+                let probe_count = match probe {
+                    Some(id) => engine
+                        .count_by_id(id)
+                        .map_err(|e| ProtocolError::Malformed(e.to_string()))?,
+                    None => None,
+                };
+                write_frame(
+                    &mut stream,
+                    &Message::Divergence {
+                        collections: collections.into_iter().collect(),
+                        probe_count,
+                    },
+                )
+                .await?;
             }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             // Anything else is a peer talking out of turn.
@@ -283,11 +316,28 @@ where
     Ok(node)
 }
 
+/// The one collection this round wants a peer's document count for, and this
+/// node's own count of it — computed once by the caller so a tick contacting
+/// several peers pays for that collection's scan once, not once per peer
+/// (ADR-133).
+#[derive(Clone, Copy, Debug)]
+pub struct DivergenceProbe {
+    pub id: kimmy_core::CollectionId,
+    pub mine_count: Option<u64>,
+}
+
 /// Run one anti-entropy round against `peer`, pulling what this node lacks.
+///
+/// `probe` drives the cross-member divergence check (ADR-133): a message or
+/// two is spent on it only in the branch where the round finds nothing left
+/// to pull, since that is the one state a truncated sync window can fake —
+/// see `kimmy_storage::divergence` for what is compared and why only that
+/// branch is safe to check without flapping during ordinary catch-up.
 pub async fn sync_once(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
+    probe: Option<DivergenceProbe>,
 ) -> Result<SyncOutcome, ProtocolError> {
     let tcp =
         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await.map_err(|_| {
@@ -347,18 +397,32 @@ pub async fn sync_once(
             // Nothing to pull, but the peer's own position is still news:
             // how far *it* trails *us* is what says whether it has been
             // away longer than tombstone retention.
+            //
+            // It is also the one belief a truncated sync window can hold
+            // falsely without anything on the anti-entropy path noticing
+            // (ADR-133): `mine` already claims to cover every origin `theirs`
+            // advertised, which is exactly finding 14's signature. Asking the
+            // peer what it actually holds is cheap precisely because this
+            // branch is common on a converged cluster — though not, on its
+            // own, on a busy one; see the `exhausted` branch below for the
+            // other place this check runs.
+            let probe = divergence_probe_for(probe, &theirs, &mine);
+            let findings = ask_divergence(engine, &mut stream, probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
                 behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
+                divergent: Some(findings.existence),
+                count_probe: findings.count,
+                exhausted: true,
                 ..SyncOutcome::default()
             });
         };
 
         // Ask for a full batch; if the peer says that will not fit, ask again for the
         // number it named. At most one retry, because the peer answers with a count
-        // rather than a refusal. The limit actually settled on is what
-        // `apply_peer_batch` is told below, so a batch shorter than it still means
-        // "the peer's whole tail" and the coverage rules are untouched.
+        // rather than a refusal. The retry re-reads the window at the smaller limit,
+        // so the window end the peer reports matches the entries it sends and the
+        // coverage rules are untouched.
         //
         // The vector `from` came from travels with it, so the peer can judge
         // its horizon per origin rather than by the threshold alone.
@@ -382,22 +446,73 @@ pub async fn sync_once(
             answer = read_frame(&mut stream).await?;
         }
 
+        // Whether this round's own pull reached the peer's true tail — the
+        // fact that lets the divergence check also run on a round that
+        // pulled something, rather than only on a round that found nothing
+        // left to pull (ADR-133). A completed snapshot pull earns the same
+        // reading: `pull_snapshot` does not return until `page.next` is
+        // `None`, which is every page the peer had as of the pull, the
+        // snapshot's own version of "reached the tail".
+        let mut window_exhausted = false;
         let mut outcome = match answer {
-            // The batch, and what it proved: a short one is the peer's whole
-            // tail, a full one a window ending at its last stamp. Either way
-            // the witnessed vector is raised for every origin the peer
-            // advertised, including stamps it holds but never ships — a
-            // `UniqueViolation` (ADR-029) — because otherwise such a stamp
+            // The batch, and what it proved: an exhausted window is the peer's
+            // whole tail, any other ends at the stamp the peer says it scanned
+            // to. Either way the witnessed vector is raised for every origin
+            // the peer advertised, including stamps it holds but never ships —
+            // a `UniqueViolation` (ADR-029) — because otherwise such a stamp
             // pins `behind` at its floor and the same window is re-served
-            // every round for the life of the cluster (ADR-082). The decision
-            // lives in storage (`coverage_after_batch`), where it is tested
-            // between engines without a network.
-            Message::Entries(entries) => engine
-                .apply_peer_batch(&theirs, &entries, limit)
-                .map_err(|e| ProtocolError::Malformed(e.to_string())),
+            // every round for the life of the cluster (ADR-082). The peer
+            // reports where its window ended rather than leaving it to be
+            // deduced from how many entries arrived, which a withheld entry
+            // could make a lie (ADR-127). The decision lives in storage
+            // (`coverage_after_batch`), where it is tested between engines
+            // without a network.
+            Message::Entries { entries, scanned_to, exhausted } => {
+                // A correct sender cannot produce an empty, non-exhausted
+                // window: `read_oplog_from_where` only stops short of the
+                // limit by reaching the true end of the oplog, and it never
+                // breaks without having pushed at least one kept entry
+                // first when it does not (U1's proof, over every withheld
+                // arrangement and limit). This combination is therefore not
+                // an ordinary capped pull with nothing new to offer — it is
+                // a peer claiming both "nothing here" and "more exists",
+                // which nothing downstream can safely read as convergence.
+                // Failed as a malformed round rather than silently treated
+                // as "not exhausted, do not check": that would fold a
+                // genuine signal into the same bucket as an unremarkable
+                // capped pull, and a failed round is exactly the shape
+                // `kimmy_sync_failures_total` exists to make visible.
+                if is_unreachable_from_a_correct_sender(entries.len(), exhausted) {
+                    // Logged unconditionally, not left to the caller's
+                    // generic per-peer failure debounce: that debounce is
+                    // right for the ordinary noise of a peer going up and
+                    // down, and wrong here, because it can route this
+                    // occurrence's very first sighting to `debug` if the
+                    // same peer already had an unrelated failure recently —
+                    // leaving nothing but a bare counter increment for a
+                    // condition whose whole point is that it should never
+                    // occur at all. The counter says something is wrong;
+                    // this is what says what.
+                    warn!(
+                        %peer,
+                        ?from,
+                        "peer answered an empty batch while reporting its tail was not \
+                         reached; a correct sender cannot produce this, refusing the round"
+                    );
+                    return Err(ProtocolError::Malformed(format!(
+                        "peer at {peer} answered an empty batch from {from:?} while reporting \
+                         its tail was not reached — a correct sender cannot produce this"
+                    )));
+                }
+                window_exhausted = exhausted;
+                engine
+                    .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))
+            }
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
+                window_exhausted = true;
                 pull_snapshot(engine, &mut stream).await
             }
             other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
@@ -416,6 +531,20 @@ pub async fn sync_once(
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         outcome.lag_ms =
             kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
+        outcome.exhausted = window_exhausted;
+        // Only when the pull reached the peer's tail: a round still working
+        // through a backlog deeper than one batch has not earned the belief
+        // the check depends on, and must not spend a message finding out
+        // (ADR-133). This is what lets a busy cluster — many small rounds,
+        // each comfortably under the batch cap — still get checked on
+        // nearly every round, unlike a single global "nothing to pull" gate,
+        // which a continuous trickle of new writes can starve indefinitely.
+        if window_exhausted {
+            let probe = divergence_probe_for(probe, &theirs, &mine);
+            let findings = ask_divergence(engine, &mut stream, probe).await?;
+            outcome.divergent = Some(findings.existence);
+            outcome.count_probe = findings.count;
+        }
         // The other direction is a different question: how far the peer
         // trails this node, in history it can no longer be served. A peer
         // that is more than tombstone retention behind may be holding
@@ -452,6 +581,92 @@ fn behind_beyond_horizon(
     let collected =
         engine.oplog_collected().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
     Ok(kimmy_storage::lag_beyond_horizon_ms(theirs, mine, &collected))
+}
+
+/// Whether to trust the peer's document count this round, given `theirs` —
+/// the peer's version vector, fetched at the top of this round — and
+/// `mine`, this node's own vector as of just before asking (ADR-133).
+///
+/// The gate that gets a caller into a divergence check at all —
+/// `mine.behind(&theirs).is_none()`, or the analogous `exhausted` check —
+/// only protects *this node's* belief that it is not behind the peer. It
+/// says nothing about the reverse: whether the *peer* is behind this node.
+/// A peer that has simply not yet pulled this node's own recent writes will
+/// answer a probe with a stale, lower count for any collection those writes
+/// touched — a real difference, but ordinary replication lag, not a
+/// divergence. Measured on the round that produced finding 14's cluster:
+/// peers lagged 130–260 s behind each other in steady operation, which
+/// would otherwise have kept the count half of this check reporting a
+/// mismatch, and the two-tick confirmation does not filter it out, because
+/// a lagging peer reproduces the same mismatch on every consecutive contact.
+///
+/// `theirs.behind(&mine)` asks the reverse question directly: is there
+/// anything `mine` holds, at any origin, that `theirs` has not yet
+/// witnessed? `Some` means the peer is behind this node and its answer
+/// cannot be trusted for a count this round, so the probe is dropped
+/// (`None`) — the existence half is unaffected, since it never depends on
+/// the peer being caught up on anything of *this* node's.
+fn divergence_probe_for(
+    probe: Option<DivergenceProbe>,
+    theirs: &kimmy_core::VersionVector,
+    mine: &kimmy_core::VersionVector,
+) -> Option<DivergenceProbe> {
+    if theirs.behind(mine).is_some() { None } else { probe }
+}
+
+/// Whether a peer's `Entries` answer combines a claim no correct sender can
+/// produce: an empty batch while also reporting its tail was not reached.
+///
+/// `read_oplog_from_where` only stops short of the batch limit by reaching
+/// the true end of the peer's oplog, and it never returns having kept zero
+/// entries without doing so — so `!exhausted` implies at least one entry,
+/// over every arrangement of withheld entries and every limit (U1's proof).
+/// Pulled out as its own function because the one-line condition it replaces
+/// is exactly what an incautious edit is likely to simplify: `!exhausted`
+/// alone reads as "the same thing, shorter" and is not — it would refuse
+/// every ordinary capped pull on a busy cluster, which is the overwhelming
+/// common case this function must leave alone. See the truth table in this
+/// function's own tests for the one cell that is actually the error.
+fn is_unreachable_from_a_correct_sender(entries_len: usize, exhausted: bool) -> bool {
+    entries_len == 0 && !exhausted
+}
+
+/// Ask the peer what it holds, and compare against what this node holds
+/// (ADR-133). One message each way, on the connection already open for this
+/// round.
+async fn ask_divergence<S>(
+    engine: &Engine,
+    stream: &mut S,
+    probe: Option<DivergenceProbe>,
+) -> Result<kimmy_storage::DivergenceFindings, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Read fresh per peer contacted this tick, unlike `probe`'s count: this
+    // is a metadata scan, not a document read, so paying it once per peer
+    // rather than caching it across the tick's peer loop is not the cost
+    // this module bounds (see the module docs on `Engine::all_collection_ids`).
+    let mine_collections =
+        engine.all_collection_ids().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+
+    write_frame(stream, &Message::AskDivergence { probe: probe.map(|p| p.id) }).await?;
+    let (peer_collections, probe_count) = match read_frame(stream).await? {
+        Message::Divergence { collections, probe_count } => (collections, probe_count),
+        Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+        other => {
+            return Err(ProtocolError::Malformed(format!("expected Divergence, got {other:?}")));
+        }
+    };
+
+    let mine = kimmy_storage::DivergenceLocalState {
+        collections: mine_collections,
+        probe: probe.map(|p| (p.id, p.mine_count)),
+    };
+    let peer = kimmy_storage::DivergencePeerAnswer {
+        collections: peer_collections.into_iter().collect(),
+        probe_count,
+    };
+    Ok(kimmy_storage::compare_divergence(&mine, &peer))
 }
 
 /// Pull a full snapshot, page by page, until the peer says it is complete.
@@ -526,4 +741,34 @@ where
 
     write_frame(stream, &Message::Confirm { proof: prove(secret, &their_nonce, binding) }).await?;
     Ok(their_node)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The truth table `is_unreachable_from_a_correct_sender` decides. Only
+    /// one of the four cells is the error; the other three are all ordinary
+    /// traffic, and the one an edit is most likely to break by accident —
+    /// a non-empty, non-exhausted batch, the shape of every capped pull on
+    /// a busy cluster — is asserted explicitly rather than left implied.
+    #[test]
+    fn only_an_empty_non_exhausted_batch_is_unreachable_from_a_correct_sender() {
+        assert!(
+            is_unreachable_from_a_correct_sender(0, false),
+            "the one cell that is the error: nothing shipped, tail not reached"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(0, true),
+            "an empty batch because the peer's whole tail really was empty"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(50, false),
+            "an ordinary capped pull -- the regression a `!exhausted` shortcut would introduce"
+        );
+        assert!(
+            !is_unreachable_from_a_correct_sender(50, true),
+            "a full batch that happened to reach the tail on its last entry"
+        );
+    }
 }

@@ -7353,3 +7353,1617 @@ and the `cluster.sync` span's `applied`. The measured benchmark numbers in
 second commit is gone.
 
 ---
+
+## ADR-126 — A batch's entry cap is spent after the filter, not before it
+
+**Decision.** `Engine::entries_for_peer` counts only the entries it will
+actually ship towards the batch limit. The oplog read takes a predicate —
+`Engine::read_oplog_from_where`, which `read_oplog_from` is now a thin call
+into — and stops when it has `limit` *retained* entries or reaches the end of
+the oplog, rather than reading `limit` raw entries and dropping some of them
+afterwards. A window truncated at the cap therefore holds `limit` shippable
+entries again, and a shorter one really is the end of the peer's oplog.
+
+**The defect.** The cap was spent before the `UniqueViolation` filter ran:
+
+```rust
+self.read_oplog_from(from, limit)?          // stops at `limit` entries
+    .into_iter()
+    .filter(|entry| entry.kind != OpKind::UniqueViolation)   // then drops some
+```
+
+So a window truncated at 1,024 could return 1,019, with the peer's tail
+nowhere near reached. `coverage_after_batch` read any batch shorter than the
+limit as "the peer's whole tail" and absorbed the peer's **entire** version
+vector — which is the right answer for a genuine tail and a catastrophe for a
+truncated window. Every entry behind that window was then witnessed without
+being applied, `VersionVector::behind` reported nothing missing, and nothing
+ever re-served them. Both preconditions are ordinary: a member more than one
+batch behind, and one collision anywhere inside the window.
+
+**Why nothing caught it.** The behaviour is a blind spot between two
+deliberate designs, both of which stay. ADR-029 withholds violation entries
+from peers because every node observes the same collision independently.
+ADR-082 absorbs the peer's advertised vector — including stamps it holds but
+never ships — precisely so a withheld violation cannot pin `behind` at its
+floor and re-serve one window for ever. Neither anticipated that a withheld
+entry also *shortens the batch*, which is the signal the third piece used to
+decide the window was complete. Nothing errored, so ADR-123's counters could
+not see it either: `kimmy_sync_failures_total` 0, `kimmy_sync_ddl_refused_total`
+unmoved, `kimmy_replication_lag_seconds` 0, and not one log line on the member
+that lost the data.
+
+**Observed** on a three-member cluster running 0.21.0, 2026-09-03. Two
+collections existed on the member that created them, holding documents, and
+answered `404` on both peers forty-five minutes later — the peers did not list
+them at all. Both were created while the peers were 130–260 s behind and after
+the cluster's first cross-member unique collision, so every truncated window
+on it contained one. Documents were lost the same way and are the worse half:
+a full `_id` comparison across the three members found one collection of 2,018
+documents holding 1,518 on one member and 1,501 on another. The **500
+contiguous ids missing from the first are a subset of the 517 missing from the
+second** — one bulk insert, accepted on a third member, discarded from the
+window remainder by *both* pullers, with the second also missing a separate
+17-run. A second collection was missing five documents on each of two members,
+four of the five the same on both. Settled and unchanging across three samples
+spanning ninety seconds, with every health signal green. The overlap is the
+signature: independent losses would not share a run, and two pullers dropping
+the same remainder is what one truncated window on the origin produces.
+
+**Cost.** The scan may read past `limit` raw entries to fill the window, so the
+work per batch is no longer bounded by `limit` reads at all — it is bounded by
+the oplog, and in practice by `limit` plus however many entries the predicate
+rejects in that stretch. That is a bound removed rather than widened, and it is
+accepted deliberately: the rejected entries are violations, which are rare by
+nature and are a cluster with a much louder problem when they are not, and the
+scan is a range read that was happening anyway. Serving fewer entries than the
+limit while the tail is unreached, the alternative, is what caused this.
+
+**One other caller changed with it.** Webhook delivery reads through
+`entries_for_peer` in `dispatch::dispatch_once`, for the same reason a peer
+does — it wants the oplog minus this node's own violation entries — and so now
+also gets a scan capped on what it keeps. It re-filters that page for the
+subscription's collection and operations and re-caps it, so the change is
+invisible beyond reading a slightly longer stretch of log to fill the page it
+asked for. Nothing was wrong there before: a shorter page was simply a shorter
+page, and progress advanced over exactly what it received.
+
+**Cost of the alternative considered: ship violations and have receivers drop
+them.** ADR-082 already declined it — it moves ADR-029's exclusion to the
+wrong side and doubles the wire cost of every collision — and it would fix
+only this filter, leaving the next one to reopen the hole. ADR-127 closes that
+door properly.
+
+Defended by `a_withheld_violation_does_not_make_a_truncated_window_look_like_a_tail`,
+`a_collection_created_inside_a_truncated_window_reaches_every_member` and the
+property test `a_window_that_is_not_a_tail_never_witnesses_past_what_it_delivered`.
+
+---
+
+## ADR-127 — The peer reports where its window ended; the receiver never infers it
+
+**Decision.** `Message::Entries` carries `scanned_to: Hlc` and
+`exhausted: bool` beside its entries — the last stamp the sender's scan
+examined, and whether it stopped there because the oplog ended rather than
+because the batch filled. `coverage_after_batch(theirs, scanned_to, exhausted)`
+absorbs `theirs` when the window was exhausted, and otherwise raises each
+advertised origin to `min(their_max, scanned_to)`. It no longer sees the
+entries or the limit at all. `Engine::entries_for_peer` returns an
+`OplogWindow` carrying all three, so the fact travels from the reader that
+knows it to the rule that needs it without being reconstructed on the way.
+
+**Why, given ADR-126 already fixes the bug.** The count was never the fact;
+it was a *proxy* for "the tail was reached", true only while nothing could
+shorten a batch for another reason. ADR-126 makes the proxy honest again
+against today's one filter. It does not stop the next one from breaking it —
+a second withheld entry kind, a size-based trim, a per-collection ACL, a
+redaction rule — and the failure mode when it breaks is silent, permanent
+document loss with every health signal green, discovered forty-five minutes
+later by hand. The sending side knows exactly where its window ended. Saying
+so costs one stamp and one bool per batch, and moves the hazard from "a filter
+nobody thought about shortens the batch" to "a sender lies about its window",
+which is a thing one line of arithmetic can check.
+
+**And it is checked, because an assertion on the wire is not a fact.** The
+window's end used to be something the receiver computed and is now something
+the peer states, so `apply_peer_batch` clamps it: a window that is **not**
+exhausted claims no more than the last stamp it actually carried, and one that
+carried nothing claims nothing at all. A correct sender is unaffected — its
+scan stops on the entry it last kept, so the clamp is arithmetic that changes
+nothing.
+
+What it forecloses is a sender that trimmed a batch in place while reporting
+the end it had scanned to, which would witness away everything it dropped.
+Measured on this code before the clamp: three entries served with the oplog's
+head as the window's end left the receiver holding 2 documents of 20 with
+`behind()` reporting nothing missing, and an **empty** batch served the same
+way absorbed the peer's entire vector in exchange for nothing — the same
+defect, with a worse exchange rate. `Message::BatchTooLarge`'s doc comment
+already told implementers not to trim in place; the clamp is that sentence as
+an invariant, and the `Fits::Only` path is exactly the place the temptation
+arises. `coverage_after_batch` stays a pure function of what it is told.
+
+**The empty case is clamped rather than exempted**, on the argument that makes
+it safe to clamp: `read_oplog_from_where` stops only after keeping an entry, so
+a window that is not exhausted holds exactly `limit` entries and a correct
+sender **cannot** emit an empty one. The state is therefore always a broken or
+hostile peer, and the honest answer to a claim with nothing behind it is to
+claim nothing. Exempting it left the clamp covering everything except the case
+it was written to defend against.
+
+**What cannot be checked, and is trusted.** `exhausted` itself. Absorbing the
+peer's advertised vector on exhaustion *is* ADR-082, and this node holds
+nothing to test the claim against — it cannot know how much oplog the peer has.
+A peer that reports `exhausted` falsely still absorbs the receiver's view of
+it, exactly as before this ADR. That residual is forced by the design rather
+than chosen: the alternative is to stop absorbing on exhaustion, which is the
+livelock ADR-082 exists to prevent. So the claim this ADR makes is bounded —
+the *window's end* is now stated and checked; whether the log ended is stated
+and taken on trust.
+
+**Why `scanned_to` counts entries the sender withheld.** The scan has read
+past them, and a stamp the receiver can never be sent must not be able to hold
+the window open — that is ADR-082's cure, stated at the window's edge instead
+of only at its end. It is safe for the same reason ADR-082 gives: the sender
+serves contiguously in stamp order from the point asked for, so nothing inside
+the window was skipped except entries deliberately withheld, and claiming
+those is correct because every node observes a violation independently
+(ADR-029). Bounding by the peer's own coverage still means the receiver never
+claims history the peer does not hold.
+
+The property is only *visible* when a rejected entry is the last one read —
+while the scan stops on a kept entry the two coincide — so it is pinned
+directly, in `a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept`,
+rather than left to fall out of a sync test. Moving one assignment inside the
+predicate's branch used to break nothing in the workspace, which is not a
+property this ADR should be asserting.
+
+**A breaking wire change, and no shim.** `Entries` was a newtype variant and is
+now a struct variant; a 0.21.0 node and a node carrying this cannot replicate
+in either direction, so this is a `0.MINOR` and the changelog says so. Pre-1.0
+the project does not carry compatibility shims or negotiate versions
+(`docs/compatibility.md`): `AskEntries::held` was added as an optional field
+because it could be, and this cannot be — a default of `exhausted: true` from
+a sender that never sets it is exactly the wrong answer, and a default of
+`false` wedges every round against an older peer. An upgrade rolls the members;
+a member that has not been rolled yet fails its rounds loudly, which is the
+behaviour to want here.
+
+**What it does not change.** `BatchTooLarge` still refuses to serve fewer
+entries unasked: the requester asks again for the count that fits, the sender
+re-reads the window at that limit, and the end it reports matches what it
+sends. Trimming in place would report having scanned past entries it did not
+send, which is the same silent gap by another route — and is now clamped
+rather than only discouraged.
+
+**Cost.** One stamp and one bool per batch on the wire, against a batch of up
+to 1,024 oplog entries, plus one comparison per batch for the clamp.
+`coverage_after_batch` gets simpler, not more complex.
+
+Defended by `an_exhausted_window_proves_the_whole_advertised_vector`,
+`a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached`,
+`a_window_short_of_the_tail_claims_only_what_it_scanned`,
+`a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept`, and, for
+the clamp, `a_peer_that_over_reports_its_window_claims_only_what_it_sent` and
+`a_window_that_carried_nothing_and_is_not_a_tail_claims_nothing`.
+
+`a_violation_stamp_does_not_pin_behind_for_ever` keeps ADR-082's guard honest:
+this fix must not be reachable by reverting to "absorb only what was
+delivered". Converging is *not* what proves that, and the test says so — once
+the scan reaches a withheld stamp at the oplog's head, clipping every origin
+to it gives the same answer as absorbing the peer's vector, because a peer's
+advertised vector does not normally exceed its own log. The two rules differ
+only where it does, which happens for real: a snapshot grants coverage for
+entries the node will never hold (ADR-036), and retention collects a log out
+from under a vector that persists (ADR-097). So the test takes the *converged
+round's own exhausted window* and evaluates the rule against a vector
+advertising an origin above it, where absorbing answers the granted stamp and
+clipping leaves that origin pinned at the window's end for ever.
+
+
+## ADR-128 — An explicit JSON `null` for a declared field is refused, not read as absent
+
+**Decision.** Every optional field of a closed request shape (ADR-121) that
+is not itself meant to be nullable is deserialized through
+`json::non_null_field`, a `deserialize_with` defined once beside `JsonBody<T>`
+in `crates/kimmy-api/src/json.rs` — the same file, and the same reasoning, as
+ADR-121's own locus for the rule it states once. Serde's derive routes every
+`Option<T>` field through `Deserializer::deserialize_option`, and for JSON
+that method treats a present `null` and an absent key identically: both call
+the visitor's `visit_none`, and neither ever reaches `T`. `non_null_field`
+supplies its own visitor whose `visit_some` hands the value straight to `T`,
+unchanged from what `Option<T>` already did, and whose `visit_none` — reached
+only when the key was present and its value was `null`, since an absent key
+never invokes `deserialize_with` at all — answers
+`invalid_type(Unexpected::Unit, …)`, the same call serde_json's own
+deserializer makes for a `null` given to any type that cannot hold it. The
+`422` and its envelope come from the same `JsonRejection → ApiError`
+conversion every other malformed body already goes through, so the message
+reads exactly like `if_stamp: invalid type: integer \`123\`, expected a
+string` does today: `if_stamp: invalid type: null, expected a non-null
+value`. An absent key still yields `None`; nothing about omission changes.
+
+The attribute is on every `Option<T>` field of every route struct behind
+`JsonBody<T>`: `FindRequest` (`filter`, `sort`, `projection`, `limit`, `skip`,
+`cursor`), `FindAndModifyRequest` (`filter`, `sort`, `update`,
+`returnDocument`, `projection`, `if_stamp`), `UpdateRequest` (`filter`,
+`if_stamp`), `DeleteRequest` (`filter`, `if_stamp`), `CreateIndexRequest`
+(`name`, `enforcement`, `expireAfterSeconds`, `partialFilterExpression`),
+`webhooks::RegisterRequest` (`operations`), and `vectors::SearchRequest`
+(`query`, `vector`, `filter`, `k`, `per_document`, `weights`, `min_overlap`) —
+every closed shape `find`, index creation, webhook registration and both
+searches, all of which ADR-121 names as closed, add to the four write shapes
+finding 12 itself demonstrated the hole on.
+
+`POST .../vector` is on that list too — ADR-121 names "a vector
+configuration's `provider`" as a nested shape it closes — but not by putting
+the attribute on `kimmy_core::VectorConfig`/`ProviderConfig` themselves. Those
+two are not only this route's request body; they are also the stored form,
+inside `CollectionMeta`, and the replicated one, inside `VectorSet`'s BSON —
+and several of their fields (`ProviderConfig::{OpenAi,Cohere,Gemini}`'s
+`endpoint`, `CustomHttp`'s `api_key_env`) have `#[serde(default)]` but no
+`skip_serializing_if`, unlike `dimensions` and `max_tokens` beside them, so an
+unset one has always serialized as a literal `null` rather than an absent
+key. Putting `non_null_field` on `VectorConfig` itself would refuse to load
+or replicate-apply exactly the records that shape has always produced by
+leaving a field at its default — turning an upgrade into a node that cannot
+read its own configuration. So the refusal lives on
+`kimmy_api::vectors::VectorConfigInput` — a request-only mirror of
+`VectorConfig`, with `ChunkConfigInput` and `ProviderConfigInput` mirroring
+its two nested shapes — deserialized from the fresh HTTP body and converted
+with `From` before anything stores or replicates it, exactly the shape
+ADR-121 already used for `GrantInput` over `kimmy_auth::Grant`, and for the
+same reason: a wire shape and a persisted one are not always the same
+closure, even when they are (there, and here until now) the same type.
+`kimmy-core/src/vector_meta.rs` carries a test,
+`a_null_endpoint_or_key_variable_still_decodes_as_absent`, pinning that the
+real type stays exactly as permissive as every version before this one.
+
+The MCP tools carry the same attribute on the same fields, named for
+`kimmy_api::json::non_null_field` rather than redefined: `DescribeArgs`
+(`sample`), `FindArgs` (`filter`, `sort`, `projection`, `limit`, `skip`),
+`CountArgs` (`filter`), `SearchArgs` (`query`, `vector`, `filter`, `k`),
+`HybridSearchArgs` (`query`, `vector`, `filter`, `k`, `weights`,
+`min_overlap`), `UpdateArgs` (`filter`), `DeleteArgs` (`filter`), and
+`CreateIndexArgs` (`name`) — the same `{"filter": null, "multi": true}`
+deletes-everything case, reachable through `delete`'s tool argument the same
+as through the REST body, since rmcp deserializes both with plain serde and
+neither the HTTP path nor the tool path is more closed than the other by
+right. `InsertArgs`'s `document`, `BulkInsertArgs`'s `documents` and
+`AggregateArgs`'s `pipeline` are content the same way a REST document body
+is, and are untouched for the same reason.
+
+Each of those fields also carries `#[schemars(required)]` alongside
+`skip_serializing_if = "Option::is_none"`. schemars derives a tool's
+`inputSchema` from the field's Rust type, not from `deserialize_with`, so an
+`Option<T>` field's advertised schema is `["T", "null"]` with
+`"default": null` by default — accurate before this decision, since `null`
+genuinely was accepted, and wrong afterwards: `delete.filter`'s schema would
+have kept telling the one client that reads it first, the model, that `null`
+is not just valid but the *default* value of the argument whose `null`
+emptied a collection. `#[schemars(required)]` asks schemars for the plain,
+non-nullable schema of the inner type instead of `Option`'s; pairing it with
+`skip_serializing_if` (inert for these `Deserialize`-only structs at
+runtime, read only by schemars) drops the `null` default that
+`#[serde(default)]` would otherwise report. The property is still not in
+`required`, since omitting it is unaffected — only its `null` is. The schema
+test in `tests/mcp.rs` drives every field in the table above through
+`schema_forbids_null` as well as the runtime refusal, so the two cannot
+drift apart unnoticed again.
+
+No field opts into nullability today; one that genuinely would keep the bare
+`Option<T>` derive and say so where it is declared. Query-string structs are
+untouched: a query string cannot carry a JSON `null` — `?if_stamp=` is an
+empty string, refused already as a malformed stamp — so ADR-124's closure
+needed nothing here. Neither does a document body: `insert`, `replace` and
+bulk insert take `JsonBody<Value>` or `JsonBody<Vec<Value>>` directly, with no
+declared fields to hold this rule, and a document's own content, a filter's,
+or an update operator's operand is read straight into `Value`, which
+legitimately holds `null` — this rule reaches only a request shape's own
+declared fields, never what a `Value`-typed field's document holds. It also
+does not reach a field that is not itself optional: `update`'s `update` on
+`POST .../update` is a required `Value`, so `null` there becomes
+`Value::Null` and is refused downstream at `400`, by that field's own type,
+rather than by `non_null_field` — which only ever runs on a field the derive
+would otherwise default to `None`. Both are refused; only the status and the
+mechanism differ, and `a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field`
+pins the distinction so it reads as deliberate.
+
+One nested shape names the wrong field when it refuses: a value inside a
+`#[serde(tag = "kind")]` enum, `ProviderConfigInput` among them, is refused
+as `"provider: invalid type: …"` rather than `"provider.endpoint: …"`.
+`serde_path_to_error` tracks a path by wrapping the `Deserializer` the
+top-level call uses; once an internally-tagged enum's own tag is matched, the
+rest of that value is re-read from a buffered `Content` tree through a
+second, unrelated `Deserializer` the wrapper never sees, so nothing after the
+tag is matched can extend the tracked path. This is not new to this decision
+and not particular to `null`: a wrong-typed `dimensions` inside the same
+`provider` object truncates identically, and always has —
+`a_wrong_value_inside_a_tagged_enum_names_the_enums_own_field_not_the_inner_one`
+pins both alongside the ordinary, untagged `chunk.max_tokens`, whose path
+reports in full. Documented in `docs/http-api.md` and `docs/openapi.yaml`
+rather than worked around: the refusal and its status are both right, only
+the name is short, and reaching further would mean threading a second,
+scoped path tracker across serde's own enum-tag buffering — a fix for
+`serde_path_to_error` and internally-tagged enums generally, not something
+this decision's scope extends to.
+
+A test in each of `kimmy-api` and `kimmy-mcp` enumerates every shape and
+field this decision claims and drives it over a real socket, asserting `422`
+(`kimmy-api`) or the tool's own `isError` (`kimmy-mcp`) for an explicit
+`null` and success for an absent key — the table-driven guard the review that
+returned this unit asked for, so a field added to a closed shape later
+without the attribute fails the suite rather than shipping quietly. Nothing
+shorter of a proc macro that refuses to compile a bare `Option<T>` on a
+closed shape is fully fail-closed by construction the way ADR-124's route
+table is; this is the nearest practical approximation, and is named as a
+residual below.
+
+**Why.** `{"if_stamp": null}` on `update`, `delete` or `find_and_modify`
+answered `200` and wrote unconditionally — the opposite of what the field is
+for, and the exact failure ADR-121 named in its own motivation, one door
+further in. Worse, `{"filter": null, "multi": true}` on `/delete` answered
+`200 {"deleted": <every document>, …}`: an optional `filter` defaults to "no
+filter", which is "match everything", so a caller whose JSON encoder writes
+an unset field as `null` — the default behaviour of many — sent what it
+believed was a scoped delete and emptied the collection. The same shape on
+`/update` rewrote every document instead. Every *other* malformed value of
+these same fields was already refused: `if_stamp: 123` and `if_stamp: true`
+both `422`, `if_stamp: "not-a-stamp"` `400 malformed stamp`, and `multi:
+null` on the non-optional `multi` field was already `422` because a required
+field with no `Option` wrapper has no null-shortcut to fall into. `null` was
+the one value serde's own machinery does not already refuse for an optional
+field, on every route that declares one — found independently by two areas
+of the same test round, one from `if_stamp` and one from `filter`, neither
+aware of the other's result.
+
+**Alternatives.**
+
+- *Patch `if_stamp` alone, by hand, on each of the four write shapes.*
+  Rejected, and stated as the failing outcome this decision exists to avoid:
+  it leaves `filter: null` open, which is the destructive case. Four
+  independent write shapes carrying the identical hole is what makes a
+  per-field patch the wrong shape of fix.
+- *Walk the raw JSON body and refuse any `null` found anywhere, ahead of
+  typed deserialization.* Rejected. `JsonBody<T>` is generic over every
+  request shape the server has, including `insert` and bulk insert, which
+  take `JsonBody<Value>` and `JsonBody<Vec<Value>>` directly — a document
+  *is* its own top-level body on those routes. A walk with no notion of
+  which keys are declared fields of a shape and which are a document's own
+  content cannot draw ADR-121's boundary; it would refuse `{"note": null}` on
+  `insert` and break the routes ADR-121 named as deliberately open.
+- *Change the field's declared type instead of its deserialization —
+  `Option<NonNull<T>>` or similar.* Rejected. The null-shortcut lives in how
+  serde's derive calls `deserialize_option` for any `Option<U>`, whatever
+  `U` is; wrapping the inner type changes nothing; a JSON `null` never
+  reaches `U::deserialize` regardless of what `U` is, wrapped or not. Only
+  supplying a different visitor for `deserialize_option` itself — which is
+  what `deserialize_with` lets a field do — intercepts it.
+- *A distinct, type-specific message per field ("expected a string", "expected
+  a document").* Rejected for the same reason ADR-121 keeps its message
+  generic: one function reused everywhere is worth more than wording tuned
+  per call site, and "a non-null value" already says what a client needs to
+  fix.
+- *Put `non_null_field` on `kimmy_core::VectorConfig`/`ProviderConfig`
+  directly, since deny_unknown_fields already lives there.* Rejected, for
+  the reason ADR-121 gave for leaving `VectorConfig` out of the
+  specification's closed-request treatment, one level more serious here: a
+  response schema staying open so a new field is additive is a documentation
+  concern, but a stored or replicated record decoding under a later version
+  is a durability one. `ProviderConfig::endpoint` already serializes an unset
+  value as a literal `null` and always has, so closing the type itself would
+  refuse to load metadata this exact version of the server wrote. `kimmy-core`
+  cannot depend on `kimmy-api` to reach `non_null_field` even if this were
+  safe, which is the surface version of the same problem: the type is used
+  where the rule must not reach.
+- *Move `non_null_field` down into `kimmy-core` so `VectorConfig` could use it
+  directly, gated some other way from the storage and replication paths.*
+  Rejected as more machinery for less clarity than a mirror: it would need a
+  second entry point, or a flag threaded through every deserialization call
+  site, to tell "this is a fresh request" from "this is a stored record" —
+  exactly the distinction `VectorConfigInput` draws for free by being a type
+  that only ever exists on the request path. `GrantInput` already established
+  the pattern for a request shape that happens to coincide with a persisted
+  one; reusing it costs a `From` impl, not a new mechanism.
+
+**Cost.** Breaking for a client relying on the bug: one that sends `null` for
+an unconditional write dressed as a conditional one, or a `null` filter
+meaning "everything", now meets a `422` (or, over MCP, the tool's own
+`isError`) instead of a silent write. A `0.MINOR` bump under the pre-1.0
+policy, no compatibility shim — sending `null` was never documented to mean
+anything, and `openapi.yaml` already typed every one of these fields without
+a `null` branch, so *that* schema was already correct and needed no change;
+only the server's behaviour was not. The MCP tool schemas were a different
+story and did need one: schemars derives `inputSchema` from the field's Rust
+type regardless of `deserialize_with`, so every one of these fields
+advertised `null` as valid — accurately, before this decision — and fixing
+the server without telling schemars would have shipped a contract that lied
+to the one reader who checks it first, an agent, worst on `delete.filter`,
+whose schema would have called the one value that used to empty a collection
+its *default*. `#[schemars(required)]` plus `skip_serializing_if` on the same
+twenty fields closes that, at the same per-field cost as the attribute that
+opened it. One helper function, reused wherever a field needs it — kimmy-mcp
+names it from kimmy-api rather than redefining it — one line per field
+naming it, and one mirror type for `POST .../vector`'s three shapes: the same
+order of cost ADR-121's `deny_unknown_fields` attribute has today, plus what
+`GrantInput` already cost once. The first-party Rust and Python clients, the
+CLI, the MCP server's own use of these tools, the conformance scenarios and
+every request example in the documentation omit an unset optional field
+rather than encoding it as `null`, so none of them are affected.
+
+The Go client is not quite in that list, and not uniformly fixed the same
+way. `Count`'s existing `nil`-to-`{}` guard is right to keep and right to
+extend to `UpdateIf` and `DeleteIf`: neither takes `multi`, so a `nil`
+filter there is bounded to one document by `if_stamp` regardless, exactly as
+harmless as `Count`'s always was. `Update`, `UpdateWith` and `Delete` are the
+opposite case: each takes `multi` as the caller's own choice on every call,
+so applying the same guard there would have reproduced the exact defect this
+decision closes, one layer further out — `Delete(ctx, db, coll, nil, true)`
+would send `{"filter": {}, "multi": true}` and empty the collection, where
+sending `nil` as JSON `null` now gets the caller a `422` instead. A `nil`
+Go map is precisely what a caller gets from *forgetting* to build a filter,
+which is finding 12's own scenario arriving through a client rather than the
+wire; guarding it there would have converted a mistake the server now
+catches back into a silent one. So those three are left to send `filter`
+exactly as given, `nil` included, and the doc comment on each says so.
+
+
+## ADR-129 — An aggregation stage operand with a fixed key set is closed; a field-path map stays open
+
+**Decision.** A pipeline stage document that has a *fixed* key set —
+`$unwind`'s document form (`path`, `preserveNullAndEmptyArrays`,
+`includeArrayIndex`), `$lookup`'s both forms (`from`, `as`, `localField`,
+`foreignField`, `let`, `pipeline`), `$replaceRoot` (`newRoot`) — refuses a key
+it does not define, `400`, naming the field and listing the ones the stage
+takes. `crates/kimmy-query/src/aggregate.rs` gets one helper,
+`deny_unknown_keys(stage, doc, allowed)`, called at the top of each of those
+stages' parsers, before anything else about the document is read.
+
+**`$match` and `$project` are not put through it, and never will be.** Both
+take a *field-path map*: every key is a document field name the caller chose,
+not a word this codebase defines, so there is no fixed vocabulary to check a
+key against — `{"$match": {"bogusFieldName": 1}}` is not a typo of anything,
+it is a filter on a field called `bogusFieldName`, and refusing it would
+refuse most ordinary pipelines. `$sort`'s keys and a `$group` stage's output
+field names are field-path-shaped the same way and are left alone for the same
+reason; `$group`'s `_id` and its accumulator arguments are expressions, open
+by the same rule expressions have always followed. This is the line ADR-121
+already drew for the request body — a document body is content, not a shape —
+extended one level down: a stage operand is a shape when its keys are
+vocabulary, and content when its keys are data.
+
+`includeArrayIndex` — a real MongoDB `$unwind` option that this database
+silently dropped — is implemented rather than refused by name: it is the name
+of a field to hold the position of the array element that produced each output
+row, `null` on a row that was not produced by fanning one out (an unwound
+scalar, or a document kept by `preserveNullAndEmptyArrays`). It is trivial
+here because `unwind`'s expansion loop already knows the element's position
+the moment it produces a row; adding the field costs one more `path::set`
+alongside the one it already makes. Two more names are refused, on KimmyDB's
+own internal consistency rather than on parity: a name beginning with `$`,
+because this language's own field-path syntax reads `"$name"` as the field
+called `name`, never one called `$name` — a document beginning with `$` is an
+operator (`aggregation.md`'s own rule) — so `$unwind` could write such a field
+and no later stage could ever read it back; and a name equal to `path` itself,
+because it would silently overwrite the element `$unwind` just placed there
+with its own index.
+
+**A closed key set is not the whole hazard; a closed key's *value* is
+another.** `preserveNullAndEmptyArrays` reached `Bson::as_bool`, which returns
+`None` — read here as `false` — for anything that is not literally a boolean.
+So `{"preserveNullAndEmptyArrays": "true"}` or `: 1` answered `200` with the
+option silently reverted, the exact failure mode finding 11 is named after,
+moved from the key to the value. It is now refused by name, matching
+`includeArrayIndex`'s existing type check three lines below it in the same
+parser — leaving one and not the other would have been the same
+inconsistency this ADR closes elsewhere, in miniature.
+
+**The same defect class, found in two expression operands while this unit
+was in the file.** `$dateToString`'s `format` and `$switch`'s `branches`
+(and each branch's `case`/`then`) are fixed-key documents too, in
+`crates/kimmy-query/src/expr.rs`, and were not closed: `{"$dateToString":
+{"date": "$t", "formt": "%Y"}}` — the finding's own shape, one character
+short — silently kept the default ISO-8601 format in every row rather than
+naming the typo, precisely the hazard `aggregation.md` already argues for an
+unknown date specifier. Both now go through `Expr::named_spec`, the helper
+`$filter`, `$map`, `$reduce` and `$let` already used for the same purpose;
+closing them cost two more calls to it, not a new mechanism.
+
+**Why.** ADR-121 states the rule reaches "the shapes nested inside" a request
+body — an index's field entry, a search's fusion weights — and gives, as its
+own motivating example, a misspelt `colection` in a grant that silently
+widened it to every collection in the database. An aggregation stage operand
+is exactly such a nested shape, and it was not closed: `{"path": "$x",
+"preserveNullAndEmptyArray": true}` — one character short of
+`preserveNullAndEmptyArrays` — answered `200` with the option silently
+reverted to `false`, dropping documents the caller asked to keep, and
+`includeArrayIndex` on a real pipeline answered `200` with the field silently
+absent. `$group` already refused an unknown accumulator by name; the
+inconsistency was that the rest of `aggregate`'s own stage operands did not
+get the same treatment ADR-121 gives everything else nested in the request.
+
+The reason ADR-121's mechanism — `#[serde(deny_unknown_fields)]` on a typed
+struct — does not reach here is structural, not an oversight to route around:
+`AggregateRequest.pipeline` is `serde_json::Value`, because a pipeline stage's
+shape depends on which operator names it, which `kimmy-api` does not decide —
+`kimmy-query` does, by hand, off a `bson::Document`, the same way `$group`
+already refuses an unknown accumulator. So the closure is enforced where the
+stage is actually parsed, with the same `Error::InvalidQuery` and `400` that
+`$group`'s refusal and every other malformed-pipeline error already use, not
+`422` — `422` is `JsonBody<T>`'s status for a shape serde itself rejects, and
+a stage operand was never one of those.
+
+**Alternatives.** *Give every stage a typed, `deny_unknown_fields` struct and
+deserialize each `Document` into one via `bson`.* Rejected: stages are parsed
+by hand today specifically because several of them are not one-shape-fits-all
+— `$unwind` takes a string or a document, `$project`'s values are flags in one
+branch and expressions in another, `$lookup` is two mutually exclusive shapes
+sharing two keys — and a serde struct would have to re-express all of that
+through its own attributes for four call sites, at the cost of the manual
+parser's existing, readable error messages. A small helper called at each
+parser's entry gets the same closure for a fraction of the code. *Silently
+drop `includeArrayIndex` and document it as unsupported.* Considered, since
+the finding permits it — but the loop that would carry it already has the
+element and its position in hand, so refusing was pure cost for no benefit.
+
+**Cost.** A `0.MINOR` behaviour change: a pipeline that sent an unrecognized
+key to `$unwind`, `$lookup`, `$replaceRoot`, `$switch` or `$dateToString` and
+relied on it being ignored now gets a `400` instead of a silent `200`, and one
+that sent a wrong-typed `preserveNullAndEmptyArrays` or an
+`includeArrayIndex` that begins with `$` or names `path` gets the same.
+`$unwind`'s document form gained a field (`include_array_index:
+Option<String>` on `Stage::Unwind`), threaded through `apply_with_vars` and
+`unwind`. Tests in `crates/kimmy-query/src/aggregate.rs`: the load-bearing
+misspelling pair, the same pair moved to the *value* of a correctly-spelled
+key, `includeArrayIndex` actually working and its two new naming refusals, an
+unknown `$lookup`/`$replaceRoot` key refused, and a control proving `$match`
+and `$project` still take any field name; two more in
+`crates/kimmy-query/src/expr.rs` for `$switch` and `$dateToString`.
+`docs/aggregation.md#stages` documents the document form,
+`preserveNullAndEmptyArrays`, `includeArrayIndex` and the closed/open line;
+none of it was written down anywhere before. `docs/http-api.md` states the
+`400`-not-`422` distinction this ADR draws, since its own status-code table
+would otherwise read as a blanket `422` for every unknown request field.
+
+---
+
+## ADR-130 — `$unwind` refuses a path that crosses an array rather than writing nowhere
+
+**Decision.** `crates/kimmy-query/src/aggregate.rs` gets a helper,
+`crossing_array(doc, field)`, that decides — for one document, before
+anything at `field` is read — whether writing to `field` would fail, and if
+so, where: it walks `field`'s segments against `doc`'s actual structure,
+read-only, the same way `path::set` would, and returns `(array_path,
+remainder)` the moment a non-terminal segment lands on an array whose next
+segment names a field rather than a numeric position — `path::set`'s one
+failure mode, and what "the path crosses an array" means here. A segment
+that is missing, a scalar, or an array reached by an index that is not
+already a document is what `path::set` would vivify or overwrite rather than
+fail on, so the walk stops there and reports no crossing, without needing to
+actually perform a write to find out — `crossing_array` never clones or
+mutates `doc`. `unwind` calls it once per document, at the top of its loop,
+unconditionally: if it reports a crossing, the document — and the whole
+request, `$unwind` is not a per-document filter — is refused, `400`, naming
+`$unwind`, the field path, the array it crosses (`array_path`), and the
+concrete remedy: unwind `array_path` first, then read `remainder` on each
+resulting row — the caller who wrote `$unwind: "$items.sku"` is told to
+write `$unwind: "$items"`, not handed `path::set`'s internal vocabulary
+about non-numeric segments. This holds **regardless of what `field` turns
+out to contain**: a non-empty array, an empty one, a scalar, `null`, nothing
+at all. Only once the check passes does `unwind` go on to read `value_at`
+and decide, by the existing rules, whether to expand, drop, preserve or pass
+a document through; every write on that path is now guaranteed to succeed
+structurally, so `path::set`'s `Result` there is still propagated with `?`
+rather than unwrapped — a proof that holds today is not a reason to let a
+future change panic instead of refuse. `preserveNullAndEmptyArrays` and
+`includeArrayIndex` are unaffected by any of this: the crossing check runs
+before either is consulted, and a document it refuses never reaches them.
+
+**This is a revision, made under independent review, of what this ADR first
+proposed.** The version first shipped kept `value_at`'s ordinary read and
+refused only when `path::set` failed *while expanding an array `value_at`
+had found* — i.e., only when the value sitting at the far end of the crossed
+segment happened itself to be an array. That is not a rule a caller could
+state or predict: whether `$unwind` refused depended on the *type* of one
+crossed element, decided by the data, not on the path crossing an array at
+all. Two consequences followed, both wrong answers of the exact shape this
+ADR exists to prevent. `a: [{b: 9}, {b: [1, 2]}]` with `$unwind: "$a.b"`
+answered `200` with one row that looked unwound but was not — `value_at`
+found `9` at the first element, a scalar, so the array-expansion branch, and
+therefore the write, was never attempted. And `items: [{sku: "a", qty: 1},
+...]` with `$unwind: "$items.sku"` — finding 10's own row 5 — kept answering
+`200` unchanged exactly as it had at `26944f8`: `sku` is a scalar at the
+first element, so this defect's own reported case was still not fixed by
+that version of the fix. The check now runs on the path's *structure* alone,
+independent of what is found, so both refuse.
+
+**Why refuse rather than MongoDB's silent skip.** The finding gave two
+options: resolve the path without descending into arrays, so a path that does
+not land on a single array is treated as absent (dropped, or kept once under
+`preserveNullAndEmptyArrays`); or refuse. MongoDB does the former. This
+project does the latter, for reasons specific to what this codebase already
+decided:
+
+- **ADR-116 did not reach this case, and its reasoning for the case it did
+  reach argues for a refusal here.** ADR-116 decided how `$unwind`'s path is
+  *read* — the single, non-fanning value, "because `$unwind` needs a single
+  place to write each element back to" — but it never decided what happens
+  when that single place does not exist; a path crossing an array was not a
+  case its rule set covered, and this ADR is the first to decide it. Its own
+  reasoning points the same way it always would: a missing field and an
+  unwritable one are different failures, and only one of them is silent by
+  design. **This does cost ADR-116's own compatibility claim for this one
+  shape** — *"a pipeline that runs there runs here with the same result"* —
+  which this codebase is no longer trying to hold as a general bar (parity is
+  not the bar this project is held to; a divergence is not by itself a
+  defect), but which ADR-116 stated as its reason, so it is named here rather
+  than left standing unqualified: a pipeline whose path crosses an array does
+  not run the same here as there, deliberately, because refusing loudly beats
+  running silently wrong.
+- **Every other stage in this file that cannot honour what it was asked
+  refuses rather than approximates**, and says so in its own comments: a
+  blocking stage over the cap is "an error naming the stage rather than a
+  truncated result" because a partial `$group` "looks exactly like one over
+  all of it"; `$lookup` run by the pure pipeline refuses rather than passing
+  its input through, because that "is a wrong answer wearing a right answer's
+  shape." A silently dropped document is the same shape of wrong answer:
+  correct-looking, `200`, and undetectable by the caller — exactly what
+  produced this finding when the row was duplicated unchanged instead. MongoDB
+  accepts that cost because the drop is documented and expected there; this
+  codebase's standing preference, stated in `deviations.md` and repeated
+  through ADR-121 and ADR-124, is that a request the server cannot honour is
+  refused rather than answered as though it had been.
+- **It is the smaller change.** The refusal mirrors `path::set`'s own
+  traversal rule read-only, once per document, with no new resolver and no
+  second notion of what a path "means"; the silent-skip contract would need
+  a genuinely different reader — one that fails to resolve at all through an
+  array, distinct from both `value_at` and `path::set` — solely to
+  reproduce, on purpose, the same "found nothing" outcome a missing field
+  already gets, and to decide, independently, what `preserveNullAndEmptyArrays`
+  should mean for a case that is not actually missing.
+
+**What is unaffected.** A path that never crosses an array on a given
+document — a top-level array field, a dotted path through plain
+subdocuments (`$unwind: "$y.b"` where `y: {b: [1, 2]}`), or a numeric-indexed
+segment into an array (`$unwind: "$a.0"`, which addresses a position rather
+than crossing) — writes back exactly as it always has; `crossing_array`
+reports nothing for any of these, because `path::set` only fails on a
+non-terminal *non-numeric* array segment. **A path that crosses an array into
+a scalar is no longer unaffected — this is the behaviour change this
+revision makes, named plainly**: `$unwind: "$items.sku"` where `items` is an
+array of `{sku, qty}` now refuses, `400`, on every document where `items` is
+an array, whatever `sku` holds there. It is a bigger break than the version
+first shipped, and it is the point: it is the only contract that closes the
+finding's own row 5 rather than leaving it standing.
+
+**This makes the refusal data-dependent, and the cost of that is stated in
+full below rather than waved past.** Whether `{"$unwind": "$a.b"}` is legal
+depends on whether `a` is ever an array in the documents it meets, which a
+schemaless collection does not fix in advance and does not enforce; the same
+pipeline can be correct today and refuse tomorrow after an ordinary write
+adds one document shaped that way, with nothing about the pipeline having
+changed, and the refusal reaches every document in the request, not only the
+one shaped that way.
+
+**What protects ADR-116's non-fan-out reading of `$unwind`'s path, now that
+this test no longer runs `$unwind` over the fixture that used to.**
+`unwind_and_lookup_keys_read_a_field_path_and_do_not_fan_out`'s `$unwind`
+assertion (`out.len() == 2`) was removed, not weakened: over its fixture
+(`a: [{b: [1, 2]}, {b: [3]}]`), a *fanning* reader would compute `$a.b` as
+`[[1, 2], [3]]` (ADR-116's own array rule) — also length 2 — so the old
+assertion held identically under the reading ADR-116 chose and the one it
+rejected, and never had the power to pin that choice; it pinned the defect's
+row count. `lookup_keys` in the same test still does: a fanning reader would
+make `lookup_keys(&input, "a.b")` a single `[[1, 2], [3]]` key, not the two
+flat integers the assertion checks, and `$lookup`'s key extraction reads
+without ever writing, so it is untouched by anything in this ADR.
+
+For a **non-numeric** crossed segment, `$unwind` itself needs no test of its
+own reader choice, because the uniform check refuses on exactly the documents
+where a fanning and a non-fanning reader would ever disagree there: an array
+on a non-terminal segment whose next segment is not numeric is both
+`path::set`'s one failure condition and where fanning would diverge from the
+single-value read, so both readers are refused alike, `items.sku` included.
+
+**A numeric segment is the one place this does not hold, and ADR-116 already
+named it as such** — *"the one place an expression path and a filter path
+disagree: the filter language reads `items.0` both ways"* — and `value_at`
+(`path::resolve`) follows the filter's rule, reading a numeric segment as
+both an index and a field name, while the fanning expression reader reads it
+only as a field name, never an index. A numeric segment after a crossed
+array is therefore not refused — `path::set` succeeds by index, the same
+"single place" a numeric-indexed write always has — and `$unwind`'s own
+output *does* distinguish the two readers there:
+`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
+pins it. Over `a: [{b: [1, 2]}, {b: [3]}]`, `$unwind: "$a.0.b"` reads `a.0.b`
+as `[1, 2]` (found once, by index) and produces two rows, `a[0].b` set to `1`
+then `2`; the fanning reader over the same path finds no element literally
+named `"0"`, gets `[]`, and would produce none. `$unwind: "$a.0"` in "What is
+unaffected" above is exactly this case one segment shorter, and is itself
+the counter-example to the broader "unobservable" claim an earlier revision
+of this ADR made here — corrected under further review, which is why this
+paragraph, unlike most of this document, describes a mistake made and fixed
+within the same unit rather than a decision reached once.
+
+**Alternatives.** *MongoDB's silent-skip contract*, rejected above. *Refuse
+only when the value found at the crossed segment happens to be an array* —
+this ADR's own first version, rejected above as not a statable rule and as
+leaving the finding's own row 5 unfixed. *Detect "crosses an array" up
+front, at parse time, before any document is read.* Not possible here:
+whether a given document's `a` holds an array is data, not schema, in a
+document database with no required shape — the same document under a
+different `_id` might hold a plain subdocument at the same path. The
+refusal is necessarily per-document, discovered by a structural walk, which
+is exactly what `crossing_array` does as early as it can.
+
+**Cost.** A `0.MINOR` behaviour change, larger than first estimated. A
+pipeline that unwound a path crossing an array by a named field previously
+got a `200` with byte-identical duplicate rows (N = the first element's
+array length, nothing actually unwound) and now gets a `400` naming
+`$unwind`, the crossed array and the field to read from each of its
+elements — on *any* document shaped that way, not only ones where the
+crossed element also held an array. **This is not limited to a pipeline that
+was already producing wrong rows.** `$unwind: "$a.b"` over a collection
+where every document has `a` as a plain subdocument runs, and returns
+correct rows, exactly as before; the same pipeline over a collection where
+even one document has `a` as an array — a shape that never triggered the
+original defect, because the crossed element might have been a scalar — now
+refuses that request entirely. A field a pipeline unwinds must be one that
+is never an array on any document reaching the stage, unless every segment
+past it addresses a position by number rather than by name;
+`docs/aggregation.md#unwind` states this as the operational rule a pipeline
+author needs, not only as an implementation detail, and describes the
+numeric exception and what it produces. Seven tests in
+`crates/kimmy-query/src/aggregate.rs`: the finding's shape refusing; a
+scalar found first no longer skipping the refusal (`a: [{b: 9}, {b: [1,
+2]}]`); the non-crossing control (`$unwind: "$y.b"`); the real corpus shape
+(`$unwind: "$items.sku"`), now refusing rather than passing through; a
+single-element array refusing identically to a multi-element one, since the
+check never inspects length; and the numeric-segment residue
+(`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`).
+An eighth, over HTTP in `crates/kimmy-api/tests/api.rs`
+(`unwind_refuses_a_path_that_crosses_an_array_over_http`), reproduces the
+finding's own route rather than only the parse layer. `docs/aggregation.md`
+states the actual rule — including the numeric carve-out, which an earlier
+revision of this documentation omitted, over-claiming that *every* crossing
+refuses — in `$unwind`'s own value table and in `#arrays`, names the
+data-dependence and the whole-request blast radius explicitly, and
+`docs/http-api.md` draws the `400`-versus-`422` line ADR-129 also needs.
+`crossing_array` walks the document read-only rather than cloning it to
+probe a write, so the fix costs no allocation on top of what `unwind`
+already made per row, and its error names the crossed array and the
+remaining field directly — *"unwind `$items` first, then read `sku` on each
+resulting row"* — rather than surfacing `path::set`'s internal vocabulary.
+
+
+## ADR-131 — `explain: true` on `update` and `delete` plans the write; it does not perform it
+
+**Decision.** `explain: true` on `POST .../update` and `POST .../delete` no
+longer executes the write it was asked to describe. Both routes now run the
+same read-only scan `find` and `count` already use — `exec::visit_matching`
+— and report its `QueryStats` as `explain`, exactly as `find` does. Nothing
+is written and no write transaction opens. The write-outcome fields keep
+their existing names and existing meaning — "what was written" — so under
+`explain` they report that nothing was: `matched`, `modified` and `commits`
+are `0` on `update`; `deleted` and `commits` are `0` on `delete`; `stamp` is
+absent on both — in every case identical to what a write that matched
+nothing already reports today. What the write *would* touch is
+`explain.documentsMatched`, the field `find`'s own `explain` has always
+carried for the same question asked of a read. `explain` cannot be combined
+with `if_stamp`, and is refused `400` with it: a plan checks no version, so
+it cannot honestly answer whether a *conditional* write would happen — the
+document it reports as matched may be exactly the one the real write,
+checking the same stamp, refuses `409 stale` on. Covered by
+`explain_plans_a_write_without_performing_it`, which drives a
+single-document and a `multi: true` case on both routes, asserts the
+response fields, asserts the engine's own commit counter is unmoved
+(`state.engine.commits()`), and reads the document(s) back to confirm
+nothing changed — plus a `find`-with-`explain` control, which was never at
+risk — and by `explain_refuses_if_stamp`.
+
+`update` and `delete` still plan their own write independently, through
+`candidates_for` — unchanged by this ADR, and still primary-key, then
+index, then scan, the same order `find` plans in. `visit_matching` does not
+call `candidates_for`; it re-derives the same choice from
+`plan::choose_primary_key`/`plan::choose` on its own. The two are **two
+implementations of one policy, not one shared code path**, so nothing
+forces them to keep agreeing — a change to one that silently stopped
+choosing an index, say, would not be caught by anything that only drives
+`explain`, because `explain` no longer touches the write's planner at all.
+`the_write_planner_and_the_read_planner_choose_the_same_access_path` pins
+the agreement directly: for an `_id` filter, an indexed equality, an
+indexed `$in`, and an unindexed filter, it asserts `candidates_for` chooses
+`Keys`/`Index`/`Index`/`Scan` and that `visit_matching`'s reported
+`strategy` for the same filter is `idLookup`/`index`/`indexUnion`/
+`collectionScan` — the corresponding answer, filter for filter. Without it,
+nothing in the repository fails when `candidates_for` forgets how to plan
+entirely: the existing index-routing tests
+(`update_uses_an_index_when_one_applies`,
+`delete_uses_an_index_when_one_applies`,
+`without_an_index_the_write_paths_still_scan_and_still_agree`,
+`a_single_update_still_touches_exactly_one_document`,
+`an_indexed_update_over_an_array_field_still_matches_every_document`,
+`a_targeted_write_on_id_also_takes_the_fast_path`) drive the plan through
+`explain` — which, correctly, exercises only the *read* planner now — and
+then perform the write as a second, unexplained request, which proves the
+write still produces the right documents but not which access path it used
+to get there: a full scan gives the same matches an index does, only
+slower. Those tests keep the write executing and its result correct; the
+new test is what keeps its *plan* honest.
+
+**Why.** Found by the 2026-09 test round: `POST .../update` and
+`POST .../delete` performed their write whenever `explain: true` was set,
+`multi: true` included. A `multi: true` `delete` with `explain: true`
+deleted every document in the collection; the equivalent `update` rewrote
+every one. `explain` is a declared field on both routes, so this was not the
+unknown-field gap ADR-121 closes — the documentation simply never said these
+two routes execute. `http-api.md`'s only statement of purpose was "to see
+whether an index was used"; the `Explain` schema's was "how a query **was**
+answered" — past tense, with no dry-run language anywhere. The word itself
+promises a description, not an act. The natural, careful use of `explain`
+is to inspect a broad `multi` write before committing to it, and that use
+was exactly the one that performed it: a `200` with
+`matched`/`modified`/`commits` in the body, indistinguishable from success,
+on a request whose entire purpose was to ask first.
+
+The information `explain` wants was reachable without a write transaction
+before this: `candidates_for` already chooses a filtered write's access path
+— primary key, then index, then scan — with no engine call at all. What was
+missing was a way to walk that access path and count without writing.
+`find` and `count` already have one — `visit_matching`, built on the same
+read-only primitives (`get_record_by_encoded_key`, `visit_index_candidates`,
+`for_each_record_after`) the storage engine exposes outside any write
+transaction — so `update` and `delete` now call it instead of reading the
+plan back out of `ModifyManyOutcome` after the engine had already written.
+This is not merely avoiding the write's side effect; it also stops
+`explain` from conflating two different questions. "What would this filter
+match" and "what did this write touch" used to be answered by the same
+number, because the write always ran first; now the two routes ask the read
+question exactly the way `find` and `count` do, and only run the write
+question when there is a write to ask it of.
+
+**What the response reports, and why.** `matched`/`modified`/`deleted`/
+`commits`/`stamp` answer "what did the write do", and they keep exactly
+that meaning — an `explain` response is not a second protocol bolted beside
+the first, it is the ordinary response for a write that touched nothing,
+because nothing was touched. Overloading `matched` to also mean "what the
+plan admits" was considered and rejected: it would break the existing
+invariant `modified == matched` for a real write, silently, and a
+`{"matched": 5, "modified": 0}` reply reads as a partial failure long before
+it reads as "asked, and not done". `explain.documentsMatched` already
+existed, already means exactly the right thing on `find` and `count`, and
+now means it identically on `update` and `delete` — a caller that wants "how
+many would this touch" reads one field regardless of which of the four
+routes it asked.
+
+**Alternatives.**
+
+- *Document that it executes, and name the effect in the response* — the
+  finding's second-choice fix. Rejected: it keeps a route named `explain`
+  doing the one thing `explain` conventionally never does, on the two routes
+  where doing it by accident destroys data. A documentation fix closes the
+  gap between the code and the page; it does nothing about the gap between
+  the word and what a careful caller brings to it.
+- *A separate `dryRun` field, leaving `explain: true` executing as before.*
+  Rejected: two flags asking overlapping questions is worse than one that
+  asks the right one, and it does not close the trap — a caller who reaches
+  for `explain` first, which is the natural name to reach for, is still
+  caught by it.
+- *Report the plan's `documentsMatched` as the top-level `matched` too, so
+  `explain` "previews" the write's would-be counts.* Rejected above: it
+  breaks `modified == matched` exactly where a careful client is reading
+  most closely, and duplicates a number `explain.documentsMatched` already
+  carries.
+
+**Cost.** Breaking, and named plainly in the changelog: a client that relied
+on `explain: true` performing the write — indistinguishable, before this,
+from not setting it at all, apart from the added `explain` field — now gets
+a plan instead. A client sending `if_stamp` alongside `explain: true`, which
+used to get a `200` (and a write), now gets `400`. `0.MINOR` under the
+pre-1.0 policy, alongside the round's other tightened refusals.
+`indexEntriesRead`, previously documented as absent for `update` and
+`delete` because their `explain` was read back out of the write's own
+bookkeeping, can now appear: the read-only scan is the same one `find` runs,
+and reports the same thing when an index answers it — a wire-visible new
+field on two response shapes, named in `CHANGELOG.md`. `docs/openapi.yaml`
+and `docs/http-api.md` are updated with this ADR.
+
+---
+
+## ADR-132 — An index carries the stamp of its creation, and a drop and a rival are both settled by it
+
+**Decision.** `IndexMeta` gains `created: Option<Stamp>` — the stamp of the
+`CreateIndex` entry a local create mints, or of the entry a replicated one
+arrived on. It is stored in the collection metadata and travels in the
+`CreateIndex` payload, because the payload *is* an `IndexMeta`. Two things
+follow from it, and neither is decidable without it.
+
+*First*, a replicated `DropIndex` older than the index standing under its
+name is history: the drop records its tombstone, which never moves backwards,
+and leaves the index alone. That is the `DropCollection` arm's incarnation
+rule (ADR-081) one level down, for the same reason — a recreated index derives
+the same id as the one it replaced, and overlapping windows are re-served as a
+matter of course.
+
+*Second*, two members that created one name with different definitions settle
+on the **later creation stamp**, by `Stamp::wins_over`, which is how two
+concurrent writes to one document already settle (ADR-020, ADR-029). The
+loser's entries are removed in the same transaction that builds the winner, so
+a winning definition this node's documents cannot be built under aborts back
+to the index this node already had — not to neither — and is skipped, counted
+and warned exactly as ADR-123 says. The tombstone the replacement records is
+under the *winner's* stamp, so the loser's own create cannot come back through
+a re-served window while the winner's re-delivery, at exactly that stamp, is
+not history. The snapshot route (`restore_collection`) follows the same rule,
+in place of the silent skip it did for any name already taken. The **local**
+path is unchanged: a client creating a conflicting definition is still refused
+`IndexExists`, because it is there to be told.
+
+*Third*, two members that created the **same** definition under one name
+converge their creation stamps as well, forward, by the same comparison. That
+is not a conflict — the definitions agree — but after the first two rules the
+stamp is the sole arbiter of whether a replayed drop applies, so one
+definition under two stamps answers one drop two ways and the members split.
+Both have already witnessed the other's create by then, so nothing re-serves
+it and the split is permanent; and the drop is `Applied` on both sides, so no
+counter moves and the lag gauge reads 0 — the exact signature this ADR exists
+to remove. The merge takes the **later** stamp because that is what
+`created` means: the incarnation standing under the name. Both members hold an
+index that has existed continuously since the later creation, and a drop
+stamped before it was aimed at neither of them. Taking the earlier stamp would
+converge just as well and would let a drop older than the incarnation delete
+it — which is, verbatim, the residual this ADR exists to close, arrived at
+through the merge instead of through the absent stamp. The first rule above
+and this one are therefore one rule, not two that happen to agree.
+
+An index holding no stamp adopts the peer's, which is the definition's true
+creation rather than an invented one, and ends the ambiguity without waiting
+for a recreation. A **local** create of a definition already present is
+untouched — it is idempotent and mints no entry, so moving the stamp there
+would be a decision no peer ever hears of.
+
+*Not* the reason, though it is the first one that suggests itself: that the
+earlier stamp would move `created` **backwards** as older creations arrived.
+It would, and it costs nothing, because the tombstone that this ADR's own
+declined drop records bounds the merge from below — `apply_remote_index`
+turns away a creation older than the tombstone before
+`create_index_inner` is reached, so no creation old enough to reopen an
+already-declined drop reaches the merge at all. The two directions are
+indistinguishable under re-delivery. They differ on the drop's *first*
+delivery, and there the meaning of `created` decides it.
+
+**An index stored without a creation stamp reads as older than every drop and
+every rival, until it learns one.** A replayed drop removes it and a rival
+definition is refused and counted — which is ADR-123's behaviour exactly, so
+nothing a caller could predict from the reference before this changes for an
+index that already exists. The exception is the merge above, and it is the
+only one: a peer holding the *same* definition with a stamp hands it over, and
+that stamp is the definition's own creation rather than an invented one, so
+the index stops being ambiguous without any operator action. Where no member
+has a stamp — an index every member created before this release — the sentence
+holds as written until someone recreates it. It is deliberately not backfilled
+at open from a local clock: an invented stamp would sort after drops that
+genuinely superseded the index, and would win comparisons this node knows
+nothing about. The ambiguity otherwise ends the first time the index is
+recreated. Same `None`, and the same argument, as a
+collection's `incarnation_floor` before ADR-081.
+
+**Why.** Both halves are the residuals ADR-123 recorded and left open, and the
+0.21.0 cluster round of 2026-09-03 found each of them doing damage. A
+collection listed **no indexes on any member** though three stood on all three
+an hour earlier — the shape of a drop re-served across a recreation of the
+same name, applying because there was nothing to compare it against. And two
+collections held **different index sets per member**, with the refusal counter
+standing at 9 / 15 / 9: the counted divergence working as designed, and
+staying divergent for as long as the cluster lived. ADR-123 named the fix for
+both in the same sentence — "a 'newer definition wins' rule would resolve it,
+but needs a creation stamp on `IndexMeta` to compare, which the definition
+does not carry" — and this is that stamp.
+
+**Why last-writer-wins, and not a second conflict rule.** KimmyDB already
+resolves two concurrent writes to one document by the later stamp, node id
+breaking the tie, and it resolves them the same way on every member so that
+they converge without coordination. A schema change is a write; two members
+creating one name are two writers of one key. Inventing a different rule here
+— alphabetical on the definition, first-arrival, most-restrictive-wins — would
+mean the cluster held two conflict rules, and a caller could predict neither
+from the other. The stamp is also already the thing every other ordering
+decision in the replication path is made on, so it needs no new machinery: the
+comparison is `Stamp::wins_over`, unchanged.
+
+**What of ADR-123 stops being true, and what replaces it.** ADR-123 promised,
+under "what is left as a counted divergence", that two members creating one
+name with different definitions each keep their own, that the second to arrive
+is refused with `IndexExists`, and that the refusal is counted in
+`kimmy_sync_ddl_refused_total`. That promise is withdrawn for the case where
+both definitions carry a creation stamp: they now converge, and nothing is
+counted. It still holds exactly as written where either definition carries
+none. Everything else ADR-123 decided stands and is unchanged — the index
+tombstone, the refusal class (`InvalidQuery`, `IndexExists`, `Unsupported`)
+and its skip-and-count behaviour, the rule that every other error still fails
+the round, the snapshot route's classification, the replicated unique
+backfill, and the three counters. `kimmy_sync_ddl_refused_total` keeps its
+meaning and its alert; what changes is that one of the three classes feeding
+it now mostly resolves instead of arriving.
+`a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace`
+is the regression test that keeps the guard honest: a definition that wins
+the comparison and still cannot be built is skipped, counted, and does not
+wedge the round — so this
+fix cannot be made by reverting to "refuse every rival".
+
+**Why the resolution is not counted on `/metrics`.** It was considered. A
+superseded definition is the conflict rule working, not a divergence to alert
+on, and KimmyDB counts no metric when two concurrent document writes resolve
+either — counting one here would say that a schema conflict is an incident
+while a data conflict is not. The operator's signal is a warning line naming
+the database, collection, index and which parts of the definition moved, on
+the member whose definition lost. What an operator *would* alert on is
+unchanged: `kimmy_sync_ddl_refused_total` still rises for every definition a
+member cannot apply, which is the case nothing repairs.
+
+**Why the payload carries the stamp, when the entry already does.** On the
+oplog route it is redundant, and provably so: the origin mints its entry's
+stamp first and records that stamp on the index it builds, and `apply_ddl`
+appends a replicated entry under the stamp it arrived with, so the payload's
+copy and the entry's stamp cannot differ. Reading either gives the same
+answer, and neither is observable from the other. The field is carried for the
+**snapshot** route, which has no entry at all: `restore_collection` sees only
+`CollectionState`, and the definition's own stamp is the only ordering fact
+that reaches it. `apply_remote_index` reads the payload first and falls back
+to the entry's stamp, so both routes read the creation stamp from the same
+place; the fallback covers a payload minted by a build that recorded none, and
+recovers exactly the value that build would have used.
+
+**Alternatives.** *Compare the drop against the tombstone alone.* That is what
+was there: the tombstone records when the index was **dropped**, and says
+nothing about when the index now standing under the name was **created**.
+*Refuse a `DropIndex` for an index whose definition differs from the one the
+drop was aimed at.* A drop carries only the name — deliberately, since the
+name is the identity — so there is no definition to compare. *Make the drop
+carry the creation stamp it was aimed at.* It would work for a drop minted
+after this change and not for one already in an oplog, and it puts the
+ordering fact in the entry that destroys state rather than on the state
+itself, so a snapshot would carry no answer at all. *Take the earliest
+creation stamp when two members create one identical definition, since that
+is when the index first existed anywhere.* It converges just as well, and it
+is wrong for the reason the first rule of this ADR is right: `created` names
+the incarnation standing under the name, and lowering it to a creation that
+incarnation succeeded lets a drop older than the incarnation delete it — the
+residual, reintroduced through the merge. Not rejected for
+non-monotonicity: `created` would indeed move backwards, but the declined
+drop's own tombstone stops any creation old enough to matter from
+reaching the merge, so re-delivery is idempotent either way. The two differ on
+the drop's first delivery, and that is the case that decides. *Resolve
+concurrent definitions by merging them — keep the union of the fields, the
+stricter uniqueness.* A merged definition is one no member asked for, and it
+is not idempotent under re-delivery. *Backfill a creation stamp for stored
+indexes at open.* Rejected above. *Keep refusing, and add a repair command.*
+A schema that stays divergent until someone notices is what the round
+observed; the
+counter made it visible and nobody was watching for four runs.
+
+**Cost.** One optional stamp per index, in the collection metadata and on the
+wire. A replicated create of a definition already present now writes the
+collection metadata where it used to return early, which is one small commit
+on a path that previously took none — only when the arriving stamp is the
+later one, so a settled cluster pays nothing. That commit is its own
+transaction rather than the batch's, as every `_inner` on the DDL path is
+(ADR-119), and it is sound to separate because the merged stamp is **monotone
+and derived from the arriving entry alone**: a batch that fails after it has
+committed leaves a value the same entry, re-delivered, computes again and does
+not move. It is the one write on this path with no state to reconcile on a
+retry. `create_index_inner` takes a `CreateOrigin` in place of its `log` flag —
+the change `drop_index_inner` made in ADR-123, for the same reason, widened
+only because a replicated *create* may carry no stamp — and returns an
+`IndexCreated` so that "a later definition is already here" is a decision the
+caller can see rather than an error. The comparison of two definitions moves
+to `IndexMeta::differences`, which the create path and the supersede warning
+share. A superseding create pays one index rebuild, which is what a create
+costs anyway. An index whose entries are removed and rebuilt in one
+transaction holds both in the write transaction briefly; the build already
+did. Nothing is added to `/metrics`, to the HTTP index listing, or to
+`docs/openapi.yaml`: the creation stamp is a fact about replication, and
+surfacing it would put a stamp a client cannot use in every index listing.
+
+Defended by `a_replayed_drop_does_not_remove_a_newer_index_of_the_same_name`,
+`a_drop_replayed_after_this_nodes_own_recreation_leaves_it_alone`,
+`a_drop_that_follows_the_creation_it_names_still_removes_the_index`,
+`a_drop_still_removes_an_index_that_carries_no_creation_stamp`,
+`concurrent_definitions_under_one_name_settle_on_the_later_stamp`,
+`the_loser_of_a_concurrent_creation_does_not_come_back_through_a_replayed_create`,
+`a_rival_definition_with_no_creation_stamp_is_still_refused_and_counted`,
+`a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace`,
+`two_members_creating_one_identical_definition_converge_on_one_creation_stamp`,
+`an_identical_definition_is_not_re_stamped_by_a_local_recreation`,
+`an_unstamped_index_learns_its_stamp_from_the_peer_that_has_one`,
+`a_losing_definition_is_not_re_served_to_a_third_member`,
+`a_snapshot_definition_under_a_taken_name_settles_on_the_later_stamp` and
+`a_creation_stamp_crosses_the_replicated_bson_boundary`, beside ADR-123's own
+`a_replayed_index_that_cannot_be_built_does_not_stop_the_entries_behind_it`,
+which is unchanged.
+
+---
+
+## ADR-133 — A periodic cross-member check makes a divergence no counter can express visible, without repairing it
+
+**Decision.** Every anti-entropy round whose pull reaches the peer's true
+tail — whether because there was nothing left to pull, or because this
+round's own batch was not truncated by the cap — also asks that peer what it
+holds, on the connection already open for that round: every collection id,
+and the live document count of one collection named in the request. The
+requester compares the peer's answer against its own state, subject to a
+second guard against the peer's own lag (below), and exports
+`kimmy_sync_divergent_collections`, a gauge, once a collection has been
+found divergent twice running — two consecutive *contacts* with the same
+peer, for the existence half; two consecutive *probes of that collection*
+against the same peer, for the count half, which are not the same thing (see
+defect 5 below). No document or collection name appears in the metric — the
+gauge is a bare count, holding `/metrics`' standing property that a name
+never crosses that boundary.
+
+This ADR went through four rounds of review, each re-running every probe
+against the fix rather than reading an account of it. The first found four
+defects in the first cut, three of them gauge-defeating; the second found a
+fifth in exactly the half the first round's fixes did not touch; the third
+found a sixth in exactly the case the second round's fix did not sweep for;
+the fourth found a seventh in the one input the third round's own fix was
+not written to handle. What follows is the corrected design; the defects and
+the reasoning behind each fix are recorded under their own headings because
+each is a decision worth being able to find again, not just a bug that got
+fixed.
+
+**What is compared, and why not everything a full reconciliation would.**
+Two things:
+
+- **Collection existence**, one-directional: only "the peer holds it and I
+  do not" is reported, never the reverse. The reverse is the peer's own
+  discovery to make when its own loop reaches the identical gate pulling
+  from this node; checking both directions from one side would flag a
+  collection the instant it is created locally, before the peer has had any
+  chance to catch up, which is the flapping the gate below exists to
+  prevent. This half costs a metadata scan — the database and collection
+  tables, never a document — so it runs on every check regardless of data
+  size, and it needs no guard beyond the gate that gets a caller into the
+  check at all.
+- **One collection's live document count**, chosen in turn from the
+  requester's own collection list (`next_probe`), so a check pays for at
+  most one collection's scan rather than the whole database. Names alone
+  would have missed the more serious half of what finding 14 actually lost:
+  two collections were missing entirely, but 500 and 517 documents were also
+  missing from collections that existed, correctly named, on every member.
+  This half needs its own guard, below — the existence half's protection
+  does not extend to it.
+
+**Defect 1: the check went dark under sustained write load, which is
+finding 14's own precondition.** The first cut ran the check only in the
+branch where `VersionVector::behind` read `None` — nothing left to pull.
+Under a continuously busy cluster (a modest 50 writes between each of 20
+rounds, in the case that found this), every round has *something* new to
+pull, so `behind` never reads `None` and the check never runs: 20 rounds, 0
+reaching the branch, gauge pinned at 0 for the whole run. Finding 14's own
+precondition was "the puller is more than one batch behind" — the corpus
+load that produced it was the exact shape this defect went blind for.
+
+**Fix: `sync_once` also runs the check whenever a round's own pull reaches
+the peer's true tail**, using the `exhausted` flag ADR-127 already computes
+and had been discarding after `apply_peer_batch` consumed it —
+`SyncOutcome` now carries it. A round pulling a handful of new entries well
+under the 1,024-entry batch cap reaches the tail and is checked; a round
+whose pull is itself truncated by the cap is not, because that is precisely
+the state a truncated window can fake without it being true, and checking
+on the strength of a truncated pull would reopen the same hole one level up.
+This closes the probed gap — the busy-cluster case above now confirms
+within a handful of rounds — without opening the excluded one: a backlog
+that stays deeper than one batch on every single round is still not
+checked, honestly, because nothing about that state can be trusted either.
+`kimmy-cluster/tests/replication.rs` pins both halves of the boundary:
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` and
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`,
+plus `the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull`
+reproducing the original busy-cluster probe against the real replication
+loop.
+
+**Residual, stated rather than hidden: a backlog that never dips under the
+batch cap is still not checked, for as long as that holds.** A `0` reading
+on `kimmy_sync_divergent_collections` during sustained heavy write load —
+the 43-batch corpus load that finding 14 stopped on, at forty times the
+volume, would be exactly such a load — means *not checked*, not *not
+divergent*. The gauge degrades gracefully with backlog depth rather than
+going fully dark the moment anything is pulled, which is what the first cut
+did; it does not claim coverage a genuinely saturated cluster cannot afford.
+
+**One state that `exhausted` alone cannot resolve: an empty, non-exhausted
+window.** ADR-126's own proof — over every arrangement of withheld entries
+and every batch limit — is that a correct sender can never answer with zero
+entries while also reporting its tail was not reached: the scan that
+produces `exhausted == false` only stops there after pushing at least one
+kept entry. A peer that does both is not offering an ordinary capped pull
+with nothing new to add; it is claiming, in the same message, both "nothing
+here" and "more exists", which nothing downstream can safely read as
+progress. Folding it into the same "not exhausted, do not check" bucket as
+a genuine capped pull would make a malfunctioning or malicious peer's claim
+indistinguishable from an unremarkable one. `sync_once` treats it as a
+malformed round instead — the same failure class `expected Entries, got
+...` already is — so it surfaces in `kimmy_sync_failures_total`, not as a
+silent skip and not as a clean reading.
+
+The counter alone is not the whole answer, though: the generic per-peer
+failure debounce that decides whether a round failure is worth a `warn!`
+line can route this occurrence's first sighting to `debug` if the same peer
+already had an unrelated failure recently, leaving a bare counter increment
+with nothing explaining it — for a condition whose entire premise is that it
+should never happen at all. `sync_once` logs it at `warn!`, unconditionally,
+at the point of detection, rather than leaving it to that debounce. The
+predicate this depends on — `entries.is_empty() && !exhausted` — is a named,
+tested function (`is_unreachable_from_a_correct_sender`) rather than an
+inline condition, specifically because the shortcut `!exhausted` reads as
+equivalent and is not: it would refuse every ordinary capped pull on a busy
+cluster, the common case this state must be kept apart from.
+
+**Defect 2: a peer merely behind was flagged, and the two-contact
+confirmation does not filter it out.** The gate above protects this node's
+own belief that it is not behind the peer. It says nothing about the
+opposite direction: whether the *peer* is behind *this node*. A peer that
+has simply not yet pulled this node's own recent writes answers a probe with
+a stale, lower count for any collection those writes touched — a real
+difference, but ordinary replication lag, not a divergence — and
+`compare`'s count check is symmetric, so it reports the mismatch regardless
+of which side is stale. Worse, a lagging peer reproduces the identical
+mismatch on *every* consecutive contact, so the two-contact confirmation
+that exists to filter out a one-off race does nothing here: on the round
+whose peers steady-state lagged 130–260 s behind each other, this would have
+been 26 to 52 consecutive confirmed ticks of a firing alert on a cluster
+that was, at the time, healthy. An alert that cries wolf on ordinary lag is
+the failure mode that gets an operator to disable it, which lands the
+cluster in exactly the state this gauge exists to prevent.
+
+**Fix: `divergence_probe_for` checks the reverse direction explicitly**
+before trusting a count. Given `theirs` (the peer's version vector, fetched
+at the top of the round) and `mine` (this node's own vector, as of just
+before asking), `theirs.behind(&mine).is_some()` means the peer has not yet
+witnessed something this node has — the peer is behind — and the probe is
+dropped for that contact (`None`) rather than compared. The existence half
+is unaffected: it never depends on the peer being caught up on anything of
+this node's, only on this node's own belief about the peer, which the
+existing gate already covers. Pinned by
+`a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent`,
+constructed with a real, genuine count difference across the wire that the
+guard must suppress rather than report.
+
+**Defect 3: above roughly twice the fanout, the gauge could never leave
+0.** The first cut's confirmation state was one global pending/confirmed
+pair, folded in once per *replication tick* from the union of every peer
+reached that tick. `PeerHealth::select` hands each tick a `fanout`-sized
+window of the known peers and advances it, so two ticks in a row share a
+peer only while `2 × fanout > N` (peers) — with the default fanout of 3,
+five members or fewer. Past that, no single peer is ever the one reached on
+two consecutive ticks, so a *global* tracker keyed by tick can never see the
+same peer's finding twice running, however badly that peer has diverged: at
+six peers and up the gauge is structurally pinned at 0. The three-member
+cluster the check was built and tested against could not have shown this.
+
+**Fix: `DivergenceTracker` is keyed per peer**, not per tick.
+`observe(peer, seen)` folds in one peer's finding from one contact with
+that peer; confirmation needs the same peer's *own* two most recent
+contacts to agree, however many other ticks or other peers fall between —
+which `PeerHealth::select` eventually guarantees for every known peer
+regardless of cluster size. A finding against one peer clears only when a
+later contact with that *same* peer no longer sees it; a tick in which a
+peer simply was not contacted leaves its last state untouched, because
+silence about a peer is not evidence it has reconciled. Pinned by
+`divergence.rs`'s
+`confirmation_survives_ticks_where_the_peer_was_not_contacted_at_all` (the
+fanout-scaling case directly), `a_peer_reconciling_does_not_clear_a_different_peers_finding`
+and `the_same_collection_confirmed_against_two_peers_counts_once` (the
+gauge answers "how many collections", not "how many peer pairs").
+
+**Defect 4: the load-bearing test's silence half was vacuous.** The
+original regression test asserted `lag_ms`, `applied`, `superseded`, `ddl`,
+`ddl_refused` and `unknown_collection` were all zero on the branch under
+test — but every one of those fields is `Default::default()` on that
+branch's return path regardless of input, so the assertions could not fail
+for any input and proved nothing about the "false belief reads as healthy"
+claim they were named for. Finding 14's silence was specifically in the
+*exported* metrics and the *absent* log lines, which live in `kimmy-cluster`'s
+`peers.rs` and are pushed into `kimmy-api`'s `Metrics` by `kimmyd`; a test
+against `sync_once`'s return value alone cannot reach either.
+
+**Fix, two parts.** The mechanism-level test
+(`the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover`)
+now asserts only what it can actually prove — that `outcome.divergent` names
+the stranded collection — and says so in its own comment rather than
+implying more. A new test,
+`the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`,
+drives the real `replicate()` loop with `on_round` and `on_lag` wired up —
+the exact hooks `kimmyd::spawn_cluster` feeds into `Metrics::record_sync_round`
+and `Metrics::set_replication_lag_secs` — and asserts, across every report
+received while waiting for the gauge to confirm, that `failed`,
+`backing_off` and `ddl_refused` stay at 0 and every `on_lag` reading is 0.
+That is the actual signal path finding 14's silence was observed on, tested
+directly rather than through a proxy that could not carry the claim.
+
+**Defect 5: a count divergence could never confirm on any node holding more
+than one collection.** A second round of review, having re-run every probe
+against the fix for defects 1–4 rather than reading the account of them,
+reproduced finding 14's more serious half directly — a document-count
+divergence in a collection that exists, correctly named, on every member,
+with no local writes on the affected member and a quiet, converged
+cluster — and found the check detected it correctly on every single contact
+in which the collection was probed, while the gauge never moved. At one
+collection the confirmation worked; at two it stopped working entirely, and
+stayed broken at every collection count above that.
+
+The cause was the same shape as defect 3, one axis over. Defect 3's fix
+keyed `DivergenceTracker` per peer, so a finding is not cleared by a contact
+that did not examine that *peer*. But the count half is also gated by
+`advance_probe`, which rotates to a *different collection* on the very next
+contact — so on a node holding N collections, a given collection's count is
+probed against a given peer roughly once every N contacts, not on every
+contact the way existence is. The tracker's confirmation rule, "two
+consecutive contacts", is correct for existence, which is checked in full
+every contact, and wrong for count, which is checked for exactly one
+collection per contact: a count finding was visible on one contact in N and
+absent from the "seen" set on the other N−1, so it could never appear on two
+*consecutive* contacts once N exceeded one. Detected on schedule, confirmed
+never — which means the gauge reported existence divergence only, and the
+count half — the half ADR-133 itself named as the reason to compare document
+counts at all, "the more serious half of what finding 14 actually lost" —
+was never wired to the gauge on any cluster with more than one collection.
+The round that motivated this ADR had roughly 57.
+
+**Fix: the two halves are tracked, and confirmed, separately.**
+[`compare`][crate::divergence::compare] now returns `Findings { existence,
+count }` rather than one merged set, and `DivergenceTracker::observe` keeps
+independent state for each: existence confirms across two consecutive
+*contacts* with a peer, unchanged from defect 3's fix; count confirms across
+that specific `(peer, collection)` pair's two most recent consecutive
+*probes*, keyed and cleared independently of how many other collections are
+rotated through in between, and independently of the existence state for the
+same peer. `confirmed_count()` unions both, so a collection found divergent
+by either half, or both, still counts once.
+
+Two other shapes were considered and rejected. **Holding the rotation on a
+divergent collection** until its finding resolves — never advancing
+`advance_probe` away from it — would confirm faster, but a permanent
+divergence, by definition, never resolves without an operator, so a single
+permanently divergent collection would starve every other collection from
+ever being probed again: a design that finds one problem by creating a
+second, larger one. **Comparing every collection's count on every
+contact** — the "one cursor walk" the round's own supervisor did by hand —
+is the cost this design exists to avoid paying forever on a live cluster,
+restated from the cost section below. Tracking the two halves apart, so each
+confirms on the cadence its own check actually runs at, was the only
+considered shape that fixes the confirmation without reopening either the
+starvation risk or the cost bound.
+
+Pinned by `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+(the exact defect, at the tracker level), `a_gap_between_probes_of_the_same_collection_never_confirms_a_count`,
+`a_contact_that_does_not_probe_the_collection_leaves_its_count_state_untouched`
+and `a_confirmed_count_divergence_clears_on_the_next_clean_probe_of_it`; by
+two composition tests added specifically because this defect and defect 3
+share their shape — `kimmy-storage`'s own unit tests already pinned `observe`
+correctly in isolation, and still missed this — `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+drives the real `advance_probe` against the real tracker, and `peers.rs`'s
+`a_peer_confirms_despite_a_fanout_smaller_than_the_cluster` drives the real
+`PeerHealth::select` against it; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_confirms_through_the_real_loop_despite_other_collections`,
+which reproduces the original P6 probe end to end against the real
+`replicate()` loop with four collections in rotation.
+
+**Defect 6: a confirmed count finding against a since-dropped collection
+never clears.** A third round of review, verifying the defect 5 fix rather
+than reading the account of it, found the one case its own design left
+uncovered: drop the divergent collection, and the gauge stays at its
+confirmed value for the rest of the process, a hundred clean ticks later. The
+cause is a straightforward asymmetry, not a new mechanism. `observe`'s
+existence half is recomputed from a fresh `existence` set on every contact —
+`confirmed_for_peer.retain(|id| existence.contains(id))` — so a collection
+absent from that set is dropped immediately, no matter why it is absent. The
+count half has no equivalent: it only ever mutates inside `if let Some((id,
+mismatched)) = count`, so once `advance_probe` stops naming a dropped
+collection, nothing ever touches its `count_pending` or `count_confirmed`
+entry again — not a peer going quiet, which is genuine silence the design
+deliberately does not read as reconciliation, but a fact this node already
+knows for certain, in the same set `advance_probe` is handed fresh every
+tick.
+
+This mattered more than its size suggested, because the realistic trigger is
+an operator following the gauge's own advice: it fires, they investigate,
+they remediate the way `operations.md` says to — reset or recreate the
+collection — and the alert they just resolved never goes out. Both this ADR
+and `operations.md` promise the opposite in as many words: *"a resolved
+divergence stops moving it rather than leaving a permanent scar."* An alert
+that cannot be cleared by fixing the thing it reported is the one an
+operator disables, which is precisely the argument defect 2's fix already
+made at length.
+
+**Fix: `advance_probe` sweeps both count structures against `mine` before
+choosing the next probe.** It already receives the full, current set of
+collections this node holds on every call; a collection missing from that
+set is provably gone, not merely unheard from, so `count_pending` and
+`count_confirmed` are filtered against it unconditionally, every tick,
+regardless of whether that tick's probe lands on the affected collection at
+all. The same sweep closes a second, subtler case: `CollectionId` is derived
+from `(db, name)`, so a drop followed by a recreation of the same name
+reuses the identical id, and without the sweep a *pending* (not yet
+confirmed) mismatch against the old incarnation could combine with one
+mismatched probe of the new incarnation to falsely confirm on what is really
+each incarnation's first sighting.
+
+Pinned by `divergence.rs`'s `a_confirmed_count_divergence_clears_when_its_collection_is_dropped`
+and `a_pending_count_mismatch_does_not_survive_a_drop_and_recreate`.
+
+**Defect 7: defect 6's own sweep, on the one input it was not written for,
+silently discarded every live count finding.** A fourth round of review
+found this: `peers.rs` handles a failed `engine.all_collection_ids()` by
+logging and passing an empty set into `advance_probe`. Before defect 6 that
+was harmless — an empty set just made the rotation return `None` for this
+tick. After defect 6, `advance_probe` sweeps its count-side state against
+whatever it is handed on the premise that a collection missing from that
+set is provably gone; an empty set now reads as "this node holds no
+collections at all", and every confirmed and pending count finding was
+swept away on a single transient storage error. Self-healing — the existence
+half is untouched, and a genuine finding re-confirms once its collection is
+probed twice more, on the order of `2 × (collection count)` ticks — but
+still a silent under-report inside the one feature whose whole thesis is
+that a divergence must never be silent, introduced by the very fix meant to
+stop the gauge from sticking. The comment at the call site had said
+"skipping this tick's probe rotation" throughout; after defect 6 it no
+longer skipped, it reset, and the comment did not change to say so.
+
+**Fix: a read failure never reaches `advance_probe`.** `advance_probe_on`
+holds the decision on its own — `Ok(ids) => tracker.advance_probe(&ids)`,
+`Err(_) => None` — so a failed read leaves the rotation's cursor and every
+piece of count state exactly where they were, and the next tick's read gets
+a clean attempt. Pulled into its own function for the same reason
+`is_unreachable_from_a_correct_sender` (defect 6's must-fix) was: the
+interaction is exactly the part a future edit is likely to touch by
+accident, and it is cheap to give it a test independent of the async loop
+and the engine around it. Pinned by `peers.rs`'s
+`a_read_failure_leaves_confirmed_count_findings_untouched`.
+
+**Confirmed on two consecutive checks, not one — "consecutive" meaning a
+different thing for each half, per defect 5.** The gates above already rule
+out ordinary lag in both directions, but the peer's answer is still built
+from two separate reads a message apart — its version vector, read by the
+round already under way, then its collection list and probe count, read a
+moment later on the same connection. A collection created on the peer in
+that gap can in principle outrun the vector the gate was judged against.
+Requiring the same finding to recur before it counts closes that window: a
+live divergence recurs every time it is checked, because nothing here
+repairs it, and a race between two reads a message apart does not recur
+back to back. For existence that means two consecutive *contacts* with a
+peer, because existence is checked in full on every contact; for count it
+means two consecutive *probes of that collection* against that peer, which
+can be many contacts apart once more than one collection is in rotation.
+The gauge is a level either way: a resolved finding clears the moment its
+own next relevant check — a contact, for existence; a probe of that
+collection, for count — no longer sees it, rather than leaving a permanent
+mark for a cluster that has since been fixed by hand.
+
+**Cost, stated as a bound — corrected.** Per contact with a peer, in the
+branch where the check runs: one metadata scan of this node's own database
+and collection tables (independent of collection size), one metadata scan
+on the peer's side, and exactly one collection's document count on each
+side — never more than one collection, and never the whole database, *per
+contact*. The first cut of this ADR stated the per-round total as "exactly
+one collection's document count on each side... never more", which is true
+per peer but not per round: a node with several pulling peers runs one such
+exchange per peer it contacts that round, since each requester's rotation
+is independent. The total is still bounded by the number of peers a tick
+contacts (itself bounded by `cluster.fanout`), and still independent of
+total data size — a node does not scan more of one collection because it
+has more peers — but it is not literally one scan process-wide.
+
+**A known, deliberately deferred cost inside that one scan.** `Engine::count`
+walks `for_each_doc`, which decodes every document's record — including the
+body — purely to increment a counter; it does not stop at a key-range scan
+that would skip the body. That cost already existed everywhere `count`
+already runs (the `count` route and aggregation's `$count`), and this check
+does not add a new instance of it, but it does put it on a five-second
+forever loop on both sides of a probed contact, which those call sites do
+not. A key-range count would cost a fraction. Left as measured and not
+fixed here: the change belongs to `Engine::count` itself, not to this
+check's use of it, and reworking a shared primitive is a larger unit than
+adding one caller of it.
+
+**What this does not do.** It does not repair a divergence it finds — a
+member found to hold less than its peers still needs an operator to decide
+what to do about it, exactly as any other divergence this cluster can
+report does. Automatically resetting or re-seeding a member on this signal
+would be a much larger decision than "make the state visible", and design
+rule 4 for this round is explicit that a bug fix does not get to make that
+call quietly. It is recorded here as a considered alternative and left to a
+future round if wanted.
+
+**What it cannot catch**, stated plainly against what the code actually
+does rather than against what an earlier draft of this ADR claimed:
+
+- A document present in equal numbers on every member but with different
+  content — a lost update that still counts, rather than a lost document.
+- **A count divergence, until the affected collection has been probed twice
+  running against the same peer** — not merely probed once, which detects it
+  but does not confirm it, and does not move the gauge. Reaching a given
+  collection's turn at the probe once takes as many *checked* contacts with
+  that peer as the cluster has collections; confirming it takes reaching
+  that same collection's turn twice in a row, with nothing in between that
+  probes it *and* finds it clean. Other collections being probed against the
+  same peer in between do not affect it either way — the two-in-a-row rule
+  is scoped to the one `(peer, collection)` pair, per defect 5 above, which
+  is what this bullet used to understate. See the next point for what
+  "checked" excludes.
+- **A round whose pull did not reach the peer's tail does not run the check
+  at all** — see defect 1's residual above. A gauge reading `0` during a
+  backlog that never drains under the batch cap is not evidence of
+  convergence; it is evidence the check has not run.
+- Anything on a peer this node's fanout is not currently pairing it with —
+  bounded by `cluster.fanout`, the same bound anti-entropy itself is subject
+  to.
+- A collection this node holds that a peer does not — by design, that
+  direction is the peer's own check to make when its own loop reaches the
+  same gate pulling from this node.
+- A shadow collection (a vector index's own storage) stranded on one member.
+  `Engine::all_collection_ids` excludes shadow collections from the
+  existence and count comparisons, because their lifecycle deliberately
+  trails the collection they serve; a genuine divergence in one is as
+  invisible to this check as it is to the collection listing routes.
+
+**A second wire change in this release, weighed against not making one.**
+This is the *second* protocol addition U1 (ADR-126/127) shares the release
+with, and rule 4 asks for the alternative to be named rather than skipped
+over. The alternative was deriving existence and counts from data the wire
+already carries — `AskVersions`/`Versions` and `Entries` — and it does not
+work: a version vector is per-origin high-water marks, not a collection
+list or a document count, and no combination of history already exchanged
+recovers either without replaying it, which is exactly the cost this design
+exists to avoid paying every round. `AskDivergence`/`Divergence` is new
+messages for a genuinely new question the existing wire cannot answer.
+
+Unlike `Entries`, which fails loudly and immediately on a version mismatch
+(a malformed frame, counted in `kimmy_sync_failures_total`, on the very
+first round after a mixed-version pair meets), an `AskDivergence` mismatch
+only surfaces on a round that reaches the branch this check runs in — a
+converged round, or one whose pull is exhausted. A freshly mixed pair still
+actively catching up looks completely healthy; only once it converges does
+every subsequent round to the unstamped peer fail. Operationally this still
+resolves the same way U1's cutover does — roll every member — but the
+failure's onset is delayed and worth stating rather than assuming it
+matches `Entries`' shape.
+
+**Cost of the alternative considered: compare every collection's count every
+round.** This is what the round's own supervisor did by hand to confirm the
+loss — "one cursor walk" — and it is exactly what is unaffordable run
+forever on a live cluster: the cost scales with total document count across
+every collection, on every round, on every member, which is the walk this
+design declines to automate. The rotation trades detection latency —
+bounded by collection count on a cluster whose backlog stays under the
+batch cap, unbounded while it does not, per defect 1's residual above — for
+a bound independent of data size.
+
+Defended by `crates/kimmy-storage/src/divergence.rs`'s unit tests —
+`a_collection_the_peer_holds_and_this_node_does_not_is_divergent`,
+`a_collection_only_this_node_holds_is_not_reported_here`,
+`a_disagreeing_probe_count_is_divergent_even_with_matching_names`,
+`a_caller_that_distrusts_the_probe_suppresses_only_the_count_half`,
+`a_gap_against_the_same_peer_never_confirms`,
+`a_confirmed_divergence_clears_the_moment_that_peer_no_longer_shows_it`,
+`confirmation_survives_ticks_where_the_peer_was_not_contacted_at_all`,
+`a_peer_reconciling_does_not_clear_a_different_peers_finding` and
+`the_same_collection_confirmed_against_two_peers_counts_once` — and by
+`crates/kimmy-cluster/tests/replication.rs`'s
+`the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover`
+(the mechanism, honestly scoped),
+`the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`
+(the actual silence claim, against the actual hooks),
+`the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull`
+(defect 1's probe, reproduced and closed),
+`a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent`
+(defect 2's probe, reproduced and closed), and
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` /
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`
+(the exhausted boundary, both sides).
+
+---

@@ -650,7 +650,7 @@ pub async fn dispatch_once(
             continue;
         }
 
-        let Ok(scanned) = state.engine.entries_for_peer(from, BATCH * 4) else {
+        let Ok(scanned) = state.engine.entries_for_peer(from, BATCH * 4).map(|w| w.entries) else {
             continue;
         };
         let batch: Vec<OplogEntry> = scanned

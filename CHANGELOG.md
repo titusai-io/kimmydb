@@ -10,6 +10,183 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **A cross-member check makes a silent divergence alertable.** Every
+  anti-entropy round whose pull reaches the peer's true tail — nothing left
+  to pull, or this round's own batch was not truncated by the cap — now also
+  asks that peer what it holds: every collection id, and one collection's
+  live document count, chosen in turn so no round pays for more than one
+  collection's scan. `kimmy_sync_divergent_collections`, a gauge, moves once
+  a collection is found disagreeing twice running: two consecutive contacts
+  with the same peer for a collection-existence finding, two consecutive
+  probes of that specific collection against that peer for a document-count
+  finding, since only one collection is probed per contact and those are not
+  the same two contacts once more than one collection is in rotation — each
+  half clears independently the moment its own next relevant check no longer
+  sees it. It moves for the exact condition below: a member missing a
+  collection or a run of documents a peer holds, with
+  `kimmy_replication_lag_seconds` at 0 and `kimmy_sync_failures_total`,
+  `kimmy_sync_peers_backing_off` and `kimmy_sync_ddl_refused_total` all
+  unmoved, because nothing about it fails a round. Runs on the existing
+  `cluster.sync_interval_secs` cadence, so it still runs during a modestly
+  busy cluster and not only an idle one; a backlog that never drains under
+  the batch cap on any round leaves the check unrun and the gauge holding
+  its last value, which is *not checked*, not *not divergent*. A peer that
+  has simply not pulled this node's own recent writes is not flagged on
+  that lag alone. A peer that answers an empty batch while claiming its
+  tail was not reached — which a correct peer cannot produce — fails the
+  round rather than being read as a clean or skipped check. It reports; it
+  does not repair — see the operations guide for what it cannot catch. No
+  collection or database name appears in the metric. A second wire change
+  this release, alongside `Entries`': old and new peers cannot exchange
+  this check, and the cutover has its own rollout shape in the operations
+  guide. ADR-133.
+
+
+### Changed
+
+
+
+- **Breaking, stored format and cluster wire: an index carries the stamp of its
+  creation.** `IndexMeta` gained `created`, recorded in the collection metadata
+  and carried in the `CreateIndex` entry, and it is what the two fixes above
+  compare against. There is no shim and no migration — pre-1.0 the format is
+  changed outright. **An index that already exists on disk carries no stamp,
+  and reads as older than every drop and every rival**: a replayed drop removes
+  it and a rival definition is refused and counted, which is exactly the
+  behaviour of 0.21.0. It also heals on its own where it can: a member holding
+  the same definition *with* a stamp hands it over on the next round. Where no
+  member has one — an index every member created before this release — drop and
+  recreate it **on one member** and let that replicate, rather than recreating
+  it on each, if you want its name settled rather than counted. Nothing is
+  added to `/metrics`, to the index listing on `/v1`, or to
+  `docs/openapi.yaml`. ADR-132.
+
+- **Two members that create the same index definition independently now agree
+  on when it was created**, not merely on what it is. The creation stamp is
+  what decides whether a replayed drop applies, so one definition under two
+  stamps answered one drop two ways — one member keeping the index, the other
+  losing it, permanently, with `kimmy_sync_ddl_refused_total` still at 0 and
+  the lag gauge at 0. The later of the two stamps now stands on both, and it
+  only ever moves forward. ADR-132.
+
+- **Breaking, cluster wire: a batch answer now carries where the window
+  ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's
+  scan examined, an entry it withheld included) and `exhausted` (whether it
+  stopped there because the oplog ran out), and changed from a newtype variant
+  to a struct variant to do it. There is no compatibility shim and no version
+  negotiation — pre-1.0 the cluster wire is changed outright — so a node of
+  this version and a 0.21.0 node **cannot replicate with each other in either
+  direction**: the round fails as a malformed frame and `kimmy_sync_failures_total`
+  rises on both. Roll every member. Nothing on disk changes, and no client-facing
+  route, response or `/v1` promise is affected. ADR-127.
+
+### Fixed
+
+- **A member no longer silently and permanently loses committed documents to a
+  peer.** A node catching up by more than one batch could discard the remainder
+  of a sync window and mark it seen, so no later round ever re-served it. Two
+  causes, both closed. First, the 1,024-entry batch cap was spent *before* the
+  `UniqueViolation` entries a peer never ships were filtered out, so a window
+  truncated at the cap could return 1,019 entries with the peer's tail nowhere
+  near reached; the cap is now spent on the entries that actually ship, so a
+  batch shorter than the limit means what the receiver believes it means.
+  Second, the receiver read any short batch as "the peer's whole tail" and
+  absorbed the peer's entire version vector — witnessing every entry behind the
+  window without applying one of them; it now takes the peer's own report of
+  where the window ended instead of deducing it from a count, so no future
+  filter can reopen the same hole.
+
+  **How it looked.** Nothing failed, so nothing said so:
+  `kimmy_replication_lag_seconds` 0 on every member, `kimmy_sync_failures_total`
+  0, `kimmy_sync_peers_backing_off` 0, `/v1/topology` all live, and not one log
+  line on the members that lost the data. Observed on a three-member cluster
+  running 0.21.0: two collections held documents on the member that created
+  them and answered `404` on both peers forty-five minutes later, and a full
+  `_id` comparison found a 2,018-document collection holding 1,518 on one
+  member and 1,501 on another — a contiguous run of 500 ids missing from both,
+  plus a further 17 missing from the second. One bulk insert, discarded from
+  the window remainder by both pullers. The preconditions are ordinary: a
+  member more than one batch behind, and one cross-member unique collision
+  anywhere inside the window.
+
+  **If you have been running a cluster under load with unique indexes, assume
+  members may already disagree.** This release stops the divergence; it does not
+  repair one that has already happened. Compare collection lists and document
+  counts across members directly — lag 0 and quiet counters are precisely this
+  defect's signature, not evidence of convergence. Expect the losses to
+  **overlap** rather than be disjoint: one lost window on an origin is missing
+  from every member that was behind it, so a member-by-member count is not the
+  sum of what went missing, and repairing from a member that has one run does
+  not tell you the others are whole. Compare `_id` sets, not counts alone.
+  ADR-126, ADR-127.
+
+- **`$unwind` over a path that crosses an array emitted duplicate,
+  unchanged rows instead of unwinding anything — and, depending on what the
+  crossed element happened to hold, could instead emit one unchanged row
+  that looked correctly unwound but was not.** `$unwind: "$x.b"`, where `x`
+  itself holds an array (at any length, including one), read a value at the
+  path to decide what to do and then failed silently to write each element
+  back through the array — there is no single place to put it, whatever is
+  found there. Both symptoms are now the same `400`, naming `$unwind` and
+  the path, decided by whether the path crosses an array **by a named
+  field**, never by what is sitting at the far end of it: `items.sku` over
+  an array of `{sku, qty}` now refuses too, where it previously passed the
+  document through unchanged. A **numeric** segment after the array is
+  still not refused and is unaffected — `$unwind: "$a.0.b"` addresses a
+  position, not a name, and reads it the way every field-path option here
+  reads a numeric segment: as an index and as a field literally named that
+  number, not only the latter the way a computed expression would. **Whether
+  a pipeline is even legal now depends on the documents it meets, not on the
+  pipeline text** — the same pipeline can run correctly for months and then
+  refuse the day an ordinary write adds one document shaped this way, and
+  one such document fails the whole request. A path that never crosses an
+  array by a named field is unaffected. The refusal names the concrete fix,
+  not just the problem: `$unwind: "$items.sku"` is told to unwind `$items`
+  first and read `sku` on each resulting row, rather than being handed
+  internal path-traversal vocabulary. ADR-130.
+
+- **`find` with `limit: 0` returned one document instead of an empty page**,
+  on the unsorted path and on a `sort: {"_id": 1}` request, whenever the
+  first document the scan examined happened to match the filter — an empty
+  filter over a non-empty collection always qualifies. `limit: 0` is a
+  documented, legal request for an empty page (`FindRequest.limit` has
+  `minimum: 0`), and the sorted paths already honoured it; the unsorted scan
+  handed a match to the page before checking whether the page's bound had
+  already been reached. The bound is now checked first.
+
+- **A replayed index drop no longer deletes a newer index of the same name.**
+  An index that is created, dropped and created again derives the same id each
+  time, and anti-entropy re-serves overlapping windows as a matter of course —
+  so the drop between the two creations arrived again after the recreation and,
+  with nothing to compare it against, removed an index nobody had dropped. It
+  now leaves its tombstone and leaves the index alone. Observed on a
+  three-member cluster running 0.21.0: a collection listed **no indexes on any
+  member**, though three stood on all three an hour earlier. This also closes
+  the half that could not repair itself — where the newer creation is the
+  member's own, no peer can re-serve it, so the index stayed dropped there for
+  good. ADR-132.
+
+- **Two members that create one index name with different definitions now
+  converge instead of staying divergent.** ADR-123 left both standing, each
+  member keeping its own and counting the refusal; the 0.21.0 round watched two
+  collections sit that way, with `kimmy_sync_ddl_refused_total` at 9 / 15 / 9
+  and no path back to one schema. The later creation stamp now wins on every
+  member, which is how two concurrent writes to one document already settle.
+  The member whose definition loses logs a warning naming the index and what
+  differed, and rebuilds the name under the winner.
+
+  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case**.
+  It is unchanged for the case that still needs an operator — a definition a
+  member's own documents cannot be built under — and, where the winning
+  definition cannot be built on the receiving member, that member keeps the
+  index it already had rather than ending with neither. Creating a conflicting
+  index through the API is unaffected: a client is still refused `409`, naming
+  what differs. ADR-132.
+
 ## 0.21.0 - 2026-09-03
 
 A minor when it ships, not a patch. Nothing changes on the wire between

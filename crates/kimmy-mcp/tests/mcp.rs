@@ -990,6 +990,236 @@ async fn an_argument_the_tool_does_not_define_is_refused_by_name() {
     }
 }
 
+/// The destructive case ADR-128 exists to close, reproduced over the MCP
+/// transport rather than the REST body it was first found on: an agent whose
+/// serializer writes an unset argument as `null` — routine behaviour for many
+/// — must not empty a collection through `delete`, or rewrite every document
+/// through `update`.
+#[tokio::test]
+async fn a_null_filter_on_delete_or_update_is_refused_rather_than_matching_everything() {
+    let server = Server::start().await;
+    seed(&server);
+    let token = server.root();
+
+    let count = || {
+        let server = &server;
+        let token = &token;
+        async move {
+            server.call_ok(token, "count", json!({"database":"sales","collection":"orders"})).await
+                ["count"]
+                .as_i64()
+                .unwrap()
+        }
+    };
+    assert_eq!(count().await, 3);
+
+    let refused = server
+        .call(
+            &token,
+            "delete",
+            json!({"database":"sales","collection":"orders","filter":null,"multi":true}),
+        )
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "must not run: {refused}");
+    assert_eq!(count().await, 3, "no document may be gone");
+
+    let refused = server
+        .call(
+            &token,
+            "update",
+            json!({"database":"sales","collection":"orders","filter":null,
+                   "update":{"$set":{"zapped":true}},"multi":true}),
+        )
+        .await;
+    assert_eq!(refused["result"]["isError"], json!(true), "must not run: {refused}");
+    let zapped = server
+        .call_ok(
+            &token,
+            "count",
+            json!({"database":"sales","collection":"orders","filter":{"zapped":true}}),
+        )
+        .await["count"]
+        .as_i64()
+        .unwrap();
+    assert_eq!(zapped, 0, "no document may have been rewritten");
+}
+
+/// A table-driven guard for ADR-128 on the MCP side: every optional argument
+/// this file's argument structs declare refuses an explicit `null` rather
+/// than reading it as absent — the property a per-field patch on the REST
+/// routes alone would have left this transport without. Read-only tools also
+/// check that *omitting* the same field still succeeds, so the two are shown
+/// to differ only in the explicit `null`; a write tool's success case is
+/// exercised elsewhere in this file and only the refusal is pinned here,
+/// since running it destructively per field would make the fields in one
+/// tool's row order-dependent.
+///
+/// Unlike the REST body, the refusal here does not name the field: rmcp
+/// deserializes tool arguments with a plain `serde_json::from_value`, not the
+/// `serde_path_to_error`-wrapped call `JsonBody<T>` uses, so no value-level
+/// type error on this transport carries a field path — `limit: "abc"` fails
+/// with `"invalid type: string \"abc\", expected usize"` and no `limit`
+/// either. Only serde's own "unknown field" message is named, because that
+/// name is part of the message text itself rather than added by a path
+/// tracker. So what is pinned here is the property that actually matters —
+/// the call does not run — not a field name this transport was never able to
+/// report for a type error.
+///
+/// Also checks that each field's advertised `inputSchema` agrees: before
+/// `non_null_field` existed, `Option<T>` genuinely accepted `null`, so
+/// schemars' default `["T", "null"]` type and `"default": null` were
+/// accurate. Adding the attribute changed the server's behaviour without
+/// telling schemars, which would otherwise keep advertising `null` as valid —
+/// worst on `delete.filter`, whose `"default": null` would name the one
+/// value that empties the collection as the argument's default. Each field
+/// also carries `#[schemars(required)]` plus `skip_serializing_if =
+/// "Option::is_none"` for exactly this reason: the first asks schemars for
+/// the plain, non-nullable schema of the inner type; the second drops the
+/// `null` default `#[serde(default)]` would otherwise report. The property
+/// still is not required, since omitting it is unaffected.
+fn schema_forbids_null(schema: &Value) -> bool {
+    if matches!(schema.get("default"), Some(Value::Null)) {
+        return false;
+    }
+    let type_is_null = match schema.get("type") {
+        Some(Value::String(s)) => s == "null",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("null")),
+        _ => false,
+    };
+    if type_is_null {
+        return false;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(variants) = schema.get(key).and_then(Value::as_array)
+            && variants.iter().any(|v| v.get("type").and_then(Value::as_str) == Some("null"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
+#[tokio::test]
+async fn every_optional_tool_argument_refuses_an_explicit_null() {
+    let server = Server::start().await;
+    seed(&server);
+    seed_vectors(&server);
+    let token = server.root();
+
+    // (tool, base arguments, [(field, also check that omitting it succeeds)])
+    type Case = (&'static str, Value, Vec<(&'static str, bool)>);
+    let cases: Vec<Case> = vec![
+        (
+            "describe_collection",
+            json!({"database":"sales","collection":"orders"}),
+            vec![("sample", true)],
+        ),
+        (
+            "find",
+            json!({"database":"sales","collection":"orders"}),
+            vec![
+                ("filter", true),
+                ("sort", true),
+                ("projection", true),
+                ("limit", true),
+                ("skip", true),
+            ],
+        ),
+        ("count", json!({"database":"sales","collection":"orders"}), vec![("filter", true)]),
+        (
+            "vector_search",
+            json!({"database":"kb","collection":"notes","vector":[1.0,0.0,0.0]}),
+            // `query` and `vector` are checked for the refusal and the
+            // schema only: on a `byo` collection removing either leaves
+            // nothing to search with, which is a functional failure this
+            // table is not about.
+            vec![("query", false), ("vector", false), ("filter", true), ("k", true)],
+        ),
+        (
+            "hybrid_search",
+            json!({"database":"kb","collection":"notes","query":"red blue",
+                   "vector":[1.0,0.0,0.0],"k":5}),
+            vec![
+                ("query", false),
+                ("vector", false),
+                ("filter", true),
+                ("k", true),
+                ("weights", true),
+                ("min_overlap", true),
+            ],
+        ),
+        (
+            "update",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"a"},
+                   "update":{"$set":{"seen":true}}}),
+            vec![("filter", false)],
+        ),
+        (
+            "delete",
+            json!({"database":"sales","collection":"orders","filter":{"_id":"a"}}),
+            vec![("filter", false)],
+        ),
+        (
+            "create_index",
+            json!({"database":"sales","collection":"orders","fields":[{"path":"status"}]}),
+            vec![("name", false)],
+        ),
+    ];
+
+    let (_, listed) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+
+    for (tool, base, fields) in cases {
+        let input_schema = &tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .unwrap_or_else(|| panic!("{tool} is not listed"))["inputSchema"];
+        let schema = &input_schema["properties"];
+        let required = input_schema["required"].as_array().cloned().unwrap_or_default();
+
+        for (field, check_omission) in fields {
+            assert!(
+                schema_forbids_null(&schema[field]),
+                "{tool}.{field}: the advertised schema must not accept null: {}",
+                schema[field]
+            );
+            // `#[schemars(required)]` earns the non-nullable type only
+            // because `#[serde(default)]` keeps the field genuinely
+            // optional; if that ever came off, the field would silently
+            // flip to required in the schema `#[schemars(required)]`
+            // otherwise produces — the opposite failure from the one this
+            // suite exists to catch, and worse, since it breaks any client
+            // that validates before calling rather than merely under-warning
+            // one that doesn't.
+            assert!(
+                !required.contains(&json!(field)),
+                "{tool}.{field}: must stay out of the schema's required list: {input_schema}"
+            );
+
+            let mut nulled = base.clone();
+            nulled[field] = Value::Null;
+            let refused = server.call(&token, tool, nulled).await;
+            assert_eq!(
+                refused["result"]["isError"],
+                json!(true),
+                "{tool}.{field}: null must be refused, not read as absent: {refused}"
+            );
+
+            if check_omission {
+                let mut omitted = base.clone();
+                omitted.as_object_mut().unwrap().remove(field);
+                let ok = server.call(&token, tool, omitted).await;
+                assert_ne!(
+                    ok["result"]["isError"],
+                    json!(true),
+                    "{tool}.{field}: omitting it must still succeed: {ok}"
+                );
+            }
+        }
+    }
+}
+
 #[tokio::test]
 async fn tool_results_carry_both_text_and_structured_content() {
     // Not every client renders structured content, and an answer no client

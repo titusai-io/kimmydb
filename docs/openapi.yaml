@@ -93,6 +93,20 @@ info:
     `additionalProperties: false`; a document body — insert, replace, bulk —
     is content rather than a shape and takes any field.
 
+    **An explicit `null` on a declared *optional* field is refused `422`
+    the same way, rather than read as the field being absent** (ADR-128).
+    `Option`-shaped fields — every optional property below — cannot
+    otherwise tell "omitted" from "sent as `null`" apart, and the two are
+    different requests: `{"if_stamp": null}` is not the same as leaving
+    `if_stamp` out, and `{"filter": null, "multi": true}` on `delete` is not
+    the same as `{"filter": {}, "multi": true}`, the documented way to match
+    every document. Only a request shape's own declared fields are held to
+    this — `null` inside a filter, an update operator's operand, or a
+    document body is content and untouched. A *required* field sent as
+    `null` was already refused before this rule, downstream, by its own
+    type — not necessarily at `422` — so this closes the one case nothing
+    refused: an optional field's `null`.
+
     Query strings are held to the same rule, at `400`. On the operations that
     declare a query parameter, one the route does not define, or cannot
     parse, is refused with the parameter named. **On every other operation
@@ -110,10 +124,11 @@ info:
     refused* — so a client that asks for everything in one request is answered
     with a prefix and no indication that it was one. Walk with a cursor.
 
-    `POST .../find` returns `nextCursor` whenever the page filled and the query
-    is one a cursor can continue. A query a cursor cannot continue returns no
-    token at all, rather than one that would silently page in a different order
-    than the one asked for.
+    `POST .../find` returns `nextCursor` whenever the page filled, `skip` is
+    `0`, and the query is one a cursor can continue. A query a cursor cannot
+    continue — and a page reached by a non-zero `skip`, which is an offset
+    rather than a walk — returns no token at all, rather than one that would
+    silently page in a different order than the one asked for.
 
     What a client may rely on:
 
@@ -1268,7 +1283,13 @@ paths:
           in: query
           required: false
           schema: { type: boolean }
-          description: Include one example value per field.
+          description: |
+            Include one example value per field. An example is always a
+            *BSON* scalar, so a date, an ObjectId or a binary value appears
+            in its Extended JSON form and a field holding only objects,
+            arrays or `null` carries none. A field whose every sampled value
+            is a string over 120 bytes carries none either: the key is
+            absent, not `null`.
       responses:
         "200":
           description: The inferred shape.
@@ -1531,6 +1552,20 @@ paths:
         An update path may address array elements: `items.$[].qty` reaches
         every element, and `items.$[line].qty` reaches the elements the
         `arrayFilters` entry for `line` selects (ADR-104).
+
+        **`explain: true` plans the update; it does not perform it**
+        (ADR-131). It answers with the same plan a real update would use —
+        `documentsExamined`, `documentsMatched`, and which index, if any —
+        but writes nothing and spends no commit: `matched`, `modified` and
+        `commits` all report zero, and `stamp` is absent, exactly as they
+        would for a write that touched nothing. What the update *would*
+        touch is `explain.documentsMatched` — but that count is the
+        selection, not a guarantee: `explain` never runs the update
+        operators, so the real write can still refuse a document it counted,
+        if an operator cannot apply to that document (a `$inc` on a
+        non-numeric field, say). Cannot be combined with `if_stamp`: a plan
+        checks no version, so it cannot answer whether a conditional update
+        would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1551,11 +1586,17 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                  description: |
+                    Plan the update and report the plan, without performing
+                    it. See the route description.
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Write only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional write would happen (ADR-131). `400` either
+                    way.
                 arrayFilters:
                   $ref: "#/components/schemas/ArrayFilters"
       responses:
@@ -1569,6 +1610,13 @@ paths:
                 properties:
                   matched:
                     type: integer
+                    description: |
+                      Documents the filter matched and the write acted on.
+                      Zero under `explain: true`, which plans and does not
+                      act on anything — see `explain.documentsMatched` for
+                      the selection the plan found, which the write may
+                      still refuse a document out of if an operator cannot
+                      apply to it (ADR-131).
                   modified:
                     type: integer
                     description: |
@@ -1589,14 +1637,16 @@ paths:
                     description: |
                       Write transactions the request cost — one per chunk of
                       `storage.multi_chunk_docs` documents, zero when nothing
-                      matched (ADR-086).
+                      matched (ADR-086) and zero under `explain: true`, which
+                      spends none (ADR-131).
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The version the write produced. Present only when the
                       request wrote exactly one document without `multi` — a
                       version names one document, and a multi write has no
-                      single one to name (ADR-084).
+                      single one to name (ADR-084). Always absent under
+                      `explain: true`, which writes nothing (ADR-131).
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -1700,6 +1750,13 @@ paths:
         `multi: true` commits in chunks of `storage.multi_chunk_docs` with the
         writer released between them, and `if_stamp` makes a single-document
         delete conditional on its version.
+
+        **`explain: true` plans the delete; it does not perform it**
+        (ADR-131). `deleted` and `commits` report zero and `stamp` is absent,
+        exactly as they would for a delete that matched nothing; what it
+        *would* delete is `explain.documentsMatched`. Cannot be combined
+        with `if_stamp`: a plan checks no version, so it cannot answer
+        whether a conditional delete would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1716,11 +1773,17 @@ paths:
                 explain:
                   type: boolean
                   default: false
+                  description: |
+                    Plan the delete and report the plan, without performing
+                    it. See the route description.
                 if_stamp:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Delete only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional delete would happen (ADR-131). `400` either
+                    way.
       responses:
         "200":
           description: How many were deleted.
@@ -1732,14 +1795,22 @@ paths:
                 properties:
                   deleted:
                     type: integer
+                    description: |
+                      Documents deleted. Zero under `explain: true`, which
+                      plans and does not delete — see
+                      `explain.documentsMatched` for what would have been
+                      deleted (ADR-131).
                   commits:
                     type: integer
-                    description: Write transactions the request cost — one per chunk (ADR-086).
+                    description: |
+                      Write transactions the request cost — one per chunk
+                      (ADR-086), zero under `explain: true` (ADR-131).
                   stamp:
                     allOf: [{ $ref: "#/components/schemas/Stamp" }]
                     description: |
                       The tombstone's version. Present only when the request
                       deleted exactly one document without `multi` (ADR-084).
+                      Always absent under `explain: true`.
                   explain: { $ref: "#/components/schemas/Explain" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "422": { $ref: "#/components/responses/WrongShape" }
@@ -2697,12 +2768,24 @@ components:
     WrongShape:
       description: |
         The body is valid JSON but not the shape this route takes — an object
-        where an array is wanted, a missing required field, or a field the
-        route does not define (ADR-121; the message names it). Carries the
-        `bad_request` code: the status distinguishes "not JSON" from "not this
-        JSON", and the code says what a client should do about either. A
-        document body — insert, replace, bulk — is content and takes any
-        field.
+        where an array is wanted, a missing required field, a field the
+        route does not define, or an explicit `null` on a declared
+        *optional* field that does not accept one (ADR-121, ADR-128; the
+        message names it). An omitted optional field still means what it
+        always meant — `null` is refused because it is not the same
+        request, not because the field stopped being optional. A `null` on
+        a *required* field is refused too, but downstream, by that field's
+        own type, and not always at this status. Carries the `bad_request`
+        code: the status distinguishes "not JSON" from "not this JSON", and
+        the code says what a client should do about either. A document
+        body — insert, replace, bulk — is content and takes any field,
+        `null` values included. One exception to "the message names it": a
+        wrong-typed or `null` value inside a tagged `provider` object names
+        `provider`, not the field inside it (`provider.endpoint`, say) —
+        true of every value error there, not only `null` — because that
+        value is re-read through a second deserializer once the `kind` tag
+        is matched, and the path tracker cannot see across the seam. An
+        ordinary nested object, `chunk` among them, is unaffected.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
@@ -3095,12 +3178,20 @@ components:
             A larger value is **clamped to 10,000 rather than refused**, so
             asking for more than the cap succeeds and returns less than was
             asked for. Walk with `cursor` instead.
+
+            `0` is a window of nothing, not a request for the default: an
+            empty `documents`, `count` of `0`, and no `nextCursor`, on every
+            access path and every sort order.
         skip:
           type: integer
           minimum: 0
           description: |
             Costs work proportional to what it skips. Use `cursor` for paging;
             `skip` is for jumping.
+
+            A page reached by a non-zero `skip` carries **no `nextCursor`**,
+            however full it is — the two ways of saying where to resume are
+            not mixed, and combining them in one request is refused outright.
 
             With a `sort` other than `{"_id": 1}`, `skip + limit` may not
             exceed 10,000 — that is what the server holds while it sorts — and
@@ -3150,10 +3241,12 @@ components:
         nextCursor:
           type: string
           description: |
-            Present when the page filled and the query is one a cursor can
-            continue. Absent means either the end of the results or a query
-            whose order a cursor cannot express — never a token that would
-            page in a different order than the one asked for.
+            Present when the page filled, `skip` was `0`, and the query is one
+            a cursor can continue. Absent means the end of the results, a
+            query whose order a cursor cannot express, or a page reached by a
+            non-zero `skip` — never a token that would page in a different
+            order than the one asked for, or from a position the caller did
+            not choose.
 
             **A full page is not proof there is more.** A collection of exactly
             100 documents read 100 at a time offers a token whose next page is
@@ -3173,7 +3266,12 @@ components:
 
     Explain:
       type: object
-      description: How a query was answered. Present only when `explain` was requested.
+      description: |
+        How a query was, or an update or a delete would be, answered. Present
+        only when `explain` was requested. On `find` and `count` this
+        describes the read that happened; on `update` and `delete` it
+        describes the read-only plan that ran *instead of* the write
+        (ADR-131) — the shape is identical either way.
       required: [strategy, index, indexFieldsUsed, documentsExamined, documentsMatched]
       properties:
         strategy:
@@ -3204,7 +3302,17 @@ components:
             consulted.
         indexFieldsUsed: { type: integer }
         documentsExamined: { type: integer }
-        documentsMatched: { type: integer }
+        documentsMatched:
+          type: integer
+          description: |
+            Documents the filter matched. On `update` and `delete` under
+            `explain: true`, this is the write's selection — the route's own
+            `matched`/`modified`/`deleted` stay zero, since nothing was
+            written (ADR-131). On `delete` that selection is exactly what a
+            real delete would remove; on `update` it is not a guarantee,
+            since `explain` never runs the update operators — a document
+            counted here can still be one the real write refuses, if an
+            operator cannot apply to it.
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.
@@ -3216,8 +3324,7 @@ components:
             examined: an equality on a complete key stopped by `limit` reads
             as many entries as it returns, while a range that had to be put
             in `_id` order reads the whole range however few documents it
-            returns. Absent for a collection scan, an `idLookup`, and for
-            `update` and `delete`.
+            returns. Absent for a collection scan and an `idLookup`.
 
     ViolationGroup:
       type: object

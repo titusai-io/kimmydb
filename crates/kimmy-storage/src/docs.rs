@@ -1229,7 +1229,7 @@ mod tests {
             .insert_many(&coll, vec![doc! { "_id": 1 }, doc! { "_id": 2 }, doc! { "_id": 3 }])
             .unwrap();
 
-        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap();
+        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
         let inserts: Vec<_> = entries.iter().filter(|e| e.kind == OpKind::Insert).collect();
         assert_eq!(inserts.len(), 3, "the batch is three documents and three log entries");
         for pair in inserts.windows(2) {

@@ -392,6 +392,21 @@ refining a query forever and learning that ingestion never happened. The first
 is fixed by configuring the collection; the second by letting the worker catch
 up or, on a `byo` collection, by supplying vectors.
 
+**A third, `500 misconfigured`, sits behind the second and is easy to mistake
+for it.** The provider is built only after those two checks pass, so a node
+that cannot build it — the environment variable named by `api_key_env` is
+unset here, the stored configuration is one this node's policy refuses, or it
+names a profile this node does not define — still answers `409 no_vectors`
+while the collection is empty, and the same missing key is why it is empty:
+the worker needs the provider too. `500 misconfigured` appears once vectors
+exist and a search asks the server to embed `query` text — after a client
+`PUT` them, after they replicate in from a member that could embed, or after
+a key that used to be set goes away. So a `409` on a collection that never
+fills is a provider question, not an ingestion one, which is what its message
+means by *check the server log for embedding provider errors*: the refusal to
+build is logged there with the variable's name or the host. A request that
+carries its own `vector` never builds a provider and never sees this at all.
+
 `filter` is an ordinary query-language document. It runs first, and its matching
 ids restrict the search — which is what lets semantic search compose with
 structured querying instead of being a separate world.

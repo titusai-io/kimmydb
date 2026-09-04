@@ -7,6 +7,8 @@
 use bson::Document;
 use serde::{Deserialize, Serialize};
 
+use crate::hlc::Stamp;
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexMeta {
     /// Derived from [`Self::name`], so every node agrees.
@@ -78,6 +80,30 @@ pub struct IndexMeta {
     /// including dates and integers above 2^53.
     #[serde(default)]
     pub partial_filter: Option<Document>,
+    /// The stamp of the create that produced *this* index, at its origin:
+    /// the stamp of the `CreateIndex` entry a local create minted, or the
+    /// stamp of the entry a replicated one arrived on.
+    ///
+    /// Two things need it, and neither can be decided without it (ADR-132).
+    /// A replayed `DropIndex` has to know which incarnation it was aimed at,
+    /// or a drop re-served after a recreation of the same name removes the
+    /// newer index — the collection-level problem `CollectionMeta::created`
+    /// and `incarnation_floor` already solve one level up. And two members
+    /// that created one name with different definitions during a partition
+    /// have to agree on a winner, which is the later stamp, exactly as two
+    /// concurrent writes to one document do ([`Stamp::wins_over`], ADR-020).
+    ///
+    /// **`None` is an index created before the stamp existed**, and reads as
+    /// *older than every drop and every rival definition*: a replayed drop
+    /// applies to it and a rival definition is refused rather than resolved,
+    /// which is the behaviour ADR-123 left. Deliberately not backfilled from
+    /// a local clock at open — a stamp invented here would sort after drops
+    /// that genuinely superseded the index and would make this node's copy
+    /// win a comparison it knows nothing about. The ambiguity ends the first
+    /// time the index is recreated. Same reasoning, and the same `None`, as a
+    /// collection's incarnation floor before ADR-081.
+    #[serde(default)]
+    pub created: Option<Stamp>,
 }
 
 /// How far a unique constraint reaches.
@@ -184,6 +210,44 @@ impl IndexMeta {
             hash = hash.wrapping_mul(PRIME);
         }
         hash
+    }
+
+    /// Which parts of two definitions under one name disagree.
+    ///
+    /// Empty means the two describe the same index, so a creation that meets
+    /// it is a re-delivery rather than a conflict. Each part is named
+    /// separately so an error can say which one moved — "different fields"
+    /// used to be reported for a changed TTL too, which sent the reader to
+    /// look at the one thing that had not changed.
+    ///
+    /// Deliberately not `PartialEq`, and the exclusions are exactly three:
+    /// `id` is derived from the name and so is equal by construction,
+    /// `multikey` is a node-local observation of the documents rather than
+    /// part of the definition, and `created` is the stamp that *decides* a
+    /// conflict rather than a term in it. Everything else is compared,
+    /// `enforcement` included — which cannot differ today, because
+    /// [`Enforcement::Coordinated`] is refused where an index is created, but
+    /// which is part of the definition the moment it can be, and would
+    /// otherwise make two genuinely different definitions read as one and
+    /// never resolve.
+    pub fn differences(&self, other: &IndexMeta) -> Vec<&'static str> {
+        let mut differs = Vec::new();
+        if self.fields != other.fields {
+            differs.push("field list");
+        }
+        if self.unique != other.unique {
+            differs.push("unique flag");
+        }
+        if self.enforcement != other.enforcement {
+            differs.push("enforcement");
+        }
+        if self.expire_after_secs != other.expire_after_secs {
+            differs.push("expireAfterSeconds");
+        }
+        if self.partial_filter != other.partial_filter {
+            differs.push("partialFilterExpression");
+        }
+        differs
     }
 
     /// Conventional Mongo-style name, e.g. `age_1_name_-1`.

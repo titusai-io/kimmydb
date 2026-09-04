@@ -10,6 +10,7 @@
 
 pub mod backup;
 pub mod codec;
+pub mod divergence;
 pub mod docs;
 pub mod engine;
 pub mod error;
@@ -26,6 +27,10 @@ pub mod tables;
 pub mod vectors;
 pub mod watch;
 
+pub use divergence::{
+    DivergenceTracker, Findings as DivergenceFindings, LocalState as DivergenceLocalState,
+    PeerAnswer as DivergencePeerAnswer, compare as compare_divergence, next_probe,
+};
 pub use docs::{BulkInsertError, ID_FIELD, WriteOutcome};
 pub use engine::physical_now_ms;
 pub use engine::{DurabilityClass, Engine, blocking};
@@ -39,4 +44,6 @@ pub use snapshot::{
     CollectionState, SNAPSHOT_PAGE, SnapshotApplied, SnapshotCursor, SnapshotDoc, SnapshotPage,
 };
 pub use sync::{SyncOutcome, lacks_collected, lag_behind_ms, lag_beyond_horizon_ms};
-pub use watch::{ChangeEvent, ChangeStream, InvalidateReason, WatchOptions, WatchScope};
+pub use watch::{
+    ChangeEvent, ChangeStream, InvalidateReason, OplogWindow, WatchOptions, WatchScope,
+};

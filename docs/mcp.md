@@ -329,6 +329,18 @@ ones the tool takes, not a call that ran without it. Each tool's `inputSchema`
 says so with `additionalProperties: false`, so a client that validates before
 calling learns it first ([ADR-121](decisions.md)).
 
+An optional argument set to `null` is refused the same way REST refuses it —
+the call does not run — though the tool's error text does not name the
+field the way an unknown argument's does: rmcp deserializes tool arguments
+without the path-tracking the HTTP body gets from `serde_path_to_error`, so
+a value error of any kind, this one included, reads as
+`"failed to deserialize parameters: invalid type: null, expected a non-null
+value"` rather than naming which field. `{"filter": null, "multi": true}` on
+`delete` does not empty a collection any more than it does over REST, which
+is the property that matters ([ADR-128](decisions.md)); an agent whose
+serializer writes an unset argument as `null` gets an error back, not a
+silent write.
+
 ---
 
 ## Next

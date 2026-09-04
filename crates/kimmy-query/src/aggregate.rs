@@ -107,6 +107,10 @@ pub enum Stage {
     Unwind {
         path: String,
         preserve_null_and_empty: bool,
+        /// `includeArrayIndex`: the name of a field to hold the position of
+        /// the element that produced each output document, `null` on a
+        /// document that was not fanned out from an array.
+        include_array_index: Option<String>,
     },
     Group {
         id: Expr,
@@ -370,6 +374,7 @@ fn parse_project(doc: &Document, vars: &[String]) -> Result<Stage> {
 }
 
 fn parse_replace_root(spec: &Document, vars: &[String]) -> Result<Stage> {
+    deny_unknown_keys("$replaceRoot", spec, &["newRoot"])?;
     let Some(new_root) = spec.get("newRoot") else {
         return Err(Error::InvalidQuery(
             "$replaceRoot needs a `newRoot`, e.g. {newRoot: \"$address\"}".into(),
@@ -382,6 +387,27 @@ fn as_document<'a>(stage: &str, value: &'a Bson) -> Result<&'a Document> {
     value.as_document().ok_or_else(|| {
         Error::InvalidQuery(format!("{stage} takes a document, found {}", type_name(value)))
     })
+}
+
+/// Refuse a key `doc` carries that is not in `allowed`.
+///
+/// A stage operand with a *fixed* key set — `$unwind`'s document form,
+/// `$lookup`'s both forms, `$replaceRoot` — gets the same closure ADR-121
+/// gives the request body and the shapes nested inside it: a field the stage
+/// does not define is refused rather than quietly ignored. `$match` and
+/// `$project` are field-path maps, not fixed-key documents — every key in
+/// them is data, not vocabulary — so they are never run through this and
+/// must stay open.
+fn deny_unknown_keys(stage: &str, doc: &Document, allowed: &[&str]) -> Result<()> {
+    for key in doc.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(Error::InvalidQuery(format!(
+                "{stage} does not accept `{key}`; it takes: {}",
+                allowed.join(", ")
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn as_count(stage: &str, value: &Bson) -> Result<usize> {
@@ -410,12 +436,21 @@ fn parse_unwind(value: &Bson) -> Result<Stage> {
     // form is the only way to ask for the empty-array behaviour.
     match value {
         Bson::String(_) => match Expr::parse(value)? {
-            Expr::Field(p) => Ok(Stage::Unwind { path: p, preserve_null_and_empty: false }),
+            Expr::Field(p) => Ok(Stage::Unwind {
+                path: p,
+                preserve_null_and_empty: false,
+                include_array_index: None,
+            }),
             _ => Err(Error::InvalidQuery(
                 "$unwind takes a field path beginning with $, e.g. {$unwind: \"$tags\"}".into(),
             )),
         },
         Bson::Document(d) => {
+            deny_unknown_keys(
+                "$unwind",
+                d,
+                &["path", "preserveNullAndEmptyArrays", "includeArrayIndex"],
+            )?;
             let field = d.get("path").ok_or_else(|| {
                 Error::InvalidQuery("$unwind needs a `path`, e.g. {path: \"$tags\"}".into())
             })?;
@@ -424,9 +459,60 @@ fn parse_unwind(value: &Bson) -> Result<Stage> {
                     "$unwind `path` must begin with $, e.g. \"$tags\"".into(),
                 ));
             };
-            let preserve =
-                d.get("preserveNullAndEmptyArrays").and_then(Bson::as_bool).unwrap_or(false);
-            Ok(Stage::Unwind { path: p, preserve_null_and_empty: preserve })
+            // A wrong-typed value is refused by name, not read as `false` —
+            // the same shape of hazard the finding this ADR is named after
+            // reports: `"preserveNullAndEmptyArrays": "true"` or `: 1` would
+            // otherwise answer `200` with the option silently reverted.
+            let preserve = match d.get("preserveNullAndEmptyArrays") {
+                None => false,
+                Some(Bson::Boolean(b)) => *b,
+                Some(other) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$unwind `preserveNullAndEmptyArrays` must be a boolean, found {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            let include_array_index = match d.get("includeArrayIndex") {
+                None => None,
+                Some(Bson::String(name)) => {
+                    if name.is_empty() {
+                        return Err(Error::InvalidQuery(
+                            "$unwind `includeArrayIndex` cannot be an empty field name".into(),
+                        ));
+                    }
+                    // A name this language's own field-path syntax cannot
+                    // read back: `"$name"` in an expression means the field
+                    // called `name`, not one called `$name`, so a field
+                    // beginning with `$` could be written by this stage and
+                    // never referenced by a later one.
+                    if name.split('.').any(|seg| seg.starts_with('$')) {
+                        return Err(Error::InvalidQuery(format!(
+                            "$unwind `includeArrayIndex` cannot be {name:?}: a field name \
+                             beginning with $ cannot be read back by this language's own \
+                             field-path syntax"
+                        )));
+                    }
+                    // Naming the unwound path itself would overwrite the
+                    // element `$unwind` just placed there with its index,
+                    // silently, on every row.
+                    if *name == p {
+                        return Err(Error::InvalidQuery(format!(
+                            "$unwind `includeArrayIndex` cannot be the same field as `path` \
+                             ({name:?}): it would overwrite the unwound element with its index"
+                        )));
+                    }
+                    Some(name.clone())
+                }
+                Some(other) => {
+                    return Err(Error::InvalidQuery(format!(
+                        "$unwind `includeArrayIndex` takes the name of a field, e.g. \"i\", \
+                         found {}",
+                        type_name(other)
+                    )));
+                }
+            };
+            Ok(Stage::Unwind { path: p, preserve_null_and_empty: preserve, include_array_index })
         }
         other => Err(Error::InvalidQuery(format!(
             "$unwind takes a field path or a document, found {}",
@@ -492,6 +578,13 @@ fn parse_group(spec: &Document, vars: &[String]) -> Result<Stage> {
 /// what an equality join attached can do that with `$filter` or `$map` in the
 /// stage after it.
 fn parse_lookup(spec: &Document, vars: &[String]) -> Result<Stage> {
+    // Closed over the union of both forms' keys; which subset is actually
+    // legal together is decided below, where the two forms are told apart.
+    deny_unknown_keys(
+        "$lookup",
+        spec,
+        &["from", "as", "localField", "foreignField", "let", "pipeline"],
+    )?;
     let string = |key: &str| -> Result<String> {
         spec.get_str(key).map(str::to_string).map_err(|_| {
             Error::InvalidQuery(format!(
@@ -676,8 +769,8 @@ pub fn apply_with_vars(
             let n = input.len() as i64;
             vec![bson::doc! { field.as_str(): n }]
         }
-        Stage::Unwind { path: p, preserve_null_and_empty } => {
-            unwind(input, p, *preserve_null_and_empty, limits)?
+        Stage::Unwind { path: p, preserve_null_and_empty, include_array_index } => {
+            unwind(input, p, *preserve_null_and_empty, include_array_index.as_deref(), limits)?
         }
         Stage::Group { id, fields } => group(input, id, fields, limits, vars)?,
         Stage::Lookup { .. } => {
@@ -725,22 +818,107 @@ pub fn check_limit(stage: &str, produced: usize, limits: &Limits) -> Result<()> 
     Ok(())
 }
 
+/// Where writing to `field` in `doc` would fail, if it would: `(array_path,
+/// remainder)`, `array_path` the dotted prefix naming the array itself,
+/// `remainder` what was left of `field` to read from each of its elements.
+/// `None` when the write would succeed.
+///
+/// Mirrors `path::set`'s own traversal read-only, without cloning `doc` to
+/// probe it — a non-terminal segment lands on an array whose next segment
+/// names a field rather than a numeric position, `path::set`'s one failure
+/// mode. A segment that is missing, a scalar, or an array reached by an
+/// index that is not already a document is what `path::set` vivifies or
+/// overwrites rather than fails on; none of those can already contain an
+/// array of their own, so this walk stops there and reports no crossing,
+/// exactly matching `path::set` succeeding by vivifying it.
+///
+/// A **numeric** segment after the array is the one case this deliberately
+/// does not report — `$unwind: "$a.0.b"` writes by index, same as any
+/// numeric-indexed write, and is not "crossing" in this function's sense.
+/// ADR-116 names this the one place its own non-fanning read and the
+/// expression layer's fanning read disagree, and that disagreement stays
+/// observable through `$unwind` here — see
+/// `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
+/// and ADR-130. An earlier revision of this function's own documentation
+/// claimed the uniform check made `$unwind`'s reader choice unobservable
+/// everywhere; that was wrong precisely because of this case, and is
+/// corrected here rather than repeated.
+fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut current = doc;
+    let mut i = 0;
+    while i + 1 < segs.len() {
+        match current.get(segs[i]) {
+            Some(Bson::Document(child)) => {
+                current = child;
+                i += 1;
+            }
+            Some(Bson::Array(items)) => match segs[i + 1].parse::<usize>() {
+                // A numeric next segment addresses a position, not a
+                // crossing; recurse into that element only if it is already
+                // a document — anything else is what `path::set` vivifies or
+                // overwrites, so nothing further along this path can fail.
+                Ok(index) => match items.get(index) {
+                    Some(Bson::Document(child)) => {
+                        current = child;
+                        i += 2;
+                    }
+                    _ => return None,
+                },
+                Err(_) => return Some((segs[..=i].join("."), segs[i + 1..].join("."))),
+            },
+            _ => return None,
+        }
+    }
+    None
+}
+
 fn unwind(
     input: Vec<Document>,
     field: &str,
     preserve: bool,
+    include_index: Option<&str>,
     limits: &Limits,
 ) -> Result<Vec<Document>> {
+    // Write the index field alongside the unwound value, or `null` on a
+    // document that passed through without being fanned out — MongoDB's rule,
+    // and the only sane reading of "which element produced this row" for a
+    // row that was not produced by one.
+    let set_index = |copy: &mut Document, index: Option<i64>| -> Result<()> {
+        let Some(name) = include_index else { return Ok(()) };
+        let value = index.map_or(Bson::Null, Bson::Int64);
+        path::set(copy, name, value)
+            .map_err(|e| Error::InvalidQuery(format!("cannot set `{name}`: {e}")))
+    };
+
     let mut out = Vec::with_capacity(input.len());
     for doc in input {
+        // Refused uniformly, for every document, before anything at `field`
+        // is read: `$unwind` names a place to write each element back to,
+        // and a path that crosses an array has none, regardless of what is
+        // sitting there — an array to expand, a scalar, `null`, or nothing
+        // at all. See ADR-130.
+        if let Some((array_path, remainder)) = crossing_array(&doc, field) {
+            return Err(Error::InvalidQuery(format!(
+                "$unwind cannot expand `{field}`: `{array_path}` is an array, so there is no \
+                 single place to write each element back to. Unwind `${array_path}` first, then \
+                 read `{remainder}` on each resulting row"
+            )));
+        }
         // `path` is a field path: `$unwind` names the array to expand, and
-        // `path::set` writes each element back to that same place. A fanned
-        // read would have no single place to write to.
+        // `path::set` writes each element back to that same place. Past the
+        // check above, `field` does not cross an array in this document, so
+        // every write below is guaranteed to succeed; the `Result` is still
+        // propagated with `?` rather than unwrapped, on the same principle
+        // as everywhere else in this module — a proof that holds today is
+        // not a reason to let a future change panic instead of refuse.
         match value_at(&doc, field) {
             Some(Bson::Array(items)) if !items.is_empty() => {
-                for item in items.clone() {
+                for (index, item) in items.clone().into_iter().enumerate() {
                     let mut copy = doc.clone();
-                    let _ = path::set(&mut copy, field, item);
+                    path::set(&mut copy, field, item)
+                        .map_err(|e| Error::InvalidQuery(format!("cannot set `{field}`: {e}")))?;
+                    set_index(&mut copy, Some(index as i64))?;
                     out.push(copy);
                 }
                 // Checked inside the loop as well as after: a handful of
@@ -755,13 +933,18 @@ fn unwind(
                 if preserve {
                     let mut copy = doc.clone();
                     path::unset(&mut copy, field);
+                    set_index(&mut copy, None)?;
                     out.push(copy);
                 }
             }
             // A non-array value unwinds to itself, which is what MongoDB does
             // and saves callers a `$type` check for a field that is sometimes
             // scalar and sometimes an array.
-            Some(_) => out.push(doc),
+            Some(_) => {
+                let mut copy = doc;
+                set_index(&mut copy, None)?;
+                out.push(copy);
+            }
         }
     }
     Ok(out)
@@ -1029,6 +1212,149 @@ mod tests {
         assert_eq!(out.len(), 4, "the empty array now yields one document: {out:?}");
     }
 
+    // -- ADR-129: stage operand documents are closed -----------------------
+
+    #[test]
+    fn a_misspelled_unwind_option_is_refused_not_silently_ignored() {
+        // The load-bearing pair, one character apart. Before ADR-129 both
+        // answered `200`: the correctly-spelled option kept the document
+        // (1 row), and the misspelling silently reverted to `false` and
+        // dropped it (0 rows) — a typo quietly changing the result.
+        let input = docs(vec![doc! { "_id": 1 }]);
+
+        let out = run(
+            vec![doc! {"$unwind": {"path": "$nosuchfield", "preserveNullAndEmptyArrays": true}}],
+            input.clone(),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 1, "correctly spelled: kept, as asked");
+
+        let err = run(
+            vec![doc! {"$unwind": {"path": "$nosuchfield", "preserveNullAndEmptyArray": true}}],
+            input,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("preserveNullAndEmptyArray"), "{err}");
+        assert!(err.contains("$unwind"), "{err}");
+    }
+
+    #[test]
+    fn unwind_include_array_index_is_implemented_not_dropped() {
+        // A real MongoDB option a porting client would send; before ADR-129
+        // it was accepted and silently dropped (a `200` with no index field).
+        let out =
+            run(vec![doc! {"$unwind": {"path": "$tags", "includeArrayIndex": "i"}}], sample())
+                .unwrap();
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[0].get_i64("i").unwrap(), 0);
+        assert_eq!(out[1].get_i64("i").unwrap(), 1);
+
+        // A document that unwinds to itself (or is preserved) gets `null`,
+        // not the field omitted — it did not come from an array element.
+        let input = docs(vec![doc! { "_id": 1, "tags": "scalar" }]);
+        let out = run(vec![doc! {"$unwind": {"path": "$tags", "includeArrayIndex": "i"}}], input)
+            .unwrap();
+        assert_eq!(out[0].get("i"), Some(&Bson::Null));
+    }
+
+    #[test]
+    fn a_wrong_typed_preserve_null_and_empty_arrays_is_refused_not_silently_false() {
+        // The load-bearing pair with the typo moved from the key to the
+        // value: `Bson::as_bool` returns `None` for anything that is not
+        // literally a boolean, so `"true"` and `1` used to fall through
+        // `.unwrap_or(false)` exactly like a missing key — the same silent
+        // `preserveNullAndEmptyArrays` failure finding 11 is named after,
+        // now in the value rather than the key.
+        let input = docs(vec![doc! { "_id": 1 }]);
+        for wrong in [Bson::String("true".into()), Bson::Int32(1)] {
+            let err = run(
+                vec![
+                    doc! {"$unwind": {"path": "$nosuchfield", "preserveNullAndEmptyArrays": wrong}},
+                ],
+                input.clone(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("preserveNullAndEmptyArrays"), "{err}");
+            assert!(err.contains("boolean"), "{err}");
+        }
+    }
+
+    #[test]
+    fn include_array_index_refuses_a_name_this_language_cannot_read_back() {
+        // A field beginning with `$` can be written here but never read back
+        // through `"$name"` field-path syntax, which means the field called
+        // `name`, not one called `$name` — see aggregation.md's operator
+        // rule (a document whose first key starts with `$`).
+        let err =
+            run(vec![doc! {"$unwind": {"path": "$tags", "includeArrayIndex": "$bad"}}], sample())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("$bad"), "{err}");
+
+        // Naming the unwound path itself would overwrite the element
+        // `$unwind` just placed there with its own index, silently.
+        let err =
+            run(vec![doc! {"$unwind": {"path": "$tags", "includeArrayIndex": "tags"}}], sample())
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("tags"), "{err}");
+        assert!(err.contains("path"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_unwind_key_is_refused() {
+        let err = run(vec![doc! {"$unwind": {"path": "$tags", "bogusOption": true}}], sample())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bogusOption"), "{err}");
+        assert!(err.contains("$unwind"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_replace_root_key_is_refused() {
+        let err =
+            parse(&[doc! {"$replaceRoot": {"newRoot": "$a", "bogus": 1}}]).unwrap_err().to_string();
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("$replaceRoot"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_lookup_key_is_refused_in_both_forms() {
+        let err = parse(&[doc! {"$lookup": {
+            "from": "users", "localField": "uid", "foreignField": "_id", "as": "user", "bogus": 1
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus"), "{err}");
+        assert!(err.contains("$lookup"), "{err}");
+
+        let err = parse(&[doc! {"$lookup": {
+            "from": "items", "pipeline": [], "as": "items", "bogus": 1
+        }}])
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("bogus"), "{err}");
+    }
+
+    #[test]
+    fn match_filters_and_project_specifications_stay_open() {
+        // The line ADR-129 draws: `$match` and `$project` are field-path
+        // maps, not fixed-key documents, so any field name is legal data —
+        // closing them would refuse every ordinary pipeline. Neither of
+        // these unusual-looking field names is a typo of anything the stage
+        // defines; both must be accepted.
+        assert!(
+            parse(&[doc! {"$match": {"bogusFieldName": 1, "another.nested.one": {"$gt": 2}}}])
+                .is_ok()
+        );
+        assert!(
+            parse(&[doc! {"$project": {"whateverTheCallerNamedIt": 1, "computed": "$other"}}])
+                .is_ok()
+        );
+    }
+
     fn orders() -> Vec<Document> {
         docs(vec![
             doc! { "_id": 1, "items": [{"sku": "a"}, {"sku": "b"}] },
@@ -1109,14 +1435,120 @@ mod tests {
 
     #[test]
     fn unwind_and_lookup_keys_read_a_field_path_and_do_not_fan_out() {
-        // `$unwind` names a place to write back to, so `$a.b` where `a` is an
-        // array reads the first element's `b` as it always has; the fan-out
-        // is an expression rule and these are not expressions.
+        // Before ADR-130's fix this test also ran `$unwind: "$a.b"` over this
+        // fixture and asserted `out.len() == 2`. That assertion is gone, not
+        // weakened: a fanning reader over `a: [{b: [1, 2]}, {b: [3]}]` would
+        // compute `$a.b` as `[[1, 2], [3]]` (ADR-116's own array rule) — also
+        // length 2 — so the old assertion held identically whichever reader
+        // `$unwind` used and pinned the defect's row count, not the reader
+        // choice. `lookup_keys` below is what actually pins it: a fanning
+        // reader would make this a single `[[1, 2], [3]]` key, not two flat
+        // integers, and `$lookup`'s key extraction is untouched by ADR-130
+        // (it only reads; there is no write to refuse).
+        //
+        // `$unwind` needs no test of its own for a **non-numeric** crossed
+        // segment: ADR-130's uniform refusal fires on the document's
+        // structure alone, before `value_at` is consulted, and it fires on
+        // exactly the documents where a fanning and a non-fanning reader
+        // would disagree there — a non-terminal array segment followed by a
+        // non-numeric one is both where they would differ and `path::set`'s
+        // one failure mode. See `unwind_refuses_a_path_that_crosses_an_array`,
+        // whose `items.sku` case refuses regardless of which reader you
+        // imagine deciding it.
+        //
+        // A **numeric** segment is the one place this does not hold — the
+        // one place ADR-116 itself already names an expression path and a
+        // filter path disagreeing, and `value_at`/`path::resolve` sides with
+        // the filter's reading (a numeric segment is read both as an index
+        // and a field name), not the expression layer's (field name only).
+        // `path::set` succeeds there by index, so `$unwind` does not refuse,
+        // and its own output *does* still distinguish the two readers — see
+        // `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`.
         let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": [3]}] }]);
-        let out = run(vec![doc! {"$unwind": "$a.b"}], input.clone()).unwrap();
-        assert_eq!(out.len(), 2, "{out:?}");
         let keys = lookup_keys(&input, "a.b");
         assert_eq!(keys, vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])]);
+    }
+
+    #[test]
+    fn unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning() {
+        // The residue ADR-130 leaves: a numeric segment after a crossed
+        // array writes by index (`path::set`'s only way into an array), so
+        // it is not "crossing" in `crossing_array`'s sense and `$unwind`
+        // does not refuse. `value_at` (`path::resolve`) reads `"0"` both as
+        // the index 0 and as a field literally named `"0"` — the filter
+        // language's rule, which ADR-116 keeps for every stage option that
+        // names a field rather than computes one. Neither element here has
+        // a field called `"0"`, so only the index reading contributes:
+        // `a.0.b` is `[1, 2]`, found once, and unwinds to two rows.
+        //
+        // The fanning expression reader ADR-116 gives `$addFields`,
+        // `$group` and the rest reads a numeric segment *only* as a field
+        // name — never an index — so `$a.0.b` there finds no element named
+        // `"0"` and is `[]`: zero rows, not two. This is the one shape
+        // where `$unwind`'s own output would differ depending on which
+        // reader answered it, and it is why `unwind_and_lookup_keys_…`
+        // above no longer needs — and cannot have — an equivalent case of
+        // its own for every crossing; this one is elsewhere.
+        let input = docs(vec![doc! { "a": [{"b": [1, 2]}, {"b": [3]}] }]);
+        let out = run(vec![doc! {"$unwind": "$a.0.b"}], input).unwrap();
+        assert_eq!(
+            out,
+            docs(vec![doc! { "a": [{"b": 1}, {"b": [3]}] }, doc! { "a": [{"b": 2}, {"b": [3]}] },])
+        );
+    }
+
+    #[test]
+    fn unwind_refuses_a_path_that_crosses_an_array() {
+        // The finding's shape (ADR-130): `a` is an array, so `$unwind:
+        // "$a.b"` reads the first element's `b` — [1, 2], an array — and then
+        // has to write 1 and 2 back to `a.b`, which is not a place: `a` holds
+        // two elements, and there is no single one to put either value in.
+        // Before the fix this silently emitted two byte-identical copies of
+        // the input (nothing unwound) rather than refusing; the write
+        // failure was discarded. Now it is a 400 naming the stage.
+        let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": 3}] }]);
+        let err = run(vec![doc! {"$unwind": "$a.b"}], input).unwrap_err().to_string();
+        assert!(err.contains("$unwind"), "{err}");
+        assert!(err.contains("a.b"), "{err}");
+
+        // The refusal is uniform: it depends only on the path crossing an
+        // array in this document, never on what turns out to be at the far
+        // end of it. Before this test's second fix, refusal depended on the
+        // *type* of the first crossed element's value — a scalar there (`b:
+        // 9`) skipped the write entirely and answered `200` with one row
+        // that looked unwound but was not, exactly the wrong-answer class
+        // this ADR exists to close. `a` here is one element short of the
+        // first case and its `b` is a scalar at that element; both are
+        // refused all the same.
+        let input = docs(vec![doc! { "_id": 1, "a": [{"b": 9}] }]);
+        assert!(run(vec![doc! {"$unwind": "$a.b"}], input).is_err());
+        let input = docs(vec![doc! { "_id": 1, "a": [{"b": 9}, {"b": [1, 2]}] }]);
+        assert!(
+            run(vec![doc! {"$unwind": "$a.b"}], input).is_err(),
+            "a scalar found first must not skip the refusal"
+        );
+
+        // A control proving it is the crossed array, not the dotted path,
+        // that is refused: no array is crossed here, so both elements write
+        // back cleanly and nothing changes from before.
+        let input = docs(vec![doc! { "y": {"b": [1, 2]} }]);
+        let out = run(vec![doc! {"$unwind": "$y.b"}], input).unwrap();
+        assert_eq!(out, docs(vec![doc! {"y": {"b": 1}}, doc! {"y": {"b": 2}}]));
+
+        // The real corpus shape: `items` is an array of `{sku, qty}`. Under
+        // the narrow, read-dependent trigger this used to pass through
+        // unchanged — `sku` is a scalar at the first element, so nothing was
+        // ever attempted to be written — which was finding 10's own row 5,
+        // still unfixed by that version of this ADR. The uniform rule
+        // refuses it: `items` is an array and `sku` is not a numeric
+        // segment, so there is no single place to write to regardless of
+        // what `sku` holds.
+        let input = docs(vec![
+            doc! { "_id": 1, "items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}] },
+        ]);
+        let err = run(vec![doc! {"$unwind": "$items.sku"}], input).unwrap_err().to_string();
+        assert!(err.contains("$unwind"), "{err}");
+        assert!(err.contains("items.sku"), "{err}");
     }
 
     #[test]

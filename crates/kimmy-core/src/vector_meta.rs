@@ -777,6 +777,42 @@ mod tests {
         assert_eq!(decoded.max_tokens, None);
     }
 
+    /// `endpoint` on the three remote-with-a-default providers, and
+    /// `CustomHttp`'s `api_key_env`, have `#[serde(default)]` but no
+    /// `skip_serializing_if`, unlike `dimensions` and `max_tokens` beside
+    /// them — so an unset one has always serialized as a literal JSON `null`
+    /// rather than an absent key, into `CollectionMeta` on disk and into a
+    /// `VectorSet` oplog entry alike. `VectorConfig` and `ProviderConfig`
+    /// stay exactly this permissive on purpose: they are not only the
+    /// `POST .../vector` request body but the stored and replicated form, and
+    /// ADR-128's null-refusal is deliberately kept off the type a node must
+    /// still be able to load and apply after every earlier version wrote it
+    /// this way (`kimmy_api::vectors::VectorConfigInput` carries the refusal
+    /// on the request side instead). This is the compatibility this decision
+    /// rests on, pinned so nobody "closes" it here later.
+    #[test]
+    fn a_null_endpoint_or_key_variable_still_decodes_as_absent() {
+        let json = r#"{"fields":["a"],"dim":8,
+            "provider":{"kind":"open_ai","model":"m","endpoint":null}}"#;
+        let c: VectorConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(c.provider, ProviderConfig::OpenAi { endpoint: None, .. }));
+
+        let json = r#"{"fields":["a"],"dim":8,
+            "provider":{"kind":"cohere","model":"m","endpoint":null}}"#;
+        let c: VectorConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(c.provider, ProviderConfig::Cohere { endpoint: None, .. }));
+
+        let json = r#"{"fields":["a"],"dim":8,
+            "provider":{"kind":"gemini","model":"m","endpoint":null}}"#;
+        let c: VectorConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(c.provider, ProviderConfig::Gemini { endpoint: None, .. }));
+
+        let json = r#"{"fields":["a"],"dim":8,
+            "provider":{"kind":"custom_http","endpoint":"http://x","api_key_env":null}}"#;
+        let c: VectorConfig = serde_json::from_str(json).unwrap();
+        assert!(matches!(c.provider, ProviderConfig::CustomHttp { api_key_env: None, .. }));
+    }
+
     #[test]
     fn requested_dimensions_must_equal_dim() {
         let mut config: VectorConfig = serde_json::from_value(serde_json::json!({

@@ -519,14 +519,16 @@ pub struct QueryStats {
     /// Index ranges scanned: 1 for a plain index plan, several for a `$in`
     /// union, 0 for a collection scan.
     pub probes: usize,
-    /// Index entries read, when an index was consulted by a read.
+    /// Index entries read, when an index was consulted.
     ///
     /// The measure of how much of the index a query touched, as distinct
     /// from how many documents it examined: an exact probe stopped by
     /// `limit` reads as many entries as documents, while a range that had
     /// to be put in `_id` order reads the whole range however few it
-    /// returns. `None` for a scan, a primary-key lookup, or a filtered
-    /// write, whose engine-side scan does not report it.
+    /// returns. `None` for a scan and for a primary-key lookup. `update` and
+    /// `delete` read this the same way `find` and `count` do — their
+    /// `explain` runs the same read-only scan (ADR-131) — so it appears
+    /// there too whenever an index answers.
     pub index_entries: Option<usize>,
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
@@ -623,7 +625,17 @@ struct Recheck<'a, F> {
 
 impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
     /// Examine one candidate; whether the scan should go on.
+    ///
+    /// The bound is checked **before** a candidate is considered, not after
+    /// one has already been handed to `visit`. Checked after, a `stop_after`
+    /// of zero let the first match through before the bound could ever
+    /// refuse it — a `limit: 0` page came back holding one document instead
+    /// of none, whenever the very first candidate the scan examined happened
+    /// to match.
     fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> bool {
+        if self.stop_after == Some(self.matched) {
+            return false;
+        }
         self.examined += 1;
         if filter::matches(self.filter, &doc) {
             self.matched += 1;
@@ -908,12 +920,20 @@ pub struct WriteParams {
 
 impl WriteParams {
     /// The caller's condition, decoded — and refused alongside `multi`,
-    /// because one stamp cannot describe several documents.
+    /// because one stamp cannot describe several documents, and alongside
+    /// `explain`, because a plan cannot honestly answer "would this write
+    /// happen" without checking a version it never reads (ADR-131).
     fn expected(&self) -> Result<Option<kimmy_core::Stamp>, ApiError> {
         if self.multi && self.if_stamp.is_some() {
             return Err(ApiError::bad_request(
                 "`if_stamp` names one document's version, so it cannot be combined with \
                  `multi: true`",
+            ));
+        }
+        if self.explain && self.if_stamp.is_some() {
+            return Err(ApiError::bad_request(
+                "`if_stamp` makes the write conditional on a version explain does not check, \
+                 so it cannot be combined with `explain: true`",
             ));
         }
         parse_if_stamp(self.if_stamp.as_deref())
@@ -934,6 +954,26 @@ pub fn update(
     let filter = parse_filter(params.filter.as_ref())?;
     let update = parse_update(update_json, &params.array_filters)?;
     let expected = params.expected()?;
+    let stop_after = if multi { None } else { Some(1) };
+
+    // `explain: true` plans the write and reports it, exactly as `find`
+    // reports a read — it does not perform the write (ADR-131). The same
+    // read-only scan `find` and `count` use already produces everything
+    // `explain` reports, so this goes through it rather than through the
+    // engine's write transaction: nothing is written and no commit is
+    // spent. `matched`/`modified`/`commits` stay at the values that mean
+    // "nothing happened", because nothing did; what the write *would* touch
+    // is `explain.documentsMatched`, the same field a real write's `explain`
+    // has always carried.
+    if explain {
+        let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
+        return Ok(json!({
+            "matched": 0,
+            "modified": 0,
+            "commits": 0,
+            "explain": stats.to_json(),
+        }));
+    }
 
     // Match and write in one transaction. This used to collect the targets
     // in a read transaction and `replace` each in its own write transaction,
@@ -941,8 +981,7 @@ pub fn update(
     // already moved on from: two concurrent `$inc`s both read 5 and both
     // stored 6. The engine now runs the same in-transaction body
     // `find_and_modify` has, over every match.
-    let stop_after = if multi { None } else { Some(1) };
-    let (candidates, planned) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
     let modify = Modify {
         filter: &filter,
         sort: &[],
@@ -960,9 +999,6 @@ pub fn update(
     });
     if let Some(stamp) = single_stamp(multi, &outcome) {
         body["stamp"] = json!(stamp.encode());
-    }
-    if explain {
-        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
 }
@@ -990,68 +1026,27 @@ fn single_stamp(
     (!multi && outcome.modified == 1).then_some(outcome.stamp).flatten()
 }
 
-/// Where a filtered write looks, in the engine's terms, plus what `explain`
-/// should say about it.
+/// Where a filtered write looks, in the engine's terms.
 ///
 /// The same planner `find` runs, in the same order — primary key first, then
 /// an index, then a scan — so an update is found exactly the way a read is.
 /// The engine re-checks a both-bounds index plan inside the transaction that
 /// scans, which is stricter than the read path can be.
-fn candidates_for(
-    filter: &filter::Filter,
-    meta: &CollectionMeta,
-) -> (kimmy_storage::Candidates, PlannedAccess) {
+///
+/// `explain` no longer reads this plan back out (ADR-131): a write's
+/// `explain` now runs the read-only [`visit_matching`] instead of the write
+/// transaction, which plans and reports for itself exactly as `find` does.
+fn candidates_for(filter: &filter::Filter, meta: &CollectionMeta) -> kimmy_storage::Candidates {
     if let Some(pk) = plan::choose_primary_key(filter) {
-        let probes = pk.keys.len();
-        return (kimmy_storage::Candidates::Keys(pk.keys), PlannedAccess::PrimaryKey { probes });
+        return kimmy_storage::Candidates::Keys(pk.keys);
     }
     match plan::choose(filter, &meta.indexes) {
-        Some(p) => (
-            kimmy_storage::Candidates::Index {
-                index_id: p.index_id,
-                ranges: p.ranges.clone(),
-                both_bounds: p.both_bounds,
-            },
-            PlannedAccess::Index {
-                name: p.index_name.clone(),
-                fields_used: p.fields_used,
-                probes: p.ranges.len(),
-            },
-        ),
-        None => (kimmy_storage::Candidates::Scan, PlannedAccess::Scan),
-    }
-}
-
-/// The access path a filtered write was planned to, for `explain`.
-///
-/// Reports the plan as chosen. The one case where the engine departs from it
-/// — a both-bounds index plan found multikey inside the transaction, which
-/// falls back to a scan — is not reflected, exactly as `find` reports the
-/// plan it chose rather than the scan it fell back to.
-enum PlannedAccess {
-    PrimaryKey { probes: usize },
-    Index { name: String, fields_used: usize, probes: usize },
-    Scan,
-}
-
-impl PlannedAccess {
-    fn stats(&self, outcome: &kimmy_storage::ModifyManyOutcome) -> QueryStats {
-        let (index, fields_used, probes, id_lookup) = match self {
-            PlannedAccess::PrimaryKey { probes } => (None, 0, *probes, true),
-            PlannedAccess::Index { name, fields_used, probes } => {
-                (Some(name.clone()), *fields_used, *probes, false)
-            }
-            PlannedAccess::Scan => (None, 0, 0, false),
-        };
-        QueryStats {
-            index,
-            fields_used,
-            examined: outcome.examined as usize,
-            matched: outcome.matched as usize,
-            probes,
-            index_entries: None,
-            id_lookup,
-        }
+        Some(p) => kimmy_storage::Candidates::Index {
+            index_id: p.index_id,
+            ranges: p.ranges.clone(),
+            both_bounds: p.both_bounds,
+        },
+        None => kimmy_storage::Candidates::Scan,
     }
 }
 
@@ -1222,7 +1217,7 @@ pub fn find_and_modify(
     // Planned the way `update` is — which now includes the primary key: a
     // `find_and_modify` on `_id` used to scan the collection under the
     // writer, because only the index planner ran here.
-    let (candidates, _) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
 
     let expected = parse_if_stamp(spec.if_stamp.as_deref())?;
     if expected.is_some() && spec.upsert {
@@ -1281,12 +1276,18 @@ pub fn delete(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
     let expected = params.expected()?;
+    let stop_after = if multi { None } else { Some(1) };
+
+    // Plans without deleting, exactly as `update` does above (ADR-131).
+    if explain {
+        let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
+        return Ok(json!({ "deleted": 0, "commits": 0, "explain": stats.to_json() }));
+    }
 
     // The same one-transaction path as `update`, with the spec removing
     // rather than replacing: what the filter matched is exactly what is
     // tombstoned, with no read-then-write gap for another writer.
-    let stop_after = if multi { None } else { Some(1) };
-    let (candidates, planned) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
     let modify = Modify {
         filter: &filter,
         sort: &[],
@@ -1300,9 +1301,6 @@ pub fn delete(
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {
         body["stamp"] = json!(stamp.encode());
-    }
-    if explain {
-        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
 }
@@ -1931,6 +1929,73 @@ mod tests {
         assert!(stats.index.is_none(), "the fallback is a collection scan, and explain says so");
     }
 
+    #[test]
+    fn the_write_planner_and_the_read_planner_choose_the_same_access_path() {
+        // `candidates_for` plans a real `update`/`delete`; `visit_matching`
+        // plans a read, and — since ADR-131 — also an `explain` on a write.
+        // They are two implementations of one policy, not one shared code
+        // path, so nothing else in the repository holds them to the same
+        // answer: `candidates_for` reduced to always `Candidates::Scan`
+        // compiles, and every existing test still passes, because every
+        // other test that touches a write's access path drives it through
+        // `explain`, which (correctly, and only) exercises the *read*
+        // planner. This is the guard on the write planner itself, and it is
+        // the one `update_uses_an_index_when_one_applies` and its siblings
+        // used to be before their `explain` case moved to the read path.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        let meta = state.engine.get_collection("app", "docs").unwrap();
+        for i in 0..10i64 {
+            state.engine.insert(&meta, bson::doc! { "_id": i, "n": i % 3 }).unwrap();
+        }
+
+        let id_lookup = filter::parse(&bson::doc! { "_id": 3 }).unwrap();
+        let indexed = filter::parse(&bson::doc! { "n": 1 }).unwrap();
+        let indexed_in = filter::parse(&bson::doc! { "n": { "$in": [1, 2] } }).unwrap();
+        let scanned = filter::parse(&bson::doc! { "missing": 1 }).unwrap();
+
+        assert!(
+            matches!(candidates_for(&id_lookup, &meta), kimmy_storage::Candidates::Keys(_)),
+            "an _id filter must plan through the primary key"
+        );
+        assert!(
+            matches!(candidates_for(&indexed, &meta), kimmy_storage::Candidates::Index { .. }),
+            "an indexed equality must plan through the index"
+        );
+        assert!(
+            matches!(candidates_for(&indexed_in, &meta), kimmy_storage::Candidates::Index { .. }),
+            "an indexed $in must plan through the index"
+        );
+        assert!(
+            matches!(candidates_for(&scanned, &meta), kimmy_storage::Candidates::Scan),
+            "a filter on an unindexed field must plan a scan"
+        );
+
+        // The read planner `explain` now reports must agree with the choice
+        // above, filter for filter — this is what makes a plan a caller
+        // reads through `explain` the plan the real write will use.
+        for (filter, strategy) in [
+            (&id_lookup, "idLookup"),
+            (&indexed, "index"),
+            (&indexed_in, "indexUnion"),
+            (&scanned, "collectionScan"),
+        ] {
+            let stats = visit_matching(&state, &meta, filter, Order::Any, None, |_, _| {}).unwrap();
+            assert_eq!(stats.to_json()["strategy"], strategy, "{filter:?}");
+        }
+    }
+
     // -----------------------------------------------------------------------
     // aggregate — the leading $match reads through the planner
     // -----------------------------------------------------------------------
@@ -2176,5 +2241,26 @@ mod tests {
             top.offer(stamp, doc);
         }
         assert!(top.into_sorted().is_empty());
+    }
+
+    #[test]
+    fn a_stop_after_of_zero_visits_nothing() {
+        // The unsorted twin of `a_window_of_zero_holds_nothing`: `Recheck`
+        // used to hand the first match to its visitor before checking
+        // `stop_after`, so a `stop_after` of zero still let one document
+        // through. Seeded so `_id: 0`'s document is the very first candidate
+        // the scan examines and matches an empty filter — the exact case
+        // that leaked.
+        let (state, meta, _dir) = seeded(3);
+        let filter = filter::parse(&bson::doc! {}).unwrap();
+
+        let mut visited = 0usize;
+        let stats = visit_matching(&state, &meta, &filter, Order::Any, Some(0), |_, _| {
+            visited += 1;
+        })
+        .unwrap();
+
+        assert_eq!(visited, 0, "a stop_after of zero must visit nothing");
+        assert_eq!(stats.matched, 0, "{:?}", stats.matched);
     }
 }

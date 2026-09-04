@@ -31,7 +31,7 @@
 
 use std::io;
 
-use kimmy_core::{Hlc, NodeId, OplogEntry, VersionVector};
+use kimmy_core::{CollectionId, Hlc, NodeId, OplogEntry, VersionVector};
 use kimmy_storage::{SnapshotCursor, SnapshotPage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -93,8 +93,24 @@ pub enum Message {
         #[serde(default)]
         held: Option<VersionVector>,
     },
-    /// The answer, in stamp order.
-    Entries(Vec<OplogEntry>),
+    /// The answer, in stamp order, and where the window it came from ended.
+    ///
+    /// `scanned_to` is the last stamp the sender's scan examined — an entry it
+    /// withheld as readily as one it shipped — and `exhausted` says it stopped
+    /// there because the oplog ended rather than because the batch filled.
+    /// Together they are the receiver's coverage rule
+    /// (`kimmy_storage::sync::coverage_after_batch`).
+    ///
+    /// **The sender reports the window's end; the receiver never infers it.**
+    /// It used to be deduced from the batch's length, on the reasoning that a
+    /// batch shorter than the limit had to be the sender's whole tail. That
+    /// held only while nothing shortened a batch for another reason, and a
+    /// withheld `UniqueViolation` (ADR-029) inside a window truncated at the
+    /// limit does exactly that — the receiver then witnesses every entry past
+    /// the window without ever being sent it, and nothing re-serves them
+    /// (ADR-126, ADR-127). Stating the fact costs one stamp and one bool per
+    /// batch and cannot be reopened by whatever the next filter is.
+    Entries { entries: Vec<OplogEntry>, scanned_to: Hlc, exhausted: bool },
     /// "That many entries will not fit in a frame; ask for this many."
     ///
     /// [`MAX_BATCH`] bounds a response by entry count and [`MAX_FRAME`] bounds it
@@ -102,11 +118,15 @@ pub enum Message {
     /// send. Answering with the count that *does* fit lets the requester retry once
     /// rather than probing.
     ///
-    /// **The sender must not simply serve fewer entries.** A batch shorter than the
-    /// limit means "this is my whole tail": `sync_once` passes the limit it used to
-    /// `apply_peer_batch`, which reads it that way. Quietly truncating would tell
-    /// the receiver it had caught up while entries it has never seen remain — the
-    /// silent gap ADR-082 and `BeyondHorizon` both exist to prevent.
+    /// **The sender must not simply serve fewer entries.** The entries it drops
+    /// would sit inside a window it reported having scanned past, so the
+    /// receiver would witness them without ever seeing them — the silent gap
+    /// ADR-082, ADR-127 and `BeyondHorizon` all exist to prevent. Asking again
+    /// for `fits` re-reads the window at the smaller limit, so the end it
+    /// reports matches the entries it sends. `Engine::apply_peer_batch` clamps
+    /// a non-exhausted window to its last delivered stamp, so a sender that
+    /// ignores this loses the claim rather than the receiver's data — but the
+    /// batch it trimmed is still short of what it said, so ask again instead.
     ///
     /// `fits` is zero when one entry alone exceeds the frame, which no limit can
     /// carry; the requester reports that rather than probing forever.
@@ -129,6 +149,27 @@ pub enum Message {
     AskSnapshot { after: Option<SnapshotCursor> },
     /// One page of it.
     Snapshot(Box<SnapshotPage>),
+    /// "Which collections do you hold, and — for one of them — how many
+    /// documents?"
+    ///
+    /// Sent only when the requester's own round found nothing left to pull
+    /// (ADR-133): that belief rests on the version vector `AskVersions`
+    /// already answered, and a truncated sync window is exactly what can
+    /// make the belief false without anything on the anti-entropy path able
+    /// to see it. `probe` names the one collection this round wants a live
+    /// document count for — rotated by the caller so no round pays for more
+    /// than one collection's scan — and is `None` when the requester holds
+    /// none at all.
+    AskDivergence { probe: Option<CollectionId> },
+    /// The answer: every collection id this node currently holds, across
+    /// every database, and the live document count of `probe` if this node
+    /// holds it too.
+    ///
+    /// `collections` costs a metadata scan, not a document read — the same
+    /// bound `Engine::all_collection_ids` states. `probe_count` is the one
+    /// piece of this exchange that reads documents, and it reads exactly one
+    /// collection's worth.
+    Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
     /// Something went wrong; the sender is closing.
     Fault(String),
 }
@@ -400,9 +441,17 @@ mod tests {
             Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None },
             Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: Some(populated_vector()) },
             Message::Versions(populated_vector()),
-            Message::Entries(Vec::new()),
+            Message::Entries { entries: Vec::new(), scanned_to: Hlc::new(11, 2), exhausted: false },
+            Message::Entries { entries: Vec::new(), scanned_to: Hlc::ZERO, exhausted: true },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
+            Message::AskDivergence { probe: Some(CollectionId(42)) },
+            Message::AskDivergence { probe: None },
+            Message::Divergence {
+                collections: vec![CollectionId(1), CollectionId(2)],
+                probe_count: Some(7),
+            },
+            Message::Divergence { collections: Vec::new(), probe_count: None },
             Message::Fault("nope".into()),
         ];
 
