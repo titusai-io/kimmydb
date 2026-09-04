@@ -1538,7 +1538,9 @@ paths:
         but writes nothing and spends no commit: `matched`, `modified` and
         `commits` all report zero, and `stamp` is absent, exactly as they
         would for a write that touched nothing. What the update *would*
-        touch is `explain.documentsMatched`.
+        touch is `explain.documentsMatched`. Cannot be combined with
+        `if_stamp`: a plan checks no version, so it cannot answer whether a
+        conditional update would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1566,7 +1568,10 @@ paths:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Write only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional write would happen (ADR-131). `400` either
+                    way.
                 arrayFilters:
                   $ref: "#/components/schemas/ArrayFilters"
       responses:
@@ -1581,9 +1586,10 @@ paths:
                   matched:
                     type: integer
                     description: |
-                      Documents written. Zero under `explain: true`, which
-                      plans and does not write — see `explain.documentsMatched`
-                      for what the write would have touched (ADR-131).
+                      Documents the filter matched and the write acted on.
+                      Zero under `explain: true`, which plans and does not
+                      act on anything — see `explain.documentsMatched` for
+                      what the write would have touched (ADR-131).
                   modified:
                     type: integer
                     description: |
@@ -1721,7 +1727,9 @@ paths:
         **`explain: true` plans the delete; it does not perform it**
         (ADR-131). `deleted` and `commits` report zero and `stamp` is absent,
         exactly as they would for a delete that matched nothing; what it
-        *would* delete is `explain.documentsMatched`.
+        *would* delete is `explain.documentsMatched`. Cannot be combined
+        with `if_stamp`: a plan checks no version, so it cannot answer
+        whether a conditional delete would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1745,7 +1753,10 @@ paths:
                   allOf: [{ $ref: "#/components/schemas/Stamp" }]
                   description: |
                     Delete only if the matched document is at this stamp.
-                    Cannot be combined with `multi`.
+                    Cannot be combined with `multi`, or with `explain` — a
+                    plan checks no version, so it cannot answer whether a
+                    conditional delete would happen (ADR-131). `400` either
+                    way.
       responses:
         "200":
           description: How many were deleted.

@@ -19,14 +19,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `explain`, using it only to attach a report of the plan afterward — so
   `POST .../delete {"filter": {}, "multi": true, "explain": true}` deleted
   every document in the collection, and the equivalent `update` rewrote
-  every one. `explain` on these two routes now runs the same read-only scan
-  `find` and `count` already use, exactly as MongoDB's `explain` never
-  executes an update or a delete. Nothing is written and no commit is
+  every one. `explain` on these two routes was never documented as
+  executing — `http-api.md` and the `Explain` schema only ever described
+  its output, in the past tense — so it now runs the same read-only scan
+  `find` and `count` already use. Nothing is written and no commit is
   spent: `matched`, `modified`, `deleted` and `commits` all read `0` and
   `stamp` is absent, identically to a write that matched nothing; what the
   write *would* touch is `explain.documentsMatched`, the field `find`'s own
-  `explain` has always carried. Breaking for a client that relied on
-  `explain: true` still performing the write. ADR-131.
+  `explain` has always carried. `explain` cannot be combined with
+  `if_stamp` and is refused `400` with it — a plan checks no version, so it
+  cannot answer whether a *conditional* write would happen. `update` and
+  `delete` can now report `indexEntriesRead` in `explain`, which they could
+  not before: their `explain` used to be read back out of the write's own
+  bookkeeping, which does not track it. Breaking for a client that relied on
+  `explain: true` still performing the write, or on sending `if_stamp`
+  alongside it. ADR-131.
 
 ### Fixed
 

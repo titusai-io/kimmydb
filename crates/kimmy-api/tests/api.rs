@@ -2893,6 +2893,47 @@ async fn if_stamp_refuses_multi_upsert_and_garbage() {
     assert_eq!(res.body["error"], "bad_request");
 }
 
+/// `explain: true` plans without checking any condition — it does not run
+/// the write at all — so combined with `if_stamp` it cannot honestly answer
+/// "would this write happen": the plan would report a document as touched
+/// that the real write, checking the very same stamp, would refuse `409` on.
+/// Refused instead, the same shape as `if_stamp` combined with `multi`
+/// above.
+#[tokio::test]
+async fn explain_refuses_if_stamp() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"cond"})).await;
+    let inserted = server.post("/v1/db/shop/coll/cond/docs", Some(&token), json!({"_id":1})).await;
+    let stamp = stamp_of(&inserted.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/cond/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": {"$set": {"n": 1}}, "if_stamp": stamp,
+                    "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/cond/delete",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "if_stamp": stamp, "explain": true }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+
+    // The document is untouched either way — neither call was a write, and
+    // now neither is a misleading plan.
+    let doc = server.get("/v1/db/shop/coll/cond/docs/1", Some(&token)).await;
+    assert_eq!(doc.status, 200, "{:?}", doc.body);
+}
+
 /// The reason to have this at all: check-then-act on one document, with
 /// exactly one winner and no coordination.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -358,9 +358,10 @@ how many chunks landed ([ADR-086](decisions.md)).
 `if_stamp` makes a single-document `update` or `delete` conditional on the
 matched document's version, exactly as on the by-id routes above: `409 stale`
 and nothing written otherwise. It cannot be combined with `multi` — one stamp
-names one document. On these routes it is a **body** field: `?if_stamp=…` on
-the URL is refused `400`, as any query string on a route that takes none is
-(see [The JSON boundary](#the-json-boundary)), rather than being read as no
+names one document — or with `explain`, below. On these routes it is a
+**body** field: `?if_stamp=…` on the URL is refused `400`, as any query
+string on a route that takes none is (see
+[The JSON boundary](#the-json-boundary)), rather than being read as no
 condition at all.
 
 An update path may address array elements — `items.$[].qty` for every
@@ -584,6 +585,13 @@ writes nothing and spends no commit: `matched`, `modified`, `deleted` and
 already say for a write that matched nothing. What the write *would* touch
 is `explain.documentsMatched`. Drop `explain` to perform the write the plan
 described.
+
+**`explain` cannot be combined with `if_stamp`, and is refused `400` with
+it.** A plan never checks a document's version — that check only happens
+inside the write `explain` does not perform — so a plan cannot honestly
+answer "would this write happen" for a conditional write: the document it
+reports as matched may be exactly the one the real write, checking the same
+stamp, refuses `409 stale` on.
 
 ---
 

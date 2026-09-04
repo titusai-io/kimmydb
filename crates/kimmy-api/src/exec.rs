@@ -519,14 +519,16 @@ pub struct QueryStats {
     /// Index ranges scanned: 1 for a plain index plan, several for a `$in`
     /// union, 0 for a collection scan.
     pub probes: usize,
-    /// Index entries read, when an index was consulted by a read.
+    /// Index entries read, when an index was consulted.
     ///
     /// The measure of how much of the index a query touched, as distinct
     /// from how many documents it examined: an exact probe stopped by
     /// `limit` reads as many entries as documents, while a range that had
     /// to be put in `_id` order reads the whole range however few it
-    /// returns. `None` for a scan, a primary-key lookup, or a filtered
-    /// write, whose engine-side scan does not report it.
+    /// returns. `None` for a scan and for a primary-key lookup. `update` and
+    /// `delete` read this the same way `find` and `count` do — their
+    /// `explain` runs the same read-only scan (ADR-131) — so it appears
+    /// there too whenever an index answers.
     pub index_entries: Option<usize>,
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
@@ -918,12 +920,20 @@ pub struct WriteParams {
 
 impl WriteParams {
     /// The caller's condition, decoded — and refused alongside `multi`,
-    /// because one stamp cannot describe several documents.
+    /// because one stamp cannot describe several documents, and alongside
+    /// `explain`, because a plan cannot honestly answer "would this write
+    /// happen" without checking a version it never reads (ADR-131).
     fn expected(&self) -> Result<Option<kimmy_core::Stamp>, ApiError> {
         if self.multi && self.if_stamp.is_some() {
             return Err(ApiError::bad_request(
                 "`if_stamp` names one document's version, so it cannot be combined with \
                  `multi: true`",
+            ));
+        }
+        if self.explain && self.if_stamp.is_some() {
+            return Err(ApiError::bad_request(
+                "`if_stamp` makes the write conditional on a version explain does not check, \
+                 so it cannot be combined with `explain: true`",
             ));
         }
         parse_if_stamp(self.if_stamp.as_deref())
@@ -1917,6 +1927,73 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, vec![1, 2], "the straddling document must not be lost to a stale plan");
         assert!(stats.index.is_none(), "the fallback is a collection scan, and explain says so");
+    }
+
+    #[test]
+    fn the_write_planner_and_the_read_planner_choose_the_same_access_path() {
+        // `candidates_for` plans a real `update`/`delete`; `visit_matching`
+        // plans a read, and — since ADR-131 — also an `explain` on a write.
+        // They are two implementations of one policy, not one shared code
+        // path, so nothing else in the repository holds them to the same
+        // answer: `candidates_for` reduced to always `Candidates::Scan`
+        // compiles, and every existing test still passes, because every
+        // other test that touches a write's access path drives it through
+        // `explain`, which (correctly, and only) exercises the *read*
+        // planner. This is the guard on the write planner itself, and it is
+        // the one `update_uses_an_index_when_one_applies` and its siblings
+        // used to be before their `explain` case moved to the read path.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state(&dir);
+        state.engine.create_collection("app", "docs").unwrap();
+        state
+            .engine
+            .create_index(
+                "app",
+                "docs",
+                vec![kimmy_storage::IndexField::ascending("n")],
+                false,
+                None,
+            )
+            .unwrap();
+        let meta = state.engine.get_collection("app", "docs").unwrap();
+        for i in 0..10i64 {
+            state.engine.insert(&meta, bson::doc! { "_id": i, "n": i % 3 }).unwrap();
+        }
+
+        let id_lookup = filter::parse(&bson::doc! { "_id": 3 }).unwrap();
+        let indexed = filter::parse(&bson::doc! { "n": 1 }).unwrap();
+        let indexed_in = filter::parse(&bson::doc! { "n": { "$in": [1, 2] } }).unwrap();
+        let scanned = filter::parse(&bson::doc! { "missing": 1 }).unwrap();
+
+        assert!(
+            matches!(candidates_for(&id_lookup, &meta), kimmy_storage::Candidates::Keys(_)),
+            "an _id filter must plan through the primary key"
+        );
+        assert!(
+            matches!(candidates_for(&indexed, &meta), kimmy_storage::Candidates::Index { .. }),
+            "an indexed equality must plan through the index"
+        );
+        assert!(
+            matches!(candidates_for(&indexed_in, &meta), kimmy_storage::Candidates::Index { .. }),
+            "an indexed $in must plan through the index"
+        );
+        assert!(
+            matches!(candidates_for(&scanned, &meta), kimmy_storage::Candidates::Scan),
+            "a filter on an unindexed field must plan a scan"
+        );
+
+        // The read planner `explain` now reports must agree with the choice
+        // above, filter for filter — this is what makes a plan a caller
+        // reads through `explain` the plan the real write will use.
+        for (filter, strategy) in [
+            (&id_lookup, "idLookup"),
+            (&indexed, "index"),
+            (&indexed_in, "indexUnion"),
+            (&scanned, "collectionScan"),
+        ] {
+            let stats = visit_matching(&state, &meta, filter, Order::Any, None, |_, _| {}).unwrap();
+            assert_eq!(stats.to_json()["strategy"], strategy, "{filter:?}");
+        }
     }
 
     // -----------------------------------------------------------------------
