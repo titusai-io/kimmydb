@@ -2612,7 +2612,7 @@ mod tests {
         )
         .unwrap();
         for engine in [&a, &b] {
-            engine.apply_batch(&[drop.clone()]).unwrap();
+            engine.apply_batch(std::slice::from_ref(&drop)).unwrap();
         }
         let holds =
             |e: &Engine| e.get_collection("shop", "orders").unwrap().index("email_1").is_some();
