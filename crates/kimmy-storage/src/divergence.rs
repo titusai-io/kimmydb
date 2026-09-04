@@ -255,6 +255,22 @@ pub fn next_probe(
 /// many other collections are probed against that peer in between —
 /// confirming across the two most recent contacts *in which that collection
 /// was probed*, not the two most recent contacts overall.
+///
+/// **A collection this node no longer holds is swept from the count state,
+/// in [`Self::advance_probe`], the moment that becomes true — not left to
+/// clear itself.** The existence half already has this for free:
+/// `Self::observe` recomputes `confirmed`'s membership from a fresh
+/// `existence` set on every contact, so a collection absent from it is
+/// dropped immediately. The count half's state, keyed by `(peer,
+/// collection)`, has no equivalent contact-shaped moment — a dropped
+/// collection is never named by `advance_probe` again, so no future probe
+/// could ever clear it — and confirming that this really is a "provably
+/// gone" fact rather than mere silence needs `mine`, which `advance_probe`
+/// already receives fresh every tick. Getting this wrong pins a confirmed
+/// finding at 1 for the rest of the process the moment an operator does the
+/// obvious thing about it (drop and recreate the collection), which is
+/// exactly the "alert nobody can clear" failure this ADR argues against
+/// elsewhere for a different reason (defect 2).
 #[derive(Debug, Default)]
 pub struct DivergenceTracker {
     cursor: Option<CollectionId>,
@@ -280,7 +296,28 @@ impl DivergenceTracker {
     /// Advance the rotation and return the collection id this tick probes
     /// for a count, given the full set of collections this node currently
     /// holds. `None` when there is nothing to probe.
+    ///
+    /// Also sweeps the count half's state against `mine`: a collection this
+    /// node no longer holds can never be named by `advance_probe` again, so
+    /// no later probe could ever clean up its `count_pending` or
+    /// `count_confirmed` entry — unlike a peer simply not being contacted,
+    /// which is silence and must not be read as reconciliation (the
+    /// existence half's own rule), a dropped collection is *provably* gone
+    /// from the one set this method is already given fresh every call.
+    /// Without this sweep a confirmed count finding against a since-dropped
+    /// collection stays lit for the rest of the process, which is exactly
+    /// the alert an operator cannot clear by fixing the thing it reported —
+    /// and it also means a later collection that reuses the same id (a
+    /// drop-and-recreate derives an identical id from the same name) would
+    /// inherit a stale pending mismatch and could confirm on a single probe
+    /// of the new incarnation.
     pub fn advance_probe(&mut self, mine: &BTreeSet<CollectionId>) -> Option<CollectionId> {
+        self.count_pending.retain(|(_, id)| mine.contains(id));
+        for confirmed in self.count_confirmed.values_mut() {
+            confirmed.retain(|id| mine.contains(id));
+        }
+        self.count_confirmed.retain(|_, confirmed| !confirmed.is_empty());
+
         self.cursor = next_probe(mine, self.cursor);
         self.cursor
     }
@@ -654,5 +691,56 @@ mod tests {
         tracker.observe(peer(1), both.clone());
         tracker.observe(peer(1), both);
         assert_eq!(tracker.confirmed_count(), 1, "one collection, found by both halves at once");
+    }
+
+    /// The realistic trigger for this defect: the gauge fires, an operator
+    /// investigates, and remediates the way `operations.md` tells them
+    /// to — drop the divergent collection and let it be recreated. Without
+    /// the sweep in `advance_probe`, this specific alert is the one an
+    /// operator's own remediation can never clear.
+    #[test]
+    fn a_confirmed_count_divergence_clears_when_its_collection_is_dropped() {
+        let mut tracker = DivergenceTracker::new();
+        let mismatched = Findings { existence: set(&[]), count: Some((id(7), true)) };
+        tracker.observe(peer(1), mismatched.clone());
+        tracker.observe(peer(1), mismatched);
+        assert_eq!(tracker.confirmed_count(), 1);
+
+        // Collection 7 is dropped locally: it no longer appears in this
+        // node's own set, so `advance_probe` can never name it again, and
+        // no later probe could ever clear it without the sweep.
+        tracker.advance_probe(&set(&[8]));
+        assert_eq!(tracker.confirmed_count(), 0, "gone locally must not stay confirmed forever");
+
+        // Any number of subsequent clean ticks must not resurrect it either.
+        for _ in 0..100 {
+            tracker.advance_probe(&set(&[8]));
+        }
+        assert_eq!(tracker.confirmed_count(), 0);
+    }
+
+    /// `CollectionId` is derived from `(db, name)`, so a drop followed by a
+    /// recreation of the same name yields the identical id. A *pending*
+    /// (not yet confirmed) mismatch against the old incarnation must not
+    /// survive to falsely confirm on the new one's very first probe.
+    #[test]
+    fn a_pending_count_mismatch_does_not_survive_a_drop_and_recreate() {
+        let mut tracker = DivergenceTracker::new();
+        // One mismatched probe: pending, not yet confirmed.
+        tracker.observe(peer(1), Findings { existence: set(&[]), count: Some((id(7), true)) });
+        assert_eq!(tracker.confirmed_count(), 0);
+
+        tracker.advance_probe(&set(&[])); // 7 dropped: sweeps the pending entry
+        tracker.advance_probe(&set(&[7])); // 7 recreated, same id
+
+        // One probe of the new incarnation, also mismatched (still
+        // catching up, say) -- on its own this must not confirm, because
+        // it is the *new* incarnation's first probe, not its second.
+        tracker.observe(peer(1), Findings { existence: set(&[]), count: Some((id(7), true)) });
+        assert_eq!(
+            tracker.confirmed_count(),
+            0,
+            "one probe of the new incarnation must not inherit the old one's pending state"
+        );
     }
 }
