@@ -1877,7 +1877,7 @@ mod tests {
 
         let coll = a.get_collection("app", "docs").unwrap();
         a.insert(&coll, doc! { "_id": 1, "a": [1, 2] }).unwrap();
-        let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap();
+        let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
         b.apply_batch(&entries).unwrap();
 
         assert!(multikey_of(&b, "a_1"), "the applying node must observe what it applied");

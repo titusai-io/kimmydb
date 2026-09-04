@@ -507,14 +507,14 @@ mod tests {
         let ca = a.create_collection("db", "c").unwrap();
         a.insert(&ca, doc! { "_id": "a-1" }).unwrap();
         a.insert(&ca, doc! { "_id": "a-2" }).unwrap();
-        for entry in a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap() {
+        for entry in a.entries_for_peer(Hlc::ZERO, usize::MAX).unwrap().entries {
             b.apply_batch(&[entry]).unwrap();
         }
         let cb = b.get_collection("db", "c").unwrap();
         b.insert(&cb, doc! { "_id": "b-1" }).unwrap();
         b.insert(&cb, doc! { "_id": "b-2" }).unwrap();
         let start = a.version_vector().unwrap().get(b.node_id());
-        let entries = b.entries_for_peer(start, usize::MAX).unwrap();
+        let entries = b.entries_for_peer(start, usize::MAX).unwrap().entries;
         a.apply_batch(&entries).unwrap();
         (a, b, da, db)
     }
