@@ -1064,6 +1064,41 @@ async fn a_null_filter_on_delete_or_update_is_refused_rather_than_matching_every
 /// tracker. So what is pinned here is the property that actually matters —
 /// the call does not run — not a field name this transport was never able to
 /// report for a type error.
+///
+/// Also checks that each field's advertised `inputSchema` agrees: before
+/// `non_null_field` existed, `Option<T>` genuinely accepted `null`, so
+/// schemars' default `["T", "null"]` type and `"default": null` were
+/// accurate. Adding the attribute changed the server's behaviour without
+/// telling schemars, which would otherwise keep advertising `null` as valid —
+/// worst on `delete.filter`, whose `"default": null` would name the one
+/// value that empties the collection as the argument's default. Each field
+/// also carries `#[schemars(required)]` plus `skip_serializing_if =
+/// "Option::is_none"` for exactly this reason: the first asks schemars for
+/// the plain, non-nullable schema of the inner type; the second drops the
+/// `null` default `#[serde(default)]` would otherwise report. The property
+/// still is not required, since omitting it is unaffected.
+fn schema_forbids_null(schema: &Value) -> bool {
+    if matches!(schema.get("default"), Some(Value::Null)) {
+        return false;
+    }
+    let type_is_null = match schema.get("type") {
+        Some(Value::String(s)) => s == "null",
+        Some(Value::Array(types)) => types.iter().any(|t| t.as_str() == Some("null")),
+        _ => false,
+    };
+    if type_is_null {
+        return false;
+    }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(variants) = schema.get(key).and_then(Value::as_array)
+            && variants.iter().any(|v| v.get("type").and_then(Value::as_str) == Some("null"))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[tokio::test]
 async fn every_optional_tool_argument_refuses_an_explicit_null() {
     let server = Server::start().await;
@@ -1094,13 +1129,24 @@ async fn every_optional_tool_argument_refuses_an_explicit_null() {
         (
             "vector_search",
             json!({"database":"kb","collection":"notes","vector":[1.0,0.0,0.0]}),
-            vec![("filter", true), ("k", true)],
+            // `query` and `vector` are checked for the refusal and the
+            // schema only: on a `byo` collection removing either leaves
+            // nothing to search with, which is a functional failure this
+            // table is not about.
+            vec![("query", false), ("vector", false), ("filter", true), ("k", true)],
         ),
         (
             "hybrid_search",
             json!({"database":"kb","collection":"notes","query":"red blue",
                    "vector":[1.0,0.0,0.0],"k":5}),
-            vec![("filter", true), ("k", true), ("weights", true), ("min_overlap", true)],
+            vec![
+                ("query", false),
+                ("vector", false),
+                ("filter", true),
+                ("k", true),
+                ("weights", true),
+                ("min_overlap", true),
+            ],
         ),
         (
             "update",
@@ -1120,8 +1166,23 @@ async fn every_optional_tool_argument_refuses_an_explicit_null() {
         ),
     ];
 
+    let (_, listed) =
+        server.rpc(Some(&token), json!({"jsonrpc":"2.0","id":1,"method":"tools/list"})).await;
+    let tools = listed["result"]["tools"].as_array().expect("tools");
+
     for (tool, base, fields) in cases {
+        let schema = &tools
+            .iter()
+            .find(|t| t["name"] == tool)
+            .unwrap_or_else(|| panic!("{tool} is not listed"))["inputSchema"]["properties"];
+
         for (field, check_omission) in fields {
+            assert!(
+                schema_forbids_null(&schema[field]),
+                "{tool}.{field}: the advertised schema must not accept null: {}",
+                schema[field]
+            );
+
             let mut nulled = base.clone();
             nulled[field] = Value::Null;
             let refused = server.call(&token, tool, nulled).await;
