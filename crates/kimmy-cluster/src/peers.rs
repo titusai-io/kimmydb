@@ -207,13 +207,29 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // (ADR-133): a fresh, cheap read of what this node holds —
                 // metadata only — and this node's own count of whichever
                 // collection is up next, computed once and reused against
-                // every peer this tick rather than once per peer.
-                let mine_collections = engine.all_collection_ids().unwrap_or_default();
+                // every peer this tick rather than once per peer. A failure
+                // here is not silently treated as "nothing to probe" — that
+                // would be indistinguishable from a clean probe in a check
+                // whose whole purpose is making silence impossible.
+                let mine_collections = match engine.all_collection_ids() {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        warn!(error = %e, "divergence check: could not list this node's own \
+                              collections; skipping this tick's probe rotation");
+                        BTreeSet::new()
+                    }
+                };
                 let probe = divergence.advance_probe(&mine_collections).map(|id| {
-                    let mine_count = engine.count_by_id(id).ok().flatten();
+                    let mine_count = match engine.count_by_id(id) {
+                        Ok(count) => count,
+                        Err(e) => {
+                            warn!(error = %e, collection = %id, "divergence check: could not \
+                                  count the probed collection; comparing existence only this tick");
+                            None
+                        }
+                    };
                     DivergenceProbe { id, mine_count }
                 });
-                let mut divergent_this_tick: BTreeSet<kimmy_core::CollectionId> = BTreeSet::new();
                 for peer in health.select(&peers, Instant::now()) {
                     // One span per peer per round, not one per round: an
                     // anti-entropy round against three peers is three
@@ -238,7 +254,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                         .instrument(span.clone())
                         .await
                     {
-                        Ok(outcome) => {
+                        Ok(mut outcome) => {
                             // `i64` throughout: `tracing-opentelemetry` has
                             // no `record_u64`, so an unsigned value is
                             // formatted with `Debug` and reaches a collector
@@ -249,8 +265,19 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
-                            divergent_this_tick.extend(outcome.divergent.iter().copied());
                             if let Some(node) = outcome.peer {
+                                // Folded in only when the check actually ran
+                                // against this peer this contact
+                                // (`exhausted`, see `sync_once`) — a peer
+                                // whose round had a backlog too deep to
+                                // reach its tail must not be read as having
+                                // reconciled, and `observe` treats "not
+                                // called" and "called with nothing found" as
+                                // the two different facts they are
+                                // (ADR-133).
+                                if let Some(seen) = outcome.divergent.take() {
+                                    divergence.observe(node, seen);
+                                }
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);
                                 if stale && !was {
@@ -306,12 +333,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms / 1_000);
                 }
-                // Advanced every tick regardless of whether anything reports
-                // it: the confirmation window this debounces (two ticks
-                // running against the same collection, see
-                // `DivergenceTracker`) must not depend on whether a caller
-                // wired up `on_round`.
-                report.divergent_collections = divergence.tick(divergent_this_tick);
+                // Read every tick regardless of whether anything reports it,
+                // for the same reason the line above computes `report`
+                // unconditionally: the tracker's own state does not depend
+                // on whether a caller wired up `on_round`, only `observe`
+                // above does, and that already ran per peer contacted.
+                report.divergent_collections = divergence.confirmed_count();
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.

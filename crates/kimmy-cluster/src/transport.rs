@@ -403,13 +403,16 @@ pub async fn sync_once(
             // (ADR-133): `mine` already claims to cover every origin `theirs`
             // advertised, which is exactly finding 14's signature. Asking the
             // peer what it actually holds is cheap precisely because this
-            // branch is rare to have anything left to do — a converged
-            // cluster spends nearly every round here.
+            // branch is common on a converged cluster — though not, on its
+            // own, on a busy one; see the `exhausted` branch below for the
+            // other place this check runs.
+            let probe = divergence_probe_for(probe, &theirs, &mine);
             let divergent = ask_divergence(engine, &mut stream, probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
                 behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
-                divergent,
+                divergent: Some(divergent),
+                exhausted: true,
                 ..SyncOutcome::default()
             });
         };
@@ -442,6 +445,14 @@ pub async fn sync_once(
             answer = read_frame(&mut stream).await?;
         }
 
+        // Whether this round's own pull reached the peer's true tail — the
+        // fact that lets the divergence check also run on a round that
+        // pulled something, rather than only on a round that found nothing
+        // left to pull (ADR-133). A completed snapshot pull earns the same
+        // reading: `pull_snapshot` does not return until `page.next` is
+        // `None`, which is every page the peer had as of the pull, the
+        // snapshot's own version of "reached the tail".
+        let mut window_exhausted = false;
         let mut outcome = match answer {
             // The batch, and what it proved: an exhausted window is the peer's
             // whole tail, any other ends at the stamp the peer says it scanned
@@ -455,12 +466,16 @@ pub async fn sync_once(
             // could make a lie (ADR-127). The decision lives in storage
             // (`coverage_after_batch`), where it is tested between engines
             // without a network.
-            Message::Entries { entries, scanned_to, exhausted } => engine
-                .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
-                .map_err(|e| ProtocolError::Malformed(e.to_string())),
+            Message::Entries { entries, scanned_to, exhausted } => {
+                window_exhausted = exhausted;
+                engine
+                    .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))
+            }
             // The peer has collected what we need. Fall back to current state.
             Message::BeyondHorizon {} => {
                 warn!(%peer, "behind the peer's retention horizon; falling back to a snapshot");
+                window_exhausted = true;
                 pull_snapshot(engine, &mut stream).await
             }
             other => Err(ProtocolError::Malformed(format!("expected Entries, got {other:?}"))),
@@ -479,6 +494,18 @@ pub async fn sync_once(
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         outcome.lag_ms =
             kimmy_storage::lag_behind_ms(&mine, &theirs, kimmy_storage::physical_now_ms());
+        outcome.exhausted = window_exhausted;
+        // Only when the pull reached the peer's tail: a round still working
+        // through a backlog deeper than one batch has not earned the belief
+        // the check depends on, and must not spend a message finding out
+        // (ADR-133). This is what lets a busy cluster — many small rounds,
+        // each comfortably under the batch cap — still get checked on
+        // nearly every round, unlike a single global "nothing to pull" gate,
+        // which a continuous trickle of new writes can starve indefinitely.
+        if window_exhausted {
+            let probe = divergence_probe_for(probe, &theirs, &mine);
+            outcome.divergent = Some(ask_divergence(engine, &mut stream, probe).await?);
+        }
         // The other direction is a different question: how far the peer
         // trails this node, in history it can no longer be served. A peer
         // that is more than tombstone retention behind may be holding
@@ -517,6 +544,37 @@ fn behind_beyond_horizon(
     Ok(kimmy_storage::lag_beyond_horizon_ms(theirs, mine, &collected))
 }
 
+/// Whether to trust the peer's document count this round, given `theirs` —
+/// the peer's version vector, fetched at the top of this round — and
+/// `mine`, this node's own vector as of just before asking (ADR-133).
+///
+/// The gate that gets a caller into a divergence check at all —
+/// `mine.behind(&theirs).is_none()`, or the analogous `exhausted` check —
+/// only protects *this node's* belief that it is not behind the peer. It
+/// says nothing about the reverse: whether the *peer* is behind this node.
+/// A peer that has simply not yet pulled this node's own recent writes will
+/// answer a probe with a stale, lower count for any collection those writes
+/// touched — a real difference, but ordinary replication lag, not a
+/// divergence. Measured on the round that produced finding 14's cluster:
+/// peers lagged 130–260 s behind each other in steady operation, which
+/// would otherwise have kept the count half of this check reporting a
+/// mismatch, and the two-tick confirmation does not filter it out, because
+/// a lagging peer reproduces the same mismatch on every consecutive contact.
+///
+/// `theirs.behind(&mine)` asks the reverse question directly: is there
+/// anything `mine` holds, at any origin, that `theirs` has not yet
+/// witnessed? `Some` means the peer is behind this node and its answer
+/// cannot be trusted for a count this round, so the probe is dropped
+/// (`None`) — the existence half is unaffected, since it never depends on
+/// the peer being caught up on anything of *this* node's.
+fn divergence_probe_for(
+    probe: Option<DivergenceProbe>,
+    theirs: &kimmy_core::VersionVector,
+    mine: &kimmy_core::VersionVector,
+) -> Option<DivergenceProbe> {
+    if theirs.behind(mine).is_some() { None } else { probe }
+}
+
 /// Ask the peer what it holds, and compare against what this node holds
 /// (ADR-133). One message each way, on the connection already open for this
 /// round.
@@ -528,6 +586,10 @@ async fn ask_divergence<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // Read fresh per peer contacted this tick, unlike `probe`'s count: this
+    // is a metadata scan, not a document read, so paying it once per peer
+    // rather than caching it across the tick's peer loop is not the cost
+    // this module bounds (see the module docs on `Engine::all_collection_ids`).
     let mine_collections =
         engine.all_collection_ids().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
 
