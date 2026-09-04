@@ -3089,6 +3089,44 @@ async fn null_inside_a_document_filter_or_update_is_untouched_by_the_refusal() {
     assert_eq!(res.body["deleted"], 2, "{:?}", res.body);
 }
 
+/// `null` on a *required* field was always refused, before ADR-128 existed —
+/// it just fails that field's own type once something tries to read it,
+/// rather than being caught by `non_null_field`, which only ever runs on a
+/// field the derive would otherwise default to `None`. `update`'s `update`
+/// on `POST .../update` is `Value`, not `Option<Value>`, so `null` there
+/// becomes `Value::Null` and is refused downstream at `400`; the same field
+/// on `find_and_modify` is genuinely optional (`remove: true` is the
+/// alternative), so it is `Option<Value>`, goes through `non_null_field`,
+/// and is refused at `422`. Both refuse; pinned here so the two statuses are
+/// shown deliberate rather than a docs mismatch.
+#[tokio::test]
+async fn a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"c"})).await;
+    server.post("/v1/db/shop/coll/c/docs", Some(&token), json!({"_id":1})).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/update",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": null }),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/c/find_and_modify",
+            Some(&token),
+            json!({ "filter": {"_id": 1}, "update": null }),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+}
+
 /// The reason to have this at all: check-then-act on one document, with
 /// exactly one winner and no coordination.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4931,6 +4969,99 @@ async fn storing_vectors_needs_write_access() {
         )
         .await;
     assert_eq!(res.status, 403, "{:?}", res.body);
+}
+
+/// `POST .../vector` is a closed request shape ADR-121 names explicitly
+/// ("a vector configuration's `provider`"), so ADR-128's refusal reaches it
+/// too — through `vectors::VectorConfigInput`, a request-only mirror, rather
+/// than `VectorConfig` itself, which stays exactly as permissive as before
+/// because it is also the stored and replicated form (see the comment on
+/// `VectorConfigInput` and `a_null_endpoint_or_key_variable_still_decodes_as_absent`
+/// in `kimmy-core`). `endpoint: null` was the destructive case named in
+/// review: silently landing on a provider's public default is not what a
+/// caller who wrote it meant.
+#[tokio::test]
+async fn a_null_field_on_the_vector_configuration_is_refused() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+
+    let refuses = |res: &Res| {
+        assert_eq!(res.status, 422, "{:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+    };
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                    "document_prefix": null }),
+        )
+        .await;
+    refuses(&res);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                    "query_prefix": null }),
+        )
+        .await;
+    refuses(&res);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                    "chunk": { "max_chars": 100, "overlap": 10, "max_tokens": null } }),
+        )
+        .await;
+    refuses(&res);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 3,
+                    "provider": { "kind": "open_ai", "model": "m", "endpoint": null } }),
+        )
+        .await;
+    refuses(&res);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 8,
+                    "provider": { "kind": "open_ai", "model": "m", "dimensions": null } }),
+        )
+        .await;
+    refuses(&res);
+
+    // Controls: a config with these fields genuinely omitted still works,
+    // and so does one that sets them to a real value.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 8,
+                    "provider": { "kind": "open_ai", "model": "m",
+                                  "endpoint": "https://93.184.216.34" } }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
 /// A collection of `n` documents, half of them `even`.
