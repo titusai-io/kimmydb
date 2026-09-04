@@ -17,6 +17,77 @@ Status meanings:
 
 ---
 
+## 🟡 A `$lookup` join key that crosses an array reads the first element, where MongoDB joins on every one
+
+**Raised 2026-09-04, by the 2026-09 test round, which asked which value
+joins and found no doc that answered.** `localField` and `foreignField` are
+field paths and the join needs one key per document, so a path whose
+non-terminal segment is an array — `items.sku` over `items: [{sku: "ef-9"},
+{sku: "gh-3"}]` — resolves to every element's value and then keeps the
+**first**. MongoDB fans the key out and attaches the union of every element's
+matches. So a stage that reads as "attach the product of every line" attaches
+the first line's product, and says nothing about the rest. A field that
+merely *holds* an array is not this case: `localField: "tags"` joins on the
+whole array as one value, which agrees with MongoDB and is what makes
+`["a","b"]` find a foreign document whose key is that same array.
+
+Not fanning out is the right default here and stays: it is the same rule
+`$sort` and `$unwind` follow for a path that names a field rather than
+computes one, and a join that silently multiplied its input by an array's
+length would be a `$unwind` nobody wrote. What was wrong was that nothing
+said which of the two it does — ADR-116's sentence about "the single value at
+the path" explains why the stage does not fan out, not which value it reads
+when there are several. `docs/aggregation.md` now says, and points at
+`$unwind` as the way to write the fanning join explicitly.
+
+**To close** — if it is ever worth closing — the fanning form would have to
+be opted into rather than made the default, because the ceiling and the cost
+both change with it. Nobody has asked.
+
+---
+
+## 🟡 A filter accepts a `$type` alias and a `$regex` flag it has never heard of, and matches nothing with either
+
+**Raised 2026-09-04 — the `$type` half by the 2026-09 test round, the
+`$options` half while closing it.** `{"$type": 999}` is a
+`400` naming the unknown code. `{"$type": "nosuchtype"}` — and `{"$type":
+"Int"}`, and `{"$type": "boolean"}` — is a `200` with no matches, because
+the argument is taken as a type *name* and no stored value ever reports that
+name. MongoDB refuses an unknown alias, and the two halves here disagree with
+each other as well as with it: the same mistake is loud through one spelling
+of the argument and silent through the other. An empty array, `{"$type":
+[]}`, is accepted the same way — it lists no type, so it matches nothing.
+
+It is the failure [ADR-121](decisions.md) closed for request fields and
+[ADR-124](decisions.md) for query parameters, still standing inside the
+filter: an empty result that is indistinguishable from a real one. It is
+narrower than either, because a filter's keys are the caller's own field
+names and only an *operator's argument* can be checked — but `$type`'s
+argument is exactly that, a closed vocabulary this database defines, and
+`$mod`'s pair, `$size`'s integer and a sort direction are all refused when
+they are wrong already.
+
+**The same shape is in `$options`.** `compile_regex` reads the flag string
+character by character, sets `i`, `m`, `s` and `x`, and drops everything else
+— so `"I"` is not `"i"`, the pattern compiles case-sensitively, and the
+caller gets an empty result with nothing said. Two words in this language's
+vocabulary that a filter accepts without checking, and they fail the same
+way.
+
+**To close:** validate the alias at parse and refuse an unknown one, as the
+numeric arm already does — the same error, reached by the other spelling.
+The table to validate against is `type_name_of`'s, the set of names a stored
+value can actually report, **not** `type_name_for_code`'s: the latter omits
+`symbol` and `dbPointer`, which have no numeric code but are real types that
+`$type` matches today. Refusing them would be a regression dressed as a fix.
+`$options` closes the same way, against its own four flags. Both are
+behaviour changes and tightenings, so they belong to a `0.MINOR` with a
+changelog line, not to a documentation pass; `docs/query-language.md` states
+the current behaviour, the alias list and the flag list in the meantime, so a
+reader can at least check a spelling against something.
+
+---
+
 ## 🟡 Type conversion is a strict superset of MongoDB's table, and `decimal` is outside it
 
 **Raised 2026-08-30, with `$convert` and the `$toX` shorthands.** The
@@ -44,9 +115,13 @@ spelled, and one target is missing:
   returned double read alike.
 - **`decimal` is refused.** `Decimal128` has no exact key encoding
   ([ADR-005](decisions.md)); a value converted to it could be neither indexed
-  nor grouped. `$convert` to `decimal` or `19`, and a `$toDecimal` operator,
-  are a `400` naming `double` and `long` as the alternatives. A `Decimal128`
-  *input* is likewise unconvertible.
+  nor grouped. `$convert` to `decimal` or `19` is a `400` naming `double` and
+  `long` as the alternatives. **`$toDecimal` is a `400` too, but not that
+  one**: the shorthand was never built as an operator, so it is refused as an
+  unknown expression operator and the message points at nothing. Both
+  refusals are right and only one of them explains itself; giving `$toDecimal`
+  its own arm of the refusal is the small change that would close it. A
+  `Decimal128` *input* is likewise unconvertible.
 
 **`$mod` and `$pullAll` have no entry.** Both follow MongoDB — `$mod`
 truncates doubles toward zero, refuses a zero divisor, and refuses a `NaN` or

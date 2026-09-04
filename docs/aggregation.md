@@ -125,6 +125,40 @@ row that was not produced by an array element has no index to report.
 
 `{"_id": null}` groups everything into one bucket.
 
+**A missing field is `null` to every accumulator**, not a value they never
+see — a missing field is null everywhere in this language — so what each one
+does with `null` is also what it does with a field half the collection lacks.
+That is where they differ, and the differences are the ones a report gets
+wrong quietly:
+
+| | Over non-numeric values | Over `null` and missing | When nothing was usable |
+|---|---|---|---|
+| `$sum` | **Ignored** — a string, a bool, an array, a document contributes nothing. A field holding `42` on some documents and `"42"` on others sums only the first kind | Ignored | `0` |
+| `$avg` | Ignored, in the numerator **and** the count — a field present on half the documents gives the mean of that half, not half the mean | Ignored | `null` |
+| `$min` `$max` | **Compared**, across types, in the [canonical order](key-encoding.md#type-ordering) — numbers below strings below documents below arrays below binary below ObjectIds below bools below dates | **Skipped**, both of them | `null` |
+| `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
+| `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them | — nothing is unusable |
+
+Two consequences worth spelling out. **`$sum` and `$avg` disagree about a
+group with nothing to work on**: `0` against `null`, because a total of
+nothing is zero and a mean of nothing is not a number — so a `$sum` reading
+`0` cannot be told apart from a genuine total of zero, where `$avg` says
+plainly that it had nothing. And **`$min`/`$max` over a mixed-type field
+answer across types rather than refusing**, so the maximum of a field holding
+integers, strings, arrays and booleans is a boolean — the highest rank in the
+order, not the largest number. Neither is a bug to work around; both are
+reasons to `$match` the type you mean first, or to `$group` after a
+`{"$type": …}` filter.
+
+`$sum` **stays integral** while every value it has seen is an integer,
+promoting to a double only when a double arrives or an `i64` sum would
+overflow. `$avg` is a double whenever it has an answer at all — it never
+returns an integer, and the one thing it returns that is not a double is the
+`null` above. `$addToSet` compares elements
+**structurally**, not by the canonical order `$group`'s own `_id` uses, so
+`5`, `5.0` and `{"$numberLong": "5"}` are one bucket as a grouping key and
+three distinct members of a set.
+
 ---
 
 ## Expressions
@@ -394,6 +428,34 @@ around the single authorization point ([ADR-024](decisions.md)).
 per-document join is O(n·m), which on any real pair of collections is the
 difference between a query and an outage.
 
+**`localField` and `foreignField` name one value each, and a path that
+crosses an array reads only the first element's.** They are field paths, not
+expressions, and the join needs one key per document on each side, so
+`localField: "items.sku"` over `items: [{sku: "a"}, {sku: "b"}]` joins on
+`"a"` and never on `"b"` — a stage that looked like it attached every line's
+product attaches the first line's. The same rule reads the foreign side, so
+the two always agree about what a key is. A field that simply *holds* an
+array is a different case and is not affected: `localField: "tags"` over
+`tags: ["a", "b"]` joins on the whole array `["a", "b"]`, matching a foreign
+document whose `foreignField` is that same array and not one whose field is
+`"a"`.
+
+Join on a scalar key. Where the key really is one per array element,
+`$unwind` the array first and join each row, which is a stage more and says
+what it means; the register records the difference from MongoDB, which fans
+a crossed `localField` out and joins on every element
+([Deviations](deviations.md)).
+
+**A key is a value, so a missing key is not `null` here.** An input document
+that lacks `localField` gets an empty `as` and joins nothing, and a foreign
+document that lacks `foreignField` is never a candidate — an explicit `null`
+on both sides joins, an absent field on either does not. The [filter rule
+that `null` matches a missing
+field](query-language.md#1-null-matches-missing-fields) does not reach here:
+that
+rule is about selecting documents, and a join is about matching two stored
+values to each other.
+
 ### The `let` / `pipeline` form
 
 ```json
@@ -534,7 +596,8 @@ documents holding large arrays can exceed the cap long before the stage ends.
 | `$zip`, `$objectToArray`, `$arrayToObject`, `$sortArray` | Not built |
 | System variables other than `$$ROOT` and `$$CURRENT` — `$$NOW`, `$$REMOVE`, `$$DESCEND`, `$$PRUNE`, `$$KEEP` | Not built. Refused with a message saying so, rather than as an unknown name |
 | `$lookup` with both `localField`/`foreignField` and `pipeline` | Refused. Join on the key, then `$filter`/`$map` the attached array in the next stage |
-| `$convert` to `decimal`, and `$toDecimal` | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse with a pointer to `double` or `long` |
+| `$convert` to `decimal` (or code `19`) | `Decimal128` has no exact key encoding ([ADR-005](decisions.md)); refused at parse, naming `double` and `long` as the alternatives |
+| `$toDecimal` | Never built as an operator at all, so it is refused at parse as an **unknown operator** — `unsupported operator "unknown expression operator \"$toDecimal\""` — rather than with the pointer `$convert` gives. The reason is the row above; the message does not say so |
 | `$facet`, `$bucket`, `$graphLookup`, `$merge`, `$out` | Not built. An unknown stage is refused with a message listing what is supported |
 | `$vectorSearch` as a stage | Vector search is its own endpoint — see [Vectors](vectors.md) |
 | Index use by a `$match` that is not first | Deliberate — see [Performance](#performance). Only the leading `$match` reads through the planner; a later one filters what reaches it |

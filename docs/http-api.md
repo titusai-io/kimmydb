@@ -419,7 +419,13 @@ pathological document from producing a field list longer than the documents it
 describes. With `examples=true` an `example` is always a scalar: a field whose
 values are objects, arrays or `null` carries none, because the field list
 already says what they hold, and a string over 120 bytes is passed over in
-favour of a shorter occurrence.
+favour of a shorter occurrence. Scalar there means *BSON* scalar, so a date,
+an ObjectId or a binary value is an example and arrives in its
+[Extended JSON](#the-json-boundary) form — `"example": {"$date":
+1754006400000}` is a scalar example, not a container one. A field is left
+without an example when no occurrence in the sample qualifies, which for a
+field whose every value is a long string means none at all: the key is
+absent rather than `null`.
 
 `nodeDurability` is the durability class of the node that answered —
 `durable` or `coalesced`, the same value `GET /v1/version` reports as
@@ -800,8 +806,13 @@ naming the first parameter and saying the route takes none
 ([ADR-124](decisions.md)). So `if_stamp` on `update`, `delete` and
 `find_and_modify` is a body field a query string can never carry:
 `POST .../update?if_stamp=…` is refused rather than read as an unconditional
-write. A bare `?` with nothing after it names no parameter and is not
-refused.
+write. A query string that names **nothing** is not refused: a bare `?`, and
+one made only of `&` separators — `?&`, `?&&&` — pass on every route,
+because there is no parameter in either to reject and a client that appended
+an empty one has asked for nothing. `?=` and `?;` do name something — an
+empty name, and a parameter whose name is `;` — and both are refused, the
+first as a malformed query string and the second as an unknown parameter,
+each saying the route takes none ([ADR-124](decisions.md)).
 
 **Object key order is preserved** through the boundary and into the stored
 document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
@@ -809,10 +820,14 @@ document: `{"zeta": 1, "alpha": 2}` is stored, indexed and read back with
 sort or update document, where the order carries meaning — a sort document's
 first key is its primary key, and update operators apply in the order they
 arrive (ADR-120). An inclusion projection answers in the document's order,
-not the projection's. This is the server's end of the wire; the other end is
-the client's JSON encoder, and the index route's `fields` array exists because
-that end is the one a client cannot always vouch for (see
-[Indexes](#indexes)).
+not the projection's. **An update keeps the order it found and appends what
+it adds:** a `$set` of a field the document already has rewrites it in place,
+and a `$set` of a new one puts it last, so `[_id, zeta, alpha]` becomes
+`[_id, zeta, alpha, beta]`. `_id` comes first because that is where a stored
+document keeps it, whatever position it held in the body that wrote it. This
+is the server's end of the wire; the other end is the client's JSON encoder,
+and the index route's `fields` array exists because that end is the one a
+client cannot always vouch for (see [Indexes](#indexes)).
 
 ---
 
@@ -985,7 +1000,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 409 | `duplicate_key` | no | `_id` already present |
 | 409 | `unique_violation` | no | A unique index would be violated |
 | 409 | `stale` | no | A conditional write's `if_stamp` did not match: the document is at another version, or is gone. Nothing was written — re-read, decide again, and send a new request with the current stamp ([conditional writes](#get-replace-delete-by-id)) |
-| 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above: the two are different questions, and [Vectors](vectors.md#search) puts them side by side |
+| 409 | `no_vectors` | no | A search against a collection that **is configured** for vectors but has none stored — ingestion never ran, or has not caught up. A refusal rather than an empty result, which would be indistinguishable from "nothing matched". The unconfigured case is the `400` above; this answer also comes *before* the embedding provider is built, so it is what a node whose provider it could not build answers too, for as long as the collection is empty. The three are different questions, and [Vectors](vectors.md#search) puts them side by side |
 | 413 | `payload_too_large` | no | Request body over `server.max_body_bytes` (2 MiB by default) |
 | 415 | `unsupported_media_type` | no | A JSON body without a JSON content type |
 | 501 | `not_implemented` | no | A reserved capability that does not exist yet |
@@ -994,7 +1009,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | 502 | `provider_error` | wait | An upstream embedding provider failed. Every node calls the same provider, so waiting helps and moving does not |
 | 503 | `timeout` | wait | The request was still waiting — for the rest of its body, or for an embedding provider — at `server.request_timeout_secs` (30 s by default) and this node abandoned it. Not a query timeout: storage work already running completes and is answered ([ADR-099](decisions.md)) |
 | 500 | `internal` | elsewhere | Storage failure on this node — details logged, never returned |
-| 500 | `misconfigured` | elsewhere | This node lacks something it needs, such as an API key its vector configuration names |
+| 500 | `misconfigured` | elsewhere | This node lacks something it needs to build the embedding provider a stored vector configuration names — the environment variable holding its API key is unset here, its provider is one this node's egress policy refuses, or it names a profile this node does not define. Reached only by a search that asks the server to **embed `query` text** on a collection that **already holds vectors**: a request carrying its own `vector` builds no provider, and an empty collection answers `409 no_vectors` first. See [Vectors](vectors.md#search) |
 | 500 | `snapshot` | elsewhere | A vector index snapshot on this node could not be used |
 
 **`retry` is three-valued because KimmyDB is leaderless.** Every node accepts
