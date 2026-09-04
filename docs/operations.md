@@ -495,6 +495,14 @@ during a period of sustained heavy write load: pair it with
 should be read, and treat a long stretch of unmoving `kimmy_sync_divergent_collections`
 under heavy load as *unknown* rather than *clean*.
 
+One case is not "skipped" at all: a peer that answers with zero entries
+while also reporting its tail was not reached. A correct peer cannot produce
+this — the scan behind a truncated window always ships at least one entry
+before it stops short — so this is a malfunctioning or misbehaving peer, not
+an ordinary capped pull. It fails the round as a malformed frame rather than
+being read as either a clean check or a skipped one, so it shows up in
+`kimmy_sync_failures_total` like any other malformed round.
+
 **What is compared.** Two things, deliberately not everything a full
 reconciliation would:
 
@@ -508,15 +516,26 @@ reconciliation would:
   has had its turn takes as many *checked* rounds as there are collections —
   not wall-clock rounds, if some rounds are skipped per the paragraph above.
 
-A finding is confirmed, and counted in the gauge, only once the same
-collection is found divergent on two consecutive *contacts with the same
-peer* — not necessarily two consecutive rounds of the whole loop, since a
-cluster larger than about twice `cluster.fanout` does not contact every peer
-every round — and it clears the moment a later contact with that peer no
-longer finds it. A peer simply not contacted this round leaves its last
-finding untouched rather than clearing it: silence about a peer is not
-evidence it has reconciled. The gauge is a level, not a counter, and a
-resolved divergence stops moving it rather than leaving a permanent scar.
+A finding is confirmed, and counted in the gauge, only once seen twice
+running — but "twice running" means something different for each half, and
+conflating them is a defect this section used to have. **Existence** is
+checked in full on every contact with a peer, so confirming it needs two
+consecutive *contacts with the same peer* — not necessarily two consecutive
+rounds of the whole loop, since a cluster larger than about twice
+`cluster.fanout` does not contact every peer every round. **Count** examines
+only whichever one collection the rotation lands on that contact, so
+confirming it needs two consecutive *probes of that same collection*
+against that same peer — which, once this node holds more than one
+collection, are not the same two contacts. A collection probed once every
+lap of the rotation and found mismatched every time still confirms; it just
+needs its collection's turn to come round twice in a row, not the peer's.
+Each half clears the moment its own next relevant check — a contact, for
+existence; a probe of that collection, for count — no longer finds it. A
+peer simply not contacted, or a contact that probed a *different*
+collection, leaves the untouched finding exactly where it was: silence is
+not evidence of reconciliation, for either half. The gauge is a level, not a
+counter, and a resolved divergence stops moving it rather than leaving a
+permanent scar.
 
 **The count half trusts a peer's answer only when the peer is not itself
 behind this node.** A peer that has simply not yet pulled this node's own
@@ -535,9 +554,13 @@ close.
 
 **What it cannot catch.** A document present in equal numbers on every
 member but with different content — a lost update that still counts, rather
-than a lost document. A count divergence in a collection that has not yet had
-its turn at the probe. **A round whose pull did not reach the peer's tail —
-see "what a `0` reading means" above.** Anything on a peer this node is not
+than a lost document. **A count divergence until its collection has been
+probed twice running against the same peer** — reaching its turn once
+detects it but does not confirm it and does not move the gauge; nothing
+about a different collection being probed against that peer in between
+resets or advances that count, only a clean probe of the *same* collection
+does. **A round whose pull did not reach the peer's tail — see "what a `0`
+reading means" above.** Anything on a peer this node is not
 currently paired with in a round (`cluster.fanout` bounds the peers contacted
 each round, the same bound anti-entropy itself is subject to). A collection
 this node holds that a peer does not — the reverse direction is the peer's

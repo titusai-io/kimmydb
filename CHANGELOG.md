@@ -20,22 +20,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   asks that peer what it holds: every collection id, and one collection's
   live document count, chosen in turn so no round pays for more than one
   collection's scan. `kimmy_sync_divergent_collections`, a gauge, moves once
-  the same collection is found disagreeing on two consecutive contacts with
-  the same peer, and clears the moment a later contact no longer sees it. It
-  moves for the exact condition below: a member missing a collection or a run
-  of documents a peer holds, with `kimmy_replication_lag_seconds` at 0 and
-  `kimmy_sync_failures_total`, `kimmy_sync_peers_backing_off` and
-  `kimmy_sync_ddl_refused_total` all unmoved, because nothing about it fails
-  a round. Runs on the existing `cluster.sync_interval_secs` cadence, so it
-  still runs during a modestly busy cluster and not only an idle one; a
-  backlog that never drains under the batch cap on any round leaves the check
-  unrun and the gauge holding its last value, which is *not checked*, not
-  *not divergent*. A peer that has simply not pulled this node's own recent
-  writes is not flagged on that lag alone. It reports; it does not repair —
-  see the operations guide for what it cannot catch. No collection or
-  database name appears in the metric. A second wire change this release,
-  alongside `Entries`': old and new peers cannot exchange this check, and the
-  cutover has its own rollout shape in the operations guide. ADR-133.
+  a collection is found disagreeing twice running: two consecutive contacts
+  with the same peer for a collection-existence finding, two consecutive
+  probes of that specific collection against that peer for a document-count
+  finding, since only one collection is probed per contact and those are not
+  the same two contacts once more than one collection is in rotation — each
+  half clears independently the moment its own next relevant check no longer
+  sees it. It moves for the exact condition below: a member missing a
+  collection or a run of documents a peer holds, with
+  `kimmy_replication_lag_seconds` at 0 and `kimmy_sync_failures_total`,
+  `kimmy_sync_peers_backing_off` and `kimmy_sync_ddl_refused_total` all
+  unmoved, because nothing about it fails a round. Runs on the existing
+  `cluster.sync_interval_secs` cadence, so it still runs during a modestly
+  busy cluster and not only an idle one; a backlog that never drains under
+  the batch cap on any round leaves the check unrun and the gauge holding
+  its last value, which is *not checked*, not *not divergent*. A peer that
+  has simply not pulled this node's own recent writes is not flagged on
+  that lag alone. A peer that answers an empty batch while claiming its
+  tail was not reached — which a correct peer cannot produce — fails the
+  round rather than being read as a clean or skipped check. It reports; it
+  does not repair — see the operations guide for what it cannot catch. No
+  collection or database name appears in the metric. A second wire change
+  this release, alongside `Entries`': old and new peers cannot exchange
+  this check, and the cutover has its own rollout shape in the operations
+  guide. ADR-133.
 
 ### Fixed
 

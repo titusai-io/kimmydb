@@ -7496,16 +7496,20 @@ holds, on the connection already open for that round: every collection id,
 and the live document count of one collection named in the request. The
 requester compares the peer's answer against its own state, subject to a
 second guard against the peer's own lag (below), and exports
-`kimmy_sync_divergent_collections`, a gauge, once the same collection has
-been found divergent on two consecutive contacts with the same peer. No
-document or collection name appears in the metric — the gauge is a bare
-count, holding `/metrics`' standing property that a name never crosses that
-boundary.
+`kimmy_sync_divergent_collections`, a gauge, once a collection has been
+found divergent twice running — two consecutive *contacts* with the same
+peer, for the existence half; two consecutive *probes of that collection*
+against the same peer, for the count half, which are not the same thing (see
+defect 5 below). No document or collection name appears in the metric — the
+gauge is a bare count, holding `/metrics`' standing property that a name
+never crosses that boundary.
 
-This ADR went through a round of review that found four defects in the
-first cut, three of them gauge-defeating. What follows is the corrected
-design; the defects and the reasoning behind each fix are recorded under
-their own headings because each is a decision worth being able to find
+This ADR went through two rounds of review. The first found four defects in
+the first cut, three of them gauge-defeating; the second, re-running every
+probe against the fix rather than reading an account of it, found a fifth in
+exactly the half the first round's fixes did not touch. What follows is the
+corrected design; the defects and the reasoning behind each fix are recorded
+under their own headings because each is a decision worth being able to find
 again, not just a bug that got fixed.
 
 **What is compared, and why not everything a full reconciliation would.**
@@ -7567,6 +7571,21 @@ volume, would be exactly such a load — means *not checked*, not *not
 divergent*. The gauge degrades gracefully with backlog depth rather than
 going fully dark the moment anything is pulled, which is what the first cut
 did; it does not claim coverage a genuinely saturated cluster cannot afford.
+
+**One state that `exhausted` alone cannot resolve: an empty, non-exhausted
+window.** ADR-126's own proof — over every arrangement of withheld entries
+and every batch limit — is that a correct sender can never answer with zero
+entries while also reporting its tail was not reached: the scan that
+produces `exhausted == false` only stops there after pushing at least one
+kept entry. A peer that does both is not offering an ordinary capped pull
+with nothing new to add; it is claiming, in the same message, both "nothing
+here" and "more exists", which nothing downstream can safely read as
+progress. Folding it into the same "not exhausted, do not check" bucket as
+a genuine capped pull would make a malfunctioning or malicious peer's claim
+indistinguishable from an unremarkable one. `sync_once` treats it as a
+malformed round instead — the same failure class `expected Entries, got
+...` already is — so it surfaces in `kimmy_sync_failures_total`, not as a
+silent skip and not as a clean reading.
 
 **Defect 2: a peer merely behind was flagged, and the two-contact
 confirmation does not filter it out.** The gate above protects this node's
@@ -7650,19 +7669,95 @@ received while waiting for the gauge to confirm, that `failed`,
 That is the actual signal path finding 14's silence was observed on, tested
 directly rather than through a proxy that could not carry the claim.
 
-**Confirmed on two consecutive contacts with the same peer, not one.** The
-gates above already rule out ordinary lag in both directions, but the
-peer's answer is still built from two separate reads a message apart — its
-version vector, read by the round already under way, then its collection
-list and probe count, read a moment later on the same connection. A
-collection created on the peer in that gap can in principle outrun the
-vector the gate was judged against. Requiring the same finding to recur on
-the very next contact with that peer closes that window: a live divergence
-recurs on every contact, because nothing here repairs it, and a race
-between two reads a message apart does not recur back to back. The gauge is
-a level: a resolved finding clears the moment a contact no longer sees it,
-rather than leaving a permanent mark for a cluster that has since been
-fixed by hand.
+**Defect 5: a count divergence could never confirm on any node holding more
+than one collection.** A second round of review, having re-run every probe
+against the fix for defects 1–4 rather than reading the account of them,
+reproduced finding 14's more serious half directly — a document-count
+divergence in a collection that exists, correctly named, on every member,
+with no local writes on the affected member and a quiet, converged
+cluster — and found the check detected it correctly on every single contact
+in which the collection was probed, while the gauge never moved. At one
+collection the confirmation worked; at two it stopped working entirely, and
+stayed broken at every collection count above that.
+
+The cause was the same shape as defect 3, one axis over. Defect 3's fix
+keyed `DivergenceTracker` per peer, so a finding is not cleared by a contact
+that did not examine that *peer*. But the count half is also gated by
+`advance_probe`, which rotates to a *different collection* on the very next
+contact — so on a node holding N collections, a given collection's count is
+probed against a given peer roughly once every N contacts, not on every
+contact the way existence is. The tracker's confirmation rule, "two
+consecutive contacts", is correct for existence, which is checked in full
+every contact, and wrong for count, which is checked for exactly one
+collection per contact: a count finding was visible on one contact in N and
+absent from the "seen" set on the other N−1, so it could never appear on two
+*consecutive* contacts once N exceeded one. Detected on schedule, confirmed
+never — which means the gauge reported existence divergence only, and the
+count half — the half ADR-133 itself named as the reason to compare document
+counts at all, "the more serious half of what finding 14 actually lost" —
+was never wired to the gauge on any cluster with more than one collection.
+The round that motivated this ADR had roughly 57.
+
+**Fix: the two halves are tracked, and confirmed, separately.**
+[`compare`][crate::divergence::compare] now returns `Findings { existence,
+count }` rather than one merged set, and `DivergenceTracker::observe` keeps
+independent state for each: existence confirms across two consecutive
+*contacts* with a peer, unchanged from defect 3's fix; count confirms across
+that specific `(peer, collection)` pair's two most recent consecutive
+*probes*, keyed and cleared independently of how many other collections are
+rotated through in between, and independently of the existence state for the
+same peer. `confirmed_count()` unions both, so a collection found divergent
+by either half, or both, still counts once.
+
+Two other shapes were considered and rejected. **Holding the rotation on a
+divergent collection** until its finding resolves — never advancing
+`advance_probe` away from it — would confirm faster, but a permanent
+divergence, by definition, never resolves without an operator, so a single
+permanently divergent collection would starve every other collection from
+ever being probed again: a design that finds one problem by creating a
+second, larger one. **Comparing every collection's count on every
+contact** — the "one cursor walk" the round's own supervisor did by hand —
+is the cost this design exists to avoid paying forever on a live cluster,
+restated from the cost section below. Tracking the two halves apart, so each
+confirms on the cadence its own check actually runs at, was the only
+considered shape that fixes the confirmation without reopening either the
+starvation risk or the cost bound.
+
+Pinned by `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+(the exact defect, at the tracker level), `a_gap_between_probes_of_the_same_collection_never_confirms_a_count`,
+`a_contact_that_does_not_probe_the_collection_leaves_its_count_state_untouched`
+and `a_confirmed_count_divergence_clears_on_the_next_clean_probe_of_it`; by
+two composition tests added specifically because this defect and defect 3
+share their shape — `kimmy-storage`'s own unit tests already pinned `observe`
+correctly in isolation, and still missed this — `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+drives the real `advance_probe` against the real tracker, and `peers.rs`'s
+`a_peer_confirms_despite_a_fanout_smaller_than_the_cluster` drives the real
+`PeerHealth::select` against it; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_confirms_through_the_real_loop_despite_other_collections`,
+which reproduces the original P6 probe end to end against the real
+`replicate()` loop with four collections in rotation.
+
+**Confirmed on two consecutive checks, not one — "consecutive" meaning a
+different thing for each half, per defect 5.** The gates above already rule
+out ordinary lag in both directions, but the peer's answer is still built
+from two separate reads a message apart — its version vector, read by the
+round already under way, then its collection list and probe count, read a
+moment later on the same connection. A collection created on the peer in
+that gap can in principle outrun the vector the gate was judged against.
+Requiring the same finding to recur before it counts closes that window: a
+live divergence recurs every time it is checked, because nothing here
+repairs it, and a race between two reads a message apart does not recur
+back to back. For existence that means two consecutive *contacts* with a
+peer, because existence is checked in full on every contact; for count it
+means two consecutive *probes of that collection* against that peer, which
+can be many contacts apart once more than one collection is in rotation.
+The gauge is a level either way: a resolved finding clears the moment its
+own next relevant check — a contact, for existence; a probe of that
+collection, for count — no longer sees it, rather than leaving a permanent
+mark for a cluster that has since been fixed by hand.
 
 **Cost, stated as a bound — corrected.** Per contact with a peer, in the
 branch where the check runs: one metadata scan of this node's own database
@@ -7678,6 +7773,18 @@ contacts (itself bounded by `cluster.fanout`), and still independent of
 total data size — a node does not scan more of one collection because it
 has more peers — but it is not literally one scan process-wide.
 
+**A known, deliberately deferred cost inside that one scan.** `Engine::count`
+walks `for_each_doc`, which decodes every document's record — including the
+body — purely to increment a counter; it does not stop at a key-range scan
+that would skip the body. That cost already existed everywhere `count`
+already runs (the `count` route and aggregation's `$count`), and this check
+does not add a new instance of it, but it does put it on a five-second
+forever loop on both sides of a probed contact, which those call sites do
+not. A key-range count would cost a fraction. Left as measured and not
+fixed here: the change belongs to `Engine::count` itself, not to this
+check's use of it, and reworking a shared primitive is a larger unit than
+adding one caller of it.
+
 **What this does not do.** It does not repair a divergence it finds — a
 member found to hold less than its peers still needs an operator to decide
 what to do about it, exactly as any other divergence this cluster can
@@ -7692,10 +7799,17 @@ does rather than against what an earlier draft of this ADR claimed:
 
 - A document present in equal numbers on every member but with different
   content — a lost update that still counts, rather than a lost document.
-- A count divergence in a collection that has not yet had its turn at the
-  probe. Reaching every collection again after one has had its turn takes as
-  many *checked* rounds as the cluster has collections — see the next point
-  for what "checked" excludes.
+- **A count divergence, until the affected collection has been probed twice
+  running against the same peer** — not merely probed once, which detects it
+  but does not confirm it, and does not move the gauge. Reaching a given
+  collection's turn at the probe once takes as many *checked* contacts with
+  that peer as the cluster has collections; confirming it takes reaching
+  that same collection's turn twice in a row, with nothing in between that
+  probes it *and* finds it clean. Other collections being probed against the
+  same peer in between do not affect it either way — the two-in-a-row rule
+  is scoped to the one `(peer, collection)` pair, per defect 5 above, which
+  is what this bullet used to understate. See the next point for what
+  "checked" excludes.
 - **A round whose pull did not reach the peer's tail does not run the check
   at all** — see defect 1's residual above. A gauge reading `0` during a
   backlog that never drains under the batch cap is not evidence of
