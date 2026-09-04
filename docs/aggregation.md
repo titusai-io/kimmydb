@@ -139,9 +139,11 @@ wrong quietly:
 | `$first` `$last` | Taken as they are | Taken as they are — `null` is a value here | — every group has a first and a last |
 | `$push` `$addToSet` | Taken as they are | Appended as `null`; `$addToSet` keeps one of them | — nothing is unusable |
 
-Two consequences worth spelling out. **`$sum` and `$avg` disagree about an
-empty group**: `0` against `null`, because a total of nothing is zero and a
-mean of nothing is not a number. And **`$min`/`$max` over a mixed-type field
+Two consequences worth spelling out. **`$sum` and `$avg` disagree about a
+group with nothing to work on**: `0` against `null`, because a total of
+nothing is zero and a mean of nothing is not a number — so a `$sum` reading
+`0` cannot be told apart from a genuine total of zero, where `$avg` says
+plainly that it had nothing. And **`$min`/`$max` over a mixed-type field
 answer across types rather than refusing**, so the maximum of a field holding
 integers, strings, arrays and booleans is a boolean — the highest rank in the
 order, not the largest number. Neither is a bug to work around; both are
