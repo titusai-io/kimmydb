@@ -124,10 +124,11 @@ info:
     refused* — so a client that asks for everything in one request is answered
     with a prefix and no indication that it was one. Walk with a cursor.
 
-    `POST .../find` returns `nextCursor` whenever the page filled and the query
-    is one a cursor can continue. A query a cursor cannot continue returns no
-    token at all, rather than one that would silently page in a different order
-    than the one asked for.
+    `POST .../find` returns `nextCursor` whenever the page filled, `skip` is
+    `0`, and the query is one a cursor can continue. A query a cursor cannot
+    continue — and a page reached by a non-zero `skip`, which is an offset
+    rather than a walk — returns no token at all, rather than one that would
+    silently page in a different order than the one asked for.
 
     What a client may rely on:
 
@@ -1282,7 +1283,13 @@ paths:
           in: query
           required: false
           schema: { type: boolean }
-          description: Include one example value per field.
+          description: |
+            Include one example value per field. An example is always a
+            *BSON* scalar, so a date, an ObjectId or a binary value appears
+            in its Extended JSON form and a field holding only objects,
+            arrays or `null` carries none. A field whose every sampled value
+            is a string over 120 bytes carries none either: the key is
+            absent, not `null`.
       responses:
         "200":
           description: The inferred shape.
@@ -3171,12 +3178,20 @@ components:
             A larger value is **clamped to 10,000 rather than refused**, so
             asking for more than the cap succeeds and returns less than was
             asked for. Walk with `cursor` instead.
+
+            `0` is a window of nothing, not a request for the default: an
+            empty `documents`, `count` of `0`, and no `nextCursor`, on every
+            access path and every sort order.
         skip:
           type: integer
           minimum: 0
           description: |
             Costs work proportional to what it skips. Use `cursor` for paging;
             `skip` is for jumping.
+
+            A page reached by a non-zero `skip` carries **no `nextCursor`**,
+            however full it is — the two ways of saying where to resume are
+            not mixed, and combining them in one request is refused outright.
 
             With a `sort` other than `{"_id": 1}`, `skip + limit` may not
             exceed 10,000 — that is what the server holds while it sorts — and
@@ -3226,10 +3241,12 @@ components:
         nextCursor:
           type: string
           description: |
-            Present when the page filled and the query is one a cursor can
-            continue. Absent means either the end of the results or a query
-            whose order a cursor cannot express — never a token that would
-            page in a different order than the one asked for.
+            Present when the page filled, `skip` was `0`, and the query is one
+            a cursor can continue. Absent means the end of the results, a
+            query whose order a cursor cannot express, or a page reached by a
+            non-zero `skip` — never a token that would page in a different
+            order than the one asked for, or from a position the caller did
+            not choose.
 
             **A full page is not proof there is more.** A collection of exactly
             100 documents read 100 at a time offers a token whose next page is
