@@ -2722,7 +2722,13 @@ components:
         code: the status distinguishes "not JSON" from "not this JSON", and
         the code says what a client should do about either. A document
         body — insert, replace, bulk — is content and takes any field,
-        `null` values included.
+        `null` values included. One exception to "the message names it": a
+        wrong-typed or `null` value inside a tagged `provider` object names
+        `provider`, not the field inside it (`provider.endpoint`, say) —
+        true of every value error there, not only `null` — because that
+        value is re-read through a second deserializer once the `kind` tag
+        is matched, and the path tracker cannot see across the seam. An
+        ordinary nested object, `chunk` among them, is unaffected.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }

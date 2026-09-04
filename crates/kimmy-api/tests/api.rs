@@ -8700,3 +8700,60 @@ async fn a_search_filter_uses_the_index_and_returns_the_filtered_top_k() {
     assert!(ids.contains(&"b") && ids.contains(&"e"), "{:?}", hybrid.body);
     assert!(!ids.contains(&"a") && !ids.contains(&"c"), "{:?}", hybrid.body);
 }
+
+/// `serde_path_to_error` loses the path inside an internally-tagged enum:
+/// once the `kind` tag is matched, serde buffers the variant's fields as
+/// `Content` and replays them through a fresh, untracked deserializer, so
+/// any error inside — a wrong type, or `non_null_field`'s refusal alike —
+/// surfaces attributed to the enum's own field (`provider`) rather than the
+/// one inside it (`provider.endpoint`). Pinned as a pre-existing limitation,
+/// not a regression: the wrong-type probe below has nothing to do with
+/// `null`, and truncates exactly the same way `endpoint: null` does. Every
+/// *other* nested shape in this file reports its full path —
+/// `chunk.max_tokens` among them — because `ChunkConfig` is an ordinary
+/// struct, not a tagged enum. Documented in `docs/http-api.md`.
+#[tokio::test]
+async fn a_wrong_value_inside_a_tagged_enum_names_the_enums_own_field_not_the_inner_one() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"docs"})).await;
+
+    let wrong_type = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 3,
+                    "provider": { "kind": "open_ai", "model": "m", "dimensions": "abc" } }),
+        )
+        .await;
+    assert_eq!(wrong_type.status, 422, "{:?}", wrong_type.body);
+    let message = wrong_type.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("provider:"), "{message}");
+    assert!(!message.contains("dimensions"), "{message}");
+
+    let null = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "dim": 3,
+                    "provider": { "kind": "open_ai", "model": "m", "endpoint": null } }),
+        )
+        .await;
+    assert_eq!(null.status, 422, "{:?}", null.body);
+    let message = null.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("provider:"), "{message}");
+    assert!(!message.contains("endpoint"), "{message}");
+
+    // The un-tagged, ordinary-struct sibling does not lose the path.
+    let chunk = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                    "chunk": { "max_chars": 100, "overlap": 10, "max_tokens": null } }),
+        )
+        .await;
+    assert_eq!(chunk.status, 422, "{:?}", chunk.body);
+    let message = chunk.body["message"].as_str().unwrap_or_default();
+    assert!(message.contains("chunk.max_tokens") || message.contains("max_tokens"), "{message}");
+}

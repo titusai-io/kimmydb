@@ -736,6 +736,18 @@ answers with; `update`'s `update` on `POST .../update` is `400 "expected a
 JSON object"`, for instance, not this `422`. This rule is what closes the
 one gap: an *optional* field's `null`, which nothing refused before.
 
+**One nested shape does not name the field inside it: a tagged `provider`
+object.** `{"provider": {"kind": "open_ai", "endpoint": null, …}}` is
+refused, but the message reads `"provider: invalid type: null, expected a
+non-null value"` — it names `provider`, not `provider.endpoint`. This is not
+particular to `null`: `{"provider": {"kind": "open_ai", "dimensions":
+"nine"}}` is refused the same truncated way, and always has been. Once the
+`kind` tag is matched, the value is re-read through a second, unrelated
+deserializer, and the path tracker that otherwise names a nested field —
+`chunk.max_tokens` reports its full path correctly, being an ordinary struct
+rather than a tagged one — cannot see across that seam. The status and the
+refusal are both right; only the name is short.
+
 **Query strings are held to the same rule, at `400`.** `?limt=5` on
 `GET .../docs`, or `?limit=abc`, is `400 bad_request` with the parameter
 named. The status differs from a body's `422` because a query string is part
