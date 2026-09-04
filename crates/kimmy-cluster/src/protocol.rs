@@ -31,7 +31,7 @@
 
 use std::io;
 
-use kimmy_core::{Hlc, NodeId, OplogEntry, VersionVector};
+use kimmy_core::{CollectionId, Hlc, NodeId, OplogEntry, VersionVector};
 use kimmy_storage::{SnapshotCursor, SnapshotPage};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -149,6 +149,27 @@ pub enum Message {
     AskSnapshot { after: Option<SnapshotCursor> },
     /// One page of it.
     Snapshot(Box<SnapshotPage>),
+    /// "Which collections do you hold, and — for one of them — how many
+    /// documents?"
+    ///
+    /// Sent only when the requester's own round found nothing left to pull
+    /// (ADR-133): that belief rests on the version vector `AskVersions`
+    /// already answered, and a truncated sync window is exactly what can
+    /// make the belief false without anything on the anti-entropy path able
+    /// to see it. `probe` names the one collection this round wants a live
+    /// document count for — rotated by the caller so no round pays for more
+    /// than one collection's scan — and is `None` when the requester holds
+    /// none at all.
+    AskDivergence { probe: Option<CollectionId> },
+    /// The answer: every collection id this node currently holds, across
+    /// every database, and the live document count of `probe` if this node
+    /// holds it too.
+    ///
+    /// `collections` costs a metadata scan, not a document read — the same
+    /// bound `Engine::all_collection_ids` states. `probe_count` is the one
+    /// piece of this exchange that reads documents, and it reads exactly one
+    /// collection's worth.
+    Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
     /// Something went wrong; the sender is closing.
     Fault(String),
 }
@@ -424,6 +445,13 @@ mod tests {
             Message::Entries { entries: Vec::new(), scanned_to: Hlc::ZERO, exhausted: true },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
             Message::Confirm { proof: vec![9, 9] },
+            Message::AskDivergence { probe: Some(CollectionId(42)) },
+            Message::AskDivergence { probe: None },
+            Message::Divergence {
+                collections: vec![CollectionId(1), CollectionId(2)],
+                probe_count: Some(7),
+            },
+            Message::Divergence { collections: Vec::new(), probe_count: None },
             Message::Fault("nope".into()),
         ];
 

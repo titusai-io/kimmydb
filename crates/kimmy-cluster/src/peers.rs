@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
-use crate::transport::sync_once;
+use crate::transport::{DivergenceProbe, sync_once};
 
 /// How often to run a round against every known peer.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -57,6 +57,20 @@ pub struct RoundReport {
     /// its peers hold, and nothing will retry it; the `warn!` at the time
     /// names it.
     pub ddl_refused: usize,
+    /// Collections the cross-member divergence check currently has confirmed
+    /// against some peer (ADR-133): held there and not here, or held by
+    /// both with disagreeing document counts. A level, like `backing_off` —
+    /// but keyed per peer, and for the count half per collection *and* peer,
+    /// not per tick: a finding clears only when a later contact with the
+    /// specific peer that reported it (and, for a count finding, the same
+    /// probe of the same collection against that peer) no longer sees it,
+    /// never merely because some tick's union of every peer reached that
+    /// tick came up empty. See `DivergenceTracker::observe` for why a
+    /// per-tick reading would have left this permanently unable to confirm
+    /// past a handful of peers, or past one collection. It moves for exactly
+    /// the condition that left every other field in this report at its
+    /// healthiest value while the cluster silently lost data.
+    pub divergent_collections: usize,
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -145,6 +159,13 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     let mut discovery = tokio::time::interval(config.discovery_interval);
     let mut sync = tokio::time::interval(config.sync_interval);
 
+    // The cross-member divergence check (ADR-133): which collection this
+    // tick probes for a document count, and which findings have recurred
+    // often enough to confirm. Owned by the loop, not the engine — like
+    // `health` and `stale_peers` below, it is a fact about this process's
+    // ticks, not about the data.
+    let mut divergence = kimmy_storage::DivergenceTracker::new();
+
     // Peers currently flagged as stale rejoiners, so the warning fires on the
     // transition and not on every round they stay that way.
     let mut stale_peers: BTreeSet<NodeId> = BTreeSet::new();
@@ -187,6 +208,42 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // an unreachable cluster has unknown lag, not zero lag.
                 let mut round_lag: Option<u64> = None;
                 let mut report = RoundReport::default();
+
+                // This tick's turn in the divergence check's rotation
+                // (ADR-133): a fresh, cheap read of what this node holds —
+                // metadata only — and this node's own count of whichever
+                // collection is up next, computed once and reused against
+                // every peer this tick rather than once per peer.
+                //
+                // A failure to read it must not reach `advance_probe` at
+                // all, empty set or otherwise: `advance_probe` sweeps its
+                // count-side state against whatever it is handed, on the
+                // reasoning that a collection absent from that set is
+                // *provably* gone (ADR-133, defect 6) — true of a fresh
+                // read, and false of a transient error standing in for one.
+                // Passing an empty set on error used to be harmless, before
+                // that sweep existed; now it would read a storage hiccup as
+                // "this node holds nothing" and silently discard every live
+                // count finding, the exact silence this check exists to
+                // rule out. `advance_probe_on` is where that decision lives,
+                // pulled out on its own so it is a function with a test
+                // rather than a branch inside this loop.
+                let mine_collections = engine.all_collection_ids();
+                if let Err(e) = &mine_collections {
+                    warn!(error = %e, "divergence check: could not list this node's own \
+                          collections; skipping this tick's probe rotation");
+                }
+                let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
+                    let mine_count = match engine.count_by_id(id) {
+                        Ok(count) => count,
+                        Err(e) => {
+                            warn!(error = %e, collection = %id, "divergence check: could not \
+                                  count the probed collection; comparing existence only this tick");
+                            None
+                        }
+                    };
+                    DivergenceProbe { id, mine_count }
+                });
                 for peer in health.select(&peers, Instant::now()) {
                     // One span per peer per round, not one per round: an
                     // anti-entropy round against three peers is three
@@ -207,8 +264,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once(&engine, peer, &config.secret).instrument(span.clone()).await {
-                        Ok(outcome) => {
+                    match sync_once(&engine, peer, &config.secret, probe)
+                        .instrument(span.clone())
+                        .await
+                    {
+                        Ok(mut outcome) => {
                             // `i64` throughout: `tracing-opentelemetry` has
                             // no `record_u64`, so an unsigned value is
                             // formatted with `Debug` and reaches a collector
@@ -220,6 +280,24 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
                             if let Some(node) = outcome.peer {
+                                // Folded in only when the check actually ran
+                                // against this peer this contact
+                                // (`exhausted`, see `sync_once`) — a peer
+                                // whose round had a backlog too deep to
+                                // reach its tail must not be read as having
+                                // reconciled, and `observe` treats "not
+                                // called" and "called with nothing found" as
+                                // the two different facts they are
+                                // (ADR-133). `divergent` and `count_probe`
+                                // are always set together by `sync_once`, so
+                                // `divergent`'s presence alone gates both.
+                                if let Some(existence) = outcome.divergent.take() {
+                                    let findings = kimmy_storage::DivergenceFindings {
+                                        existence,
+                                        count: outcome.count_probe.take(),
+                                    };
+                                    divergence.observe(node, findings);
+                                }
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);
                                 if stale && !was {
@@ -275,6 +353,12 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 if let (Some(on_lag), Some(lag_ms)) = (&config.on_lag, round_lag) {
                     on_lag(lag_ms / 1_000);
                 }
+                // Read every tick regardless of whether anything reports it,
+                // for the same reason the line above computes `report`
+                // unconditionally: the tracker's own state does not depend
+                // on whether a caller wired up `on_round`, only `observe`
+                // above does, and that already ran per peer contacted.
+                report.divergent_collections = divergence.confirmed_count();
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.
@@ -284,6 +368,31 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
             }
         }
+    }
+}
+
+/// The collection id this tick probes for a count, given the result of
+/// reading this node's own collection set — or `None`, without touching
+/// `tracker` at all, when that read failed.
+///
+/// A read failure is *not* an empty set standing in for one:
+/// `DivergenceTracker::advance_probe` sweeps its count-side confirmation
+/// state against whatever it is handed, on the premise that a collection
+/// absent from that set is provably gone: this node no longer holds it
+/// (ADR-133, defect 6). That premise holds for a genuine read and fails for
+/// a read that merely errored — a transient storage hiccup is not evidence
+/// this node suddenly holds zero collections, and reading it that way would
+/// silently discard every live count finding for as long as the error
+/// lasts. So `advance_probe` is not called at all on that path: the
+/// rotation's cursor stays exactly where it was, and every finding survives
+/// untouched into the next tick, which may read cleanly.
+fn advance_probe_on<E>(
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    mine: Result<BTreeSet<kimmy_core::CollectionId>, E>,
+) -> Option<kimmy_core::CollectionId> {
+    match mine {
+        Ok(ids) => tracker.advance_probe(&ids),
+        Err(_) => None,
     }
 }
 
@@ -344,5 +453,84 @@ mod tests {
         let peers = resolve(&seeds, "127.0.0.1:7900".parse().unwrap()).await;
 
         assert_eq!(peers.len(), 1);
+    }
+
+    /// The fanout scaling defect, composed the way the real loop composes
+    /// it: `PeerHealth::select`'s own rotation feeding `DivergenceTracker`,
+    /// not a hand-written stand-in for either. `DivergenceTracker`'s unit
+    /// tests already pin that it confirms across non-adjacent contacts in
+    /// isolation; this is the piece that pins the *other* half actually
+    /// produces contacts shaped that way at a cluster size the default
+    /// fanout cannot cover in one pass, so a future change to either
+    /// `select`'s rotation policy or the tracker's keying cannot silently
+    /// re-break the composition while each component's own tests stay
+    /// green.
+    #[test]
+    fn a_peer_confirms_despite_a_fanout_smaller_than_the_cluster() {
+        use std::collections::HashMap;
+
+        let peers: BTreeSet<SocketAddr> =
+            (0..8).map(|i| format!("127.0.0.1:{}", 7900 + i).parse().unwrap()).collect();
+        // Stands in for the handshake's introduction in the real protocol,
+        // which is where a `SocketAddr` and a `NodeId` are actually paired.
+        let ids: HashMap<SocketAddr, NodeId> = peers
+            .iter()
+            .enumerate()
+            .map(|(i, &addr)| (addr, NodeId::from_bytes((i as u128).to_be_bytes())))
+            .collect();
+        // Past the sixth of eight peers at the default fanout of 3 -- two
+        // ticks in a row cannot possibly both reach it by round-robin alone.
+        let divergent_peer = *peers.iter().nth(5).unwrap();
+        let divergent_collection = kimmy_core::CollectionId(1);
+
+        let mut health = PeerHealth::new(DEFAULT_FANOUT, Duration::from_secs(5));
+        let mut tracker = kimmy_storage::DivergenceTracker::new();
+        let now = Instant::now();
+
+        for _ in 0..40 {
+            for addr in health.select(&peers, now) {
+                health.succeeded(addr);
+                let existence = if addr == divergent_peer {
+                    BTreeSet::from([divergent_collection])
+                } else {
+                    BTreeSet::new()
+                };
+                let findings = kimmy_storage::DivergenceFindings { existence, count: None };
+                tracker.observe(ids[&addr], findings);
+            }
+            if tracker.confirmed_count() > 0 {
+                break;
+            }
+        }
+        assert_eq!(tracker.confirmed_count(), 1, "confirms at 8 peers despite fanout 3");
+    }
+
+    /// Defect 6's sweep introduced a regression of its own: a transient
+    /// failure to read this node's own collections must not be handed to
+    /// `advance_probe` as an empty set, or it silently discards every live
+    /// count finding on the strength of an error rather than a fact.
+    #[test]
+    fn a_read_failure_leaves_confirmed_count_findings_untouched() {
+        let mut tracker = kimmy_storage::DivergenceTracker::new();
+        let p = NodeId::from_bytes(1u128.to_be_bytes());
+        let mismatched = kimmy_storage::DivergenceFindings {
+            existence: BTreeSet::new(),
+            count: Some((kimmy_core::CollectionId(7), true)),
+        };
+        tracker.observe(p, mismatched.clone());
+        tracker.observe(p, mismatched);
+        assert_eq!(tracker.confirmed_count(), 1, "confirmed before the read failure");
+
+        // Stands in for `engine.all_collection_ids()` failing this tick —
+        // not for it succeeding with nothing in it.
+        let failed: Result<BTreeSet<kimmy_core::CollectionId>, &str> = Err("transient");
+        let probe = advance_probe_on(&mut tracker, failed);
+
+        assert_eq!(probe, None, "nothing to probe when the read itself failed");
+        assert_eq!(
+            tracker.confirmed_count(),
+            1,
+            "a read failure must not be read as \"this node holds nothing\""
+        );
     }
 }

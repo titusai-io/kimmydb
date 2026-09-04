@@ -8483,3 +8483,487 @@ Defended by `a_replayed_drop_does_not_remove_a_newer_index_of_the_same_name`,
 which is unchanged.
 
 ---
+
+## ADR-133 — A periodic cross-member check makes a divergence no counter can express visible, without repairing it
+
+**Decision.** Every anti-entropy round whose pull reaches the peer's true
+tail — whether because there was nothing left to pull, or because this
+round's own batch was not truncated by the cap — also asks that peer what it
+holds, on the connection already open for that round: every collection id,
+and the live document count of one collection named in the request. The
+requester compares the peer's answer against its own state, subject to a
+second guard against the peer's own lag (below), and exports
+`kimmy_sync_divergent_collections`, a gauge, once a collection has been
+found divergent twice running — two consecutive *contacts* with the same
+peer, for the existence half; two consecutive *probes of that collection*
+against the same peer, for the count half, which are not the same thing (see
+defect 5 below). No document or collection name appears in the metric — the
+gauge is a bare count, holding `/metrics`' standing property that a name
+never crosses that boundary.
+
+This ADR went through four rounds of review, each re-running every probe
+against the fix rather than reading an account of it. The first found four
+defects in the first cut, three of them gauge-defeating; the second found a
+fifth in exactly the half the first round's fixes did not touch; the third
+found a sixth in exactly the case the second round's fix did not sweep for;
+the fourth found a seventh in the one input the third round's own fix was
+not written to handle. What follows is the corrected design; the defects and
+the reasoning behind each fix are recorded under their own headings because
+each is a decision worth being able to find again, not just a bug that got
+fixed.
+
+**What is compared, and why not everything a full reconciliation would.**
+Two things:
+
+- **Collection existence**, one-directional: only "the peer holds it and I
+  do not" is reported, never the reverse. The reverse is the peer's own
+  discovery to make when its own loop reaches the identical gate pulling
+  from this node; checking both directions from one side would flag a
+  collection the instant it is created locally, before the peer has had any
+  chance to catch up, which is the flapping the gate below exists to
+  prevent. This half costs a metadata scan — the database and collection
+  tables, never a document — so it runs on every check regardless of data
+  size, and it needs no guard beyond the gate that gets a caller into the
+  check at all.
+- **One collection's live document count**, chosen in turn from the
+  requester's own collection list (`next_probe`), so a check pays for at
+  most one collection's scan rather than the whole database. Names alone
+  would have missed the more serious half of what finding 14 actually lost:
+  two collections were missing entirely, but 500 and 517 documents were also
+  missing from collections that existed, correctly named, on every member.
+  This half needs its own guard, below — the existence half's protection
+  does not extend to it.
+
+**Defect 1: the check went dark under sustained write load, which is
+finding 14's own precondition.** The first cut ran the check only in the
+branch where `VersionVector::behind` read `None` — nothing left to pull.
+Under a continuously busy cluster (a modest 50 writes between each of 20
+rounds, in the case that found this), every round has *something* new to
+pull, so `behind` never reads `None` and the check never runs: 20 rounds, 0
+reaching the branch, gauge pinned at 0 for the whole run. Finding 14's own
+precondition was "the puller is more than one batch behind" — the corpus
+load that produced it was the exact shape this defect went blind for.
+
+**Fix: `sync_once` also runs the check whenever a round's own pull reaches
+the peer's true tail**, using the `exhausted` flag ADR-127 already computes
+and had been discarding after `apply_peer_batch` consumed it —
+`SyncOutcome` now carries it. A round pulling a handful of new entries well
+under the 1,024-entry batch cap reaches the tail and is checked; a round
+whose pull is itself truncated by the cap is not, because that is precisely
+the state a truncated window can fake without it being true, and checking
+on the strength of a truncated pull would reopen the same hole one level up.
+This closes the probed gap — the busy-cluster case above now confirms
+within a handful of rounds — without opening the excluded one: a backlog
+that stays deeper than one batch on every single round is still not
+checked, honestly, because nothing about that state can be trusted either.
+`kimmy-cluster/tests/replication.rs` pins both halves of the boundary:
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` and
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`,
+plus `the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull`
+reproducing the original busy-cluster probe against the real replication
+loop.
+
+**Residual, stated rather than hidden: a backlog that never dips under the
+batch cap is still not checked, for as long as that holds.** A `0` reading
+on `kimmy_sync_divergent_collections` during sustained heavy write load —
+the 43-batch corpus load that finding 14 stopped on, at forty times the
+volume, would be exactly such a load — means *not checked*, not *not
+divergent*. The gauge degrades gracefully with backlog depth rather than
+going fully dark the moment anything is pulled, which is what the first cut
+did; it does not claim coverage a genuinely saturated cluster cannot afford.
+
+**One state that `exhausted` alone cannot resolve: an empty, non-exhausted
+window.** ADR-126's own proof — over every arrangement of withheld entries
+and every batch limit — is that a correct sender can never answer with zero
+entries while also reporting its tail was not reached: the scan that
+produces `exhausted == false` only stops there after pushing at least one
+kept entry. A peer that does both is not offering an ordinary capped pull
+with nothing new to add; it is claiming, in the same message, both "nothing
+here" and "more exists", which nothing downstream can safely read as
+progress. Folding it into the same "not exhausted, do not check" bucket as
+a genuine capped pull would make a malfunctioning or malicious peer's claim
+indistinguishable from an unremarkable one. `sync_once` treats it as a
+malformed round instead — the same failure class `expected Entries, got
+...` already is — so it surfaces in `kimmy_sync_failures_total`, not as a
+silent skip and not as a clean reading.
+
+The counter alone is not the whole answer, though: the generic per-peer
+failure debounce that decides whether a round failure is worth a `warn!`
+line can route this occurrence's first sighting to `debug` if the same peer
+already had an unrelated failure recently, leaving a bare counter increment
+with nothing explaining it — for a condition whose entire premise is that it
+should never happen at all. `sync_once` logs it at `warn!`, unconditionally,
+at the point of detection, rather than leaving it to that debounce. The
+predicate this depends on — `entries.is_empty() && !exhausted` — is a named,
+tested function (`is_unreachable_from_a_correct_sender`) rather than an
+inline condition, specifically because the shortcut `!exhausted` reads as
+equivalent and is not: it would refuse every ordinary capped pull on a busy
+cluster, the common case this state must be kept apart from.
+
+**Defect 2: a peer merely behind was flagged, and the two-contact
+confirmation does not filter it out.** The gate above protects this node's
+own belief that it is not behind the peer. It says nothing about the
+opposite direction: whether the *peer* is behind *this node*. A peer that
+has simply not yet pulled this node's own recent writes answers a probe with
+a stale, lower count for any collection those writes touched — a real
+difference, but ordinary replication lag, not a divergence — and
+`compare`'s count check is symmetric, so it reports the mismatch regardless
+of which side is stale. Worse, a lagging peer reproduces the identical
+mismatch on *every* consecutive contact, so the two-contact confirmation
+that exists to filter out a one-off race does nothing here: on the round
+whose peers steady-state lagged 130–260 s behind each other, this would have
+been 26 to 52 consecutive confirmed ticks of a firing alert on a cluster
+that was, at the time, healthy. An alert that cries wolf on ordinary lag is
+the failure mode that gets an operator to disable it, which lands the
+cluster in exactly the state this gauge exists to prevent.
+
+**Fix: `divergence_probe_for` checks the reverse direction explicitly**
+before trusting a count. Given `theirs` (the peer's version vector, fetched
+at the top of the round) and `mine` (this node's own vector, as of just
+before asking), `theirs.behind(&mine).is_some()` means the peer has not yet
+witnessed something this node has — the peer is behind — and the probe is
+dropped for that contact (`None`) rather than compared. The existence half
+is unaffected: it never depends on the peer being caught up on anything of
+this node's, only on this node's own belief about the peer, which the
+existing gate already covers. Pinned by
+`a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent`,
+constructed with a real, genuine count difference across the wire that the
+guard must suppress rather than report.
+
+**Defect 3: above roughly twice the fanout, the gauge could never leave
+0.** The first cut's confirmation state was one global pending/confirmed
+pair, folded in once per *replication tick* from the union of every peer
+reached that tick. `PeerHealth::select` hands each tick a `fanout`-sized
+window of the known peers and advances it, so two ticks in a row share a
+peer only while `2 × fanout > N` (peers) — with the default fanout of 3,
+five members or fewer. Past that, no single peer is ever the one reached on
+two consecutive ticks, so a *global* tracker keyed by tick can never see the
+same peer's finding twice running, however badly that peer has diverged: at
+six peers and up the gauge is structurally pinned at 0. The three-member
+cluster the check was built and tested against could not have shown this.
+
+**Fix: `DivergenceTracker` is keyed per peer**, not per tick.
+`observe(peer, seen)` folds in one peer's finding from one contact with
+that peer; confirmation needs the same peer's *own* two most recent
+contacts to agree, however many other ticks or other peers fall between —
+which `PeerHealth::select` eventually guarantees for every known peer
+regardless of cluster size. A finding against one peer clears only when a
+later contact with that *same* peer no longer sees it; a tick in which a
+peer simply was not contacted leaves its last state untouched, because
+silence about a peer is not evidence it has reconciled. Pinned by
+`divergence.rs`'s
+`confirmation_survives_ticks_where_the_peer_was_not_contacted_at_all` (the
+fanout-scaling case directly), `a_peer_reconciling_does_not_clear_a_different_peers_finding`
+and `the_same_collection_confirmed_against_two_peers_counts_once` (the
+gauge answers "how many collections", not "how many peer pairs").
+
+**Defect 4: the load-bearing test's silence half was vacuous.** The
+original regression test asserted `lag_ms`, `applied`, `superseded`, `ddl`,
+`ddl_refused` and `unknown_collection` were all zero on the branch under
+test — but every one of those fields is `Default::default()` on that
+branch's return path regardless of input, so the assertions could not fail
+for any input and proved nothing about the "false belief reads as healthy"
+claim they were named for. Finding 14's silence was specifically in the
+*exported* metrics and the *absent* log lines, which live in `kimmy-cluster`'s
+`peers.rs` and are pushed into `kimmy-api`'s `Metrics` by `kimmyd`; a test
+against `sync_once`'s return value alone cannot reach either.
+
+**Fix, two parts.** The mechanism-level test
+(`the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover`)
+now asserts only what it can actually prove — that `outcome.divergent` names
+the stranded collection — and says so in its own comment rather than
+implying more. A new test,
+`the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`,
+drives the real `replicate()` loop with `on_round` and `on_lag` wired up —
+the exact hooks `kimmyd::spawn_cluster` feeds into `Metrics::record_sync_round`
+and `Metrics::set_replication_lag_secs` — and asserts, across every report
+received while waiting for the gauge to confirm, that `failed`,
+`backing_off` and `ddl_refused` stay at 0 and every `on_lag` reading is 0.
+That is the actual signal path finding 14's silence was observed on, tested
+directly rather than through a proxy that could not carry the claim.
+
+**Defect 5: a count divergence could never confirm on any node holding more
+than one collection.** A second round of review, having re-run every probe
+against the fix for defects 1–4 rather than reading the account of them,
+reproduced finding 14's more serious half directly — a document-count
+divergence in a collection that exists, correctly named, on every member,
+with no local writes on the affected member and a quiet, converged
+cluster — and found the check detected it correctly on every single contact
+in which the collection was probed, while the gauge never moved. At one
+collection the confirmation worked; at two it stopped working entirely, and
+stayed broken at every collection count above that.
+
+The cause was the same shape as defect 3, one axis over. Defect 3's fix
+keyed `DivergenceTracker` per peer, so a finding is not cleared by a contact
+that did not examine that *peer*. But the count half is also gated by
+`advance_probe`, which rotates to a *different collection* on the very next
+contact — so on a node holding N collections, a given collection's count is
+probed against a given peer roughly once every N contacts, not on every
+contact the way existence is. The tracker's confirmation rule, "two
+consecutive contacts", is correct for existence, which is checked in full
+every contact, and wrong for count, which is checked for exactly one
+collection per contact: a count finding was visible on one contact in N and
+absent from the "seen" set on the other N−1, so it could never appear on two
+*consecutive* contacts once N exceeded one. Detected on schedule, confirmed
+never — which means the gauge reported existence divergence only, and the
+count half — the half ADR-133 itself named as the reason to compare document
+counts at all, "the more serious half of what finding 14 actually lost" —
+was never wired to the gauge on any cluster with more than one collection.
+The round that motivated this ADR had roughly 57.
+
+**Fix: the two halves are tracked, and confirmed, separately.**
+[`compare`][crate::divergence::compare] now returns `Findings { existence,
+count }` rather than one merged set, and `DivergenceTracker::observe` keeps
+independent state for each: existence confirms across two consecutive
+*contacts* with a peer, unchanged from defect 3's fix; count confirms across
+that specific `(peer, collection)` pair's two most recent consecutive
+*probes*, keyed and cleared independently of how many other collections are
+rotated through in between, and independently of the existence state for the
+same peer. `confirmed_count()` unions both, so a collection found divergent
+by either half, or both, still counts once.
+
+Two other shapes were considered and rejected. **Holding the rotation on a
+divergent collection** until its finding resolves — never advancing
+`advance_probe` away from it — would confirm faster, but a permanent
+divergence, by definition, never resolves without an operator, so a single
+permanently divergent collection would starve every other collection from
+ever being probed again: a design that finds one problem by creating a
+second, larger one. **Comparing every collection's count on every
+contact** — the "one cursor walk" the round's own supervisor did by hand —
+is the cost this design exists to avoid paying forever on a live cluster,
+restated from the cost section below. Tracking the two halves apart, so each
+confirms on the cadence its own check actually runs at, was the only
+considered shape that fixes the confirmation without reopening either the
+starvation risk or the cost bound.
+
+Pinned by `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+(the exact defect, at the tracker level), `a_gap_between_probes_of_the_same_collection_never_confirms_a_count`,
+`a_contact_that_does_not_probe_the_collection_leaves_its_count_state_untouched`
+and `a_confirmed_count_divergence_clears_on_the_next_clean_probe_of_it`; by
+two composition tests added specifically because this defect and defect 3
+share their shape — `kimmy-storage`'s own unit tests already pinned `observe`
+correctly in isolation, and still missed this — `divergence.rs`'s
+`a_count_divergence_confirms_despite_rotating_through_other_collections`
+drives the real `advance_probe` against the real tracker, and `peers.rs`'s
+`a_peer_confirms_despite_a_fanout_smaller_than_the_cluster` drives the real
+`PeerHealth::select` against it; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_confirms_through_the_real_loop_despite_other_collections`,
+which reproduces the original P6 probe end to end against the real
+`replicate()` loop with four collections in rotation.
+
+**Defect 6: a confirmed count finding against a since-dropped collection
+never clears.** A third round of review, verifying the defect 5 fix rather
+than reading the account of it, found the one case its own design left
+uncovered: drop the divergent collection, and the gauge stays at its
+confirmed value for the rest of the process, a hundred clean ticks later. The
+cause is a straightforward asymmetry, not a new mechanism. `observe`'s
+existence half is recomputed from a fresh `existence` set on every contact —
+`confirmed_for_peer.retain(|id| existence.contains(id))` — so a collection
+absent from that set is dropped immediately, no matter why it is absent. The
+count half has no equivalent: it only ever mutates inside `if let Some((id,
+mismatched)) = count`, so once `advance_probe` stops naming a dropped
+collection, nothing ever touches its `count_pending` or `count_confirmed`
+entry again — not a peer going quiet, which is genuine silence the design
+deliberately does not read as reconciliation, but a fact this node already
+knows for certain, in the same set `advance_probe` is handed fresh every
+tick.
+
+This mattered more than its size suggested, because the realistic trigger is
+an operator following the gauge's own advice: it fires, they investigate,
+they remediate the way `operations.md` says to — reset or recreate the
+collection — and the alert they just resolved never goes out. Both this ADR
+and `operations.md` promise the opposite in as many words: *"a resolved
+divergence stops moving it rather than leaving a permanent scar."* An alert
+that cannot be cleared by fixing the thing it reported is the one an
+operator disables, which is precisely the argument defect 2's fix already
+made at length.
+
+**Fix: `advance_probe` sweeps both count structures against `mine` before
+choosing the next probe.** It already receives the full, current set of
+collections this node holds on every call; a collection missing from that
+set is provably gone, not merely unheard from, so `count_pending` and
+`count_confirmed` are filtered against it unconditionally, every tick,
+regardless of whether that tick's probe lands on the affected collection at
+all. The same sweep closes a second, subtler case: `CollectionId` is derived
+from `(db, name)`, so a drop followed by a recreation of the same name
+reuses the identical id, and without the sweep a *pending* (not yet
+confirmed) mismatch against the old incarnation could combine with one
+mismatched probe of the new incarnation to falsely confirm on what is really
+each incarnation's first sighting.
+
+Pinned by `divergence.rs`'s `a_confirmed_count_divergence_clears_when_its_collection_is_dropped`
+and `a_pending_count_mismatch_does_not_survive_a_drop_and_recreate`.
+
+**Defect 7: defect 6's own sweep, on the one input it was not written for,
+silently discarded every live count finding.** A fourth round of review
+found this: `peers.rs` handles a failed `engine.all_collection_ids()` by
+logging and passing an empty set into `advance_probe`. Before defect 6 that
+was harmless — an empty set just made the rotation return `None` for this
+tick. After defect 6, `advance_probe` sweeps its count-side state against
+whatever it is handed on the premise that a collection missing from that
+set is provably gone; an empty set now reads as "this node holds no
+collections at all", and every confirmed and pending count finding was
+swept away on a single transient storage error. Self-healing — the existence
+half is untouched, and a genuine finding re-confirms once its collection is
+probed twice more, on the order of `2 × (collection count)` ticks — but
+still a silent under-report inside the one feature whose whole thesis is
+that a divergence must never be silent, introduced by the very fix meant to
+stop the gauge from sticking. The comment at the call site had said
+"skipping this tick's probe rotation" throughout; after defect 6 it no
+longer skipped, it reset, and the comment did not change to say so.
+
+**Fix: a read failure never reaches `advance_probe`.** `advance_probe_on`
+holds the decision on its own — `Ok(ids) => tracker.advance_probe(&ids)`,
+`Err(_) => None` — so a failed read leaves the rotation's cursor and every
+piece of count state exactly where they were, and the next tick's read gets
+a clean attempt. Pulled into its own function for the same reason
+`is_unreachable_from_a_correct_sender` (defect 6's must-fix) was: the
+interaction is exactly the part a future edit is likely to touch by
+accident, and it is cheap to give it a test independent of the async loop
+and the engine around it. Pinned by `peers.rs`'s
+`a_read_failure_leaves_confirmed_count_findings_untouched`.
+
+**Confirmed on two consecutive checks, not one — "consecutive" meaning a
+different thing for each half, per defect 5.** The gates above already rule
+out ordinary lag in both directions, but the peer's answer is still built
+from two separate reads a message apart — its version vector, read by the
+round already under way, then its collection list and probe count, read a
+moment later on the same connection. A collection created on the peer in
+that gap can in principle outrun the vector the gate was judged against.
+Requiring the same finding to recur before it counts closes that window: a
+live divergence recurs every time it is checked, because nothing here
+repairs it, and a race between two reads a message apart does not recur
+back to back. For existence that means two consecutive *contacts* with a
+peer, because existence is checked in full on every contact; for count it
+means two consecutive *probes of that collection* against that peer, which
+can be many contacts apart once more than one collection is in rotation.
+The gauge is a level either way: a resolved finding clears the moment its
+own next relevant check — a contact, for existence; a probe of that
+collection, for count — no longer sees it, rather than leaving a permanent
+mark for a cluster that has since been fixed by hand.
+
+**Cost, stated as a bound — corrected.** Per contact with a peer, in the
+branch where the check runs: one metadata scan of this node's own database
+and collection tables (independent of collection size), one metadata scan
+on the peer's side, and exactly one collection's document count on each
+side — never more than one collection, and never the whole database, *per
+contact*. The first cut of this ADR stated the per-round total as "exactly
+one collection's document count on each side... never more", which is true
+per peer but not per round: a node with several pulling peers runs one such
+exchange per peer it contacts that round, since each requester's rotation
+is independent. The total is still bounded by the number of peers a tick
+contacts (itself bounded by `cluster.fanout`), and still independent of
+total data size — a node does not scan more of one collection because it
+has more peers — but it is not literally one scan process-wide.
+
+**A known, deliberately deferred cost inside that one scan.** `Engine::count`
+walks `for_each_doc`, which decodes every document's record — including the
+body — purely to increment a counter; it does not stop at a key-range scan
+that would skip the body. That cost already existed everywhere `count`
+already runs (the `count` route and aggregation's `$count`), and this check
+does not add a new instance of it, but it does put it on a five-second
+forever loop on both sides of a probed contact, which those call sites do
+not. A key-range count would cost a fraction. Left as measured and not
+fixed here: the change belongs to `Engine::count` itself, not to this
+check's use of it, and reworking a shared primitive is a larger unit than
+adding one caller of it.
+
+**What this does not do.** It does not repair a divergence it finds — a
+member found to hold less than its peers still needs an operator to decide
+what to do about it, exactly as any other divergence this cluster can
+report does. Automatically resetting or re-seeding a member on this signal
+would be a much larger decision than "make the state visible", and design
+rule 4 for this round is explicit that a bug fix does not get to make that
+call quietly. It is recorded here as a considered alternative and left to a
+future round if wanted.
+
+**What it cannot catch**, stated plainly against what the code actually
+does rather than against what an earlier draft of this ADR claimed:
+
+- A document present in equal numbers on every member but with different
+  content — a lost update that still counts, rather than a lost document.
+- **A count divergence, until the affected collection has been probed twice
+  running against the same peer** — not merely probed once, which detects it
+  but does not confirm it, and does not move the gauge. Reaching a given
+  collection's turn at the probe once takes as many *checked* contacts with
+  that peer as the cluster has collections; confirming it takes reaching
+  that same collection's turn twice in a row, with nothing in between that
+  probes it *and* finds it clean. Other collections being probed against the
+  same peer in between do not affect it either way — the two-in-a-row rule
+  is scoped to the one `(peer, collection)` pair, per defect 5 above, which
+  is what this bullet used to understate. See the next point for what
+  "checked" excludes.
+- **A round whose pull did not reach the peer's tail does not run the check
+  at all** — see defect 1's residual above. A gauge reading `0` during a
+  backlog that never drains under the batch cap is not evidence of
+  convergence; it is evidence the check has not run.
+- Anything on a peer this node's fanout is not currently pairing it with —
+  bounded by `cluster.fanout`, the same bound anti-entropy itself is subject
+  to.
+- A collection this node holds that a peer does not — by design, that
+  direction is the peer's own check to make when its own loop reaches the
+  same gate pulling from this node.
+- A shadow collection (a vector index's own storage) stranded on one member.
+  `Engine::all_collection_ids` excludes shadow collections from the
+  existence and count comparisons, because their lifecycle deliberately
+  trails the collection they serve; a genuine divergence in one is as
+  invisible to this check as it is to the collection listing routes.
+
+**A second wire change in this release, weighed against not making one.**
+This is the *second* protocol addition U1 (ADR-126/127) shares the release
+with, and rule 4 asks for the alternative to be named rather than skipped
+over. The alternative was deriving existence and counts from data the wire
+already carries — `AskVersions`/`Versions` and `Entries` — and it does not
+work: a version vector is per-origin high-water marks, not a collection
+list or a document count, and no combination of history already exchanged
+recovers either without replaying it, which is exactly the cost this design
+exists to avoid paying every round. `AskDivergence`/`Divergence` is new
+messages for a genuinely new question the existing wire cannot answer.
+
+Unlike `Entries`, which fails loudly and immediately on a version mismatch
+(a malformed frame, counted in `kimmy_sync_failures_total`, on the very
+first round after a mixed-version pair meets), an `AskDivergence` mismatch
+only surfaces on a round that reaches the branch this check runs in — a
+converged round, or one whose pull is exhausted. A freshly mixed pair still
+actively catching up looks completely healthy; only once it converges does
+every subsequent round to the unstamped peer fail. Operationally this still
+resolves the same way U1's cutover does — roll every member — but the
+failure's onset is delayed and worth stating rather than assuming it
+matches `Entries`' shape.
+
+**Cost of the alternative considered: compare every collection's count every
+round.** This is what the round's own supervisor did by hand to confirm the
+loss — "one cursor walk" — and it is exactly what is unaffordable run
+forever on a live cluster: the cost scales with total document count across
+every collection, on every round, on every member, which is the walk this
+design declines to automate. The rotation trades detection latency —
+bounded by collection count on a cluster whose backlog stays under the
+batch cap, unbounded while it does not, per defect 1's residual above — for
+a bound independent of data size.
+
+Defended by `crates/kimmy-storage/src/divergence.rs`'s unit tests —
+`a_collection_the_peer_holds_and_this_node_does_not_is_divergent`,
+`a_collection_only_this_node_holds_is_not_reported_here`,
+`a_disagreeing_probe_count_is_divergent_even_with_matching_names`,
+`a_caller_that_distrusts_the_probe_suppresses_only_the_count_half`,
+`a_gap_against_the_same_peer_never_confirms`,
+`a_confirmed_divergence_clears_the_moment_that_peer_no_longer_shows_it`,
+`confirmation_survives_ticks_where_the_peer_was_not_contacted_at_all`,
+`a_peer_reconciling_does_not_clear_a_different_peers_finding` and
+`the_same_collection_confirmed_against_two_peers_counts_once` — and by
+`crates/kimmy-cluster/tests/replication.rs`'s
+`the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover`
+(the mechanism, honestly scoped),
+`the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`
+(the actual silence claim, against the actual hooks),
+`the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull`
+(defect 1's probe, reproduced and closed),
+`a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent`
+(defect 2's probe, reproduced and closed), and
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` /
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`
+(the exhausted boundary, both sides).
+
+---

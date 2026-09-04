@@ -9,10 +9,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
-use kimmy_cluster::transport::{serve, sync_once};
-use kimmy_core::DocId;
+use kimmy_cluster::transport::{DivergenceProbe, serve, sync_once};
+use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
 use tokio::net::{TcpListener, TcpStream};
 
@@ -79,8 +81,8 @@ impl Node {
 
 /// Pull into `into` from `from`, both directions making a full round.
 async fn sync(a: &Node, b: &Node) {
-    sync_once(&a.engine, b.addr, SECRET).await.expect("a should pull from b");
-    sync_once(&b.engine, a.addr, SECRET).await.expect("b should pull from a");
+    sync_once(&a.engine, b.addr, SECRET, None).await.expect("a should pull from b");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("b should pull from a");
 }
 
 #[tokio::test]
@@ -173,7 +175,7 @@ async fn a_batch_of_large_entries_still_replicates() {
     // oversized frame for ever. Ten is generous and still bounded, so a regression
     // fails rather than hangs.
     for _ in 0..10 {
-        sync_once(&b.engine, a.addr, SECRET).await.expect("b should pull from a");
+        sync_once(&b.engine, a.addr, SECRET, None).await.expect("b should pull from a");
     }
 
     let cb = b.engine.get_collection("shop", "big").expect("the collection should have replicated");
@@ -228,7 +230,7 @@ async fn a_collection_and_its_index_replicate_over_the_network() {
     let ca = a.engine.get_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": 1, "email": "x@y" }).unwrap();
 
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
     let index = cb.indexes.iter().find(|i| i.name == "email_1").expect("the index must replicate");
@@ -246,7 +248,7 @@ async fn a_node_joining_an_existing_cluster_catches_up() {
 
     // b starts empty and knows nothing.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(b.engine.count(&cb).unwrap(), 200);
@@ -260,7 +262,7 @@ async fn a_converged_round_transfers_nothing() {
     a.engine.insert(&ca, doc! { "_id": 1 }).unwrap();
 
     sync(&a, &b).await;
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     assert_eq!(second.total(), 0, "a converged pair must exchange nothing: {second:?}");
 }
@@ -278,7 +280,7 @@ async fn a_peer_with_the_wrong_secret_is_refused() {
     let ca = a.engine.create_collection("shop", "orders").unwrap();
     a.engine.insert(&ca, doc! { "_id": "secret" }).unwrap();
 
-    let err = sync_once(&intruder.engine, a.addr, "not-the-cluster-secret")
+    let err = sync_once(&intruder.engine, a.addr, "not-the-cluster-secret", None)
         .await
         .expect_err("a wrong secret must be refused");
 
@@ -337,7 +339,7 @@ async fn one_bad_connection_does_not_stop_the_listener() {
 
     // A well-behaved peer still works.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the listener must still be serving");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the listener must still be serving");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert_eq!(b.engine.count(&cb).unwrap(), 1);
 }
@@ -350,7 +352,7 @@ async fn a_peer_that_hangs_up_mid_handshake_is_survivable() {
 
     let b = node().await;
     b.engine.create_collection("shop", "orders").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the listener must still be serving");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the listener must still be serving");
 }
 
 #[tokio::test]
@@ -365,9 +367,10 @@ async fn connecting_to_a_dead_peer_is_an_error_not_a_hang() {
     let dead = listener.local_addr().unwrap();
     drop(listener);
 
-    let result = tokio::time::timeout(Duration::from_secs(10), sync_once(&engine, dead, SECRET))
-        .await
-        .expect("must not hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(10), sync_once(&engine, dead, SECRET, None))
+            .await
+            .expect("must not hang");
     assert!(result.is_err());
 }
 
@@ -394,7 +397,7 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
 
     // B joins knowing nothing.
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must arrive");
     assert_eq!(b.engine.count(&cb).unwrap(), 50, "every document must arrive");
@@ -404,7 +407,7 @@ async fn a_node_joining_a_cluster_past_its_retention_horizon_still_catches_up() 
     );
 
     // And it must stop asking for history that no longer exists.
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
 }
 
@@ -436,12 +439,12 @@ async fn a_snapshot_of_a_high_bit_collection_crosses_the_wire() {
         .unwrap();
 
     let b = node().await;
-    let first = sync_once(&b.engine, a.addr, SECRET).await.expect("the snapshot must encode");
+    let first = sync_once(&b.engine, a.addr, SECRET, None).await.expect("the snapshot must encode");
     assert_eq!(first.applied, 50);
     let cb = b.engine.get_collection("shop", &name).expect("the collection must arrive");
     assert_eq!(b.engine.count(&cb).unwrap(), 50);
 
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "a caught-up node must not keep resyncing: {second:?}");
 }
 
@@ -456,7 +459,7 @@ async fn a_snapshot_is_only_used_when_the_oplog_cannot_serve() {
     }
 
     let b = node().await;
-    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
 
     // An incremental round reports DDL separately; a snapshot reports only
     // applied documents, so a non-zero ddl count means the oplog served it.
@@ -484,14 +487,14 @@ async fn a_dead_peer_is_backed_off_rather_than_retried_every_round() {
     // First round: contacted, and it really does fail.
     let now = Instant::now();
     assert_eq!(health.select(&peers, now), vec![dead]);
-    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    assert!(sync_once(&node.engine, dead, SECRET, None).await.is_err());
     health.failed(dead, now);
 
     // A single failure is forgiven promptly — a blip should not cost a peer
     // several intervals of isolation.
     let next = now + Duration::from_secs(5);
     assert_eq!(health.select(&peers, next), vec![dead], "one failure should retry soon");
-    assert!(sync_once(&node.engine, dead, SECRET).await.is_err());
+    assert!(sync_once(&node.engine, dead, SECRET, None).await.is_err());
     health.failed(dead, next);
 
     // Repeated failure is what earns the backoff.
@@ -587,7 +590,7 @@ async fn a_man_in_the_middle_cannot_relay_the_handshake() {
     let (mitm_addr, _relayed) = man_in_the_middle(a.addr).await;
 
     let b = node().await;
-    let err = sync_once(&b.engine, mitm_addr, SECRET)
+    let err = sync_once(&b.engine, mitm_addr, SECRET, None)
         .await
         .expect_err("a relayed handshake must be refused");
 
@@ -617,7 +620,7 @@ async fn the_same_two_nodes_converge_when_nobody_is_in_the_middle() {
     a.engine.insert(&ca, doc! { "_id": "confidential" }).unwrap();
 
     let b = node().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("a direct round must succeed");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("a direct round must succeed");
 
     let cb = b.engine.get_collection("shop", "orders").expect("the collection must replicate");
     assert!(b.engine.get(&cb, &DocId::String("confidential".into())).unwrap().is_some());
@@ -655,9 +658,10 @@ async fn a_silent_peer_cannot_stall_a_sync_round() {
     let b = node().await;
 
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(30), sync_once(&b.engine, addr, SECRET))
-        .await
-        .expect("the dial must give up on its own rather than hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(30), sync_once(&b.engine, addr, SECRET, None))
+            .await
+            .expect("the dial must give up on its own rather than hang");
     let elapsed = started.elapsed();
 
     result.expect_err("a peer that never speaks cannot produce a successful round");
@@ -684,9 +688,10 @@ async fn an_unroutable_peer_cannot_stall_a_sync_round() {
     let b = node().await;
 
     let started = std::time::Instant::now();
-    let result = tokio::time::timeout(Duration::from_secs(60), sync_once(&b.engine, addr, SECRET))
-        .await
-        .expect("the connect must give up on its own rather than hang");
+    let result =
+        tokio::time::timeout(Duration::from_secs(60), sync_once(&b.engine, addr, SECRET, None))
+            .await
+            .expect("the connect must give up on its own rather than hang");
     let elapsed = started.elapsed();
 
     result.expect_err("an unroutable address cannot produce a successful round");
@@ -721,7 +726,7 @@ async fn sender_and_a_receiver_that_dropped_it() -> (Node, Node) {
     let b = node().await;
 
     a.engine.create_collection("shelf", "doomed").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the create must replicate");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the create must replicate");
 
     // Recorded on the sender only -- the receiver has not seen it yet.
     a.engine.configure_vectors("shelf", "doomed", vector_config()).unwrap();
@@ -749,7 +754,7 @@ async fn a_dropped_collection_does_not_wedge_replication() {
     let live = a.engine.create_collection("shelf", "survivor").unwrap();
     a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
 
-    sync_once(&b.engine, a.addr, SECRET)
+    sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("the round must not fail on a schema change for a dropped collection");
 
@@ -769,7 +774,7 @@ async fn a_dropped_collection_does_not_come_back_through_replication() {
     // collection it names -- resurrecting a drop would be a worse bug than the
     // one being fixed.
     let (a, b) = sender_and_a_receiver_that_dropped_it().await;
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the round must succeed");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the round must succeed");
 
     assert!(
         b.engine.get_collection("shelf", "doomed").is_err(),
@@ -827,7 +832,7 @@ async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
     let live = a.engine.create_collection("shelf", "survivor").unwrap();
     a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET)
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("the round must not fail on an index this node cannot build");
     assert_eq!(outcome.ddl_refused, 1, "skipped and counted: {outcome:?}");
@@ -844,7 +849,7 @@ async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
         b.engine.get(&coll, &DocId::String("must-replicate".into())).unwrap().is_some(),
         "a refused schema change must not block the entries behind it"
     );
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "witnessed, so the window is not re-served: {second:?}");
 }
 
@@ -877,15 +882,15 @@ async fn a_dropped_index_never_comes_back_through_replication() {
         )
         .unwrap();
     a.engine.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
-    sync_once(&b.engine, a.addr, SECRET).await.expect("the create and the drop replicate");
+    sync_once(&b.engine, a.addr, SECRET, None).await.expect("the create and the drop replicate");
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(cb.index("tags_1_cats_1").is_none());
     b.engine.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
     // A learns of C; B has never heard of C, so its next round with A is
     // served from the beginning of everything A holds.
-    sync_once(&a.engine, c.addr, SECRET).await.unwrap();
-    let outcome = sync_once(&b.engine, a.addr, SECRET)
+    sync_once(&a.engine, c.addr, SECRET, None).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
         .expect("a re-served create older than its drop must not fail the round");
     assert_eq!(outcome.ddl_refused, 0, "history, not a refusal: {outcome:?}");
@@ -1070,7 +1075,7 @@ async fn a_restarted_member_does_not_name_its_converged_peers_stale_on_its_first
         assert!(raw > DAY_SECS * 1_000, "the scenario must reproduce the raw gap: {raw} ms");
         assert_eq!(peer.engine.version_vector().unwrap().get(a_id), a_last);
 
-        let outcome = sync_once(&a.engine, peer.addr, SECRET).await.unwrap();
+        let outcome = sync_once(&a.engine, peer.addr, SECRET, None).await.unwrap();
         assert_eq!(
             outcome.behind_ms, 0,
             "a peer that can still be served everything it lacks is not a stale rejoiner: {outcome:?}"
@@ -1099,7 +1104,7 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
         "by the threshold alone B is beyond A's horizon — the snapshot the roll paid for"
     );
 
-    let outcome = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     // An incremental round re-serves the tail B already holds and reports it
     // superseded; a snapshot reports only what it applied. That is the tell.
     assert!(
@@ -1110,7 +1115,7 @@ async fn a_restarted_member_serves_its_first_puller_from_the_oplog() {
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     assert!(b.engine.get(&cb, &DocId::String("a-after-restart".into())).unwrap().is_some());
 
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "and B is then caught up: {second:?}");
 }
 
@@ -1129,7 +1134,7 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     b.engine.insert(&cb, doc! { "_id": "b-1" }).unwrap();
     b.engine.insert(&cb, doc! { "_id": "b-2" }).unwrap();
-    sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+    sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
 
     let later = kimmy_storage::physical_now_ms() + 36 * HOUR_MS;
     a.engine.apply_batch(&[entry_stamped(ca.id, later)]).unwrap();
@@ -1141,13 +1146,13 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
         .unwrap();
     a.engine.insert(&ca, doc! { "_id": "a-after" }).unwrap();
 
-    let outcome = sync_once(&a.engine, b.addr, SECRET).await.unwrap();
+    let outcome = sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
     assert!(
         outcome.behind_ms > DAY_SECS * 1_000,
         "B lacks a collected write of A's, 36 hours behind: it is stale: {outcome:?}"
     );
 
-    let pulled = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let pulled = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(pulled.superseded, 0, "served as a snapshot, not from the oplog: {pulled:?}");
     for id in ["a-missed", "a-after"] {
         assert!(
@@ -1155,6 +1160,381 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
             "{id} must arrive"
         );
     }
-    let second = sync_once(&b.engine, a.addr, SECRET).await.unwrap();
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "{second:?}");
+}
+
+// -----------------------------------------------------------------------
+// The cross-member divergence check (ADR-133)
+// -----------------------------------------------------------------------
+
+/// Reproduce the outside-visible shape of finding 14 directly, without
+/// depending on its now-fixed cause: a witnessed vector that claims to cover
+/// a peer's advertised one while a collection that peer holds is simply
+/// missing here.
+///
+/// This checks the mechanism at `sync_once`'s level — that `outcome.divergent`
+/// actually names the stranded collection. It is deliberately *not* offered
+/// as proof that every other signal stays quiet: on this code path
+/// `SyncOutcome`'s other fields (`lag_ms`, `applied`, `superseded`, `ddl`,
+/// `ddl_refused`, `unknown_collection`) are `Default::default()` by
+/// construction, whether or not anything is wrong, so asserting them here
+/// would pass for any input and prove nothing. The real proof that the rest
+/// of the signal surface stays healthy while this one moves is
+/// `the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`
+/// below, which drives the actual hooks `kimmy-api`'s metrics are pushed
+/// through.
+#[tokio::test]
+async fn the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+
+    // B is made to believe it has witnessed everything A has advertised,
+    // without ever applying the entries that created the collection or its
+    // document — exactly what a truncated window's absorbed vector looked
+    // like from outside.
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.witnessed_vector().unwrap().behind(&theirs).is_none(), "the false belief");
+    assert!(b.engine.get_collection("shop", "stranded").is_err(), "and yet B does not have it");
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::from([ca.id])),
+        "the check must catch what the witnessed vector hides: {outcome:?}"
+    );
+}
+
+/// A genuinely converged pair reports nothing divergent — the gauge's
+/// resting state. `mine_count` comes from a real `count_by_id`, the way
+/// `kimmy-cluster::peers` actually builds a probe, not a hardcoded value —
+/// hardcoding it here would exercise the existence half only and never the
+/// count comparison against genuine engine state.
+#[tokio::test]
+async fn a_converged_cluster_has_no_divergence() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "from-a" }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await; // both directions witness the other's tail
+
+    let mine_count = b.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert_eq!(outcome.divergent, Some(BTreeSet::new()), "{outcome:?}");
+}
+
+/// A round whose pull does not reach the peer's true tail — the backlog
+/// exceeds the batch cap — must not spend a message on the check at all:
+/// `exhausted` is exactly the fact that a truncated window can fake, so the
+/// check must not run on the strength of a batch that was itself truncated.
+#[tokio::test]
+async fn a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    // Comfortably over the batch cap, so the first pull is truncated and
+    // `exhausted` reads `false`.
+    for i in 0..(MAX_BATCH + 200) {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
+    assert!(!first.exhausted, "the batch cap truncated this round's window: {first:?}");
+    assert_eq!(first.divergent, None, "not checked, not found clean: {first:?}");
+}
+
+/// A round whose pull *does* reach the peer's true tail — the whole backlog
+/// fits under the batch cap — runs the check too, on the same round, and it
+/// correctly finds nothing wrong. This is what closes the gap a
+/// nothing-to-pull-only gate leaves open on a busy cluster: a round that is
+/// still pulling something is not automatically exempt, only a round whose
+/// pull was itself truncated is.
+#[tokio::test]
+async fn a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..40 {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
+    assert!(first.exhausted, "40 entries fit comfortably under the batch cap: {first:?}");
+    assert_eq!(first.divergent, Some(BTreeSet::new()), "checked, and correctly clean: {first:?}");
+}
+
+/// The probed collection's count is the only document read this exchange
+/// performs — the bound `Engine::count_by_id` and `next_probe` exist to
+/// keep. A second, unprobed collection with a *real* count mismatch costs
+/// nothing this round: its existence is compared by id, never by walking
+/// it, and its count is simply not asked for.
+///
+/// The mismatch on "big" is manufactured with `apply_peer_batch` rather than
+/// a local write on B, deliberately: a local write on B would itself trip
+/// the peer-staleness guard (`divergence_probe_for`) and suppress the probe
+/// for an unrelated reason, which would not test the bound this case exists
+/// to pin.
+#[tokio::test]
+async fn only_the_probed_collection_is_ever_counted() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "small").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+    let big = a.engine.create_collection("shop", "big").unwrap();
+    for i in 0..500 {
+        a.engine.insert(&big, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await;
+
+    // A's "big" grows further; B is made to believe it has already
+    // witnessed the growth without ever applying it — a real, genuine count
+    // mismatch B does not know about, on a collection neither side is
+    // probing this round.
+    a.engine.insert(&big, doc! { "_id": "extra-on-a" }).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+
+    let mine_count = b.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::new()),
+        "the unprobed collection's real count divergence is out of scope this round: {outcome:?}"
+    );
+}
+
+/// A peer that has simply not pulled this node's own recent writes yet must
+/// not be flagged divergent on their strength — that is ordinary
+/// replication lag, indistinguishable from real divergence by a symmetric
+/// count comparison alone, which is exactly why `divergence_probe_for` is
+/// asymmetric. A is the requester and is *ahead* of B on A's own writes; B
+/// has not pulled them, so B's answer would report a stale, lower count for
+/// the same collection if asked.
+#[tokio::test]
+async fn a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "0" }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await; // converged: both hold one document
+
+    // A writes more; B never pulls. From A's side there is nothing new to
+    // pull *from B*, so A's own gate reads "nothing to pull" — but B is the
+    // one behind here, not A.
+    for i in 1..=500 {
+        a.engine.insert(&ca, doc! { "_id": i.to_string() }).unwrap();
+    }
+
+    let mine_count = a.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let outcome = sync_once(&a.engine, b.addr, SECRET, probe).await.unwrap();
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::new()),
+        "B merely trails A; the guard must suppress the stale count, not report it: {outcome:?}"
+    );
+}
+
+/// The real proof that the silence claim holds: run the actual replication
+/// loop, with the actual hooks `kimmyd` wires straight into `kimmy-api`'s
+/// metrics, and watch every one of them while a stranded collection sits
+/// undetected on the level below `sync_once`'s reported fields (which the
+/// mechanism-level test above cannot use as evidence — see its own
+/// comment). `on_round` is what `kimmy_sync_failures_total`,
+/// `kimmy_sync_peers_backing_off`, `kimmy_sync_ddl_refused_total` and
+/// `kimmy_sync_divergent_collections` are pushed from; `on_lag` is what
+/// `kimmy_replication_lag_seconds` is pushed from.
+#[tokio::test]
+async fn the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy()
+{
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "stranded").is_err());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let (lag_tx, mut lag_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    config.on_lag = Some(Arc::new(move |lag| {
+        let _ = lag_tx.send(lag);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the gauge-feeding report never confirmed the divergence"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "nothing about this failed a round: {report:?}");
+        assert_eq!(report.backing_off, 0, "the peer answered every round: {report:?}");
+        assert_eq!(report.ddl_refused, 0, "nothing was refused: {report:?}");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "exactly the one stranded collection");
+    looping.abort();
+
+    // Drain what `on_lag` saw across the whole run: it must never have
+    // reported anything but 0 — the exact reading finding 14 left on every
+    // member throughout.
+    let mut lags = Vec::new();
+    while let Ok(lag) = lag_rx.try_recv() {
+        lags.push(lag);
+    }
+    assert!(!lags.is_empty(), "on_lag must have fired at least once");
+    assert!(lags.iter().all(|&l| l == 0), "lag must read 0 throughout: {lags:?}");
+}
+
+/// Finding 14's own precondition was a member more than one batch behind —
+/// the shape of a modest, continuously busy cluster, not an idle one. A gate
+/// on "nothing left to pull" alone would never fire here, because there is
+/// always something new to pull. The check must also run whenever a round's
+/// own pull reaches the peer's tail, batch cap or not, so detection does not
+/// go dark for the whole duration of ordinary write traffic.
+#[tokio::test]
+async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let stranded = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&stranded, doc! { "_id": "1" }).unwrap();
+    let busy = a.engine.create_collection("shop", "busy").unwrap();
+
+    let theirs0 = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs0, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "stranded").is_err());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    // A modest busy cluster: a handful of writes between rounds, well under
+    // the batch cap, so a round pulling them still reaches the tail.
+    let a_engine = Arc::clone(&a.engine);
+    let writer = tokio::spawn(async move {
+        for i in 0..20 {
+            for j in 0..5 {
+                a_engine.insert(&busy, doc! { "_id": format!("d{i}-{j}") }).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the check never confirmed under sustained write load"))
+            .expect("the loop must keep reporting");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "the stranded collection, found despite the concurrent writes");
+    looping.abort();
+    writer.abort();
+}
+
+/// P6's own reproduction, at the network level: finding 14's more serious
+/// half was 500 and 517 documents missing from collections that existed,
+/// correctly named, on every member — the case a names-only check would
+/// have missed entirely, and the stated reason the count half of this check
+/// exists at all. It must confirm through the real `replicate()` loop even
+/// when this node holds several collections, so the probe rotation
+/// naturally cycles away from the divergent one between contacts — the
+/// exact shape that left the gauge structurally unable to move before this
+/// was fixed (see `DivergenceTracker::observe`'s own documentation).
+#[tokio::test]
+async fn a_count_divergence_confirms_through_the_real_loop_despite_other_collections() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let mut collections = Vec::new();
+    for name in ["alpha", "beta", "gamma", "delta"] {
+        let c = a.engine.create_collection("shop", name).unwrap();
+        a.engine.insert(&c, doc! { "_id": "0" }).unwrap();
+        collections.push(c);
+    }
+    sync(&a, &b).await;
+    sync(&a, &b).await; // converged: every collection holds one document on both
+
+    // "gamma" grows further on A; B is made to believe it has already
+    // witnessed the growth without ever applying it -- a real count
+    // divergence B does not know about, on a collection whose name and
+    // existence agree everywhere.
+    let gamma = &collections[2];
+    for i in 1..=20 {
+        a.engine.insert(gamma, doc! { "_id": i.to_string() }).unwrap();
+    }
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(50);
+    config.discovery_interval = Duration::from_millis(50);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the count divergence never confirmed through the real loop")
+            })
+            .expect("the loop must keep reporting");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "gamma's count divergence, despite alpha/beta/delta rotating through");
+    looping.abort();
 }
