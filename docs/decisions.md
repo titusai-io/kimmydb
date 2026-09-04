@@ -7504,15 +7504,16 @@ defect 5 below). No document or collection name appears in the metric — the
 gauge is a bare count, holding `/metrics`' standing property that a name
 never crosses that boundary.
 
-This ADR went through three rounds of review, each re-running every probe
+This ADR went through four rounds of review, each re-running every probe
 against the fix rather than reading an account of it. The first found four
 defects in the first cut, three of them gauge-defeating; the second found a
 fifth in exactly the half the first round's fixes did not touch; the third
-found a sixth in exactly the case the second round's fix did not sweep for.
-What follows is the
-corrected design; the defects and the reasoning behind each fix are recorded
-under their own headings because each is a decision worth being able to find
-again, not just a bug that got fixed.
+found a sixth in exactly the case the second round's fix did not sweep for;
+the fourth found a seventh in the one input the third round's own fix was
+not written to handle. What follows is the corrected design; the defects and
+the reasoning behind each fix are recorded under their own headings because
+each is a decision worth being able to find again, not just a bug that got
+fixed.
 
 **What is compared, and why not everything a full reconciliation would.**
 Two things:
@@ -7797,6 +7798,35 @@ each incarnation's first sighting.
 
 Pinned by `divergence.rs`'s `a_confirmed_count_divergence_clears_when_its_collection_is_dropped`
 and `a_pending_count_mismatch_does_not_survive_a_drop_and_recreate`.
+
+**Defect 7: defect 6's own sweep, on the one input it was not written for,
+silently discarded every live count finding.** A fourth round of review
+found this: `peers.rs` handles a failed `engine.all_collection_ids()` by
+logging and passing an empty set into `advance_probe`. Before defect 6 that
+was harmless — an empty set just made the rotation return `None` for this
+tick. After defect 6, `advance_probe` sweeps its count-side state against
+whatever it is handed on the premise that a collection missing from that
+set is provably gone; an empty set now reads as "this node holds no
+collections at all", and every confirmed and pending count finding was
+swept away on a single transient storage error. Self-healing — the existence
+half is untouched, and a genuine finding re-confirms once its collection is
+probed twice more, on the order of `2 × (collection count)` ticks — but
+still a silent under-report inside the one feature whose whole thesis is
+that a divergence must never be silent, introduced by the very fix meant to
+stop the gauge from sticking. The comment at the call site had said
+"skipping this tick's probe rotation" throughout; after defect 6 it no
+longer skipped, it reset, and the comment did not change to say so.
+
+**Fix: a read failure never reaches `advance_probe`.** `advance_probe_on`
+holds the decision on its own — `Ok(ids) => tracker.advance_probe(&ids)`,
+`Err(_) => None` — so a failed read leaves the rotation's cursor and every
+piece of count state exactly where they were, and the next tick's read gets
+a clean attempt. Pulled into its own function for the same reason
+`is_unreachable_from_a_correct_sender` (defect 6's must-fix) was: the
+interaction is exactly the part a future edit is likely to touch by
+accident, and it is cheap to give it a test independent of the async loop
+and the engine around it. Pinned by `peers.rs`'s
+`a_read_failure_leaves_confirmed_count_findings_untouched`.
 
 **Confirmed on two consecutive checks, not one — "consecutive" meaning a
 different thing for each half, per defect 5.** The gates above already rule
