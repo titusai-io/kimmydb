@@ -1171,16 +1171,30 @@ async fn every_optional_tool_argument_refuses_an_explicit_null() {
     let tools = listed["result"]["tools"].as_array().expect("tools");
 
     for (tool, base, fields) in cases {
-        let schema = &tools
+        let input_schema = &tools
             .iter()
             .find(|t| t["name"] == tool)
-            .unwrap_or_else(|| panic!("{tool} is not listed"))["inputSchema"]["properties"];
+            .unwrap_or_else(|| panic!("{tool} is not listed"))["inputSchema"];
+        let schema = &input_schema["properties"];
+        let required = input_schema["required"].as_array().cloned().unwrap_or_default();
 
         for (field, check_omission) in fields {
             assert!(
                 schema_forbids_null(&schema[field]),
                 "{tool}.{field}: the advertised schema must not accept null: {}",
                 schema[field]
+            );
+            // `#[schemars(required)]` earns the non-nullable type only
+            // because `#[serde(default)]` keeps the field genuinely
+            // optional; if that ever came off, the field would silently
+            // flip to required in the schema `#[schemars(required)]`
+            // otherwise produces — the opposite failure from the one this
+            // suite exists to catch, and worse, since it breaks any client
+            // that validates before calling rather than merely under-warning
+            // one that doesn't.
+            assert!(
+                !required.contains(&json!(field)),
+                "{tool}.{field}: must stay out of the schema's required list: {input_schema}"
             );
 
             let mut nulled = base.clone();
