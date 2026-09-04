@@ -234,6 +234,20 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > — a member left behind longer than retention falls past the horizon and pays
 > for a snapshot instead.
 
+> **Upgrading a cluster to a version with the divergence check.** A second new
+> message pair, `AskDivergence`/`Divergence` ([ADR-133](decisions.md)), on the
+> same connection anti-entropy already opens. No stop needed, same as the
+> `Entries` change above — roll the members one at a time. An old peer cannot
+> decode `AskDivergence` and the round fails the same way an `Entries` mismatch
+> does — a malformed frame, counted in `kimmy_sync_failures_total` — but **only
+> on a round that would have run the check**: one that finds nothing left to
+> pull, or whose own pull is not truncated by the batch cap. A freshly mixed
+> pair still actively catching up looks completely healthy; only once a round
+> reaches the branch that sends `AskDivergence` does it start failing, every
+> time, against the not-yet-rolled peer. `kimmy_sync_failures_total` and
+> `kimmy_sync_peers_backing_off` are what to watch, same as above; both settle
+> once the last member is rolled.
+
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
 than an identity, so the node refuses to announce it and advertises loopback
@@ -457,48 +471,96 @@ unmoved, because nothing about it fails a round ([ADR-133](decisions.md)).
 `kimmy_sync_divergent_collections` exists because that state is otherwise
 invisible.
 
-**What runs, and when.** Every anti-entropy round against a peer that finds
-nothing left to pull — which is most rounds, on a healthy cluster — also asks
-that peer what it holds, on the same connection. A round that *is* pulling
-something never asks: a member genuinely catching up is not divergent, and
-checking only the "nothing to pull" state is what keeps the check from ever
-flapping during ordinary replication lag, by construction rather than by a
-grace period. There is no separate interval to configure; the check rides
-`cluster.sync_interval_secs` (default 5 s) via the anti-entropy round itself.
+**What runs, and when.** Every anti-entropy round whose pull reaches the
+peer's true tail also asks that peer what it holds, on the same connection —
+whether the round found nothing left to pull, or the round pulled something
+and this round's own batch was not truncated by the 1,024-entry cap. A round
+whose pull *is* truncated by the cap skips the check entirely: that is
+precisely the state a truncated window can fake without it being true, and
+checking on the strength of a truncated pull would reopen the same hole one
+level up. There is no separate interval to configure; the check rides
+`cluster.sync_interval_secs` (default 5 s) via the anti-entropy round itself,
+and it runs on nearly every round of a converged cluster and on most rounds
+of a modestly busy one — a handful of writes between rounds still leaves a
+round's own pull comfortably under the cap.
+
+**What a `0` reading means, and does not.** On a cluster whose backlog stays
+deeper than one batch on *every* round — sustained write volume the cluster
+cannot currently drain within a batch — the check does not run at all, and
+the gauge holds its last value rather than climbing or falling. A `0` during
+that state means *not checked*, not *not divergent*. This is a real limit,
+not a rounding error: do not read a quiet gauge as proof of convergence
+during a period of sustained heavy write load: pair it with
+`kimmy_replication_lag_seconds` and the sync counters the way any of them
+should be read, and treat a long stretch of unmoving `kimmy_sync_divergent_collections`
+under heavy load as *unknown* rather than *clean*.
 
 **What is compared.** Two things, deliberately not everything a full
 reconciliation would:
 
 - **Which collections exist**, on this node and on the peer. Metadata only —
   a scan of the database and collection tables, never a document — so it
-  costs the same regardless of how much data a collection holds and runs on
-  every check.
+  costs the same regardless of how much data a collection holds and runs
+  whenever the check does.
 - **One collection's live document count**, chosen in turn from this node's
-  own collection list so a round pays for at most one collection's scan
+  own collection list so a check pays for at most one collection's scan
   rather than the whole database. Reaching every collection again after one
-  has had its turn takes as many checks as there are collections — on a
-  cluster with a few dozen, minutes; with thousands, longer.
+  has had its turn takes as many *checked* rounds as there are collections —
+  not wall-clock rounds, if some rounds are skipped per the paragraph above.
 
 A finding is confirmed, and counted in the gauge, only once the same
-collection is found divergent on two checks in a row against the same peer,
-and it clears the moment a check no longer finds it — the gauge is a level,
-not a counter, and a resolved divergence stops moving it rather than leaving
-a permanent scar.
+collection is found divergent on two consecutive *contacts with the same
+peer* — not necessarily two consecutive rounds of the whole loop, since a
+cluster larger than about twice `cluster.fanout` does not contact every peer
+every round — and it clears the moment a later contact with that peer no
+longer finds it. A peer simply not contacted this round leaves its last
+finding untouched rather than clearing it: silence about a peer is not
+evidence it has reconciled. The gauge is a level, not a counter, and a
+resolved divergence stops moving it rather than leaving a permanent scar.
+
+**The count half trusts a peer's answer only when the peer is not itself
+behind this node.** A peer that has simply not yet pulled this node's own
+recent writes answers a probe with a stale, lower count for any collection
+those writes touched — ordinary replication lag, not divergence — and a
+count comparison alone cannot tell the two apart. Before trusting a count,
+this node checks the peer's advertised version vector against its own: if
+the peer has not yet witnessed something this node has, the count is
+dropped for that contact and only the existence half runs. Without this a
+cluster running with any steady per-peer lag — the round that produced
+finding 14 measured 130–260 s between some pairs — would see the gauge
+firing continuously on ordinary catch-up, which is worse than not having the
+gauge at all: an alert that cries wolf on a healthy cluster is the one an
+operator disables, landing back in the exact blind spot this gauge exists to
+close.
 
 **What it cannot catch.** A document present in equal numbers on every
 member but with different content — a lost update that still counts, rather
 than a lost document. A count divergence in a collection that has not yet had
-its turn at the probe. Anything on a member this node is not currently
-paired with in a round (the fanout, `cluster.fanout`, contacts a subset of
-peers each tick). And it only ever reports what a peer holds that this node
-lacks — the reverse direction is the peer's own discovery to make when its
-own loop pulls from this node, so a collection created moments ago and not
-yet replicated outward is never flagged from this side either.
+its turn at the probe. **A round whose pull did not reach the peer's tail —
+see "what a `0` reading means" above.** Anything on a peer this node is not
+currently paired with in a round (`cluster.fanout` bounds the peers contacted
+each round, the same bound anti-entropy itself is subject to). A collection
+this node holds that a peer does not — the reverse direction is the peer's
+own discovery to make when its own loop pulls from this node, so a collection
+created moments ago and not yet replicated outward is never flagged from this
+side either. And a vector index's own shadow storage: excluded from both
+halves of the comparison because its lifecycle deliberately trails the
+collection it serves, so a genuine divergence there is as invisible to this
+check as it is to the collection listing routes.
 
 **This is observability, not repair.** The check reports a divergence; it
 never resolves one. Recovering a member found to hold less than its peers is
 an operator decision — reset it and let anti-entropy or a snapshot refill it
 — the same as any other divergence this cluster can report.
+
+**A second wire change in this release.** `AskDivergence`/`Divergence` are
+new cluster-protocol messages, alongside the `Entries` shape change this
+release also ships ([ADR-127](decisions.md)) — neither a collection list nor
+a document count is derivable from the existing version-vector or entry
+exchange, so this could not ride the existing wire. See the "Upgrading a
+cluster to a version with the divergence check" callout further up this page
+for the rollout shape, which differs from `Entries`' in when the failure
+surfaces.
 
 ### Tracing
 
