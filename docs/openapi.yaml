@@ -1538,9 +1538,13 @@ paths:
         but writes nothing and spends no commit: `matched`, `modified` and
         `commits` all report zero, and `stamp` is absent, exactly as they
         would for a write that touched nothing. What the update *would*
-        touch is `explain.documentsMatched`. Cannot be combined with
-        `if_stamp`: a plan checks no version, so it cannot answer whether a
-        conditional update would happen.
+        touch is `explain.documentsMatched` — but that count is the
+        selection, not a guarantee: `explain` never runs the update
+        operators, so the real write can still refuse a document it counted,
+        if an operator cannot apply to that document (a `$inc` on a
+        non-numeric field, say). Cannot be combined with `if_stamp`: a plan
+        checks no version, so it cannot answer whether a conditional update
+        would happen.
       x-kimmy-action: write
       requestBody:
         required: true
@@ -1589,7 +1593,9 @@ paths:
                       Documents the filter matched and the write acted on.
                       Zero under `explain: true`, which plans and does not
                       act on anything — see `explain.documentsMatched` for
-                      what the write would have touched (ADR-131).
+                      the selection the plan found, which the write may
+                      still refuse a document out of if an operator cannot
+                      apply to it (ADR-131).
                   modified:
                     type: integer
                     description: |
@@ -3257,9 +3263,13 @@ components:
           type: integer
           description: |
             Documents the filter matched. On `update` and `delete` under
-            `explain: true`, this is what the write would have touched — the
-            route's own `matched`/`modified`/`deleted` stay zero, since
-            nothing was written (ADR-131).
+            `explain: true`, this is the write's selection — the route's own
+            `matched`/`modified`/`deleted` stay zero, since nothing was
+            written (ADR-131). On `delete` that selection is exactly what a
+            real delete would remove; on `update` it is not a guarantee,
+            since `explain` never runs the update operators — a document
+            counted here can still be one the real write refuses, if an
+            operator cannot apply to it.
         probes:
           type: integer
           description: Index ranges scanned. Present only when more than one.

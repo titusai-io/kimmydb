@@ -586,6 +586,13 @@ already say for a write that matched nothing. What the write *would* touch
 is `explain.documentsMatched`. Drop `explain` to perform the write the plan
 described.
 
+**On `update`, that count is the selection, not a guarantee.** `explain`
+plans which documents match and how they are found; it never runs the
+update operators, so the real write can still refuse a document `explain`
+reported as matched — a `$inc` on a field holding a string, for instance,
+answers `400` on the write and `200` with that document counted on the
+plan.
+
 **`explain` cannot be combined with `if_stamp`, and is refused `400` with
 it.** A plan never checks a document's version — that check only happens
 inside the write `explain` does not perform — so a plan cannot honestly

@@ -4083,6 +4083,55 @@ async fn explain_plans_a_write_without_performing_it() {
     assert_eq!(survivors.body["count"], 5, "explain must not have destroyed the collection");
 }
 
+/// `explain` plans the selection and the access path; it never runs the
+/// update operators. So `documentsMatched` under `explain: true` is the
+/// plan's selection, not a guarantee: the real write can still refuse a
+/// document it counted, when an operator cannot apply to that document's
+/// content. Delete has no operators to fail this way, so this is
+/// `update`-only.
+#[tokio::test]
+async fn explain_can_count_a_document_the_real_update_refuses() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name": "mixed"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/mixed/bulk",
+            Some(&token),
+            json!([{"_id": 1, "n": 1}, {"_id": 2, "n": "text"}, {"_id": 3, "n": 3}]),
+        )
+        .await;
+
+    let planned = server
+        .post(
+            "/v1/db/shop/coll/mixed/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$inc": {"n": 1}}, "multi": true, "explain": true}),
+        )
+        .await;
+    assert_eq!(planned.body["explain"]["documentsMatched"], 3, "{:?}", planned.body);
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/mixed/update",
+            Some(&token),
+            json!({"filter": {}, "update": {"$inc": {"n": 1}}, "multi": true}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert!(
+        res.body["message"].as_str().unwrap_or_default().contains("non-numeric"),
+        "{:?}",
+        res.body
+    );
+
+    // Neither call wrote anything.
+    let unchanged = server
+        .post("/v1/db/shop/coll/mixed/count", Some(&token), json!({"filter": {"n": {"$gt": 3}}}))
+        .await;
+    assert_eq!(unchanged.body["count"], 0, "{:?}", unchanged.body);
+}
+
 /// A `_id` the fast path cannot encode still finds its document, by scanning.
 ///
 /// This is the safety case, and it is not hypothetical. Filter equality is
