@@ -442,6 +442,15 @@ what it means; the register records the difference from MongoDB, which fans
 a crossed `localField` out and joins on every element
 ([Deviations](deviations.md)).
 
+**A key is a value, so a missing key is not `null` here.** An input document
+that lacks `localField` gets an empty `as` and joins nothing, and a foreign
+document that lacks `foreignField` is never a candidate — an explicit `null`
+on both sides joins, an absent field on either does not. This is the one
+place the [filter rule that `null` matches a missing
+field](query-language.md#1-null-matches-missing-fields) does not reach: that
+rule is about selecting documents, and a join is about matching two stored
+values to each other.
+
 ### The `let` / `pipeline` form
 
 ```json
