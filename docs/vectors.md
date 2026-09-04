@@ -75,9 +75,6 @@ POST /v1/db/{db}/coll/{coll}/vector
 > [The provider policy](#the-provider-policy). The example above needs
 > `allowed_hosts = ["localhost"]`.
 
-```json
-```
-
 | Field | Meaning |
 |---|---|
 | `fields` | Which document paths to embed. Joined with a blank line, so a chunk boundary between two fields cannot glue unrelated sentences together |
@@ -97,7 +94,6 @@ POST /v1/db/{db}/coll/{coll}/vector
 |---|---|---|
 | `byo` | nothing | **The default.** The client supplies vectors through [the ingest route](#supplying-your-own-vectors); the server never embeds. "Nothing" is literal — `{"kind":"byo"}` takes no other field |
 | `open_ai` | an API key | Any OpenAI-compatible `/v1/embeddings` endpoint. **Voyage is this** — `{"kind":"open_ai","model":"voyage-3","endpoint":"https://api.voyageai.com","api_key_env":"VOYAGE_API_KEY"}` |
-
 | `ollama` | a reachable Ollama | Local or remote |
 | `cohere` | an API key | Cohere `/v2/embed`. Sends `input_type: search_document`; accepts both v1 and v2 response shapes ([ADR-047](decisions.md)) |
 | `gemini` | an API key | Google `:batchEmbedContents`. Key goes in the `x-goog-api-key` header ([ADR-047](decisions.md)) |
