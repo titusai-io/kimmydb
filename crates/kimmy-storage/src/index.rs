@@ -667,8 +667,8 @@ impl crate::Engine {
                     // how two concurrent writes to one document already
                     // settle (ADR-020, ADR-132). The loser is removed in the
                     // transaction that builds the winner, below.
-                    (CreateOrigin::Replicated(_), Some(theirs), Some(mine))
-                        if mine.wins_over(&theirs) =>
+                    (CreateOrigin::Replicated(_), Some(held), Some(arriving))
+                        if arriving.wins_over(&held) =>
                     {
                         Some(existing.clone())
                     }
