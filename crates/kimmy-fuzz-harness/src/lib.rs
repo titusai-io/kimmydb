@@ -109,6 +109,9 @@ static INDEXES: LazyLock<Vec<kimmy_core::IndexMeta>> = LazyLock::new(|| {
         multikey: false,
         expire_after_secs: None,
         partial_filter: None,
+        // The planner never reads the creation stamp; it settles replicated
+        // conflicts, which no fuzz target reaches.
+        created: None,
     };
     vec![
         index("qty_1", vec![IndexField::ascending("qty")]),

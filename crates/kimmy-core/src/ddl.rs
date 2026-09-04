@@ -91,6 +91,63 @@ mod tests {
         assert_eq!(bson::deserialize_from_slice::<IndexDrop>(&bytes).unwrap(), drop);
     }
 
+    fn stamped(created: Option<crate::Stamp>) -> IndexCreate {
+        IndexCreate {
+            db: "shop".into(),
+            collection: "orders".into(),
+            index: IndexMeta {
+                id: IndexMeta::derive_id("email_1"),
+                name: "email_1".into(),
+                fields: vec![crate::IndexField::ascending("email")],
+                unique: true,
+                enforcement: Default::default(),
+                multikey: false,
+                expire_after_secs: Some(3_600),
+                partial_filter: Some(bson::doc! { "email": { "$exists": true } }),
+                created,
+            },
+        }
+    }
+
+    #[test]
+    fn a_creation_stamp_crosses_the_replicated_bson_boundary() {
+        // `Hlc::wall_ms` is a `u64`, and BSON has no unsigned 64-bit type —
+        // the hazard `IndexMeta::expire_after_secs` two fields up was chosen
+        // to avoid, and which has cost this project a replication outage
+        // twice. A `CreateIndex` payload now carries one, so it is asserted
+        // rather than assumed: milliseconds since the epoch are four orders
+        // of magnitude below the ceiling, and the ceiling itself encodes.
+        for wall_ms in [1_756_900_000_000u64, i64::MAX as u64] {
+            let stamp = crate::Stamp::new(crate::Hlc::new(wall_ms, 7), crate::NodeId::generate());
+            let create = stamped(Some(stamp));
+            let bytes = bson::serialize_to_vec(&create).expect("a stamped definition must encode");
+            let back: IndexCreate = bson::deserialize_from_slice(&bytes).unwrap();
+            assert_eq!(back, create, "wall_ms {wall_ms}");
+            assert_eq!(back.index.created, Some(stamp));
+        }
+    }
+
+    #[test]
+    fn a_definition_stamped_by_a_build_that_had_no_stamp_decodes_as_unstamped() {
+        // The stored-format rule reaches the wire too: absent must arrive as
+        // `None` rather than as a decode failure, or the field could not have
+        // been added to a payload that already replicates.
+        let create = stamped(None);
+        let bytes = bson::serialize_to_vec(&create).unwrap();
+        let document: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        let index = document.get_document("index").unwrap();
+        assert_eq!(index.get("created"), Some(&bson::Bson::Null));
+
+        let mut without = index.clone();
+        without.remove("created");
+        let mut trimmed = document.clone();
+        trimmed.insert("index", without);
+        let bytes = bson::serialize_to_vec(&trimmed).unwrap();
+        let back: IndexCreate = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(back.index.created, None);
+        assert_eq!(back, create);
+    }
+
     #[test]
     fn disabling_vectors_is_distinct_from_never_configuring_them() {
         // `None` has to survive the round trip as `None` rather than collapsing

@@ -463,6 +463,7 @@ mod tests {
             multikey: false,
             expire_after_secs: None,
             partial_filter: None,
+            created: None,
         }
     }
 

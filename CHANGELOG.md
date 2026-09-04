@@ -16,6 +16,40 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 
 
+- **Breaking, stored format and cluster wire: an index carries the stamp of its
+  creation.** `IndexMeta` gained `created`, recorded in the collection metadata
+  and carried in the `CreateIndex` entry, and it is what the two fixes above
+  compare against. There is no shim and no migration — pre-1.0 the format is
+  changed outright. **An index that already exists on disk carries no stamp,
+  and reads as older than every drop and every rival**: a replayed drop removes
+  it and a rival definition is refused and counted, which is exactly the
+  behaviour of 0.21.0. It also heals on its own where it can: a member holding
+  the same definition *with* a stamp hands it over on the next round. Where no
+  member has one — an index every member created before this release — drop and
+  recreate it **on one member** and let that replicate, rather than recreating
+  it on each, if you want its name settled rather than counted. Nothing is
+  added to `/metrics`, to the index listing on `/v1`, or to
+  `docs/openapi.yaml`. ADR-132.
+
+- **Two members that create the same index definition independently now agree
+  on when it was created**, not merely on what it is. The creation stamp is
+  what decides whether a replayed drop applies, so one definition under two
+  stamps answered one drop two ways — one member keeping the index, the other
+  losing it, permanently, with `kimmy_sync_ddl_refused_total` still at 0 and
+  the lag gauge at 0. The later of the two stamps now stands on both, and it
+  only ever moves forward. ADR-132.
+
+- **Breaking, cluster wire: a batch answer now carries where the window
+  ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's
+  scan examined, an entry it withheld included) and `exhausted` (whether it
+  stopped there because the oplog ran out), and changed from a newtype variant
+  to a struct variant to do it. There is no compatibility shim and no version
+  negotiation — pre-1.0 the cluster wire is changed outright — so a node of
+  this version and a 0.21.0 node **cannot replicate with each other in either
+  direction**: the round fails as a malformed frame and `kimmy_sync_failures_total`
+  rises on both. Roll every member. Nothing on disk changes, and no client-facing
+  route, response or `/v1` promise is affected. ADR-127.
+
 ### Fixed
 
 - **A member no longer silently and permanently loses committed documents to a
@@ -89,6 +123,35 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `minimum: 0`), and the sorted paths already honoured it; the unsorted scan
   handed a match to the page before checking whether the page's bound had
   already been reached. The bound is now checked first.
+
+- **A replayed index drop no longer deletes a newer index of the same name.**
+  An index that is created, dropped and created again derives the same id each
+  time, and anti-entropy re-serves overlapping windows as a matter of course —
+  so the drop between the two creations arrived again after the recreation and,
+  with nothing to compare it against, removed an index nobody had dropped. It
+  now leaves its tombstone and leaves the index alone. Observed on a
+  three-member cluster running 0.21.0: a collection listed **no indexes on any
+  member**, though three stood on all three an hour earlier. This also closes
+  the half that could not repair itself — where the newer creation is the
+  member's own, no peer can re-serve it, so the index stayed dropped there for
+  good. ADR-132.
+
+- **Two members that create one index name with different definitions now
+  converge instead of staying divergent.** ADR-123 left both standing, each
+  member keeping its own and counting the refusal; the 0.21.0 round watched two
+  collections sit that way, with `kimmy_sync_ddl_refused_total` at 9 / 15 / 9
+  and no path back to one schema. The later creation stamp now wins on every
+  member, which is how two concurrent writes to one document already settle.
+  The member whose definition loses logs a warning naming the index and what
+  differed, and rebuilds the name under the winner.
+
+  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case**.
+  It is unchanged for the case that still needs an operator — a definition a
+  member's own documents cannot be built under — and, where the winning
+  definition cannot be built on the receiving member, that member keeps the
+  index it already had rather than ending with neither. Creating a conflicting
+  index through the API is unaffected: a client is still refused `409`, naming
+  what differs. ADR-132.
 
 ## 0.21.0 - 2026-09-03
 
