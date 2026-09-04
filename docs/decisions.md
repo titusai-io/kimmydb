@@ -7354,6 +7354,334 @@ second commit is gone.
 
 ---
 
+## ADR-129 — An aggregation stage operand with a fixed key set is closed; a field-path map stays open
+
+**Decision.** A pipeline stage document that has a *fixed* key set —
+`$unwind`'s document form (`path`, `preserveNullAndEmptyArrays`,
+`includeArrayIndex`), `$lookup`'s both forms (`from`, `as`, `localField`,
+`foreignField`, `let`, `pipeline`), `$replaceRoot` (`newRoot`) — refuses a key
+it does not define, `400`, naming the field and listing the ones the stage
+takes. `crates/kimmy-query/src/aggregate.rs` gets one helper,
+`deny_unknown_keys(stage, doc, allowed)`, called at the top of each of those
+stages' parsers, before anything else about the document is read.
+
+**`$match` and `$project` are not put through it, and never will be.** Both
+take a *field-path map*: every key is a document field name the caller chose,
+not a word this codebase defines, so there is no fixed vocabulary to check a
+key against — `{"$match": {"bogusFieldName": 1}}` is not a typo of anything,
+it is a filter on a field called `bogusFieldName`, and refusing it would
+refuse most ordinary pipelines. `$sort`'s keys and a `$group` stage's output
+field names are field-path-shaped the same way and are left alone for the same
+reason; `$group`'s `_id` and its accumulator arguments are expressions, open
+by the same rule expressions have always followed. This is the line ADR-121
+already drew for the request body — a document body is content, not a shape —
+extended one level down: a stage operand is a shape when its keys are
+vocabulary, and content when its keys are data.
+
+`includeArrayIndex` — a real MongoDB `$unwind` option that this database
+silently dropped — is implemented rather than refused by name: it is the name
+of a field to hold the position of the array element that produced each output
+row, `null` on a row that was not produced by fanning one out (an unwound
+scalar, or a document kept by `preserveNullAndEmptyArrays`). It is trivial
+here because `unwind`'s expansion loop already knows the element's position
+the moment it produces a row; adding the field costs one more `path::set`
+alongside the one it already makes. Two more names are refused, on KimmyDB's
+own internal consistency rather than on parity: a name beginning with `$`,
+because this language's own field-path syntax reads `"$name"` as the field
+called `name`, never one called `$name` — a document beginning with `$` is an
+operator (`aggregation.md`'s own rule) — so `$unwind` could write such a field
+and no later stage could ever read it back; and a name equal to `path` itself,
+because it would silently overwrite the element `$unwind` just placed there
+with its own index.
+
+**A closed key set is not the whole hazard; a closed key's *value* is
+another.** `preserveNullAndEmptyArrays` reached `Bson::as_bool`, which returns
+`None` — read here as `false` — for anything that is not literally a boolean.
+So `{"preserveNullAndEmptyArrays": "true"}` or `: 1` answered `200` with the
+option silently reverted, the exact failure mode finding 11 is named after,
+moved from the key to the value. It is now refused by name, matching
+`includeArrayIndex`'s existing type check three lines below it in the same
+parser — leaving one and not the other would have been the same
+inconsistency this ADR closes elsewhere, in miniature.
+
+**The same defect class, found in two expression operands while this unit
+was in the file.** `$dateToString`'s `format` and `$switch`'s `branches`
+(and each branch's `case`/`then`) are fixed-key documents too, in
+`crates/kimmy-query/src/expr.rs`, and were not closed: `{"$dateToString":
+{"date": "$t", "formt": "%Y"}}` — the finding's own shape, one character
+short — silently kept the default ISO-8601 format in every row rather than
+naming the typo, precisely the hazard `aggregation.md` already argues for an
+unknown date specifier. Both now go through `Expr::named_spec`, the helper
+`$filter`, `$map`, `$reduce` and `$let` already used for the same purpose;
+closing them cost two more calls to it, not a new mechanism.
+
+**Why.** ADR-121 states the rule reaches "the shapes nested inside" a request
+body — an index's field entry, a search's fusion weights — and gives, as its
+own motivating example, a misspelt `colection` in a grant that silently
+widened it to every collection in the database. An aggregation stage operand
+is exactly such a nested shape, and it was not closed: `{"path": "$x",
+"preserveNullAndEmptyArray": true}` — one character short of
+`preserveNullAndEmptyArrays` — answered `200` with the option silently
+reverted to `false`, dropping documents the caller asked to keep, and
+`includeArrayIndex` on a real pipeline answered `200` with the field silently
+absent. `$group` already refused an unknown accumulator by name; the
+inconsistency was that the rest of `aggregate`'s own stage operands did not
+get the same treatment ADR-121 gives everything else nested in the request.
+
+The reason ADR-121's mechanism — `#[serde(deny_unknown_fields)]` on a typed
+struct — does not reach here is structural, not an oversight to route around:
+`AggregateRequest.pipeline` is `serde_json::Value`, because a pipeline stage's
+shape depends on which operator names it, which `kimmy-api` does not decide —
+`kimmy-query` does, by hand, off a `bson::Document`, the same way `$group`
+already refuses an unknown accumulator. So the closure is enforced where the
+stage is actually parsed, with the same `Error::InvalidQuery` and `400` that
+`$group`'s refusal and every other malformed-pipeline error already use, not
+`422` — `422` is `JsonBody<T>`'s status for a shape serde itself rejects, and
+a stage operand was never one of those.
+
+**Alternatives.** *Give every stage a typed, `deny_unknown_fields` struct and
+deserialize each `Document` into one via `bson`.* Rejected: stages are parsed
+by hand today specifically because several of them are not one-shape-fits-all
+— `$unwind` takes a string or a document, `$project`'s values are flags in one
+branch and expressions in another, `$lookup` is two mutually exclusive shapes
+sharing two keys — and a serde struct would have to re-express all of that
+through its own attributes for four call sites, at the cost of the manual
+parser's existing, readable error messages. A small helper called at each
+parser's entry gets the same closure for a fraction of the code. *Silently
+drop `includeArrayIndex` and document it as unsupported.* Considered, since
+the finding permits it — but the loop that would carry it already has the
+element and its position in hand, so refusing was pure cost for no benefit.
+
+**Cost.** A `0.MINOR` behaviour change: a pipeline that sent an unrecognized
+key to `$unwind`, `$lookup`, `$replaceRoot`, `$switch` or `$dateToString` and
+relied on it being ignored now gets a `400` instead of a silent `200`, and one
+that sent a wrong-typed `preserveNullAndEmptyArrays` or an
+`includeArrayIndex` that begins with `$` or names `path` gets the same.
+`$unwind`'s document form gained a field (`include_array_index:
+Option<String>` on `Stage::Unwind`), threaded through `apply_with_vars` and
+`unwind`. Tests in `crates/kimmy-query/src/aggregate.rs`: the load-bearing
+misspelling pair, the same pair moved to the *value* of a correctly-spelled
+key, `includeArrayIndex` actually working and its two new naming refusals, an
+unknown `$lookup`/`$replaceRoot` key refused, and a control proving `$match`
+and `$project` still take any field name; two more in
+`crates/kimmy-query/src/expr.rs` for `$switch` and `$dateToString`.
+`docs/aggregation.md#stages` documents the document form,
+`preserveNullAndEmptyArrays`, `includeArrayIndex` and the closed/open line;
+none of it was written down anywhere before. `docs/http-api.md` states the
+`400`-not-`422` distinction this ADR draws, since its own status-code table
+would otherwise read as a blanket `422` for every unknown request field.
+
+---
+
+## ADR-130 — `$unwind` refuses a path that crosses an array rather than writing nowhere
+
+**Decision.** `crates/kimmy-query/src/aggregate.rs` gets a helper,
+`crossing_array(doc, field)`, that decides — for one document, before
+anything at `field` is read — whether writing to `field` would fail, and if
+so, where: it walks `field`'s segments against `doc`'s actual structure,
+read-only, the same way `path::set` would, and returns `(array_path,
+remainder)` the moment a non-terminal segment lands on an array whose next
+segment names a field rather than a numeric position — `path::set`'s one
+failure mode, and what "the path crosses an array" means here. A segment
+that is missing, a scalar, or an array reached by an index that is not
+already a document is what `path::set` would vivify or overwrite rather than
+fail on, so the walk stops there and reports no crossing, without needing to
+actually perform a write to find out — `crossing_array` never clones or
+mutates `doc`. `unwind` calls it once per document, at the top of its loop,
+unconditionally: if it reports a crossing, the document — and the whole
+request, `$unwind` is not a per-document filter — is refused, `400`, naming
+`$unwind`, the field path, the array it crosses (`array_path`), and the
+concrete remedy: unwind `array_path` first, then read `remainder` on each
+resulting row — the caller who wrote `$unwind: "$items.sku"` is told to
+write `$unwind: "$items"`, not handed `path::set`'s internal vocabulary
+about non-numeric segments. This holds **regardless of what `field` turns
+out to contain**: a non-empty array, an empty one, a scalar, `null`, nothing
+at all. Only once the check passes does `unwind` go on to read `value_at`
+and decide, by the existing rules, whether to expand, drop, preserve or pass
+a document through; every write on that path is now guaranteed to succeed
+structurally, so `path::set`'s `Result` there is still propagated with `?`
+rather than unwrapped — a proof that holds today is not a reason to let a
+future change panic instead of refuse. `preserveNullAndEmptyArrays` and
+`includeArrayIndex` are unaffected by any of this: the crossing check runs
+before either is consulted, and a document it refuses never reaches them.
+
+**This is a revision, made under independent review, of what this ADR first
+proposed.** The version first shipped kept `value_at`'s ordinary read and
+refused only when `path::set` failed *while expanding an array `value_at`
+had found* — i.e., only when the value sitting at the far end of the crossed
+segment happened itself to be an array. That is not a rule a caller could
+state or predict: whether `$unwind` refused depended on the *type* of one
+crossed element, decided by the data, not on the path crossing an array at
+all. Two consequences followed, both wrong answers of the exact shape this
+ADR exists to prevent. `a: [{b: 9}, {b: [1, 2]}]` with `$unwind: "$a.b"`
+answered `200` with one row that looked unwound but was not — `value_at`
+found `9` at the first element, a scalar, so the array-expansion branch, and
+therefore the write, was never attempted. And `items: [{sku: "a", qty: 1},
+...]` with `$unwind: "$items.sku"` — finding 10's own row 5 — kept answering
+`200` unchanged exactly as it had at `26944f8`: `sku` is a scalar at the
+first element, so this defect's own reported case was still not fixed by
+that version of the fix. The check now runs on the path's *structure* alone,
+independent of what is found, so both refuse.
+
+**Why refuse rather than MongoDB's silent skip.** The finding gave two
+options: resolve the path without descending into arrays, so a path that does
+not land on a single array is treated as absent (dropped, or kept once under
+`preserveNullAndEmptyArrays`); or refuse. MongoDB does the former. This
+project does the latter, for reasons specific to what this codebase already
+decided:
+
+- **ADR-116 did not reach this case, and its reasoning for the case it did
+  reach argues for a refusal here.** ADR-116 decided how `$unwind`'s path is
+  *read* — the single, non-fanning value, "because `$unwind` needs a single
+  place to write each element back to" — but it never decided what happens
+  when that single place does not exist; a path crossing an array was not a
+  case its rule set covered, and this ADR is the first to decide it. Its own
+  reasoning points the same way it always would: a missing field and an
+  unwritable one are different failures, and only one of them is silent by
+  design. **This does cost ADR-116's own compatibility claim for this one
+  shape** — *"a pipeline that runs there runs here with the same result"* —
+  which this codebase is no longer trying to hold as a general bar (parity is
+  not the bar this project is held to; a divergence is not by itself a
+  defect), but which ADR-116 stated as its reason, so it is named here rather
+  than left standing unqualified: a pipeline whose path crosses an array does
+  not run the same here as there, deliberately, because refusing loudly beats
+  running silently wrong.
+- **Every other stage in this file that cannot honour what it was asked
+  refuses rather than approximates**, and says so in its own comments: a
+  blocking stage over the cap is "an error naming the stage rather than a
+  truncated result" because a partial `$group` "looks exactly like one over
+  all of it"; `$lookup` run by the pure pipeline refuses rather than passing
+  its input through, because that "is a wrong answer wearing a right answer's
+  shape." A silently dropped document is the same shape of wrong answer:
+  correct-looking, `200`, and undetectable by the caller — exactly what
+  produced this finding when the row was duplicated unchanged instead. MongoDB
+  accepts that cost because the drop is documented and expected there; this
+  codebase's standing preference, stated in `deviations.md` and repeated
+  through ADR-121 and ADR-124, is that a request the server cannot honour is
+  refused rather than answered as though it had been.
+- **It is the smaller change.** The refusal mirrors `path::set`'s own
+  traversal rule read-only, once per document, with no new resolver and no
+  second notion of what a path "means"; the silent-skip contract would need
+  a genuinely different reader — one that fails to resolve at all through an
+  array, distinct from both `value_at` and `path::set` — solely to
+  reproduce, on purpose, the same "found nothing" outcome a missing field
+  already gets, and to decide, independently, what `preserveNullAndEmptyArrays`
+  should mean for a case that is not actually missing.
+
+**What is unaffected.** A path that never crosses an array on a given
+document — a top-level array field, a dotted path through plain
+subdocuments (`$unwind: "$y.b"` where `y: {b: [1, 2]}`), or a numeric-indexed
+segment into an array (`$unwind: "$a.0"`, which addresses a position rather
+than crossing) — writes back exactly as it always has; `crossing_array`
+reports nothing for any of these, because `path::set` only fails on a
+non-terminal *non-numeric* array segment. **A path that crosses an array into
+a scalar is no longer unaffected — this is the behaviour change this
+revision makes, named plainly**: `$unwind: "$items.sku"` where `items` is an
+array of `{sku, qty}` now refuses, `400`, on every document where `items` is
+an array, whatever `sku` holds there. It is a bigger break than the version
+first shipped, and it is the point: it is the only contract that closes the
+finding's own row 5 rather than leaving it standing.
+
+**This makes the refusal data-dependent, and the cost of that is stated in
+full below rather than waved past.** Whether `{"$unwind": "$a.b"}` is legal
+depends on whether `a` is ever an array in the documents it meets, which a
+schemaless collection does not fix in advance and does not enforce; the same
+pipeline can be correct today and refuse tomorrow after an ordinary write
+adds one document shaped that way, with nothing about the pipeline having
+changed, and the refusal reaches every document in the request, not only the
+one shaped that way.
+
+**What protects ADR-116's non-fan-out reading of `$unwind`'s path, now that
+this test no longer runs `$unwind` over the fixture that used to.**
+`unwind_and_lookup_keys_read_a_field_path_and_do_not_fan_out`'s `$unwind`
+assertion (`out.len() == 2`) was removed, not weakened: over its fixture
+(`a: [{b: [1, 2]}, {b: [3]}]`), a *fanning* reader would compute `$a.b` as
+`[[1, 2], [3]]` (ADR-116's own array rule) — also length 2 — so the old
+assertion held identically under the reading ADR-116 chose and the one it
+rejected, and never had the power to pin that choice; it pinned the defect's
+row count. `lookup_keys` in the same test still does: a fanning reader would
+make `lookup_keys(&input, "a.b")` a single `[[1, 2], [3]]` key, not the two
+flat integers the assertion checks, and `$lookup`'s key extraction reads
+without ever writing, so it is untouched by anything in this ADR.
+
+For a **non-numeric** crossed segment, `$unwind` itself needs no test of its
+own reader choice, because the uniform check refuses on exactly the documents
+where a fanning and a non-fanning reader would ever disagree there: an array
+on a non-terminal segment whose next segment is not numeric is both
+`path::set`'s one failure condition and where fanning would diverge from the
+single-value read, so both readers are refused alike, `items.sku` included.
+
+**A numeric segment is the one place this does not hold, and ADR-116 already
+named it as such** — *"the one place an expression path and a filter path
+disagree: the filter language reads `items.0` both ways"* — and `value_at`
+(`path::resolve`) follows the filter's rule, reading a numeric segment as
+both an index and a field name, while the fanning expression reader reads it
+only as a field name, never an index. A numeric segment after a crossed
+array is therefore not refused — `path::set` succeeds by index, the same
+"single place" a numeric-indexed write always has — and `$unwind`'s own
+output *does* distinguish the two readers there:
+`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
+pins it. Over `a: [{b: [1, 2]}, {b: [3]}]`, `$unwind: "$a.0.b"` reads `a.0.b`
+as `[1, 2]` (found once, by index) and produces two rows, `a[0].b` set to `1`
+then `2`; the fanning reader over the same path finds no element literally
+named `"0"`, gets `[]`, and would produce none. `$unwind: "$a.0"` in "What is
+unaffected" above is exactly this case one segment shorter, and is itself
+the counter-example to the broader "unobservable" claim an earlier revision
+of this ADR made here — corrected under further review, which is why this
+paragraph, unlike most of this document, describes a mistake made and fixed
+within the same unit rather than a decision reached once.
+
+**Alternatives.** *MongoDB's silent-skip contract*, rejected above. *Refuse
+only when the value found at the crossed segment happens to be an array* —
+this ADR's own first version, rejected above as not a statable rule and as
+leaving the finding's own row 5 unfixed. *Detect "crosses an array" up
+front, at parse time, before any document is read.* Not possible here:
+whether a given document's `a` holds an array is data, not schema, in a
+document database with no required shape — the same document under a
+different `_id` might hold a plain subdocument at the same path. The
+refusal is necessarily per-document, discovered by a structural walk, which
+is exactly what `crossing_array` does as early as it can.
+
+**Cost.** A `0.MINOR` behaviour change, larger than first estimated. A
+pipeline that unwound a path crossing an array by a named field previously
+got a `200` with byte-identical duplicate rows (N = the first element's
+array length, nothing actually unwound) and now gets a `400` naming
+`$unwind`, the crossed array and the field to read from each of its
+elements — on *any* document shaped that way, not only ones where the
+crossed element also held an array. **This is not limited to a pipeline that
+was already producing wrong rows.** `$unwind: "$a.b"` over a collection
+where every document has `a` as a plain subdocument runs, and returns
+correct rows, exactly as before; the same pipeline over a collection where
+even one document has `a` as an array — a shape that never triggered the
+original defect, because the crossed element might have been a scalar — now
+refuses that request entirely. A field a pipeline unwinds must be one that
+is never an array on any document reaching the stage, unless every segment
+past it addresses a position by number rather than by name;
+`docs/aggregation.md#unwind` states this as the operational rule a pipeline
+author needs, not only as an implementation detail, and describes the
+numeric exception and what it produces. Seven tests in
+`crates/kimmy-query/src/aggregate.rs`: the finding's shape refusing; a
+scalar found first no longer skipping the refusal (`a: [{b: 9}, {b: [1,
+2]}]`); the non-crossing control (`$unwind: "$y.b"`); the real corpus shape
+(`$unwind: "$items.sku"`), now refusing rather than passing through; a
+single-element array refusing identically to a multi-element one, since the
+check never inspects length; and the numeric-segment residue
+(`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`).
+An eighth, over HTTP in `crates/kimmy-api/tests/api.rs`
+(`unwind_refuses_a_path_that_crosses_an_array_over_http`), reproduces the
+finding's own route rather than only the parse layer. `docs/aggregation.md`
+states the actual rule — including the numeric carve-out, which an earlier
+revision of this documentation omitted, over-claiming that *every* crossing
+refuses — in `$unwind`'s own value table and in `#arrays`, names the
+data-dependence and the whole-request blast radius explicitly, and
+`docs/http-api.md` draws the `400`-versus-`422` line ADR-129 also needs.
+`crossing_array` walks the document read-only rather than cloning it to
+probe a write, so the fix costs no allocation on top of what `unwind`
+already made per row, and its error names the crossed array and the
+remaining field directly — *"unwind `$items` first, then read `sku` on each
+resulting row"* — rather than surfacing `path::set`'s internal vocabulary.
+
+
 ## ADR-131 — `explain: true` on `update` and `delete` plans the write; it does not perform it
 
 **Decision.** `explain: true` on `POST .../update` and `POST .../delete` no

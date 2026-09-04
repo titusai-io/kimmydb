@@ -6602,6 +6602,41 @@ async fn a_field_path_through_an_array_fans_out_in_every_expression_context() {
 }
 
 #[tokio::test]
+async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
+    // Finding 10's own reproduction, over the route rather than the parse
+    // layer: `items` is an array, so `$unwind: "$items.sku"` has no single
+    // place to write an element back to, whatever any particular document's
+    // `sku` holds — refused uniformly, `400`, naming the stage (ADR-130).
+    // Before this fix the server answered `200` with the document unchanged.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({"name":"orders"})).await;
+    server
+        .post(
+            "/v1/db/shop/coll/orders/docs",
+            Some(&token),
+            json!({"_id": 1, "items": [{"sku": "a", "qty": 1}, {"sku": "b", "qty": 2}]}),
+        )
+        .await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/orders/aggregate",
+            Some(&token),
+            json!({"pipeline": [{"$unwind": "$items.sku"}]}),
+        )
+        .await;
+    assert_eq!(res.status, 400, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request");
+    let body = format!("{:?}", res.body);
+    assert!(body.contains("$unwind"), "{body}");
+    // The refusal names the concrete fix, not just the problem: the caller
+    // who wrote `$items.sku` is told to unwind `$items` first.
+    assert!(body.contains("$items"), "{body}");
+    assert!(body.contains("sku"), "{body}");
+}
+
+#[tokio::test]
 async fn a_computed_date_survives_the_extended_json_boundary() {
     // Dates are the type JSON cannot express, so a date expression is where a
     // working evaluator and a working edge are hardest to tell apart.

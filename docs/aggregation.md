@@ -27,10 +27,87 @@ can answer it, which only a *leading* `$match` gets (see
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
 | `$sort` | The same sort language. Blocking |
 | `$skip`, `$limit` | Non-negative whole numbers |
-| `$unwind` | One output document per array element |
+| `$unwind` | One output document per array element. Below |
 | `$group` | Blocking. Accumulators below |
 | `$count` | `{$count: "name"}` — a document holding the count |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
+
+**Stage operands with a fixed key set are closed; field-path maps stay
+open.** `$unwind`'s document form, `$lookup`'s both forms and `$replaceRoot`
+refuse a key they do not define — `400`, naming it — the same closure
+[ADR-121](decisions.md) gives the request body and the shapes nested in it. A
+`$match` filter and a `$project` specification are **not** put through this:
+every key in either is a document field name the caller chose, not vocabulary
+this database defines, so there is no fixed list to check a key against —
+closing them would refuse ordinary pipelines rather than typos. See
+[ADR-129](decisions.md).
+
+### `$unwind`
+
+```json
+{ "$unwind": "$tags" }
+{ "$unwind": { "path": "$tags", "preserveNullAndEmptyArrays": true, "includeArrayIndex": "i" } }
+```
+
+The shorthand string form takes only a path. The document form takes:
+
+| Key | Default | Meaning |
+|---|---|---|
+| `path` | required | The field to expand, `"$"`-prefixed |
+| `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it. Wrong-typed is a `400`, not read as `false` |
+| `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out. Cannot begin with `$` (this language cannot read such a field back) or name `path` itself (it would overwrite the unwound element) |
+
+**A path that crosses an array *by name* is refused outright, before
+anything at the far end of it is even read — see [ADR-130](decisions.md) and
+[Arrays](#arrays).** `$unwind` needs a single place to write the expanded
+element back to. Whenever a non-terminal segment of `path` is itself an
+array on a given document, and the segment after it **names a field rather
+than a numeric position** — `x.b` where `x` holds an array, at any length
+down to one — there is no such place, and the request is refused, `400`,
+naming `$unwind` and the path. This holds regardless of what that array
+turns out to contain: a scalar, another array, an empty array, nothing —
+none of it changes the answer, because the refusal is decided by the
+document's *shape* along the path, before `$unwind` looks at what is there
+to unwind.
+
+**A numeric segment addresses a position instead, and is not refused.**
+`$unwind: "$a.0"` writes into element `0` of `a` directly — a single place,
+the same as any array write by index — and reads it the same way `find` and
+every other field-path option here does: a numeric segment is read as
+*both* an index and a field literally named that number ([Arrays](#arrays)
+has the full rule and the one place it disagrees with an expression path).
+So `$unwind: "$a.0.b"` over `a: [{b: [1, 2]}, {b: [3]}]` does not cross
+anything by this rule — it finds `a.0.b` as `[1, 2]` (element `0`'s `b`) and
+unwinds it into **two rows, `a[0].b` replaced by `1` then by `2`, with the
+rest of `a` untouched** — `[{b: 1}, {b: [3]}]`, then `[{b: 2}, {b: [3]}]`.
+This is a genuine difference from a computed expression over the identical
+path: `{$addFields: {r: "$a.0.b"}}` reads `"0"` as a field name only, finds
+no element actually named `"0"`, and gives `r: []`.
+
+**This makes the refusal data-dependent: whether a pipeline is legal at all
+depends on the documents it meets, not on the pipeline text.** The same
+`{"$unwind": "$a.b"}` answers `200` for every document where `a` is a plain
+subdocument and `400` for any document where `a` is an array — a schemaless
+collection can hold both shapes under the same field name, so a pipeline
+that has run correctly for months can start answering `400` the day an
+ordinary write adds one document shaped that way, with nothing about the
+pipeline having changed. And it fails **the whole request**, not just the
+offending document: one such document among a thousand others refuses
+every row, because the refusal is a stage-level error, not a per-document
+skip. A field a pipeline unwinds should be one every document in the
+collection either holds as a plain field or never holds as an array at all.
+
+For every document where `path` does not cross an array this way, what is
+found there decides what happens:
+
+| Value at `path` | Without `preserveNullAndEmptyArrays` | With it |
+|---|---|---|
+| A non-empty array | One row per element, `path` set to that element | Same |
+| Missing, `null`, or `[]` | Dropped | Kept once, `path` unset (removed) |
+| Any other scalar | One row, unchanged — the value unwinds to itself | Same |
+
+`includeArrayIndex` is `null` on every row in the second and third cases: a
+row that was not produced by an array element has no index to report.
 
 ### Accumulators
 
@@ -78,6 +155,12 @@ field path.
       "month": { "$dateToString": { "date": "$placed", "format": "%Y-%m" } } } },
   { "$group": { "_id": "$month", "revenue": { "$sum": "$value" } } } ]
 ```
+
+**The named-argument operators are closed the same way stage operands are**
+(see [Stages](#stages)): `$filter`, `$map`, `$reduce`, `$let`, `$convert`,
+`$switch` (and each of its branches) and `$dateToString` refuse a key they do
+not define — `{"input": "$items", "condition": …}` inside `$filter` is a
+`400` naming `condition`, not a silently unfiltered array.
 
 ### How a value is read
 
@@ -207,6 +290,11 @@ nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
 an expression path and a filter path disagree — the filter language reads
 `items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
+**`$unwind` also has to write each expanded element back to its path**, not
+only read it, and a path crossing an array by a named segment has no single
+place to write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is
+refused, `400`, on every such document, regardless of what `b` holds at any
+element (see [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the
 pipeline, for the same reason: `{$range: [0, 1000000000]}` is a memory
