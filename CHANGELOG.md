@@ -83,10 +83,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   changed outright. **An index that already exists on disk carries no stamp,
   and reads as older than every drop and every rival**: a replayed drop removes
   it and a rival definition is refused and counted, which is exactly the
-  behaviour of 0.21.0, so nothing changes for it until it is next recreated.
-  Recreate an index whose name two members may disagree about if you want it
-  settled rather than counted. Nothing is added to `/metrics`, to the index
-  listing on `/v1`, or to `docs/openapi.yaml`. ADR-132.
+  behaviour of 0.21.0. It also heals on its own where it can: a member holding
+  the same definition *with* a stamp hands it over on the next round. Where no
+  member has one — an index every member created before this release — drop and
+  recreate it **on one member** and let that replicate, rather than recreating
+  it on each, if you want its name settled rather than counted. Nothing is
+  added to `/metrics`, to the index listing on `/v1`, or to
+  `docs/openapi.yaml`. ADR-132.
+
+- **Two members that create the same index definition independently now agree
+  on when it was created**, not merely on what it is. The creation stamp is
+  what decides whether a replayed drop applies, so one definition under two
+  stamps answered one drop two ways — one member keeping the index, the other
+  losing it, permanently, with `kimmy_sync_ddl_refused_total` still at 0 and
+  the lag gauge at 0. The later of the two stamps now stands on both, and it
+  only ever moves forward. ADR-132.
 
 - **Breaking, cluster wire: a batch answer now carries where the window
   ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's

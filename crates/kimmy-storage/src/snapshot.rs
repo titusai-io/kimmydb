@@ -503,7 +503,16 @@ mod tests {
         c.create_collection("shop", "orders").unwrap();
         c.create_index("shop", "orders", vec![field("item")], false, Some("by_item".into()))
             .unwrap();
-        restamp_index(&c, "shop", "orders", "by_item", Stamp::new(Hlc::MAX, node(1)));
+        // Far ahead of any clock, but still an encodable stamp: `Hlc::MAX`
+        // holds a `wall_ms` above `i64::MAX`, which BSON cannot carry, and a
+        // fixture must not pin a value the wire would refuse.
+        restamp_index(
+            &c,
+            "shop",
+            "orders",
+            "by_item",
+            Stamp::new(Hlc::new(i64::MAX as u64, 0), node(1)),
+        );
 
         let page = a.snapshot_page(None).unwrap();
         let into_b = b.apply_snapshot_page(&page).unwrap();

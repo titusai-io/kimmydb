@@ -7516,6 +7516,25 @@ in place of the silent skip it did for any name already taken. The **local**
 path is unchanged: a client creating a conflicting definition is still refused
 `IndexExists`, because it is there to be told.
 
+*Third*, two members that created the **same** definition under one name
+converge their creation stamps as well, forward, by the same comparison. That
+is not a conflict — the definitions agree — but after the first two rules the
+stamp is the sole arbiter of whether a replayed drop applies, so one
+definition under two stamps answers one drop two ways and the members split.
+Both have already witnessed the other's create by then, so nothing re-serves
+it and the split is permanent; and the drop is `Applied` on both sides, so no
+counter moves and the lag gauge reads 0 — the exact signature this ADR exists
+to remove. The merge takes the **later** stamp because every stamp in this
+subsystem is a forward-only join (`record_index_drop_in_txn` and
+`record_collection_drop` both refuse to move backwards), and forward is what
+makes it idempotent under re-delivery: a drop once declined stays declined,
+whereas taking the earlier stamp would let a later-arriving *older* creation
+make an already-declined drop apply. An index holding no stamp adopts the
+peer's, which is the definition's true creation rather than an invented one,
+and ends the ambiguity without waiting for a recreation. A **local** create of
+a definition already present is untouched — it is idempotent and mints no
+entry, so moving the stamp there would be a decision no peer ever hears of.
+
 **An index stored without a creation stamp reads as older than every drop and
 every rival.** A replayed drop removes it and a rival definition is refused
 and counted — which is ADR-123's behaviour exactly, so nothing a caller could
@@ -7578,15 +7597,18 @@ the member whose definition lost. What an operator *would* alert on is
 unchanged: `kimmy_sync_ddl_refused_total` still rises for every definition a
 member cannot apply, which is the case nothing repairs.
 
-**Why the entry's stamp, and why the payload carries it too.** The receiver
-takes `index.created` from the payload when it is there and the entry's own
-stamp when it is not; at the origin the two are the same value, because the
-create mints its entry's stamp first and records it on the index it builds.
-Preferring the payload means a definition keeps the identity it was created
-with rather than the identity of whatever entry carried it, which is the same
-choice `IndexCreate` already makes for the derived id (ADR-032) — the id
-travels rather than being recomputed so that two nodes cannot disagree about
-it.
+**Why the payload carries the stamp, when the entry already does.** On the
+oplog route it is redundant, and provably so: the origin mints its entry's
+stamp first and records that stamp on the index it builds, and `apply_ddl`
+appends a replicated entry under the stamp it arrived with, so the payload's
+copy and the entry's stamp cannot differ. Reading either gives the same
+answer, and neither is observable from the other. The field is carried for the
+**snapshot** route, which has no entry at all: `restore_collection` sees only
+`CollectionState`, and the definition's own stamp is the only ordering fact
+that reaches it. `apply_remote_index` reads the payload first and falls back
+to the entry's stamp, so both routes read the creation stamp from the same
+place; the fallback covers a payload minted by a build that recorded none, and
+recovers exactly the value that build would have used.
 
 **Alternatives.** *Compare the drop against the tombstone alone.* That is what
 was there: the tombstone records when the index was **dropped**, and says
@@ -7597,7 +7619,11 @@ name is the identity — so there is no definition to compare. *Make the drop
 carry the creation stamp it was aimed at.* It would work for a drop minted
 after this change and not for one already in an oplog, and it puts the
 ordering fact in the entry that destroys state rather than on the state
-itself, so a snapshot would carry no answer at all. *Resolve concurrent
+itself, so a snapshot would carry no answer at all. *Take the earliest creation stamp when two members create one identical
+definition, since that is when the index first existed anywhere.* It converges
+too, but it is not monotone: `created` would move backwards as older creations
+arrive, so a drop this node had already declined would begin to apply on
+re-delivery, and anti-entropy re-delivers by design. *Resolve concurrent
 definitions by merging them — keep the union of the fields, the stricter
 uniqueness.* A merged definition is one no member asked for, and it is not
 idempotent under re-delivery. *Backfill a creation stamp for stored indexes at
@@ -7606,7 +7632,12 @@ that stays divergent until someone notices is what the round observed; the
 counter made it visible and nobody was watching for four runs.
 
 **Cost.** One optional stamp per index, in the collection metadata and on the
-wire. `create_index_inner` takes a `CreateOrigin` in place of its `log` flag —
+wire. A replicated create of a
+definition already present now writes the collection metadata where it used to
+return early, which is one small commit on a path that previously took none —
+only when the arriving stamp is the later one, so a settled cluster pays
+nothing. `create_index_inner` takes a `CreateOrigin` in place of its `log` flag
+—
 the change `drop_index_inner` made in ADR-123, for the same reason, widened
 only because a replicated *create* may carry no stamp — and returns an
 `IndexCreated` so that "a later definition is already here" is a decision the
@@ -7625,9 +7656,14 @@ Defended by `a_replayed_drop_does_not_remove_a_newer_index_of_the_same_name`,
 `a_drop_still_removes_an_index_that_carries_no_creation_stamp`,
 `concurrent_definitions_under_one_name_settle_on_the_later_stamp`,
 `the_loser_of_a_concurrent_creation_does_not_come_back_through_a_replayed_create`,
-`a_rival_definition_with_no_creation_stamp_is_still_refused_and_counted` and
+`a_rival_definition_with_no_creation_stamp_is_still_refused_and_counted`,
 `a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace`,
-beside ADR-123's own
+`two_members_creating_one_identical_definition_converge_on_one_creation_stamp`,
+`an_identical_definition_is_not_re_stamped_by_a_local_recreation`,
+`an_unstamped_index_learns_its_stamp_from_the_peer_that_has_one`,
+`a_losing_definition_is_not_re_served_to_a_third_member`,
+`a_snapshot_definition_under_a_taken_name_settles_on_the_later_stamp` and
+`a_creation_stamp_crosses_the_replicated_bson_boundary`, beside ADR-123's own
 `a_replayed_index_that_cannot_be_built_does_not_stop_the_entries_behind_it`,
 which is unchanged.
 

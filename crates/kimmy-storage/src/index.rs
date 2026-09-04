@@ -652,12 +652,65 @@ impl crate::Engine {
         // part of the definition: re-creating the same index with a different
         // `expireAfterSeconds` must not quietly return the old policy and
         // leave documents living longer than asked.
-        let superseded = match meta.index(&index.name) {
+        //
+        // Cloned rather than borrowed, because both outcomes below write to
+        // `meta` — the stamp merge in place, the supersede by removing it.
+        let superseded = match meta.index(&index.name).cloned() {
             None => None,
             Some(existing) => {
                 let differs = existing.differences(&index);
                 if differs.is_empty() {
-                    return Ok((IndexCreated::Built(existing.clone()), Vec::new()));
+                    // The same definition, created independently on two
+                    // members — and the creation stamp has to converge too,
+                    // not only the definition. After ADR-132 the stamp is the
+                    // sole arbiter of whether a replayed `DropIndex` applies,
+                    // so two members holding one definition under two stamps
+                    // answer the same drop differently and stay split: both
+                    // have witnessed the other's create, so nothing re-serves
+                    // it, and the drop is `Applied` on each, so no counter
+                    // moves and the lag gauge reads 0.
+                    //
+                    // It merges **forward**, by the comparison the conflict
+                    // arm uses. Every stamp in this subsystem is a
+                    // forward-only join — `record_index_drop_in_txn` and
+                    // `record_collection_drop` both refuse to move backwards
+                    // — and forward is what makes the merge idempotent under
+                    // re-delivery: a drop once declined stays declined, where
+                    // taking the earlier stamp would let a later-arriving
+                    // *older* creation make an already-declined drop apply.
+                    // The originating entry is appended onward as it always
+                    // was, so every member computes the same maximum whatever
+                    // order the creations reach it in.
+                    let merged = match (origin, existing.created, index.created) {
+                        // A local create mints a fresh stamp and returns here
+                        // without logging, so adopting it would be a decision
+                        // no peer ever hears of — the divergence this merge
+                        // exists to close, from the other side.
+                        (CreateOrigin::Local, _, _) => None,
+                        (_, Some(held), Some(arriving)) if arriving.wins_over(&held) => {
+                            Some(arriving)
+                        }
+                        // An index stored without a stamp learns one from the
+                        // peer that has it: that is the definition's true
+                        // creation, and adopting it ends the ambiguity rather
+                        // than inventing an answer for it.
+                        (_, None, Some(arriving)) => Some(arriving),
+                        _ => None,
+                    };
+                    let Some(merged) = merged else {
+                        return Ok((IndexCreated::Built(existing), Vec::new()));
+                    };
+                    let mut settled = existing;
+                    settled.created = Some(merged);
+                    meta.indexes
+                        .iter_mut()
+                        .find(|i| i.name == settled.name)
+                        .expect("the index was found on this meta a moment ago")
+                        .created = Some(merged);
+                    let txn = self.begin_write()?;
+                    crate::Engine::put_collection_meta(&txn, &meta)?;
+                    txn.commit()?;
+                    return Ok((IndexCreated::Built(settled), Vec::new()));
                 }
                 match (origin, existing.created, index.created) {
                     // Two members created one name with different definitions
@@ -670,7 +723,7 @@ impl crate::Engine {
                     (CreateOrigin::Replicated(_), Some(held), Some(arriving))
                         if arriving.wins_over(&held) =>
                     {
-                        Some(existing.clone())
+                        Some(existing)
                     }
                     (CreateOrigin::Replicated(_), Some(_), Some(_)) => {
                         // The definition here is the later one. The arrival is
@@ -716,10 +769,13 @@ impl crate::Engine {
                 let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
                 entries.retain_in(index_id_range(meta.id, loser.id), |_, _| false)?;
             }
-            // Under the *winner's* stamp, not the loser's: the tombstone is
-            // what stops the loser's own create coming back through a
-            // re-served window, and a creation at exactly the tombstone's
-            // stamp — the winner's own re-delivery — is not history.
+            // Under the *winner's* stamp. The upper bound is the load-bearing
+            // half: anything above it would make the winner's own re-delivery
+            // read as history — a creation at exactly the tombstone's stamp is
+            // not — and the definition could never be rebuilt after a later
+            // drop. Below it the loser's replay would still be turned away by
+            // the comparison above, so recording the winner's stamp is the
+            // tighter of two correct answers rather than the only one.
             crate::Engine::record_index_drop_in_txn(
                 &txn,
                 meta.id,

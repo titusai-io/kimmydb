@@ -861,8 +861,12 @@ impl Engine {
                     // Still remembered, exactly as the `DropCollection` arm
                     // remembers a superseded drop: a tombstone never moves
                     // backwards, and this one is older than the creation that
-                    // beat it, so it withholds the *earlier* index of the name
-                    // without touching the one standing here.
+                    // beat it, so it cannot touch the index standing here.
+                    // It is this node's record that the drop was seen, and a
+                    // second line of defence against the earlier index of the
+                    // name — the comparison above turns that replay away too,
+                    // so removing this would not by itself let the earlier
+                    // index back.
                     self.record_index_drop(
                         entry.collection,
                         kimmy_core::IndexMeta::derive_id(&target.index),
@@ -1013,10 +1017,14 @@ impl Engine {
         }
 
         // The entry's stamp is the definition's creation stamp: the origin
-        // recorded exactly this one on the index it minted the entry for. The
-        // payload carries its own copy, and it is preferred when present so
-        // that a definition lifted onward keeps the identity it was created
-        // with rather than the identity of whatever entry carried it.
+        // recorded exactly this one on the index it minted the entry for, and
+        // a replicated entry is appended under the stamp it arrived with, so
+        // on this route the payload's copy can never differ from it. Read
+        // from the payload first all the same, because that is the field the
+        // *snapshot* route has to use — a snapshot carries definitions with
+        // no entry behind them — and one rule for reading it is better than
+        // two. A payload from a build that recorded no stamp falls back to
+        // the entry's, which is the same value the origin would have used.
         let created = target.index.created.unwrap_or(stamp);
         let (created, violations) = self.create_index_inner(
             &target.db,
@@ -2448,6 +2456,18 @@ mod tests {
             b.get_collection("shop", "orders").unwrap().index("email_1").is_some_and(|i| i.unique),
             "a drop older than the index it names must not remove it"
         );
+        // Declined, but not forgotten: the tombstone is this node's record
+        // that the drop was seen, and it stands at the drop's own stamp — the
+        // `DropCollection` arm keeps its superseded drops the same way.
+        assert_eq!(
+            b.index_dropped_at(
+                kimmy_core::CollectionId::derive("shop", "orders"),
+                kimmy_core::IndexMeta::derive_id("email_1")
+            )
+            .unwrap(),
+            Some(history[2].stamp),
+            "a declined drop still leaves its tombstone"
+        );
 
         // And the whole history, in order and repeatedly, reaches the same
         // state: the older creation is history against the tombstone the
@@ -2538,6 +2558,151 @@ mod tests {
         assert!(
             b.get_collection("shop", "orders").unwrap().index("email_1").is_none(),
             "an unstamped index is removed by a replicated drop, exactly as before"
+        );
+    }
+
+    #[test]
+    fn two_members_creating_one_identical_definition_converge_on_one_creation_stamp() {
+        // The stamp has to converge, not only the definition. After ADR-132
+        // it is the sole arbiter of whether a replayed drop applies, so two
+        // members holding the same definition under two stamps answer the
+        // same drop differently — and nothing re-serves the creations, both
+        // having been witnessed, so the split is permanent and silent: the
+        // drop is `Applied` on both sides, no counter moves and lag reads 0.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        // Two creations in one millisecond leave no stamp between them for
+        // the drop below to occupy — the interesting case is the partition
+        // that lasts, so the fixture makes the gap real rather than hoping
+        // the scheduler provides one.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        b.create_collection("shop", "orders").unwrap();
+        b.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+
+        let stamps = |e: &Engine| {
+            e.get_collection("shop", "orders").unwrap().index("email_1").unwrap().created.unwrap()
+        };
+        let (first, second) = (stamps(&a), stamps(&b));
+        assert!(first < second, "the fixture needs two independent creations, A's first");
+
+        // Heal, both ways and to quiescence.
+        for _ in 0..3 {
+            sync(&a, &b);
+        }
+        assert_eq!(stamps(&a), second, "the later creation is the one that stands");
+        assert_eq!(stamps(&b), second, "on both members");
+
+        // And a drop stamped between the two creations — which is exactly
+        // what anti-entropy delivers on heal — now resolves the same way on
+        // each of them.
+        let between =
+            Stamp::new(Hlc::new(first.hlc.wall_ms + 1, 0), kimmy_core::NodeId::from_bytes([9; 16]));
+        assert!(between > first && between < second, "the fixture's drop sits between them");
+        let drop = crate::engine::ddl_entry(
+            between,
+            OpKind::DropIndex,
+            kimmy_core::CollectionId::derive("shop", "orders"),
+            &kimmy_core::IndexDrop {
+                db: "shop".into(),
+                collection: "orders".into(),
+                index: "email_1".into(),
+            },
+        )
+        .unwrap();
+        for engine in [&a, &b] {
+            engine.apply_batch(&[drop.clone()]).unwrap();
+        }
+        let holds =
+            |e: &Engine| e.get_collection("shop", "orders").unwrap().index("email_1").is_some();
+        assert_eq!(holds(&a), holds(&b), "the members must answer one drop alike");
+        assert!(holds(&a), "and the drop precedes the creation that stands, so it is history");
+    }
+
+    #[test]
+    fn an_identical_definition_is_not_re_stamped_by_a_local_recreation() {
+        // The merge is for definitions arriving from a peer. A client asking
+        // again for an index it already has is idempotent and mints no entry,
+        // so moving the stamp here would be a decision no peer ever hears of
+        // — which is the divergence the merge exists to close, from the other
+        // side.
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let first = a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let again = a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        assert_eq!(again.created, first.created, "an idempotent local create moves nothing");
+        assert_eq!(
+            a.get_collection("shop", "orders").unwrap().index("email_1").unwrap().created,
+            first.created
+        );
+    }
+
+    #[test]
+    fn an_unstamped_index_learns_its_stamp_from_the_peer_that_has_one() {
+        // The other half of the merge: an index stored before the stamp
+        // existed is ambiguous, and a peer holding the same definition with a
+        // stamp has the answer. Adopting it ends the ambiguity rather than
+        // inventing one, and is what stops the two from answering a drop
+        // differently for as long as the pair lives.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+        let created = a.get_collection("shop", "orders").unwrap().index("email_1").unwrap().created;
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        b.apply_batch(&history).unwrap();
+        restamp_index(&b, "shop", "orders", "email_1", None);
+
+        b.apply_batch(&history).unwrap();
+
+        assert_eq!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").unwrap().created,
+            created,
+            "the definition's true creation stamp is learned from the peer that carries it"
+        );
+    }
+
+    #[test]
+    fn a_losing_definition_is_not_re_served_to_a_third_member() {
+        // Why `IndexCreated::Older` exists at all. A creation this node has
+        // decided is history must not be appended: appending it would
+        // propagate through this node a definition this node does not hold,
+        // to every member that pulls from it, for ever. ADR-123's rule for a
+        // refusal, and ADR-132's for a loser.
+        let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let loser = create_index_entry(
+            id,
+            "shop",
+            "orders",
+            definition("by_email", vec![field("email")], false, Some(earlier)),
+            earlier,
+        );
+        let winner = create_index_entry(
+            id,
+            "shop",
+            "orders",
+            definition("by_email", vec![field("email")], true, Some(later)),
+            later,
+        );
+
+        let (m, _dm) = engine();
+        m.create_collection("shop", "orders").unwrap();
+        m.apply_batch(&[winner]).unwrap();
+        let outcome = m.apply_batch(&[loser]).unwrap();
+        assert_eq!(outcome.ddl_refused, 0, "history, not a refusal: {outcome:?}");
+
+        let served = m.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        assert!(
+            !served.iter().any(|e| e.kind == OpKind::CreateIndex && e.stamp == earlier),
+            "this node must not serve onward a definition it decided was history: {served:?}"
+        );
+        assert!(
+            served.iter().any(|e| e.kind == OpKind::CreateIndex && e.stamp == later),
+            "and it must still serve the one it holds"
         );
     }
 
@@ -2732,8 +2897,19 @@ mod tests {
         );
 
         let (m, _dm) = engine();
-        m.create_collection("shop", "orders").unwrap();
+        let cm = m.create_collection("shop", "orders").unwrap();
         m.apply_batch(&[loser.clone(), winner.clone()]).unwrap();
+        // The tombstone the replacement records stands at the *winner's*
+        // stamp. Above it, the winner's own re-delivery would read as history
+        // and the definition could never be rebuilt after a later drop; below
+        // it, the loser's replay reaches the comparison instead of being
+        // stopped here. Recorded rather than inferred, so neither bound can
+        // move unnoticed.
+        assert_eq!(
+            m.index_dropped_at(cm.id, kimmy_core::IndexMeta::derive_id("by_email")).unwrap(),
+            Some(later),
+            "the supersede's tombstone is the winner's stamp"
+        );
         for _ in 0..3 {
             let outcome = m.apply_batch(&[loser.clone(), winner.clone()]).unwrap();
             assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");

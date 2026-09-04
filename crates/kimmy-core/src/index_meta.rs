@@ -220,10 +220,16 @@ impl IndexMeta {
     /// used to be reported for a changed TTL too, which sent the reader to
     /// look at the one thing that had not changed.
     ///
-    /// Deliberately not `PartialEq`: `id` is derived from the name and so is
-    /// equal by construction, `multikey` is a node-local observation of the
-    /// documents rather than part of the definition, and `created` is the
-    /// stamp that *decides* a conflict rather than a term in it.
+    /// Deliberately not `PartialEq`, and the exclusions are exactly three:
+    /// `id` is derived from the name and so is equal by construction,
+    /// `multikey` is a node-local observation of the documents rather than
+    /// part of the definition, and `created` is the stamp that *decides* a
+    /// conflict rather than a term in it. Everything else is compared,
+    /// `enforcement` included — which cannot differ today, because
+    /// [`Enforcement::Coordinated`] is refused where an index is created, but
+    /// which is part of the definition the moment it can be, and would
+    /// otherwise make two genuinely different definitions read as one and
+    /// never resolve.
     pub fn differences(&self, other: &IndexMeta) -> Vec<&'static str> {
         let mut differs = Vec::new();
         if self.fields != other.fields {
@@ -231,6 +237,9 @@ impl IndexMeta {
         }
         if self.unique != other.unique {
             differs.push("unique flag");
+        }
+        if self.enforcement != other.enforcement {
+            differs.push("enforcement");
         }
         if self.expire_after_secs != other.expire_after_secs {
             differs.push("expireAfterSeconds");

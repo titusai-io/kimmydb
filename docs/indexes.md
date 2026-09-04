@@ -238,6 +238,25 @@ tombstone, which never moves backwards, and leaves the newer index alone. A
 drop stamped **after** the index it names still removes it, which is the
 ordinary case.
 
+> **A replicated drop cannot remove an index whose creation stamp is ahead of
+> it.** Ordinarily that is the rule doing its job on a re-served window, and
+> it is logged at debug and counted nowhere, because it happens routinely. But
+> a member whose clock ran far ahead when it created the index will decline
+> *every* drop for that name, indefinitely, with no default-level signal — the
+> drops keep arriving and keep being declined. The escape hatch is a local
+> `DELETE /v1/db/{db}/coll/{coll}/indexes/{name}` on that member: a **local**
+> drop does not consult the creation stamp, removes the index, and mints a
+> drop entry under the member's own current stamp, which is ahead of the
+> creation and so removes it on every other member too.
+
+*Two identical definitions converge on one stamp.* Two members can also create
+the *same* definition independently, which is not a conflict — but the two
+creations carry different stamps, and after the rules above the stamp is what
+answers a drop. So the stamp converges as well: the later creation is the one
+that stands, on every member, and it only ever moves forward. Without that,
+one definition under two stamps would answer one drop two ways and the members
+would split with nothing left to re-serve.
+
 *Two definitions under one name settle on the later stamp.* Two members can
 create the same index name with different definitions while they cannot see
 each other; neither is wrong, and neither can be kept without the cluster
@@ -258,8 +277,10 @@ logged, and the round goes on.
 **An index created before this version carries no creation stamp**, and reads
 as *older* than every drop and every rival: a replayed drop removes it, and a
 rival definition is refused and counted rather than resolved. That is exactly
-the behaviour of the version before it, and it ends the first time the index
-is recreated. See [ADR-132](decisions.md).
+the behaviour of the version before it. It ends as soon as the index is
+recreated — or sooner, on its own: a member holding the same definition *with*
+a stamp hands it over on the next round, which is the true creation stamp
+rather than an invented one. See [ADR-132](decisions.md).
 
 ---
 
