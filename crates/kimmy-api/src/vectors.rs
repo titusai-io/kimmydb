@@ -274,20 +274,27 @@ fn authorize_write(
 #[serde(default, deny_unknown_fields)]
 pub struct SearchRequest {
     /// Query text. Embedded server-side, so it needs an embedding provider.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub query: Option<String>,
     /// A pre-computed query vector. Required when the provider is `byo`.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub vector: Option<Vec<f32>>,
     /// Restrict results to documents matching this filter.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub filter: Option<Value>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub k: Option<usize>,
     /// Chunks per document allowed into the results.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub per_document: Option<usize>,
     /// How much each half of `hybrid_search` counts in fusion (ADR-094).
     /// Ignored by `vector_search`, which has one half.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub weights: Option<FusionWeights>,
     /// Distinct query terms a chunk must share with the query to count as
     /// lexical evidence in `hybrid_search` (ADR-094). Ignored by
     /// `vector_search`.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     pub min_overlap: Option<usize>,
 }
 
