@@ -54,10 +54,36 @@ The shorthand string form takes only a path. The document form takes:
 | Key | Default | Meaning |
 |---|---|---|
 | `path` | required | The field to expand, `"$"`-prefixed |
-| `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it |
-| `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out |
+| `preserveNullAndEmptyArrays` | `false` | Keep a document whose path is missing, `null` or an empty array, as one row with the path unset, instead of dropping it. Wrong-typed is a `400`, not read as `false` |
+| `includeArrayIndex` | none | The name of a field to hold the position of the element that produced each row, or `null` on a row that was not produced by fanning one out. Cannot begin with `$` (this language cannot read such a field back) or name `path` itself (it would overwrite the unwound element) |
 
-**What each value at the path does:**
+**A path that crosses an array is refused outright, before anything at the
+far end of it is even read — see [ADR-130](decisions.md) and
+[Arrays](#arrays).** `$unwind` needs a single place to write the expanded
+element back to. Whenever a non-terminal segment of `path` is itself an
+array on a given document — `x.b` where `x` holds an array, at any length
+down to one — there is no such place, and the request is refused, `400`,
+naming `$unwind` and the path. This holds regardless of what that array
+turns out to contain: a scalar, another array, an empty array, nothing —
+none of it changes the answer, because the refusal is decided by the
+document's *shape* along the path, before `$unwind` looks at what is there
+to unwind.
+
+**This makes the refusal data-dependent: whether a pipeline is legal at all
+depends on the documents it meets, not on the pipeline text.** The same
+`{"$unwind": "$a.b"}` answers `200` for every document where `a` is a plain
+subdocument and `400` for any document where `a` is an array — a schemaless
+collection can hold both shapes under the same field name, so a pipeline
+that has run correctly for months can start answering `400` the day an
+ordinary write adds one document shaped that way, with nothing about the
+pipeline having changed. And it fails **the whole request**, not just the
+offending document: one such document among a thousand others refuses
+every row, because the refusal is a stage-level error, not a per-document
+skip. A field a pipeline unwinds should be one every document in the
+collection either holds as a plain field or never holds as an array at all.
+
+For every document where `path` does not cross an array this way, what is
+found there decides what happens:
 
 | Value at `path` | Without `preserveNullAndEmptyArrays` | With it |
 |---|---|---|
@@ -67,16 +93,6 @@ The shorthand string form takes only a path. The document form takes:
 
 `includeArrayIndex` is `null` on every row in the second and third cases: a
 row that was not produced by an array element has no index to report.
-
-**A path that crosses an array is refused, not silently wrong.** `$unwind`
-names a single place to write the expanded element back to; a path like
-`x.b` where `x` itself holds several elements has no such place, and asking
-for it is a `400` naming `$unwind` and the path rather than a `200` with
-rows that look unwound but are not — see [ADR-130](decisions.md) and
-[Arrays](#arrays). A path that reaches a *scalar* through an array — `items.sku`
-where `items` is an array of `{sku, qty}` and the first element's `sku` is a
-string — is unaffected: it unwinds to itself, as any non-array value does,
-because there is no array there to expand or write back.
 
 ### Accumulators
 
@@ -124,6 +140,12 @@ field path.
       "month": { "$dateToString": { "date": "$placed", "format": "%Y-%m" } } } },
   { "$group": { "_id": "$month", "revenue": { "$sum": "$value" } } } ]
 ```
+
+**The named-argument operators are closed the same way stage operands are**
+(see [Stages](#stages)): `$filter`, `$map`, `$reduce`, `$let`, `$convert`,
+`$switch` (and each of its branches) and `$dateToString` refuse a key they do
+not define — `{"input": "$items", "condition": …}` inside `$filter` is a
+`400` naming `condition`, not a silently unfiltered array.
 
 ### How a value is read
 
@@ -253,11 +275,10 @@ nothing; `{$arrayElemAt: ["$items", 0]}` is the element. That is the one place
 an expression path and a filter path disagree — the filter language reads
 `items.0` both ways — and `$unwind`, `$sort` and `$lookup`'s `localField` and
 `foreignField` name a field rather than compute one, so they do not fan out.
-**For `$unwind` this cuts both ways:** it reads the single value at the path,
-same as `$sort` and `$lookup`, but it also has to write each expanded element
-back to that same path, and a path crossing an array has no single place to
-write to — `$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is refused,
-`400`, rather than answering with rows that look unwound but are not (see
+**`$unwind` also has to write each expanded element back to its path**, not
+only read it, and a path crossing an array has no single place to write to —
+`$unwind: "$a.b"` over `a: [{b: [1, 2]}, {b: 3}]` is refused, `400`, on every
+such document, regardless of what `b` holds at any element (see
 [`$unwind`](#unwind) and [ADR-130](decisions.md)).
 
 **`$range`** produces at most 100,000 integers — the same ceiling as the

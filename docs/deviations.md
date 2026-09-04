@@ -173,7 +173,12 @@ MongoDB produces `Int32`, as every integer result of the expression layer does
 (see the module notes on numbers). And `$filter`, `$map`, `$reduce` and `$let`
 **refuse a key they do not know** (`condition` for `cond`), where MongoDB
 ignores it; that is stricter, and only turns a silently wrong pipeline into an
-error.
+error. `$unwind`'s document form, `$lookup`'s both forms, `$replaceRoot`,
+`$switch` (and each of its branches), and `$dateToString` refuse an unknown
+key the same way (ADR-129) — the same closure, not a new one. Whether MongoDB
+itself ignores or refuses an unknown key on each of *those* five is not
+verified here, so no claim is made about it either way; the "where MongoDB
+ignores it" clause above is scoped to the original four.
 
 **`$lookup` refuses the combined form.** MongoDB 5.0 accepts
 `localField`/`foreignField` *and* `pipeline` in one stage — the "concise

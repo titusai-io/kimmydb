@@ -15,35 +15,49 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 ### Changed
 
 - **An aggregation stage operand with a fixed key set refuses a key it does
-  not define.** `$unwind`'s document form, `$lookup`'s both forms and
-  `$replaceRoot` answered `200` and silently ignored an unrecognized key —
-  `{"path": "$x", "preserveNullAndEmptyArray": true}`, one character short of
-  `preserveNullAndEmptyArrays`, silently reverted the option to `false` and
-  dropped documents the caller asked to keep; `includeArrayIndex`, a real
-  MongoDB option, was silently dropped outright. Both are now a `400` naming
+  not define, and a declared key refuses a wrong-typed value rather than
+  silently falling back.** `$unwind`'s document form, `$lookup`'s both
+  forms, `$replaceRoot`, `$switch` (and each branch) and `$dateToString`
+  answered `200` and silently ignored an unrecognized key —
+  `{"path": "$x", "preserveNullAndEmptyArray": true}`, one character short
+  of `preserveNullAndEmptyArrays`, silently reverted the option to `false`
+  and dropped documents the caller asked to keep; `{"date": "$t", "formt":
+  "%Y"}` silently kept the default date format; `includeArrayIndex`, a real
+  MongoDB option, was silently dropped outright. All are now a `400` naming
   the field, the same closure [ADR-121](docs/decisions.md) already gives the
-  request body and its nested shapes. `$match` filters and `$project`
-  specifications are unaffected and stay open — every key in either is a
-  document field name the caller chose, not vocabulary this database
-  defines. `includeArrayIndex` is now implemented rather than left dropped:
-  the name of a field to hold each output row's array position, `null` on a
-  row not produced by fanning one out. **Breaking for a client sending an
-  unrecognized key to one of these three stages**, and a `0.MINOR` bump for
-  it; no documented, working pipeline is affected. ADR-129.
+  request body and its nested shapes. The same typo can also land in a
+  *value*: `{"preserveNullAndEmptyArrays": "true"}` or `: 1` fell through to
+  `false` exactly like a missing key; it is now refused by name too.
+  `includeArrayIndex` is implemented rather than left dropped — the name of
+  a field to hold each output row's array position, `null` on a row not
+  produced by fanning one out — and itself refuses a name beginning with `$`
+  (unreadable by this language's own field-path syntax) or the same name as
+  `path` (would silently overwrite the unwound element). `$match` filters
+  and `$project` specifications are unaffected and stay open — every key in
+  either is a document field name the caller chose, not vocabulary this
+  database defines. **Breaking for a client sending an unrecognized key or a
+  wrong-typed `preserveNullAndEmptyArrays` to one of these stages**, and a
+  `0.MINOR` bump for it; no documented, working pipeline is affected.
+  ADR-129.
 
 ### Fixed
 
 - **`$unwind` over a path that crosses an array emitted duplicate,
-  unchanged rows instead of unwinding anything.** `$unwind: "$x.b"`, where
-  `x` itself holds more than one relevant element, read the first element's
-  `b` to decide how many rows to emit, then failed silently to write each
-  element back through the array — there is no single place to put it — and
-  emitted that many byte-identical copies of the input document, `200`, with
-  nothing actually unwound; a `$group`, `$count` or `$sum` after the stage
-  then double-counted. The write failure is no longer discarded: this shape
-  is now a `400` naming `$unwind` and the path. A path that never crosses an
-  array, or that crosses one into a scalar rather than another array
-  (`items.sku` over an array of `{sku, qty}`), is unaffected. ADR-130.
+  unchanged rows instead of unwinding anything — and, depending on what the
+  crossed element happened to hold, could instead emit one unchanged row
+  that looked correctly unwound but was not.** `$unwind: "$x.b"`, where `x`
+  itself holds an array (at any length, including one), read a value at the
+  path to decide what to do and then failed silently to write each element
+  back through the array — there is no single place to put it, whatever is
+  found there. Both symptoms are now the same `400`, naming `$unwind` and
+  the path, decided by whether the path crosses an array **at all**, never
+  by what is sitting at the far end of it: `items.sku` over an array of
+  `{sku, qty}` now refuses too, where it previously passed the document
+  through unchanged. **Whether a pipeline is even legal now depends on the
+  documents it meets, not on the pipeline text** — the same pipeline can run
+  correctly for months and then refuse the day an ordinary write adds one
+  document shaped this way, and one such document fails the whole request.
+  A path that never crosses an array is unaffected. ADR-130.
 
 ## 0.21.0 - 2026-09-03
 

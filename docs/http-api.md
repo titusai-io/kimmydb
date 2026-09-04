@@ -710,6 +710,20 @@ a misspelt `collection` used to default to `*` and widen the grant. A document
 body is content, not a shape: insert, replace and bulk take any field, because
 `limit` and `filter` are perfectly good names for a document's own fields.
 
+**An aggregation stage operand is closed too, but at `400`, not `422`.**
+`$unwind`'s document form (`path`, `preserveNullAndEmptyArrays`,
+`includeArrayIndex`), `$lookup`'s both forms, and `$replaceRoot` refuse a key
+they do not define, naming it — the same closure, deliberately at a different
+status ([ADR-129](decisions.md)). The `422` above is `JsonBody<T>`'s status
+for a *serde-typed* shape the request extractor itself rejects; a pipeline's
+`pipeline` array is untyped JSON at that layer — which stage a document
+names, and therefore which keys are legal, is not decided until
+`kimmy-query` parses it — so its refusal lands where every other
+malformed-pipeline error already does: `400 bad_request`, the same status
+`$group`'s unknown-accumulator refusal has always used. `$match` filters and
+`$project` specifications are **not** closed: every key in either is a
+document field name the caller chose, not vocabulary this server defines.
+
 **Query strings are held to the same rule, at `400`.** `?limt=5` on
 `GET .../docs`, or `?limit=abc`, is `400 bad_request` with the parameter
 named. The status differs from a body's `422` because a query string is part
@@ -898,8 +912,8 @@ failure cannot appear without its retry class being decided in the same commit.
 
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
-| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it |
-| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)) |
+| 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
+| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)). **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
 | 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |
