@@ -31,7 +31,7 @@ use crate::meta::CollectionMeta;
 use crate::watch::OplogWindow;
 
 /// What applying a batch of replicated entries did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct SyncOutcome {
     /// Entries that won and changed a document.
     pub applied: usize,
@@ -75,6 +75,15 @@ pub struct SyncOutcome {
     /// history still missing does not, and read 0 for a bulk insert whose
     /// stamps all lie within a second (ADR-122). See [`lag_behind_ms`].
     pub lag_ms: u64,
+    /// Collections the cross-member divergence check found disagreeing
+    /// against this peer this round (ADR-133): held by the peer and not
+    /// here, or held by both with disagreeing document counts. Populated
+    /// only when there was nothing to pull — see
+    /// [`crate::divergence::compare`] for why that gate matters and what it
+    /// deliberately does not report. Empty on every path exercised by the
+    /// network-free tests in this module: the check itself lives in
+    /// `kimmy-cluster`, which is the only place a peer's answer exists.
+    pub divergent: std::collections::BTreeSet<kimmy_core::CollectionId>,
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of
