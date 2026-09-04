@@ -7353,3 +7353,136 @@ and the `cluster.sync` span's `applied`. The measured benchmark numbers in
 second commit is gone.
 
 ---
+
+## ADR-126 — A batch's entry cap is spent after the filter, not before it
+
+**Decision.** `Engine::entries_for_peer` counts only the entries it will
+actually ship towards the batch limit. The oplog read takes a predicate —
+`Engine::read_oplog_from_where`, which `read_oplog_from` is now a thin call
+into — and stops when it has `limit` *retained* entries or reaches the end of
+the oplog, rather than reading `limit` raw entries and dropping some of them
+afterwards. A window truncated at the cap therefore holds `limit` shippable
+entries again, and a shorter one really is the end of the peer's oplog.
+
+**The defect.** The cap was spent before the `UniqueViolation` filter ran:
+
+```rust
+self.read_oplog_from(from, limit)?          // stops at `limit` entries
+    .into_iter()
+    .filter(|entry| entry.kind != OpKind::UniqueViolation)   // then drops some
+```
+
+So a window truncated at 1,024 could return 1,019, with the peer's tail
+nowhere near reached. `coverage_after_batch` read any batch shorter than the
+limit as "the peer's whole tail" and absorbed the peer's **entire** version
+vector — which is the right answer for a genuine tail and a catastrophe for a
+truncated window. Every entry behind that window was then witnessed without
+being applied, `VersionVector::behind` reported nothing missing, and nothing
+ever re-served them. Both preconditions are ordinary: a member more than one
+batch behind, and one collision anywhere inside the window.
+
+**Why nothing caught it.** The behaviour is a blind spot between two
+deliberate designs, both of which stay. ADR-029 withholds violation entries
+from peers because every node observes the same collision independently.
+ADR-082 absorbs the peer's advertised vector — including stamps it holds but
+never ships — precisely so a withheld violation cannot pin `behind` at its
+floor and re-serve one window for ever. Neither anticipated that a withheld
+entry also *shortens the batch*, which is the signal the third piece used to
+decide the window was complete. Nothing errored, so ADR-123's counters could
+not see it either: `kimmy_sync_failures_total` 0, `kimmy_sync_ddl_refused_total`
+unmoved, `kimmy_replication_lag_seconds` 0, and not one log line on the member
+that lost the data.
+
+**Observed** on a three-member cluster running 0.21.0, 2026-09-03. Two
+collections existed on the member that created them, holding documents, and
+answered `404` on both peers forty-five minutes later — the peers did not list
+them at all. Both were created while the peers were 130–260 s behind and after
+the cluster's first cross-member unique collision, so every truncated window
+on it contained one. Documents were lost the same way and are the worse half:
+a full `_id` comparison across the three members found one collection missing
+**500 contiguous ids on one member and a different 517 on another**, the shape
+of a single bulk insert each, settled and unchanging across three samples with
+every health signal green.
+
+**Cost.** The scan may read past `limit` raw entries to fill the window. The
+excess is exactly the entries the predicate rejects, on a range read that was
+happening anyway, and violations are rare by nature — a batch that is all
+violations is a cluster with a much louder problem. Serving fewer entries than
+the limit while the tail is unreached, the alternative, is what caused this.
+
+**Cost of the alternative considered: ship violations and have receivers drop
+them.** ADR-082 already declined it — it moves ADR-029's exclusion to the
+wrong side and doubles the wire cost of every collision — and it would fix
+only this filter, leaving the next one to reopen the hole. ADR-127 closes that
+door properly.
+
+Defended by `a_withheld_violation_does_not_make_a_truncated_window_look_like_a_tail`,
+`a_collection_created_inside_a_truncated_window_reaches_every_member` and the
+property test `a_window_that_is_not_a_tail_never_witnesses_past_what_it_delivered`.
+
+---
+
+## ADR-127 — The peer reports where its window ended; the receiver never infers it
+
+**Decision.** `Message::Entries` carries `scanned_to: Hlc` and
+`exhausted: bool` beside its entries — the last stamp the sender's scan
+examined, and whether it stopped there because the oplog ended rather than
+because the batch filled. `coverage_after_batch(theirs, scanned_to, exhausted)`
+absorbs `theirs` when the window was exhausted, and otherwise raises each
+advertised origin to `min(their_max, scanned_to)`. It no longer sees the
+entries or the limit at all. `Engine::entries_for_peer` returns an
+`OplogWindow` carrying all three, so the fact travels from the reader that
+knows it to the rule that needs it without being reconstructed on the way.
+
+**Why, given ADR-126 already fixes the bug.** The count was never the fact;
+it was a *proxy* for "the tail was reached", true only while nothing could
+shorten a batch for another reason. ADR-126 makes the proxy honest again
+against today's one filter. It does not stop the next one from breaking it —
+a second withheld entry kind, a size-based trim, a per-collection ACL, a
+redaction rule — and the failure mode when it breaks is silent, permanent
+document loss with every health signal green, discovered forty-five minutes
+later by hand. The sending side knows exactly where its window ended. Saying
+so costs one stamp and one bool per batch and cannot be reopened.
+
+It also expresses a state the count cannot: a window that shipped **nothing**
+and is still not the tail. Under the old rule an empty batch was necessarily
+"the whole tail"; under this one it claims only what the scan reached.
+
+**Why `scanned_to` counts entries the sender withheld.** The scan has read
+past them, and a stamp the receiver can never be sent must not be able to hold
+the window open — that is ADR-082's cure, stated at the window's edge instead
+of only at its end. It is safe for the same reason ADR-082 gives: the sender
+serves contiguously in stamp order from the point asked for, so nothing inside
+the window was skipped except entries deliberately withheld, and claiming
+those is correct because every node observes a violation independently
+(ADR-029). Bounding by the peer's own coverage still means the receiver never
+claims history the peer does not hold.
+
+**A breaking wire change, and no shim.** `Entries` was a newtype variant and is
+now a struct variant; a 0.21.0 node and a node carrying this cannot replicate
+in either direction, so this is a `0.MINOR` and the changelog says so. Pre-1.0
+the project does not carry compatibility shims or negotiate versions
+(`docs/compatibility.md`): `AskEntries::held` was added as an optional field
+because it could be, and this cannot be — a default of `exhausted: true` from
+a sender that never sets it is exactly the wrong answer, and a default of
+`false` wedges every round against an older peer. An upgrade rolls the members;
+a member that has not been rolled yet fails its rounds loudly, which is the
+behaviour to want here.
+
+**What it does not change.** `BatchTooLarge` still refuses to serve fewer
+entries unasked: the requester asks again for the count that fits, the sender
+re-reads the window at that limit, and the end it reports matches what it
+sends. Trimming in place would report having scanned past entries it did not
+send, which is the same silent gap by another route.
+
+**Cost.** One stamp and one bool per batch on the wire, against a batch of up
+to 1,024 oplog entries. `coverage_after_batch` gets simpler, not more complex.
+
+Defended by `an_exhausted_window_proves_the_whole_advertised_vector`,
+`a_truncated_window_proves_every_origin_up_to_the_stamp_it_reached`,
+`an_empty_window_that_is_not_the_tail_claims_only_what_it_scanned` and
+`a_violation_stamp_does_not_pin_behind_for_ever`, which keeps ADR-082's guard
+honest — this fix must not be reachable by reverting to "absorb only what was
+delivered".
+
+---

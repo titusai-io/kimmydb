@@ -10,6 +10,54 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **A member no longer silently and permanently loses committed documents to a
+  peer.** A node catching up by more than one batch could discard the remainder
+  of a sync window and mark it seen, so no later round ever re-served it. Two
+  causes, both closed. First, the 1,024-entry batch cap was spent *before* the
+  `UniqueViolation` entries a peer never ships were filtered out, so a window
+  truncated at the cap could return 1,019 entries with the peer's tail nowhere
+  near reached; the cap is now spent on the entries that actually ship, so a
+  batch shorter than the limit means what the receiver believes it means.
+  Second, the receiver read any short batch as "the peer's whole tail" and
+  absorbed the peer's entire version vector — witnessing every entry behind the
+  window without applying one of them; it now takes the peer's own report of
+  where the window ended instead of deducing it from a count, so no future
+  filter can reopen the same hole.
+
+  **How it looked.** Nothing failed, so nothing said so:
+  `kimmy_replication_lag_seconds` 0 on every member, `kimmy_sync_failures_total`
+  0, `kimmy_sync_peers_backing_off` 0, `/v1/topology` all live, and not one log
+  line on the members that lost the data. Observed on a three-member cluster
+  running 0.21.0: two collections held documents on the member that created
+  them and answered `404` on both peers forty-five minutes later, and a full
+  `_id` comparison found one collection missing 500 contiguous ids on one
+  member and a different 517 on another — the shape of one bulk insert each.
+  The preconditions are ordinary: a member more than one batch behind, and one
+  cross-member unique collision anywhere inside the window.
+
+  **If you have been running a cluster under load with unique indexes, assume
+  members may already disagree.** This release stops the divergence; it does not
+  repair one that has already happened. Compare collection lists and document
+  counts across members directly — lag 0 and quiet counters are precisely this
+  defect's signature, not evidence of convergence. ADR-126, ADR-127.
+
+### Changed
+
+- **Breaking, cluster wire: a batch answer now carries where the window
+  ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's
+  scan examined, an entry it withheld included) and `exhausted` (whether it
+  stopped there because the oplog ran out), and changed from a newtype variant
+  to a struct variant to do it. There is no compatibility shim and no version
+  negotiation — pre-1.0 the cluster wire is changed outright — so a node of
+  this version and a 0.21.0 node **cannot replicate with each other in either
+  direction**: the round fails as a malformed frame and `kimmy_sync_failures_total`
+  rises on both. Roll every member. Nothing on disk changes, and no client-facing
+  route, response or `/v1` promise is affected. ADR-127.
+
 ## 0.21.0 - 2026-09-03
 
 A minor when it ships, not a patch. Nothing changes on the wire between
