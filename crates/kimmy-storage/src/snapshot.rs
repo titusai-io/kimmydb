@@ -467,6 +467,63 @@ mod tests {
         }
     }
 
+    /// Rewrite an index's creation stamp in place, so a test can put the
+    /// receiver's definition in a known order against the snapshot's without
+    /// racing the wall clock.
+    fn restamp_index(engine: &Engine, db: &str, collection: &str, name: &str, created: Stamp) {
+        let mut meta = engine.get_collection(db, collection).unwrap();
+        meta.indexes.iter_mut().find(|i| i.name == name).expect("the index is here").created =
+            Some(created);
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_definition_under_a_taken_name_settles_on_the_later_stamp() {
+        // The snapshot route follows the rule the replicated `CreateIndex`
+        // route follows (ADR-132), where before it silently kept whatever the
+        // name already held. B's definition is older than anything A can
+        // mint, so A's replaces it; C's is newer, so C keeps its own and the
+        // arrival is history.
+        let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
+        let (a, _da) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("item")], true, Some("by_item".into()))
+            .unwrap();
+
+        let (b, _db) = engine();
+        b.create_collection("shop", "orders").unwrap();
+        b.create_index("shop", "orders", vec![field("item")], false, Some("by_item".into()))
+            .unwrap();
+        restamp_index(&b, "shop", "orders", "by_item", Stamp::new(Hlc::new(1, 0), node(1)));
+
+        let (c, _dc) = engine();
+        c.create_collection("shop", "orders").unwrap();
+        c.create_index("shop", "orders", vec![field("item")], false, Some("by_item".into()))
+            .unwrap();
+        restamp_index(&c, "shop", "orders", "by_item", Stamp::new(Hlc::MAX, node(1)));
+
+        let page = a.snapshot_page(None).unwrap();
+        let into_b = b.apply_snapshot_page(&page).unwrap();
+        assert_eq!(into_b.ddl_refused, 0, "the later definition is not a refusal: {into_b:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_item").unwrap().unique,
+            "the snapshot's definition is the later one and replaces B's"
+        );
+
+        let into_c = c.apply_snapshot_page(&page).unwrap();
+        assert_eq!(
+            into_c.ddl_refused, 0,
+            "an older definition is history, not a refusal: {into_c:?}"
+        );
+        assert!(
+            !c.get_collection("shop", "orders").unwrap().index("by_item").unwrap().unique,
+            "C's definition is the later one and stands"
+        );
+    }
+
     #[test]
     fn a_snapshot_pages_a_collection_larger_than_one_page() {
         let (a, _da) = engine();
