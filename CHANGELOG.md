@@ -10,6 +10,19 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **`find` with `limit: 0` returned one document instead of an empty page**,
+  on the unsorted path and on a `sort: {"_id": 1}` request, whenever the
+  first document the scan examined happened to match the filter — an empty
+  filter over a non-empty collection always qualifies. `limit: 0` is a
+  documented, legal request for an empty page (`FindRequest.limit` has
+  `minimum: 0`), and the sorted paths already honoured it; the unsorted scan
+  handed a match to the page before checking whether the page's bound had
+  already been reached. The bound is now checked first.
+
 ## 0.21.0 - 2026-09-03
 
 A minor when it ships, not a patch. Nothing changes on the wire between

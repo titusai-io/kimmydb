@@ -623,7 +623,17 @@ struct Recheck<'a, F> {
 
 impl<F: FnMut(kimmy_core::Stamp, bson::Document)> Recheck<'_, F> {
     /// Examine one candidate; whether the scan should go on.
+    ///
+    /// The bound is checked **before** a candidate is considered, not after
+    /// one has already been handed to `visit`. Checked after, a `stop_after`
+    /// of zero let the first match through before the bound could ever
+    /// refuse it — a `limit: 0` page came back holding one document instead
+    /// of none, whenever the very first candidate the scan examined happened
+    /// to match.
     fn take(&mut self, stamp: kimmy_core::Stamp, doc: bson::Document) -> bool {
+        if self.stop_after == Some(self.matched) {
+            return false;
+        }
         self.examined += 1;
         if filter::matches(self.filter, &doc) {
             self.matched += 1;
@@ -2176,5 +2186,26 @@ mod tests {
             top.offer(stamp, doc);
         }
         assert!(top.into_sorted().is_empty());
+    }
+
+    #[test]
+    fn a_stop_after_of_zero_visits_nothing() {
+        // The unsorted twin of `a_window_of_zero_holds_nothing`: `Recheck`
+        // used to hand the first match to its visitor before checking
+        // `stop_after`, so a `stop_after` of zero still let one document
+        // through. Seeded so `_id: 0`'s document is the very first candidate
+        // the scan examines and matches an empty filter — the exact case
+        // that leaked.
+        let (state, meta, _dir) = seeded(3);
+        let filter = filter::parse(&bson::doc! {}).unwrap();
+
+        let mut visited = 0usize;
+        let stats = visit_matching(&state, &meta, &filter, Order::Any, Some(0), |_, _| {
+            visited += 1;
+        })
+        .unwrap();
+
+        assert_eq!(visited, 0, "a stop_after of zero must visit nothing");
+        assert_eq!(stats.matched, 0, "{:?}", stats.matched);
     }
 }

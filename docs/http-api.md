@@ -295,7 +295,9 @@ so this is the cheap way to read one document *with* its version.
 
 **Default limit 100, maximum 10,000, and both are silent.** Omitting `limit`
 returns a page of 100 rather than the collection, and a larger `limit` is
-clamped rather than refused. To read everything, walk with a cursor:
+clamped rather than refused. `limit: 0` is legal and is an empty page —
+`{"documents": [], "count": 0}`, with no `nextCursor` — on every sort order.
+To read everything, walk with a cursor:
 
 ```json
 { "filter": {}, "limit": 100 }

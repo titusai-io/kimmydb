@@ -4832,6 +4832,31 @@ async fn paging_through_an_index_agrees_with_paging_through_a_scan() {
     assert_eq!(a, (0..200).filter(|i| i % 2 == 1).collect::<Vec<i64>>());
 }
 
+/// `limit: 0` is a legal request for an empty page, on every path a `find`
+/// can take — not just the sorted one, which held up under a heap of
+/// capacity zero while the unsorted and `_id`-ascending paths handed back
+/// one document whenever the very first candidate the scan examined
+/// happened to match. Every case here is exactly that: an empty filter over
+/// a non-empty collection, so the first document the scan sees matches.
+#[tokio::test]
+async fn a_page_of_zero_is_empty_on_every_path() {
+    let server = Server::start().await;
+    let token = paged(&server, "orders", 10).await;
+
+    for (why, body) in [
+        ("unsorted", json!({"filter": {}, "limit": 0})),
+        ("_id ascending", json!({"filter": {}, "limit": 0, "sort": {"_id": 1}})),
+        ("_id descending", json!({"filter": {}, "limit": 0, "sort": {"_id": -1}})),
+        ("a non-_id sort", json!({"filter": {}, "limit": 0, "sort": {"parity": 1}})),
+    ] {
+        let res = server.post("/v1/db/shop/coll/orders/find", Some(&token), body).await;
+        assert_eq!(res.status, 200, "{why}: {:?}", res.body);
+        assert_eq!(res.body["documents"], json!([]), "{why}: {:?}", res.body);
+        assert_eq!(res.body["count"], 0, "{why}: {:?}", res.body);
+        assert!(res.body.get("nextCursor").is_none(), "{why}: {:?}", res.body);
+    }
+}
+
 #[tokio::test]
 async fn the_last_page_carries_no_cursor() {
     let server = Server::start().await;
