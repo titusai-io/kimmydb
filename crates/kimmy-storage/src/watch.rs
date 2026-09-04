@@ -629,6 +629,42 @@ mod tests {
         assert_eq!(names.len(), all.len(), "each reason needs its own name");
     }
 
+    #[test]
+    fn a_window_ends_at_the_last_entry_the_scan_read_not_the_last_it_kept() {
+        // `scanned_to` counts entries the predicate rejects. That is the whole
+        // reason it is a separate fact from "the last entry returned": a stamp
+        // this node holds and will never ship — a `UniqueViolation` (ADR-029)
+        // — must not be able to hold the window open, or it pins the reader's
+        // `behind` at that origin's floor for ever (ADR-082, ADR-127).
+        //
+        // Only visible when the rejected entry is the *last* one read. While
+        // the scan stops on a kept entry the two coincide, which is why this
+        // needs a test of its own rather than falling out of the sync suite.
+        let (engine, coll, _dir) = setup();
+        engine.insert(&coll, doc! { "_id": 1 }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2 }).unwrap();
+        let tail = engine.read_oplog_from(Hlc::ZERO, 100).unwrap();
+        let last = tail.last().expect("the oplog holds entries").stamp;
+
+        let window =
+            engine.read_oplog_from_where(Hlc::ZERO, 100, |entry| entry.stamp != last).unwrap();
+
+        assert!(window.exhausted, "the scan ran to the end of the oplog");
+        assert!(
+            !window.entries.iter().any(|e| e.stamp == last),
+            "the predicate withheld the last entry"
+        );
+        assert_eq!(window.entries.len(), tail.len() - 1);
+        assert_eq!(
+            window.scanned_to, last.hlc,
+            "the window still ends where the scan read to, not where it last kept something"
+        );
+        assert!(
+            window.scanned_to > window.entries.last().unwrap().stamp.hlc,
+            "which is strictly past the last entry delivered"
+        );
+    }
+
     /// Collect the next `n` *document* changes, failing rather than hanging.
     ///
     /// Schema-change entries share the collection id and would otherwise be
