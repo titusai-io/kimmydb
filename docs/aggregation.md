@@ -152,7 +152,9 @@ reasons to `$match` the type you mean first, or to `$group` after a
 
 `$sum` **stays integral** while every value it has seen is an integer,
 promoting to a double only when a double arrives or an `i64` sum would
-overflow. `$avg` is always a double. `$addToSet` compares elements
+overflow. `$avg` is a double whenever it has an answer at all — it never
+returns an integer, and the one thing it returns that is not a double is the
+`null` above. `$addToSet` compares elements
 **structurally**, not by the canonical order `$group`'s own `_id` uses, so
 `5`, `5.0` and `{"$numberLong": "5"}` are one bucket as a grouping key and
 three distinct members of a set.
@@ -447,9 +449,10 @@ a crossed `localField` out and joins on every element
 **A key is a value, so a missing key is not `null` here.** An input document
 that lacks `localField` gets an empty `as` and joins nothing, and a foreign
 document that lacks `foreignField` is never a candidate — an explicit `null`
-on both sides joins, an absent field on either does not. This is the one
-place the [filter rule that `null` matches a missing
-field](query-language.md#1-null-matches-missing-fields) does not reach: that
+on both sides joins, an absent field on either does not. The [filter rule
+that `null` matches a missing
+field](query-language.md#1-null-matches-missing-fields) does not reach here:
+that
 rule is about selecting documents, and a join is about matching two stored
 values to each other.
 

@@ -225,10 +225,15 @@ retrying the same entry could never succeed.
 What reaches it is a member that wrote a document the origin never had —
 while it was behind, or partitioned — and then receives a `CreateIndex` the
 origin still holds, whose backfill meets that document. Two more refusals are
-in the same class: a name already taken **here** by a different definition,
-because two members created it concurrently, and an `enforcement` mode this
-build does not implement. A snapshot page carrying such a definition is
-classified the same way, and the page's documents still restore.
+in the same class: an `enforcement` mode this build does not implement, and a
+rival definition arriving against a name this member holds **without a
+creation stamp**, which the conflict rule below has nothing to compare and so
+cannot resolve. Two *stamped* definitions under one name are resolved rather
+than refused, and the resolution itself is counted nowhere; the stamp rules
+below say how, and what is counted when the winning definition turns out to
+be one this member cannot build. A snapshot page carrying a definition this
+member cannot build is classified the same way as the first case, and the
+page's documents still restore.
 
 **A dropped index leaves a tombstone**, and it is why the counter does *not*
 move for the sequence ADR-123 was written about. Like a dropped collection, an

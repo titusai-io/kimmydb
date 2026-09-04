@@ -46,9 +46,10 @@ both change with it. Nobody has asked.
 
 ---
 
-## 🟡 `$type` accepts an alias it has never heard of, and matches nothing with it
+## 🟡 A filter accepts a `$type` alias and a `$regex` flag it has never heard of, and matches nothing with either
 
-**Raised 2026-09-04, by the 2026-09 test round.** `{"$type": 999}` is a
+**Raised 2026-09-04 — the `$type` half by the 2026-09 test round, the
+`$options` half while closing it.** `{"$type": 999}` is a
 `400` naming the unknown code. `{"$type": "nosuchtype"}` — and `{"$type":
 "Int"}`, and `{"$type": "boolean"}` — is a `200` with no matches, because
 the argument is taken as a type *name* and no stored value ever reports that
@@ -66,13 +67,24 @@ argument is exactly that, a closed vocabulary this database defines, and
 `$mod`'s pair, `$size`'s integer and a sort direction are all refused when
 they are wrong already.
 
-**To close:** validate the alias against `type_name_for_code`'s own table at
-parse and refuse an unknown one, as the numeric arm already does — the same
-error, reached by the other spelling. It is a behaviour change and a
-tightening, so it belongs to a `0.MINOR` with a changelog line, not to a
-documentation pass; `docs/query-language.md` states the current behaviour and
-the alias list in the meantime, so a reader can at least check a spelling
-against something.
+**The same shape is in `$options`.** `compile_regex` reads the flag string
+character by character, sets `i`, `m`, `s` and `x`, and drops everything else
+— so `"I"` is not `"i"`, the pattern compiles case-sensitively, and the
+caller gets an empty result with nothing said. Two words in this language's
+vocabulary that a filter accepts without checking, and they fail the same
+way.
+
+**To close:** validate the alias at parse and refuse an unknown one, as the
+numeric arm already does — the same error, reached by the other spelling.
+The table to validate against is `type_name_of`'s, the set of names a stored
+value can actually report, **not** `type_name_for_code`'s: the latter omits
+`symbol` and `dbPointer`, which have no numeric code but are real types that
+`$type` matches today. Refusing them would be a regression dressed as a fix.
+`$options` closes the same way, against its own four flags. Both are
+behaviour changes and tightenings, so they belong to a `0.MINOR` with a
+changelog line, not to a documentation pass; `docs/query-language.md` states
+the current behaviour, the alias list and the flag list in the meantime, so a
+reader can at least check a spelling against something.
 
 ---
 
