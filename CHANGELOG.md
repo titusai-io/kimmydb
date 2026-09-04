@@ -33,11 +33,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   filter's contents, and an update operator's operand are content, not a
   shape, and still take `null` freely, on both transports. This tightens a
   refusal and is breaking for a caller relying on the old behaviour: a
-  `0.MINOR` bump under the pre-1.0 policy, no compatibility shim. The Go
-  client's `Update`, `Delete`, `UpdateIf`, `DeleteIf` and `UpdateOptions` now
-  turn a `nil` filter into `{}` before sending it, matching `Count`'s
-  existing guard, so a caller who passed `nil` meaning "no condition" keeps
-  getting exactly that rather than a new `422`. ADR-128.
+  `0.MINOR` bump under the pre-1.0 policy, no compatibility shim. MCP tool
+  schemas are corrected to match: `null` was a genuinely valid value of
+  these fields before this change and is advertised on no longer. The Go
+  client's `UpdateIf` and `DeleteIf` now turn a `nil` filter into `{}`
+  before sending it, matching `Count`'s existing guard — safe there since
+  neither takes `multi`. `Update`, `UpdateWith` and `Delete` deliberately do
+  not: each takes `multi` as the caller's own choice, so a `nil` filter
+  there now reaches the server as `null` and is refused, rather than being
+  quietly normalized into a write against every document. ADR-128.
 
 ## 0.21.0 - 2026-09-03
 

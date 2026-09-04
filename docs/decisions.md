@@ -7426,6 +7426,24 @@ right. `InsertArgs`'s `document`, `BulkInsertArgs`'s `documents` and
 `AggregateArgs`'s `pipeline` are content the same way a REST document body
 is, and are untouched for the same reason.
 
+Each of those fields also carries `#[schemars(required)]` alongside
+`skip_serializing_if = "Option::is_none"`. schemars derives a tool's
+`inputSchema` from the field's Rust type, not from `deserialize_with`, so an
+`Option<T>` field's advertised schema is `["T", "null"]` with
+`"default": null` by default — accurate before this decision, since `null`
+genuinely was accepted, and wrong afterwards: `delete.filter`'s schema would
+have kept telling the one client that reads it first, the model, that `null`
+is not just valid but the *default* value of the argument whose `null`
+emptied a collection. `#[schemars(required)]` asks schemars for the plain,
+non-nullable schema of the inner type instead of `Option`'s; pairing it with
+`skip_serializing_if` (inert for these `Deserialize`-only structs at
+runtime, read only by schemars) drops the `null` default that
+`#[serde(default)]` would otherwise report. The property is still not in
+`required`, since omitting it is unaffected — only its `null` is. The schema
+test in `tests/mcp.rs` drives every field in the table above through
+`schema_forbids_null` as well as the runtime refusal, so the two cannot
+drift apart unnoticed again.
+
 No field opts into nullability today; one that genuinely would keep the bare
 `Option<T>` derive and say so where it is declared. Query-string structs are
 untouched: a query string cannot carry a JSON `null` — `?if_stamp=` is an
@@ -7443,6 +7461,25 @@ rather than by `non_null_field` — which only ever runs on a field the derive
 would otherwise default to `None`. Both are refused; only the status and the
 mechanism differ, and `a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field`
 pins the distinction so it reads as deliberate.
+
+One nested shape names the wrong field when it refuses: a value inside a
+`#[serde(tag = "kind")]` enum, `ProviderConfigInput` among them, is refused
+as `"provider: invalid type: …"` rather than `"provider.endpoint: …"`.
+`serde_path_to_error` tracks a path by wrapping the `Deserializer` the
+top-level call uses; once an internally-tagged enum's own tag is matched, the
+rest of that value is re-read from a buffered `Content` tree through a
+second, unrelated `Deserializer` the wrapper never sees, so nothing after the
+tag is matched can extend the tracked path. This is not new to this decision
+and not particular to `null`: a wrong-typed `dimensions` inside the same
+`provider` object truncates identically, and always has —
+`a_wrong_value_inside_a_tagged_enum_names_the_enums_own_field_not_the_inner_one`
+pins both alongside the ordinary, untagged `chunk.max_tokens`, whose path
+reports in full. Documented in `docs/http-api.md` and `docs/openapi.yaml`
+rather than worked around: the refusal and its status are both right, only
+the name is short, and reaching further would mean threading a second,
+scoped path tracker across serde's own enum-tag buffering — a fix for
+`serde_path_to_error` and internally-tagged enums generally, not something
+this decision's scope extends to.
 
 A test in each of `kimmy-api` and `kimmy-mcp` enumerates every shape and
 field this decision claims and drives it over a real socket, asserting `422`
@@ -7528,25 +7565,39 @@ meaning "everything", now meets a `422` (or, over MCP, the tool's own
 `isError`) instead of a silent write. A `0.MINOR` bump under the pre-1.0
 policy, no compatibility shim — sending `null` was never documented to mean
 anything, and `openapi.yaml` already typed every one of these fields without
-a `null` branch, so the schema was already correct; only the server's
-behaviour was not. One helper function, reused wherever a field needs it —
-kimmy-mcp names it from kimmy-api rather than redefining it — one line per
-field naming it, and one mirror type for `POST .../vector`'s three shapes:
-the same order of cost ADR-121's `deny_unknown_fields` attribute has today,
-plus what `GrantInput` already cost once. The first-party Rust and Python
-clients, the CLI, the MCP server's own use of these tools, the conformance
-scenarios and every request example in the documentation omit an unset
-optional field rather than encoding it as `null`, so none of them are
-affected. The Go client is not quite in that list: `Update`, `Delete`,
-`UpdateIf` and `DeleteIf`, and `UpdateOptions.body`, built their request body
-around whatever `filter` map the caller passed with no guard against `nil` —
-only `Count` turned a `nil` map into `{}` first — and Go's encoder marshals a
-`nil` map as `null`, so `Delete(ctx, db, coll, nil, true)` sent exactly
-`{"filter": null, "multi": true}`. Before this decision that emptied the
-collection silently; the fix in this repository turns it into a `422` the
-client's `*APIError` reports, which is already strictly better, but the five
-call sites now carry the same `nonNilFilter` guard `Count` always had, so a
-`nil` filter reads as `{}` — "no condition" — the way every other client's
-does, rather than reaching the server as `null` at all.
+a `null` branch, so *that* schema was already correct and needed no change;
+only the server's behaviour was not. The MCP tool schemas were a different
+story and did need one: schemars derives `inputSchema` from the field's Rust
+type regardless of `deserialize_with`, so every one of these fields
+advertised `null` as valid — accurately, before this decision — and fixing
+the server without telling schemars would have shipped a contract that lied
+to the one reader who checks it first, an agent, worst on `delete.filter`,
+whose schema would have called the one value that used to empty a collection
+its *default*. `#[schemars(required)]` plus `skip_serializing_if` on the same
+twenty fields closes that, at the same per-field cost as the attribute that
+opened it. One helper function, reused wherever a field needs it — kimmy-mcp
+names it from kimmy-api rather than redefining it — one line per field
+naming it, and one mirror type for `POST .../vector`'s three shapes: the same
+order of cost ADR-121's `deny_unknown_fields` attribute has today, plus what
+`GrantInput` already cost once. The first-party Rust and Python clients, the
+CLI, the MCP server's own use of these tools, the conformance scenarios and
+every request example in the documentation omit an unset optional field
+rather than encoding it as `null`, so none of them are affected.
+
+The Go client is not quite in that list, and not uniformly fixed the same
+way. `Count`'s existing `nil`-to-`{}` guard is right to keep and right to
+extend to `UpdateIf` and `DeleteIf`: neither takes `multi`, so a `nil`
+filter there is bounded to one document by `if_stamp` regardless, exactly as
+harmless as `Count`'s always was. `Update`, `UpdateWith` and `Delete` are the
+opposite case: each takes `multi` as the caller's own choice on every call,
+so applying the same guard there would have reproduced the exact defect this
+decision closes, one layer further out — `Delete(ctx, db, coll, nil, true)`
+would send `{"filter": {}, "multi": true}` and empty the collection, where
+sending `nil` as JSON `null` now gets the caller a `422` instead. A `nil`
+Go map is precisely what a caller gets from *forgetting* to build a filter,
+which is finding 12's own scenario arriving through a client rather than the
+wire; guarding it there would have converted a mistake the server now
+catches back into a silent one. So those three are left to send `filter`
+exactly as given, `nil` included, and the doc comment on each says so.
 
 ---
