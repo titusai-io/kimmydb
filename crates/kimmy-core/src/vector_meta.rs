@@ -95,7 +95,18 @@ pub enum ProviderConfig {
     ///
     /// The default, and the only provider that needs nothing external —
     /// no API key, no network, no model download.
-    Byo,
+    ///
+    /// Written `Byo {}` rather than `Byo` on purpose. `deny_unknown_fields`
+    /// above is applied per variant, and an internally-tagged *unit* variant
+    /// has no field list for serde to apply it to: it reads the tag and stops,
+    /// so `{"kind":"byo","nosuch":1}` was accepted and `nosuch` dropped while
+    /// every struct variant beside it refused (ADR-121). The empty body gives
+    /// serde the field list it needs — an unknown key is now "unknown field
+    /// `nosuch`, there are no fields". The encoding does not move: `Byo` and
+    /// `Byo {}` are indistinguishable in JSON, BSON and TOML alike, all three
+    /// carrying exactly `{"kind": "byo"}`, so stored metadata and the
+    /// replication wire read back unchanged.
+    Byo {},
     /// OpenAI-compatible `/v1/embeddings`.
     OpenAi {
         model: String,
@@ -182,7 +193,7 @@ fn default_gemini_key_env() -> String {
 impl ProviderConfig {
     pub fn name(&self) -> &'static str {
         match self {
-            Self::Byo => "byo",
+            Self::Byo {} => "byo",
             Self::OpenAi { .. } => "openai",
             Self::Ollama { .. } => "ollama",
             Self::CustomHttp { .. } => "custom_http",
@@ -206,7 +217,7 @@ impl ProviderConfig {
             Self::Cohere { endpoint, .. } => Some(endpoint.as_deref().unwrap_or(COHERE_ENDPOINT)),
             Self::Gemini { endpoint, .. } => Some(endpoint.as_deref().unwrap_or(GEMINI_ENDPOINT)),
             Self::Ollama { endpoint, .. } | Self::CustomHttp { endpoint, .. } => Some(endpoint),
-            Self::Byo | Self::Local { .. } | Self::Profile { .. } => None,
+            Self::Byo {} | Self::Local { .. } | Self::Profile { .. } => None,
         }
     }
 
@@ -218,7 +229,7 @@ impl ProviderConfig {
             | Self::Cohere { api_key_env, .. }
             | Self::Gemini { api_key_env, .. } => Some(api_key_env),
             Self::CustomHttp { api_key_env, .. } => api_key_env.as_deref(),
-            Self::Byo | Self::Ollama { .. } | Self::Local { .. } | Self::Profile { .. } => None,
+            Self::Byo {} | Self::Ollama { .. } | Self::Local { .. } | Self::Profile { .. } => None,
         }
     }
 
@@ -227,7 +238,7 @@ impl ProviderConfig {
     /// `byo` does not, which means the embedding worker has nothing to do and
     /// vectors arrive with the document instead.
     pub fn embeds_server_side(&self) -> bool {
-        !matches!(self, Self::Byo)
+        !matches!(self, Self::Byo {})
     }
 
     /// Reject a provider that cannot work. Public because a server-side
@@ -235,7 +246,7 @@ impl ProviderConfig {
     /// it is defined.
     pub fn validate(&self) -> Result<(), String> {
         match self {
-            Self::Byo => Ok(()),
+            Self::Byo {} => Ok(()),
             Self::OpenAi { model, .. } if model.is_empty() => {
                 Err("openai provider needs a model".into())
             }
@@ -428,7 +439,7 @@ mod tests {
     fn config() -> VectorConfig {
         VectorConfig {
             fields: vec!["title".into(), "body".into()],
-            provider: ProviderConfig::Byo,
+            provider: ProviderConfig::Byo {},
             dim: 384,
             metric: Metric::Cosine,
             document_prefix: None,
@@ -445,7 +456,7 @@ mod tests {
         // provider's. Note `open_ai`'s serde tag is snake_case while its
         // `name()` is not; this pins the latter.
         let all = [
-            ProviderConfig::Byo,
+            ProviderConfig::Byo {},
             ProviderConfig::OpenAi {
                 model: "m".into(),
                 endpoint: None,
@@ -470,7 +481,7 @@ mod tests {
         let names: std::collections::BTreeSet<_> = all.iter().map(|p| p.name()).collect();
         assert_eq!(names.len(), all.len(), "tags must be distinct: {names:?}");
         assert!(!names.contains(""), "and none may be empty");
-        assert_eq!(ProviderConfig::Byo.name(), "byo");
+        assert_eq!(ProviderConfig::Byo {}.name(), "byo");
         assert_eq!(all[3].name(), "cohere");
         assert_eq!(all[4].name(), "gemini");
     }
@@ -559,7 +570,7 @@ mod tests {
             None,
             "an unauthenticated custom endpoint names no variable"
         );
-        assert_eq!(ProviderConfig::Byo.endpoint(), None);
+        assert_eq!(ProviderConfig::Byo {}.endpoint(), None);
         assert_eq!(ProviderConfig::Local { model: "m".into() }.endpoint(), None);
     }
 
@@ -635,7 +646,7 @@ mod tests {
 
     #[test]
     fn byo_does_not_embed_server_side() {
-        assert!(!ProviderConfig::Byo.embeds_server_side());
+        assert!(!ProviderConfig::Byo {}.embeds_server_side());
         assert!(
             ProviderConfig::Ollama { model: "m".into(), endpoint: "http://x".into() }
                 .embeds_server_side()
@@ -670,6 +681,53 @@ mod tests {
         // A typo should fail loudly rather than be silently ignored.
         let json = r#"{"fields":["a"],"provider":{"kind":"byo"},"dim":8,"metrik":"cosine"}"#;
         assert!(serde_json::from_str::<VectorConfig>(json).is_err());
+    }
+
+    #[test]
+    fn an_unknown_key_inside_the_provider_is_rejected_for_byo_too() {
+        // `deny_unknown_fields` on an internally-tagged enum is applied per
+        // variant, and a *unit* variant has no field list to apply it to:
+        // serde reads the tag and stops. That made `byo` — the default, and
+        // the kind most likely to be hand-written — the one provider that
+        // swallowed a typo, while every struct variant beside it refused.
+        // Giving it an empty body closes that.
+        let json = r#"{"fields":["a"],"provider":{"kind":"byo","nosuch":1},"dim":8}"#;
+        assert!(serde_json::from_str::<VectorConfig>(json).is_err());
+        assert!(serde_json::from_str::<ProviderConfig>(r#"{"kind":"byo","nosuch":1}"#).is_err());
+
+        // The control, and the sibling that has always refused.
+        serde_json::from_str::<ProviderConfig>(r#"{"kind":"byo"}"#).unwrap();
+        assert!(
+            serde_json::from_str::<ProviderConfig>(r#"{"kind":"open_ai","model":"m","nosuch":1}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_byo_provider_still_encodes_to_the_bare_tag_on_every_wire() {
+        // What makes closing the hole above non-breaking, pinned so a later
+        // edit cannot quietly break it: an empty struct variant encodes
+        // exactly as the unit variant did, on both encodings a stored
+        // configuration travels over. `CollectionMeta` is JSON on disk;
+        // `VectorSet` is BSON on the replication wire (see
+        // `kimmy-storage`'s `serialize_to_document` / `deserialize_from_document`
+        // round trip). An extra key on either side — an empty `{}` body
+        // serialized as such, say — would be a format change, and a peer or a
+        // data directory written by an older node would stop reading.
+        let c = config();
+
+        let json = serde_json::to_value(&c).unwrap();
+        assert_eq!(json["provider"], serde_json::json!({ "kind": "byo" }));
+
+        let doc = bson::serialize_to_document(&c).unwrap();
+        let provider = doc.get_document("provider").unwrap();
+        assert_eq!(provider.len(), 1, "byo must carry the tag and nothing else: {provider:?}");
+        assert_eq!(provider.get_str("kind").unwrap(), "byo");
+
+        // And a value in that encoding — which is what every `byo` record
+        // written before this change looks like — still decodes to it.
+        assert_eq!(serde_json::from_value::<VectorConfig>(json).unwrap(), c);
+        assert_eq!(bson::deserialize_from_document::<VectorConfig>(doc).unwrap(), c);
     }
 
     // -----------------------------------------------------------------------

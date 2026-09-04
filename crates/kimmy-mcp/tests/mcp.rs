@@ -248,7 +248,7 @@ fn seed_vectors(server: &Server) {
             "notes",
             VectorConfig {
                 fields: vec!["text".into()],
-                provider: ProviderConfig::Byo,
+                provider: ProviderConfig::Byo {},
                 dim: 3,
                 metric: Metric::Cosine,
                 chunk: ChunkConfig::default(),
@@ -524,7 +524,7 @@ async fn listings_omit_internals_but_tools_still_reach_them_by_name() {
             "orders",
             kimmy_core::vector_meta::VectorConfig {
                 fields: vec!["status".into()],
-                provider: kimmy_core::vector_meta::ProviderConfig::Byo,
+                provider: kimmy_core::vector_meta::ProviderConfig::Byo {},
                 dim: 4,
                 metric: Default::default(),
                 document_prefix: None,

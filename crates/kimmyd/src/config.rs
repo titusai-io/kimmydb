@@ -2268,6 +2268,25 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
     }
 
     #[test]
+    fn a_typo_in_a_byo_provider_profile_stops_the_node_like_any_other_typo() {
+        // `[vector.providers.<name>]` is a `ProviderConfig`, so a misspelt key
+        // in one is caught the same way `bnid` under `[server]` is: at parse,
+        // by name. `kind = "byo"` was the one kind that let it through — an
+        // internally-tagged *unit* variant gives serde nowhere to hang
+        // `deny_unknown_fields`, so it stopped reading after the tag and the
+        // operator's typo took effect as silence rather than a refusal.
+        let err = toml::from_str::<Config>(
+            "[vector.providers.mine]\nkind = \"byo\"\nmodle = \"nomic-embed-text\"\n",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("modle"), "unhelpful error: {err}");
+
+        // The control: the profile without the typo still reads.
+        let cfg: Config = toml::from_str("[vector.providers.mine]\nkind = \"byo\"\n").unwrap();
+        assert_eq!(cfg.vector.providers["mine"], kimmy_core::ProviderConfig::Byo {});
+    }
+
+    #[test]
     fn a_vector_batch_section_reads_back_from_toml_as_written() {
         // The documented shape, exactly as `kimmy.example.toml` shows it, and
         // the defaults match the worker's own.

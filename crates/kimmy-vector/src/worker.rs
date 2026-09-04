@@ -1966,7 +1966,7 @@ mod tests {
         // 0.14.0 the byo bail sat above the delete branch and these chunks
         // stayed searchable for ever.
         let (engine, _coll, mut worker, _dir) = setup().await;
-        let byo = VectorConfig { provider: ProviderConfig::Byo, ..config(&["title"]) };
+        let byo = VectorConfig { provider: ProviderConfig::Byo {}, ..config(&["title"]) };
         engine.configure_vectors("app", "docs", byo).unwrap();
         let coll = engine.get_collection("app", "docs").unwrap();
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
@@ -2561,7 +2561,7 @@ mod tests {
         // never be re-embedded.
         let base = VectorConfig {
             fields: vec!["title".into()],
-            provider: ProviderConfig::Byo,
+            provider: ProviderConfig::Byo {},
             dim: 4,
             metric: Metric::Cosine,
             document_prefix: None,
@@ -3043,7 +3043,7 @@ mod tests {
             "disabling has nothing to embed"
         );
 
-        let byo = VectorConfig { provider: ProviderConfig::Byo, ..config(&["title"]) };
+        let byo = VectorConfig { provider: ProviderConfig::Byo {}, ..config(&["title"]) };
         engine.configure_vectors("app", "docs", byo).unwrap();
         assert_eq!(
             worker.process(&last_entry(&engine)).await.unwrap(),

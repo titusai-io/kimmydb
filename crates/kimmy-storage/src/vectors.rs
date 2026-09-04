@@ -526,7 +526,7 @@ mod tests {
     fn config(dim: usize) -> VectorConfig {
         VectorConfig {
             fields: vec!["body".into()],
-            provider: ProviderConfig::Byo,
+            provider: ProviderConfig::Byo {},
             dim,
             metric: Default::default(),
             document_prefix: None,

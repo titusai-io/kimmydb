@@ -3525,7 +3525,7 @@ mod tests {
     fn vector_config() -> kimmy_core::VectorConfig {
         kimmy_core::VectorConfig {
             fields: vec!["text".into()],
-            provider: kimmy_core::ProviderConfig::Byo,
+            provider: kimmy_core::ProviderConfig::Byo {},
             dim: 4,
             metric: Default::default(),
             document_prefix: None,

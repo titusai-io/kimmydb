@@ -335,7 +335,7 @@ impl ProviderPolicy {
     /// endpoint was left out — are checked as they will be used.
     pub fn check_configure(&self, config: &ProviderConfig) -> Result<(), PolicyError> {
         match config {
-            ProviderConfig::Byo | ProviderConfig::Local { .. } => Ok(()),
+            ProviderConfig::Byo {} | ProviderConfig::Local { .. } => Ok(()),
             ProviderConfig::Profile { name } => self
                 .resolve(config)
                 .map(|_| ())
@@ -502,7 +502,7 @@ mod tests {
             p.check_configure(&openai(Some("http://10.0.0.5"), "OPENAI_API_KEY")).unwrap_err();
         assert!(matches!(err, PolicyError::Endpoint(_)), "{err:?}");
         // byo and local reach nothing.
-        p.check_configure(&ProviderConfig::Byo).unwrap();
+        p.check_configure(&ProviderConfig::Byo {}).unwrap();
         p.check_configure(&ProviderConfig::Local { model: "m".into() }).unwrap();
         // An unauthenticated custom endpoint has no variable to check, only
         // an address — a literal public one here, so no resolver is needed.
@@ -538,7 +538,7 @@ mod tests {
 
         // The three kinds that reach nothing the operator did not define.
         locked.check_configure(&ProviderConfig::Profile { name: "corp".into() }).unwrap();
-        locked.check_configure(&ProviderConfig::Byo).unwrap();
+        locked.check_configure(&ProviderConfig::Byo {}).unwrap();
         locked.check_configure(&ProviderConfig::Local { model: "m".into() }).unwrap();
 
         // A profile that does not exist is refused where there is someone to
