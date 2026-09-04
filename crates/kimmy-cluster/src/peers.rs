@@ -213,19 +213,27 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // (ADR-133): a fresh, cheap read of what this node holds —
                 // metadata only — and this node's own count of whichever
                 // collection is up next, computed once and reused against
-                // every peer this tick rather than once per peer. A failure
-                // here is not silently treated as "nothing to probe" — that
-                // would be indistinguishable from a clean probe in a check
-                // whose whole purpose is making silence impossible.
-                let mine_collections = match engine.all_collection_ids() {
-                    Ok(ids) => ids,
-                    Err(e) => {
-                        warn!(error = %e, "divergence check: could not list this node's own \
-                              collections; skipping this tick's probe rotation");
-                        BTreeSet::new()
-                    }
-                };
-                let probe = divergence.advance_probe(&mine_collections).map(|id| {
+                // every peer this tick rather than once per peer.
+                //
+                // A failure to read it must not reach `advance_probe` at
+                // all, empty set or otherwise: `advance_probe` sweeps its
+                // count-side state against whatever it is handed, on the
+                // reasoning that a collection absent from that set is
+                // *provably* gone (ADR-133, defect 6) — true of a fresh
+                // read, and false of a transient error standing in for one.
+                // Passing an empty set on error used to be harmless, before
+                // that sweep existed; now it would read a storage hiccup as
+                // "this node holds nothing" and silently discard every live
+                // count finding, the exact silence this check exists to
+                // rule out. `advance_probe_on` is where that decision lives,
+                // pulled out on its own so it is a function with a test
+                // rather than a branch inside this loop.
+                let mine_collections = engine.all_collection_ids();
+                if let Err(e) = &mine_collections {
+                    warn!(error = %e, "divergence check: could not list this node's own \
+                          collections; skipping this tick's probe rotation");
+                }
+                let probe = advance_probe_on(&mut divergence, mine_collections).map(|id| {
                     let mine_count = match engine.count_by_id(id) {
                         Ok(count) => count,
                         Err(e) => {
@@ -363,6 +371,31 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     }
 }
 
+/// The collection id this tick probes for a count, given the result of
+/// reading this node's own collection set — or `None`, without touching
+/// `tracker` at all, when that read failed.
+///
+/// A read failure is *not* an empty set standing in for one:
+/// `DivergenceTracker::advance_probe` sweeps its count-side confirmation
+/// state against whatever it is handed, on the premise that a collection
+/// absent from that set is provably gone this node no longer holds it
+/// (ADR-133, defect 6). That premise holds for a genuine read and fails for
+/// a read that merely errored — a transient storage hiccup is not evidence
+/// this node suddenly holds zero collections, and reading it that way would
+/// silently discard every live count finding for as long as the error
+/// lasts. So `advance_probe` is not called at all on that path: the
+/// rotation's cursor stays exactly where it was, and every finding survives
+/// untouched into the next tick, which may read cleanly.
+fn advance_probe_on<E>(
+    tracker: &mut kimmy_storage::DivergenceTracker,
+    mine: Result<BTreeSet<kimmy_core::CollectionId>, E>,
+) -> Option<kimmy_core::CollectionId> {
+    match mine {
+        Ok(ids) => tracker.advance_probe(&ids),
+        Err(_) => None,
+    }
+}
+
 /// Resolve every seed source, dropping this node's own address.
 async fn resolve(seeds: &[SeedSource], local: SocketAddr) -> BTreeSet<SocketAddr> {
     let mut out = BTreeSet::new();
@@ -470,5 +503,34 @@ mod tests {
             }
         }
         assert_eq!(tracker.confirmed_count(), 1, "confirms at 8 peers despite fanout 3");
+    }
+
+    /// Defect 6's sweep introduced a regression of its own: a transient
+    /// failure to read this node's own collections must not be handed to
+    /// `advance_probe` as an empty set, or it silently discards every live
+    /// count finding on the strength of an error rather than a fact.
+    #[test]
+    fn a_read_failure_leaves_confirmed_count_findings_untouched() {
+        let mut tracker = kimmy_storage::DivergenceTracker::new();
+        let p = NodeId::from_bytes(1u128.to_be_bytes());
+        let mismatched = kimmy_storage::DivergenceFindings {
+            existence: BTreeSet::new(),
+            count: Some((kimmy_core::CollectionId(7), true)),
+        };
+        tracker.observe(p, mismatched.clone());
+        tracker.observe(p, mismatched);
+        assert_eq!(tracker.confirmed_count(), 1, "confirmed before the read failure");
+
+        // Stands in for `engine.all_collection_ids()` failing this tick —
+        // not for it succeeding with nothing in it.
+        let failed: Result<BTreeSet<kimmy_core::CollectionId>, &str> = Err("transient");
+        let probe = advance_probe_on(&mut tracker, failed);
+
+        assert_eq!(probe, None, "nothing to probe when the read itself failed");
+        assert_eq!(
+            tracker.confirmed_count(),
+            1,
+            "a read failure must not be read as \"this node holds nothing\""
+        );
     }
 }
