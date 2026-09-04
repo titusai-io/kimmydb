@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use std::collections::BTreeSet;
+
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
 use kimmy_cluster::transport::{DivergenceProbe, serve, sync_once};
@@ -1166,16 +1168,22 @@ async fn a_peer_that_missed_collected_history_is_still_named_and_still_snapshots
 // The cross-member divergence check (ADR-133)
 // -----------------------------------------------------------------------
 
-/// The load-bearing case: reproduce the *silence*, not just the divergence.
+/// Reproduce the outside-visible shape of finding 14 directly, without
+/// depending on its now-fixed cause: a witnessed vector that claims to cover
+/// a peer's advertised one while a collection that peer holds is simply
+/// missing here.
 ///
-/// Finding 14's defect (fixed by ADR-126/127) is what made a node witness a
-/// peer's stamp without ever applying the entry behind it — but any future
-/// bug in the same class produces the identical outside-visible state, so
-/// this test manufactures that state directly with `apply_peer_batch`
-/// rather than depending on the now-fixed bug, and asserts the divergence
-/// check catches the *class*: a member whose witnessed vector claims to
-/// cover a peer's advertised one, while a collection that peer holds is
-/// simply missing here, and every ordinary sync signal reads healthy.
+/// This checks the mechanism at `sync_once`'s level — that `outcome.divergent`
+/// actually names the stranded collection. It is deliberately *not* offered
+/// as proof that every other signal stays quiet: on this code path
+/// `SyncOutcome`'s other fields (`lag_ms`, `applied`, `superseded`, `ddl`,
+/// `ddl_refused`, `unknown_collection`) are `Default::default()` by
+/// construction, whether or not anything is wrong, so asserting them here
+/// would pass for any input and prove nothing. The real proof that the rest
+/// of the signal surface stays healthy while this one moves is
+/// `the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy`
+/// below, which drives the actual hooks `kimmy-api`'s metrics are pushed
+/// through.
 #[tokio::test]
 async fn the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_cover() {
     let a = node().await;
@@ -1196,23 +1204,18 @@ async fn the_divergence_check_finds_a_collection_the_witness_wrongly_claims_to_c
     let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
 
-    assert!(
-        outcome.divergent.contains(&ca.id),
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::from([ca.id])),
         "the check must catch what the witnessed vector hides: {outcome:?}"
     );
-    // Every signal an operator already watches reads exactly as healthy as
-    // it did throughout finding 14: no lag, nothing pulled, nothing failed,
-    // nothing refused.
-    assert_eq!(outcome.lag_ms, 0, "the false belief reads as caught up");
-    assert_eq!(outcome.applied, 0);
-    assert_eq!(outcome.superseded, 0);
-    assert_eq!(outcome.ddl, 0);
-    assert_eq!(outcome.ddl_refused, 0);
-    assert_eq!(outcome.unknown_collection, 0);
 }
 
 /// A genuinely converged pair reports nothing divergent — the gauge's
-/// resting state.
+/// resting state. `mine_count` comes from a real `count_by_id`, the way
+/// `kimmy-cluster::peers` actually builds a probe, not a hardcoded value —
+/// hardcoding it here would exercise the existence half only and never the
+/// count comparison against genuine engine state.
 #[tokio::test]
 async fn a_converged_cluster_has_no_divergence() {
     let a = node().await;
@@ -1223,17 +1226,45 @@ async fn a_converged_cluster_has_no_divergence() {
     sync(&a, &b).await;
     sync(&a, &b).await; // both directions witness the other's tail
 
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count: Some(1) });
+    let mine_count = b.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
-    assert!(outcome.divergent.is_empty(), "{outcome:?}");
+    assert_eq!(outcome.divergent, Some(BTreeSet::new()), "{outcome:?}");
 }
 
-/// A member legitimately behind must not be reported as divergent — the
-/// check runs only when the round finds nothing left to pull, so ordinary
-/// catch-up never reaches it in the first place, however many rounds it
-/// takes.
+/// A round whose pull does not reach the peer's true tail — the backlog
+/// exceeds the batch cap — must not spend a message on the check at all:
+/// `exhausted` is exactly the fact that a truncated window can fake, so the
+/// check must not run on the strength of a batch that was itself truncated.
 #[tokio::test]
-async fn a_member_legitimately_behind_is_never_reported_as_divergent() {
+async fn a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    // Comfortably over the batch cap, so the first pull is truncated and
+    // `exhausted` reads `false`.
+    for i in 0..(MAX_BATCH + 200) {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
+    let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
+    assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
+    assert!(!first.exhausted, "the batch cap truncated this round's window: {first:?}");
+    assert_eq!(first.divergent, None, "not checked, not found clean: {first:?}");
+}
+
+/// A round whose pull *does* reach the peer's true tail — the whole backlog
+/// fits under the batch cap — runs the check too, on the same round, and it
+/// correctly finds nothing wrong. This is what closes the gap a
+/// nothing-to-pull-only gate leaves open on a busy cluster: a round that is
+/// still pulling something is not automatically exempt, only a round whose
+/// pull was itself truncated is.
+#[tokio::test]
+async fn a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong() {
     let a = node().await;
     let b = node().await;
 
@@ -1243,23 +1274,23 @@ async fn a_member_legitimately_behind_is_never_reported_as_divergent() {
     }
 
     let probe = Some(DivergenceProbe { id: ca.id, mine_count: None });
-    // B is behind by everything above on the very first round it makes: the
-    // check must not fire here at all, not merely fire and clear.
     let first = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
     assert!(first.applied > 0, "a genuine catch-up round: {first:?}");
-    assert!(first.divergent.is_empty(), "behind is not divergent: {first:?}");
-
-    // Converged now; a further round finds nothing to pull and the check
-    // agrees with reality.
-    let second = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
-    assert_eq!(second.total(), 0);
-    assert!(second.divergent.is_empty(), "{second:?}");
+    assert!(first.exhausted, "40 entries fit comfortably under the batch cap: {first:?}");
+    assert_eq!(first.divergent, Some(BTreeSet::new()), "checked, and correctly clean: {first:?}");
 }
 
 /// The probed collection's count is the only document read this exchange
 /// performs — the bound `Engine::count_by_id` and `next_probe` exist to
-/// keep. A second, unprobed collection full of documents costs nothing:
-/// its existence is compared by id, never by walking it.
+/// keep. A second, unprobed collection with a *real* count mismatch costs
+/// nothing this round: its existence is compared by id, never by walking
+/// it, and its count is simply not asked for.
+///
+/// The mismatch on "big" is manufactured with `apply_peer_batch` rather than
+/// a local write on B, deliberately: a local write on B would itself trip
+/// the peer-staleness guard (`divergence_probe_for`) and suppress the probe
+/// for an unrelated reason, which would not test the bound this case exists
+/// to pin.
 #[tokio::test]
 async fn only_the_probed_collection_is_ever_counted() {
     let a = node().await;
@@ -1274,16 +1305,175 @@ async fn only_the_probed_collection_is_ever_counted() {
     sync(&a, &b).await;
     sync(&a, &b).await;
 
-    // Only "small" is named as the probe; "big" is not, despite existing on
-    // both sides. A mismatched count planted on the *unprobed* collection
-    // must go unnoticed this round -- it is not this round's turn.
-    let cb_big = b.engine.get_collection("shop", "big").unwrap();
-    b.engine.insert(&cb_big, doc! { "_id": "extra-on-b" }).unwrap();
+    // A's "big" grows further; B is made to believe it has already
+    // witnessed the growth without ever applying it — a real, genuine count
+    // mismatch B does not know about, on a collection neither side is
+    // probing this round.
+    a.engine.insert(&big, doc! { "_id": "extra-on-a" }).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
 
-    let probe = Some(DivergenceProbe { id: ca.id, mine_count: Some(1) });
+    let mine_count = b.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
     let outcome = sync_once(&b.engine, a.addr, SECRET, probe).await.unwrap();
-    assert!(
-        outcome.divergent.is_empty(),
-        "the unprobed collection's count divergence is out of scope this round: {outcome:?}"
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::new()),
+        "the unprobed collection's real count divergence is out of scope this round: {outcome:?}"
     );
+}
+
+/// A peer that has simply not pulled this node's own recent writes yet must
+/// not be flagged divergent on their strength — that is ordinary
+/// replication lag, indistinguishable from real divergence by a symmetric
+/// count comparison alone, which is exactly why `divergence_probe_for` is
+/// asymmetric. A is the requester and is *ahead* of B on A's own writes; B
+/// has not pulled them, so B's answer would report a stale, lower count for
+/// the same collection if asked.
+#[tokio::test]
+async fn a_peer_that_has_not_pulled_this_nodes_own_writes_is_not_flagged_divergent() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "0" }).unwrap();
+    sync(&a, &b).await;
+    sync(&a, &b).await; // converged: both hold one document
+
+    // A writes more; B never pulls. From A's side there is nothing new to
+    // pull *from B*, so A's own gate reads "nothing to pull" — but B is the
+    // one behind here, not A.
+    for i in 1..=500 {
+        a.engine.insert(&ca, doc! { "_id": i.to_string() }).unwrap();
+    }
+
+    let mine_count = a.engine.count_by_id(ca.id).unwrap();
+    let probe = Some(DivergenceProbe { id: ca.id, mine_count });
+    let outcome = sync_once(&a.engine, b.addr, SECRET, probe).await.unwrap();
+    assert_eq!(
+        outcome.divergent,
+        Some(BTreeSet::new()),
+        "B merely trails A; the guard must suppress the stale count, not report it: {outcome:?}"
+    );
+}
+
+/// The real proof that the silence claim holds: run the actual replication
+/// loop, with the actual hooks `kimmyd` wires straight into `kimmy-api`'s
+/// metrics, and watch every one of them while a stranded collection sits
+/// undetected on the level below `sync_once`'s reported fields (which the
+/// mechanism-level test above cannot use as evidence — see its own
+/// comment). `on_round` is what `kimmy_sync_failures_total`,
+/// `kimmy_sync_peers_backing_off`, `kimmy_sync_ddl_refused_total` and
+/// `kimmy_sync_divergent_collections` are pushed from; `on_lag` is what
+/// `kimmy_replication_lag_seconds` is pushed from.
+#[tokio::test]
+async fn the_replication_loop_reports_a_stranded_collection_while_every_other_signal_stays_healthy()
+{
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "stranded").is_err());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let (lag_tx, mut lag_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    config.on_lag = Some(Arc::new(move |lag| {
+        let _ = lag_tx.send(lag);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the gauge-feeding report never confirmed the divergence"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "nothing about this failed a round: {report:?}");
+        assert_eq!(report.backing_off, 0, "the peer answered every round: {report:?}");
+        assert_eq!(report.ddl_refused, 0, "nothing was refused: {report:?}");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "exactly the one stranded collection");
+    looping.abort();
+
+    // Drain what `on_lag` saw across the whole run: it must never have
+    // reported anything but 0 — the exact reading finding 14 left on every
+    // member throughout.
+    let mut lags = Vec::new();
+    while let Ok(lag) = lag_rx.try_recv() {
+        lags.push(lag);
+    }
+    assert!(!lags.is_empty(), "on_lag must have fired at least once");
+    assert!(lags.iter().all(|&l| l == 0), "lag must read 0 throughout: {lags:?}");
+}
+
+/// Finding 14's own precondition was a member more than one batch behind —
+/// the shape of a modest, continuously busy cluster, not an idle one. A gate
+/// on "nothing left to pull" alone would never fire here, because there is
+/// always something new to pull. The check must also run whenever a round's
+/// own pull reaches the peer's tail, batch cap or not, so detection does not
+/// go dark for the whole duration of ordinary write traffic.
+#[tokio::test]
+async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let stranded = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&stranded, doc! { "_id": "1" }).unwrap();
+    let busy = a.engine.create_collection("shop", "busy").unwrap();
+
+    let theirs0 = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs0, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "stranded").is_err());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    // A modest busy cluster: a handful of writes between rounds, well under
+    // the batch cap, so a round pulling them still reaches the tail.
+    let a_engine = Arc::clone(&a.engine);
+    let writer = tokio::spawn(async move {
+        for i in 0..20 {
+            for j in 0..5 {
+                a_engine.insert(&busy, doc! { "_id": format!("d{i}-{j}") }).unwrap();
+            }
+            tokio::time::sleep(Duration::from_millis(60)).await;
+        }
+    });
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the check never confirmed under sustained write load"))
+            .expect("the loop must keep reporting");
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "the stranded collection, found despite the concurrent writes");
+    looping.abort();
+    writer.abort();
 }
