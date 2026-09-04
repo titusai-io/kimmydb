@@ -6798,12 +6798,14 @@ these is a typo on exactly the field where a silent no-op costs the most, and
 none of them could be seen from the response. One route refused the same
 thing: `POST .../vector`, because `VectorConfig` and `ProviderConfig` in
 `kimmy-core` carried the attribute since they were written, so a client met a
-`422` for an unknown field on one route and a `200` on every other. The
-reference documented neither. The compatibility page described the refusal as
-the behaviour a client should expect from an older node — "several request
-bodies reject unknown fields deliberately" — which was true of two structs.
-Making it true of all of them is making the documented contract the actual
-one.
+`422` for an unknown field on one route and a `200` on every other. (That was
+true of every provider kind but one: `ProviderConfig::Byo` was a unit variant,
+which `deny_unknown_fields` does not reach, and stayed open until ADR-134 gave
+it an empty struct body.) The reference documented neither. The compatibility
+page described the refusal as the behaviour a client should expect from an
+older node — "several request bodies reject unknown fields deliberately" —
+which was true of two structs. Making it true of all of them is making the
+documented contract the actual one.
 
 The argument for refusing is the same one ADR-057 made for the error envelope:
 a client can only act on what it can see. A field the server does not read is
@@ -7596,11 +7598,12 @@ searches, all of which ADR-121 names as closed, add to the four write shapes
 finding 12 itself demonstrated the hole on.
 
 `POST .../vector` is on that list too — ADR-121 names "a vector
-configuration's `provider`" as a nested shape it closes — but not by putting
-the attribute on `kimmy_core::VectorConfig`/`ProviderConfig` themselves. Those
-two are not only this route's request body; they are also the stored form,
-inside `CollectionMeta`, and the replicated one, inside `VectorSet`'s BSON —
-and several of their fields (`ProviderConfig::{OpenAi,Cohere,Gemini}`'s
+configuration's `provider`" as a nested shape it closes, for every provider
+kind but `byo` until ADR-134 — but not by putting the attribute on
+`kimmy_core::VectorConfig`/`ProviderConfig` themselves. Those two are not only
+this route's request body; they are also the stored form, inside
+`CollectionMeta`, and the replicated one, inside `VectorSet`'s BSON — and
+several of their fields (`ProviderConfig::{OpenAi,Cohere,Gemini}`'s
 `endpoint`, `CustomHttp`'s `api_key_env`) have `#[serde(default)]` but no
 `skip_serializing_if`, unlike `dimensions` and `max_tokens` beside them, so an
 unset one has always serialized as a literal `null` rather than an absent
@@ -8965,5 +8968,88 @@ Defended by `crates/kimmy-storage/src/divergence.rs`'s unit tests —
 `a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` /
 `a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`
 (the exhausted boundary, both sides).
+
+---
+
+## ADR-134 — A tagged variant that takes no configuration carries an empty body, so an unknown key beside it is refused
+
+**Decision.** `ProviderConfig`'s `byo` variant is declared `Byo {}` — an empty
+struct body — in both `kimmy_core::vector_meta::ProviderConfig` and its
+request-only mirror `kimmy_api::vectors::ProviderConfigInput`, in place of the
+unit variant it was. `#[serde(deny_unknown_fields)]` is enforced by the
+field-matching visitor the derive writes for a variant's *body*; an
+internally-tagged unit variant has no body, so the deserializer written for it
+consumes whatever content is left beside the tag and discards it rather than
+matching any of it against a field list, and the attribute both enums have
+carried since they were written did not reach the one variant that took no
+fields. Empty braces give it a body to enforce against. The rule
+that generalises, for every enum after this one: **a variant of an
+internally-tagged enum that takes no configuration is written `V {}`, never
+`V`** — the braces are what put it under the enum's own closure.
+
+**Why.** `{"kind":"byo","nosuch":1}` on `POST /v1/db/{db}/coll/{coll}/vector`
+answered `200` and configured the collection, having read `nosuch` and thrown
+it away; the same body under `"kind":"open_ai"` answered `422` naming the
+field. That is ADR-121's own defect, surviving inside the one route ADR-121
+cites as having been correct all along — and `byo` is the *default* provider,
+so the kind most likely to be configured was the kind that was open. A client
+cannot tell from a `200` that the server did not honour what it sent; that is
+the whole of ADR-121's argument, and it applies here unchanged. The refusal is
+now serde's own — *unknown field `nosuch`, there are no fields* — in the
+standard envelope, and it falls only on a request that was already wrong.
+
+The same hole was open at the operator's end. `[vector.providers.<name>]`
+profiles deserialize into a `BTreeMap<String, ProviderConfig>` in `kimmyd`'s
+configuration, so a profile written `kind = "byo"` with a misspelt key beside
+it started the node, while every other `kind` refused to start and named the
+key it did not know. A file that is parsed at startup, and before that by
+`kimmyd check-config`, exists so a typo surfaces there rather than as
+behaviour nobody asked for; one variant silently exempt from that is the
+worst place for it.
+
+**Both types, not only the request mirror.** ADR-128 reserves
+`ProviderConfigInput` for refusals the stored form cannot bear, and that
+constraint is real — but it is about `null`-versus-absent, where the stored
+shape has always written a literal `null` for an unset defaulted field and
+refusing it would stop a node reading its own configuration. An unknown field
+is not that case: `deny_unknown_fields` has been on
+`kimmy_core::ProviderConfig` since it was written, and seven of its eight
+variants have always enforced it — on the request, on the replication wire, on
+disk and in the profile map alike. Closing only the mirror would put the
+eighth variant's closure somewhere other than where the other seven live,
+which is where the next reader loses the thread, and would leave the
+`[vector.providers.<name>]` map open, since that map reads the core type and
+never the mirror.
+
+**No shim, and no roll ordering: the encoded form does not move.** `Byo` and
+`Byo {}` encode identically, measured against this workspace's own dependency
+versions (serde 1, serde_json 1, bson 3, toml 1) rather than assumed:
+
+- JSON — both serialize to `{"kind":"byo"}`, and `Byo {}` reads back a record
+  written by `Byo`.
+- BSON — `bson::serialize_to_document` yields
+  `Document({"kind": String("byo")})` for both, and `Byo {}` deserializes a
+  document produced by `Byo`. That covers `VectorSet` on the replication wire
+  and `CollectionMeta` on disk.
+- TOML — `kind = "byo"` parses into both, which is the profile map.
+
+So nothing stored needs rewriting, a mixed-version cluster exchanges the same
+bytes it did before, and there is no order in which members must be rolled.
+Nor is there an upgrade hazard from the keys that used to be accepted: they
+were *ignored*, never stored, so no `byo` record on disk carries one for the
+stricter type to trip over. The only behaviour that moves is the one being
+fixed.
+
+**Cost.** Breaking, for a request or a profile that was already wrong. A `POST
+.../vector` body carrying an unknown key beside `"kind":"byo"` answers `422`
+where it answered `200`, and a `[vector.providers.<name>]` profile carrying
+one stops the node at startup rather than running with a setting nobody wrote.
+A `byo` configuration with no stray key is unaffected in every direction.
+`docs/openapi.yaml` still cannot mark `ProviderConfig`
+`additionalProperties: false` — `GET .../vector` and `describe` return it, and
+ADR-121's rule keeps a returned schema open so a new response field stays
+additive — so the refusal is stated there in prose, the way `VectorConfig`'s
+own already is, and `docs/vectors.md` says it beside the provider that has no
+fields to give.
 
 ---

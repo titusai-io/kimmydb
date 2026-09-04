@@ -84,6 +84,28 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   rises on both. Roll every member. Nothing on disk changes, and no client-facing
   route, response or `/v1` promise is affected. ADR-127.
 
+- **A `byo` provider configuration carrying a field that does not exist is now
+  refused instead of accepted.** `{"kind":"byo","nosuch":1}` on
+  `POST .../vector` answered `200` and configured the collection, having read
+  `nosuch` and dropped it; it now answers `422` naming the field, the way
+  `open_ai`, `ollama`, `custom_http`, `cohere`, `gemini`, `local` and `profile`
+  always have. `byo` is the default provider, so this was the kind most likely
+  to be configured and the only one that was open — its variant carried no
+  fields at all, and the attribute that refuses unknown fields does not reach a
+  variant with no body. The same key under a `[vector.providers.<name>]`
+  profile now stops the node at startup rather than being ignored, and
+  `kimmyd check-config` reports it without starting anything. A `byo`
+  configuration with no stray key is unaffected in either place. **Breaking for
+  a client that sends a field beside `"kind":"byo"` the provider does not
+  define, and for an operator whose configuration file carries one — that node
+  refuses to start on a file it started on before** — and a `0.MINOR` bump for
+  it. **The encoded form is unchanged** — `{"kind":"byo"}` in JSON, a one-key
+  document in the BSON that goes on the replication wire and to disk,
+  `kind = "byo"` in TOML, all identical before and after — so nothing stored
+  needs rewriting, there is no shim, and members may be rolled in any order.
+  The keys that used to be accepted were never stored, so no existing record
+  carries one. ADR-134.
+
 ### Fixed
 
 - **A member no longer silently and permanently loses committed documents to a

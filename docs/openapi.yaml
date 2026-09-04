@@ -3474,6 +3474,17 @@ components:
         external — no API key, no network, no model download. API keys are
         named by environment variable and never stored in collection metadata.
 
+        The properties below are the union across every `kind`, not a list any
+        one of them takes; which kind takes which is the provider table in
+        `docs/vectors.md`. A `kind` takes only its own, and a request body
+        carrying any other is refused `422` naming it (ADR-121).
+        `byo` takes **none** — `{"kind":"byo"}` and nothing else — so
+        `{"kind":"byo","model":"..."}` is refused rather than configured as a
+        collection that embeds nothing (ADR-134). The schema is not marked
+        `additionalProperties: false` because `GET .../vector` and `describe`
+        return it and a response schema stays open; the refusal is the
+        server's, and this is where it is written down.
+
         The node's provider policy decides what is accepted (ADR-115): an
         `api_key_env` outside `vector.provider.allowed_key_env` — and any
         `KIMMY_*` name other than `KIMMY_PROVIDER_*`, whatever that setting
