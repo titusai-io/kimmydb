@@ -45,7 +45,48 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   counts across members directly — lag 0 and quiet counters are precisely this
   defect's signature, not evidence of convergence. ADR-126, ADR-127.
 
+- **A replayed index drop no longer deletes a newer index of the same name.**
+  An index that is created, dropped and created again derives the same id each
+  time, and anti-entropy re-serves overlapping windows as a matter of course —
+  so the drop between the two creations arrived again after the recreation and,
+  with nothing to compare it against, removed an index nobody had dropped. It
+  now leaves its tombstone and leaves the index alone. Observed on a
+  three-member cluster running 0.21.0: a collection listed **no indexes on any
+  member**, though three stood on all three an hour earlier. This also closes
+  the half that could not repair itself — where the newer creation is the
+  member's own, no peer can re-serve it, so the index stayed dropped there for
+  good. ADR-132.
+
+- **Two members that create one index name with different definitions now
+  converge instead of staying divergent.** ADR-123 left both standing, each
+  member keeping its own and counting the refusal; the 0.21.0 round watched two
+  collections sit that way, with `kimmy_sync_ddl_refused_total` at 9 / 15 / 9
+  and no path back to one schema. The later creation stamp now wins on every
+  member, which is how two concurrent writes to one document already settle.
+  The member whose definition loses logs a warning naming the index and what
+  differed, and rebuilds the name under the winner.
+
+  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case**.
+  It is unchanged for the case that still needs an operator — a definition a
+  member's own documents cannot be built under — and, where the winning
+  definition cannot be built on the receiving member, that member keeps the
+  index it already had rather than ending with neither. Creating a conflicting
+  index through the API is unaffected: a client is still refused `409`, naming
+  what differs. ADR-132.
+
 ### Changed
+
+- **Breaking, stored format and cluster wire: an index carries the stamp of its
+  creation.** `IndexMeta` gained `created`, recorded in the collection metadata
+  and carried in the `CreateIndex` entry, and it is what the two fixes above
+  compare against. There is no shim and no migration — pre-1.0 the format is
+  changed outright. **An index that already exists on disk carries no stamp,
+  and reads as older than every drop and every rival**: a replayed drop removes
+  it and a rival definition is refused and counted, which is exactly the
+  behaviour of 0.21.0, so nothing changes for it until it is next recreated.
+  Recreate an index whose name two members may disagree about if you want it
+  settled rather than counted. Nothing is added to `/metrics`, to the index
+  listing on `/v1`, or to `docs/openapi.yaml`. ADR-132.
 
 - **Breaking, cluster wire: a batch answer now carries where the window
   ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's

@@ -227,6 +227,40 @@ drop is recorded in `indexes_dropped` under the drop's stamp and kept for
 it. Creating an index of the same name again, stamped after the drop, is a new
 index and wins. See [ADR-123](decisions.md).
 
+**Every index carries the stamp of its creation**, and two questions are
+answered by comparing against it.
+
+*A drop older than the index it names is history.* A name that has been
+created, dropped and created again derives the same id each time, and
+anti-entropy re-serves overlapping windows as a matter of course — so the drop
+between the two creations arrives again after the recreation. It records its
+tombstone, which never moves backwards, and leaves the newer index alone. A
+drop stamped **after** the index it names still removes it, which is the
+ordinary case.
+
+*Two definitions under one name settle on the later stamp.* Two members can
+create the same index name with different definitions while they cannot see
+each other; neither is wrong, and neither can be kept without the cluster
+holding two schemas indefinitely. The later creation stamp wins on every
+member — the same rule, and the same stamp comparison, that settles two
+concurrent writes to one document. The member whose definition loses logs a
+warning naming the index and which parts of the definition moved, and rebuilds
+the name under the winner. Nothing is counted for this: it is the conflict
+rule working, not a divergence. **Creating a conflicting definition through
+the API is unaffected** — a client is refused `409 conflict`, naming what
+differs, because a client is there to be told.
+
+Where the winning definition cannot be built over the receiving member's own
+documents, the whole replacement is abandoned: that member keeps the index it
+already had, the refusal is counted in `kimmy_sync_ddl_refused_total` and
+logged, and the round goes on.
+
+**An index created before this version carries no creation stamp**, and reads
+as *older* than every drop and every rival: a replayed drop removes it, and a
+rival definition is refused and counted rather than resolved. That is exactly
+the behaviour of the version before it, and it ends the first time the index
+is recreated. See [ADR-132](decisions.md).
+
 ---
 
 ## The planner

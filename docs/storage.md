@@ -232,6 +232,13 @@ forbids, so it did not merely resurrect the index — it failed the round, for
 ever. A creation stamped before the tombstone is history; one stamped after it
 is a new index. See [ADR-123](decisions.md).
 
+The tombstone answers "when was this name dropped"; the **index's own
+`created` stamp** answers "when did the index now standing under it begin".
+Both are needed: a replayed drop older than the index it names leaves it
+alone and records its tombstone anyway, so a name that was created, dropped
+and created again keeps its newest index rather than losing it to a re-served
+window. See [ADR-132](decisions.md).
+
 > **Sharp edge.** The retention window must exceed the longest partition you are
 > willing to tolerate. If a partitioned peer rejoins after tombstones have been
 > collected here, documents it deleted — and collections and indexes it

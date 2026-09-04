@@ -188,7 +188,7 @@ Five kinds carry schema changes between nodes:
 |---|---|
 | `CreateCollection` | `{ db, name }` |
 | `DropCollection` | `{ db, name }` |
-| `CreateIndex` | the full `IndexMeta`, including its derived id |
+| `CreateIndex` | the full `IndexMeta`, including its derived id and its creation stamp |
 | `DropIndex` | `{ db, collection, index }` |
 | `ConfigureVectors` | `{ db, collection, config }` — `config: null` disables |
 
@@ -198,7 +198,9 @@ meeting a collection for the first time could not otherwise learn what to call
 it.
 
 They are *operations*, not a metadata snapshot, so two nodes adding different
-indexes during a partition both keep theirs — see [ADR-033](decisions.md).
+indexes during a partition both keep theirs — see [ADR-033](decisions.md). Two
+nodes adding a different definition under the *same name* is the other case,
+and is settled by the creation stamp below.
 
 **Applying one must not log a new entry.** The originating entry is appended as
 received; minting a local one would send the change back to the peer, which
@@ -214,14 +216,29 @@ and a create replayed after it aged out rebuilt what it removed. For an index
 the rebuild also backfills over this node's current documents, which is why
 the tombstone was needed before retention ever ran (ADR-034, ADR-123).
 
+**A drop knows which index it was aimed at.** The tombstone records when an
+index was *dropped*; the index's own `created` stamp records when the one now
+standing under that name began. A `DropIndex` older than that is history: it
+leaves its tombstone and leaves the index alone, so a window re-served across
+a recreation of the same name stops removing an index nobody dropped. The
+`DropCollection` arm's incarnation rule, one level down (ADR-081,
+[ADR-132](decisions.md)).
+
+**Two definitions under one name settle on the later creation stamp**, on
+every member, the way two concurrent writes to one document do — the loser's
+entries are removed in the transaction that builds the winner. Where either
+definition carries no creation stamp there is nothing to compare, and the
+arrival is refused as below.
+
 **One that cannot be applied is skipped, not retried.** A replicated index
-definition this node's documents cannot be built under, or a name already
-taken here by a different definition, is refused by this node's own data, and
-re-delivering the entry unchanged could never succeed. So the entry is
-witnessed, not appended, counted in `kimmy_sync_ddl_refused_total`, and
-logged at warning with the reason; the round goes on. Any *other* error
-still fails the round — a round that skips what it cannot understand is how
-corruption becomes convergence ([ADR-123](decisions.md)).
+definition this node's documents cannot be built under, or a name taken here
+by a different definition that cannot be settled against a stamp, is refused
+by this node's own data, and re-delivering the entry unchanged could never
+succeed. So the entry is witnessed, not appended, counted in
+`kimmy_sync_ddl_refused_total`, and logged at warning with the reason; the
+round goes on. Any *other* error still fails the round — a round that skips
+what it cannot understand is how corruption becomes convergence
+([ADR-123](decisions.md)).
 
 The older payload-free `Collection` kind is still decoded so existing oplogs
 load, but is never written and cannot be applied — it names nothing.
