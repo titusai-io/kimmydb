@@ -45,10 +45,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   this check, and the cutover has its own rollout shape in the operations
   guide. ADR-133.
 
-
 ### Changed
-
-
 
 - **Breaking, stored format and cluster wire: an index carries the stamp of its
   creation.** `IndexMeta` gained `created`, recorded in the collection metadata
