@@ -7353,3 +7353,112 @@ and the `cluster.sync` span's `applied`. The measured benchmark numbers in
 second commit is gone.
 
 ---
+
+## ADR-131 — `explain: true` on `update` and `delete` plans the write; it does not perform it
+
+**Decision.** `explain: true` on `POST .../update` and `POST .../delete` no
+longer executes the write it was asked to describe. Both routes now run the
+same read-only scan `find` and `count` already use — `exec::visit_matching`
+— over the same primary-key/index/scan choice `candidates_for` makes for the
+real write, and report its `QueryStats` as `explain`, exactly as `find`
+does. Nothing is written and no write transaction opens. The write-outcome
+fields keep their existing names and existing meaning — "what was written" —
+so under `explain` they report that nothing was: `matched`, `modified` and
+`commits` are `0` on `update`; `deleted` and `commits` are `0` on `delete`;
+`stamp` is absent on both — in every case identical to what a write that
+matched nothing already reports today. What the write *would* touch is
+`explain.documentsMatched`, the field `find`'s own `explain` has always
+carried for the same question asked of a read. Covered by
+`explain_plans_a_write_without_performing_it`, which drives a
+single-document and a `multi: true` case on both routes, asserts the
+response fields, asserts the engine's own commit counter is unmoved
+(`state.engine.commits()`), and reads the document(s) back to confirm
+nothing changed — plus a `find`-with-`explain` control, which was never at
+risk. The existing index-routing tests
+(`update_uses_an_index_when_one_applies`,
+`delete_uses_an_index_when_one_applies`,
+`without_an_index_the_write_paths_still_scan_and_still_agree`,
+`a_single_update_still_touches_exactly_one_document`,
+`an_indexed_update_over_an_array_field_still_matches_every_document`,
+`a_targeted_write_on_id_also_takes_the_fast_path`) now assert the plan
+through `explain` and then perform the write as a second, unexplained
+request, so both halves — "the right index" and "the write still lands" —
+stay proven.
+
+**Why.** Found by the 2026-09 test round: `POST .../update` and
+`POST .../delete` performed their write whenever `explain: true` was set,
+`multi: true` included. A `multi: true` `delete` with `explain: true`
+deleted every document in the collection; the equivalent `update` rewrote
+every one. `explain` is a declared field on both routes, so this was not the
+unknown-field gap ADR-121 closes — the documentation simply never said these
+two routes execute, and `explain`'s only stated purpose, in `http-api.md`
+and in the `Explain` schema, was to report what happened, each time phrased
+in the past tense. MongoDB's `explain` on an update or a delete does not
+execute it, and this project documents its MongoDB divergences deliberately
+(`deviations.md`) — this one was not among them. The natural, careful use of
+`explain` is to inspect a broad `multi` write before committing to it, and
+that use was exactly the one that performed it: a `200` with
+`matched`/`modified`/`commits` in the body, indistinguishable from success,
+on a request whose entire purpose was to ask first.
+
+The information `explain` wants was reachable without a write transaction
+before this: `candidates_for` already chooses a filtered write's access path
+— primary key, then index, then scan, the same order `find` plans in — with
+no engine call at all. What was missing was a way to walk that access path
+and count without writing. `find` and `count` already have one —
+`visit_matching`, built on the same read-only primitives
+(`get_record_by_encoded_key`, `visit_index_candidates`,
+`for_each_record_after`) the storage engine exposes outside any write
+transaction — so `update` and `delete` now call it instead of reading the
+plan back out of `ModifyManyOutcome` after the engine had already written.
+This is not merely avoiding the write's side effect; it also stops
+`explain` from conflating two different questions. "What would this filter
+match" and "what did this write touch" used to be answered by the same
+number, because the write always ran first; now the two routes ask the read
+question exactly the way `find` and `count` do, and only run the write
+question when there is a write to ask it of.
+
+**What the response reports, and why.** `matched`/`modified`/`deleted`/
+`commits`/`stamp` answer "what did the write do", and they keep exactly
+that meaning — an `explain` response is not a second protocol bolted beside
+the first, it is the ordinary response for a write that touched nothing,
+because nothing was touched. Overloading `matched` to also mean "what the
+plan admits" was considered and rejected: it would break the existing
+invariant `modified == matched` for a real write, silently, and a
+`{"matched": 5, "modified": 0}` reply reads as a partial failure long before
+it reads as "asked, and not done". `explain.documentsMatched` already
+existed, already means exactly the right thing on `find` and `count`, and
+now means it identically on `update` and `delete` — a caller that wants "how
+many would this touch" reads one field regardless of which of the four
+routes it asked.
+
+**Alternatives.**
+
+- *Document that it executes, and name the effect in the response* — the
+  finding's second-choice fix. Rejected: it keeps a route named `explain`
+  doing the one thing `explain` conventionally never does, on the two routes
+  where doing it by accident destroys data. A documentation fix closes the
+  gap between the code and the page; it does nothing about the gap between
+  the word and what a careful caller brings to it.
+- *A separate `dryRun` field, leaving `explain: true` executing as before.*
+  Rejected: two flags asking overlapping questions is worse than one that
+  asks the right one, and it does not close the trap — a caller who reaches
+  for `explain` first, which is the natural name to reach for, is still
+  caught by it.
+- *Report the plan's `documentsMatched` as the top-level `matched` too, so
+  `explain` "previews" the write's would-be counts.* Rejected above: it
+  breaks `modified == matched` exactly where a careful client is reading
+  most closely, and duplicates a number `explain.documentsMatched` already
+  carries.
+
+**Cost.** Breaking, and named plainly in the changelog: a client that relied
+on `explain: true` performing the write — indistinguishable, before this,
+from not setting it at all, apart from the added `explain` field — now gets
+a plan instead. `0.MINOR` under the pre-1.0 policy, alongside the round's
+other tightened refusals. `indexEntriesRead`, previously documented as
+absent for `update` and `delete` because their `explain` was read back out
+of the write's own bookkeeping, can now appear: the read-only scan is the
+same one `find` runs, and reports the same thing when an index answers it.
+`docs/openapi.yaml` and `docs/http-api.md` are updated with this ADR.
+
+---

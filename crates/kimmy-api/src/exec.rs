@@ -944,6 +944,26 @@ pub fn update(
     let filter = parse_filter(params.filter.as_ref())?;
     let update = parse_update(update_json, &params.array_filters)?;
     let expected = params.expected()?;
+    let stop_after = if multi { None } else { Some(1) };
+
+    // `explain: true` plans the write and reports it, exactly as `find`
+    // reports a read — it does not perform the write (ADR-131). The same
+    // read-only scan `find` and `count` use already produces everything
+    // `explain` reports, so this goes through it rather than through the
+    // engine's write transaction: nothing is written and no commit is
+    // spent. `matched`/`modified`/`commits` stay at the values that mean
+    // "nothing happened", because nothing did; what the write *would* touch
+    // is `explain.documentsMatched`, the same field a real write's `explain`
+    // has always carried.
+    if explain {
+        let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
+        return Ok(json!({
+            "matched": 0,
+            "modified": 0,
+            "commits": 0,
+            "explain": stats.to_json(),
+        }));
+    }
 
     // Match and write in one transaction. This used to collect the targets
     // in a read transaction and `replace` each in its own write transaction,
@@ -951,8 +971,7 @@ pub fn update(
     // already moved on from: two concurrent `$inc`s both read 5 and both
     // stored 6. The engine now runs the same in-transaction body
     // `find_and_modify` has, over every match.
-    let stop_after = if multi { None } else { Some(1) };
-    let (candidates, planned) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
     let modify = Modify {
         filter: &filter,
         sort: &[],
@@ -970,9 +989,6 @@ pub fn update(
     });
     if let Some(stamp) = single_stamp(multi, &outcome) {
         body["stamp"] = json!(stamp.encode());
-    }
-    if explain {
-        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
 }
@@ -1000,68 +1016,27 @@ fn single_stamp(
     (!multi && outcome.modified == 1).then_some(outcome.stamp).flatten()
 }
 
-/// Where a filtered write looks, in the engine's terms, plus what `explain`
-/// should say about it.
+/// Where a filtered write looks, in the engine's terms.
 ///
 /// The same planner `find` runs, in the same order — primary key first, then
 /// an index, then a scan — so an update is found exactly the way a read is.
 /// The engine re-checks a both-bounds index plan inside the transaction that
 /// scans, which is stricter than the read path can be.
-fn candidates_for(
-    filter: &filter::Filter,
-    meta: &CollectionMeta,
-) -> (kimmy_storage::Candidates, PlannedAccess) {
+///
+/// `explain` no longer reads this plan back out (ADR-131): a write's
+/// `explain` now runs the read-only [`visit_matching`] instead of the write
+/// transaction, which plans and reports for itself exactly as `find` does.
+fn candidates_for(filter: &filter::Filter, meta: &CollectionMeta) -> kimmy_storage::Candidates {
     if let Some(pk) = plan::choose_primary_key(filter) {
-        let probes = pk.keys.len();
-        return (kimmy_storage::Candidates::Keys(pk.keys), PlannedAccess::PrimaryKey { probes });
+        return kimmy_storage::Candidates::Keys(pk.keys);
     }
     match plan::choose(filter, &meta.indexes) {
-        Some(p) => (
-            kimmy_storage::Candidates::Index {
-                index_id: p.index_id,
-                ranges: p.ranges.clone(),
-                both_bounds: p.both_bounds,
-            },
-            PlannedAccess::Index {
-                name: p.index_name.clone(),
-                fields_used: p.fields_used,
-                probes: p.ranges.len(),
-            },
-        ),
-        None => (kimmy_storage::Candidates::Scan, PlannedAccess::Scan),
-    }
-}
-
-/// The access path a filtered write was planned to, for `explain`.
-///
-/// Reports the plan as chosen. The one case where the engine departs from it
-/// — a both-bounds index plan found multikey inside the transaction, which
-/// falls back to a scan — is not reflected, exactly as `find` reports the
-/// plan it chose rather than the scan it fell back to.
-enum PlannedAccess {
-    PrimaryKey { probes: usize },
-    Index { name: String, fields_used: usize, probes: usize },
-    Scan,
-}
-
-impl PlannedAccess {
-    fn stats(&self, outcome: &kimmy_storage::ModifyManyOutcome) -> QueryStats {
-        let (index, fields_used, probes, id_lookup) = match self {
-            PlannedAccess::PrimaryKey { probes } => (None, 0, *probes, true),
-            PlannedAccess::Index { name, fields_used, probes } => {
-                (Some(name.clone()), *fields_used, *probes, false)
-            }
-            PlannedAccess::Scan => (None, 0, 0, false),
-        };
-        QueryStats {
-            index,
-            fields_used,
-            examined: outcome.examined as usize,
-            matched: outcome.matched as usize,
-            probes,
-            index_entries: None,
-            id_lookup,
-        }
+        Some(p) => kimmy_storage::Candidates::Index {
+            index_id: p.index_id,
+            ranges: p.ranges.clone(),
+            both_bounds: p.both_bounds,
+        },
+        None => kimmy_storage::Candidates::Scan,
     }
 }
 
@@ -1232,7 +1207,7 @@ pub fn find_and_modify(
     // Planned the way `update` is — which now includes the primary key: a
     // `find_and_modify` on `_id` used to scan the collection under the
     // writer, because only the index planner ran here.
-    let (candidates, _) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
 
     let expected = parse_if_stamp(spec.if_stamp.as_deref())?;
     if expected.is_some() && spec.upsert {
@@ -1291,12 +1266,18 @@ pub fn delete(
     let meta = authorize(state, auth, Action::Write, db, coll)?;
     let filter = parse_filter(params.filter.as_ref())?;
     let expected = params.expected()?;
+    let stop_after = if multi { None } else { Some(1) };
+
+    // Plans without deleting, exactly as `update` does above (ADR-131).
+    if explain {
+        let stats = visit_matching(state, &meta, &filter, Order::Any, stop_after, |_, _| {})?;
+        return Ok(json!({ "deleted": 0, "commits": 0, "explain": stats.to_json() }));
+    }
 
     // The same one-transaction path as `update`, with the spec removing
     // rather than replacing: what the filter matched is exactly what is
     // tombstoned, with no read-then-write gap for another writer.
-    let stop_after = if multi { None } else { Some(1) };
-    let (candidates, planned) = candidates_for(&filter, &meta);
+    let candidates = candidates_for(&filter, &meta);
     let modify = Modify {
         filter: &filter,
         sort: &[],
@@ -1310,9 +1291,6 @@ pub fn delete(
     let mut body = json!({ "deleted": outcome.modified, "commits": outcome.commits });
     if let Some(stamp) = single_stamp(multi, &outcome) {
         body["stamp"] = json!(stamp.encode());
-    }
-    if explain {
-        body["explain"] = planned.stats(&outcome).to_json();
     }
     Ok(body)
 }

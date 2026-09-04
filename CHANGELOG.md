@@ -12,6 +12,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **`explain: true` on `update` and `delete` plans the write; it no longer
+  performs it.** Both routes previously executed the write regardless of
+  `explain`, using it only to attach a report of the plan afterward — so
+  `POST .../delete {"filter": {}, "multi": true, "explain": true}` deleted
+  every document in the collection, and the equivalent `update` rewrote
+  every one. `explain` on these two routes now runs the same read-only scan
+  `find` and `count` already use, exactly as MongoDB's `explain` never
+  executes an update or a delete. Nothing is written and no commit is
+  spent: `matched`, `modified`, `deleted` and `commits` all read `0` and
+  `stamp` is absent, identically to a write that matched nothing; what the
+  write *would* touch is `explain.documentsMatched`, the field `find`'s own
+  `explain` has always carried. Breaking for a client that relied on
+  `explain: true` still performing the write. ADR-131.
+
 ### Fixed
 
 - **`find` with `limit: 0` returned one document instead of an empty page**,

@@ -576,6 +576,15 @@ many entries as it returns, a range put in `_id` order reads the whole range.
 `count` visits every match and holds none of them: its cost is the time of
 the scan, not the memory of the result.
 
+**On `update` and `delete`, `explain: true` plans the write; it does not
+perform it** ([ADR-131](decisions.md)). It answers with the same
+`documentsExamined`/`documentsMatched`/`strategy` a real write would use, but
+writes nothing and spends no commit: `matched`, `modified`, `deleted` and
+`commits` all read `0`, and `stamp` is absent — exactly what those fields
+already say for a write that matched nothing. What the write *would* touch
+is `explain.documentsMatched`. Drop `explain` to perform the write the plan
+described.
+
 ---
 
 ## Change streams
