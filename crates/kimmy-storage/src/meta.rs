@@ -116,6 +116,7 @@ mod tests {
             multikey: false,
             expire_after_secs: None,
             partial_filter: None,
+            created: None,
         });
         let text = serde_json::to_string(&m).unwrap();
         assert_eq!(serde_json::from_str::<CollectionMeta>(&text).unwrap(), m);
@@ -192,6 +193,7 @@ mod tests {
             multikey: false,
             expire_after_secs: Some(3600),
             partial_filter: None,
+            created: None,
         });
         let text = serde_json::to_string(&m).unwrap();
         let back: CollectionMeta = serde_json::from_str(&text).unwrap();

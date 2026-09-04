@@ -258,9 +258,6 @@ impl Engine {
         let mut refused = 0usize;
         for index in &state.indexes {
             let existing = self.get_collection(&state.db, &state.name)?;
-            if existing.index(&index.name).is_some() {
-                continue;
-            }
             let created = self.create_index_inner(
                 &state.db,
                 &state.name,
@@ -272,7 +269,16 @@ impl Engine {
                 // would leave a collection that silently stopped expiring.
                 index.expire_after_secs,
                 index.partial_filter.clone(),
-                false,
+                // The definition's own creation stamp, which is the only
+                // ordering fact a snapshot carries — there is no entry behind
+                // it. A name already held here by a different definition is
+                // resolved against it exactly as a replicated `CreateIndex`
+                // is (ADR-132); a definition already here under this name is
+                // returned unchanged, which is what makes calling this for
+                // every index of the page cheap. A snapshot written before
+                // the stamp existed carries none, and such a rival is refused
+                // and counted rather than silently skipped as it was.
+                crate::index::CreateOrigin::Replicated(index.created),
             );
             match crate::sync::settle(created)? {
                 crate::sync::Ddl::Applied((_, violations)) => {

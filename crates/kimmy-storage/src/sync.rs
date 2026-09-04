@@ -801,7 +801,8 @@ impl Engine {
                 let target: kimmy_core::IndexCreate = bson::deserialize_from_slice(body)?;
                 match settle(self.apply_remote_index(&target, entry.stamp))? {
                     Ddl::Applied(true) => {}
-                    // History: older than the drop that removed the index.
+                    // History: older than the drop that removed the index, or
+                    // than the definition this node holds under the same name.
                     // Counted as applied and *not* appended, exactly as a
                     // `CreateCollection` older than its drop is above — this
                     // node does not re-serve onward an entry it has decided
@@ -831,6 +832,45 @@ impl Engine {
             }
             OpKind::DropIndex => {
                 let target: kimmy_core::IndexDrop = bson::deserialize_from_slice(body)?;
+
+                // A drop is the one arm that destroys state, so it is the one
+                // arm that has to know *which* index it was aimed at — the
+                // `DropCollection` arm's incarnation rule, one level down. An
+                // index recreated under the same name derives the same id, and
+                // overlapping windows are re-served as a matter of course, so
+                // a drop from before the recreation arrives again after it and
+                // removes an index nobody dropped. Observed on a three-member
+                // cluster on 2026-09-03: a collection listed no indexes on any
+                // member, though three stood on all three an hour earlier
+                // (ADR-132).
+                //
+                // An index carrying no creation stamp cannot arbitrate, and
+                // reads as older than the drop: the drop applies, which is
+                // what ADR-123 left and what a caller reading the reference
+                // before this expects.
+                if let Ok(current) = self.get_collection(&target.db, &target.collection)
+                    && let Some(index) = current.index(&target.index)
+                    && index.created.is_some_and(|created| entry.stamp < created)
+                {
+                    debug!(
+                        db = %target.db,
+                        collection = %target.collection,
+                        index = %target.index,
+                        "ignored a drop older than the index it names"
+                    );
+                    // Still remembered, exactly as the `DropCollection` arm
+                    // remembers a superseded drop: a tombstone never moves
+                    // backwards, and this one is older than the creation that
+                    // beat it, so it withholds the *earlier* index of the name
+                    // without touching the one standing here.
+                    self.record_index_drop(
+                        entry.collection,
+                        kimmy_core::IndexMeta::derive_id(&target.index),
+                        entry.stamp,
+                    )?;
+                    return Ok(DdlOutcome::Applied);
+                }
+
                 let dropped = self.drop_index_inner(
                     &target.db,
                     &target.collection,
@@ -932,19 +972,23 @@ impl Engine {
     /// Create a replicated index, stamped `stamp` at its origin.
     ///
     /// Idempotent through `create_index_inner`, which returns the existing
-    /// definition when it matches and `IndexExists` when the name is taken by
-    /// a different one — a concurrent creation on another member, which the
-    /// caller counts as a refusal rather than silently keeping whichever
-    /// arrived first (ADR-123).
+    /// definition when it matches. When the name is taken by a *different*
+    /// definition — two members created it while they could not see each
+    /// other — the later creation stamp wins, which is how two concurrent
+    /// writes to one document already settle (ADR-132); the loser is removed
+    /// in the transaction that builds the winner. Where either definition
+    /// carries no creation stamp there is nothing to compare, and the
+    /// arrival is refused with `IndexExists` and counted, as ADR-123 left it.
     ///
     /// A unique index whose backfill finds keys already shared is built in
     /// full and the collisions are recorded after the commit, the way a
     /// merged write's are (`report_remote_write`, ADR-020, ADR-029): count,
     /// warn, mint a `UniqueViolation` entry, publish.
     ///
-    /// `Ok(false)` means the creation is older than the drop that removed
-    /// the index and nothing was done; the caller counts it as applied and
-    /// does not append it.
+    /// `Ok(false)` means the creation is history — older than the drop that
+    /// removed the index, or older than the definition this node holds under
+    /// the same name — and nothing was done; the caller counts it as applied
+    /// and does not append it.
     fn apply_remote_index(&self, target: &kimmy_core::IndexCreate, stamp: Stamp) -> Result<bool> {
         let meta = self.get_collection(&target.db, &target.collection)?;
 
@@ -968,7 +1012,13 @@ impl Engine {
             return Ok(false);
         }
 
-        let (_, violations) = self.create_index_inner(
+        // The entry's stamp is the definition's creation stamp: the origin
+        // recorded exactly this one on the index it minted the entry for. The
+        // payload carries its own copy, and it is preferred when present so
+        // that a definition lifted onward keeps the identity it was created
+        // with rather than the identity of whatever entry carried it.
+        let created = target.index.created.unwrap_or(stamp);
+        let (created, violations) = self.create_index_inner(
             &target.db,
             &target.collection,
             target.index.fields.clone(),
@@ -977,12 +1027,12 @@ impl Engine {
             Some(target.index.name.clone()),
             target.index.expire_after_secs,
             target.index.partial_filter.clone(),
-            false,
+            crate::index::CreateOrigin::Replicated(Some(created)),
         )?;
         if !violations.is_empty() {
             self.report_index_backfill_violations(&meta, &violations)?;
         }
-        Ok(true)
+        Ok(matches!(created, crate::index::IndexCreated::Built(_)))
     }
 }
 
@@ -2355,6 +2405,143 @@ mod tests {
     }
 
     #[test]
+    fn a_replayed_drop_does_not_remove_a_newer_index_of_the_same_name() {
+        // The shape observed on a three-member cluster on 2026-09-03: a
+        // collection listed *no* indexes on any member, though three stood on
+        // all three an hour earlier. A name is created, dropped and created
+        // again; the drop between the two creations is re-served after the
+        // recreation has arrived, resolves to the index standing under the
+        // name, and — with no creation stamp to compare — removes it
+        // (ADR-132).
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let kinds: Vec<OpKind> = history.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                OpKind::CreateCollection,
+                OpKind::CreateIndex,
+                OpKind::DropIndex,
+                OpKind::CreateIndex
+            ],
+            "the fixture is create, drop, recreate"
+        );
+
+        // B takes the recreation without the drop that precedes it — the peer
+        // served a window that started after it.
+        b.apply_batch(&[history[0].clone(), history[3].clone()]).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").is_some_and(|i| i.unique),
+            "the recreated definition is the one B holds"
+        );
+
+        // Now the older drop arrives, as an overlapping window re-serves it.
+        let outcome = b.apply_batch(&[history[2].clone()]).unwrap();
+        assert_eq!(outcome.ddl_refused, 0, "declining a stale drop is not a refusal: {outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").is_some_and(|i| i.unique),
+            "a drop older than the index it names must not remove it"
+        );
+
+        // And the whole history, in order and repeatedly, reaches the same
+        // state: the older creation is history against the tombstone the
+        // declined drop still recorded.
+        for _ in 0..3 {
+            b.apply_batch(&history).unwrap();
+            assert!(
+                b.get_collection("shop", "orders")
+                    .unwrap()
+                    .index("email_1")
+                    .is_some_and(|i| i.unique),
+                "the newer index stands through a re-served window"
+            );
+        }
+    }
+
+    #[test]
+    fn a_drop_replayed_after_this_nodes_own_recreation_leaves_it_alone() {
+        // The half ADR-123 recorded as not converging on its own: when the
+        // newer creation is *this* node's, no peer can re-serve it, so a
+        // replayed drop left the index gone here for ever while every peer
+        // kept it. The creation stamp settles it locally.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        b.apply_batch(&history).unwrap();
+        assert!(b.get_collection("shop", "orders").unwrap().index("email_1").is_none());
+
+        // B recreates the name itself, after the drop.
+        b.create_index("shop", "orders", vec![field("email")], true, None).unwrap();
+
+        b.apply_batch(&history).unwrap();
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").is_some_and(|i| i.unique),
+            "B's own recreation must survive the replay of the drop it followed"
+        );
+    }
+
+    #[test]
+    fn a_drop_that_follows_the_creation_it_names_still_removes_the_index() {
+        // The ordinary case, which the rule above must not cost: a drop
+        // stamped after the index it names removes it, whether it arrives in
+        // the same batch or a later one.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+
+        // The creation first, on its own, so the drop meets a live index.
+        b.apply_batch(&history[..2]).unwrap();
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.index("email_1").expect("the creation arrived").clone();
+        assert!(index.created.is_some(), "a replicated creation records the origin's stamp");
+
+        let outcome = b.apply_batch(&history[2..]).unwrap();
+        assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").is_none(),
+            "a drop newer than the index it names must still remove it"
+        );
+        let entries = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        assert!(entries.is_empty(), "and with it every entry it held");
+    }
+
+    #[test]
+    fn a_drop_still_removes_an_index_that_carries_no_creation_stamp() {
+        // The stored-format rule on the drop side. An index written before
+        // the stamp existed cannot say whether it predates a drop, and reads
+        // as older than every one: the drop applies, which is what ADR-123
+        // left and what a caller reading the reference before ADR-132
+        // expects.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        b.apply_batch(&history).unwrap();
+        restamp_index(&b, "shop", "orders", "email_1", None);
+
+        a.drop_index("shop", "orders", "email_1").unwrap();
+        pull(&b, &a);
+
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("email_1").is_none(),
+            "an unstamped index is removed by a replicated drop, exactly as before"
+        );
+    }
+
+    #[test]
     fn a_replicated_unique_index_whose_backfill_collides_is_built_with_the_collision_recorded() {
         // ADR-020 for a definition rather than a document: A created a unique
         // index over its one document; B, partitioned, holds a document with
@@ -2413,12 +2600,157 @@ mod tests {
         assert!(b.insert(&cb, doc! { "_id": "d", "email": "free@x" }).is_ok());
     }
 
+    /// An index definition as a peer would put it on the wire, stamped where
+    /// a test says it was created.
+    ///
+    /// Hand-built rather than replicated out of a second engine so that the
+    /// two definitions of a concurrent creation sit in a *known* order: two
+    /// engines creating an index microseconds apart land in the same
+    /// millisecond, where the node id breaks the tie and the winner is
+    /// whichever `NodeId::generate` happened to produce.
+    fn create_index_entry(
+        collection: kimmy_core::CollectionId,
+        db: &str,
+        name: &str,
+        index: crate::meta::IndexMeta,
+        stamp: Stamp,
+    ) -> OplogEntry {
+        crate::engine::ddl_entry(
+            stamp,
+            OpKind::CreateIndex,
+            collection,
+            &kimmy_core::IndexCreate { db: db.to_string(), collection: name.to_string(), index },
+        )
+        .unwrap()
+    }
+
+    /// A definition under `name`, stamped `created`.
+    fn definition(
+        name: &str,
+        fields: Vec<crate::meta::IndexField>,
+        unique: bool,
+        created: Option<Stamp>,
+    ) -> crate::meta::IndexMeta {
+        crate::meta::IndexMeta {
+            id: kimmy_core::IndexMeta::derive_id(name),
+            name: name.to_string(),
+            fields,
+            unique,
+            enforcement: Default::default(),
+            multikey: false,
+            expire_after_secs: None,
+            partial_filter: None,
+            created,
+        }
+    }
+
+    /// Rewrite an index's creation stamp in place: `None` stands in for one
+    /// stored by a build that recorded none, and an explicit stamp puts a
+    /// local definition in a known order against an arriving one without
+    /// racing the wall clock.
+    fn restamp_index(
+        engine: &Engine,
+        db: &str,
+        collection: &str,
+        name: &str,
+        created: Option<Stamp>,
+    ) {
+        let mut meta = engine.get_collection(db, collection).unwrap();
+        meta.indexes.iter_mut().find(|i| i.name == name).expect("the index is here").created =
+            created;
+        // Straight at the database, the way a test that means to write what
+        // another build would have written does — the engine's own chokepoint
+        // is for writes the engine makes.
+        let db = engine.db();
+        let txn = db.begin_write().unwrap();
+        Engine::put_collection_meta(&txn, &meta).unwrap();
+        txn.commit().unwrap();
+    }
+
     #[test]
-    fn a_concurrently_created_index_with_a_different_definition_is_refused_and_counted() {
-        // Two members create the same name with different definitions during
-        // a partition. Neither is wrong; the second to arrive cannot be
-        // applied without silently replacing the first, so it is skipped,
-        // counted, and left for an operator — not a failed round.
+    fn concurrent_definitions_under_one_name_settle_on_the_later_stamp() {
+        // Two members created one name with different definitions while they
+        // could not see each other. ADR-123 left both standing, counted; a
+        // schema that stays divergent for ever is not a resting state, and
+        // the round of 2026-09-03 watched two collections sit that way. They
+        // settle the way two concurrent writes to one document settle: the
+        // later stamp wins, on whichever member the entries reach in
+        // whichever order (ADR-132).
+        let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let loser = definition("by_email", vec![field("email")], false, Some(earlier));
+        let winner = definition("by_email", vec![field("email")], true, Some(later));
+        let entries = [
+            create_index_entry(id, "shop", "orders", loser, earlier),
+            create_index_entry(id, "shop", "orders", winner, later),
+        ];
+
+        // Both orders, because a member cannot choose which reaches it first.
+        for order in [[0, 1], [1, 0]] {
+            let (m, _dm) = engine();
+            m.create_collection("shop", "orders").unwrap();
+            for i in order {
+                let outcome = m.apply_batch(&[entries[i].clone()]).unwrap();
+                assert_eq!(outcome.ddl_refused, 0, "neither definition is refused: {outcome:?}");
+            }
+
+            let index = m
+                .get_collection("shop", "orders")
+                .unwrap()
+                .index("by_email")
+                .cloned()
+                .expect("the name still holds an index");
+            assert!(index.unique, "the later definition wins, arriving {order:?}");
+            assert_eq!(index.created, Some(later), "and it keeps the stamp that won");
+        }
+    }
+
+    #[test]
+    fn the_loser_of_a_concurrent_creation_does_not_come_back_through_a_replayed_create() {
+        // The resolution has to hold against a re-served window, which
+        // anti-entropy produces routinely — otherwise the two definitions
+        // would trade places on every round for ever.
+        let node = |n: u8| kimmy_core::NodeId::from_bytes([n; 16]);
+        let earlier = Stamp::new(Hlc::new(1_000, 0), node(1));
+        let later = Stamp::new(Hlc::new(2_000, 0), node(2));
+        let id = kimmy_core::CollectionId::derive("shop", "orders");
+        let loser = create_index_entry(
+            id,
+            "shop",
+            "orders",
+            definition("by_email", vec![field("email")], false, Some(earlier)),
+            earlier,
+        );
+        let winner = create_index_entry(
+            id,
+            "shop",
+            "orders",
+            definition("by_email", vec![field("email")], true, Some(later)),
+            later,
+        );
+
+        let (m, _dm) = engine();
+        m.create_collection("shop", "orders").unwrap();
+        m.apply_batch(&[loser.clone(), winner.clone()]).unwrap();
+        for _ in 0..3 {
+            let outcome = m.apply_batch(&[loser.clone(), winner.clone()]).unwrap();
+            assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+            let index =
+                m.get_collection("shop", "orders").unwrap().index("by_email").unwrap().clone();
+            assert!(index.unique, "the winner stands through a re-served window");
+        }
+    }
+
+    #[test]
+    fn a_rival_definition_with_no_creation_stamp_is_still_refused_and_counted() {
+        // The stored-format rule. An index written before the creation stamp
+        // existed carries none, and a stamp invented for it here would decide
+        // a comparison this node knows nothing about — so there is nothing to
+        // compare, and the arrival is skipped, counted and named exactly as
+        // ADR-123 left it. The ambiguity ends the first time the index is
+        // recreated.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -2427,6 +2759,7 @@ mod tests {
             .unwrap();
         b.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
             .unwrap();
+        restamp_index(&b, "shop", "orders", "by_email", None);
         let ca = a.get_collection("shop", "orders").unwrap();
         a.insert(&ca, doc! { "_id": "after" }).unwrap();
 
@@ -2434,10 +2767,74 @@ mod tests {
         assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
         assert!(
             !b.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
-            "B keeps its own definition"
+            "B keeps the definition it cannot arbitrate away"
         );
         let cb = b.get_collection("shop", "orders").unwrap();
-        assert!(b.get(&cb, &DocId::String("after".into())).unwrap().is_some());
+        assert!(
+            b.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
+            "and the refusal does not stop the entries behind it"
+        );
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "witnessed, not re-served");
+    }
+
+    #[test]
+    fn a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace() {
+        // ADR-123's guard, kept honest against the rule that replaces its
+        // `IndexExists` case. A refusal is still a refusal: the winning
+        // definition's backfill meets a document this node holds and cannot
+        // be built, so the whole replacement aborts — B keeps the index it
+        // had rather than ending with neither — and the round goes on,
+        // skipped, counted and not re-served, rather than wedging.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+        b.create_index("shop", "orders", vec![field("tags")], false, Some("probe".into())).unwrap();
+        // B's definition is older than anything A can mint, so A's wins the
+        // comparison — and then fails to build over B's two-array document.
+        restamp_index(
+            &b,
+            "shop",
+            "orders",
+            "probe",
+            Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]))),
+        );
+
+        a.create_index(
+            "shop",
+            "orders",
+            vec![field("tags"), field("cats")],
+            false,
+            Some("probe".into()),
+        )
+        .expect("accepted on A: no document there holds arrays at both paths");
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "after" }).unwrap();
+        let held = b.get_collection("shop", "orders").unwrap().index("probe").unwrap().id;
+        let before = crate::index::scan_range(b.db(), cb.id, held, &[], None).unwrap();
+        assert!(!before.is_empty(), "the fixture gave the index entries to lose");
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.ddl_refused, 1, "skipped and counted, not applied: {outcome:?}");
+        let index = b.get_collection("shop", "orders").unwrap().index("probe").cloned().unwrap();
+        assert_eq!(
+            index.fields.len(),
+            1,
+            "the replacement aborted whole: B keeps its own definition, not neither"
+        );
+        let after = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        for key in &before {
+            assert!(
+                after.contains(key),
+                "every entry the index held is still there: the transaction that removed them \
+                 aborted with the failed build"
+            );
+        }
+        assert!(
+            b.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
+            "the entries behind the refusal still arrive"
+        );
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "witnessed, not re-served");
     }
 

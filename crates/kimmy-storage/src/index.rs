@@ -443,6 +443,37 @@ pub(crate) fn doc_key_for(id: &DocId) -> Result<Vec<u8>> {
     Ok(keyenc::encode(&id.to_bson())?)
 }
 
+/// Where a create came from, and the stamp its definition carries.
+///
+/// The two travel together because every decision that needs one needs the
+/// other: a local create mints its own entry and takes that entry's stamp as
+/// the index's creation stamp, while a replicated one must neither log nor
+/// invent a stamp. Same shape, and the same reason, as `drop_index_inner`'s
+/// `replicated: Option<Stamp>` (ADR-123) — widened only because a replicated
+/// *create* may carry no stamp at all.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum CreateOrigin {
+    /// A client's create on this node.
+    Local,
+    /// A peer's definition, stamped where it was created.
+    ///
+    /// `None` is a definition from a build that recorded no creation stamp,
+    /// or one lifted out of a snapshot written by such a build; it reads as
+    /// older than every rival (ADR-132).
+    Replicated(Option<Stamp>),
+}
+
+/// What a create decided.
+pub(crate) enum IndexCreated {
+    /// Built, or already here under this definition.
+    Built(IndexMeta),
+    /// A definition under this name, created *later* than this one, is
+    /// already here; nothing was done. Only reachable on the replicated
+    /// path, where the caller counts it as history and does not append the
+    /// entry (ADR-132).
+    Older,
+}
+
 impl crate::Engine {
     /// Create an index and populate it from the existing documents.
     ///
@@ -482,7 +513,7 @@ impl crate::Engine {
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
     ) -> Result<IndexMeta> {
-        let (index, violations) = self.create_index_inner(
+        let (created, violations) = self.create_index_inner(
             db,
             collection,
             fields,
@@ -491,23 +522,40 @@ impl crate::Engine {
             name,
             expire_after_secs,
             partial_filter,
-            true,
+            CreateOrigin::Local,
         )?;
         debug_assert!(
             violations.is_empty(),
             "a local backfill refuses a collision, never reports one"
         );
-        Ok(index)
+        match created {
+            IndexCreated::Built(index) => Ok(index),
+            // A local create is never resolved against another node's stamp:
+            // the name is free, already this definition, or refused with
+            // `IndexExists` (ADR-132).
+            IndexCreated::Older => unreachable!("a local create is never superseded"),
+        }
     }
 
-    /// `log = false` when applying a replicated definition.
-    ///
-    /// A replicated change must not mint an entry of its own: the originating
+    /// `origin` is [`CreateOrigin::Replicated`] when applying a peer's
+    /// definition, which must not mint an entry of its own: the originating
     /// entry is appended by the caller, and minting a second one under this
     /// node's stamp would send the same change back to the peer, which would
     /// apply it and mint another. That amplifies without bound.
     ///
-    /// `log` also decides what a unique index's backfill does when the
+    /// It also carries the definition's **creation stamp**, which is what
+    /// decides a name held here by a different definition (ADR-132). Two
+    /// members that created one name during a partition are the same
+    /// situation as two members writing one document: the later stamp wins,
+    /// by [`Stamp::wins_over`], and the loser's entries are removed in the
+    /// same transaction that builds the winner — so a definition this node
+    /// cannot build leaves the one it already had, rather than neither. A
+    /// **local** create is unaffected: a client is told `IndexExists`,
+    /// because it is there to be told. So is a rival whose creation stamp is
+    /// absent, which reads as older than everything and is refused and
+    /// counted exactly as ADR-123 left it.
+    ///
+    /// `origin` also decides what a unique index's backfill does when the
     /// existing documents already share a key, and the asymmetry is the one
     /// between [`maintain`] and [`maintain_remote`] (ADR-020). A **local**
     /// create is refused with `UniqueViolation`: the client is there to be
@@ -532,8 +580,8 @@ impl crate::Engine {
         name: Option<String>,
         expire_after_secs: Option<i64>,
         partial_filter: Option<bson::Document>,
-        log: bool,
-    ) -> Result<(IndexMeta, Vec<UniqueViolation>)> {
+        origin: CreateOrigin,
+    ) -> Result<(IndexCreated, Vec<UniqueViolation>)> {
         if fields.is_empty() {
             return Err(StorageError::Core(CoreError::InvalidQuery(
                 "an index needs at least one field".into(),
@@ -574,53 +622,18 @@ impl crate::Engine {
         let mut meta = self.get_collection(db, collection)?;
         let name = name.unwrap_or_else(|| IndexMeta::default_name(&fields));
 
-        if let Some(existing) = meta.index(&name) {
-            // Idempotent when the definition matches, a conflict when it does
-            // not — silently keeping the old shape under a reused name would be
-            // worse than either.
-            // The TTL is part of the definition: re-creating the same index
-            // with a different `expireAfterSeconds` must not quietly return the
-            // old policy and leave documents living longer than asked.
-            // Each part of the definition, so the error can say which one
-            // moved. "Different fields" used to be reported for all of them,
-            // including a changed TTL — which sent the reader to look at the
-            // one thing that had not changed.
-            let mut differs = Vec::new();
-            if existing.fields != fields {
-                differs.push("field list");
-            }
-            if existing.unique != unique {
-                differs.push("unique flag");
-            }
-            if existing.expire_after_secs != expire_after_secs {
-                differs.push("expireAfterSeconds");
-            }
-            if existing.partial_filter != partial_filter {
-                differs.push("partialFilterExpression");
-            }
-
-            if differs.is_empty() {
-                return Ok((existing.clone(), Vec::new()));
-            }
-            return Err(StorageError::Core(CoreError::IndexExists {
-                db: db.to_string(),
-                collection: collection.to_string(),
-                index: name,
-                differs: differs.join(", "),
-            }));
-        }
+        // A local create takes the stamp of the entry it is about to mint, so
+        // that the definition every peer receives and the one stored here name
+        // the same moment. Minted before the transaction opens, as
+        // `drop_index_inner` mints its own.
+        let stamp = match origin {
+            CreateOrigin::Local => Some(self.next_stamp()),
+            CreateOrigin::Replicated(created) => created,
+        };
 
         // Derived from the name so every node agrees, which is what lets an
         // index definition replicate at all.
         let id = IndexMeta::derive_id(&name);
-        if let Some(existing) = meta.index_by_id(id) {
-            return Err(StorageError::Corrupt(format!(
-                "index id for {name:?} collides with existing index {:?} on {db}.{collection}; \
-                 rename one of them",
-                existing.name
-            )));
-        }
-
         let mut index = IndexMeta {
             id,
             name,
@@ -630,9 +643,91 @@ impl crate::Engine {
             multikey: false,
             expire_after_secs,
             partial_filter,
+            created: stamp,
         };
 
+        // The name may already be taken. Idempotent when the definition
+        // matches, a conflict when it does not — silently keeping the old
+        // shape under a reused name would be worse than either. The TTL is
+        // part of the definition: re-creating the same index with a different
+        // `expireAfterSeconds` must not quietly return the old policy and
+        // leave documents living longer than asked.
+        let superseded = match meta.index(&index.name) {
+            None => None,
+            Some(existing) => {
+                let differs = existing.differences(&index);
+                if differs.is_empty() {
+                    return Ok((IndexCreated::Built(existing.clone()), Vec::new()));
+                }
+                match (origin, existing.created, index.created) {
+                    // Two members created one name with different definitions
+                    // while they could not see each other. Neither is wrong,
+                    // and neither can be kept without the cluster holding two
+                    // schemas for ever — so the later stamp wins, which is
+                    // how two concurrent writes to one document already
+                    // settle (ADR-020, ADR-132). The loser is removed in the
+                    // transaction that builds the winner, below.
+                    (CreateOrigin::Replicated(_), Some(theirs), Some(mine))
+                        if mine.wins_over(&theirs) =>
+                    {
+                        Some(existing.clone())
+                    }
+                    (CreateOrigin::Replicated(_), Some(_), Some(_)) => {
+                        // The definition here is the later one. The arrival is
+                        // history: nothing to do, and the caller must not
+                        // append it onward.
+                        return Ok((IndexCreated::Older, Vec::new()));
+                    }
+                    // A local create, or a rival with no creation stamp to
+                    // compare — the second reads as older than everything,
+                    // and dropping this node's index for it would be
+                    // resolving a conflict by guessing. Refused, counted and
+                    // named, exactly as ADR-123 left it.
+                    _ => {
+                        return Err(StorageError::Core(CoreError::IndexExists {
+                            db: db.to_string(),
+                            collection: collection.to_string(),
+                            index: index.name,
+                            differs: differs.join(", "),
+                        }));
+                    }
+                }
+            }
+        };
+
+        // Only a genuine hash collision can reach this: an index of the same
+        // *name* was resolved just above, and it derives the same id.
+        if let Some(other) = meta.index_by_id(id).filter(|other| other.name != index.name) {
+            return Err(StorageError::Corrupt(format!(
+                "index id for {:?} collides with existing index {:?} on {db}.{collection}; \
+                 rename one of them",
+                index.name, other.name
+            )));
+        }
+
         let txn = self.begin_write()?;
+
+        // The loser of a concurrent creation goes in the same transaction as
+        // the winner's build, so a definition this node's documents cannot be
+        // built under aborts back to the index it already had rather than
+        // leaving the name empty on this member alone.
+        if let Some(loser) = &superseded {
+            {
+                let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
+                entries.retain_in(index_id_range(meta.id, loser.id), |_, _| false)?;
+            }
+            // Under the *winner's* stamp, not the loser's: the tombstone is
+            // what stops the loser's own create coming back through a
+            // re-served window, and a creation at exactly the tombstone's
+            // stamp — the winner's own re-delivery — is not history.
+            crate::Engine::record_index_drop_in_txn(
+                &txn,
+                meta.id,
+                loser.id,
+                stamp.expect("a superseding create carries a stamp: it is what won the comparison"),
+            )?;
+            meta.indexes.retain(|i| i.name != index.name);
+        }
 
         // Scoped in a closure so every table borrow ends before the abort or
         // commit below, which need to move the transaction. Returns whether the
@@ -661,7 +756,7 @@ impl crate::Engine {
                 let (keys, multikey) = index_keys_observed(index, &doc)?;
                 observed_multikey |= multikey;
                 for key in keys {
-                    if index.unique && log {
+                    if index.unique && matches!(origin, CreateOrigin::Local) {
                         // A unique index over data that already violates it
                         // must not be created *locally* — it would report a
                         // constraint it does not actually hold.
@@ -709,29 +804,45 @@ impl crate::Engine {
         meta.indexes.push(index.clone());
         crate::Engine::put_collection_meta(&txn, &meta)?;
 
-        let logged = if log {
-            let entry = crate::engine::ddl_entry(
-                self.next_stamp(),
-                kimmy_core::OpKind::CreateIndex,
-                meta.id,
-                &kimmy_core::IndexCreate {
-                    db: db.to_string(),
-                    collection: collection.to_string(),
-                    index: index.clone(),
-                },
-            )?;
-            crate::engine::append_oplog(&txn, &entry)?;
-            Some(entry)
-        } else {
-            None
+        let logged = match origin {
+            CreateOrigin::Local => {
+                let entry = crate::engine::ddl_entry(
+                    stamp.expect("a local create mints its stamp above"),
+                    kimmy_core::OpKind::CreateIndex,
+                    meta.id,
+                    &kimmy_core::IndexCreate {
+                        db: db.to_string(),
+                        collection: collection.to_string(),
+                        index: index.clone(),
+                    },
+                )?;
+                crate::engine::append_oplog(&txn, &entry)?;
+                Some(entry)
+            }
+            CreateOrigin::Replicated(_) => None,
         };
         txn.commit()?;
         if let Some(entry) = logged {
             self.publish(vec![entry]);
         }
 
+        if let Some(loser) = &superseded {
+            // The operator's signal, and the only one: an index they created
+            // here has been replaced by a peer's definition of the same name.
+            // Not counted on `/metrics` — this is the conflict rule working,
+            // the way two concurrent document writes resolving is, and
+            // neither is a divergence to alert on (ADR-132).
+            tracing::warn!(
+                db,
+                collection,
+                index = %index.name,
+                differs = %loser.differences(&index).join(", "),
+                "replaced an index with a peer's definition of the same name, created later; \
+                 the members now agree on the later definition"
+            );
+        }
         tracing::info!(db, collection, index = %index.name, unique, "created index");
-        Ok((index, violations))
+        Ok((IndexCreated::Built(index), violations))
     }
 
     /// Drop an index and every entry it holds.
@@ -1303,6 +1414,7 @@ mod tests {
             multikey: false,
             expire_after_secs: None,
             partial_filter: None,
+            created: None,
         }
     }
 
