@@ -181,8 +181,9 @@ name and no stored value ever reports that name. Names are **case-sensitive
 and exactly as spelled above**, so `"Int"`, `"bindata"` and `"boolean"` are
 each a `200` and an empty result rather than a refusal. A misspelt alias is
 therefore indistinguishable from a genuine "nothing is that type" — the one
-place inside a filter where a typo is silent. Prefer the numeric code when a
-query is generated rather than typed.
+piece of this language's own vocabulary a filter takes without checking,
+where a misspelt *operator* is `unsupported operator "$typo"`. Send the code
+where the spelling is not being read by a person.
 
 **`$type` is applied to array elements as well as to the value**, which
 follows from [rule 2](#2-paths-traverse-into-arrays) and is the consequence
