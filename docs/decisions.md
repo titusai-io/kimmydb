@@ -7353,3 +7353,107 @@ and the `cluster.sync` span's `applied`. The measured benchmark numbers in
 second commit is gone.
 
 ---
+
+## ADR-128 — An explicit JSON `null` for a declared field is refused, not read as absent
+
+**Decision.** Every optional field of a closed request shape (ADR-121) that
+is not itself meant to be nullable is deserialized through
+`json::non_null_field`, a `deserialize_with` defined once beside `JsonBody<T>`
+in `crates/kimmy-api/src/json.rs` — the same file, and the same reasoning, as
+ADR-121's own locus for the rule it states once. Serde's derive routes every
+`Option<T>` field through `Deserializer::deserialize_option`, and for JSON
+that method treats a present `null` and an absent key identically: both call
+the visitor's `visit_none`, and neither ever reaches `T`. `non_null_field`
+supplies its own visitor whose `visit_some` hands the value straight to `T`,
+unchanged from what `Option<T>` already did, and whose `visit_none` — reached
+only when the key was present and its value was `null`, since an absent key
+never invokes `deserialize_with` at all — answers
+`invalid_type(Unexpected::Unit, …)`, the same call serde_json's own
+deserializer makes for a `null` given to any type that cannot hold it. The
+`422` and its envelope come from the same `JsonRejection → ApiError`
+conversion every other malformed body already goes through, so the message
+reads exactly like `if_stamp: invalid type: integer \`123\`, expected a
+string` does today: `if_stamp: invalid type: null, expected a non-null
+value`. An absent key still yields `None`; nothing about omission changes.
+
+The attribute is on every `Option<T>` field of every route struct behind
+`JsonBody<T>`: `FindRequest` (`filter`, `sort`, `projection`, `limit`, `skip`,
+`cursor`), `FindAndModifyRequest` (`filter`, `sort`, `update`,
+`returnDocument`, `projection`, `if_stamp`), `UpdateRequest` (`filter`,
+`if_stamp`), `DeleteRequest` (`filter`, `if_stamp`), `CreateIndexRequest`
+(`name`, `enforcement`, `expireAfterSeconds`, `partialFilterExpression`),
+`webhooks::RegisterRequest` (`operations`), and `vectors::SearchRequest`
+(`query`, `vector`, `filter`, `k`, `per_document`, `weights`, `min_overlap`).
+No field opts into nullability today; one that genuinely needs to keep the
+bare `Option<T>` derive and says so where it is declared. Query-string
+structs are untouched: a query string cannot carry a JSON `null` — `?if_stamp=`
+is an empty string, refused already as a malformed stamp — so ADR-124's
+closure needed nothing here. Neither does a document body: `insert`,
+`replace` and bulk insert take `JsonBody<Value>` or `JsonBody<Vec<Value>>`
+directly, with no declared fields to hold this rule, and a document's own
+content, a filter's, or an update operator's operand is read straight into
+`Value`, which legitimately holds `null` — this rule reaches only a request
+shape's own declared fields, never what a `Value`-typed field's document
+holds.
+
+**Why.** `{"if_stamp": null}` on `update`, `delete` or `find_and_modify`
+answered `200` and wrote unconditionally — the opposite of what the field is
+for, and the exact failure ADR-121 named in its own motivation, one door
+further in. Worse, `{"filter": null, "multi": true}` on `/delete` answered
+`200 {"deleted": <every document>, …}`: an optional `filter` defaults to "no
+filter", which is "match everything", so a caller whose JSON encoder writes
+an unset field as `null` — the default behaviour of many — sent what it
+believed was a scoped delete and emptied the collection. The same shape on
+`/update` rewrote every document instead. Every *other* malformed value of
+these same fields was already refused: `if_stamp: 123` and `if_stamp: true`
+both `422`, `if_stamp: "not-a-stamp"` `400 malformed stamp`, and `multi:
+null` on the non-optional `multi` field was already `422` because a required
+field with no `Option` wrapper has no null-shortcut to fall into. `null` was
+the one value serde's own machinery does not already refuse for an optional
+field, on every route that declares one — found independently by two areas
+of the same test round, one from `if_stamp` and one from `filter`, neither
+aware of the other's result.
+
+**Alternatives.**
+
+- *Patch `if_stamp` alone, by hand, on each of the four write shapes.*
+  Rejected, and stated as the failing outcome this decision exists to avoid:
+  it leaves `filter: null` open, which is the destructive case. Four
+  independent write shapes carrying the identical hole is what makes a
+  per-field patch the wrong shape of fix.
+- *Walk the raw JSON body and refuse any `null` found anywhere, ahead of
+  typed deserialization.* Rejected. `JsonBody<T>` is generic over every
+  request shape the server has, including `insert` and bulk insert, which
+  take `JsonBody<Value>` and `JsonBody<Vec<Value>>` directly — a document
+  *is* its own top-level body on those routes. A walk with no notion of
+  which keys are declared fields of a shape and which are a document's own
+  content cannot draw ADR-121's boundary; it would refuse `{"note": null}` on
+  `insert` and break the routes ADR-121 named as deliberately open.
+- *Change the field's declared type instead of its deserialization —
+  `Option<NonNull<T>>` or similar.* Rejected. The null-shortcut lives in how
+  serde's derive calls `deserialize_option` for any `Option<U>`, whatever
+  `U` is; wrapping the inner type changes nothing; a JSON `null` never
+  reaches `U::deserialize` regardless of what `U` is, wrapped or not. Only
+  supplying a different visitor for `deserialize_option` itself — which is
+  what `deserialize_with` lets a field do — intercepts it.
+- *A distinct, type-specific message per field ("expected a string", "expected
+  a document").* Rejected for the same reason ADR-121 keeps its message
+  generic: one function reused everywhere is worth more than wording tuned
+  per call site, and "a non-null value" already says what a client needs to
+  fix.
+
+**Cost.** Breaking for a client relying on the bug: one that sends `null` for
+an unconditional write dressed as a conditional one, or a `null` filter
+meaning "everything", now meets a `422` instead of a silent write. A
+`0.MINOR` bump under the pre-1.0 policy, no compatibility shim — sending
+`null` was never documented to mean anything, and `openapi.yaml` already
+typed every one of these fields without a `null` branch, so the schema was
+already correct; only the server's behaviour was not. One helper function,
+reused wherever a field needs it, and one line per field naming it — the
+same shape of cost ADR-121's `deny_unknown_fields` attribute has today. The
+first-party Rust, Python and Go clients, the CLI, the MCP server, the
+conformance scenarios and every request example in the documentation omit an
+unset optional field rather than encoding it as `null`, so none of them are
+affected.
+
+---

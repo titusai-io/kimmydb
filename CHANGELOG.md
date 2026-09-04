@@ -10,6 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Changed
+
+- **An explicit JSON `null` on a declared request field is refused `422`,
+  rather than read the same as the field being absent.** `Option<T>`'s
+  ordinary deserialization cannot tell a caller who never mentioned a field
+  from one who sent it as `null`, so `{"if_stamp": null}` on `update`,
+  `delete` or `find_and_modify` made a conditional write unconditional, and
+  `{"filter": null, "multi": true}` on `/delete` deleted every document in
+  the collection — the same on `/update` rewrote every one. Every other
+  malformed value of these fields was already refused; `null` was the one
+  hole. The refusal is stated once, at the `JsonBody<T>` extractor every
+  request body passes through, and applies to every declared optional field
+  of a closed request shape (ADR-121) — not an `if_stamp`-only patch. A
+  document body, a filter's contents, and an update operator's operand are
+  content, not a shape, and still take `null` freely. This tightens a
+  refusal and is breaking for a caller relying on the old behaviour: a
+  `0.MINOR` bump under the pre-1.0 policy, no compatibility shim. ADR-128.
+
 ## 0.21.0 - 2026-09-03
 
 A minor when it ships, not a patch. Nothing changes on the wire between

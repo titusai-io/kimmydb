@@ -93,6 +93,17 @@ info:
     `additionalProperties: false`; a document body — insert, replace, bulk —
     is content rather than a shape and takes any field.
 
+    **An explicit `null` on a declared field is refused the same way, rather
+    than read as the field being absent** (ADR-128). `Option`-shaped fields —
+    every optional property below — cannot otherwise tell "omitted" from
+    "sent as `null`" apart, and the two are different requests:
+    `{"if_stamp": null}` is not the same as leaving `if_stamp` out, and
+    `{"filter": null, "multi": true}` on `delete` is not the same as
+    `{"filter": {}, "multi": true}`, the documented way to match every
+    document. Only a request shape's own declared fields are held to this —
+    `null` inside a filter, an update operator's operand, or a document body
+    is content and untouched.
+
     Query strings are held to the same rule, at `400`. On the operations that
     declare a query parameter, one the route does not define, or cannot
     parse, is refused with the parameter named. **On every other operation
@@ -2697,12 +2708,15 @@ components:
     WrongShape:
       description: |
         The body is valid JSON but not the shape this route takes — an object
-        where an array is wanted, a missing required field, or a field the
-        route does not define (ADR-121; the message names it). Carries the
-        `bad_request` code: the status distinguishes "not JSON" from "not this
-        JSON", and the code says what a client should do about either. A
-        document body — insert, replace, bulk — is content and takes any
-        field.
+        where an array is wanted, a missing required field, a field the
+        route does not define, or an explicit `null` on a declared field
+        that does not accept one (ADR-121, ADR-128; the message names it).
+        An omitted optional field still means what it always meant — `null`
+        is refused because it is not the same request, not because the field
+        stopped being optional. Carries the `bad_request` code: the status
+        distinguishes "not JSON" from "not this JSON", and the code says what
+        a client should do about either. A document body — insert, replace,
+        bulk — is content and takes any field, `null` values included.
       content:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
