@@ -7476,25 +7476,34 @@ would otherwise read as a blanket `422` for every unknown request field.
 ## ADR-130 — `$unwind` refuses a path that crosses an array rather than writing nowhere
 
 **Decision.** `crates/kimmy-query/src/aggregate.rs` gets a helper,
-`crosses_an_array(doc, field)`, that decides — for one document, before
-anything at `field` is read — whether writing to `field` would fail: it
-probes with `path::set(doc.clone(), field, Bson::Null)` and reports the
-error, if any. `path::set` fails in exactly one situation, a non-terminal
-segment of the path landing on an array whose next segment is not a numeric
-index, which is what "the path crosses an array" means here. `unwind` calls
-this once per document, at the top of its loop, unconditionally: if it
-reports a failure, the document — and the whole request, `$unwind` is not a
-per-document filter — is refused, `400`, naming `$unwind`, the path and the
-underlying reason. This holds **regardless of what `field` turns out to
-contain**: a non-empty array, an empty one, a scalar, `null`, nothing at all.
-Only once the check passes does `unwind` go on to read `value_at` and decide,
-by the existing rules, whether to expand, drop, preserve or pass a document
-through; every write on that path is now guaranteed to succeed structurally,
-so `path::set`'s `Result` there is still propagated with `?` rather than
-unwrapped — a proof that holds today is not a reason to let a future change
-panic instead of refuse. `preserveNullAndEmptyArrays` and `includeArrayIndex`
-are unaffected by any of this: the crossing check runs before either is
-consulted, and a document it refuses never reaches them.
+`crossing_array(doc, field)`, that decides — for one document, before
+anything at `field` is read — whether writing to `field` would fail, and if
+so, where: it walks `field`'s segments against `doc`'s actual structure,
+read-only, the same way `path::set` would, and returns `(array_path,
+remainder)` the moment a non-terminal segment lands on an array whose next
+segment names a field rather than a numeric position — `path::set`'s one
+failure mode, and what "the path crosses an array" means here. A segment
+that is missing, a scalar, or an array reached by an index that is not
+already a document is what `path::set` would vivify or overwrite rather than
+fail on, so the walk stops there and reports no crossing, without needing to
+actually perform a write to find out — `crossing_array` never clones or
+mutates `doc`. `unwind` calls it once per document, at the top of its loop,
+unconditionally: if it reports a crossing, the document — and the whole
+request, `$unwind` is not a per-document filter — is refused, `400`, naming
+`$unwind`, the field path, the array it crosses (`array_path`), and the
+concrete remedy: unwind `array_path` first, then read `remainder` on each
+resulting row — the caller who wrote `$unwind: "$items.sku"` is told to
+write `$unwind: "$items"`, not handed `path::set`'s internal vocabulary
+about non-numeric segments. This holds **regardless of what `field` turns
+out to contain**: a non-empty array, an empty one, a scalar, `null`, nothing
+at all. Only once the check passes does `unwind` go on to read `value_at`
+and decide, by the existing rules, whether to expand, drop, preserve or pass
+a document through; every write on that path is now guaranteed to succeed
+structurally, so `path::set`'s `Result` there is still propagated with `?`
+rather than unwrapped — a proof that holds today is not a reason to let a
+future change panic instead of refuse. `preserveNullAndEmptyArrays` and
+`includeArrayIndex` are unaffected by any of this: the crossing check runs
+before either is consulted, and a document it refuses never reaches them.
 
 **This is a revision, made under independent review, of what this ADR first
 proposed.** The version first shipped kept `value_at`'s ordinary read and
@@ -7550,10 +7559,11 @@ decided:
   codebase's standing preference, stated in `deviations.md` and repeated
   through ADR-121 and ADR-124, is that a request the server cannot honour is
   refused rather than answered as though it had been.
-- **It is the smaller change.** The refusal reuses `path::set`'s existing
-  `Result`, probed once per document, with no new resolver; the silent-skip
-  contract would need a second, stricter path reader — one that fails to
-  resolve at all through an array, distinct from `value_at` — solely to
+- **It is the smaller change.** The refusal mirrors `path::set`'s own
+  traversal rule read-only, once per document, with no new resolver and no
+  second notion of what a path "means"; the silent-skip contract would need
+  a genuinely different reader — one that fails to resolve at all through an
+  array, distinct from both `value_at` and `path::set` — solely to
   reproduce, on purpose, the same "found nothing" outcome a missing field
   already gets, and to decide, independently, what `preserveNullAndEmptyArrays`
   should mean for a case that is not actually missing.
@@ -7562,7 +7572,7 @@ decided:
 document — a top-level array field, a dotted path through plain
 subdocuments (`$unwind: "$y.b"` where `y: {b: [1, 2]}`), or a numeric-indexed
 segment into an array (`$unwind: "$a.0"`, which addresses a position rather
-than crossing) — writes back exactly as it always has; `crosses_an_array`
+than crossing) — writes back exactly as it always has; `crossing_array`
 reports nothing for any of these, because `path::set` only fails on a
 non-terminal *non-numeric* array segment. **A path that crosses an array into
 a scalar is no longer unaffected — this is the behaviour change this
@@ -7592,17 +7602,34 @@ rejected, and never had the power to pin that choice; it pinned the defect's
 row count. `lookup_keys` in the same test still does: a fanning reader would
 make `lookup_keys(&input, "a.b")` a single `[[1, 2], [3]]` key, not the two
 flat integers the assertion checks, and `$lookup`'s key extraction reads
-without ever writing, so it is untouched by anything in this ADR. `$unwind`
-itself does not get an equivalent test of its own reader choice, because this
-revision's uniform check makes that choice unobservable through `$unwind`
-specifically: the check refuses on the document's structure alone, before
-`value_at` runs, and it refuses on *exactly* the documents where a fanning
-and a non-fanning reader would ever disagree (an array on a non-terminal
-segment is precisely both `path::set`'s failure condition and where fanning
-would diverge from the single-value read) — so every case that could have
-told the two readers apart for `$unwind` is refused under both, including
-`items.sku`, which now refuses regardless of which reader you imagine
-deciding it.
+without ever writing, so it is untouched by anything in this ADR.
+
+For a **non-numeric** crossed segment, `$unwind` itself needs no test of its
+own reader choice, because the uniform check refuses on exactly the documents
+where a fanning and a non-fanning reader would ever disagree there: an array
+on a non-terminal segment whose next segment is not numeric is both
+`path::set`'s one failure condition and where fanning would diverge from the
+single-value read, so both readers are refused alike, `items.sku` included.
+
+**A numeric segment is the one place this does not hold, and ADR-116 already
+named it as such** — *"the one place an expression path and a filter path
+disagree: the filter language reads `items.0` both ways"* — and `value_at`
+(`path::resolve`) follows the filter's rule, reading a numeric segment as
+both an index and a field name, while the fanning expression reader reads it
+only as a field name, never an index. A numeric segment after a crossed
+array is therefore not refused — `path::set` succeeds by index, the same
+"single place" a numeric-indexed write always has — and `$unwind`'s own
+output *does* distinguish the two readers there:
+`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
+pins it. Over `a: [{b: [1, 2]}, {b: [3]}]`, `$unwind: "$a.0.b"` reads `a.0.b`
+as `[1, 2]` (found once, by index) and produces two rows, `a[0].b` set to `1`
+then `2`; the fanning reader over the same path finds no element literally
+named `"0"`, gets `[]`, and would produce none. `$unwind: "$a.0"` in "What is
+unaffected" above is exactly this case one segment shorter, and is itself
+the counter-example to the broader "unobservable" claim an earlier revision
+of this ADR made here — corrected under further review, which is why this
+paragraph, unlike most of this document, describes a mistake made and fixed
+within the same unit rather than a decision reached once.
 
 **Alternatives.** *MongoDB's silent-skip contract*, rejected above. *Refuse
 only when the value found at the crossed segment happens to be an array* —
@@ -7612,34 +7639,46 @@ front, at parse time, before any document is read.* Not possible here:
 whether a given document's `a` holds an array is data, not schema, in a
 document database with no required shape — the same document under a
 different `_id` might hold a plain subdocument at the same path. The
-refusal is necessarily per-document, discovered by a structural probe, which
-is exactly what `crosses_an_array` does as early as it can.
+refusal is necessarily per-document, discovered by a structural walk, which
+is exactly what `crossing_array` does as early as it can.
 
 **Cost.** A `0.MINOR` behaviour change, larger than first estimated. A
-pipeline that unwound a path crossing an array previously got a `200` with
-byte-identical duplicate rows (N = the first element's array length, nothing
-actually unwound) and now gets a `400` naming `$unwind` and the path — on
-*any* document shaped that way, not only ones where the crossed element also
-held an array. **This is not limited to a pipeline that was already
-producing wrong rows.** `$unwind: "$a.b"` over a collection where every
-document has `a` as a plain subdocument runs, and returns correct rows,
-exactly as before; the same pipeline over a collection where even one
-document has `a` as an array — a shape that never triggered the original
-defect, because the crossed element might have been a scalar — now refuses
-that request entirely. A field a pipeline unwinds must be one that is never
-an array on any document that reaches the stage; `docs/aggregation.md#unwind`
-states this as the operational rule a pipeline author needs, not only as an
-implementation detail. Five tests in `crates/kimmy-query/src/aggregate.rs`:
-the finding's shape refusing; a scalar found first no longer skipping the
-refusal (`a: [{b: 9}, {b: [1, 2]}]`); the non-crossing control
-(`$unwind: "$y.b"`); the real corpus shape (`$unwind: "$items.sku"`), now
-refusing rather than passing through; and a single-element array refusing
-identically to a multi-element one, since the check never inspects length. A
-sixth, over HTTP in `crates/kimmy-api/tests/api.rs`
+pipeline that unwound a path crossing an array by a named field previously
+got a `200` with byte-identical duplicate rows (N = the first element's
+array length, nothing actually unwound) and now gets a `400` naming
+`$unwind`, the crossed array and the field to read from each of its
+elements — on *any* document shaped that way, not only ones where the
+crossed element also held an array. **This is not limited to a pipeline that
+was already producing wrong rows.** `$unwind: "$a.b"` over a collection
+where every document has `a` as a plain subdocument runs, and returns
+correct rows, exactly as before; the same pipeline over a collection where
+even one document has `a` as an array — a shape that never triggered the
+original defect, because the crossed element might have been a scalar — now
+refuses that request entirely. A field a pipeline unwinds must be one that
+is never an array on any document reaching the stage, unless every segment
+past it addresses a position by number rather than by name;
+`docs/aggregation.md#unwind` states this as the operational rule a pipeline
+author needs, not only as an implementation detail, and describes the
+numeric exception and what it produces. Seven tests in
+`crates/kimmy-query/src/aggregate.rs`: the finding's shape refusing; a
+scalar found first no longer skipping the refusal (`a: [{b: 9}, {b: [1,
+2]}]`); the non-crossing control (`$unwind: "$y.b"`); the real corpus shape
+(`$unwind: "$items.sku"`), now refusing rather than passing through; a
+single-element array refusing identically to a multi-element one, since the
+check never inspects length; and the numeric-segment residue
+(`unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`).
+An eighth, over HTTP in `crates/kimmy-api/tests/api.rs`
 (`unwind_refuses_a_path_that_crosses_an_array_over_http`), reproduces the
 finding's own route rather than only the parse layer. `docs/aggregation.md`
-states the actual rule in `$unwind`'s own value table and in `#arrays`,
-names the data-dependence and the whole-request blast radius explicitly, and
+states the actual rule — including the numeric carve-out, which an earlier
+revision of this documentation omitted, over-claiming that *every* crossing
+refuses — in `$unwind`'s own value table and in `#arrays`, names the
+data-dependence and the whole-request blast radius explicitly, and
 `docs/http-api.md` draws the `400`-versus-`422` line ADR-129 also needs.
+`crossing_array` walks the document read-only rather than cloning it to
+probe a write, so the fix costs no allocation on top of what `unwind`
+already made per row, and its error names the crossed array and the
+remaining field directly — *"unwind `$items` first, then read `sku` on each
+resulting row"* — rather than surfacing `path::set`'s internal vocabulary.
 
 ---

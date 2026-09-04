@@ -50,14 +50,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   path to decide what to do and then failed silently to write each element
   back through the array — there is no single place to put it, whatever is
   found there. Both symptoms are now the same `400`, naming `$unwind` and
-  the path, decided by whether the path crosses an array **at all**, never
-  by what is sitting at the far end of it: `items.sku` over an array of
-  `{sku, qty}` now refuses too, where it previously passed the document
-  through unchanged. **Whether a pipeline is even legal now depends on the
-  documents it meets, not on the pipeline text** — the same pipeline can run
-  correctly for months and then refuse the day an ordinary write adds one
-  document shaped this way, and one such document fails the whole request.
-  A path that never crosses an array is unaffected. ADR-130.
+  the path, decided by whether the path crosses an array **by a named
+  field**, never by what is sitting at the far end of it: `items.sku` over
+  an array of `{sku, qty}` now refuses too, where it previously passed the
+  document through unchanged. A **numeric** segment after the array is
+  still not refused and is unaffected — `$unwind: "$a.0.b"` addresses a
+  position, not a name, and reads it the way every field-path option here
+  reads a numeric segment: as an index and as a field literally named that
+  number, not only the latter the way a computed expression would. **Whether
+  a pipeline is even legal now depends on the documents it meets, not on the
+  pipeline text** — the same pipeline can run correctly for months and then
+  refuse the day an ordinary write adds one document shaped this way, and
+  one such document fails the whole request. A path that never crosses an
+  array by a named field is unaffected. The refusal names the concrete fix,
+  not just the problem: `$unwind: "$items.sku"` is told to unwind `$items`
+  first and read `sku` on each resulting row, rather than being handed
+  internal path-traversal vocabulary. ADR-130.
 
 ## 0.21.0 - 2026-09-03
 

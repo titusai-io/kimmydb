@@ -818,21 +818,59 @@ pub fn check_limit(stage: &str, produced: usize, limits: &Limits) -> Result<()> 
     Ok(())
 }
 
-/// Whether writing to `field` in `doc` would fail: a non-terminal segment of
-/// the path lands on an array whose next segment is not a numeric index, so
-/// there is no single place to write an unwound element back to
-/// (`path::set`'s one failure mode). Checked against a throwaway copy with a
-/// placeholder value, before anything about what `field` actually holds is
-/// read — the value inserted never affects whether the write structurally
-/// succeeds, only the document's shape along the way does. Deciding this
-/// from the *read*'s outcome instead — refusing only when the value found
-/// happened to be an array — was ADR-130's original mistake: it made the
-/// refusal depend on the type of one crossed element rather than on the path
-/// crossing an array at all, so `$unwind: "$a.b"` over `a: [{b: 9}, {b: [1,
-/// 2]}]` answered `200` with one row that looked unwound but was not.
-fn crosses_an_array(doc: &Document, field: &str) -> Option<String> {
-    let mut probe = doc.clone();
-    path::set(&mut probe, field, Bson::Null).err()
+/// Where writing to `field` in `doc` would fail, if it would: `(array_path,
+/// remainder)`, `array_path` the dotted prefix naming the array itself,
+/// `remainder` what was left of `field` to read from each of its elements.
+/// `None` when the write would succeed.
+///
+/// Mirrors `path::set`'s own traversal read-only, without cloning `doc` to
+/// probe it — a non-terminal segment lands on an array whose next segment
+/// names a field rather than a numeric position, `path::set`'s one failure
+/// mode. A segment that is missing, a scalar, or an array reached by an
+/// index that is not already a document is what `path::set` vivifies or
+/// overwrites rather than fails on; none of those can already contain an
+/// array of their own, so this walk stops there and reports no crossing,
+/// exactly matching `path::set` succeeding by vivifying it.
+///
+/// A **numeric** segment after the array is the one case this deliberately
+/// does not report — `$unwind: "$a.0.b"` writes by index, same as any
+/// numeric-indexed write, and is not "crossing" in this function's sense.
+/// ADR-116 names this the one place its own non-fanning read and the
+/// expression layer's fanning read disagree, and that disagreement stays
+/// observable through `$unwind` here — see
+/// `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`
+/// and ADR-130. An earlier revision of this function's own documentation
+/// claimed the uniform check made `$unwind`'s reader choice unobservable
+/// everywhere; that was wrong precisely because of this case, and is
+/// corrected here rather than repeated.
+fn crossing_array(doc: &Document, field: &str) -> Option<(String, String)> {
+    let segs: Vec<&str> = field.split('.').collect();
+    let mut current = doc;
+    let mut i = 0;
+    while i + 1 < segs.len() {
+        match current.get(segs[i]) {
+            Some(Bson::Document(child)) => {
+                current = child;
+                i += 1;
+            }
+            Some(Bson::Array(items)) => match segs[i + 1].parse::<usize>() {
+                // A numeric next segment addresses a position, not a
+                // crossing; recurse into that element only if it is already
+                // a document — anything else is what `path::set` vivifies or
+                // overwrites, so nothing further along this path can fail.
+                Ok(index) => match items.get(index) {
+                    Some(Bson::Document(child)) => {
+                        current = child;
+                        i += 2;
+                    }
+                    _ => return None,
+                },
+                Err(_) => return Some((segs[..=i].join("."), segs[i + 1..].join("."))),
+            },
+            _ => return None,
+        }
+    }
+    None
 }
 
 fn unwind(
@@ -860,11 +898,11 @@ fn unwind(
         // and a path that crosses an array has none, regardless of what is
         // sitting there — an array to expand, a scalar, `null`, or nothing
         // at all. See ADR-130.
-        if let Some(reason) = crosses_an_array(&doc, field) {
+        if let Some((array_path, remainder)) = crossing_array(&doc, field) {
             return Err(Error::InvalidQuery(format!(
-                "$unwind cannot expand `{field}`: {reason}. The path crosses an array, so there \
-                 is no single place to write each element back to — unwind a top-level array \
-                 field, or reshape with $addFields first"
+                "$unwind cannot expand `{field}`: `{array_path}` is an array, so there is no \
+                 single place to write each element back to. Unwind `${array_path}` first, then \
+                 read `{remainder}` on each resulting row"
             )));
         }
         // `path` is a field path: `$unwind` names the array to expand, and
@@ -1408,19 +1446,55 @@ mod tests {
         // integers, and `$lookup`'s key extraction is untouched by ADR-130
         // (it only reads; there is no write to refuse).
         //
-        // `$unwind` no longer needs a test of its own for this: ADR-130's
-        // uniform refusal fires on the document's structure alone, before
-        // `value_at` is consulted, and it fires on *exactly* the documents
-        // where a fanning and a non-fanning reader would disagree — any
-        // non-terminal segment that is an array is where they would differ,
-        // and is also `path::set`'s one failure mode. So every case that
-        // could have told the two readers apart for `$unwind` specifically
-        // is refused under both; see `unwind_refuses_a_path_that_crosses_an_array`,
+        // `$unwind` needs no test of its own for a **non-numeric** crossed
+        // segment: ADR-130's uniform refusal fires on the document's
+        // structure alone, before `value_at` is consulted, and it fires on
+        // exactly the documents where a fanning and a non-fanning reader
+        // would disagree there — a non-terminal array segment followed by a
+        // non-numeric one is both where they would differ and `path::set`'s
+        // one failure mode. See `unwind_refuses_a_path_that_crosses_an_array`,
         // whose `items.sku` case refuses regardless of which reader you
         // imagine deciding it.
+        //
+        // A **numeric** segment is the one place this does not hold — the
+        // one place ADR-116 itself already names an expression path and a
+        // filter path disagreeing, and `value_at`/`path::resolve` sides with
+        // the filter's reading (a numeric segment is read both as an index
+        // and a field name), not the expression layer's (field name only).
+        // `path::set` succeeds there by index, so `$unwind` does not refuse,
+        // and its own output *does* still distinguish the two readers — see
+        // `unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning`.
         let input = docs(vec![doc! { "_id": 1, "a": [{"b": [1, 2]}, {"b": [3]}] }]);
         let keys = lookup_keys(&input, "a.b");
         assert_eq!(keys, vec![Bson::Array(vec![Bson::Int32(1), Bson::Int32(2)])]);
+    }
+
+    #[test]
+    fn unwind_over_a_numeric_segment_into_a_crossed_array_reads_by_index_not_by_fanning() {
+        // The residue ADR-130 leaves: a numeric segment after a crossed
+        // array writes by index (`path::set`'s only way into an array), so
+        // it is not "crossing" in `crossing_array`'s sense and `$unwind`
+        // does not refuse. `value_at` (`path::resolve`) reads `"0"` both as
+        // the index 0 and as a field literally named `"0"` — the filter
+        // language's rule, which ADR-116 keeps for every stage option that
+        // names a field rather than computes one. Neither element here has
+        // a field called `"0"`, so only the index reading contributes:
+        // `a.0.b` is `[1, 2]`, found once, and unwinds to two rows.
+        //
+        // The fanning expression reader ADR-116 gives `$addFields`,
+        // `$group` and the rest reads a numeric segment *only* as a field
+        // name — never an index — so `$a.0.b` there finds no element named
+        // `"0"` and is `[]`: zero rows, not two. This is the one shape
+        // where `$unwind`'s own output would differ depending on which
+        // reader answered it, and it is why `unwind_and_lookup_keys_…`
+        // above no longer needs — and cannot have — an equivalent case of
+        // its own for every crossing; this one is elsewhere.
+        let input = docs(vec![doc! { "a": [{"b": [1, 2]}, {"b": [3]}] }]);
+        let out = run(vec![doc! {"$unwind": "$a.0.b"}], input).unwrap();
+        assert_eq!(
+            out,
+            docs(vec![doc! { "a": [{"b": 1}, {"b": [3]}] }, doc! { "a": [{"b": 2}, {"b": [3]}] },])
+        );
     }
 
     #[test]

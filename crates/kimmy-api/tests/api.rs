@@ -6307,7 +6307,12 @@ async fn unwind_refuses_a_path_that_crosses_an_array_over_http() {
         .await;
     assert_eq!(res.status, 400, "{:?}", res.body);
     assert_eq!(res.body["error"], "bad_request");
-    assert!(format!("{:?}", res.body).contains("$unwind"), "{:?}", res.body);
+    let body = format!("{:?}", res.body);
+    assert!(body.contains("$unwind"), "{body}");
+    // The refusal names the concrete fix, not just the problem: the caller
+    // who wrote `$items.sku` is told to unwind `$items` first.
+    assert!(body.contains("$items"), "{body}");
+    assert!(body.contains("sku"), "{body}");
 }
 
 #[tokio::test]
