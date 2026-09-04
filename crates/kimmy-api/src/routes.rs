@@ -947,14 +947,20 @@ async fn bulk_insert_docs(
 #[derive(Deserialize, Default)]
 #[serde(default, deny_unknown_fields)]
 struct FindRequest {
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     filter: Option<Value>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     sort: Option<Value>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     projection: Option<Value>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     limit: Option<usize>,
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     skip: Option<usize>,
     /// Report how the query was answered alongside the results.
     explain: bool,
     /// Resume after a previous page, using the `nextCursor` it returned.
+    #[serde(deserialize_with = "crate::json::non_null_field")]
     cursor: Option<String>,
     /// Return each document's stamp in a parallel `stamps` array.
     stamps: bool,
@@ -1105,26 +1111,26 @@ async fn delete_doc(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FindAndModifyRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     filter: Option<Value>,
     /// Chooses which document when several match. Without it the choice is the
     /// scan's own order, which is unspecified.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     sort: Option<Value>,
     /// Operators, or a whole replacement document.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     update: Option<Value>,
     #[serde(default)]
     remove: bool,
     #[serde(default)]
     upsert: bool,
     /// `"before"` (default) or `"after"`.
-    #[serde(default, rename = "returnDocument")]
+    #[serde(default, rename = "returnDocument", deserialize_with = "crate::json::non_null_field")]
     return_document: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     projection: Option<Value>,
     /// Write only if the chosen document is at this stamp.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     if_stamp: Option<String>,
     /// Which array elements the update's `$[<identifier>]` segments address.
     #[serde(default, rename = "arrayFilters")]
@@ -1164,7 +1170,7 @@ async fn find_and_modify(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     filter: Option<Value>,
     update: Value,
     #[serde(default)]
@@ -1173,7 +1179,7 @@ struct UpdateRequest {
     #[serde(default)]
     explain: bool,
     /// Write only if the matched document is at this stamp.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     if_stamp: Option<String>,
     /// Which array elements the update's `$[<identifier>]` segments address.
     #[serde(default, rename = "arrayFilters")]
@@ -1199,7 +1205,7 @@ async fn update_docs(
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DeleteRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     filter: Option<Value>,
     #[serde(default)]
     multi: bool,
@@ -1207,7 +1213,7 @@ struct DeleteRequest {
     #[serde(default)]
     explain: bool,
     /// Delete only if the matched document is at this stamp.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     if_stamp: Option<String>,
 }
 
@@ -1271,19 +1277,27 @@ struct CreateIndexRequest {
     fields: Vec<IndexFieldSpec>,
     #[serde(default)]
     unique: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     name: Option<String>,
     /// `"local"` (default) or `"coordinated"`. See the storage docs — a
     /// coordinated unique constraint needs clustering and is refused until M4.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     enforcement: Option<String>,
     /// Present makes this a TTL index: documents are deleted this many seconds
     /// after the single indexed date field.
-    #[serde(default, rename = "expireAfterSeconds")]
+    #[serde(
+        default,
+        rename = "expireAfterSeconds",
+        deserialize_with = "crate::json::non_null_field"
+    )]
     expire_after_seconds: Option<i64>,
     /// Present makes this a partial index: only matching documents are held,
     /// and the planner uses it only for queries provably contained by it.
-    #[serde(default, rename = "partialFilterExpression")]
+    #[serde(
+        default,
+        rename = "partialFilterExpression",
+        deserialize_with = "crate::json::non_null_field"
+    )]
     partial_filter_expression: Option<Value>,
 }
 

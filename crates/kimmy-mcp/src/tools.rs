@@ -72,6 +72,16 @@ impl KimmyMcp {
 // says so too. `HybridSearchArgs` spells its search fields out rather than
 // flattening `SearchArgs`, because serde cannot refuse unknown fields across
 // a flatten.
+//
+// Every `Option<T>` field among them also carries
+// `deserialize_with = "kimmy_api::json::non_null_field"` (ADR-128): an
+// explicit `null` is refused rather than read the same as the argument being
+// left out, so `{"filter": null, "multi": true}` cannot reach `delete` or
+// `update` through this transport any more than it can through the REST
+// body. A new optional field here needs the same attribute — the acceptance
+// suite in `tests/mcp.rs` drives every field this comment claims and fails
+// if one is missing, but only for a field the test table already knows
+// about, so add the field there too.
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize, JsonSchema)]
@@ -89,7 +99,12 @@ pub struct DescribeArgs {
     /// Collection name.
     pub collection: String,
     /// How many documents to sample. Defaults to 100.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub sample: Option<usize>,
 }
 
@@ -102,22 +117,47 @@ pub struct FindArgs {
     pub collection: String,
     /// MongoDB-style query filter, for example
     /// `{"status": "open", "total": {"$gt": 100}}`. Omit to match everything.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
     /// Sort specification, for example `{"created_at": -1}`.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub sort: Option<Value>,
     /// Fields to return, for example `{"name": 1, "total": 1}`. Returning only
     /// what you need keeps large documents from crowding out the rest of the
     /// answer.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub projection: Option<Value>,
     /// Maximum documents to return. Defaults to 100.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub limit: Option<usize>,
     /// Documents to skip, for paging. With a sort other than `{"_id": 1}`,
     /// `skip + limit` may not exceed 10,000.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub skip: Option<usize>,
     /// Also report whether an index was used and how many documents were
     /// examined. Useful when a query is slow.
@@ -133,7 +173,12 @@ pub struct CountArgs {
     /// Collection name.
     pub collection: String,
     /// MongoDB-style query filter. Omit to count the whole collection.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
 }
 
@@ -157,18 +202,38 @@ pub struct SearchArgs {
     pub collection: String,
     /// Text to search for. The server embeds it, so this requires the
     /// collection to use a server-side embedding provider.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub query: Option<String>,
     /// A pre-computed query vector. Required when the collection's provider is
     /// `byo`, which supplies its own vectors.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub vector: Option<Vec<f32>>,
     /// Restrict results to documents matching this filter, so semantic search
     /// composes with ordinary conditions.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
     /// How many results to return. Defaults to 10.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub k: Option<usize>,
 }
 
@@ -200,21 +265,46 @@ pub struct HybridSearchArgs {
     pub collection: String,
     /// Text to search for. The server embeds it, and the keyword half needs
     /// the words, so this is required in practice.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub query: Option<String>,
     /// A pre-computed query vector, for a collection whose provider is `byo`.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub vector: Option<Vec<f32>>,
     /// Restrict results to documents matching this filter.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
     /// How many results to return. Defaults to 10.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub k: Option<usize>,
     /// How much each half counts in fusion: the score is
     /// `dense / (60 + rank_dense) + lexical / (60 + rank_lexical)`. Each at
     /// least 0, not both zero. Defaults to equal weights.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub weights: Option<FusionWeightsArgs>,
     /// How many distinct query terms a chunk must contain to count as keyword
     /// evidence at all (at least 1; defaults to 1). The keyword half ranks by
@@ -222,7 +312,12 @@ pub struct HybridSearchArgs {
     /// with the query and its ranking is noise; `2` keeps only chunks that
     /// really match. A document this removes from the keyword half keeps its
     /// vector-search contribution.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub min_overlap: Option<usize>,
 }
 
@@ -257,7 +352,12 @@ pub struct UpdateArgs {
     pub collection: String,
     /// Which documents to update. **Omitting this matches every document in
     /// the collection**, so pass one unless that is genuinely what you want.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
     /// Update operators, for example `{"$set": {"status": "closed"}}`.
     pub update: Value,
@@ -281,7 +381,12 @@ pub struct DeleteArgs {
     pub collection: String,
     /// Which documents to delete. **Omitting this matches every document in
     /// the collection.**
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub filter: Option<Value>,
     /// Delete every match rather than only the first.
     #[serde(default)]
@@ -321,7 +426,12 @@ pub struct CreateIndexArgs {
     #[serde(default)]
     pub unique: bool,
     /// Optional index name. Derived from the fields when omitted.
-    #[serde(default)]
+    #[schemars(required)]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "kimmy_api::json::non_null_field"
+    )]
     pub name: Option<String>,
 }
 

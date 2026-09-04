@@ -7561,6 +7561,253 @@ advertising an origin above it, where absorbing answers the granted stamp and
 clipping leaves that origin pinned at the window's end for ever.
 
 
+## ADR-128 — An explicit JSON `null` for a declared field is refused, not read as absent
+
+**Decision.** Every optional field of a closed request shape (ADR-121) that
+is not itself meant to be nullable is deserialized through
+`json::non_null_field`, a `deserialize_with` defined once beside `JsonBody<T>`
+in `crates/kimmy-api/src/json.rs` — the same file, and the same reasoning, as
+ADR-121's own locus for the rule it states once. Serde's derive routes every
+`Option<T>` field through `Deserializer::deserialize_option`, and for JSON
+that method treats a present `null` and an absent key identically: both call
+the visitor's `visit_none`, and neither ever reaches `T`. `non_null_field`
+supplies its own visitor whose `visit_some` hands the value straight to `T`,
+unchanged from what `Option<T>` already did, and whose `visit_none` — reached
+only when the key was present and its value was `null`, since an absent key
+never invokes `deserialize_with` at all — answers
+`invalid_type(Unexpected::Unit, …)`, the same call serde_json's own
+deserializer makes for a `null` given to any type that cannot hold it. The
+`422` and its envelope come from the same `JsonRejection → ApiError`
+conversion every other malformed body already goes through, so the message
+reads exactly like `if_stamp: invalid type: integer \`123\`, expected a
+string` does today: `if_stamp: invalid type: null, expected a non-null
+value`. An absent key still yields `None`; nothing about omission changes.
+
+The attribute is on every `Option<T>` field of every route struct behind
+`JsonBody<T>`: `FindRequest` (`filter`, `sort`, `projection`, `limit`, `skip`,
+`cursor`), `FindAndModifyRequest` (`filter`, `sort`, `update`,
+`returnDocument`, `projection`, `if_stamp`), `UpdateRequest` (`filter`,
+`if_stamp`), `DeleteRequest` (`filter`, `if_stamp`), `CreateIndexRequest`
+(`name`, `enforcement`, `expireAfterSeconds`, `partialFilterExpression`),
+`webhooks::RegisterRequest` (`operations`), and `vectors::SearchRequest`
+(`query`, `vector`, `filter`, `k`, `per_document`, `weights`, `min_overlap`) —
+every closed shape `find`, index creation, webhook registration and both
+searches, all of which ADR-121 names as closed, add to the four write shapes
+finding 12 itself demonstrated the hole on.
+
+`POST .../vector` is on that list too — ADR-121 names "a vector
+configuration's `provider`" as a nested shape it closes — but not by putting
+the attribute on `kimmy_core::VectorConfig`/`ProviderConfig` themselves. Those
+two are not only this route's request body; they are also the stored form,
+inside `CollectionMeta`, and the replicated one, inside `VectorSet`'s BSON —
+and several of their fields (`ProviderConfig::{OpenAi,Cohere,Gemini}`'s
+`endpoint`, `CustomHttp`'s `api_key_env`) have `#[serde(default)]` but no
+`skip_serializing_if`, unlike `dimensions` and `max_tokens` beside them, so an
+unset one has always serialized as a literal `null` rather than an absent
+key. Putting `non_null_field` on `VectorConfig` itself would refuse to load
+or replicate-apply exactly the records that shape has always produced by
+leaving a field at its default — turning an upgrade into a node that cannot
+read its own configuration. So the refusal lives on
+`kimmy_api::vectors::VectorConfigInput` — a request-only mirror of
+`VectorConfig`, with `ChunkConfigInput` and `ProviderConfigInput` mirroring
+its two nested shapes — deserialized from the fresh HTTP body and converted
+with `From` before anything stores or replicates it, exactly the shape
+ADR-121 already used for `GrantInput` over `kimmy_auth::Grant`, and for the
+same reason: a wire shape and a persisted one are not always the same
+closure, even when they are (there, and here until now) the same type.
+`kimmy-core/src/vector_meta.rs` carries a test,
+`a_null_endpoint_or_key_variable_still_decodes_as_absent`, pinning that the
+real type stays exactly as permissive as every version before this one.
+
+The MCP tools carry the same attribute on the same fields, named for
+`kimmy_api::json::non_null_field` rather than redefined: `DescribeArgs`
+(`sample`), `FindArgs` (`filter`, `sort`, `projection`, `limit`, `skip`),
+`CountArgs` (`filter`), `SearchArgs` (`query`, `vector`, `filter`, `k`),
+`HybridSearchArgs` (`query`, `vector`, `filter`, `k`, `weights`,
+`min_overlap`), `UpdateArgs` (`filter`), `DeleteArgs` (`filter`), and
+`CreateIndexArgs` (`name`) — the same `{"filter": null, "multi": true}`
+deletes-everything case, reachable through `delete`'s tool argument the same
+as through the REST body, since rmcp deserializes both with plain serde and
+neither the HTTP path nor the tool path is more closed than the other by
+right. `InsertArgs`'s `document`, `BulkInsertArgs`'s `documents` and
+`AggregateArgs`'s `pipeline` are content the same way a REST document body
+is, and are untouched for the same reason.
+
+Each of those fields also carries `#[schemars(required)]` alongside
+`skip_serializing_if = "Option::is_none"`. schemars derives a tool's
+`inputSchema` from the field's Rust type, not from `deserialize_with`, so an
+`Option<T>` field's advertised schema is `["T", "null"]` with
+`"default": null` by default — accurate before this decision, since `null`
+genuinely was accepted, and wrong afterwards: `delete.filter`'s schema would
+have kept telling the one client that reads it first, the model, that `null`
+is not just valid but the *default* value of the argument whose `null`
+emptied a collection. `#[schemars(required)]` asks schemars for the plain,
+non-nullable schema of the inner type instead of `Option`'s; pairing it with
+`skip_serializing_if` (inert for these `Deserialize`-only structs at
+runtime, read only by schemars) drops the `null` default that
+`#[serde(default)]` would otherwise report. The property is still not in
+`required`, since omitting it is unaffected — only its `null` is. The schema
+test in `tests/mcp.rs` drives every field in the table above through
+`schema_forbids_null` as well as the runtime refusal, so the two cannot
+drift apart unnoticed again.
+
+No field opts into nullability today; one that genuinely would keep the bare
+`Option<T>` derive and say so where it is declared. Query-string structs are
+untouched: a query string cannot carry a JSON `null` — `?if_stamp=` is an
+empty string, refused already as a malformed stamp — so ADR-124's closure
+needed nothing here. Neither does a document body: `insert`, `replace` and
+bulk insert take `JsonBody<Value>` or `JsonBody<Vec<Value>>` directly, with no
+declared fields to hold this rule, and a document's own content, a filter's,
+or an update operator's operand is read straight into `Value`, which
+legitimately holds `null` — this rule reaches only a request shape's own
+declared fields, never what a `Value`-typed field's document holds. It also
+does not reach a field that is not itself optional: `update`'s `update` on
+`POST .../update` is a required `Value`, so `null` there becomes
+`Value::Null` and is refused downstream at `400`, by that field's own type,
+rather than by `non_null_field` — which only ever runs on a field the derive
+would otherwise default to `None`. Both are refused; only the status and the
+mechanism differ, and `a_null_required_field_is_refused_by_its_own_type_not_by_non_null_field`
+pins the distinction so it reads as deliberate.
+
+One nested shape names the wrong field when it refuses: a value inside a
+`#[serde(tag = "kind")]` enum, `ProviderConfigInput` among them, is refused
+as `"provider: invalid type: …"` rather than `"provider.endpoint: …"`.
+`serde_path_to_error` tracks a path by wrapping the `Deserializer` the
+top-level call uses; once an internally-tagged enum's own tag is matched, the
+rest of that value is re-read from a buffered `Content` tree through a
+second, unrelated `Deserializer` the wrapper never sees, so nothing after the
+tag is matched can extend the tracked path. This is not new to this decision
+and not particular to `null`: a wrong-typed `dimensions` inside the same
+`provider` object truncates identically, and always has —
+`a_wrong_value_inside_a_tagged_enum_names_the_enums_own_field_not_the_inner_one`
+pins both alongside the ordinary, untagged `chunk.max_tokens`, whose path
+reports in full. Documented in `docs/http-api.md` and `docs/openapi.yaml`
+rather than worked around: the refusal and its status are both right, only
+the name is short, and reaching further would mean threading a second,
+scoped path tracker across serde's own enum-tag buffering — a fix for
+`serde_path_to_error` and internally-tagged enums generally, not something
+this decision's scope extends to.
+
+A test in each of `kimmy-api` and `kimmy-mcp` enumerates every shape and
+field this decision claims and drives it over a real socket, asserting `422`
+(`kimmy-api`) or the tool's own `isError` (`kimmy-mcp`) for an explicit
+`null` and success for an absent key — the table-driven guard the review that
+returned this unit asked for, so a field added to a closed shape later
+without the attribute fails the suite rather than shipping quietly. Nothing
+shorter of a proc macro that refuses to compile a bare `Option<T>` on a
+closed shape is fully fail-closed by construction the way ADR-124's route
+table is; this is the nearest practical approximation, and is named as a
+residual below.
+
+**Why.** `{"if_stamp": null}` on `update`, `delete` or `find_and_modify`
+answered `200` and wrote unconditionally — the opposite of what the field is
+for, and the exact failure ADR-121 named in its own motivation, one door
+further in. Worse, `{"filter": null, "multi": true}` on `/delete` answered
+`200 {"deleted": <every document>, …}`: an optional `filter` defaults to "no
+filter", which is "match everything", so a caller whose JSON encoder writes
+an unset field as `null` — the default behaviour of many — sent what it
+believed was a scoped delete and emptied the collection. The same shape on
+`/update` rewrote every document instead. Every *other* malformed value of
+these same fields was already refused: `if_stamp: 123` and `if_stamp: true`
+both `422`, `if_stamp: "not-a-stamp"` `400 malformed stamp`, and `multi:
+null` on the non-optional `multi` field was already `422` because a required
+field with no `Option` wrapper has no null-shortcut to fall into. `null` was
+the one value serde's own machinery does not already refuse for an optional
+field, on every route that declares one — found independently by two areas
+of the same test round, one from `if_stamp` and one from `filter`, neither
+aware of the other's result.
+
+**Alternatives.**
+
+- *Patch `if_stamp` alone, by hand, on each of the four write shapes.*
+  Rejected, and stated as the failing outcome this decision exists to avoid:
+  it leaves `filter: null` open, which is the destructive case. Four
+  independent write shapes carrying the identical hole is what makes a
+  per-field patch the wrong shape of fix.
+- *Walk the raw JSON body and refuse any `null` found anywhere, ahead of
+  typed deserialization.* Rejected. `JsonBody<T>` is generic over every
+  request shape the server has, including `insert` and bulk insert, which
+  take `JsonBody<Value>` and `JsonBody<Vec<Value>>` directly — a document
+  *is* its own top-level body on those routes. A walk with no notion of
+  which keys are declared fields of a shape and which are a document's own
+  content cannot draw ADR-121's boundary; it would refuse `{"note": null}` on
+  `insert` and break the routes ADR-121 named as deliberately open.
+- *Change the field's declared type instead of its deserialization —
+  `Option<NonNull<T>>` or similar.* Rejected. The null-shortcut lives in how
+  serde's derive calls `deserialize_option` for any `Option<U>`, whatever
+  `U` is; wrapping the inner type changes nothing; a JSON `null` never
+  reaches `U::deserialize` regardless of what `U` is, wrapped or not. Only
+  supplying a different visitor for `deserialize_option` itself — which is
+  what `deserialize_with` lets a field do — intercepts it.
+- *A distinct, type-specific message per field ("expected a string", "expected
+  a document").* Rejected for the same reason ADR-121 keeps its message
+  generic: one function reused everywhere is worth more than wording tuned
+  per call site, and "a non-null value" already says what a client needs to
+  fix.
+- *Put `non_null_field` on `kimmy_core::VectorConfig`/`ProviderConfig`
+  directly, since deny_unknown_fields already lives there.* Rejected, for
+  the reason ADR-121 gave for leaving `VectorConfig` out of the
+  specification's closed-request treatment, one level more serious here: a
+  response schema staying open so a new field is additive is a documentation
+  concern, but a stored or replicated record decoding under a later version
+  is a durability one. `ProviderConfig::endpoint` already serializes an unset
+  value as a literal `null` and always has, so closing the type itself would
+  refuse to load metadata this exact version of the server wrote. `kimmy-core`
+  cannot depend on `kimmy-api` to reach `non_null_field` even if this were
+  safe, which is the surface version of the same problem: the type is used
+  where the rule must not reach.
+- *Move `non_null_field` down into `kimmy-core` so `VectorConfig` could use it
+  directly, gated some other way from the storage and replication paths.*
+  Rejected as more machinery for less clarity than a mirror: it would need a
+  second entry point, or a flag threaded through every deserialization call
+  site, to tell "this is a fresh request" from "this is a stored record" —
+  exactly the distinction `VectorConfigInput` draws for free by being a type
+  that only ever exists on the request path. `GrantInput` already established
+  the pattern for a request shape that happens to coincide with a persisted
+  one; reusing it costs a `From` impl, not a new mechanism.
+
+**Cost.** Breaking for a client relying on the bug: one that sends `null` for
+an unconditional write dressed as a conditional one, or a `null` filter
+meaning "everything", now meets a `422` (or, over MCP, the tool's own
+`isError`) instead of a silent write. A `0.MINOR` bump under the pre-1.0
+policy, no compatibility shim — sending `null` was never documented to mean
+anything, and `openapi.yaml` already typed every one of these fields without
+a `null` branch, so *that* schema was already correct and needed no change;
+only the server's behaviour was not. The MCP tool schemas were a different
+story and did need one: schemars derives `inputSchema` from the field's Rust
+type regardless of `deserialize_with`, so every one of these fields
+advertised `null` as valid — accurately, before this decision — and fixing
+the server without telling schemars would have shipped a contract that lied
+to the one reader who checks it first, an agent, worst on `delete.filter`,
+whose schema would have called the one value that used to empty a collection
+its *default*. `#[schemars(required)]` plus `skip_serializing_if` on the same
+twenty fields closes that, at the same per-field cost as the attribute that
+opened it. One helper function, reused wherever a field needs it — kimmy-mcp
+names it from kimmy-api rather than redefining it — one line per field
+naming it, and one mirror type for `POST .../vector`'s three shapes: the same
+order of cost ADR-121's `deny_unknown_fields` attribute has today, plus what
+`GrantInput` already cost once. The first-party Rust and Python clients, the
+CLI, the MCP server's own use of these tools, the conformance scenarios and
+every request example in the documentation omit an unset optional field
+rather than encoding it as `null`, so none of them are affected.
+
+The Go client is not quite in that list, and not uniformly fixed the same
+way. `Count`'s existing `nil`-to-`{}` guard is right to keep and right to
+extend to `UpdateIf` and `DeleteIf`: neither takes `multi`, so a `nil`
+filter there is bounded to one document by `if_stamp` regardless, exactly as
+harmless as `Count`'s always was. `Update`, `UpdateWith` and `Delete` are the
+opposite case: each takes `multi` as the caller's own choice on every call,
+so applying the same guard there would have reproduced the exact defect this
+decision closes, one layer further out — `Delete(ctx, db, coll, nil, true)`
+would send `{"filter": {}, "multi": true}` and empty the collection, where
+sending `nil` as JSON `null` now gets the caller a `422` instead. A `nil`
+Go map is precisely what a caller gets from *forgetting* to build a filter,
+which is finding 12's own scenario arriving through a client rather than the
+wire; guarding it there would have converted a mistake the server now
+catches back into a silent one. So those three are left to send `filter`
+exactly as given, `nil` included, and the doc comment on each says so.
+
+
 ## ADR-129 — An aggregation stage operand with a fixed key set is closed; a field-path map stays open
 
 **Decision.** A pipeline stage document that has a *fixed* key set —

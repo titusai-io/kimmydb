@@ -79,6 +79,66 @@ where
     }
 }
 
+/// Deserialize a declared-optional field of a request shape, refusing an
+/// explicit JSON `null` rather than reading it the same as an absent key.
+///
+/// `Option<T>`'s built-in `Deserialize` cannot tell the two apart: a present
+/// `null` and a missing key both produce `None`. For most fields that is
+/// harmless, but `"if_stamp": null` reads as no condition at all, and
+/// `"filter": null` reads as no filter — which on a `multi` write is every
+/// document in the collection. Every other malformed value of these same
+/// fields is already refused `422`; `null` was the one hole ADR-121 and
+/// ADR-124 left open, one door further in than either closed (ADR-128).
+///
+/// A field on a closed request shape (ADR-121) that means "optional", rather
+/// than "nullable", names this as its `deserialize_with`. Serde's derive
+/// invokes it only when the key is present — an absent key still falls
+/// through to the field's own `#[serde(default)]` and yields `None` exactly
+/// as before — so the two cases the built-in impl conflates are told apart.
+/// The `Some` arm hands the untouched deserializer to `T` and changes
+/// nothing about how a present, non-null value is read, wrong-typed values
+/// included; only a present `null` takes the new path, refused with the same
+/// `invalid_type` machinery serde itself uses for any other value `T`
+/// cannot hold, so the message reads like every other type error and the
+/// `422` comes from the same `JsonRejection` plumbing.
+///
+/// A field that is genuinely nullable — none exist today — does not name
+/// this and keeps the bare `Option<T>` derive.
+pub fn non_null_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    struct RequirePresent<T>(std::marker::PhantomData<T>);
+
+    impl<'de, T: serde::Deserialize<'de>> serde::de::Visitor<'de> for RequirePresent<T> {
+        type Value = Option<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a non-null value")
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            T::deserialize(deserializer).map(Some)
+        }
+
+        // Reached only for a key present with value `null`: an absent key
+        // never reaches `deserialize_with` at all, and any other value takes
+        // `visit_some` above.
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Err(E::invalid_type(serde::de::Unexpected::Unit, &self))
+        }
+    }
+
+    deserializer.deserialize_option(RequirePresent(std::marker::PhantomData))
+}
+
 /// Convert a JSON value into BSON, honouring Extended JSON wrappers.
 pub fn json_to_bson(value: &Value) -> Result<Bson, ApiError> {
     Ok(match value {

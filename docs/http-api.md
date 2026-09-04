@@ -336,7 +336,11 @@ curl -XPOST localhost:7878/v1/db/shop/coll/orders/delete -H "$A" \
   -d '{"filter":{"qty":{"$lt":1}},"multi":true}'
 ```
 
-`multi` defaults to `false` — without it, one document is affected.
+`multi` defaults to `false` — without it, one document is affected. An
+omitted `filter`, or `{}`, matches every document — combined with
+`multi: true` that is the deliberate way to affect the whole collection. An
+explicit `filter: null` is not the same as omitting it: it is refused `422`,
+not read as "no filter" ([The JSON boundary](#the-json-boundary)).
 
 > **`modified` counts documents written, not documents changed.** A `$set` to
 > the value a field already holds is still a write, so it still counts —
@@ -362,7 +366,8 @@ names one document — or with `explain`, below. On these routes it is a
 **body** field: `?if_stamp=…` on the URL is refused `400`, as any query
 string on a route that takes none is (see
 [The JSON boundary](#the-json-boundary)), rather than being read as no
-condition at all.
+condition at all — and `"if_stamp": null` in the body is refused `422` for
+the same reason, rather than making the write unconditional.
 
 An update path may address array elements — `items.$[].qty` for every
 element, `items.$[line].qty` for the elements an `arrayFilters` entry
@@ -736,6 +741,39 @@ a misspelt `collection` used to default to `*` and widen the grant. A document
 body is content, not a shape: insert, replace and bulk take any field, because
 `limit` and `filter` are perfectly good names for a document's own fields.
 
+**An explicit `null` on a declared *optional* field is refused `422
+bad_request`, not read as absent.** An optional field you omit still means
+what it always meant; the same field sent as `"field": null` is refused by
+name, in the same envelope and message shape as any other wrong-typed value.
+`Option<T>`'s ordinary deserialization cannot tell "you never mentioned this"
+from "you sent `null`", and the two are not the same request:
+`{"if_stamp": null}` on `update`, `delete` or `find_and_modify` is not the
+same as leaving `if_stamp` out, and `{"filter": null, "multi": true}` on
+`delete` is not the same as `{"filter": {}, "multi": true}` — the latter is
+the documented, deliberate way to match every document; the former is
+refused rather than silently meaning the same thing ([ADR-128](decisions.md)).
+This is about a request shape's own declared fields, not what is inside
+them: a filter, an update operator's operand, or a stored document may hold
+a genuine `null` value anywhere, and none of that is touched by this rule.
+A *required* field sent as `null` was already refused before this rule
+existed — it fails its own type, downstream of the field being present at
+all — but by whatever status and message that field's own validation
+answers with; `update`'s `update` on `POST .../update` is `400 "expected a
+JSON object"`, for instance, not this `422`. This rule is what closes the
+one gap: an *optional* field's `null`, which nothing refused before.
+
+**One nested shape does not name the field inside it: a tagged `provider`
+object.** `{"provider": {"kind": "open_ai", "endpoint": null, …}}` is
+refused, but the message reads `"provider: invalid type: null, expected a
+non-null value"` — it names `provider`, not `provider.endpoint`. This is not
+particular to `null`: `{"provider": {"kind": "open_ai", "dimensions":
+"nine"}}` is refused the same truncated way, and always has been. Once the
+`kind` tag is matched, the value is re-read through a second, unrelated
+deserializer, and the path tracker that otherwise names a nested field —
+`chunk.max_tokens` reports its full path correctly, being an ordinary struct
+rather than a tagged one — cannot see across that seam. The status and the
+refusal are both right; only the name is short.
+
 **An aggregation stage operand is closed too, but at `400`, not `422`.**
 `$unwind`'s document form (`path`, `preserveNullAndEmptyArrays`,
 `includeArrayIndex`), `$lookup`'s both forms, and `$replaceRoot` refuse a key
@@ -939,7 +977,7 @@ failure cannot appear without its retry class being decided in the same commit.
 | Status | `error` | `retry` | Cause |
 |---|---|---|---|
 | 400 | `bad_request` | no | Malformed filter, update, projection, or Extended JSON; a bulk batch over 1000 documents; a query parameter the route does not define, or one it cannot parse or honour — `?sample=0` on `describe` ([ADR-121](decisions.md)); an `if_stamp` that is not a stamp the server issued; a `vector_search` or `hybrid_search` on a collection with **no vector configuration**, where the message names the `POST …/vector` route that enables it; **a key `$unwind`'s document form, `$lookup`, or `$replaceRoot` does not define, or a document whose `$unwind` path crosses an array** ([ADR-129](decisions.md), [ADR-130](decisions.md)) |
-| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, or a field the route does not define; the message names it ([ADR-121](decisions.md)). **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
+| 422 | `bad_request` | no | A body that is valid JSON but the wrong shape — an object where `/bulk` wants an array, a required field missing, a field the route does not define, or an explicit `null` on a declared *optional* field that does not accept one; the message names it ([ADR-121](decisions.md), [ADR-128](decisions.md)). A `null` sent for a *required* field is refused too, but by that field's own type — see [The JSON boundary](#the-json-boundary) — and is not always this status. **Not** a pipeline stage operand's unknown key, which is untyped JSON at this layer and is refused `400` once `kimmy-query` parses it (ADR-129) |
 | 401 | `unauthorized` | no | Missing, malformed, invalid, or expired token; bad credentials; a token whose account was deleted, disabled, or had its password or grants changed ([ADR-052](decisions.md)) |
 | 403 | `forbidden` | no | Denied by RBAC |
 | 404 | `not_found` | no | Document, collection, or user absent. **A collection absent on a node that has peers answers `elsewhere` instead**: created through a load balancer, it lands on one member and reaches the rest a sync round later, and another member has it meanwhile |

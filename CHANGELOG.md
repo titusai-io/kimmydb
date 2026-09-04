@@ -14,63 +14,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
-- **Breaking, cluster wire: a batch answer now carries where the window
-  ended.** `Message::Entries` gained `scanned_to` (the last stamp the sender's
-  scan examined, an entry it withheld included) and `exhausted` (whether it
-  stopped there because the oplog ran out), and changed from a newtype variant
-  to a struct variant to do it. There is no compatibility shim and no version
-  negotiation — pre-1.0 the cluster wire is changed outright — so a node of
-  this version and a 0.21.0 node **cannot replicate with each other in either
-  direction**: the round fails as a malformed frame and `kimmy_sync_failures_total`
-  rises on both. Roll every member. Nothing on disk changes, and no client-facing
-  route, response or `/v1` promise is affected. ADR-127.
 
-- **An aggregation stage operand with a fixed key set refuses a key it does
-  not define, and a declared key refuses a wrong-typed value rather than
-  silently falling back.** `$unwind`'s document form, `$lookup`'s both
-  forms, `$replaceRoot`, `$switch` (and each branch) and `$dateToString`
-  answered `200` and silently ignored an unrecognized key —
-  `{"path": "$x", "preserveNullAndEmptyArray": true}`, one character short
-  of `preserveNullAndEmptyArrays`, silently reverted the option to `false`
-  and dropped documents the caller asked to keep; `{"date": "$t", "formt":
-  "%Y"}` silently kept the default date format; `includeArrayIndex`, a real
-  MongoDB option, was silently dropped outright. All are now a `400` naming
-  the field, the same closure [ADR-121](docs/decisions.md) already gives the
-  request body and its nested shapes. The same typo can also land in a
-  *value*: `{"preserveNullAndEmptyArrays": "true"}` or `: 1` fell through to
-  `false` exactly like a missing key; it is now refused by name too.
-  `includeArrayIndex` is implemented rather than left dropped — the name of
-  a field to hold each output row's array position, `null` on a row not
-  produced by fanning one out — and itself refuses a name beginning with `$`
-  (unreadable by this language's own field-path syntax) or the same name as
-  `path` (would silently overwrite the unwound element). `$match` filters
-  and `$project` specifications are unaffected and stay open — every key in
-  either is a document field name the caller chose, not vocabulary this
-  database defines. **Breaking for a client sending an unrecognized key or a
-  wrong-typed `preserveNullAndEmptyArrays` to one of these stages**, and a
-  `0.MINOR` bump for it; no documented, working pipeline is affected.
-  ADR-129.
-
-- **`explain: true` on `update` and `delete` plans the write; it no longer
-  performs it.** Both routes previously executed the write regardless of
-  `explain`, using it only to attach a report of the plan afterward — so
-  `POST .../delete {"filter": {}, "multi": true, "explain": true}` deleted
-  every document in the collection, and the equivalent `update` rewrote
-  every one. `explain` on these two routes was never documented as
-  executing — `http-api.md` and the `Explain` schema only ever described
-  its output, in the past tense — so it now runs the same read-only scan
-  `find` and `count` already use. Nothing is written and no commit is
-  spent: `matched`, `modified`, `deleted` and `commits` all read `0` and
-  `stamp` is absent, identically to a write that matched nothing; what the
-  write *would* touch is `explain.documentsMatched`, the field `find`'s own
-  `explain` has always carried. `explain` cannot be combined with
-  `if_stamp` and is refused `400` with it — a plan checks no version, so it
-  cannot answer whether a *conditional* write would happen. `update` and
-  `delete` can now report `indexEntriesRead` in `explain`, which they could
-  not before: their `explain` used to be read back out of the write's own
-  bookkeeping, which does not track it. Breaking for a client that relied on
-  `explain: true` still performing the write, or on sending `if_stamp`
-  alongside it. ADR-131.
 
 ### Fixed
 

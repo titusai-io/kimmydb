@@ -125,7 +125,7 @@ impl Subscription {
 #[serde(deny_unknown_fields)]
 pub struct RegisterRequest {
     pub url: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "crate::json::non_null_field")]
     pub operations: Option<Vec<String>>,
 }
 
