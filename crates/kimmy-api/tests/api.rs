@@ -5422,6 +5422,54 @@ async fn a_null_field_on_the_vector_configuration_is_refused() {
     assert_eq!(res.status, 200, "{:?}", res.body);
 }
 
+/// A typo beside `kind = "byo"` is refused like a typo beside any other kind.
+///
+/// ADR-121 closes every request shape, and `provider` is one of the nested
+/// shapes it names. `deny_unknown_fields` on an internally-tagged enum is
+/// applied per variant, and serde has nowhere to apply it on a *unit*
+/// variant — it stops reading after the tag. So `byo`, alone among the eight
+/// kinds, took an extra key and dropped it, while `open_ai` beside it
+/// refused. A caller who misspells a field on the one provider that needs no
+/// fields is exactly the caller who most needs to be told.
+#[tokio::test]
+async fn an_unknown_field_beside_a_byo_provider_is_refused_by_name() {
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["t"], "provider": { "kind": "byo", "nosuch": 1 }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 422, "{:?}", res.body);
+    assert_eq!(res.body["error"], "bad_request", "{:?}", res.body);
+    assert_eq!(res.body["retry"], "no", "{:?}", res.body);
+    let message = res.body["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("unknown field `nosuch`"),
+        "must name the field it refused: {message}"
+    );
+
+    // Nothing was stored by the refusal.
+    let res = server.get("/v1/db/shop/coll/docs/vector", Some(&token)).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert!(res.body["vector"].is_null(), "{:?}", res.body);
+
+    // The control: the same provider without the extra key still configures,
+    // so the refusal above is the field and not the shape around it.
+    let res = server
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({ "fields": ["t"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+}
+
 /// A collection of `n` documents, half of them `even`.
 async fn paged(server: &Server, coll: &str, n: i64) -> String {
     let token = server.root().await;

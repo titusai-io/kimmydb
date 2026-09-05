@@ -268,7 +268,7 @@ fn vector_writes(c: &mut Criterion) {
                     "docs",
                     VectorConfig {
                         fields: vec!["name".into()],
-                        provider: ProviderConfig::Byo,
+                        provider: ProviderConfig::Byo {},
                         dim: 384,
                         metric: Metric::Cosine,
                         document_prefix: None,

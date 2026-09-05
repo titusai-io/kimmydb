@@ -621,7 +621,7 @@ mod tests {
                 name,
                 VectorConfig {
                     fields: vec!["body".into()],
-                    provider: ProviderConfig::Byo,
+                    provider: ProviderConfig::Byo {},
                     dim: 4,
                     metric: Metric::Cosine,
                     document_prefix: None,

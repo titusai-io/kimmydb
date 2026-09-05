@@ -104,7 +104,13 @@ fn default_gemini_key_env() -> String {
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ProviderConfigInput {
-    Byo,
+    /// An empty body, not a unit variant, for the reason spelled out on
+    /// [`ProviderConfig::Byo`]: serde has nowhere to apply `deny_unknown_fields`
+    /// on an internally-tagged unit variant, so `{"kind":"byo","nosuch":1}`
+    /// reached the handler as a plain `byo` with the typo dropped. Both types
+    /// need the fix — this mirror is what the route deserializes, the core
+    /// type is what the operator's profile map and the stored form do.
+    Byo {},
     OpenAi {
         model: String,
         #[serde(default, deserialize_with = "crate::json::non_null_field")]
@@ -148,7 +154,7 @@ pub enum ProviderConfigInput {
 impl From<ProviderConfigInput> for ProviderConfig {
     fn from(input: ProviderConfigInput) -> Self {
         match input {
-            ProviderConfigInput::Byo => ProviderConfig::Byo,
+            ProviderConfigInput::Byo {} => ProviderConfig::Byo {},
             ProviderConfigInput::OpenAi { model, endpoint, api_key_env, dimensions } => {
                 ProviderConfig::OpenAi { model, endpoint, api_key_env, dimensions }
             }
@@ -1031,7 +1037,7 @@ mod tests {
         admit_provider(&state, &openai(None, "OPENAI_API_KEY")).unwrap();
         admit_provider(&state, &openai(Some("https://93.184.216.34"), "KIMMY_PROVIDER_ACME"))
             .unwrap();
-        admit_provider(&state, &ProviderConfig::Byo).unwrap();
+        admit_provider(&state, &ProviderConfig::Byo {}).unwrap();
     }
 
     #[test]
@@ -1056,7 +1062,7 @@ mod tests {
         assert!(err.message.contains("endpoints_locked"), "{}", err.message);
 
         admit_provider(&state, &ProviderConfig::Profile { name: "corp".into() }).unwrap();
-        admit_provider(&state, &ProviderConfig::Byo).unwrap();
+        admit_provider(&state, &ProviderConfig::Byo {}).unwrap();
         let err =
             admit_provider(&state, &ProviderConfig::Profile { name: "nope".into() }).unwrap_err();
         assert!(err.message.contains("vector.providers.nope"), "{}", err.message);
@@ -1074,7 +1080,7 @@ mod tests {
     fn config() -> VectorConfig {
         VectorConfig {
             fields: vec!["text".into()],
-            provider: ProviderConfig::Byo,
+            provider: ProviderConfig::Byo {},
             dim: 2,
             metric: Metric::Cosine,
             document_prefix: None,

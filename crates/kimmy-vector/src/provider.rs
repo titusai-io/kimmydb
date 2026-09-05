@@ -166,7 +166,7 @@ pub fn build(
     policy.check_provider(config).map_err(|e| refused(e, config.name()))?;
     let endpoint = config.endpoint().map(str::to_string);
     match config {
-        ProviderConfig::Byo => Err(VectorError::NoProvider),
+        ProviderConfig::Byo {} => Err(VectorError::NoProvider),
 
         ProviderConfig::OpenAi { model, api_key_env, dimensions, .. } => {
             Ok(Box::new(HttpProvider::openai(
@@ -742,7 +742,7 @@ mod tests {
     fn byo_has_no_provider_to_build() {
         // The client supplies vectors, so there is nothing to call.
         assert!(matches!(
-            build(&ProviderConfig::Byo, 8, &ProviderPolicy::default()).err(),
+            build(&ProviderConfig::Byo {}, 8, &ProviderPolicy::default()).err(),
             Some(VectorError::NoProvider)
         ));
     }

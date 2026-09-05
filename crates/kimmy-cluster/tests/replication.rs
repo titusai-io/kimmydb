@@ -704,7 +704,7 @@ async fn an_unroutable_peer_cannot_stall_a_sync_round() {
 fn vector_config() -> kimmy_core::VectorConfig {
     kimmy_core::VectorConfig {
         fields: vec!["body".into()],
-        provider: kimmy_core::ProviderConfig::Byo,
+        provider: kimmy_core::ProviderConfig::Byo {},
         dim: 8,
         metric: kimmy_core::Metric::Cosine,
         document_prefix: None,
