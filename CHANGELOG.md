@@ -47,6 +47,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **Breaking, `kimmy-api` API: a failure's log level is a three-variant type,
+  so one below `INFO` cannot be asked for.** `ErrorCode::log_level` and
+  `ApiError::log_level` return `Option<LogLevel>` — `Error`, `Warn`, `Info` —
+  `ApiError::at_level` takes one, and the public `ApiError::level_override`
+  field holds one, all in place of `tracing::Level`. `at_level` is public and
+  used to accept all five `tracing` levels while the log site handled three,
+  with a fallback that fired `debug_assert!(false)` and then logged at `INFO`:
+  `at_level(Level::DEBUG)` panicked a debug build and, in a release build,
+  logged the failure one level louder than asked. Narrowing the type removes
+  the state rather than the guard, and the match at the log site is now
+  exhaustive over three arms with no fallback to get wrong. It also makes the
+  rule the two entries below rest on structural rather than asserted — `None`
+  is "not a log event" and there is no variant quieter than `INFO`, so neither
+  can be written down incorrectly. **Nothing on the wire moves**: the status,
+  the `error` code, the `retry` class, the message, the `request failed` event
+  message and every code's published level are all unchanged, and the two
+  overrides in the server pass `LogLevel::Error` where they passed
+  `Level::ERROR`. ADR-137, amending ADR-136.
+
 - **A node that cannot serve local embeddings now says so at `ERROR`.** It
   answers `501 not_implemented`, the same code as a caller asking for a
   reserved capability, so it used to be indistinguishable in the log from
@@ -91,6 +110,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   against a named variant is unchanged. The list of documented codes the client's
   round-trip test checks had also fallen two behind the server and now names
   all nineteen.
+
+- **Documentation only: `docs/testing.md` states what is enforced instead of
+  counting.** Its header claimed `1398 tests passing` over a per-crate column
+  that summed to 874, against a workspace that measures 1947 — three numbers,
+  no two agreeing, none checked by anything. Four measurements taken hours
+  apart on one afternoon gave 1933, 1937, 1939 and 1947, each correct for the
+  crate set it covered, which is the case against the count rather than against
+  whoever last updated it. The header now names the four commands CI runs on
+  every pull request instead of a result this file cannot assert, the table
+  keeps what each crate is *for*, which does not go stale, and `kimmy-egress`
+  and `kimmy-client` are in it for the first time.
 
 ### Fixed
 

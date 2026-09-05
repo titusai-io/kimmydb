@@ -9391,6 +9391,15 @@ remain the boundary this ADR declines to move.
 
 ## ADR-136 — What a failed request logs is a property of its error code, and the property is actionability rather than HTTP class
 
+> **Amended by [ADR-137](#adr-137--the-log-level-a-failure-can-ask-for-is-a-three-variant-type-not-tracinglevel).**
+> Not superseded: every level below, and the reasoning for each, stands. What
+> changed is the type they are written in. `log_level()` returns
+> `Option<LogLevel>` and `level_override` holds one, where `LogLevel` is
+> `Error | Warn | Info` — so what *"`None`, not a level the subscriber filters
+> out"* below argues for is now held by the type: "quieter than `INFO`" is not
+> a thing that can be written down, rather than a thing an assertion catches
+> once it has been. Read `Level` below as `LogLevel`; `at_level` takes one too.
+
 **Decision.** `ErrorCode` gains `log_level() -> Option<Level>`, a third
 exhaustive match beside `as_str()` and `retry()`, and
 `impl IntoResponse for ApiError` logs at that level instead of gating on
@@ -9599,5 +9608,78 @@ the only test module that can reach both sources; and by
 `operations_names_every_code_that_is_never_logged`, which hold the published
 list to the enum in both directions so an operator's alert rule cannot be
 made wrong by a level moving underneath it.
+
+---
+
+## ADR-137 — The log level a failure can ask for is a three-variant type, not `tracing::Level`
+
+**Decision.** `ErrorCode::log_level` and `ApiError::log_level` return
+`Option<LogLevel>`, and `ApiError::at_level` takes a `LogLevel`, where
+
+```rust
+pub enum LogLevel { Error, Warn, Info }
+```
+
+`LogLevel::tracing()` converts, once, at the single log site in
+`impl IntoResponse for ApiError`. `ErrorCode` and `ApiError` no longer mention
+`tracing::Level` in a signature. Breaking for anything outside this crate that
+called `at_level` or matched on `log_level`; nothing outside it does.
+
+**Why.** ADR-136 gave `ApiError` a per-instance level override, because
+`not_implemented` has two sources that share a code and only one of them should
+page. The override took a `tracing::Level`, which has five variants, while
+`into_response` handled three — so the two disagreed, and the gap was covered
+by a fallback arm:
+
+```rust
+_ => {
+    debug_assert!(false, "{code} asked for a level below INFO");
+    info!(code, message, "{EVENT}")
+}
+```
+
+`at_level` is public. `ApiError::new(…).at_level(Level::DEBUG)` therefore
+**panicked a debug build** and, in a release build, logged the failure one level
+louder than the caller asked for. Neither is a thing a caller should be able to
+reach, and no caller wanted to: the only two overrides in the tree pass
+`Level::ERROR` as a literal.
+
+**The guard was the wrong tool, not a badly written one.** A `debug_assert!`
+that is followed by a plausible-looking fallback is the shape this codebase has
+spent a release removing — it panics where nobody is watching and silently does
+the wrong thing where somebody is. Narrowing the type does not improve the
+guard; it deletes the state the guard existed for. `into_response`'s match is
+now exhaustive over three variants and carries no fallback, because there is no
+fourth case to write.
+
+**Why `log_level` narrows too, and not only `at_level`.** Narrowing one of them
+would leave two vocabularies and a conversion between them in the middle of the
+code that decides severity. Narrowing both makes the whole of ADR-136's rule
+structural:
+
+- *"`None` means this is not a log event"* — the `Option`.
+- *"No code is ever quieter than `INFO`"* — the enum has three variants, so
+  "quieter than `INFO`" cannot be written down.
+
+`no_code_is_logged_below_info` survives as **documentation**, and says so. It
+asserts what the type proves, which is worth stating where somebody adding a
+code will read it, and it is the natural home for the one invariant still worth
+checking: that `LogLevel`'s three variants map onto the `tracing` levels — and
+render as the words — that `docs/operations.md` publishes and `tests/docs.rs`
+compares against. That mapping is the only place a drift can now start.
+
+**What was rejected.** Admitting `DEBUG` and `TRACE` to the match, which is what
+the first attempt at this did (reverted in `b050d1f`). It reopens exactly what
+ADR-136 decided — a failure meant to be quieter than `INFO` answers `None`,
+because "do not log this" is a property of the code and not of how the process
+was started — and it would create a *second* way for a failure to be quiet,
+with different semantics from the first. Two quiet mechanisms is a worse
+outcome than the latent panic. It also has no use case: nothing in the tree
+wants a below-`INFO` failure line, so the argument would have to be made from
+a hypothetical.
+
+**Nothing on the wire moves.** The status, the `error` code, the `retry` class,
+the message and the `request failed` event message are all untouched, as are
+every code's level and the published table in `docs/operations.md`.
 
 ---
