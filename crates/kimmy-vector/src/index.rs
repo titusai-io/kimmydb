@@ -1061,6 +1061,20 @@ mod tests {
     fn scores_match_the_exact_path_exactly() {
         // Scores are recomputed rather than derived from graph distances, so
         // they must be byte-identical to what a scan reports.
+        //
+        // Compared **per document**, not per rank. This test used to assert
+        // `approx[0].score == exact[0].score`, which holds only while the
+        // approximate search happens to return the same top-1 as the scan —
+        // and it is an approximate index over a graph built from a randomised
+        // layer assignment (see `build`), so it does not always. When it did
+        // not, this test failed with two unequal floats and the appearance of
+        // a scoring bug, where the actual event was a recall roll that
+        // `recall_against_exact_search_is_high` explicitly tolerates one of in
+        // ten. It blocked a release that way.
+        //
+        // Per-document is also the stronger claim: it checks every result the
+        // index returned rather than only the first, and it is what the
+        // sentence above actually says.
         let (engine, shadow, _dir) = setup(50, 8);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 8).unwrap();
         let options = SearchOptions { k: 3, metric: Metric::Cosine, per_document: 1 };
@@ -1068,7 +1082,28 @@ mod tests {
 
         let exact = crate::search::vector_search(&engine, &shadow, &query, &options, None).unwrap();
         let approx = index.search(&engine, &shadow, &query, &options, None).unwrap();
-        assert_eq!(approx[0].score, exact[0].score);
+
+        assert!(!approx.is_empty(), "the index returned nothing to compare");
+        let mut compared = 0;
+        for hit in &approx {
+            // A document the scan did not return at this `k` is a recall miss,
+            // which is not what this test is about. Skipping it is not a hole:
+            // the assertion below requires at least one comparison, and recall
+            // itself is covered by its own tests.
+            let Some(scanned) = exact.iter().find(|e| e.id == hit.id) else { continue };
+            assert_eq!(
+                hit.score, scanned.score,
+                "document {} scored {} through the index and {} through the scan; scores are \
+                 recomputed from the stored vector on both paths, so they must agree bit for bit",
+                hit.id, hit.score, scanned.score
+            );
+            compared += 1;
+        }
+        assert!(
+            compared > 0,
+            "no document was returned by both paths, so nothing was actually compared — that is a \
+             total recall failure rather than the scoring question this test asks"
+        );
     }
 
     #[test]
