@@ -82,10 +82,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `Unknown` was documented as keeping the string the server sent and did not:
   every unrecognized code became the literal `unknown`, so the one situation
   the variant exists for — a code newer than the client — was the one it made
-  undiagnosable. `ErrorCode::Unknown` now carries a `String` rather than a
+  undiagnosable. `ErrorCode::Unknown` now carries an `Arc<str>` rather than a
   `&'static str`, which means `ErrorCode` is no longer `Copy`; `Error::code()`
-  still returns an owned `Option<ErrorCode>` and every comparison against a
-  named variant is unchanged. The list of documented codes the client's
+  still returns an owned `Option<ErrorCode>` without reallocating string buffers,
+  `Error::code_str()` returns an unallocated `Option<&str>`, and every comparison
+  against a named variant is unchanged. The list of documented codes the client's
   round-trip test checks had also fallen two behind the server and now names
   all nineteen.
 

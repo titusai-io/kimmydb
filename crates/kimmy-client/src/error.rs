@@ -1,6 +1,7 @@
 //! What can go wrong, and what a caller may do about it.
 
 use std::fmt;
+use std::sync::Arc;
 
 /// A failure, from the wire or from the attempt to reach it.
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +67,14 @@ impl Error {
         }
     }
 
+    /// The string form of the server's code without cloning the code enum.
+    pub fn code_str(&self) -> Option<&str> {
+        match self {
+            Self::Api { code, .. } => Some(code.as_str()),
+            _ => None,
+        }
+    }
+
     pub fn status(&self) -> Option<u16> {
         match self {
             Self::Api { status, .. } => Some(*status),
@@ -115,7 +124,8 @@ impl Retry {
 /// Not `Copy`, because [`ErrorCode::Unknown`] owns the code it was handed. That
 /// is the point of the variant: a caller meeting a code newer than its client
 /// can still log and report *which* code it was, and a `&'static str` payload
-/// cannot hold a string that arrived over a socket.
+/// cannot hold a string that arrived over a socket. It stores an `Arc<str>` so
+/// inspection and cloning remain cheap without reallocating strings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
@@ -143,7 +153,7 @@ pub enum ErrorCode {
     /// moving to a peer.
     Timeout,
     /// A code this client does not know. The string is kept.
-    Unknown(String),
+    Unknown(Arc<str>),
 }
 
 impl ErrorCode {
@@ -173,14 +183,13 @@ impl ErrorCode {
             // `retry` and still say in a log *which* code it was; a client
             // that reports every one of them as "unknown" makes the additive
             // case undiagnosable.
-            other => Self::Unknown(other.to_string()),
+            other => Self::Unknown(Arc::from(other)),
         }
     }
-}
 
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let name = match self {
+    /// The wire string for this error code.
+    pub fn as_str(&self) -> &str {
+        match self {
             Self::BadRequest => "bad_request",
             Self::PayloadTooLarge => "payload_too_large",
             Self::UnsupportedMediaType => "unsupported_media_type",
@@ -200,9 +209,14 @@ impl fmt::Display for ErrorCode {
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
             Self::Timeout => "timeout",
-            Self::Unknown(s) => s.as_str(),
-        };
-        f.write_str(name)
+            Self::Unknown(s) => s.as_ref(),
+        }
+    }
+}
+
+impl fmt::Display for ErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -278,7 +292,8 @@ mod tests {
             None,
             &json!({ "error": "shed_load", "message": "busy", "retry": "wait" }),
         );
-        assert_eq!(e.code(), Some(ErrorCode::Unknown("shed_load".to_string())));
+        assert_eq!(e.code(), Some(ErrorCode::Unknown(Arc::from("shed_load"))));
+        assert_eq!(e.code_str(), Some("shed_load"));
         assert_eq!(
             e.code().expect("a code").to_string(),
             "shed_load",

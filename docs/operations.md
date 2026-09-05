@@ -575,7 +575,11 @@ The four readings:
   resolve together as the backlog drains.
 - **Both flat.** No contact completed at all — look at
   `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`, since a
-  round that failed is counted there and in neither outcome above.
+  round that failed is counted there and in neither outcome above. (Note on
+  PromQL: `kimmy_sync_divergence_checks_total` carries the `outcome` label,
+  while `kimmy_sync_failures_total` is unlabelled. To sum total attempted
+  contacts across both, sum out the label first:
+  `sum(rate(kimmy_sync_divergence_checks_total[5m])) + rate(kimmy_sync_failures_total[5m])`).
 - **Both rising.** *Partly* blind, and the alert above will not fire.
   Some peers are being checked and at least one is not, and **these two
   series are not labelled by peer, so they cannot tell you which** — that
