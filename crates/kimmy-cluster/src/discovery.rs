@@ -286,6 +286,8 @@ impl TryFrom<String> for SeedSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
 
     fn parse(s: &str) -> SeedSource {
         s.parse().unwrap_or_else(|e| panic!("{s:?} should parse: {e}"))
@@ -587,8 +589,19 @@ mod tests {
         // Guards the wiring rather than the resolution: `dns-srv:` returned a
         // "not implemented" error for four milestones, and the parse tests
         // above passed the whole time.
+        //
+        // Alone among the tests here it goes through the process-wide
+        // resolver, which is built from the host's own DNS configuration, so
+        // how long a guaranteed-nonexistent name takes to fail is the host's
+        // business and not this crate's: an immediate NXDOMAIN where the
+        // resolver is a local stub, minutes of retries where it is not. That
+        // is why the lookup is bounded and **a timeout is a pass** — the
+        // failure this test exists to catch, a resolver that cannot be built
+        // at all, returns before the lookup starts.
         let source = parse("dns-srv:_kimmy._tcp.invalid.");
-        let resolved = source.resolve().await;
+        let Ok(resolved) = timeout(Duration::from_secs(2), source.resolve()).await else {
+            return;
+        };
         assert!(
             !matches!(&resolved, Err(ResolveError::Resolver(_))),
             "must reach a lookup rather than failing to build a resolver: {resolved:?}"
