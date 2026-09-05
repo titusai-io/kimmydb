@@ -10,7 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.22.0 - 2026-09-04
 
 ### Added
 
@@ -44,6 +44,13 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   this release, alongside `Entries`': old and new peers cannot exchange
   this check, and the cutover has its own rollout shape in the operations
   guide. ADR-133.
+
+- **`$unwind`'s `includeArrayIndex` is implemented rather than dropped.** The
+  named field carries the position of the array element that produced each
+  row, and `null` on a row no fan-out produced. A name beginning with `$`, or
+  equal to `path`, is refused: this language reads `"$name"` as the field
+  `name`, so a field named that way could never be read back, and the second
+  would overwrite the element just placed there. ADR-129.
 
 ### Changed
 
@@ -80,6 +87,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   direction**: the round fails as a malformed frame and `kimmy_sync_failures_total`
   rises on both. Roll every member. Nothing on disk changes, and no client-facing
   route, response or `/v1` promise is affected. ADR-127.
+
+- **Breaking: an explicit `null` where a field is optional is refused rather
+  than read as absent.** A key present with a `null` value reached the server
+  as though it had never been sent, so `{"if_stamp": null}` on `update`,
+  `delete` or `find_and_modify` performed the write **unconditionally** — the
+  conditional-write guard of ADR-084 silently removed by the value it was
+  given — and `{"filter": null, "multi": true}` on `delete` matched every
+  document and **emptied the collection**, the one request whose typo is
+  indistinguishable from its intent. Such a body now answers `422` naming the
+  field, in the same envelope and the same wording a wrongly-typed value
+  already produced: `if_stamp: invalid type: null, expected a non-null value`.
+  **Omitting the key is unchanged** and still means absent; only an explicit
+  `null` is refused. It applies to every optional field of every closed
+  request shape — `find`, `update`, `delete`, `find_and_modify`, index
+  creation, webhook registration, both searches and `POST .../vector` — and to
+  the matching MCP tool arguments, since `delete`'s `filter` reaches the same
+  code either way. The tools' advertised `inputSchema` no longer offers `null`
+  as a valid value or as the default, which is what a model reads before it
+  calls one. Nothing stored or replicated is affected: the refusal sits on a
+  request-only mirror of the vector configuration, so records that have always
+  serialized an unset field as a literal `null` still load and still
+  replicate. **Breaking for a client that sends `null` for a field it means to
+  omit**, and a `0.MINOR` bump for it. ADR-128.
 
 - **A `byo` provider configuration carrying a field that does not exist is now
   refused instead of accepted.** `{"kind":"byo","nosuch":1}` on
@@ -167,6 +197,39 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   not just the problem: `$unwind: "$items.sku"` is told to unwind `$items`
   first and read `sku` on each resulting row, rather than being handed
   internal path-traversal vocabulary. ADR-130.
+
+- **A misspelled key inside a pipeline stage was ignored, so the stage ran
+  with the option silently off.** `{"$unwind": {"path": "$a",
+  "preserveNullAndEmptyArrays": true}}` written one character short kept every
+  document with an empty array out of the result and answered `200`, and the
+  same held for `$lookup`'s and `$replaceRoot`'s operands. A stage whose keys
+  are **vocabulary** — `$unwind`'s document form, `$lookup` in both forms,
+  `$replaceRoot` — now refuses a key it does not define, `400`, naming the key
+  and listing the ones the stage takes; the same closure covers
+  `$dateToString`'s `format` and `$switch`'s `branches`, where a typo had
+  quietly returned the default format in every row. A closed key's **value**
+  is checked too: `"preserveNullAndEmptyArrays": "true"` or `: 1` reverted the
+  option to `false` and is now refused by name. **`$match`, `$project`,
+  `$sort` and a `$group`'s output names are deliberately left open and always
+  will be** — their keys are field names the caller chose, not words this
+  database defines, so there is nothing to check a key against. **Breaking for
+  a pipeline that carried an unknown key in one of those stages**, which until
+  now ran with that key discarded. ADR-129.
+
+- **`explain: true` on `update` and `delete` performed the write it was asked
+  to describe.** Inspecting a `multi: true` delete before running it deleted
+  every matching document — the request an operator makes precisely to avoid
+  that. Both routes now run the same read-only scan `find` and `count` use:
+  nothing is written, no write transaction opens, and the engine's commit
+  counter does not move. The write-outcome fields keep their names and their
+  meaning — `matched`, `modified`, `deleted` and `commits` report `0` and
+  `stamp` is absent, identical to a write that matched nothing — while what
+  the write *would* touch is reported as `explain.documentsMatched`, the field
+  `find`'s own `explain` has always carried. **`explain` combined with
+  `if_stamp` is now refused `400`**: a plan checks no version, so it cannot
+  honestly answer whether a conditional write would land, and the document it
+  reports as matched may be the one the real write refuses `409 stale`.
+  ADR-131.
 
 - **`find` with `limit: 0` returned one document instead of an empty page**,
   on the unsorted path and on a `sort: {"_id": 1}` request, whenever the
