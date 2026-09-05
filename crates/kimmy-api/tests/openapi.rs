@@ -1914,9 +1914,11 @@ async fn a_rate_limited_login_matches_its_documented_response() {
          to guess"
     );
 
-    // The one code whose answer is "the same node, later". `Retry-After` says
-    // how much later; the class is what tells a client to wait at all rather
-    // than moving on to a peer that shares nothing about this limit.
+    // A code whose answer is "the same node, later", and the only one that can
+    // say how much later: `Retry-After` is a number this node already knows,
+    // where `provider_error` and `timeout` are waiting on something that never
+    // told them. The class is what makes a client wait at all rather than
+    // moving on to a peer that shares nothing about this limit.
     assert_eq!(body["error"], "rate_limited");
     assert_eq!(body["retry"], "wait");
 }

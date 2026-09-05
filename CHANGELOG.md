@@ -91,6 +91,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **Documentation only, no behaviour change:** the hardcoded counts of error
+  codes are corrected, and most of them are gone rather than corrected. The
+  server's `ErrorCode` enum has grown twice since the counts were written —
+  `stale` with conditional writes, `timeout` with the request deadline — and
+  three places still stated the old size with nothing checking them: the module
+  documentation in `crates/kimmy-api/src/error.rs` said a new failure "cannot
+  invent an eighteenth code", the M10 task table in
+  [Roadmap](docs/roadmap.md) said "the seventeen codes are closed by the
+  compiler", and ADR-057 said `wait` was two codes and `no` was twelve, where
+  they are now three and thirteen. **The number is removed wherever the
+  sentence did not need one** — "the code set is closed by the compiler" is the
+  same claim without a figure that can rot — and ADR-057, being a settled
+  record, is amended in place rather than rewritten: the amendment marks the
+  bullets as an M10 snapshot, names the two codes that joined since, and points
+  at `ErrorCode::retry()` and the contract test that already holds every code's
+  retry class to the enum, instead of writing a fresh count for someone to find
+  wrong later. `crates/kimmy-api/src/error.rs` also now records beside the enum
+  that adding a variant means editing `kimmy-client` too, which shares no code
+  with the server by design and which no test points an author at. The
+  mutation-pass finding in [Testing](docs/testing.md) keeps its "thirteen of
+  the seventeen" — it is the dated record of a run against a set that really
+  did hold seventeen codes, and updating the figure would falsify it.
+
 - **Documentation only, no behaviour change:** ADR-123 now carries a forward
   marker to ADR-132. ADR-132 withdrew one of ADR-123's promises — that two
   members creating one index name with different definitions each keep their

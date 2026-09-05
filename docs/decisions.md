@@ -2455,6 +2455,19 @@ the whole cluster for an answer that will not change, to serve a cluster
 assembled inconsistently. One code cannot carry two classes; the common case
 wins and the nuance is documented rather than encoded.
 
+**Amended 2026-09-05 — the count under `no` and the pair named under `wait` are
+M10's, and are not maintained.** The division stands, and so does every reason
+given for it; the set has simply grown since. `timeout` joined `wait` when
+[ADR-099](#adr-099--authenticated-routes-carry-a-request-timeout-an-explicit-body-ceiling-and-a-per-principal-rate-limit)
+gave the server a request deadline, and `stale` joined `no` with conditional
+writes; `elsewhere` is still exactly the three codes named. No corrected count
+is written in their place, because a number in prose has nothing holding it —
+which is how both of these came to be wrong with nothing failing. The live
+division is `ErrorCode::retry()`, published per code in the `ErrorCode` table
+of `docs/openapi.yaml` and held to the enum by
+`every_error_code_is_specified_with_the_retry_class_the_server_uses` in
+`crates/kimmy-api/tests/openapi.rs`.
+
 **The class is on the wire, not only in the document.** A client that acts on
 `retry` handles a code released after it was written; a client that acts on a
 table it compiled at release time does not. That is precisely what has to be

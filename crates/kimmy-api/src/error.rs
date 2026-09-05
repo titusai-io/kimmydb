@@ -6,11 +6,13 @@
 //! # The code set is closed, and the compiler is what closes it
 //!
 //! [`ErrorCode`] is an enum rather than a `&'static str`, so a new failure
-//! cannot invent an eighteenth code at a call site. The wire string, the retry
-//! class and the log level all come from exhaustive matches on it: adding a
-//! variant does not compile until all three are answered, which is the point —
-//! the last two are decisions about client behaviour and about what wakes an
-//! operator, and both would otherwise be made by accident.
+//! cannot invent a code at a call site. No count is given here, deliberately:
+//! this sentence named one, went two codes out of date, and nothing failed —
+//! and the claim it makes does not need a number to be true. The wire string,
+//! the retry class and the log level all come from exhaustive matches on it:
+//! adding a variant does not compile until all three are answered, which is
+//! the point — the last two are decisions about client behaviour and about
+//! what wakes an operator, and both would otherwise be made by accident.
 //!
 //! The set had already drifted before this existed. `no_vectors` is returned
 //! from `vectors.rs` and appeared in neither the HTTP reference nor the first
@@ -27,6 +29,19 @@ use serde_json::json;
 use tracing::{Level, error, info, warn};
 
 /// Every code the API can return, and nothing else.
+///
+/// **Adding a variant here also means editing `kimmy-client`.** That crate
+/// depends on no `kimmy-*` crate by design — it has to see what the Python and
+/// Go clients see — so its own `ErrorCode`, its `parse`, its `Display` and the
+/// code list in its round-trip test are hand-copied from this one and nothing
+/// ties them together. The tests in this workspace fail on a code the *server*
+/// documents and does not serve, or serves and does not document, so a new
+/// variant is caught here and prompts its author; nothing points that author at
+/// `crates/kimmy-client/src/error.rs`, which is what this comment is for. A
+/// client meeting an unknown code is not broken — it reads the `retry` class
+/// from the envelope, which is exactly why that field exists (ADR-057), and it
+/// keeps the string — but the code reaches it as `ErrorCode::Unknown` rather
+/// than as a named variant, and a named variant is what a caller matches on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
