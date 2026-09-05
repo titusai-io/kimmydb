@@ -89,15 +89,23 @@ impl TelemetryGuard {
         let snapshot = move || weak.upgrade().map(|state| state.metrics.snapshot());
 
         macro_rules! observe {
-            ($build:ident, $name:literal, $unit:literal, $description:literal, $field:ident) => {{
+            ($build:ident, $name:literal, $unit:literal, $description:literal, $field:ident) => {
+                observe!($build, $name, $unit, $description, |s| s.$field)
+            };
+            // The same, for a series that is not a bare field of the snapshot
+            // -- `embed_provider_errors{kind}` reads out of a fixed array, and
+            // an index is not an `ident`. A series the macro cannot express is
+            // a reason to extend the macro, not a reason to leave the series
+            // off the bridge.
+            ($build:ident, $name:literal, $unit:literal, $description:literal, |$s:ident| $value:expr) => {{
                 let snapshot = snapshot.clone();
                 let _ = meter
                     .$build($name)
                     .with_unit($unit)
                     .with_description($description)
                     .with_callback(move |observer| {
-                        if let Some(s) = snapshot() {
-                            observer.observe(s.$field, &[]);
+                        if let Some($s) = snapshot() {
+                            observer.observe($value, &[]);
                         }
                     })
                     .build();
@@ -285,6 +293,132 @@ impl TelemetryGuard {
             "OIDC signing-key refreshes that failed, leaving the key set in use verifying.",
             jwks_refresh_failed
         );
+
+        // The divergence pair (ADR-133, ADR-135). The gauge alone is not
+        // readable: a `0` is *checked and the peers agree* or *not checked at
+        // all*, and the two counters are what tell those apart, so a collector
+        // that received one without the others would be in the state the
+        // operations guide tells an operator not to reason from. The labelled
+        // Prometheus series becomes two instrument names, which is how every
+        // other labelled series here is bridged.
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.divergent_collections",
+            "{collection}",
+            "Collections the cross-member divergence check currently has confirmed as divergent.",
+            sync_divergent_collections
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_checks.ran",
+            "{contact}",
+            "Peer contacts whose round ran the cross-member divergence check.",
+            sync_divergence_checks
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_checks.skipped",
+            "{contact}",
+            "Peer contacts whose round skipped the check because the pull was truncated by the batch cap.",
+            sync_divergence_skips
+        );
+
+        // The embedding worker. Every one of these reads 0 on a node where the
+        // worker is disabled, which is the distinction an operator is looking
+        // for, and none of them reached a collector at all until now.
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.documents",
+            "{document}",
+            "Documents embedded by this node's worker.",
+            embed_documents_embedded
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.chunks",
+            "{chunk}",
+            "Chunks embedded by this node's worker.",
+            embed_chunks_embedded
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.deferred",
+            "{document}",
+            "Documents whose embedding was deferred to a later pass.",
+            embed_deferred
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.skipped_not_owned",
+            "{document}",
+            "Documents skipped because another member owns their embedding.",
+            embed_skipped_not_owned
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.failures",
+            "{document}",
+            "Embedding attempts that failed.",
+            embed_failures
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.requests",
+            "{request}",
+            "Calls to an upstream embedding provider that were answered.",
+            embed_provider_requests
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.tokens",
+            "{token}",
+            "Input tokens billed by an upstream embedding provider.",
+            embed_provider_tokens
+        );
+
+        // Provider calls that failed before a response, by what failed. Four
+        // instrument names for the four `kind` values, in the order the
+        // snapshot's array holds them.
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.errors.connect",
+            "{error}",
+            "Provider calls that failed to connect: DNS, TCP or TLS.",
+            |s| s.embed_transport[0]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.errors.timeout",
+            "{error}",
+            "Provider calls that timed out before a response.",
+            |s| s.embed_transport[1]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.errors.reset",
+            "{error}",
+            "Provider calls where the far side closed an open connection.",
+            |s| s.embed_transport[2]
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.embed.provider.errors.other",
+            "{error}",
+            "Provider calls that failed before a response for any other reason.",
+            |s| s.embed_transport[3]
+        );
+
+        // Worst scheduling delay since the last scrape. A gauge in
+        // microseconds, bridged in its own unit rather than converted, because
+        // the interesting values are well under a second and rounding to
+        // seconds would report every one of them as 0.
+        observe!(
+            u64_observable_gauge,
+            "kimmy.runtime.stall",
+            "us",
+            "Worst runtime scheduling delay observed since the last scrape.",
+            runtime_stall_us
+        );
     }
 }
 
@@ -470,9 +604,120 @@ fn meter_provider(cfg: &TelemetryConfig, resource: Resource) -> Result<SdkMeterP
         .build())
 }
 
+/// Every `/metrics` series that is deliberately **not** on the OTLP bridge,
+/// with the reason. Read by `every_metrics_series_reaches_the_bridge`, which
+/// fails on a series that is neither bridged nor named here.
+///
+/// The list exists because the bridge drifted twelve series behind `/metrics`
+/// without anyone deciding that it should — including the divergence pair,
+/// which is the one an operations guide tells an operator to alert on. Nothing
+/// compared the two surfaces, so nothing objected. OTLP support is a standing
+/// requirement (ADR-070), so the default is bridged and an exception has to be
+/// written down here to compile.
+#[cfg(test)]
+const NOT_BRIDGED: &[(&str, &str)] = &[(
+    "kimmy_request_duration_seconds",
+    "A histogram. Every instrument on this bridge is observable (async): a \
+     callback reads the latest snapshot when the collector asks. OpenTelemetry \
+     has no observable histogram — a histogram is recorded synchronously, at \
+     the point each observation happens — so bridging this one means \
+     instrumenting the request path rather than adding a callback here, which \
+     is a different change with its own design (bucket boundaries against the \
+     Prometheus ones, and what the collector should export back). Deliberately \
+     left for that change.",
+)];
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_metrics_series_reaches_the_bridge() {
+        // The guard the bridge did not have. `/metrics` is the surface an
+        // operator scrapes directly and OTLP is the one a collector reads, and
+        // a series on the first and not the second is invisible to everything
+        // downstream of the collector — which is where the alerting lives.
+        //
+        // Matching is by name, and it has to tolerate the convention this
+        // module already uses: a labelled Prometheus series becomes one
+        // instrument per label value (`kimmy_responses_total{class}` is
+        // `kimmy.responses.2xx`, `.4xx`, `.5xx`), so a series counts as
+        // bridged when some instrument name starts with its stem.
+        // `include_str!` rather than reading the path at runtime: it resolves
+        // at compile time, so the test does not depend on the working
+        // directory a `cargo test` invocation happens to have. Every
+        // instrument name is a `"kimmy.…"` literal, wherever on the line it
+        // sits — some `observe!` calls are one-liners.
+        let source = include_str!("logging.rs");
+        let mut bridged: Vec<String> = Vec::new();
+        for (i, _) in source.match_indices("\"kimmy.") {
+            let rest = &source[i + 1..];
+            let Some(end) = rest.find('"') else { continue };
+            bridged.push(format!(
+                "kimmy_{}",
+                rest[..end].trim_start_matches("kimmy.").replace('.', "_")
+            ));
+        }
+        bridged.sort();
+        bridged.dedup();
+        assert!(
+            bridged.len() > 30,
+            "found {} instruments; the scrape of this file broke",
+            bridged.len()
+        );
+
+        // Where the OTLP name is not a prefix transform of the Prometheus one.
+        // Both of these predate the guard and are bridged correctly; the names
+        // simply do not line up textually, and renaming a published instrument
+        // to please a test would be the wrong way round.
+        let aliases = [("kimmy_webhook_deliveries", "kimmy_webhook_delivered")];
+
+        let rendered = kimmy_api::metrics::Metrics::default().render();
+
+        // An exception has to carry a reason, or the list becomes the place a
+        // series goes to stop being asked about — which is the failure this
+        // whole test exists to prevent, rebuilt one level up.
+        for (name, why) in NOT_BRIDGED {
+            assert!(
+                why.trim().len() > 40,
+                "`{name}` is in NOT_BRIDGED with no real reason. An exception that does not say \
+                 why is indistinguishable from an oversight, which is how the twelve got there"
+            );
+            // And it has to name a series that still exists. An exception that
+            // outlives the series it excused is a permission nobody granted.
+            assert!(
+                rendered.lines().any(|l| l
+                    .strip_prefix("# TYPE ")
+                    .is_some_and(|r| { r.split_whitespace().next() == Some(name) })),
+                "NOT_BRIDGED names `{name}`, which /metrics no longer exposes. Remove the entry"
+            );
+        }
+
+        let mut unbridged = Vec::new();
+        for line in rendered.lines() {
+            let Some(rest) = line.strip_prefix("# TYPE ") else { continue };
+            let series = rest.split_whitespace().next().expect("a series name");
+            let stem = series.strip_suffix("_total").unwrap_or(series);
+            // `_seconds` is a Prometheus unit suffix; the bridge carries the
+            // unit in the instrument's own `with_unit`, so the names differ.
+            let stem = stem.strip_suffix("_seconds").unwrap_or(stem);
+            let stem = aliases.iter().find(|(from, _)| *from == stem).map_or(stem, |(_, to)| *to);
+            if bridged.iter().any(|b| b == stem || b.starts_with(&format!("{stem}_"))) {
+                continue;
+            }
+            if NOT_BRIDGED.iter().any(|(name, _)| *name == series) {
+                continue;
+            }
+            unbridged.push(series.to_string());
+        }
+        assert!(
+            unbridged.is_empty(),
+            "these /metrics series reach no OTLP instrument: {unbridged:?}. Add an `observe!` \
+             for each in `install`, or, if one genuinely cannot be bridged, add it to \
+             NOT_BRIDGED with the reason. OTLP is a standing requirement, so silence is not \
+             the default"
+        );
+    }
 
     /// A `Metadata` for a callsite that does not exist, so the filter can be
     /// asked about targets and kinds no test would otherwise produce.

@@ -2858,8 +2858,7 @@ components:
         answers are made at the same moment or the build fails.
 
         Codes are strings rather than numbers deliberately: a client's branch
-        reads as what it means, where MongoDB's numeric codes need a lookup
-        table to be legible.
+        reads as what it means.
 
         | Code | Status | Retry | Meaning |
         |---|---|---|---|
