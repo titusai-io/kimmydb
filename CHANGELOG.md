@@ -12,6 +12,39 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **The divergence gauge now says whether it looked.**
+  `kimmy_sync_divergence_checks_total{outcome}` counts contacts with a peer in
+  which the cross-member divergence check `ran`, and contacts whose round
+  completed without it because the pull was truncated by the batch cap
+  (`skipped`). `kimmy_sync_divergent_collections` reading 0 meant two
+  different things — *checked, and the peers agree* and *not checked at
+  all* — with nothing scrapable to tell them apart, which left the documented
+  alert ("gauge above 0") silent in exactly the state it most needs to speak:
+  a sustained backlog silences the check, and a sustained backlog is when a
+  divergence is most plausibly being created. Alert on the pair — the gauge
+  above 0, **and** `ran` failing to increase on a node that has peers — and
+  read `ran` flat with `skipped` rising as *unknown* rather than clean. A
+  round that failed outright is counted in `kimmy_sync_failures_total` and in
+  neither outcome, so `ran` + `skipped` + failures is every contact a node
+  made. No peer name, node id or collection name appears in either series;
+  the check itself, what it compares and when it runs are all unchanged.
+  ADR-135.
+
+- **A round whose pull the batch cap truncated still skips the check, and now
+  there is a worked example of why.** A three-member cluster produced a
+  245-second window that looked like a divergence the gauge had slept
+  through, and was a backlog: five collections created on one member reached
+  the other two at 219 s and 227 s and the gap closed by itself. On a
+  truncated pull "the peer holds a collection I lack" and "I have not applied
+  the entry that creates it here yet" are the same observation, and the
+  two-contact confirmation — about 10 s at the default sync interval — is far
+  too fast to filter a window of that length. Checking anyway would have held
+  the gauge above zero for minutes on a healthy cluster, on every wave of a
+  bulk load. The behaviour does not change; the operations guide now states
+  the correlation plainly instead of leaving it to be inferred. ADR-135.
+
 ### Changed
 
 - **A node that cannot serve local embeddings now says so at `ERROR`.** It

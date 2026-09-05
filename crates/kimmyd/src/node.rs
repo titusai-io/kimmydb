@@ -1120,16 +1120,21 @@ async fn spawn_cluster(
             // peers backed off, schema changes refused. Pushed after every
             // tick, reached peers or not, because a tick in which every
             // round failed is the one that leaves the lag gauge at its last
-            // value and the cluster looking healthy (ADR-123).
+            // value and the cluster looking healthy (ADR-123). Two of its
+            // fields say whether the divergence check ran at all, so that
+            // gauge's 0 can be told apart from silence (ADR-135).
+            //
+            // Handed over whole rather than unpacked into arguments here:
+            // this closure is the only caller of `record_sync_round` and no
+            // test covers it, so a pair of same-typed positional arguments
+            // transposed on this line would compile, pass every gate, and
+            // report one series under another's name until somebody read a
+            // dashboard closely. There is nothing here to get in the wrong
+            // order (ADR-135).
             on_round: Some(std::sync::Arc::new({
                 let state = state.clone();
                 move |report: kimmy_cluster::RoundReport| {
-                    state.metrics.record_sync_round(
-                        report.failed as u64,
-                        report.backing_off as u64,
-                        report.ddl_refused as u64,
-                        report.divergent_collections as u64,
-                    );
+                    state.metrics.record_sync_round(&report);
                 }
             })),
             // The replication loop is the only place a peer's version vector

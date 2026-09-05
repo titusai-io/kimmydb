@@ -9079,6 +9079,303 @@ fields to give.
 
 ---
 
+## ADR-135 — The divergence gauge reports whether it looked, and ADR-133's cap-truncation skip stays because a backlog fakes exactly what removing it would report
+
+**Decision.** Two things, one added and one deliberately left alone.
+
+*First*, `/metrics` gains `kimmy_sync_divergence_checks_total`, a counter
+split by a closed two-value outcome: `ran` counts contacts with a peer in
+which ADR-133's cross-member check actually ran, `skipped` counts contacts
+whose round completed without running it because the pull was truncated by
+the batch cap. Both are counted per **contact**, not per tick, so a tick
+reaching several peers contributes one to one of the two per peer. A round
+that *failed* is counted in `kimmy_sync_failures_total` and in neither of
+these, so `ran + skipped + failures` accounts for every peer a node
+contacted. Neither series carries a peer label, or any other label but
+`outcome` — see below.
+
+*Second*, ADR-133's rule that **a round whose pull was truncated by the
+batch cap does not run the check at all** stands, unchanged, and the worked
+example below is recorded as the evidence for it rather than against it.
+
+**Why the gauge needed a companion at all.** `kimmy_sync_divergent_collections`
+reading `0` means two different things — *checked, and this node and the peer
+agree* and *not checked* — and nothing an operator can scrape tells them
+apart. ADR-133 states the residual in as many words ("a `0` reading during
+sustained heavy write load means *not checked*, not *not divergent*") and
+`operations.md` repeats it, but stating a limit in prose does not give an
+alert rule anything to condition on. The rule the reference actually offers
+is "alert above 0", and that rule is silent in exactly the state it most
+needs to speak: the gauge is pinned at its healthy value and the operator has
+no way to learn that nothing is looking. A counter of the checks that ran is
+the smallest thing that makes the distinction observable, and it does it
+without touching what the check does or when it runs.
+
+**The worked example: 245 seconds during which the gauge read `0` on every
+member, and was right to.** Observed on a three-member cluster running
+0.22.0, under six concurrent writers. For 245 seconds across 49 consecutive
+sampler rows, one member's `kimmy_collections` read 38 against 33 on the
+other two, while `kimmy_sync_divergent_collections` read `0.0` on all three
+members in every sample, `kimmy_replication_lag_seconds` climbed from 80 to
+265 s at wall-clock rate on all three, and `kimmy_sync_failures_total` did
+not move. Read at the endpoints that looks like the exact shape ADR-133 was
+built for — a member holding collections its peers do not, with every other
+health signal flat — and the first reading of it was that a real divergence
+had been slept through, with a proposal to remove the cap-truncation skip so
+that the cheaper half of the check (comparing collection ids) would still run
+on a backlogged round.
+
+**That reading was wrong, and this window is the case *for* the skip.** The
+five collections were created on the third member and had simply not yet
+arrived at the other two; they arrived at 219 s and 227 s and the gap closed
+by itself with no operator action. So from either lagging member's side the
+state was "the peer holds collections I do not" — which, on a pull the batch
+cap truncated, is indistinguishable from "I have not yet applied the entries
+that create them here." It was the second. The existence half is
+one-directional by design (ADR-133: only "the peer holds it and I do not" is
+ever reported), and that is precisely why a truncated window can fake it:
+this node's belief about what it holds is complete, and its belief about what
+it has *yet to apply* is exactly what a truncated pull leaves unsettled.
+
+**And the confirmation gate would not have absorbed it.** Two consecutive
+contacts with the same peer, at the default `cluster.sync_interval_secs` of
+5 s, is roughly 10 seconds. The window was 245. An unskipped existence half
+would have confirmed inside the first 2% of it and held the gauge above zero
+for the remaining four minutes, on a healthy cluster doing nothing worse than
+draining a corpus load — and would have done it again on every wave of every
+such load. That is the flapping the gate exists to stop, and ADR-133's own
+argument for the skip — "that is precisely the state a truncated window can
+fake without it being true, and checking on the strength of a truncated pull
+would reopen the same hole one level up" — is not conservatism but the
+correct call, now with a measured demonstration behind it. Defect 2 of
+ADR-133 already made this argument at length about ordinary lag and the count
+half; this is the same argument, on the same cluster, about the existence
+half. **The proposal to remove the skip is withdrawn.**
+
+**What survives is narrower, and is what this ADR fixes.** Not "a divergence
+was missed" — none was. What is true is that *during* a sustained backlog the
+check does not run, cannot say so, and a genuine divergence created in that
+window would be invisible for as long as it lasted; and that a backlog is a
+plausible time for one to arise. The honest fix is not to make the check run
+where it cannot be trusted. It is to make the blindness visible, so that
+"quiet" and "blind" stop looking identical, and to prove the gauge can move
+at all.
+
+**Both outcomes, not one.** A checks counter alone answers "has the check run
+recently" and leaves "why not" to guesswork; worse, a flat `ran` count is
+ambiguous between a blind node and one with no peers, a node whose rounds are
+all failing, and a process that has only just started. A skips counter alone
+inverts the problem: rising means blind, but `0` is ambiguous between "every
+contact was checked" and "nothing was contacted". Carried together, and read
+beside `kimmy_sync_failures_total`, they account for every contact a node
+made, so an operator can tell the four states apart without inferring any of
+them. That is the whole point of adding a series here rather than a sentence
+to the guide.
+
+**One series with an `outcome` label, not two names.** Every counter in this
+exposition that splits by a closed enumeration is written that way already —
+`kimmy_responses_total{class}`, `kimmy_tls_reloads_total{outcome}`,
+`kimmy_jwks_refresh_total{outcome}`, `kimmy_webhook_deliveries_total{outcome}`,
+`kimmy_embed_provider_errors_total{kind}` — and `ran`/`skipped` is such an
+enumeration: a completed round either ran the check or was truncated out of
+it, with no third case and no case that can be added without a decision like
+this one.
+
+**No peer label, decided deliberately.** The finding this ADR answers
+proposed counting checked rounds *per peer*. That is not done, for three
+reasons, and the residual is stated rather than hidden.
+
+- **Every label in this exposition is a closed set fixed at compile
+  time** — `class`, `outcome`, `state`, `kind`, `le`. A peer label is open,
+  and its members churn: every member ever replaced leaves a series that
+  never receives another sample, on every other member, for the life of
+  each process. Nothing else on this endpoint behaves that way.
+- **It would put member identity on `/metrics`.** ADR-133 holds the standing
+  property that no document or collection name crosses that boundary, and the
+  gauge is a bare count for that reason. A node id is a different kind of
+  name, and the argument does not transfer automatically — but the boundary
+  is the same one, `/metrics` is unauthenticated by default and routinely
+  shipped off the box, and per-peer facts already have a home behind
+  authorization in `/v1/topology`, which is where the staleness record
+  (ADR-085) went for the same reason. Extending the property rather than
+  carving the first exception into it is the smaller decision, and this ADR
+  takes it: **the two new series carry no name of any kind.**
+- **It would not join to what it qualifies.** `kimmy_sync_divergent_collections`
+  is itself an unlabelled level over peers — the gauge answers "how many
+  collections", not "how many peer pairs", by ADR-133's own defect 3 fix. A
+  per-peer breakdown of the diagnostic beside an aggregate of the thing it
+  diagnoses gives an operator two series they cannot line up.
+
+*Residual, stated:* the aggregate cannot single out one permanently truncated
+peer among several that are being checked. A node whose `skipped` count is
+rising at all has a backlog against *some* peer, which is enough to know the
+gauge's `0` is not fully trustworthy.
+
+Which peer is answerable, but **not from the sync warnings, and saying so
+matters more than the reassurance an earlier draft of this paragraph
+offered.** Neither warning can fire in this state, by construction. A
+truncated round *succeeds*, so the `Err` arm's `sync round failed` never
+runs. The stale-rejoiner warning fires on `outcome.behind_ms`, which
+`behind_beyond_horizon` computes as how far the *peer* trails *this node* —
+the opposite direction from a pull this node could not finish — so it stays
+at roughly zero and silent, and `/v1/topology`'s stale-peer record is fed
+from the same hook in the same direction. `kimmy_replication_lag_seconds`
+does rise, and is a max over peers, so it says "some peer" and not which.
+What answers it is the `cluster.sync` span: one span per peer per contact,
+at info, carrying `peer` and `lag_ms`, which exists precisely because
+"folding them into one span would lose which peer was the slow one — the
+only thing anybody opens this trace to find out." A peer whose `lag_ms`
+stays high round after round is the peer nothing is checking. That is a
+weaker instrument than a labelled series — it is a trace rather than a
+metric, and reading it is a step an alert cannot take on its own — and it is
+the one this ADR is willing to pay for.
+
+**Counted in the branch that folds, not beside it.** `sync_once` already
+returns `divergent: Some(..)` when the round reached the peer's tail and
+asked, and `None` when ADR-133's skip applied — including `Some` of an empty
+set, which is the "checked, nothing found" case the gauge's `0` is supposed
+to mean. The loop's two increments sit **inside the same two arms** that fold
+the finding into `DivergenceTracker`, rather than in a sibling `if` reading
+the same `Option`. A sibling would have been correct today and would have
+been a second predicate to keep in step with the first: the fold is gated on
+the peer having introduced itself as well, and a `divergent: Some(..)`
+carrying no peer would have been counted as a check the tracker never
+received. No such outcome exists — both places `sync_once` sets `divergent`
+set `peer` in the same breath — but "the counter cannot report a check the
+tracker was not told about" is a property worth holding structurally rather
+than by an invariant asserted in one file and relied on in another.
+`RoundReport` carries both per tick, on the same hook
+`kimmy_sync_failures_total` and the gauge already ride.
+
+**And the report crosses into `/metrics` whole.** `Metrics::record_sync_round`
+takes `&RoundReport` rather than the six `u64`s it would otherwise have grown
+to. Its only caller is a closure in `kimmyd::spawn_cluster` that no test
+reaches — `kimmyd`'s own cluster tests scrape `/metrics` for three unrelated
+series and are `#[ignore]`d besides — so a pair of same-typed positional
+arguments transposed on that line would compile, satisfy every gate, and
+publish one series' value under another's name until somebody read a
+dashboard closely enough to disbelieve it. Passing the struct deletes the
+category: the fields are named where they are read, the `usize` to `u64`
+widening happens once inside the method instead of six times at the call
+site, and a field added to the report cannot silently take another's place.
+That `kimmy-api` may name a `kimmy-cluster` type is settled — it already
+takes `kimmy_cluster::Members` in several signatures. The direction that is
+deliberately *not* opened is the other one, `kimmy-cluster` knowing what a
+caller does with a number: lag is pushed out through a callback on
+`ReplicationConfig` rather than a metrics handle, the shape ADR-043 predicted
+when it deferred the metric and ADR-046 recorded when it added one. Nothing
+here moves that; the report still travels out through `on_round`, and
+`kimmy-cluster` still has no idea a metric exists.
+
+**A positive control, and why it belongs in an ADR rather than in a test
+file.** Before this change the gauge had never been observed leaving `0` on
+any cluster, and nothing in the suite drove it off `0` **and back**. A
+detector in that state is indistinguishable from a dead one, and the correct
+consequence — which this ADR records as a rule, not an aspiration — is that
+**a `0` reading may not be cited as evidence of convergence by any test round
+until a case exists that proves the gauge can move.** Two now do.
+`the_divergence_gauge_leaves_zero_and_returns_to_zero_through_the_real_loop`
+drives the real `replicate()` loop against a real peer over TCP: it waits for
+the gauge to leave `0`, asserts it did not move until at least two contacts
+had actually been checked (the existence half's confirmation rule, measured
+through the new counter), then makes the repair `operations.md` prescribes
+and waits for the gauge to fall back to `0`. Both directions are load
+bearing and fail for different reasons: a gauge that never moves fails the
+first, and a gauge that sticks fails the second — and a stuck gauge is the
+worse defect, because an alert that cannot be cleared by fixing what it
+reported is the one an operator disables, which is defect 6's argument
+exactly. `one_checked_contact_is_pending_and_the_second_moves_the_gauge` pins
+the same three transitions without timers, composing the real `sync_once` and
+the real `DivergenceTracker` the way the loop does.
+
+Each was checked against a deliberately broken gauge rather than assumed to
+be sensitive: pinning the reported level to `0`, removing the clearing sweep
+so a confirmed finding sticks, and confirming on first sight instead of on
+two consecutive contacts each fail the control at the assertion written for
+it. A positive control that passes against a dead gauge is worse than none,
+because it converts an unknown into a false assurance.
+
+**And the skip has a control of its own.**
+`a_cap_truncated_round_counts_a_skip_and_never_a_check` drives a backlog
+deeper than the batch cap through the real loop and asserts that the
+truncated round was counted as a skip *before* any check was counted, and
+that once the backlog drains nothing further is skipped. That ordering is the
+whole operator-facing claim: if a truncated round could tick the `ran`
+counter, the blind state would read as the healthy one and the new series
+would be worse than nothing. Counting the truncated round as a check fails it.
+
+**What this does not do.** It does not make the check run anywhere it did not
+run before, does not change what is compared, does not change the
+confirmation rules, and does not repair a divergence — ADR-133's deferral of
+repair is untouched. It adds two sample lines and one branch per contact.
+
+**Alternatives considered.**
+
+*Give the gauge a third state instead of a second series* — a sentinel value
+for "not checked". Rejected: a sentinel is a value every dashboard, every
+alert expression and every aggregation has to be taught about, `sum()` over
+members silently produces nonsense, and a gauge whose domain is "a count, or
+one magic number" is exactly the ambiguity being removed, relocated. A
+counter that has not moved is unambiguous without instruction.
+
+*A "seconds since the last check" gauge*, which answers the alert question in
+one series. Rejected on the case it cannot express: a node that has **never**
+checked has to be given a value, and every available answer is wrong in a
+different way — `0` reads as "just checked", the process uptime reads as a
+stale check that once succeeded, and a very large number reads as a fault on
+a node that simply has no peers. A counter at `0` says "this has never
+happened here", which is the truth.
+
+*Count the count half's own suppression as a third outcome.* The document-count
+probe is dropped whenever the peer has not yet witnessed something this node
+has (ADR-133, defect 2), and whenever the rotation has nothing to name. On any
+busy healthy cluster that happens on most contacts, so the series would rise
+in proportion to write traffic and mean nothing an operator could act on,
+while the count half's real coverage limit is a latency bound — order twice
+the collection count in *checked* contacts — that is a property of the design
+rather than of a moment, and belongs in the guide where it already is.
+
+*Remove ADR-133's cap-truncation skip so the existence half still runs on a
+backlogged round*, on the grounds that comparing collection ids is the cheap
+half. Rejected, at length, above: the 245-second window is a live
+demonstration that a truncated pull manufactures exactly the finding the
+existence half reports, that the confirmation gate is two orders of magnitude
+too fast to filter it, and that the result would be minutes of firing gauge
+per corpus load on a healthy cluster. Cost was never the reason for the skip
+and removing it would not have found anything real.
+
+*Do nothing, since every observed behaviour already matches the reference.*
+It does — the members' `0` readings were correct throughout. Rejected for the
+reason the gauge exists: the state it was built to make visible is one where
+every other signal reads healthy, so "matches the reference" is precisely the
+condition under which it must still be possible to tell a working detector
+from a silent one. Leaving that unresolved would carry forward, in a new
+form, the mistake of trusting a signal nobody had shown could move.
+
+**Cost.** Two sample lines on `/metrics` and two `AtomicU64`s per process.
+One extra `else` arm per peer contact, on a path that has just finished a
+network round. Two more fields on `RoundReport`, and a changed signature on
+`Metrics::record_sync_round`, which now takes the report by reference rather
+than its fields one at a time. Nothing is added to the cluster wire, to
+`/v1/topology`, or to `docs/openapi.yaml`: whether this node's own check ran
+is a fact about this node's rounds, and no peer has any use for it.
+
+Defended by `kimmy-cluster/tests/replication.rs`'s
+`the_divergence_gauge_leaves_zero_and_returns_to_zero_through_the_real_loop`,
+`one_checked_contact_is_pending_and_the_second_moves_the_gauge` and
+`a_cap_truncated_round_counts_a_skip_and_never_a_check`; by
+`kimmy-api`'s `the_render_is_byte_for_byte_what_a_scrape_receives`,
+`the_snapshot_reads_the_same_atomics_the_render_does` and
+`the_pushed_gauges_render_what_was_pushed`, which pin the two series' names,
+labels, help text, position and counter semantics; and by
+`kimmy-api/tests/api.rs`'s `the_metrics_body_exposes_exactly_these_series_in_exactly_this_order`, which
+pins that they reach a real scrape in order. Beside them, ADR-133's own
+`a_round_that_does_not_reach_the_peers_tail_skips_the_check_entirely` and
+`a_round_that_reaches_the_peers_tail_runs_the_check_and_finds_nothing_wrong`
+remain the boundary this ADR declines to move.
+
+---
+
 ## ADR-136 — What a failed request logs is a property of its error code, and the property is actionability rather than HTTP class
 
 **Decision.** `ErrorCode` gains `log_level() -> Option<Level>`, a third
