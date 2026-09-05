@@ -203,7 +203,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
                 .expect_err("creating an existing collection is a conflict");
             Ok(json!({
                 "first_created": first["created"] == "orders",
-                "second_code": second.code().map(|c| c.to_string()),
+                "second_code": second.code_str(),
                 "second_status": second.status(),
             }))
         }
@@ -216,7 +216,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
                 .await
                 .expect_err("a duplicate _id must be refused");
             Ok(json!({
-                "code": error.code().map(|c| c.to_string()),
+                "code": error.code_str(),
                 "retry": retry_name(error.retry()),
                 "status": error.status(),
             }))
@@ -404,7 +404,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
                 .expect_err("the same stamp a second time must be refused");
             Ok(json!({
                 "first_write_ok": first["modified"] == 1,
-                "code": error.code().map(|c| c.to_string()),
+                "code": error.code_str(),
                 "retry": retry_name(error.retry()),
                 "status": error.status(),
             }))
@@ -447,7 +447,7 @@ async fn run(scenario: &str, base: &str, dead: &str) -> Result<Value, String> {
             Ok(json!({
                 "modified": updated["modified"],
                 "shipped": shipped,
-                "missing_filter_code": error.code().map(|c| c.to_string()),
+                "missing_filter_code": error.code_str(),
                 "missing_filter_status": error.status(),
             }))
         }
