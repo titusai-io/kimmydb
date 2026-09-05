@@ -10,36 +10,7 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
-
-### Fixed
-
-- **Every `/metrics` series a collector can be given now reaches the OTLP
-  bridge, and a test keeps it that way.** Twelve series were on `/metrics` and
-  on no OTLP instrument, so a deployment that reads telemetry through a
-  collector could not see them at all: the whole embedding worker
-  (`kimmy_embed_documents_total`, `_chunks_`, `_deferred_`,
-  `_skipped_not_owned_`, `_failures_`, `_provider_requests_`,
-  `_provider_tokens_`, and `_provider_errors_total{kind}`),
-  `kimmy_runtime_stall_seconds`, and — the pair an operator is told to alert
-  on — `kimmy_sync_divergent_collections` with
-  `kimmy_sync_divergence_checks_total{outcome}`. That last one matters more
-  than its size: ADR-135 exists because the gauge reading `0` means *checked
-  and agreed* or *not checked at all*, and the counter is what separates them,
-  so a collector receiving the gauge without the counter is in exactly the
-  state the operations guide says not to reason from. Eleven of the twelve are
-  bridged here. Labelled series become one instrument per label value
-  (`kimmy.sync.divergence_checks.ran` and `.skipped`), which is how every
-  labelled series on this bridge was already carried. Nothing on `/metrics`
-  changes — same names, same values, same scrape.
-
-  `kimmy_request_duration_seconds` is the twelfth and is deliberately not
-  bridged yet: every instrument here is observable, read by a callback when a
-  collector asks, and OpenTelemetry has no observable histogram. Bridging it
-  means recording at each request rather than adding a callback, which is its
-  own change with its own bucket design. It is named, with that reason, in a
-  `NOT_BRIDGED` list that the new test reads — so the exception is written
-  down rather than silent, which is how the other twelve went missing.
+## 0.23.0 - 2026-09-05
 
 ### Added
 
@@ -152,6 +123,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and `kimmy-client` are in it for the first time.
 
 ### Fixed
+
+- **Every `/metrics` series a collector can be given now reaches the OTLP
+  bridge, and a test keeps it that way.** Twelve series were on `/metrics` and
+  on no OTLP instrument, so a deployment that reads telemetry through a
+  collector could not see them at all: the whole embedding worker
+  (`kimmy_embed_documents_total`, `_chunks_`, `_deferred_`,
+  `_skipped_not_owned_`, `_failures_`, `_provider_requests_`,
+  `_provider_tokens_`, and `_provider_errors_total{kind}`),
+  `kimmy_runtime_stall_seconds`, and — the pair an operator is told to alert
+  on — `kimmy_sync_divergent_collections` with
+  `kimmy_sync_divergence_checks_total{outcome}`. That last one matters more
+  than its size: ADR-135 exists because the gauge reading `0` means *checked
+  and agreed* or *not checked at all*, and the counter is what separates them,
+  so a collector receiving the gauge without the counter is in exactly the
+  state the operations guide says not to reason from. Eleven of the twelve are
+  bridged here. Labelled series become one instrument per label value
+  (`kimmy.sync.divergence_checks.ran` and `.skipped`), which is how every
+  labelled series on this bridge was already carried. Nothing on `/metrics`
+  changes — same names, same values, same scrape.
+
+  `kimmy_request_duration_seconds` is the twelfth and is deliberately not
+  bridged yet: every instrument here is observable, read by a callback when a
+  collector asks, and OpenTelemetry has no observable histogram. Bridging it
+  means recording at each request rather than adding a callback, which is its
+  own change with its own bucket design. It is named, with that reason, in a
+  `NOT_BRIDGED` list that the new test reads — so the exception is written
+  down rather than silent, which is how the other twelve went missing.
 
 - **Documentation only, no behaviour change:** the hardcoded counts of error
   codes are corrected, and most of them are gone rather than corrected. The
