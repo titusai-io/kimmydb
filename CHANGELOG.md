@@ -12,6 +12,35 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **Breaking, `kimmy-api` API: a failure's log level is a three-variant type,
+  so one below `INFO` cannot be asked for.** `ErrorCode::log_level` and
+  `ApiError::log_level` return `Option<LogLevel>` — `Error`, `Warn`, `Info` —
+  and `ApiError::at_level` takes one, instead of `tracing::Level`. `at_level`
+  is public and used to accept all five `tracing` levels while the log site
+  handled three, with a fallback that fired `debug_assert!(false)` and then
+  logged at `INFO`: `at_level(Level::DEBUG)` panicked a debug build and, in a
+  release build, logged the failure one level louder than asked. Narrowing the
+  type removes the state rather than the guard, and the match at the log site
+  is now exhaustive over three arms with no fallback to get wrong. It also
+  makes ADR-136's rule structural rather than asserted — `None` is "not a log
+  event" and there is no variant quieter than `INFO`, so neither can be written
+  down incorrectly. **Nothing on the wire moves**: the status, the `error`
+  code, the `retry` class, the message, the `request failed` event message and
+  every code's published level are all unchanged, and the two overrides in the
+  server pass `LogLevel::Error` where they passed `Level::ERROR`. ADR-137.
+
+- **Documentation only: `docs/testing.md` states what is enforced instead of
+  counting.** Its header claimed `1398 tests passing` over a per-crate column
+  that summed to 874, against a workspace that measures 1947 — three numbers,
+  no two agreeing, none checked by anything. Four measurements taken hours
+  apart on one afternoon gave 1933, 1937, 1939 and 1947, each correct for the
+  crate set it covered, which is the case against the count rather than against
+  whoever last updated it. The header now names `cargo test --workspace` and
+  `clippy -D warnings`, both of which CI enforces on every pull request, and
+  the table keeps what each crate is *for*, which does not go stale.
+
 ### Added
 
 - **The divergence gauge now says whether it looked.**

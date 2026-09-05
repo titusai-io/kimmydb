@@ -26,6 +26,7 @@ use kimmy_auth::AuthError;
 use kimmy_core::Error as CoreError;
 use kimmy_storage::StorageError;
 use serde_json::json;
+use std::fmt;
 use tracing::{Level, error, info, warn};
 
 /// Every code the API can return, and nothing else.
@@ -96,6 +97,52 @@ impl Retry {
             Self::Wait => "wait",
             Self::Elsewhere => "elsewhere",
         }
+    }
+}
+
+/// The levels a failure may be logged at, and there are only three.
+///
+/// Deliberately not [`tracing::Level`], which also has `DEBUG` and `TRACE`.
+/// ADR-136 decided that a failure meant to be quieter than `INFO` is not a log
+/// event at all — it answers `None` from [`ErrorCode::log_level`] — rather than
+/// an event at a level the subscriber happens to filter out, because "do not
+/// log this" is a property of the code and not of how the process was started.
+/// That rule used to be held by an assertion in `into_response` and a test over
+/// `ErrorCode::ALL`; it is held by this type instead, which is why neither is
+/// needed to state it any more (ADR-137).
+///
+/// The consequence worth naming: `Option<LogLevel>` makes the whole vocabulary
+/// structural. `None` is *not an event*, and the three variants are the only
+/// severities that exist, so `into_response`'s match is exhaustive over three
+/// arms with no fallback to get wrong.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LogLevel {
+    /// Page someone: this node's own state, and the operator's to fix.
+    Error,
+    /// A rise in these is worth looking at; no single one demands action.
+    Warn,
+    /// This happened and it is not a fault.
+    Info,
+}
+
+impl LogLevel {
+    /// The `tracing` level this maps to. The one place the two vocabularies
+    /// meet, so a caller cannot pick a `tracing::Level` this type cannot say.
+    pub fn tracing(self) -> Level {
+        match self {
+            Self::Error => Level::ERROR,
+            Self::Warn => Level::WARN,
+            Self::Info => Level::INFO,
+        }
+    }
+}
+
+impl fmt::Display for LogLevel {
+    /// The same rendering `tracing::Level` gives, because `docs/operations.md`
+    /// publishes these words and `tests/docs.rs` compares the document to
+    /// this. A divergence here would be a documentation drift nothing catches.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.tracing(), f)
     }
 }
 
@@ -215,7 +262,7 @@ impl ErrorCode {
     /// `WARN` says *a rise in these is worth looking at*, `INFO` says *this
     /// happened and it is not a fault*, and `None` says *this is not an event
     /// at all*.
-    pub fn log_level(self) -> Option<Level> {
+    pub fn log_level(self) -> Option<LogLevel> {
         match self {
             // Not logged, at any level. These are the caller's to fix and the
             // caller already holds the answer, in a response naming exactly
@@ -258,7 +305,7 @@ impl ErrorCode {
             // [`ApiError::level_override`] and `vectors.rs`. Lowering the
             // whole code to suit its commoner source would have hidden that
             // one, which is the failure this level split exists to prevent.
-            Self::NotImplemented => Some(Level::INFO),
+            Self::NotImplemented => Some(LogLevel::Info),
 
             // An upstream embedding provider failed, and the comment on
             // `retry()` above says whose fault that is: the upstream's. No
@@ -266,7 +313,7 @@ impl ErrorCode {
             // drops a connection and the client retries — but a *rise* is a
             // quota, a revoked key, or a provider that is down, and those are
             // all the operator's. `WARN` is the level that says exactly that.
-            Self::ProviderError => Some(Level::WARN),
+            Self::ProviderError => Some(LogLevel::Warn),
 
             // `WARN`, uniformly, and deliberately not split by cause. The
             // deadline is only ever reached while the request is *waiting* —
@@ -282,12 +329,12 @@ impl ErrorCode {
             // rise in abandoned requests is operationally interesting even
             // when each one is a slow client, and `WARN` keeps it visible
             // without paging (ADR-099, ADR-136).
-            Self::Timeout => Some(Level::WARN),
+            Self::Timeout => Some(LogLevel::Warn),
 
             // A genuine fault in this node: storage failed, or something that
             // cannot happen did. Nothing a caller sends causes it and nothing
             // a caller changes fixes it.
-            Self::Internal => Some(Level::ERROR),
+            Self::Internal => Some(LogLevel::Error),
 
             // An operator must set something. This node cannot build the
             // provider a replicated vector configuration names — an unset
@@ -297,7 +344,7 @@ impl ErrorCode {
             // loud: it is silent until a caller happens to search that
             // collection on this node, so the first occurrence is the whole
             // warning an operator gets.
-            Self::Misconfigured => Some(Level::ERROR),
+            Self::Misconfigured => Some(LogLevel::Error),
 
             // A vector index snapshot on this node's disk could not be written
             // or could not be read back: an I/O error under the snapshot
@@ -308,7 +355,7 @@ impl ErrorCode {
             // response means that absorption did not happen, which is a fault
             // in this node on top of whatever the disk did. Both halves are
             // the operator's.
-            Self::Snapshot => Some(Level::ERROR),
+            Self::Snapshot => Some(LogLevel::Error),
         }
     }
 }
@@ -344,7 +391,7 @@ pub struct ApiError {
     /// this one", because no site has wanted to suppress an occurrence of a
     /// code that is otherwise logged, and a per-instance silence is the kind
     /// of thing that hides a fault rather than a nuisance.
-    pub level_override: Option<Level>,
+    pub level_override: Option<LogLevel>,
     /// A more specific `error_description` for the `WWW-Authenticate`
     /// challenge than the generic one every 401 carries.
     ///
@@ -389,7 +436,13 @@ impl ApiError {
     }
 
     /// The same error logged at a level other than its code's default.
-    pub fn at_level(mut self, level: Level) -> Self {
+    ///
+    /// Takes a [`LogLevel`] and not a [`tracing::Level`], so "quieter than
+    /// `INFO`" is not a thing a caller can ask for. It used to be: the
+    /// parameter accepted any `tracing::Level` while `into_response` handled
+    /// three, so `at_level(Level::DEBUG)` tripped a `debug_assert!` in a debug
+    /// build and logged at `INFO` in a release one (ADR-137).
+    pub fn at_level(mut self, level: LogLevel) -> Self {
         self.level_override = Some(level);
         self
     }
@@ -401,7 +454,7 @@ impl ApiError {
 
     /// The level this failure is logged at, or `None` for one that is not
     /// logged. The instance's own answer wins over its code's default.
-    pub fn log_level(&self) -> Option<Level> {
+    pub fn log_level(&self) -> Option<LogLevel> {
         self.level_override.or_else(|| self.code.log_level())
     }
 
@@ -503,6 +556,13 @@ impl IntoResponse for ApiError {
         //
         // The three arms are written out because a `tracing` macro takes a
         // constant level; there is no `event!(level, …)` that accepts a value.
+        // They are also all of them: `LogLevel` has three variants, so this
+        // match is exhaustive and carries no fallback. It used to carry one,
+        // for a `tracing::Level` below INFO that `at_level` accepted and
+        // nothing here could log — `debug_assert!(false)` and then `info!`,
+        // which panics a debug build and quietly logs one level too loud in a
+        // release one. Narrowing the type deleted the state rather than the
+        // guard (ADR-137).
         //
         // The event message is the *same* on all three, deliberately. Varying
         // it would put a second discriminator beside the level — one nothing
@@ -514,24 +574,9 @@ impl IntoResponse for ApiError {
         if let Some(level) = self.log_level() {
             let (code, message) = (self.code.as_str(), self.message.as_str());
             match level {
-                Level::ERROR => error!(code, message, "{EVENT}"),
-                Level::WARN => warn!(code, message, "{EVENT}"),
-                Level::INFO => info!(code, message, "{EVENT}"),
-                // Unreachable: `log_level` maps nothing below INFO, and a code
-                // that wanted to be quieter than INFO wanted `None` instead —
-                // an unlogged failure is stated as one, not hidden behind a
-                // level the default filter happens to drop. Loud in a debug
-                // build, because otherwise a code mapped to `DEBUG` later
-                // would be *documented* as DEBUG and *emitted* at INFO, and
-                // the drift tests would not catch it: they compare the
-                // document to `log_level()`, not to what leaves this match.
-                // `no_code_is_logged_below_info` is the other half of that.
-                // Still emitted rather than dropped, so a release build loses
-                // no line over a mapping mistake.
-                _ => {
-                    debug_assert!(false, "{code} asked for a level below INFO");
-                    info!(code, message, "{EVENT}")
-                }
+                LogLevel::Error => error!(code, message, "{EVENT}"),
+                LogLevel::Warn => warn!(code, message, "{EVENT}"),
+                LogLevel::Info => info!(code, message, "{EVENT}"),
             }
         }
         // `retry` rides in the envelope rather than living only in the
@@ -756,7 +801,7 @@ mod tests {
         // Each level is a claim about what an alert on it would mean, and
         // ADR-136 argues them one at a time; this is that argument's fixture.
         use ErrorCode::*;
-        let expected: [(ErrorCode, Option<Level>); 19] = [
+        let expected: [(ErrorCode, Option<LogLevel>); 19] = [
             // The caller's, every one, and answered in full by the response.
             (BadRequest, None),
             (PayloadTooLarge, None),
@@ -773,14 +818,14 @@ mod tests {
             (Stale, None),
             // Refused on purpose, with no operator action to take. The
             // default only: `vectors.rs` raises its own source above this.
-            (NotImplemented, Some(Level::INFO)),
+            (NotImplemented, Some(LogLevel::Info)),
             // Somebody else's fault, or nobody's; a rise is the finding.
-            (ProviderError, Some(Level::WARN)),
-            (Timeout, Some(Level::WARN)),
+            (ProviderError, Some(LogLevel::Warn)),
+            (Timeout, Some(LogLevel::Warn)),
             // This node's own state, and the operator's to fix.
-            (Internal, Some(Level::ERROR)),
-            (Misconfigured, Some(Level::ERROR)),
-            (Snapshot, Some(Level::ERROR)),
+            (Internal, Some(LogLevel::Error)),
+            (Misconfigured, Some(LogLevel::Error)),
+            (Snapshot, Some(LogLevel::Error)),
         ];
         assert_eq!(
             expected.len(),
@@ -794,22 +839,35 @@ mod tests {
 
     #[test]
     fn no_code_is_logged_below_info() {
-        // `into_response`'s match has three arms and a fallback, so a code
-        // mapped to `DEBUG` later would be *documented* as DEBUG and
-        // *emitted* at INFO — and `tests/docs.rs` would not notice, because
-        // both of its checks compare the document to `log_level()` rather
-        // than to what actually leaves the match. This is the assertion that
-        // notices. A code that wants to be quieter than INFO wants `None`.
+        // Documentation now, not enforcement. `LogLevel` has three variants
+        // and `log_level` returns `Option<LogLevel>`, so "a code below INFO"
+        // is not a state that can be written down — the rule ADR-136 argued
+        // is held by the type, and this asserts what the type already proves
+        // (ADR-137). It stays because the rule is worth stating where someone
+        // adding a code will read it, and because it is the natural place to
+        // pin the one thing still worth pinning: that the three variants map
+        // onto the `tracing` levels a reader of `operations.md` expects.
         //
+        // The real drift risk moved to `LogLevel::tracing` and `Display`. If
+        // `Warn` ever rendered as anything but `WARN`, `tests/docs.rs` would
+        // compare the published table against a different word.
+        assert_eq!(LogLevel::Error.tracing(), Level::ERROR);
+        assert_eq!(LogLevel::Warn.tracing(), Level::WARN);
+        assert_eq!(LogLevel::Info.tracing(), Level::INFO);
+        assert_eq!(
+            [LogLevel::Error.to_string(), LogLevel::Warn.to_string(), LogLevel::Info.to_string()],
+            ["ERROR", "WARN", "INFO"],
+            "operations.md publishes these words and tests/docs.rs compares against them"
+        );
+
         // `tracing` orders `Level` by verbosity, so "below INFO" is `>` and
         // not `<`. Pinned here rather than assumed, because getting it the
         // wrong way round would leave a check that passes on everything.
         assert!(Level::DEBUG > Level::INFO && Level::ERROR < Level::INFO);
-
         for code in ErrorCode::ALL {
             if let Some(level) = code.log_level() {
                 assert!(
-                    level <= Level::INFO,
+                    level.tracing() <= Level::INFO,
                     "{} maps to {level}, which is below INFO; use `None` to say it is not \
                      logged, or raise it — anything else is emitted at a level the document \
                      does not claim",
@@ -868,11 +926,11 @@ mod tests {
         // of it, and `vectors.rs`'s own tests check that source end to end.
         let raised =
             ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, "no model")
-                .at_level(Level::ERROR);
-        assert_eq!(raised.log_level(), Some(Level::ERROR));
+                .at_level(LogLevel::Error);
+        assert_eq!(raised.log_level(), Some(LogLevel::Error));
         assert_eq!(
             ErrorCode::NotImplemented.log_level(),
-            Some(Level::INFO),
+            Some(LogLevel::Info),
             "the default is untouched"
         );
         assert!(logged(raised).contains("ERROR"));
