@@ -453,7 +453,20 @@ implicitly with their last: dropping the last collection takes the database
 out of listings on every member, because the drop replicates and the
 decision is made where it is applied. `DELETE /v1/db/{db}` drops each
 collection in turn (`ddl` over the database); system databases (`__…`) are
-refused. Listing responses
+refused.
+
+**Issue a database drop once, on one member, and let it replicate.** It drops
+the collections that member holds **at the moment it is applied**, and that is
+the whole of what replicates. Sending the same `DELETE` to every member is not
+belt and braces — it is a race each peer can lose: a collection still in flight
+to that peer arrives after its local drop and recreates the database there. A
+vector-enabled collection is the easy way to see it, because the owning member
+builds the shadow collection locally and it replicates a moment behind, leaving
+a peer holding a database whose only contents are a shadow whose base
+collection is gone. Drop on one member and confirm the drop on the others (a
+drop is not instant — see [Operations](operations.md)); do not drop on each.
+
+Listing responses
 are **filtered by what the caller may read**, so they cannot be used to discover
 objects you have no access to.
 

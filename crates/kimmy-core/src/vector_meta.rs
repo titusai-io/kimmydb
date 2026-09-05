@@ -23,6 +23,16 @@ pub fn is_shadow(name: &str) -> bool {
     name.ends_with(VECTOR_SUFFIX)
 }
 
+/// The collection a shadow name serves, or `None` if the name is not a shadow.
+///
+/// The inverse of [`shadow_name`]. Callers that need to tell an ordinary
+/// shadow from an orphaned one — a shadow whose base collection is gone —
+/// need the base name to look for, not just the fact that the name is a
+/// shadow; see `Engine::all_collection_ids` (ADR-138).
+pub fn base_name(name: &str) -> Option<&str> {
+    name.strip_suffix(VECTOR_SUFFIX)
+}
+
 /// Auto-embedding settings for one collection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -890,5 +900,19 @@ mod tests {
         }))
         .unwrap();
         assert!(serde_json::to_value(&plain).unwrap()["provider"].get("dimensions").is_none());
+    }
+
+    #[test]
+    fn base_name_inverts_shadow_name_and_ignores_ordinary_collections() {
+        assert_eq!(base_name(&shadow_name("docs")), Some("docs"));
+        assert_eq!(base_name(&shadow_name("a.b")), Some("a.b"));
+        assert_eq!(base_name("docs"), None);
+        // A name that merely contains the suffix is not one that ends with it.
+        assert_eq!(base_name("docs.__vectors.extra"), None);
+        // Agrees with `is_shadow` on every input, which is what lets callers
+        // swap one for the other when they need the base to look up.
+        for name in ["docs", shadow_name("docs").as_str(), "", ".__vectors"] {
+            assert_eq!(base_name(name).is_some(), is_shadow(name), "{name}");
+        }
     }
 }

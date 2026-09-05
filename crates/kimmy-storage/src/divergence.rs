@@ -62,14 +62,39 @@ impl Engine {
     /// each scan their own small table, never a document, so this costs the
     /// same on a cluster with empty collections as one with full ones and can
     /// run every round without the cost this module exists to bound (see the
-    /// module docs). Vector shadow collections are excluded — their own
-    /// lifecycle trails the collection they serve by design, and comparing
-    /// them would flag that lag as a divergence rather than measure one.
+    /// module docs).
+    ///
+    /// A vector shadow collection is excluded **while the collection it serves
+    /// is present here** — its own lifecycle trails that collection by design
+    /// (only the owning member builds one), and comparing them would flag that
+    /// lag as a divergence rather than measure one.
+    ///
+    /// An **orphaned** shadow — one whose base collection this node does not
+    /// hold — is included, because it is not lag. Nothing builds a shadow for a
+    /// collection that is not there, so it is residue, and it is what a
+    /// database drop racing an in-flight shadow replication leaves behind: the
+    /// peer applies its own local drop, the owner's shadow-creation entry
+    /// arrives afterwards, and the database comes back holding nothing but the
+    /// shadow. Excluding those made a whole database present on one member and
+    /// absent on another **structurally invisible** to the existence check —
+    /// observed on a live cluster for over a minute with the check running
+    /// every round and `divergence_checks_total{skipped}` at zero, which is
+    /// exactly the reading ADR-135 added to mean "checked and agreed"
+    /// (ADR-138).
+    ///
+    /// The base is looked up by name within the same database, which is where
+    /// the shadow's own name is derived from, so this stays one pass over
+    /// metadata already loaded.
     pub fn all_collection_ids(&self) -> Result<BTreeSet<CollectionId>> {
         let mut ids = BTreeSet::new();
         for db in self.list_databases()? {
-            for coll in self.list_collections(&db.name)? {
-                if !kimmy_core::vector_meta::is_shadow(&coll.name) {
+            let colls = self.list_collections(&db.name)?;
+            let present: std::collections::HashSet<&str> =
+                colls.iter().map(|c| c.name.as_str()).collect();
+            for coll in &colls {
+                let hidden = kimmy_core::vector_meta::base_name(&coll.name)
+                    .is_some_and(|base| present.contains(base));
+                if !hidden {
                     ids.insert(coll.id);
                 }
             }
@@ -388,6 +413,69 @@ impl DivergenceTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An engine holding `app.docs` and, optionally, its shadow — the two
+    /// shapes `all_collection_ids` has to tell apart (ADR-138).
+    fn engine_with(base: bool, shadow: bool) -> (Engine, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        if base {
+            engine.create_collection("app", "docs").unwrap();
+        }
+        if shadow {
+            engine
+                .create_system_collection("app", &kimmy_core::vector_meta::shadow_name("docs"))
+                .unwrap();
+        }
+        (engine, dir)
+    }
+
+    #[test]
+    fn a_shadow_beside_its_collection_is_not_compared() {
+        // The owning member's ordinary steady state: it alone builds the
+        // shadow, and the peers legitimately do not have one. Comparing it
+        // would report that by-design difference as a divergence on every
+        // round, which is why the exclusion exists (ADR-133).
+        let (owner, _d1) = engine_with(true, true);
+        let (peer, _d2) = engine_with(true, false);
+        assert_eq!(
+            owner.all_collection_ids().unwrap(),
+            peer.all_collection_ids().unwrap(),
+            "an owner and a non-owner of the same collection must compare equal"
+        );
+    }
+
+    #[test]
+    fn an_orphaned_shadow_is_compared() {
+        // What a database drop racing an in-flight shadow replication leaves:
+        // the base collection is gone and the shadow is not. Nothing builds a
+        // shadow for a collection that is not there, so this is residue, not
+        // the lifecycle lag the exclusion is for.
+        let (stranded, _d1) = engine_with(false, true);
+        let ids = stranded.all_collection_ids().unwrap();
+        assert_eq!(ids.len(), 1, "an orphaned shadow must be visible to the check");
+    }
+
+    #[test]
+    fn a_database_holding_only_an_orphaned_shadow_diverges_from_an_empty_peer() {
+        // The live failure this fixes, end to end through `compare`: one
+        // member holds a database containing nothing but a shadow, another
+        // holds nothing at all. Before ADR-138 both sides filtered the shadow
+        // out, the difference was the empty set, and the gauge read 0 for
+        // over a minute on a real cluster while the check ran every round
+        // with `skipped` at zero.
+        let (stranded, _d1) = engine_with(false, true);
+        let (empty, _d2) = engine_with(false, false);
+
+        let mine = LocalState { collections: empty.all_collection_ids().unwrap(), probe: None };
+        let peer =
+            PeerAnswer { collections: stranded.all_collection_ids().unwrap(), probe_count: None };
+        assert_eq!(
+            compare(&mine, &peer).existence.len(),
+            1,
+            "a shadow-only database the peer holds and this node does not must be reported"
+        );
+    }
 
     fn id(n: u64) -> CollectionId {
         CollectionId(n)

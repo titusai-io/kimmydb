@@ -10,6 +10,39 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The cross-member divergence check no longer goes blind on a database that
+  holds nothing but a vector shadow collection.** `kimmy_sync_divergent_collections`
+  is built from a set that excludes vector shadow collections, because only the
+  owning member builds one and comparing them would report that by-design
+  difference on every round. The exclusion was wider than its reason: it also
+  hid a shadow whose *base collection is gone*, which is not lifecycle lag but
+  residue. A database left holding only such a shadow was therefore filtered out
+  on both sides of the comparison, and a database present on one member and
+  absent on another became structurally invisible — the gauge read `0` while
+  `kimmy_sync_divergence_checks_total{ran}` climbed and `{skipped}` stayed at
+  `0`, which is exactly the reading that is supposed to mean *checked and
+  agreed*. An orphaned shadow is now compared; a shadow beside its collection
+  still is not ([ADR-138](docs/decisions.md)).
+
+  Measured on a live three-member cluster before the fix: a real one-sided
+  difference held for over 60 seconds with every instrument reporting clean.
+  Nothing about the wire, the gauge's name, or its meaning changes — what
+  changes is what it can see.
+
+### Documentation
+
+- **The database drop contract now says to issue the drop once.**
+  `DELETE /v1/db/{db}` drops the collections the receiving member holds at the
+  moment it is applied, and that is what replicates. Sending it to every member
+  at once is a race each peer can lose: a collection still in flight arrives
+  after that peer's local drop and recreates the database there. A
+  vector-enabled collection makes it easy to hit, since the owner's shadow
+  replicates a moment behind. Drop on one member and confirm on the others.
+
 ## 0.23.1 - 2026-09-05
 
 ### Fixed

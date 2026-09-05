@@ -9683,3 +9683,66 @@ the message and the `request failed` event message are all untouched, as are
 every code's level and the published table in `docs/operations.md`.
 
 ---
+
+## ADR-138 — An orphaned vector shadow is compared for divergence; one beside its collection still is not
+
+**Decision.** `Engine::all_collection_ids` — the set both sides of the
+cross-member divergence check are built from (ADR-133) — excludes a vector
+shadow collection only **while the collection it serves is present on the same
+node**. A shadow whose base collection is absent is included.
+
+`kimmy_core::vector_meta::base_name` is the inverse of `shadow_name` and is what
+the rule is expressed in.
+
+**Why.** ADR-133 excluded shadow collections wholesale, for a good reason that
+still holds: only the member the rendezvous hash makes the owner builds one, so
+a shadow present on the owner and absent on its peers is the design working, and
+comparing them would report that on every round for every vector-enabled
+collection.
+
+The exclusion was wider than the reason. It also hid the case where a shadow is
+the *only* thing a member holds, and that case is not lag — nothing builds a
+shadow for a collection that is not there. It is residue, and there is an
+ordinary way to produce it:
+
+`DELETE /v1/db/{db}` drops each collection the node holds **at the moment it is
+applied**. Issue it on every member at once — as an operator tidying up after a
+test might, and as this project's own cluster test protocol prescribed — and
+each peer drops what it has while the owner's shadow-creation entry is still in
+flight. The entry lands afterwards and recreates the database on that peer,
+holding nothing but the shadow.
+
+Both sides of the comparison then filtered that shadow out, the difference came
+out empty, and the check reported nothing. Measured on a live three-member
+cluster at 0.23.1: a database present on two members and absent on the third for
+over **60 seconds**, with `kimmy_sync_divergent_collections` at `0` on all three,
+`kimmy_sync_divergence_checks_total{ran}` climbing about 24 times per member,
+and `{skipped}` never leaving `0`.
+
+That last part is what makes this worth an ADR rather than a patch.
+`{skipped}` at zero with `{ran}` climbing is precisely the reading ADR-135 added
+so an operator could tell *checked and agreed* from *not checked*. Here it said
+"checked and agreed" about a state it could not see, which is a worse failure
+than the one ADR-135 fixed — the earlier gauge was merely ambiguous, and this
+one was confidently wrong.
+
+**What this does not change.** The healthy case is untouched: an owner holding
+`docs` and `docs.__vectors` and a peer holding `docs` compare equal, which
+`a_shadow_beside_its_collection_is_not_compared` pins. The check stays
+one-directional — a collection this node holds and a peer does not is still that
+peer's own discovery to make — and ADR-133's cap-truncation skip is untouched.
+
+**Alternative considered.** Compare shadow collections against the rendezvous
+owner, so a shadow on a non-owner is a divergence. Rejected: it makes the
+divergence check depend on ownership state that moves as membership changes,
+and it would report a genuine divergence during every legitimate ownership
+handoff. The orphan rule needs no such input — a shadow with no base is wrong on
+any member, whoever owns it.
+
+**Not fixed here.** The drop race itself. `DELETE /v1/db/{db}` still has no
+database-level tombstone, so a late entry can still recreate a dropped database;
+what changes is that the cluster can now *see* it. The drop contract in
+`docs/http-api.md` now says the drop is applied where it lands and should be
+issued once rather than per member.
+
+---
