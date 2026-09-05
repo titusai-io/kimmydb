@@ -61,7 +61,7 @@ impl Error {
     /// The server's code, when there is one.
     pub fn code(&self) -> Option<ErrorCode> {
         match self {
-            Self::Api { code, .. } => Some(*code),
+            Self::Api { code, .. } => Some(code.clone()),
             _ => None,
         }
     }
@@ -111,7 +111,12 @@ impl Retry {
 /// `Unknown` is not a gap — it is how a code added after this client was
 /// released stays additive. Branch on [`Retry`] when the code is not one you
 /// know; that is what it is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+///
+/// Not `Copy`, because [`ErrorCode::Unknown`] owns the code it was handed. That
+/// is the point of the variant: a caller meeting a code newer than its client
+/// can still log and report *which* code it was, and a `&'static str` payload
+/// cannot hold a string that arrived over a socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
     PayloadTooLarge,
@@ -132,8 +137,13 @@ pub enum ErrorCode {
     ProviderError,
     /// A conditional write's `if_stamp` did not match. Re-read and decide again.
     Stale,
+    /// The request outlived the node's deadline for it and was abandoned. The
+    /// class is `wait`: the deadline is only ever reached while the request is
+    /// waiting, and neither a slow upload nor a slow provider improves by
+    /// moving to a peer.
+    Timeout,
     /// A code this client does not know. The string is kept.
-    Unknown(&'static str),
+    Unknown(String),
 }
 
 impl ErrorCode {
@@ -157,7 +167,13 @@ impl ErrorCode {
             "not_implemented" => Self::NotImplemented,
             "provider_error" => Self::ProviderError,
             "stale" => Self::Stale,
-            _ => Self::Unknown("unknown"),
+            "timeout" => Self::Timeout,
+            // The code is kept rather than flattened to a placeholder. A
+            // caller that meets a code newer than its client can act on
+            // `retry` and still say in a log *which* code it was; a client
+            // that reports every one of them as "unknown" makes the additive
+            // case undiagnosable.
+            other => Self::Unknown(other.to_string()),
         }
     }
 }
@@ -183,7 +199,8 @@ impl fmt::Display for ErrorCode {
             Self::NotImplemented => "not_implemented",
             Self::ProviderError => "provider_error",
             Self::Stale => "stale",
-            Self::Unknown(s) => s,
+            Self::Timeout => "timeout",
+            Self::Unknown(s) => s.as_str(),
         };
         f.write_str(name)
     }
@@ -250,6 +267,54 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_code_keeps_the_string_the_server_sent() {
+        // The whole use of the variant. `retry` tells the client what to do;
+        // the code is what it puts in the log so a human can find out what
+        // happened. Flattening every unrecognized code to one placeholder —
+        // which this did — makes the additive case indistinguishable from
+        // every other additive case.
+        let e = from_response(
+            503,
+            None,
+            &json!({ "error": "shed_load", "message": "busy", "retry": "wait" }),
+        );
+        assert_eq!(e.code(), Some(ErrorCode::Unknown("shed_load".to_string())));
+        assert_eq!(
+            e.code().expect("a code").to_string(),
+            "shed_load",
+            "an unrecognized code must render as itself, not as a placeholder"
+        );
+        // And it reaches the message a caller prints, which is where it is
+        // actually read.
+        assert!(e.to_string().contains("shed_load"), "{e}");
+
+        // Two different unrecognized codes stay different, which they cannot
+        // be if the payload is a constant.
+        let other =
+            from_response(503, None, &json!({ "error": "quiesced", "message": "x" })).code();
+        assert_ne!(e.code(), other);
+    }
+
+    #[test]
+    fn a_timeout_is_a_code_this_client_knows() {
+        // `503 timeout` is a documented code with a documented class
+        // (ADR-099). Without a variant it parsed as `Unknown`, so a caller
+        // branching on the code could not see a timeout at all — the `retry`
+        // hint carried the behaviour and nothing carried the reason.
+        assert_eq!(ErrorCode::parse("timeout"), ErrorCode::Timeout);
+        assert_eq!(ErrorCode::Timeout.to_string(), "timeout");
+
+        let e = from_response(
+            503,
+            None,
+            &json!({ "error": "timeout", "message": "the request was not completed in time",
+                     "retry": "wait" }),
+        );
+        assert_eq!(e.code(), Some(ErrorCode::Timeout));
+        assert_eq!(e.retry(), Retry::Wait);
+    }
+
+    #[test]
     fn a_server_without_the_retry_field_falls_back_to_the_status() {
         // A node older than ADR-057. Guessing from the status is worse advice
         // than the server's own, and better than none.
@@ -262,16 +327,18 @@ mod tests {
     #[test]
     fn every_documented_code_round_trips() {
         // The mutation pass found this table barely exercised: the suite
-        // produces three or four codes, so the other thirteen could each have
-        // been renamed without anything noticing. They are public surface — a
+        // produces three or four codes, so the rest could each have been
+        // renamed without anything noticing. They are public surface — a
         // caller matching on `ErrorCode::UniqueViolation` is matching on this
         // — and the strings are the specification's rather than this crate's
         // to choose.
         //
         // Written out rather than imported: this crate depends on no server
         // crate, so the only way it can agree with `docs/openapi.yaml` is by
-        // repeating it and being checked.
-        const CODES: [&str; 17] = [
+        // repeating it and being checked. It had fallen two behind the server:
+        // `stale` and `timeout` were both parseable-or-not with nothing here
+        // to say which, and `timeout` was in fact not.
+        const CODES: [&str; 19] = [
             "bad_request",
             "payload_too_large",
             "unsupported_media_type",
@@ -289,6 +356,8 @@ mod tests {
             "snapshot",
             "not_implemented",
             "provider_error",
+            "stale",
+            "timeout",
         ];
 
         for code in CODES {

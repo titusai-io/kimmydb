@@ -3218,7 +3218,7 @@ mod tests {
         // caller without the collection they asked for, so all of them fail.
         for code in [ErrorCode::BadRequest, ErrorCode::NotFound, ErrorCode::Forbidden] {
             assert!(
-                collection_created(Err(api_error(400, code)), "orders").is_err(),
+                collection_created(Err(api_error(400, code.clone())), "orders").is_err(),
                 "{code:?} must not be swallowed"
             );
         }

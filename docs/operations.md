@@ -396,6 +396,53 @@ RUST_LOG=info,kimmy_storage=debug kimmyd …
 KIMMY_LOG_FORMAT=json kimmyd …          # one JSON object per line
 ```
 
+#### What a failed request logs, and what to alert on
+
+**Alert on `ERROR`.** That rule is meant to be correct as written, on a node
+nobody has tuned, and the levels below are chosen so that it is: an `ERROR` line
+is something *you* have to fix, and a client cannot produce one by sending a
+request this API documents as a refusal.
+
+The level is a property of the **error code**, decided by one question — is the
+fix in the operator's hands or the caller's? — and not by the HTTP status
+([ADR-136](decisions.md)). Those are different cuts: a `501` for a capability
+that is reserved and unbuilt is a `5xx` no operator can act on, and a `500` for
+a provider this member cannot build is one only an operator can.
+
+| `error` | Level | What it means for an alert |
+|---|---|---|
+| `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
+| `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
+| `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
+| `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
+| `provider_error` | `WARN` | An upstream embedding provider failed. Nobody needs to act on one; a rise is a quota, a revoked key, or a provider that is down, and those are yours. Pair it with `kimmy_embed_provider_errors_total{kind}`, which says at which layer |
+| `not_implemented` | `INFO` | A caller asked for a capability that is reserved and does not exist yet. There is no operator action — no configuration turns it on — so it is recorded and nothing more. **One exception, which logs `ERROR`**: a node that cannot build *local embeddings* returns this same code, and that is a member provisioned unlike its cluster; every search of that collection landing here fails, and behind a load balancer the other members hide it |
+
+**Every other code writes no line at all**, at any level, however `log.level` or
+`RUST_LOG` is set. These are the refusals the caller caused and the caller can
+already read in full in the response body, so logging them would be an access
+log of nothing but the failures — half a record, and one this server has never
+kept. They are `bad_request`, `payload_too_large`, `unsupported_media_type`,
+`unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
+`unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited` and
+`stale`. Count them with `kimmy_responses_total{class="4xx"}`, read the
+authorization decisions among them in [the audit log](#the-audit-log), and see
+[HTTP API](http-api.md#errors) for what each one means to the client.
+
+**Every line here says `request failed`, at all three levels**, with the code in
+a `code` field and the client-facing text in a `message` field. The wording does
+not soften at `INFO`: a message that varied by level would be a second thing to
+filter on beside the level itself, and a query written for one wording would
+miss the lines written under the other. Filter on the level, and read `code` for
+which failure it was.
+
+That list and the levels above are not maintained by hand beside the server: the
+levels live on the error-code enum, and
+`crates/kimmy-api/tests/docs.rs` fails the build if this section and that enum
+disagree — a code given a level and left out here, or listed here as silent
+after it started logging, is a test failure rather than an operator finding out
+from a page.
+
 ### Health
 
 | Endpoint | Meaning | Probe |
@@ -451,7 +498,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_failures_total` | Anti-entropy rounds against a peer that failed, any cause: unreachable, handshake refused, a batch this node could not apply. **Alert on this** rising while `kimmy_replication_lag_seconds` sits at 0 — that pairing was exactly a silent wedge observed on a three-member cluster running 0.20.0, where a replayed index definition failed every round against one peer for the life of the process, the lag gauge read 0 throughout, and `/v1/topology` showed every member live ([ADR-123](decisions.md)). A peer rebooting produces a handful; a peer that never recovers produces one per backoff interval, up to every 300 s |
 | `kimmy_sync_peers_backing_off` | Peers this node is currently leaving alone after failed rounds, as of the last tick. 0 when every known peer answered its last round, or with clustering off. Non-zero for longer than a restart takes is a peer that is down or one this node cannot sync with; the `sync round failed` warning names it |
 | `kimmy_sync_ddl_refused_total` | Replicated schema changes this node could not apply to its own data and skipped: an index definition its documents cannot be built under, or an index name held here by a different definition that no creation stamp can settle. **Alert on this**: each one is an index the peers hold and this node does not, nothing will retry it, and the warning logged at the time names the database, collection, index and reason. Resolve by dropping the definition on the origin, or by making this node's documents fit it and recreating it ([ADR-123](decisions.md)). It does **not** rise for two members creating one name with different definitions, which now settle on the later creation stamp and log a warning on the member whose definition lost ([ADR-132](decisions.md)) |
-| `kimmy_sync_divergent_collections` | Collections a periodic cross-member check currently finds disagreeing with a peer, confirmed on two checks running: held there and not here, or held by both with a different document count. 0 on a converged cluster. **Alert on this above 0**: it is the one series in this table that moves for a divergence the other three cannot — no round fails, the lag gauge reads 0, nothing is refused — see [below](#the-divergence-check) for what it compares, how often, and what it cannot catch ([ADR-133](decisions.md)) |
+| `kimmy_sync_divergent_collections` | Collections a periodic cross-member check currently finds disagreeing with a peer, confirmed on two checks running: held there and not here, or held by both with a different document count. 0 on a converged cluster. **Alert on this above 0**: it is the one series in this table that moves for a divergence the other three cannot — no round fails, the lag gauge reads 0, nothing is refused. **Its 0 is only as good as the series below**: a 0 while the check is not running means *not checked*, not *not divergent*, so alert on the pair, not on this alone. See [below](#the-divergence-check) for what it compares, how often, and what it cannot catch ([ADR-133](decisions.md)) |
+| `kimmy_sync_divergence_checks_total{outcome}` | Contacts with a peer in which the check above **`ran`**, and contacts whose round completed without it because the pull was truncated by the batch cap and could not be trusted (**`skipped`**). This is what tells a quiet cluster from a blind one. **Alert on `ran` not increasing** while `kimmy_cluster_members` is above 0 — the gauge above is then holding a value nothing has re-examined — and treat any sustained `skipped` rate as the gauge being *unknown* rather than clean, **including while `ran` is also rising**, which is the partly-blind case the alert cannot catch because neither series is labelled by peer. A round that failed outright is in `kimmy_sync_failures_total` and in neither of these, so `ran` + `skipped` + failures is every contact the node made. See [below](#the-divergence-check) for the four readings ([ADR-135](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
 | `kimmy_jwks_refresh_total{outcome}` | `ok` / `failed` fetches of the OIDC provider's signing keys. **Alert on `failed`** for the same shape of reason: the node keeps verifying perfectly against the keys it already holds, until the provider rotates and every federated caller is refused at once. Zero on a node with no `auth.oidc` configured ([ADR-064](decisions.md)) |
@@ -488,16 +536,87 @@ and it runs on nearly every round of a converged cluster and on most rounds
 of a modestly busy one — a handful of writes between rounds still leaves a
 round's own pull comfortably under the cap.
 
-**What a `0` reading means, and does not.** On a cluster whose backlog stays
-deeper than one batch on *every* round — sustained write volume the cluster
-cannot currently drain within a batch — the check does not run at all, and
-the gauge holds its last value rather than climbing or falling. A `0` during
-that state means *not checked*, not *not divergent*. This is a real limit,
-not a rounding error: do not read a quiet gauge as proof of convergence
-during a period of sustained heavy write load: pair it with
-`kimmy_replication_lag_seconds` and the sync counters the way any of them
-should be read, and treat a long stretch of unmoving `kimmy_sync_divergent_collections`
-under heavy load as *unknown* rather than *clean*.
+**What a `0` reading means, and does not — read this before writing an alert
+on the gauge.** On a cluster whose backlog stays deeper than one batch on
+*every* round — sustained write volume it cannot currently drain within a
+batch — the check does not run at all, and the gauge holds its last value
+rather than climbing or falling. A `0` during that state means *not checked*,
+not *not divergent*.
+
+**A sustained backlog silences the check, and a sustained backlog is exactly
+when you will most want to trust it.** That correlation is real and is not
+going away: heavy write load, a member catching up after an outage, and a
+partition healing are all times a divergence is plausibly being created, and
+all times a member's pull is likeliest to be truncated. So do not read a
+quiet gauge as proof of convergence during one.
+
+**`kimmy_sync_divergence_checks_total` is how you tell a quiet cluster from a
+blind one** ([ADR-135](decisions.md)). Its `outcome="ran"` count rises once
+per contact in which the check actually ran, and its `outcome="skipped"`
+count rises once per contact whose round was truncated out of it. **Write the
+alert as a pair:**
+
+- `kimmy_sync_divergent_collections` above 0 — a confirmed divergence, the
+  thing to page on.
+- `kimmy_sync_divergence_checks_total{outcome="ran"}` not increasing over a
+  window comfortably longer than `cluster.sync_interval_secs`, on a node
+  whose `kimmy_cluster_members` is above 0 — the gauge is holding a number
+  nothing has re-examined, and its `0` is worth nothing until this moves
+  again.
+
+A rule written only as "gauge above 0", which is what this guide used to
+offer on its own, is silent in precisely the state it most needs to speak.
+The four readings:
+
+- **`ran` rising, `skipped` flat.** The check is running on every contact.
+  This is the only state in which the gauge's `0` means what it says.
+- **`ran` flat, `skipped` rising.** A node blinded by its own backlog. Pair
+  it with `kimmy_replication_lag_seconds` to see how deep, and expect both to
+  resolve together as the backlog drains.
+- **Both flat.** No contact completed at all — look at
+  `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`, since a
+  round that failed is counted there and in neither outcome above.
+- **Both rising.** *Partly* blind, and the alert above will not fire.
+  Some peers are being checked and at least one is not, and **these two
+  series are not labelled by peer, so they cannot tell you which** — that
+  limit is deliberate ([ADR-135](decisions.md)) and this is the state it
+  costs you. On a cluster larger than a few members, one peer permanently
+  behind the batch cap leaves `ran` climbing steadily from every other
+  contact while that peer is never examined, and nothing here distinguishes
+  that from full coverage. Treat any sustained `skipped` rate as the gauge
+  being *unknown* for some peer.
+
+  **To find which member, do not reach for the sync warnings — they cannot
+  fire here.** A truncated round *succeeds*, so `sync round failed` never
+  logs; and the stale-rejoiner warning measures how far a peer trails **this
+  node**, which is the opposite direction from a pull this node could not
+  finish, so it stays silent too (and `/v1/topology`'s stale-peer list is fed
+  from that same hook, so it is no help either).
+  `kimmy_replication_lag_seconds` does rise, but it is a max over peers and
+  says "some peer", not which. What answers it is **the `cluster.sync` span**,
+  emitted once per peer per round at info level with `peer` and `lag_ms` on
+  it — one conversation per peer, so the peer whose `lag_ms` stays high round
+  after round is the one nothing is checking. See [Tracing](#tracing) for
+  pointing that at a collector. Without one, the `merged from peer` line
+  names the peer and how much each round applied, and a peer draining a
+  backlog emits it every round with a large `applied`.
+
+**Why the check does not simply run anyway on a truncated round.** Because a
+truncated pull manufactures the finding. The existence half reports only "the
+peer holds it and I do not", and on a round that did not reach the peer's
+tail that is indistinguishable from "I have not yet applied the entry that
+creates it here" — which is ordinary catch-up, not divergence. Measured on a
+three-member cluster: five collections created on one member took 219 s and
+227 s to reach the other two under a corpus load, during which one member's
+`kimmy_collections` read 38 against 33 on the other two for 245 s, and then
+the gap closed by itself. Two consecutive contacts at a 5 s interval is about
+10 s, so a check that ran on those truncated rounds would have confirmed
+inside the first few percent of that window and held the gauge above zero for
+four minutes on a healthy cluster — on every wave of every bulk load. An
+alert that cries wolf on ordinary catch-up is the one an operator turns off,
+which lands the cluster back in the blind spot the gauge exists to close. The
+skip is right; the fix is knowing when it is in effect, which is what the
+counter above is for.
 
 One case is not "skipped" at all: a peer that answers with zero entries
 while also reporting its tail was not reached. A correct peer cannot produce

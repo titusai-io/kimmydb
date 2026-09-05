@@ -71,6 +71,29 @@ pub struct RoundReport {
     /// the condition that left every other field in this report at its
     /// healthiest value while the cluster silently lost data.
     pub divergent_collections: usize,
+    /// Contacts in this tick whose round actually ran the cross-member
+    /// check — the pull reached the peer's true tail, so `sync_once`
+    /// returned a `divergent` set rather than `None` (ADR-135). A counter,
+    /// summed over the peers reached.
+    ///
+    /// Without it `divergent_collections` reading 0 means two different
+    /// things — *checked, and the peers agree* and *not checked at all* —
+    /// and an operator cannot tell them apart from the metric alone. This
+    /// is the half that says the reading is worth something.
+    ///
+    /// Incremented in the same branch that folds the finding into
+    /// `DivergenceTracker`, not beside it, so this can never report a check
+    /// the tracker was not told about.
+    pub divergence_checks: usize,
+    /// Contacts in this tick whose round completed and did **not** run the
+    /// check, because the pull was truncated by the batch cap (ADR-133's
+    /// skip, ADR-135's counter). A counter, on the same terms.
+    ///
+    /// Rounds that *failed* are in `failed` and in neither of these two, so
+    /// `divergence_checks + divergence_skips + failed` is the number of
+    /// peers this tick contacted — every successful round identifies its
+    /// peer, which is the gate both arms sit inside.
+    pub divergence_skips: usize,
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -291,12 +314,30 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 // (ADR-133). `divergent` and `count_probe`
                                 // are always set together by `sync_once`, so
                                 // `divergent`'s presence alone gates both.
+                                //
+                                // The two counters are incremented in these
+                                // same two arms rather than beside them
+                                // (ADR-135), so what they report and what the
+                                // tracker was told are decided by one branch
+                                // and cannot drift: a "check" cannot be
+                                // counted for a contact the fold below never
+                                // received. `Some` — including `Some` of an
+                                // empty set — is the check having run and
+                                // found nothing, which is exactly what the
+                                // gauge's 0 is supposed to mean; `None` is
+                                // ADR-133's cap-truncation skip, which the
+                                // gauge alone cannot distinguish from it. A
+                                // round that *failed* reaches neither arm and
+                                // is counted in `failed`.
                                 if let Some(existence) = outcome.divergent.take() {
+                                    report.divergence_checks += 1;
                                     let findings = kimmy_storage::DivergenceFindings {
                                         existence,
                                         count: outcome.count_probe.take(),
                                     };
                                     divergence.observe(node, findings);
+                                } else {
+                                    report.divergence_skips += 1;
                                 }
                                 let stale = retention_ms > 0 && outcome.behind_ms > retention_ms;
                                 let was = stale_peers.contains(&node);

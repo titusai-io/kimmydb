@@ -10,6 +10,162 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **The divergence gauge now says whether it looked.**
+  `kimmy_sync_divergence_checks_total{outcome}` counts contacts with a peer in
+  which the cross-member divergence check `ran`, and contacts whose round
+  completed without it because the pull was truncated by the batch cap
+  (`skipped`). `kimmy_sync_divergent_collections` reading 0 meant two
+  different things — *checked, and the peers agree* and *not checked at
+  all* — with nothing scrapable to tell them apart, which left the documented
+  alert ("gauge above 0") silent in exactly the state it most needs to speak:
+  a sustained backlog silences the check, and a sustained backlog is when a
+  divergence is most plausibly being created. Alert on the pair — the gauge
+  above 0, **and** `ran` failing to increase on a node that has peers — and
+  read `ran` flat with `skipped` rising as *unknown* rather than clean. A
+  round that failed outright is counted in `kimmy_sync_failures_total` and in
+  neither outcome, so `ran` + `skipped` + failures is every contact a node
+  made. No peer name, node id or collection name appears in either series;
+  the check itself, what it compares and when it runs are all unchanged.
+  ADR-135.
+
+- **A round whose pull the batch cap truncated still skips the check, and now
+  there is a worked example of why.** A three-member cluster produced a
+  245-second window that looked like a divergence the gauge had slept
+  through, and was a backlog: five collections created on one member reached
+  the other two at 219 s and 227 s and the gap closed by itself. On a
+  truncated pull "the peer holds a collection I lack" and "I have not applied
+  the entry that creates it here yet" are the same observation, and the
+  two-contact confirmation — about 10 s at the default sync interval — is far
+  too fast to filter a window of that length. Checking anyway would have held
+  the gauge above zero for minutes on a healthy cluster, on every wave of a
+  bulk load. The behaviour does not change; the operations guide now states
+  the correlation plainly instead of leaving it to be inferred. ADR-135.
+
+### Changed
+
+- **A node that cannot serve local embeddings now says so at `ERROR`.** It
+  answers `501 not_implemented`, the same code as a caller asking for a
+  reserved capability, so it used to be indistinguishable in the log from
+  somebody else's request. It is not the same thing: it is a member
+  provisioned unlike the rest of its cluster, every search of that collection
+  landing on it fails, and behind a load balancer the other members hide it.
+  It is raised above its code's level at the point it is constructed, so the
+  lowering below does not bury it. ADR-136.
+
+- **A failed request is logged at a level chosen by who has to fix it, not by
+  its HTTP status.** Every 5xx used to write an `ERROR` line, which meant one
+  client sending requests the reference documents as refusals could make a
+  member look unhealthy: a test round produced seven `ERROR` lines, and all
+  seven were refusals a passing test case had asked for on purpose. The level
+  is now a property of the error code — `internal`, `misconfigured` and
+  `snapshot` at `ERROR`; `timeout` and `provider_error` at `WARN`;
+  `not_implemented` at `INFO` — and 4xx codes are still not logged at all, now
+  because the code says so rather than because the status did. **Alert on
+  `ERROR` is meant to be correct as written on an untuned node**; the levels
+  and the list of codes that never log are published in
+  [Operations](docs/operations.md#logs) and held to the server's own enum by a
+  test, so they cannot drift apart. This changes what a node logs and nothing
+  else — the status, the `error` code, the `retry` class and the message in
+  the response body are all untouched, as is the `request failed` event
+  message, which is the same on every level so one query still finds them all.
+  ADR-136.
+
+- **Breaking, `kimmy-client` API: `ErrorCode` knows `timeout`, and `Unknown`
+  keeps the code it was handed.** The client's mirror of the server's code set
+  had no `Timeout` variant and no `"timeout"` arm, so a `503 timeout` — a code
+  the server has sent since ADR-099 — parsed as the unknown fallback, and a
+  caller branching on the code could not see a timeout at all. Separately,
+  `Unknown` was documented as keeping the string the server sent and did not:
+  every unrecognized code became the literal `unknown`, so the one situation
+  the variant exists for — a code newer than the client — was the one it made
+  undiagnosable. `ErrorCode::Unknown` now carries a `String` rather than a
+  `&'static str`, which means `ErrorCode` is no longer `Copy`; `Error::code()`
+  still returns an owned `Option<ErrorCode>` and every comparison against a
+  named variant is unchanged. The list of documented codes the client's
+  round-trip test checks had also fallen two behind the server and now names
+  all nineteen.
+
+### Fixed
+
+- **Documentation only, no behaviour change:** the hardcoded counts of error
+  codes are corrected, and most of them are gone rather than corrected. The
+  server's `ErrorCode` enum has grown twice since the counts were written —
+  `stale` with conditional writes, `timeout` with the request deadline — and
+  three places still stated the old size with nothing checking them: the module
+  documentation in `crates/kimmy-api/src/error.rs` said a new failure "cannot
+  invent an eighteenth code", the M10 task table in
+  [Roadmap](docs/roadmap.md) said "the seventeen codes are closed by the
+  compiler", and ADR-057 said `wait` was two codes and `no` was twelve, where
+  they are now three and thirteen. **The number is removed wherever the
+  sentence did not need one** — "the code set is closed by the compiler" is the
+  same claim without a figure that can rot — and ADR-057, being a settled
+  record, is amended in place rather than rewritten: the amendment marks the
+  bullets as an M10 snapshot, names the two codes that joined since, and points
+  at `ErrorCode::retry()` and the contract test that already holds every code's
+  retry class to the enum, instead of writing a fresh count for someone to find
+  wrong later. `crates/kimmy-api/src/error.rs` also now records beside the enum
+  that adding a variant means editing `kimmy-client` too, which shares no code
+  with the server by design and which no test points an author at. The
+  mutation-pass finding in [Testing](docs/testing.md) keeps its "thirteen of
+  the seventeen" — it is the dated record of a run against a set that really
+  did hold seventeen codes, and updating the figure would falsify it.
+
+- **Documentation only, no behaviour change:** ADR-123 now carries a forward
+  marker to ADR-132. ADR-132 withdrew one of ADR-123's promises — that two
+  members creating one index name with different definitions each keep their
+  own and the refusal is counted in `kimmy_sync_ddl_refused_total` — for the
+  case where both definitions carry a creation stamp, and said so in its own
+  record; ADR-123 said nothing, so a reader landing there read a promise that
+  is no longer true for that case with nothing pointing forward. The marker
+  sits at the head of ADR-123 and beside the paragraph it amends, and states
+  the scope in both places: the counter does not rise where **both**
+  definitions carry a stamp, that case settles on the later stamp, and
+  ADR-123 holds exactly as written where either carries none. The 0.22.0
+  entry below, which stated the new rule without that scope, is corrected in
+  place for the same reason: on an upgraded cluster every index that already
+  exists is unstamped, so a reader of that entry alone had the wrong model for
+  the whole population they were about to roll.
+
+- **The aggregation reference now says what `$count` and `$group` do over an
+  empty input stream.** Nothing changed in either stage; what was missing was
+  any way to derive their answers from the documentation, and they differ.
+  `$count` computes one number over the whole stream and that number is
+  defined when the stream holds nothing, so it emits **one document holding
+  `0`** however the stream came to be empty — a `$match` that selected
+  nothing, an `$unwind` that dropped every row, a `$skip` past the end, an
+  explicit `$limit: 0`, all answer `[{"n": 0}]`. `$group` over that same
+  stream emits **nothing at all**, `{"_id": null}` included, because it
+  produces one row per distinct key and an empty stream has no keys. The two
+  are the same rule asked different questions, but the difference decides the
+  read: a total taken from `$count` is always present, where a pipeline
+  ending in `$group` can legitimately answer `[]` and `{"_id": null}` is not
+  a promise of one row. `docs/aggregation.md` states both, in the stage table
+  and beside the accumulators' own "nothing to work on" case, which is a
+  different one — a group that exists and had nothing usable in it, not the
+  absence of any group. Both behaviours are now held by tests.
+
+- **`$count` is documented as blocking, which it always was.** The
+  aggregation reference defined blocking as a stage that cannot emit until it
+  has consumed everything, then listed only `$group` and `$sort` — `$count`
+  meets the same definition and was named nowhere. The term was also used in
+  the stage table and defined 550 lines below it with no link between the
+  two; the `$sort`, `$group` and `$count` rows now link to the definition.
+  Nothing about the memory ceiling changes: a pipeline's input is materialised
+  before the first stage and every stage works on that whole set.
+
+- **The error table in `docs/http-api.md` is now held to the server's code
+  set.** A contract test already pinned `docs/openapi.yaml`'s `ErrorCode`
+  schema to the enum, but nothing checked the prose table — the one a client
+  author actually reads — so a new code could go missing from it silently. The
+  new test asserts the table's codes are exactly the served set and that its
+  `retry` column matches what the server sends for each one. The table was in
+  fact complete and correct; what was missing was anything that would notice
+  when it stopped being.
+
 ## 0.22.0 - 2026-09-04
 
 ### Added
@@ -256,18 +412,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   converge instead of staying divergent.** ADR-123 left both standing, each
   member keeping its own and counting the refusal; the 0.21.0 round watched two
   collections sit that way, with `kimmy_sync_ddl_refused_total` at 9 / 15 / 9
-  and no path back to one schema. The later creation stamp now wins on every
-  member, which is how two concurrent writes to one document already settle.
-  The member whose definition loses logs a warning naming the index and what
-  differed, and rebuilds the name under the winner.
+  and no path back to one schema. **Where both definitions carry a creation
+  stamp**, the later of the two now wins on every member, which is how two
+  concurrent writes to one document already settle. The member whose
+  definition loses logs a warning naming the index and what differed, and
+  rebuilds the name under the winner. Where either definition carries none —
+  and on an upgraded cluster **every index that already exists carries
+  none** — the 0.21.0 behaviour stands unchanged; the creation-stamp entry
+  under *Changed* above says what that means and how to settle such a name.
 
-  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case**.
-  It is unchanged for the case that still needs an operator — a definition a
-  member's own documents cannot be built under — and, where the winning
-  definition cannot be built on the receiving member, that member keeps the
-  index it already had rather than ending with neither. Creating a conflicting
-  index through the API is unaffected: a client is still refused `409`, naming
-  what differs. ADR-132.
+  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case** —
+  the stamped one. It is unchanged for the case that still needs an operator —
+  a definition a member's own documents cannot be built under — and, where the
+  winning definition cannot be built on the receiving member, that member keeps
+  the index it already had rather than ending with neither. Creating a
+  conflicting index through the API is unaffected: a client is still refused
+  `409`, naming what differs. ADR-132.
 
 ## 0.21.0 - 2026-09-03
 

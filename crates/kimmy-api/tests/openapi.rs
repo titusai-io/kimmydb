@@ -280,6 +280,136 @@ fn every_error_code_is_specified_with_the_retry_class_the_server_uses() {
     assert_eq!(classes, BTreeSet::from(["no", "wait", "elsewhere"]));
 }
 
+/// The error table in `docs/http-api.md`, as `(status, code, retry)` per row.
+///
+/// A code may hold more than one row — `bad_request` is documented at 400 and
+/// at 422, because the two are different mistakes — so this is a list rather
+/// than a map, and every row is checked.
+///
+/// Parsed strictly on purpose. A scan that silently matches nothing passes
+/// every assertion built on it, which is the failure this whole family of
+/// tests exists to prevent: each step panics with what it expected rather than
+/// falling back to an empty result.
+fn error_rows_in_the_http_reference() -> Vec<(String, String, String)> {
+    const REFERENCE: &str = include_str!("../../../docs/http-api.md");
+    const HEADER: &str = "| Status | `error` | `retry` | Cause |";
+
+    let section =
+        REFERENCE.split_once("\n## Errors\n").expect("docs/http-api.md has an Errors section").1;
+    // Bounded at the next heading, so a table elsewhere in the document cannot
+    // stand in for this one.
+    let section = section.split("\n## ").next().expect("a section body");
+    let table = section
+        .split_once(HEADER)
+        .unwrap_or_else(|| panic!("the Errors section has no table headed `{HEADER}`"))
+        .1;
+
+    // The header ends its own line, and the alignment row is the next one. Both
+    // are consumed by position rather than skipped by shape: a scan that
+    // tolerates a blank line here would tolerate one anywhere before the first
+    // data row, and the count below cannot see that — the rows are all still
+    // there and still add up.
+    let table = table.strip_prefix('\n').expect("the table header ends its line");
+    let mut lines = table.lines();
+    let alignment = lines.next().expect("a line under the table header").trim();
+    assert!(
+        alignment.starts_with('|') && alignment.chars().all(|c| matches!(c, '|' | '-' | ':' | ' ')),
+        "the line under the table header is not an alignment row: `{alignment}`"
+    );
+
+    let mut rows = Vec::new();
+    for line in lines {
+        let line = line.trim();
+        // The table ends at the first line that is not a row.
+        if !line.starts_with('|') {
+            break;
+        }
+
+        // The first three cells are all before the prose, so a `|` inside a
+        // cause — none today — could not shift them.
+        let mut cells = line.split('|').skip(1);
+        let status = cells.next().expect("a status column").trim().to_string();
+        let code = cells.next().expect("a code column").trim();
+        let retry = cells.next().expect("a retry column").trim().to_string();
+        let code = code
+            .strip_prefix('`')
+            .and_then(|c| c.strip_suffix('`'))
+            .unwrap_or_else(|| panic!("the code column of `{line}` is not a single `code` span"))
+            .to_string();
+        rows.push((status, code, retry));
+    }
+
+    // The scan reached the end of the table. Counting the table lines in the
+    // section independently is what turns an early stop into a failure rather
+    // than a smaller set that still happens to compare equal — the silent-pass
+    // shape this file exists to prevent. The two extra lines are the header
+    // and the alignment row; a second table in this section trips it too, and
+    // should, because then "the error table" is ambiguous.
+    let table_lines = section.lines().filter(|line| line.trim_start().starts_with('|')).count();
+    assert_eq!(
+        rows.len() + 2,
+        table_lines,
+        "the Errors section holds {table_lines} table lines and the scan read {} rows",
+        rows.len()
+    );
+
+    rows
+}
+
+/// The prose reference's error table is the server's code set too.
+///
+/// `every_error_code_is_specified_with_the_retry_class_the_server_uses` holds
+/// `docs/openapi.yaml` to the enum, so the machine-readable specification
+/// cannot fall behind. Nothing held `docs/http-api.md`, which is the page a
+/// person actually reads to learn what a refusal means — so a new code could go
+/// missing from it silently, and the drift would be invisible until someone met
+/// the code in production and looked it up in vain.
+///
+/// Both directions, like the specification's: a code with no row is an
+/// undocumented refusal, and a row with no code is a refusal the server cannot
+/// produce, which sends a reader looking for a condition that does not exist.
+#[test]
+fn every_error_code_is_in_the_http_reference_with_the_retry_class_the_server_uses() {
+    use kimmy_api::error::ErrorCode;
+
+    let rows = error_rows_in_the_http_reference();
+    // A parse that found nothing would satisfy nothing below vacuously — the
+    // set comparison would fail — but it would fail with a confusing message,
+    // and a parse that found *some* rows is the dangerous case.
+    assert!(
+        rows.len() >= ErrorCode::ALL.len(),
+        "the error table scan found {} rows for {} codes; it is broken",
+        rows.len(),
+        ErrorCode::ALL.len()
+    );
+
+    let documented: BTreeSet<&str> = rows.iter().map(|(_, code, _)| code.as_str()).collect();
+    let served: BTreeSet<&str> = ErrorCode::ALL.iter().map(|c| c.as_str()).collect();
+    assert_eq!(
+        served, documented,
+        "the server's codes and the error table in docs/http-api.md disagree"
+    );
+
+    for (status, code, retry) in &rows {
+        let served = ErrorCode::ALL
+            .iter()
+            .find(|c| c.as_str() == code)
+            .expect("the sets are equal, so every row names a served code");
+        assert_eq!(
+            retry,
+            served.retry().as_str(),
+            "docs/http-api.md documents `{code}` as `{retry}` and the server sends `{}`",
+            served.retry().as_str()
+        );
+        // Proof that the columns being read are the ones intended: a shifted
+        // parse would put prose here.
+        assert!(
+            status.parse::<u16>().is_ok_and(|s| (100..600).contains(&s)),
+            "the status column of the `{code}` row reads `{status}`"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The compatibility policy
 // ---------------------------------------------------------------------------
@@ -1784,9 +1914,11 @@ async fn a_rate_limited_login_matches_its_documented_response() {
          to guess"
     );
 
-    // The one code whose answer is "the same node, later". `Retry-After` says
-    // how much later; the class is what tells a client to wait at all rather
-    // than moving on to a peer that shares nothing about this limit.
+    // A code whose answer is "the same node, later", and the only one that can
+    // say how much later: `Retry-After` is a number this node already knows,
+    // where `provider_error` and `timeout` are waiting on something that never
+    // told them. The class is what makes a client wait at all rather than
+    // moving on to a peer that shares nothing about this limit.
     assert_eq!(body["error"], "rate_limited");
     assert_eq!(body["retry"], "wait");
 }

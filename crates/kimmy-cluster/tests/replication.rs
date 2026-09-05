@@ -1538,3 +1538,367 @@ async fn a_count_divergence_confirms_through_the_real_loop_despite_other_collect
     assert_eq!(confirmed, 1, "gamma's count divergence, despite alpha/beta/delta rotating through");
     looping.abort();
 }
+
+/// **The positive control.** Until a test drives
+/// `kimmy_sync_divergent_collections` off `0` and back to `0`, a dead gauge
+/// and a working one are indistinguishable, and no cluster round may cite a
+/// `0` reading as evidence of anything: the reading a broken gauge produces
+/// is the reading a healthy cluster produces.
+///
+/// Both directions matter, and each fails for a different reason. Off `0`
+/// catches a gauge that never moves — a tracker that never confirms, a
+/// finding never folded in, a hook never called. Back to `0` catches a gauge
+/// that sticks, which is worse than one that never fires: an alert an
+/// operator cannot clear by fixing the thing it reported is the one they
+/// disable, which lands the cluster in exactly the state this gauge exists
+/// to prevent.
+///
+/// The confirmation gate is asserted at the moment the gauge moves rather
+/// than separately: `divergence_checks` counts contacts in which the check
+/// actually ran, so requiring at least two of them before the gauge leaves
+/// `0` is the existence half's "two consecutive contacts with the same peer"
+/// rule, measured through the real loop (ADR-133, ADR-135).
+#[tokio::test]
+async fn the_divergence_gauge_leaves_zero_and_returns_to_zero_through_the_real_loop() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    // A holds a collection B does not, and B believes it has already
+    // witnessed everything A holds — so nothing about this fails a round,
+    // no counter moves, and the lag gauge reads 0. The state the check
+    // exists for.
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+    assert!(b.engine.get_collection("shop", "stranded").is_err());
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    // Off 0.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut checks = 0usize;
+    let mut skips = 0usize;
+    let mut confirmed = 0usize;
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the gauge never left 0: a dead gauge reads exactly this"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "nothing about this failed a round: {report:?}");
+        checks += report.divergence_checks;
+        skips += report.divergence_skips;
+        confirmed = report.divergent_collections;
+        if confirmed > 0 {
+            assert!(
+                checks >= 2,
+                "the existence half confirms across two consecutive contacts, never one: \
+                 the gauge moved after {checks} checked contact(s)"
+            );
+        }
+    }
+    assert_eq!(confirmed, 1, "exactly the one stranded collection");
+    assert_eq!(skips, 0, "nothing here has a backlog to truncate a round: {skips}");
+
+    // Back to 0, on the repair `operations.md` tells an operator to make:
+    // B now holds the collection it lacked, so the next contact with the
+    // same peer no longer finds it and the level falls.
+    b.engine.create_collection("shop", "stranded").unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut cleared = confirmed;
+    while cleared != 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("a resolved divergence left a permanent scar on the gauge"))
+            .expect("the loop must keep reporting");
+        cleared = report.divergent_collections;
+    }
+    looping.abort();
+}
+
+/// The same control at the level the loop composes, without the timers: one
+/// checked contact is a *pending* finding and the gauge stays at 0; the
+/// second consecutive contact with the same peer confirms it; the contact
+/// after the repair clears it. `sync_once` and `DivergenceTracker` are the
+/// two real pieces `replicate()` puts together, so this pins the boundary
+/// exactly rather than waiting for a tick to land on the right side of it.
+#[tokio::test]
+async fn one_checked_contact_is_pending_and_the_second_moves_the_gauge() {
+    let a = node().await;
+    let b = node().await;
+
+    let ca = a.engine.create_collection("shop", "stranded").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "1" }).unwrap();
+    let theirs = a.engine.version_vector().unwrap();
+    b.engine.apply_peer_batch(&theirs, &[], Hlc::ZERO, true).unwrap();
+
+    let mut tracker = kimmy_storage::DivergenceTracker::new();
+    let mut contact = |outcome: kimmy_storage::SyncOutcome| {
+        let peer = outcome.peer.expect("the handshake introduces the peer");
+        let existence = outcome.divergent.expect("the round reached the tail, so it checked");
+        let found = existence.len();
+        tracker.observe(peer, kimmy_storage::DivergenceFindings { existence, count: None });
+        (found, tracker.confirmed_count())
+    };
+
+    // Found on the first contact, and deliberately not reported: a race
+    // between the peer's version vector and its collection list, read a
+    // message apart, produces exactly this and does not recur.
+    let first = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(contact(first), (1, 0), "one contact is a pending finding, not a gauge reading");
+
+    // Two consecutive contacts with the same peer: confirmed, and the gauge
+    // leaves 0.
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(contact(second), (1, 1), "the gauge must be able to leave 0");
+
+    // And falls again once the divergence is gone, rather than holding a
+    // value nothing an operator does can clear.
+    b.engine.create_collection("shop", "stranded").unwrap();
+    let third = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(contact(third), (0, 0), "a resolved finding clears on its own next check");
+}
+
+/// What tells a quiet cluster from a blind one (ADR-135). ADR-133's skip is
+/// correct and stays — a round whose pull the batch cap truncated cannot
+/// distinguish "the peer genuinely holds a collection I lack" from "I have
+/// not applied the entry that creates it here yet" — but while it applies,
+/// `kimmy_sync_divergent_collections` reading 0 means *not checked*, and the
+/// gauge alone cannot say so.
+///
+/// So the skipped count must rise for exactly the rounds the check did not
+/// run on, and the checked count must not: an operator's alert rule turns on
+/// the checked count still moving, and a checked count that ticked up for a
+/// round nobody checked would make the blind state read as the healthy one.
+#[tokio::test]
+async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
+    use kimmy_cluster::protocol::MAX_BATCH;
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    // Comfortably over the batch cap, so B's first pull is truncated and
+    // its round cannot reach A's tail.
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..(MAX_BATCH + 200) {
+        a.engine.insert(&ca, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![a.addr])], SECRET.into(), b.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = tx.send(report);
+    }));
+    let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let mut checks = 0usize;
+    let mut skips = 0usize;
+    while checks == 0 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the check never ran once the backlog drained"))
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "the backlog is not a failure: {report:?}");
+        if report.divergence_checks > 0 {
+            assert!(
+                skips >= 1,
+                "the truncated round must have been counted as a skip before any check was: \
+                 skips={skips}"
+            );
+        }
+        checks += report.divergence_checks;
+        skips += report.divergence_skips;
+    }
+
+    // And the blindness belongs to the backlog, not to the node: once the
+    // pull reaches the tail every round is checked again, and nothing more
+    // is skipped.
+    let skipped_while_behind = skips;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while checks < 3 {
+        let report = tokio::time::timeout_at(deadline, rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("a drained cluster stopped being checked"))
+            .expect("the loop must keep reporting");
+        checks += report.divergence_checks;
+        skips += report.divergence_skips;
+    }
+    assert_eq!(skips, skipped_while_behind, "a drained cluster skips nothing further");
+    looping.abort();
+}
+
+/// One of ADR-132's two remaining rises of `kimmy_sync_ddl_refused_total`,
+/// over the wire: a rival definition arrives under a name this node holds
+/// with **no creation stamp**, so there is nothing to arbitrate with, and the
+/// arrival is skipped and counted exactly as ADR-123 left it. The 0.22.0
+/// round read `0` on this counter on every member in every sample, and
+/// nothing anywhere drove either of the two cases that still move it.
+///
+/// The unstamped definition is built the only way a node can genuinely
+/// acquire one — restored from a snapshot page carrying no stamp, which is
+/// what a definition written before ADR-132 looks like on the wire and on
+/// disk.
+#[tokio::test]
+async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
+    let a = node().await;
+    let b = node().await;
+    let source = node().await;
+
+    // A definition with its creation stamp stripped, restored onto B.
+    source.engine.create_collection("shop", "orders").unwrap();
+    source
+        .engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            false,
+            Some("by_email".into()),
+        )
+        .unwrap();
+    let mut page = source.engine.snapshot_page(None).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = None;
+        }
+    }
+    page.documents.clear();
+    // Granting B no coverage of another node's history: this fixture is
+    // about the stored shape of the definition, nothing else.
+    page.versions = kimmy_core::VersionVector::default();
+    b.engine.apply_snapshot_page(&page).unwrap();
+    assert!(
+        b.engine
+            .get_collection("shop", "orders")
+            .unwrap()
+            .index("by_email")
+            .unwrap()
+            .created
+            .is_none(),
+        "the fixture must leave B holding a definition with no creation stamp"
+    );
+
+    // A holds a rival definition under the same name, stamped.
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            true,
+            Some("by_email".into()),
+        )
+        .unwrap();
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "after" }).unwrap();
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
+        .await
+        .expect("a rival it cannot arbitrate must not fail the round");
+    assert_eq!(outcome.ddl_refused, 1, "skipped and counted: {outcome:?}");
+    assert!(
+        !b.engine.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
+        "B keeps the definition it cannot arbitrate away"
+    );
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert!(
+        b.engine.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
+        "and the refusal does not stop the entries behind it"
+    );
+}
+
+/// ADR-132's other remaining rise, over the wire: the arriving definition
+/// *wins* the creation-stamp comparison and still cannot be built over the
+/// documents this node holds. The replacement aborts whole — B keeps the
+/// index it had rather than ending with neither — the round goes on, and the
+/// skip is counted. This is the case that stops "refuse every rival" being a
+/// valid simplification of ADR-132's rule.
+#[tokio::test]
+async fn a_winning_definition_that_cannot_be_built_is_refused_and_counted_over_the_wire() {
+    let a = node().await;
+    let b = node().await;
+    let source = node().await;
+
+    // B's definition, stamped older than anything A can mint — pinned to a
+    // fixed stamp rather than left to the clock, so which side wins is a
+    // fact of the fixture and not of how fast the test ran.
+    let ancient = kimmy_core::Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]));
+    source.engine.create_collection("shop", "orders").unwrap();
+    source
+        .engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("tags")],
+            false,
+            Some("probe".into()),
+        )
+        .unwrap();
+    let mut page = source.engine.snapshot_page(None).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = Some(ancient);
+        }
+    }
+    page.documents.clear();
+    page.versions = kimmy_core::VersionVector::default();
+    b.engine.apply_snapshot_page(&page).unwrap();
+    assert_eq!(
+        b.engine.get_collection("shop", "orders").unwrap().index("probe").unwrap().created,
+        Some(ancient),
+        "the fixture must leave B holding the older definition, or A's does not win \
+         the comparison and this test proves something else"
+    );
+
+    // The document A's compound definition cannot be built over: two
+    // indexed paths both holding arrays.
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+    // A's rival, which builds there because A holds no such document.
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![
+                kimmy_core::IndexField::ascending("tags"),
+                kimmy_core::IndexField::ascending("cats"),
+            ],
+            false,
+            Some("probe".into()),
+        )
+        .expect("accepted on A: no document there holds arrays at both paths");
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "after" }).unwrap();
+
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None)
+        .await
+        .expect("a definition it cannot build must not wedge the round");
+    assert_eq!(outcome.ddl_refused, 1, "skipped and counted, not applied: {outcome:?}");
+    let index = b.engine.get_collection("shop", "orders").unwrap().index("probe").cloned().unwrap();
+    assert_eq!(
+        index.fields.len(),
+        1,
+        "the replacement aborted whole: B keeps its own definition, not neither"
+    );
+    assert!(
+        b.engine.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
+        "and the refusal does not stop the entries behind it"
+    );
+}

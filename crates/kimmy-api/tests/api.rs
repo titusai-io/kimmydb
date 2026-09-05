@@ -7794,6 +7794,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_sync_peers_backing_off",
             "kimmy_sync_ddl_refused_total",
             "kimmy_sync_divergent_collections",
+            "kimmy_sync_divergence_checks_total",
+            "kimmy_sync_divergence_checks_total",
             "kimmy_tls_reloads_total",
             "kimmy_tls_reloads_total",
             "kimmy_jwks_refresh_total",

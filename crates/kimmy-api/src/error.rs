@@ -6,10 +6,13 @@
 //! # The code set is closed, and the compiler is what closes it
 //!
 //! [`ErrorCode`] is an enum rather than a `&'static str`, so a new failure
-//! cannot invent an eighteenth code at a call site. The wire string and the
-//! retry class both come from exhaustive matches on it: adding a variant does
-//! not compile until both are answered, which is the point — the second one is
-//! a decision about client behaviour that would otherwise be made by accident.
+//! cannot invent a code at a call site. No count is given here, deliberately:
+//! this sentence named one, went two codes out of date, and nothing failed —
+//! and the claim it makes does not need a number to be true. The wire string,
+//! the retry class and the log level all come from exhaustive matches on it:
+//! adding a variant does not compile until all three are answered, which is
+//! the point — the last two are decisions about client behaviour and about
+//! what wakes an operator, and both would otherwise be made by accident.
 //!
 //! The set had already drifted before this existed. `no_vectors` is returned
 //! from `vectors.rs` and appeared in neither the HTTP reference nor the first
@@ -23,9 +26,22 @@ use kimmy_auth::AuthError;
 use kimmy_core::Error as CoreError;
 use kimmy_storage::StorageError;
 use serde_json::json;
-use tracing::error;
+use tracing::{Level, error, info, warn};
 
 /// Every code the API can return, and nothing else.
+///
+/// **Adding a variant here also means editing `kimmy-client`.** That crate
+/// depends on no `kimmy-*` crate by design — it has to see what the Python and
+/// Go clients see — so its own `ErrorCode`, its `parse`, its `Display` and the
+/// code list in its round-trip test are hand-copied from this one and nothing
+/// ties them together. The tests in this workspace fail on a code the *server*
+/// documents and does not serve, or serves and does not document, so a new
+/// variant is caught here and prompts its author; nothing points that author at
+/// `crates/kimmy-client/src/error.rs`, which is what this comment is for. A
+/// client meeting an unknown code is not broken — it reads the `retry` class
+/// from the envelope, which is exactly why that field exists (ADR-057), and it
+/// keeps the string — but the code reaches it as `ErrorCode::Unknown` rather
+/// than as a named variant, and a named variant is what a caller matches on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorCode {
     BadRequest,
@@ -184,6 +200,117 @@ impl ErrorCode {
             Self::Internal | Self::Misconfigured | Self::Snapshot => Retry::Elsewhere,
         }
     }
+
+    /// How loudly this node talks to its operator about a failure it answered
+    /// with, or `None` for one it does not log at all.
+    ///
+    /// **The discriminator is actionability, not HTTP class**: is the fix in
+    /// the operator's hands, or the caller's? That question cuts across the
+    /// 5xx set — a reserved capability is refused with a 501 that no operator
+    /// can do anything about — which is why the status could never have
+    /// scoped this (ADR-136).
+    ///
+    /// The level a code takes here is a claim about what an alert built on it
+    /// would mean, so read each arm as one: `ERROR` says *page someone*,
+    /// `WARN` says *a rise in these is worth looking at*, `INFO` says *this
+    /// happened and it is not a fault*, and `None` says *this is not an event
+    /// at all*.
+    pub fn log_level(self) -> Option<Level> {
+        match self {
+            // Not logged, at any level. These are the caller's to fix and the
+            // caller already holds the answer, in a response naming exactly
+            // what was wrong. Logging them would be an access log of nothing
+            // but the failures — half a record, and one this server has never
+            // kept. `kimmy_responses_total{class="4xx"}` counts them, the
+            // audit log records the authorization decisions among them, and
+            // neither costs a line per bad request.
+            //
+            // `None` rather than a level the subscriber filters out, so that
+            // an operator raising `RUST_LOG` to debug something else does not
+            // suddenly acquire that half access log. "Do not log this" is a
+            // property of the code, not of how the process was started.
+            Self::BadRequest
+            | Self::PayloadTooLarge
+            | Self::UnsupportedMediaType
+            | Self::Unauthorized
+            | Self::Forbidden
+            | Self::NotFound
+            | Self::Conflict
+            | Self::DuplicateKey
+            | Self::UniqueViolation
+            | Self::NoVectors
+            | Self::ResumeTokenExpired
+            | Self::RateLimited
+            | Self::Stale => None,
+
+            // Reserved and unbuilt, by default. The reference says this will
+            // be refused, the caller asked for it anyway, and there is no
+            // operator action — the capability exists on no node and no
+            // configuration turns it on. `INFO` rather than `None` because
+            // unlike a 4xx it is the *server* declining, and an operator
+            // sizing up what callers are reaching for should be able to see
+            // it without turning on a firehose.
+            //
+            // One source overrides this upward. A node that cannot serve
+            // embeddings the rest of the cluster expects returns the same
+            // code for an entirely operator-owned condition, and raises
+            // itself to `ERROR` at construction — see
+            // [`ApiError::level_override`] and `vectors.rs`. Lowering the
+            // whole code to suit its commoner source would have hidden that
+            // one, which is the failure this level split exists to prevent.
+            Self::NotImplemented => Some(Level::INFO),
+
+            // An upstream embedding provider failed, and the comment on
+            // `retry()` above says whose fault that is: the upstream's. No
+            // single occurrence demands an operator do anything — a provider
+            // drops a connection and the client retries — but a *rise* is a
+            // quota, a revoked key, or a provider that is down, and those are
+            // all the operator's. `WARN` is the level that says exactly that.
+            Self::ProviderError => Some(Level::WARN),
+
+            // `WARN`, uniformly, and deliberately not split by cause. The
+            // deadline is only ever reached while the request is *waiting* —
+            // for the rest of its body, or for an upstream provider — and
+            // those have different owners: a slow client is the caller's, a
+            // slow provider is the operator's. But the deadline is enforced
+            // by a middleware layer wrapping the whole handler
+            // (`limits::enforce_timeout`), which learns only that the future
+            // did not finish; the cause is somewhere inside a future that no
+            // longer exists. Threading it out would mean every awaiting site
+            // reporting what it was waiting on, which is a large change to
+            // pay for a log level. `WARN` is the honest answer for both: a
+            // rise in abandoned requests is operationally interesting even
+            // when each one is a slow client, and `WARN` keeps it visible
+            // without paging (ADR-099, ADR-136).
+            Self::Timeout => Some(Level::WARN),
+
+            // A genuine fault in this node: storage failed, or something that
+            // cannot happen did. Nothing a caller sends causes it and nothing
+            // a caller changes fixes it.
+            Self::Internal => Some(Level::ERROR),
+
+            // An operator must set something. This node cannot build the
+            // provider a replicated vector configuration names — an unset
+            // environment variable, an egress policy that refuses it, a
+            // profile it does not define — while some other member could,
+            // which makes it a member configured unlike its cluster. Correctly
+            // loud: it is silent until a caller happens to search that
+            // collection on this node, so the first occurrence is the whole
+            // warning an operator gets.
+            Self::Misconfigured => Some(Level::ERROR),
+
+            // A vector index snapshot on this node's disk could not be written
+            // or could not be read back: an I/O error under the snapshot
+            // directory, or a snapshot file whose metadata does not parse. All
+            // of that is this node's own storage, and no request changes it.
+            // The cache is supposed to absorb it — a snapshot that will not
+            // load is discarded and the graph rebuilt — so one reaching a
+            // response means that absorption did not happen, which is a fault
+            // in this node on top of whatever the disk did. Both halves are
+            // the operator's.
+            Self::Snapshot => Some(Level::ERROR),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -202,6 +329,22 @@ pub struct ApiError {
     /// where "elsewhere" is the truth and "no" would tell a client that just
     /// created it to give up.
     pub retry_override: Option<Retry>,
+    /// A log level that differs from the code's default, set where the source
+    /// of the failure is known and the default is wrong for it.
+    ///
+    /// This exists because a per-code level alone cannot split
+    /// `not_implemented`: its two sources *share the code*, and one of them —
+    /// a node that cannot build local embeddings — is an operator-owned
+    /// condition wearing the same wire code as a caller asking for a reserved
+    /// feature. Both sources are explicit constructions, so the level is
+    /// decided where the cause is still in hand and nothing is threaded
+    /// through a call chain to reach it (ADR-136).
+    ///
+    /// `Some(level)` raises or lowers; there is no way to say "and do not log
+    /// this one", because no site has wanted to suppress an occurrence of a
+    /// code that is otherwise logged, and a per-instance silence is the kind
+    /// of thing that hides a fault rather than a nuisance.
+    pub level_override: Option<Level>,
     /// A more specific `error_description` for the `WWW-Authenticate`
     /// challenge than the generic one every 401 carries.
     ///
@@ -228,6 +371,7 @@ impl ApiError {
             message: message.into(),
             retry_after_secs: None,
             retry_override: None,
+            level_override: None,
             challenge_description: None,
         }
     }
@@ -244,9 +388,21 @@ impl ApiError {
         self
     }
 
+    /// The same error logged at a level other than its code's default.
+    pub fn at_level(mut self, level: Level) -> Self {
+        self.level_override = Some(level);
+        self
+    }
+
     /// The retry hint a client will see.
     pub fn retry(&self) -> Retry {
         self.retry_override.unwrap_or_else(|| self.code.retry())
+    }
+
+    /// The level this failure is logged at, or `None` for one that is not
+    /// logged. The instance's own answer wins over its code's default.
+    pub fn log_level(&self) -> Option<Level> {
+        self.level_override.or_else(|| self.code.log_level())
     }
 
     /// Over a rate limit.
@@ -337,8 +493,46 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        if self.status.is_server_error() {
-            error!(code = self.code.as_str(), message = %self.message, "request failed");
+        // The gate is the code's level, not the status class. `is_server_error`
+        // used to stand in for "the operator needs to know", and it is not that
+        // — a 501 for a reserved capability is a documented refusal a caller
+        // asked for, and it wrote an ERROR line on whichever member answered
+        // it. The level a code carries is the property that was actually
+        // wanted, and the one instance where the code is not enough to decide
+        // overrides it at construction (ADR-136).
+        //
+        // The three arms are written out because a `tracing` macro takes a
+        // constant level; there is no `event!(level, …)` that accepts a value.
+        //
+        // The event message is the *same* on all three, deliberately. Varying
+        // it would put a second discriminator beside the level — one nothing
+        // publishes and no test pins — and an operator grepping for one
+        // wording would silently miss the lines written under the other. That
+        // is the shape of trap this whole change removes, so severity is the
+        // level's job alone, and `code` is what says which failure it was.
+        const EVENT: &str = "request failed";
+        if let Some(level) = self.log_level() {
+            let (code, message) = (self.code.as_str(), self.message.as_str());
+            match level {
+                Level::ERROR => error!(code, message, "{EVENT}"),
+                Level::WARN => warn!(code, message, "{EVENT}"),
+                Level::INFO => info!(code, message, "{EVENT}"),
+                // Unreachable: `log_level` maps nothing below INFO, and a code
+                // that wanted to be quieter than INFO wanted `None` instead —
+                // an unlogged failure is stated as one, not hidden behind a
+                // level the default filter happens to drop. Loud in a debug
+                // build, because otherwise a code mapped to `DEBUG` later
+                // would be *documented* as DEBUG and *emitted* at INFO, and
+                // the drift tests would not catch it: they compare the
+                // document to `log_level()`, not to what leaves this match.
+                // `no_code_is_logged_below_info` is the other half of that.
+                // Still emitted rather than dropped, so a release build loses
+                // no line over a mapping mistake.
+                _ => {
+                    debug_assert!(false, "{code} asked for a level below INFO");
+                    info!(code, message, "{EVENT}")
+                }
+            }
         }
         // `retry` rides in the envelope rather than living only in the
         // specification, so a client meeting a code added after it was written
@@ -511,6 +705,178 @@ impl From<AuthError> for ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A writer a test can read back, so an assertion can be made about the
+    /// line a failure produced rather than about the call that produced it.
+    /// The same shape `audit.rs` uses, and for the same reason: the only way
+    /// to check what a subscriber sees is to capture what one formats.
+    #[derive(Clone, Default)]
+    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Captured {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = Captured;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Whatever this error writes to the log on its way to becoming a
+    /// response. Empty for one that is not logged.
+    fn logged(error: ApiError) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(Level::TRACE)
+            .without_time()
+            .with_ansi(false)
+            .finish();
+        // Scoped to this thread, so a parallel test in this binary does not
+        // collect the line and read it as its own.
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = error.into_response();
+        });
+        let out = sink.0.lock().clone();
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    #[test]
+    fn every_code_logs_at_the_level_its_actionability_earns() {
+        // Written out rather than derived, so that changing a level is a
+        // change to this table and not a side effect of editing a match arm.
+        // Each level is a claim about what an alert on it would mean, and
+        // ADR-136 argues them one at a time; this is that argument's fixture.
+        use ErrorCode::*;
+        let expected: [(ErrorCode, Option<Level>); 19] = [
+            // The caller's, every one, and answered in full by the response.
+            (BadRequest, None),
+            (PayloadTooLarge, None),
+            (UnsupportedMediaType, None),
+            (Unauthorized, None),
+            (Forbidden, None),
+            (NotFound, None),
+            (Conflict, None),
+            (DuplicateKey, None),
+            (UniqueViolation, None),
+            (NoVectors, None),
+            (ResumeTokenExpired, None),
+            (RateLimited, None),
+            (Stale, None),
+            // Refused on purpose, with no operator action to take. The
+            // default only: `vectors.rs` raises its own source above this.
+            (NotImplemented, Some(Level::INFO)),
+            // Somebody else's fault, or nobody's; a rise is the finding.
+            (ProviderError, Some(Level::WARN)),
+            (Timeout, Some(Level::WARN)),
+            // This node's own state, and the operator's to fix.
+            (Internal, Some(Level::ERROR)),
+            (Misconfigured, Some(Level::ERROR)),
+            (Snapshot, Some(Level::ERROR)),
+        ];
+        assert_eq!(
+            expected.len(),
+            ErrorCode::ALL.len(),
+            "a new code must be given a level here as well as in the match"
+        );
+        for (code, level) in expected {
+            assert_eq!(code.log_level(), level, "{} logs at the wrong level", code.as_str());
+        }
+    }
+
+    #[test]
+    fn no_code_is_logged_below_info() {
+        // `into_response`'s match has three arms and a fallback, so a code
+        // mapped to `DEBUG` later would be *documented* as DEBUG and
+        // *emitted* at INFO — and `tests/docs.rs` would not notice, because
+        // both of its checks compare the document to `log_level()` rather
+        // than to what actually leaves the match. This is the assertion that
+        // notices. A code that wants to be quieter than INFO wants `None`.
+        //
+        // `tracing` orders `Level` by verbosity, so "below INFO" is `>` and
+        // not `<`. Pinned here rather than assumed, because getting it the
+        // wrong way round would leave a check that passes on everything.
+        assert!(Level::DEBUG > Level::INFO && Level::ERROR < Level::INFO);
+
+        for code in ErrorCode::ALL {
+            if let Some(level) = code.log_level() {
+                assert!(
+                    level <= Level::INFO,
+                    "{} maps to {level}, which is below INFO; use `None` to say it is not \
+                     logged, or raise it — anything else is emitted at a level the document \
+                     does not claim",
+                    code.as_str()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_refusal_the_caller_caused_writes_no_line_at_all() {
+        // The property an operator's alert rule rests on: one client sending
+        // requests this API documents as refusals cannot make a member look
+        // unhealthy. `None` rather than a quiet level, so this holds however
+        // the process was started — an operator who raised the filter to
+        // debug something else does not acquire a log line per bad request.
+        for code in ErrorCode::ALL.into_iter().filter(|c| c.log_level().is_none()) {
+            let error = ApiError::new(StatusCode::BAD_REQUEST, code, "whatever the caller sent");
+            assert_eq!(logged(error), "", "{} must not be logged", code.as_str());
+        }
+    }
+
+    #[test]
+    fn the_log_gate_is_the_codes_level_and_no_longer_the_status_class() {
+        // Before ADR-136 this was `status.is_server_error()`, so all three of
+        // these wrote an identical ERROR line. They are three different
+        // statements about who has to act, and now they read as three.
+        let fault = logged(ApiError::internal("the disk"));
+        assert!(fault.contains("ERROR"), "a genuine fault still pages: {fault}");
+        assert!(fault.contains(r#"code="internal""#), "{fault}");
+
+        let waited = logged(ApiError::timeout(std::time::Duration::from_secs(30)));
+        assert!(waited.contains("WARN"), "an abandoned request is visible, not loud: {waited}");
+        assert!(!waited.contains("ERROR"), "{waited}");
+
+        let reserved: ApiError =
+            CoreError::Unsupported("coordinated unique enforcement".into()).into();
+        let reserved = logged(reserved);
+        assert!(reserved.contains("INFO"), "a documented refusal is not a fault: {reserved}");
+        assert!(!reserved.contains("ERROR"), "{reserved}");
+
+        // And all three carry the same event message, so one query finds every
+        // logged failure and the level is the only thing that separates them.
+        // A wording that varied by level would be a second discriminator
+        // nothing publishes: an operator grepping for one of them would miss
+        // the lines written under the other, silently.
+        for line in [&fault, &waited, &reserved] {
+            assert!(line.contains("request failed"), "the event message must not vary: {line}");
+        }
+    }
+
+    #[test]
+    fn an_instance_can_be_louder_than_its_code() {
+        // The override exists because `not_implemented`'s two sources share
+        // the code and do not share an owner; `vectors.rs` holds the one use
+        // of it, and `vectors.rs`'s own tests check that source end to end.
+        let raised =
+            ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, "no model")
+                .at_level(Level::ERROR);
+        assert_eq!(raised.log_level(), Some(Level::ERROR));
+        assert_eq!(
+            ErrorCode::NotImplemented.log_level(),
+            Some(Level::INFO),
+            "the default is untouched"
+        );
+        assert!(logged(raised).contains("ERROR"));
+    }
 
     #[tokio::test]
     async fn a_body_rejection_keeps_its_status_and_gains_a_stable_code() {

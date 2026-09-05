@@ -73,6 +73,12 @@ pub struct MetricsSnapshot {
     /// divergence none of the three counters above can express, because
     /// nothing about it fails a round.
     pub sync_divergent_collections: u64,
+    /// Peer contacts whose round ran the cross-member divergence check, and
+    /// contacts whose round skipped it because the pull was truncated by the
+    /// batch cap (ADR-135). What makes `sync_divergent_collections` reading 0
+    /// mean *checked and agreed* rather than *not checked*.
+    pub sync_divergence_checks: u64,
+    pub sync_divergence_skips: u64,
     /// Worst runtime scheduling delay since the last scrape, microseconds.
     pub runtime_stall_us: u64,
     pub tls_reloads_ok: u64,
@@ -113,6 +119,12 @@ pub struct Metrics {
     sync_peers_backing_off: AtomicU64,
     sync_ddl_refused: AtomicU64,
     sync_divergent_collections: AtomicU64,
+    /// The gauge above says how many collections disagree; these two say
+    /// whether anything looked (ADR-135). Counters, unlike the gauge beside
+    /// them, because "has the check run recently" is a question about a
+    /// window of time and a level cannot answer it.
+    sync_divergence_checks: AtomicU64,
+    sync_divergence_skips: AtomicU64,
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
@@ -161,6 +173,8 @@ impl Default for Metrics {
             sync_peers_backing_off: AtomicU64::new(0),
             sync_ddl_refused: AtomicU64::new(0),
             sync_divergent_collections: AtomicU64::new(0),
+            sync_divergence_checks: AtomicU64::new(0),
+            sync_divergence_skips: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
@@ -314,17 +328,34 @@ impl Metrics {
     /// 0 against the *same* healthy reading is another, and it is the one
     /// none of the other three can express, because nothing about it fails a
     /// round.
-    pub fn record_sync_round(
-        &self,
-        failed: u64,
-        backing_off: u64,
-        ddl_refused: u64,
-        divergent_collections: u64,
-    ) {
-        self.sync_failures.fetch_add(failed, Ordering::Relaxed);
-        self.sync_peers_backing_off.store(backing_off, Ordering::Relaxed);
-        self.sync_ddl_refused.fetch_add(ddl_refused, Ordering::Relaxed);
-        self.sync_divergent_collections.store(divergent_collections, Ordering::Relaxed);
+    ///
+    /// `divergence_checks` and `divergence_skips` qualify the fourth rather
+    /// than adding a fifth signal (ADR-135): a divergent count of 0 is
+    /// evidence of agreement only while checks are still being made, and the
+    /// skip count is why they are not. Both accumulate. Pushed on this same
+    /// call rather than through a second one from the same hook, so a tick
+    /// cannot land half of what it saw.
+    ///
+    /// **The report is taken whole, not field by field.** Six of its numbers
+    /// now reach `/metrics`, all of them `usize`, four of them counting
+    /// different things about the same tick — and the only call site is a
+    /// closure in `kimmyd::spawn_cluster` that no test covers, so a pair of
+    /// positional arguments swapped there would compile, pass every gate, and
+    /// silently report one series' value under another's name for the life of
+    /// the release. Passing the struct removes the argument order from the
+    /// problem entirely: the fields are named at the point they are read, and
+    /// a field added to [`kimmy_cluster::RoundReport`] cannot quietly take
+    /// another's place. The `usize` to `u64` widening happens here for the
+    /// same reason — six casts at a call site are six more chances to write
+    /// the wrong one.
+    pub fn record_sync_round(&self, round: &kimmy_cluster::RoundReport) {
+        self.sync_failures.fetch_add(round.failed as u64, Ordering::Relaxed);
+        self.sync_peers_backing_off.store(round.backing_off as u64, Ordering::Relaxed);
+        self.sync_ddl_refused.fetch_add(round.ddl_refused as u64, Ordering::Relaxed);
+        self.sync_divergent_collections
+            .store(round.divergent_collections as u64, Ordering::Relaxed);
+        self.sync_divergence_checks.fetch_add(round.divergence_checks as u64, Ordering::Relaxed);
+        self.sync_divergence_skips.fetch_add(round.divergence_skips as u64, Ordering::Relaxed);
     }
 
     /// How many peers this node's SWIM instance currently considers alive.
@@ -437,6 +468,8 @@ impl Metrics {
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
+            sync_divergence_checks: self.get(&self.sync_divergence_checks),
+            sync_divergence_skips: self.get(&self.sync_divergence_skips),
             runtime_stall_us: self.get(&self.runtime_stall_us),
             tls_reloads_ok: self.get(&self.tls_reloads_ok),
             tls_reloads_failed: self.get(&self.tls_reloads_failed),
@@ -562,6 +595,10 @@ impl Metrics {
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
+             # HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and contacts whose round completed without running it because the pull was truncated by the batch cap. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed outright is counted in kimmy_sync_failures_total and in neither of these.\n\
+             # TYPE kimmy_sync_divergence_checks_total counter\n\
+             kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {sync_div_ran}\n\
+             kimmy_sync_divergence_checks_total{{outcome=\"skipped\"}} {sync_div_skipped}\n\
              # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.\n\
              # TYPE kimmy_tls_reloads_total counter\n\
              kimmy_tls_reloads_total{{outcome=\"ok\"}} {tls_ok}\n\
@@ -624,6 +661,8 @@ impl Metrics {
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
             sync_divergent = self.get(&self.sync_divergent_collections),
+            sync_div_ran = self.get(&self.sync_divergence_checks),
+            sync_div_skipped = self.get(&self.sync_divergence_skips),
             tls_ok = self.get(&self.tls_reloads_ok),
             tls_fail = self.get(&self.tls_reloads_failed),
             embed_docs = embed_docs,
@@ -711,8 +750,25 @@ mod tests {
         // Two ticks: the counters accumulate, the backoff level and the
         // divergence count are each replaced. A render that printed the
         // first tick's level, or a level that accumulated, would not match.
-        m.record_sync_round(20, 99, 21, 12);
-        m.record_sync_round(3, 24, 4, 5);
+        // Every field written out rather than `..Default::default()`: a
+        // field added to the report must break this and be given a distinct
+        // value here, not default silently into the golden below.
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            failed: 20,
+            backing_off: 99,
+            ddl_refused: 21,
+            divergent_collections: 12,
+            divergence_checks: 30,
+            divergence_skips: 33,
+        });
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            failed: 3,
+            backing_off: 24,
+            ddl_refused: 4,
+            divergent_collections: 5,
+            divergence_checks: 2,
+            divergence_skips: 1,
+        });
         for _ in 0..20 {
             m.record_tls_reload(true);
         }
@@ -814,6 +870,10 @@ kimmy_sync_ddl_refused_total 25
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
+# HELP kimmy_sync_divergence_checks_total Contacts with a peer in which the cross-member divergence check above ran, and contacts whose round completed without running it because the pull was truncated by the batch cap. kimmy_sync_divergent_collections reading 0 is evidence that the peers agree only while ran is rising; ran flat while skipped rises means nothing looked, which a bare 0 cannot say. A round that failed outright is counted in kimmy_sync_failures_total and in neither of these.
+# TYPE kimmy_sync_divergence_checks_total counter
+kimmy_sync_divergence_checks_total{outcome=\"ran\"} 32
+kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 34
 # HELP kimmy_tls_reloads_total Certificate reload attempts by outcome. A failed reload leaves the certificate already in use serving.
 # TYPE kimmy_tls_reloads_total counter
 kimmy_tls_reloads_total{outcome=\"ok\"} 20
@@ -917,6 +977,14 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
+        expect(&format!(
+            "kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {}\n",
+            s.sync_divergence_checks
+        ));
+        expect(&format!(
+            "kimmy_sync_divergence_checks_total{{outcome=\"skipped\"}} {}\n",
+            s.sync_divergence_skips
+        ));
         expect(&format!("kimmy_tls_reloads_total{{outcome=\"ok\"}} {}\n", s.tls_reloads_ok));
         expect(&format!(
             "kimmy_tls_reloads_total{{outcome=\"failed\"}} {}\n",
@@ -987,9 +1055,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 40 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // 42 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 55, "expected one sample per series: {out}");
+        assert_eq!(samples, 57, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -1074,8 +1142,22 @@ kimmy_request_duration_seconds_count 3
         let m = Metrics::default();
         m.set_replication_lag_secs(7);
         m.set_cluster_members(2);
-        m.record_sync_round(1, 1, 0, 0);
-        m.record_sync_round(2, 0, 3, 6);
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            failed: 1,
+            backing_off: 1,
+            ddl_refused: 0,
+            divergent_collections: 0,
+            divergence_checks: 4,
+            divergence_skips: 0,
+        });
+        m.record_sync_round(&kimmy_cluster::RoundReport {
+            failed: 2,
+            backing_off: 0,
+            ddl_refused: 3,
+            divergent_collections: 6,
+            divergence_checks: 0,
+            divergence_skips: 5,
+        });
         m.record_tls_reload(true);
         m.record_tls_reload(false);
         m.record_tls_reload(false);
@@ -1094,6 +1176,17 @@ kimmy_request_duration_seconds_count 3
         assert!(
             out.contains("kimmy_sync_divergent_collections 6"),
             "a level, not accumulated: {out}"
+        );
+        // And the two counters that say whether that level was arrived at by
+        // looking (ADR-135). Counters, so they accumulate across the ticks
+        // the gauge above replaces: four contacts checked, five skipped.
+        assert!(
+            out.contains("kimmy_sync_divergence_checks_total{outcome=\"ran\"} 4"),
+            "a counter, not a level: {out}"
+        );
+        assert!(
+            out.contains("kimmy_sync_divergence_checks_total{outcome=\"skipped\"} 5"),
+            "a counter, not a level: {out}"
         );
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"ok\"} 1"), "{out}");
         assert!(out.contains("kimmy_tls_reloads_total{outcome=\"failed\"} 2"), "{out}");
