@@ -26,7 +26,7 @@ use kimmy_auth::AuthError;
 use kimmy_core::Error as CoreError;
 use kimmy_storage::StorageError;
 use serde_json::json;
-use tracing::{Level, debug, error, info, trace, warn};
+use tracing::{Level, error, info, warn};
 
 /// Every code the API can return, and nothing else.
 ///
@@ -517,8 +517,21 @@ impl IntoResponse for ApiError {
                 Level::ERROR => error!(code, message, "{EVENT}"),
                 Level::WARN => warn!(code, message, "{EVENT}"),
                 Level::INFO => info!(code, message, "{EVENT}"),
-                Level::DEBUG => debug!(code, message, "{EVENT}"),
-                Level::TRACE => trace!(code, message, "{EVENT}"),
+                // Unreachable: `log_level` maps nothing below INFO, and a code
+                // that wanted to be quieter than INFO wanted `None` instead —
+                // an unlogged failure is stated as one, not hidden behind a
+                // level the default filter happens to drop. Loud in a debug
+                // build, because otherwise a code mapped to `DEBUG` later
+                // would be *documented* as DEBUG and *emitted* at INFO, and
+                // the drift tests would not catch it: they compare the
+                // document to `log_level()`, not to what leaves this match.
+                // `no_code_is_logged_below_info` is the other half of that.
+                // Still emitted rather than dropped, so a release build loses
+                // no line over a mapping mistake.
+                _ => {
+                    debug_assert!(false, "{code} asked for a level below INFO");
+                    info!(code, message, "{EVENT}")
+                }
             }
         }
         // `retry` rides in the envelope rather than living only in the
@@ -863,20 +876,6 @@ mod tests {
             "the default is untouched"
         );
         assert!(logged(raised).contains("ERROR"));
-    }
-
-    #[test]
-    fn an_instance_can_be_quieter_than_its_code() {
-        // An override can also lower a level to DEBUG or TRACE without being
-        // coerced up to INFO in release builds.
-        let lowered =
-            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, ErrorCode::Internal, "low severity")
-                .at_level(Level::DEBUG);
-        assert_eq!(lowered.log_level(), Some(Level::DEBUG));
-        assert_eq!(ErrorCode::Internal.log_level(), Some(Level::ERROR), "the default is untouched");
-        let output = logged(lowered);
-        assert!(output.contains("DEBUG"), "must log at DEBUG: {output}");
-        assert!(!output.contains("INFO"), "must not be promoted to INFO: {output}");
     }
 
     #[tokio::test]
