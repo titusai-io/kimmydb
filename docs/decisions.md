@@ -9391,6 +9391,15 @@ remain the boundary this ADR declines to move.
 
 ## ADR-136 — What a failed request logs is a property of its error code, and the property is actionability rather than HTTP class
 
+> **Amended by [ADR-137](#adr-137--the-log-level-a-failure-can-ask-for-is-a-three-variant-type-not-tracinglevel).**
+> Not superseded: every level below, and the reasoning for each, stands. What
+> changed is the type they are written in. `log_level()` returns
+> `Option<LogLevel>` and `level_override` holds one, where `LogLevel` is
+> `Error | Warn | Info` — so what *"`None`, not a level the subscriber filters
+> out"* below argues for is now held by the type: "quieter than `INFO`" is not
+> a thing that can be written down, rather than a thing an assertion catches
+> once it has been. Read `Level` below as `LogLevel`; `at_level` takes one too.
+
 **Decision.** `ErrorCode` gains `log_level() -> Option<Level>`, a third
 exhaustive match beside `as_str()` and `retry()`, and
 `impl IntoResponse for ApiError` logs at that level instead of gating on
