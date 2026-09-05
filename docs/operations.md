@@ -695,10 +695,26 @@ each round, the same bound anti-entropy itself is subject to). A collection
 this node holds that a peer does not — the reverse direction is the peer's
 own discovery to make when its own loop pulls from this node, so a collection
 created moments ago and not yet replicated outward is never flagged from this
-side either. And a vector index's own shadow storage: excluded from both
-halves of the comparison because its lifecycle deliberately trails the
-collection it serves, so a genuine divergence there is as invisible to this
-check as it is to the collection listing routes.
+side either. And a vector index's own shadow storage **while the collection it
+serves is present on the same node**: excluded from both halves of the
+comparison because its lifecycle deliberately trails that collection — only
+the owning member builds one — so a divergence confined to a shadow that still
+has its base collection is as invisible to this check as it is to the
+collection listing routes.
+
+An **orphaned** shadow, whose base collection this node does not hold, *is*
+compared ([ADR-138](decisions.md)). That is not lifecycle lag — nothing builds
+a shadow for a collection that is not there — and excluding it made a whole
+database present on one member and absent on another invisible, because a
+database left holding nothing but a shadow was filtered out on both sides of
+the comparison. The state that found it: a `DELETE /v1/db/{db}` sent to every
+member at once, where each peer's local drop raced the owner's still-replicating
+shadow, and the database came back on the peers holding only the shadow. Measured
+before the fix on a live three-member cluster: over **60 seconds** of a real
+one-sided difference with this gauge at `0`, `{ran}` climbing on every member
+and `{skipped}` never leaving `0` — the reading that is supposed to mean
+*checked and agreed*. **Issue a database drop once and let it replicate**; see
+the drop contract in [HTTP API](http-api.md).
 
 **This is observability, not repair.** The check reports a divergence; it
 never resolves one. Recovering a member found to hold less than its peers is
