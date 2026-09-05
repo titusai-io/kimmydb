@@ -10,6 +10,26 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **Documentation only, no behaviour change:** ADR-123 now carries a forward
+  marker to ADR-132. ADR-132 withdrew one of ADR-123's promises — that two
+  members creating one index name with different definitions each keep their
+  own and the refusal is counted in `kimmy_sync_ddl_refused_total` — for the
+  case where both definitions carry a creation stamp, and said so in its own
+  record; ADR-123 said nothing, so a reader landing there read a promise that
+  is no longer true for that case with nothing pointing forward. The marker
+  sits at the head of ADR-123 and beside the paragraph it amends, and states
+  the scope in both places: the counter does not rise where **both**
+  definitions carry a stamp, that case settles on the later stamp, and
+  ADR-123 holds exactly as written where either carries none. The 0.22.0
+  entry below, which stated the new rule without that scope, is corrected in
+  place for the same reason: on an upgraded cluster every index that already
+  exists is unstamped, so a reader of that entry alone had the wrong model for
+  the whole population they were about to roll.
+
 ## 0.22.0 - 2026-09-04
 
 ### Added
@@ -256,18 +276,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   converge instead of staying divergent.** ADR-123 left both standing, each
   member keeping its own and counting the refusal; the 0.21.0 round watched two
   collections sit that way, with `kimmy_sync_ddl_refused_total` at 9 / 15 / 9
-  and no path back to one schema. The later creation stamp now wins on every
-  member, which is how two concurrent writes to one document already settle.
-  The member whose definition loses logs a warning naming the index and what
-  differed, and rebuilds the name under the winner.
+  and no path back to one schema. **Where both definitions carry a creation
+  stamp**, the later of the two now wins on every member, which is how two
+  concurrent writes to one document already settle. The member whose
+  definition loses logs a warning naming the index and what differed, and
+  rebuilds the name under the winner. Where either definition carries none —
+  and on an upgraded cluster **every index that already exists carries
+  none** — the 0.21.0 behaviour stands unchanged; the creation-stamp entry
+  under *Changed* above says what that means and how to settle such a name.
 
-  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case**.
-  It is unchanged for the case that still needs an operator — a definition a
-  member's own documents cannot be built under — and, where the winning
-  definition cannot be built on the receiving member, that member keeps the
-  index it already had rather than ending with neither. Creating a conflicting
-  index through the API is unaffected: a client is still refused `409`, naming
-  what differs. ADR-132.
+  `kimmy_sync_ddl_refused_total` therefore **no longer rises for that case** —
+  the stamped one. It is unchanged for the case that still needs an operator —
+  a definition a member's own documents cannot be built under — and, where the
+  winning definition cannot be built on the receiving member, that member keeps
+  the index it already had rather than ending with neither. Creating a
+  conflicting index through the API is unaffected: a client is still refused
+  `409`, naming what differs. ADR-132.
 
 ## 0.21.0 - 2026-09-03
 

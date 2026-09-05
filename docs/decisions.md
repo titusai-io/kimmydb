@@ -6941,6 +6941,22 @@ where the span gave 300.
 
 ## ADR-123 — A dropped index leaves a tombstone, and a schema change a replica cannot apply is skipped, counted and exported
 
+> **Amended by [ADR-132](#adr-132--an-index-carries-the-stamp-of-its-creation-and-a-drop-and-a-rival-are-both-settled-by-it).**
+> Not superseded: two claims below are withdrawn, and each only where a
+> creation stamp is there to decide it. Where **both** definitions carry one,
+> two members that create one index name with different definitions now settle
+> on the later stamp instead of each keeping its own, and
+> `kimmy_sync_ddl_refused_total` does not rise for that case. And a replayed
+> drop older than the index standing under its name now records its tombstone
+> and leaves that index alone, rather than removing one nobody dropped. Where
+> a definition carries **no** stamp this record still holds exactly as
+> written — but an index is not fixed that way: one holding no stamp adopts
+> the stamp of a peer holding the same definition *with* one, on the next
+> round and with no operator action. Everything else it decides is unchanged:
+> the tombstone, the refusal class and its skip-and-count behaviour, the rule
+> that every other error fails the round, the snapshot route's classification,
+> the replicated unique backfill, and the three counters.
+
 **Decision.** Three things, one finding. *First*, dropping an index records a
 tombstone: `indexes_dropped`, keyed by collection id and index id, holding the
 drop's originating stamp, kept for `tombstone_retention_secs` beside the
@@ -7086,6 +7102,15 @@ explicitly; the pair does not converge on its own. Accepted for the same
 reason: the fix is the creation stamp, and the case needs a drop from before
 a recreation to arrive after it, which is a re-served window across a
 recreation on the same name.
+
+**Amended 2026-09-05 — the creation stamp exists, and both halves of this
+paragraph are settled by it.** ADR-132 put `created` on `IndexMeta`, which is
+the fact this paragraph says the fix needs, and with it the "newer definition
+wins" rule declined above: where both definitions carry a stamp, the later one
+stands on every member, the loser is rebuilt under it, and nothing is counted.
+The same stamp is what a replayed drop is now compared against, so it leaves a
+newer index of the same name alone. What is written above holds only where a
+definition carries no stamp.
 
 **Why a counter, not a zero lag, is the failure signal.** ADR-122 stands: an
 unreachable cluster has *unknown* lag, and `on_lag` is not called for a tick
