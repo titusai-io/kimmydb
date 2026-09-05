@@ -16,10 +16,12 @@
 //!
 //! # Blocking stages and why there is a hard cap
 //!
-//! `$sort` and `$group` cannot emit anything until they have consumed
-//! everything: a sort has no first element until the last is seen, and a group
-//! has no totals until the last member arrives. `$unwind` and `$lookup` can
-//! *grow* their input rather than shrink it.
+//! `$sort`, `$group` and `$count` cannot emit anything until they have consumed
+//! everything: a sort has no first element until the last is seen, a group has
+//! no totals until the last member arrives, and a count has no number until the
+//! last document has gone past. `$count` emits one document whatever it
+//! consumed. `$unwind` and `$lookup` can *grow* their input rather than shrink
+//! it.
 //!
 //! `find` is bounded by `MAX_LIMIT`, but a pipeline's input is a whole
 //! collection, so an unbounded pipeline is a way for one request to occupy all
@@ -1151,6 +1153,64 @@ mod tests {
         let out =
             run(vec![doc! {"$match": {"city": "London"}}, doc! {"$count": "n"}], sample()).unwrap();
         assert_eq!(out, vec![doc! { "n": 2i64 }]);
+    }
+
+    #[test]
+    fn count_over_an_empty_stream_is_one_document_holding_zero() {
+        // The count of nothing is defined, and it is 0. Emitting no document
+        // would make every caller spell a defensive read for a value the stage
+        // always knows. Four differently-shaped ways of emptying the stream —
+        // a filter matching nothing, a fan-out dropping every row, a `$skip`
+        // past the end, an explicit `$limit: 0` — and one answer for all.
+
+        // The unwind case needs pinning beyond "the prefix came out empty":
+        // if `_id: 3` ever left `sample()`, `$match` would select nothing,
+        // `$unwind` would never run, the prefix would still be empty, and the
+        // case would have silently degenerated into a second copy of the
+        // filter one below. So assert one document reaches `$unwind`, and that
+        // its `tags` is the empty array that makes the fan-out drop it.
+        let reaches_unwind = run(vec![doc! {"$match": {"_id": 3}}], sample()).unwrap();
+        assert_eq!(reaches_unwind.len(), 1, "$unwind must do the emptying: {reaches_unwind:?}");
+        assert!(reaches_unwind[0].get_array("tags").unwrap().is_empty(), "{reaches_unwind:?}");
+
+        for prefix in [
+            vec![doc! {"$match": {"city": "Berlin"}}],
+            vec![doc! {"$match": {"_id": 3}}, doc! {"$unwind": "$tags"}],
+            vec![doc! {"$skip": 999}],
+            vec![doc! {"$limit": 0}],
+        ] {
+            // Each prefix must really empty the stream, or the count below
+            // would be the count of a non-empty one — this catches `$skip:
+            // 999` becoming reachable, or `"Berlin"` starting to match.
+            let emptied = run(prefix.clone(), sample()).unwrap();
+            assert!(emptied.is_empty(), "{prefix:?} left {emptied:?}");
+
+            let mut pipeline = prefix.clone();
+            pipeline.push(doc! {"$count": "n"});
+            let out = run(pipeline, sample()).unwrap();
+            assert_eq!(out, vec![doc! { "n": 0i64 }], "{prefix:?}");
+        }
+    }
+
+    #[test]
+    fn group_over_an_empty_stream_produces_no_groups_at_all() {
+        // One row per distinct key, and an empty stream has no keys — `_id:
+        // null` included, which is the one a caller expects to be exempt. Not
+        // an inconsistency with `$count` above: it is the same rule answering
+        // a different question, so a pipeline ending in `$group` can
+        // legitimately answer nothing.
+        let emptied = run(vec![doc! {"$match": {"city": "Berlin"}}], sample()).unwrap();
+        assert!(emptied.is_empty(), "the filter must select nothing: {emptied:?}");
+
+        let out = run(
+            vec![
+                doc! {"$match": {"city": "Berlin"}},
+                doc! {"$group": {"_id": null, "n": {"$sum": 1}}},
+            ],
+            sample(),
+        )
+        .unwrap();
+        assert!(out.is_empty(), "{out:?}");
     }
 
     #[test]

@@ -40,7 +40,34 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   asks that peer what it holds: every collection id, and one collection's
   live document count, chosen in turn so no round pays for more than one
   collection's scan. `kimmy_sync_divergent_collections`, a gauge, moves once
-  a collection is found disagreeing twice running: two consecutive contacts
+
+- **The aggregation reference now says what `$count` and `$group` do over an
+  empty input stream.** Nothing changed in either stage; what was missing was
+  any way to derive their answers from the documentation, and they differ.
+  `$count` computes one number over the whole stream and that number is
+  defined when the stream holds nothing, so it emits **one document holding
+  `0`** however the stream came to be empty — a `$match` that selected
+  nothing, an `$unwind` that dropped every row, a `$skip` past the end, an
+  explicit `$limit: 0`, all answer `[{"n": 0}]`. `$group` over that same
+  stream emits **nothing at all**, `{"_id": null}` included, because it
+  produces one row per distinct key and an empty stream has no keys. The two
+  are the same rule asked different questions, but the difference decides the
+  read: a total taken from `$count` is always present, where a pipeline
+  ending in `$group` can legitimately answer `[]` and `{"_id": null}` is not
+  a promise of one row. `docs/aggregation.md` states both, in the stage table
+  and beside the accumulators' own "nothing to work on" case, which is a
+  different one — a group that exists and had nothing usable in it, not the
+  absence of any group. Both behaviours are now held by tests.
+
+- **`$count` is documented as blocking, which it always was.** The
+  aggregation reference defined blocking as a stage that cannot emit until it
+  has consumed everything, then listed only `$group` and `$sort` — `$count`
+  meets the same definition and was named nowhere. The term was also used in
+  the stage table and defined 550 lines below it with no link between the
+  two; the `$sort`, `$group` and `$count` rows now link to the definition.
+  Nothing about the memory ceiling changes: a pipeline's input is materialised
+  before the first stage and every stage works on that whole set.
+
   with the same peer for a collection-existence finding, two consecutive
   probes of that specific collection against that peer for a document-count
   finding, since only one collection is probed per contact and those are not

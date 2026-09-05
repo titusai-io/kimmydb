@@ -25,11 +25,11 @@ can answer it, which only a *leading* `$match` gets (see
 | `$project` | The same projection language as `find`, **plus computed fields** |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
-| `$sort` | The same sort language. Blocking |
+| `$sort` | The same sort language. [Blocking](#the-memory-limit) |
 | `$skip`, `$limit` | Non-negative whole numbers |
 | `$unwind` | One output document per array element. Below |
-| `$group` | Blocking. Accumulators below |
-| `$count` | `{$count: "name"}` — a document holding the count |
+| `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
+| `$count` | `{$count: "name"}` — a document holding the count, **always**: over an empty input it is one document holding `0`, not no document. [Blocking](#the-memory-limit) |
 | `$lookup` | Join another collection, by one key or by a sub-pipeline. **Authorized separately** |
 
 **Stage operands with a fixed key set are closed; field-path maps stay
@@ -41,6 +41,24 @@ every key in either is a document field name the caller chose, not vocabulary
 this database defines, so there is no fixed list to check a key against —
 closing them would refuse ordinary pipelines rather than typos. See
 [ADR-129](decisions.md).
+
+**An empty input stream is not an empty answer, and `$count` and `$group`
+answer it differently.** `$count` computes one number over the whole stream,
+and that number is defined when the stream holds nothing: it is `0`. So a
+`$count` over an empty input emits **one document holding `0`**, never no
+document, and it does not matter how the stream came to be empty — a `$match`
+that selected nothing, an `$unwind` that dropped every row, a `$skip` past the
+end, an explicit `$limit: 0`. All of them answer `[{"n": 0}]`. `$group` over
+that same stream emits **nothing at all**, `{"_id": null}` included, because it
+produces one row per distinct key and an empty stream has no keys to produce a
+row for.
+
+Neither is a special case — each stage is answering its own question about a
+stream that happens to hold nothing — but the difference decides how the answer
+is read. `[0]["n"]` after a `$count` is always there, so a total needs no
+defensive read; `[0]` after a `$group` may not be, so a pipeline ending in
+`$group` can legitimately answer `[]`, and `{"_id": null}` is not a promise of
+one row.
 
 ### `$unwind`
 
@@ -149,6 +167,11 @@ integers, strings, arrays and booleans is a boolean — the highest rank in the
 order, not the largest number. Neither is a bug to work around; both are
 reasons to `$match` the type you mean first, or to `$group` after a
 `{"$type": …}` filter.
+
+Both of those are about a group that **exists** and had nothing usable in it.
+A `$group` whose whole input is empty has no group to report at all — not a
+bucket holding `0`, no bucket — while a `$count` over the same input still
+answers one document holding `0`. See [Stages](#stages).
 
 `$sum` **stays integral** while every value it has seen is an integer,
 promoting to a double only when a double arrives or an `i64` sum would
@@ -557,10 +580,15 @@ planner reading the same indexes, so the answer is the same.
 
 ## The memory limit
 
-`$group` and `$sort` are **blocking**: neither can emit anything until it has
-consumed everything. `$unwind` and `$lookup` can *grow* their input. `find` is
-bounded by `MAX_LIMIT`, but a pipeline's input is a whole collection — so
-without a ceiling one request could take all the memory on a node.
+`$group`, `$sort` and `$count` are **blocking**: none of them can emit anything
+until it has consumed everything — a sort has no first element until the last
+is seen, a group has no totals until the last member arrives, and a count has
+no number until the last document has gone past. All three work on the whole
+materialised input, and `$count` emits a single document however large that
+input is. `$unwind` and `$lookup` can *grow* their input, which is the other
+way a stage can cost more than it was given. `find` is bounded by `MAX_LIMIT`,
+but a pipeline's input is a whole collection — so without a ceiling one request
+could take all the memory on a node.
 
 Every stage checks its output against a cap of **100,000 documents**, and
 exceeding it is an error naming the stage. **The ceiling applies to what the
