@@ -396,6 +396,53 @@ RUST_LOG=info,kimmy_storage=debug kimmyd …
 KIMMY_LOG_FORMAT=json kimmyd …          # one JSON object per line
 ```
 
+#### What a failed request logs, and what to alert on
+
+**Alert on `ERROR`.** That rule is meant to be correct as written, on a node
+nobody has tuned, and the levels below are chosen so that it is: an `ERROR` line
+is something *you* have to fix, and a client cannot produce one by sending a
+request this API documents as a refusal.
+
+The level is a property of the **error code**, decided by one question — is the
+fix in the operator's hands or the caller's? — and not by the HTTP status
+([ADR-136](decisions.md)). Those are different cuts: a `501` for a capability
+that is reserved and unbuilt is a `5xx` no operator can act on, and a `500` for
+a provider this member cannot build is one only an operator can.
+
+| `error` | Level | What it means for an alert |
+|---|---|---|
+| `internal` | `ERROR` | A fault on this node — storage failed, or something that cannot happen did. Nothing a caller sends causes it. **Page** |
+| `misconfigured` | `ERROR` | This member cannot build the embedding provider a stored vector configuration names, while some other member could: an unset environment variable, an egress policy that refuses it, a profile it does not define. It is silent until somebody searches that collection *on this member*, so the first line is the whole warning you get. **Page** |
+| `snapshot` | `ERROR` | A vector index snapshot on this node's disk could not be written or read back. The cache is supposed to absorb this by discarding and rebuilding, so one reaching a response means that did not happen — a fault on top of whatever the disk did. **Page** |
+| `timeout` | `WARN` | The request was abandoned at `server.request_timeout_secs` while waiting for the rest of its body or for an embedding provider. One is usually a slow client; a *rise* is worth looking at, and the level does not distinguish the two causes because the deadline is enforced above the code that knows which one it was |
+| `provider_error` | `WARN` | An upstream embedding provider failed. Nobody needs to act on one; a rise is a quota, a revoked key, or a provider that is down, and those are yours. Pair it with `kimmy_embed_provider_errors_total{kind}`, which says at which layer |
+| `not_implemented` | `INFO` | A caller asked for a capability that is reserved and does not exist yet. There is no operator action — no configuration turns it on — so it is recorded and nothing more. **One exception, which logs `ERROR`**: a node that cannot build *local embeddings* returns this same code, and that is a member provisioned unlike its cluster; every search of that collection landing here fails, and behind a load balancer the other members hide it |
+
+**Every other code writes no line at all**, at any level, however `log.level` or
+`RUST_LOG` is set. These are the refusals the caller caused and the caller can
+already read in full in the response body, so logging them would be an access
+log of nothing but the failures — half a record, and one this server has never
+kept. They are `bad_request`, `payload_too_large`, `unsupported_media_type`,
+`unauthorized`, `forbidden`, `not_found`, `conflict`, `duplicate_key`,
+`unique_violation`, `no_vectors`, `resume_token_expired`, `rate_limited` and
+`stale`. Count them with `kimmy_responses_total{class="4xx"}`, read the
+authorization decisions among them in [the audit log](#the-audit-log), and see
+[HTTP API](http-api.md#errors) for what each one means to the client.
+
+**Every line here says `request failed`, at all three levels**, with the code in
+a `code` field and the client-facing text in a `message` field. The wording does
+not soften at `INFO`: a message that varied by level would be a second thing to
+filter on beside the level itself, and a query written for one wording would
+miss the lines written under the other. Filter on the level, and read `code` for
+which failure it was.
+
+That list and the levels above are not maintained by hand beside the server: the
+levels live on the error-code enum, and
+`crates/kimmy-api/tests/docs.rs` fails the build if this section and that enum
+disagree — a code given a level and left out here, or listed here as silent
+after it started logging, is a test failure rather than an operator finding out
+from a page.
+
 ### Health
 
 | Endpoint | Meaning | Probe |

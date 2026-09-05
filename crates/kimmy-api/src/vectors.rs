@@ -773,6 +773,9 @@ async fn resolve_query_vector(
     };
     let mut vectors = provider.embed(std::slice::from_ref(&text)).await.map_err(vector_error)?;
     vectors.pop().ok_or_else(|| {
+        // The upstream's fault like every other `provider_error` — a
+        // well-formed answer with the vector missing from it — so it takes
+        // that code's level unchanged, and no override belongs here.
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             ErrorCode::ProviderError,
@@ -933,8 +936,20 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
     use kimmy_vector::VectorError as V;
     match e {
         V::NoProvider | V::DimensionMismatch { .. } => ApiError::bad_request(e.to_string()),
+        // The one place a `not_implemented` is the operator's, so the one
+        // place that overrides the code's level (ADR-136). `not_implemented`
+        // defaults to `INFO` for its commoner source — a caller asking for a
+        // reserved capability, which no operator can grant — but a node that
+        // cannot build local embeddings the rest of the cluster is configured
+        // to use is a cluster built inconsistently: some member accepted this
+        // vector configuration, and this one was compiled or provisioned
+        // without what it needs to honour it. Every search of that collection
+        // that lands here fails, and it is invisible behind a load balancer
+        // because the other members answer. That should page, so it is raised
+        // to `ERROR` here rather than the code being lowered around it.
         V::LocalUnavailable | V::ModelUnavailable { .. } => {
             ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, e.to_string())
+                .at_level(tracing::Level::ERROR)
         }
         // A stored configuration this node's policy refuses, or a profile it
         // does not define, is the deployment's to fix, not the caller's: the
@@ -1349,5 +1364,46 @@ mod tests {
         // contributes; only switching *both* off is meaningless.
         assert!(fusion_controls(&request(Some((1.0, 0.0)), None)).is_ok());
         assert!(fusion_controls(&request(Some((0.0, 1.0)), None)).is_ok());
+    }
+
+    #[test]
+    fn the_two_sources_of_not_implemented_do_not_log_at_the_same_level() {
+        // This is the whole reason the level is a per-instance override and
+        // not only a per-code property (ADR-136): both of these answer `501
+        // not_implemented`, a client cannot tell them apart and should not
+        // have to, and they have opposite owners. A caller asking for a
+        // reserved capability is nobody's problem to fix. A node that cannot
+        // build the embeddings its cluster's stored configuration calls for
+        // is a member provisioned unlike its peers — every search of that
+        // collection that lands here fails, and behind a load balancer that
+        // is invisible, which is exactly the shape of fault that must page.
+        //
+        // Reachable from here and only from here: one source is `error.rs`'s
+        // `CoreError` mapping, the other is this module's `vector_error`, and
+        // this is the one test module that can see both.
+        let reserved: ApiError =
+            kimmy_core::Error::Unsupported("coordinated unique enforcement".into()).into();
+        let no_model = vector_error(kimmy_vector::VectorError::LocalUnavailable);
+
+        assert_eq!(reserved.code, ErrorCode::NotImplemented);
+        assert_eq!(no_model.code, ErrorCode::NotImplemented);
+        assert_eq!(reserved.status, no_model.status, "the wire answer is deliberately the same");
+
+        assert_eq!(reserved.log_level(), Some(tracing::Level::INFO));
+        assert_eq!(no_model.log_level(), Some(tracing::Level::ERROR));
+
+        // And the unbuilt-model case is raised at construction rather than
+        // the code being lowered around it, so a third source added later
+        // inherits the documented refusal's level and has to argue its way up.
+        assert!(reserved.level_override.is_none());
+        assert_eq!(no_model.level_override, Some(tracing::Level::ERROR));
+
+        // The other arm of the same match, which is the same condition
+        // reported by a provider that names a model it cannot load.
+        let unknown_model = vector_error(kimmy_vector::VectorError::ModelUnavailable {
+            model: "a-model-this-build-does-not-have".into(),
+            detail: "not present on this node".into(),
+        });
+        assert_eq!(unknown_model.log_level(), Some(tracing::Level::ERROR));
     }
 }

@@ -12,6 +12,35 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **A node that cannot serve local embeddings now says so at `ERROR`.** It
+  answers `501 not_implemented`, the same code as a caller asking for a
+  reserved capability, so it used to be indistinguishable in the log from
+  somebody else's request. It is not the same thing: it is a member
+  provisioned unlike the rest of its cluster, every search of that collection
+  landing on it fails, and behind a load balancer the other members hide it.
+  It is raised above its code's level at the point it is constructed, so the
+  lowering below does not bury it. ADR-136.
+
+- **A failed request is logged at a level chosen by who has to fix it, not by
+  its HTTP status.** Every 5xx used to write an `ERROR` line, which meant one
+  client sending requests the reference documents as refusals could make a
+  member look unhealthy: a test round produced seven `ERROR` lines, and all
+  seven were refusals a passing test case had asked for on purpose. The level
+  is now a property of the error code — `internal`, `misconfigured` and
+  `snapshot` at `ERROR`; `timeout` and `provider_error` at `WARN`;
+  `not_implemented` at `INFO` — and 4xx codes are still not logged at all, now
+  because the code says so rather than because the status did. **Alert on
+  `ERROR` is meant to be correct as written on an untuned node**; the levels
+  and the list of codes that never log are published in
+  [Operations](docs/operations.md#logs) and held to the server's own enum by a
+  test, so they cannot drift apart. This changes what a node logs and nothing
+  else — the status, the `error` code, the `retry` class and the message in
+  the response body are all untouched, as is the `request failed` event
+  message, which is the same on every level so one query still finds them all.
+  ADR-136.
+
 ### Fixed
 
 - **Documentation only, no behaviour change:** ADR-123 now carries a forward
@@ -29,17 +58,6 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   place for the same reason: on an upgraded cluster every index that already
   exists is unstamped, so a reader of that entry alone had the wrong model for
   the whole population they were about to roll.
-
-## 0.22.0 - 2026-09-04
-
-### Added
-
-- **A cross-member check makes a silent divergence alertable.** Every
-  anti-entropy round whose pull reaches the peer's true tail — nothing left
-  to pull, or this round's own batch was not truncated by the cap — now also
-  asks that peer what it holds: every collection id, and one collection's
-  live document count, chosen in turn so no round pays for more than one
-  collection's scan. `kimmy_sync_divergent_collections`, a gauge, moves once
 
 - **The aggregation reference now says what `$count` and `$group` do over an
   empty input stream.** Nothing changed in either stage; what was missing was
@@ -68,6 +86,17 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   Nothing about the memory ceiling changes: a pipeline's input is materialised
   before the first stage and every stage works on that whole set.
 
+## 0.22.0 - 2026-09-04
+
+### Added
+
+- **A cross-member check makes a silent divergence alertable.** Every
+  anti-entropy round whose pull reaches the peer's true tail — nothing left
+  to pull, or this round's own batch was not truncated by the cap — now also
+  asks that peer what it holds: every collection id, and one collection's
+  live document count, chosen in turn so no round pays for more than one
+  collection's scan. `kimmy_sync_divergent_collections`, a gauge, moves once
+  a collection is found disagreeing twice running: two consecutive contacts
   with the same peer for a collection-existence finding, two consecutive
   probes of that specific collection against that peer for a document-count
   finding, since only one collection is probed per contact and those are not

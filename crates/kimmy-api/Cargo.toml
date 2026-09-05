@@ -50,9 +50,10 @@ tokio = { workspace = true, features = ["sync", "rt", "net", "macros"] }
 
 [dev-dependencies]
 parking_lot.workspace = true
-# For the audit tests only: the record's *fields* are the contract a collector
-# reads, and the only way to assert on them is to capture what a subscriber
-# formats. Nothing here ships.
+# For the tests that assert on what a subscriber sees: the audit record's
+# *fields* are the contract a collector reads, and a failed request's *level*
+# is what an operator's alert rule is written against (ADR-136). Neither can
+# be checked except by capturing what a subscriber formats. Nothing here ships.
 tracing-subscriber.workspace = true
 # Dev-only, and the layering is deliberate: this crate ships with the OTel API
 # alone, but the *tests* need an SDK to install a propagator and an in-memory

@@ -9078,3 +9078,216 @@ own already is, and `docs/vectors.md` says it beside the provider that has no
 fields to give.
 
 ---
+
+## ADR-136 — What a failed request logs is a property of its error code, and the property is actionability rather than HTTP class
+
+**Decision.** `ErrorCode` gains `log_level() -> Option<Level>`, a third
+exhaustive match beside `as_str()` and `retry()`, and
+`impl IntoResponse for ApiError` logs at that level instead of gating on
+`status.is_server_error()`. `None` means the failure is not logged at all.
+`ApiError` carries `level_override: Option<Level>`, set at construction where
+the code alone cannot decide, and the level a request actually logs at is
+`level_override.or(code.log_level())` — the same shape `retry_override`
+already has over `retry()`.
+
+The whole mapping:
+
+| `error` | Status | Level | Whose |
+|---|---|---|---|
+| `internal` | 500 | `ERROR` | the operator's |
+| `misconfigured` | 500 | `ERROR` | the operator's |
+| `snapshot` | 500 | `ERROR` | the operator's |
+| `timeout` | 503 | `WARN` | one or the other, and this node cannot tell |
+| `provider_error` | 502 | `WARN` | an upstream's |
+| `not_implemented` | 501 | `INFO`, or `ERROR` from one source | the caller's, or the operator's |
+| every other code | 4xx | not logged | the caller's |
+
+**Why.** A test round against 0.22.0 on a three-member cluster produced seven
+`ERROR` lines across the whole round: four *coordinated unique enforcement is
+reserved and not implemented*, one *an environment variable is not set, so the
+provider has no API key*, and two *the request was not completed within 30
+seconds and was abandoned*. Every one of them was a documented refusal that a
+test case asked for on purpose, and every one of those cases passed. The
+finding was not that the server did something wrong; it is that a single
+client sending requests this API's own reference says will be refused writes
+`ERROR` lines on whichever member refuses them. An operator alerting on error
+lines — which is the first alert anybody writes, and the one
+`docs/operations.md` is about to tell them to write — is paged by somebody
+else's bad input.
+
+**The discriminator is actionability, and HTTP class cannot express it.** A
+`4xx` is a statement about the request and a `5xx` a statement about the
+server, and neither answers the question a log level is for: **is the fix in
+the operator's hands, or the caller's?** That question cuts *across* the 5xx
+set. `501 not_implemented` for a reserved capability is a `5xx` no operator
+can act on — no configuration turns it on, because the capability exists
+nowhere. `500 misconfigured` is one only an operator can act on, and the
+caller who tripped it has nothing to change.
+
+This is not a distinction the status could have been made to carry, and the
+reason is worth stating plainly because it rules out the obvious cheaper fix:
+**4xx were already silent.** `status.is_server_error()` meant that a plan to
+"move client-caused refusals to `INFO`" is a plan to change nothing — the
+entire change lives inside the 5xx set, where the class is constant and
+actionability is not. The status is the right answer to a different question
+and stays exactly as it was; nothing on the wire moves.
+
+**The substantive half is raising a case, not lowering one.** Read only as
+"four noisy lines became `INFO`" this is a small tidying. The half that
+matters is the opposite: `501 not_implemented` has a second source —
+`VectorError::LocalUnavailable` / `ModelUnavailable` in `vectors.rs`, a node
+that cannot build the local embeddings a stored vector configuration calls for
+— and that is a member provisioned unlike its cluster. Every search of that
+collection landing on it fails, the other members answer normally, and behind
+a load balancer the failure is a fraction of requests with no member obviously
+at fault. That is exactly the condition that should page, and until now it was
+indistinguishable in the log from a caller asking for a feature that does not
+exist. Blanket-lowering `not_implemented` to suit its commoner source would
+have buried it. So it is *raised* — the only use of the override in the
+server today.
+
+**Why a per-instance override at all, given the enum is meant to be the single
+source of truth.** Because a per-code property keys on the code, and
+`not_implemented`'s two sources **share the code**. They share it
+deliberately: a client cannot act differently on the two and should not be
+asked to, which is why `retry()` gives them one conservative answer too (see
+its comment). A property that must split them therefore cannot live on the
+code alone. It does not need to be threaded, either — both sources are
+explicit `ApiError::new` constructions, one in `error.rs`'s `CoreError`
+mapping and one in `vectors.rs`'s `vector_error`, so the cause is still in
+hand where the level is chosen and no call chain is touched. The default stays
+on the enum, which is what keeps `operations.md`'s published list derivable
+from the server rather than maintained beside it.
+
+**`None`, not a level the subscriber filters out.** A 4xx could have been
+given `DEBUG` and left below the default filter. It is `None` instead, because
+"this is not a log event" is a property of the code and not of how the process
+was started: `docs/operations.md` teaches `RUST_LOG=info,kimmy_storage=debug`
+for debugging a running container, and an operator who raises the filter to
+chase something unrelated should not thereby acquire a line per malformed
+request. That would be an access log of nothing but the failures — half a
+record, and one this server has never kept. The count is already in
+`kimmy_responses_total{class="4xx"}` and the authorization decisions among
+them are already in the audit log, neither of which costs a line per request.
+
+**One event message on every level.** The three arms write the same
+`request failed`, and the temptation to soften the INFO one to
+`request refused` was refused. A wording that varies by level is a second
+discriminator beside the level — one nothing publishes and no test pins — and
+an operator or a log query grepping for one of them silently misses every line
+written under the other. That is the same shape of trap this ADR exists to
+remove, arriving through a different door. Severity is the level's job alone;
+`code` is what says which failure it was.
+
+**Each 5xx level, on its own terms.**
+
+- **`internal` — `ERROR`.** A genuine fault: storage failed, or something that
+  cannot happen did. Unchanged, and correctly loud.
+- **`misconfigured` — `ERROR`.** An operator must set something. This member
+  cannot build the provider a replicated vector configuration names while some
+  other member could, which makes it a member configured unlike its cluster.
+  Unchanged. Note it is silent until a caller happens to search that
+  collection on this member, so the first occurrence is the whole warning
+  anyone gets — one of the two lines the test round produced, and the one that
+  was right to be loud.
+- **`snapshot` — `ERROR`, decided here rather than carried over.** Asked the
+  same actionability question directly, from what produces it:
+  `VectorError::Snapshot` comes from `kimmy-vector`'s index snapshot I/O — an
+  error writing under the snapshot directory, or a snapshot file whose
+  metadata will not parse. All of that is this node's own disk, and no request
+  body changes it, so the caller cannot be the owner. There is a second reason
+  on top, from the mapping site's own comment: this is meant to be unreachable
+  from a request path, because the cache discards a snapshot it cannot load
+  and rebuilds the graph rather than letting the error escape. One reaching a
+  response means that absorption did not happen — a fault in this node in
+  addition to whatever the disk did. Both halves are the operator's, and the
+  second is precisely the kind of thing that must not arrive quietly.
+- **`provider_error` — `WARN`.** The upstream's fault; the `retry()` comment
+  beside it already says so. An operator may end up acting — a quota, a
+  revoked key, a provider that is down — but no single occurrence demands it,
+  and a client retries on the `wait` the envelope already carries. A rise is
+  the finding, which is what `WARN` means.
+- **`timeout` — `WARN`, uniformly, and deliberately not split by cause.** The
+  `retry()` comment records that the deadline is only ever reached while the
+  request is *waiting* — for the rest of its body, or for an upstream provider
+  — and those have different owners: a slow client is the caller's, a slow
+  provider is the operator's. Splitting them was considered and is not worth
+  its price. The deadline is enforced by `limits::enforce_timeout`, a
+  middleware layer wrapping the whole handler, and `tokio::time::timeout`
+  hands it an `Elapsed` that says only that the future did not finish; the
+  cause is somewhere inside a future that has been dropped. Reaching it would
+  mean every awaiting site reporting what it was waiting on, threaded out to a
+  layer above all of them — a large change to pay for a log level, and one
+  that would put a reporting obligation on every future await. `WARN` is
+  honest for both: a rise in abandoned requests is operationally interesting
+  even when each one is a slow client, and `WARN` keeps it visible without
+  paging. Two of the seven lines were this, and `WARN` is where they belong —
+  not silent, not a page.
+- **`not_implemented` — `INFO` by default, `ERROR` from the local-embeddings
+  source.** Argued above. `INFO` rather than `None` for the default because,
+  unlike a 4xx, this is the *server* declining, and an operator sizing up what
+  callers are reaching for should be able to see it at the default filter
+  without turning on a firehose. Four of the seven lines were this.
+
+**Alternatives.**
+
+- **Log every 5xx at `ERROR` and fix the alert rule instead** — tell operators
+  to exclude `not_implemented`. That pushes a decision the server is in the
+  best position to make onto every operator who deploys it, and it is the
+  decision they are least equipped to make: it requires knowing which codes
+  have a second source. An alert rule that is wrong until it is tuned is a
+  rule that is wrong in every deployment nobody got round to tuning.
+- **Lower the whole `not_implemented` code** — one line, no override, no new
+  field. Rejected because it hides the one occurrence of that code worth
+  paging on, which inverts the finding rather than fixing it.
+- **A level per construction site, with nothing on the enum** — the override
+  mechanism alone. Rejected because the list an operator alerts on would then
+  have no single place to be read from, and `operations.md` would carry a
+  hand-copied table that drifts. The enum is what makes the published list
+  derivable, and the compiler is what stops a new code shipping without an
+  answer.
+- **Splitting `timeout` by cause** — covered above.
+- **A distinct error code for the local-embeddings case**, so the split lives
+  on the wire and no override is needed. Rejected on the terms ADR-057 set:
+  the code set is closed and a code is something a client *branches* on, and a
+  client has nothing to do differently here. It would be a new public code
+  whose only purpose is to carry an internal severity, which is the wrong
+  place for severity to live.
+
+**Why now, on a pre-release project with no operators.** Not operator pain —
+there are none yet. The reason is that `docs/operations.md`'s alert rule and
+the test round's own teardown check are being written *against current
+behaviour* right now. Left alone, both get written to accommodate a level
+scheme that is wrong, and fixing the levels later means rewriting them a
+second time and re-teaching whoever read the first version. The cheapest
+moment to make the levels right is before anything is documented on top of
+them.
+
+**Cost.** A new field on `ApiError` and a third match to answer when a code is
+added — the same tax `retry()` already charges, and for the same reason: a
+level that is not decided is a level decided by accident. What the change
+touches is what a node logs, and nothing else: the status, the `error` code,
+the `retry` class and the message in the response body are all untouched, so
+the only difference is in the log. There, a deployment grepping for `ERROR`
+sees fewer lines, all of them still worth reading, plus one condition that was
+never distinguishable before.
+
+**Held by** `crates/kimmy-api/src/error.rs`'s
+`every_code_logs_at_the_level_its_actionability_earns` (the whole mapping,
+written out so a level changes only on purpose),
+`a_refusal_the_caller_caused_writes_no_line_at_all` (driven through
+`into_response` against a capturing subscriber, so it is the real log site
+being checked and not the table),
+`the_log_gate_is_the_codes_level_and_no_longer_the_status_class` (a 500, a 503
+and a 501 that used to render three identical `ERROR` lines, now rendering
+three different ones) and `an_instance_can_be_louder_than_its_code`; by
+`crates/kimmy-api/src/vectors.rs`'s
+`the_two_sources_of_not_implemented_do_not_log_at_the_same_level`, which is
+the only test module that can reach both sources; and by
+`crates/kimmy-api/tests/docs.rs`'s
+`operations_publishes_the_level_of_every_code_the_server_logs` and
+`operations_names_every_code_that_is_never_logged`, which hold the published
+list to the enum in both directions so an operator's alert rule cannot be
+made wrong by a level moving underneath it.
+
+---
