@@ -9,18 +9,24 @@ What is tested, how, and — more usefully — *why those particular things*.
 ## Current state
 
 ```
-cargo test --workspace · 0 failures · clippy clean at -D warnings
+cargo nextest run --workspace                          # every test, each in its own process
+cargo test --workspace --doc                           # the doctests nextest does not run
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
 ```
 
-Both halves of that are enforced on every pull request, which is why they are
-stated and a count is not. There used to be one — `1398 tests passing`, with a
-per-crate column under it that summed to 874. Neither matched the other, and
-neither matched the workspace, which measured 1947 on the day they were finally
-checked. The number is a function of when and how you ask: four measurements
-taken hours apart over one afternoon gave 1933, 1937, 1939 and 1947, every one
-correct for the crate set it covered. A count in a document nothing regenerates
-is not a fact about the suite, it is a fact about the last time somebody
-remembered, and this file had two of them disagreeing.
+Those four are what CI runs on every pull request — `.github/workflows/ci.yml`,
+jobs `test` and `fmt, clippy` — which is why they are stated and a count is
+not. Naming the commands rather than a result is the point: a green run is
+something the workflow decides on the day, not something this file can assert.
+There used to be one — `1398 tests passing`, with a per-crate column under it
+that summed to 874. Neither matched the other, and neither matched the
+workspace, which measured 1947 on the day they were finally checked. The number
+is a function of when and how you ask: four measurements taken hours apart over
+one afternoon gave 1933, 1937, 1939 and 1947, every one correct for the crate
+set it covered. A count in a document nothing regenerates is not a fact about
+the suite, it is a fact about the last time somebody remembered, and this file
+had two of them disagreeing.
 
 What each crate is *for* does not rot, so that is what the table keeps.
 
@@ -29,12 +35,14 @@ What each crate is *for* does not rot, so that is what the table keeps.
 | `kimmy-core` | HLC, key encoding, comparison, LWW merge, resume tokens, vector metadata and provider configs |
 | `kimmy-storage` | Codecs, engine lifecycle, document CRUD, bulk insert, indexes, change streams, vector storage and fingerprints, retention, schema migration, anti-entropy |
 | `kimmy-query` | Filter, update, sort, projection semantics |
+| `kimmy-egress` | The outbound-request policy: loopback, private, carrier-NAT and reserved ranges refused, the cloud metadata endpoint by name, IPv4-mapped IPv6 smuggling, the operator allowlist, and the resolver that enforces all of it at dial time |
 | `kimmy-vector` | Providers, chunking, the embedding worker and its backfill, HNSW recall, index-cache policy |
 | `kimmy-auth` | Passwords, tokens, RBAC, user store |
 | `kimmy-api` | Unit (JSON boundary, errors, schema inference, rate limiting, audit modes, metrics, ownership, session revocation) plus end-to-end over a real socket and webhook delivery against a real receiver |
 | `kimmy-mcp` | Unit (resource URIs, internal-object filter) plus end-to-end JSON-RPC over a real socket |
 | `kimmyd` | Config layering and validation, TLS termination, certificate reload, and the serving stack |
 | `kimmy-cli` | Target parsing, JSON argument errors, and that no `--password` flag exists |
+| `kimmy-client` | Typed refusals, token refresh and federated tokens, cursor paging and its end conditions, change streams and resume tokens, node failover and the writes deliberately not retried elsewhere |
 | `kimmy-cluster` | Discovery including SRV resolution against a local DNS server, wire protocol, handshake, peer health, replication over real sockets, and SWIM membership over real UDP |
 | `kimmy-fuzz-harness` | Every seed in every fuzz corpus runs clean; the degenerate inputs a fuzzer finds first; the signed token paths are reachable ([Fuzzing](#fuzzing)) |
 
