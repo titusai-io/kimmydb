@@ -408,17 +408,37 @@ impl TelemetryGuard {
             |s| s.embed_transport[3]
         );
 
-        // Worst scheduling delay since the last scrape. A gauge in
-        // microseconds, bridged in its own unit rather than converted, because
-        // the interesting values are well under a second and rounding to
-        // seconds would report every one of them as 0.
-        observe!(
-            u64_observable_gauge,
-            "kimmy.runtime.stall",
-            "us",
-            "Worst runtime scheduling delay observed since the last scrape.",
-            runtime_stall_us
-        );
+        // Worst scheduling delay since this bridge last reported one. A gauge
+        // in microseconds, bridged in its own unit rather than converted,
+        // because the interesting values are well under a second and rounding
+        // to seconds would report every one of them as 0.
+        //
+        // The one instrument here that does NOT go through `observe!`, because
+        // it is the one series whose read *clears* what it read. `/metrics`
+        // takes its own high-water mark on every scrape; this takes a second
+        // mark fed by the same `fetch_max`. Reading through `snapshot()` like
+        // everything else would mean never clearing it — and on a deployment
+        // whose telemetry only leaves through a collector, nothing else ever
+        // would either, so the gauge would climb to the worst stall ever seen
+        // and stay there for the life of the process. A latched gauge cannot
+        // answer the one question it exists for, which is whether a worker
+        // thread is blocked *now*.
+        let stall = {
+            let weak = Arc::downgrade(state);
+            move || weak.upgrade().map(|s| s.metrics.take_runtime_stall_otlp_us())
+        };
+        let _ = meter
+            .u64_observable_gauge("kimmy.runtime.stall")
+            .with_unit("us")
+            .with_description(
+                "Worst runtime scheduling delay observed since this bridge last reported one.",
+            )
+            .with_callback(move |observer| {
+                if let Some(us) = stall() {
+                    observer.observe(us, &[]);
+                }
+            })
+            .build();
     }
 }
 
