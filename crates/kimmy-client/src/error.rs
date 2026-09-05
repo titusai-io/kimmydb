@@ -84,7 +84,7 @@ impl Error {
 
     /// Whether this is the server saying the caller's credentials are no good.
     pub fn is_unauthorized(&self) -> bool {
-        self.code() == Some(ErrorCode::Unauthorized)
+        matches!(self, Self::Api { code: ErrorCode::Unauthorized, .. })
     }
 }
 
