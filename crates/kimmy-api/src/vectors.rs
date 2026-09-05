@@ -11,7 +11,7 @@ use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::error::{ApiError, ErrorCode};
+use crate::error::{ApiError, ErrorCode, LogLevel};
 use crate::exec::QueryStats;
 use crate::json::{JsonBody, json_to_document};
 use crate::state::{Auth, SharedState};
@@ -949,7 +949,7 @@ fn vector_error(e: kimmy_vector::VectorError) -> ApiError {
         // to `ERROR` here rather than the code being lowered around it.
         V::LocalUnavailable | V::ModelUnavailable { .. } => {
             ApiError::new(StatusCode::NOT_IMPLEMENTED, ErrorCode::NotImplemented, e.to_string())
-                .at_level(crate::error::LogLevel::Error)
+                .at_level(LogLevel::Error)
         }
         // A stored configuration this node's policy refuses, or a profile it
         // does not define, is the deployment's to fix, not the caller's: the
@@ -1389,14 +1389,14 @@ mod tests {
         assert_eq!(no_model.code, ErrorCode::NotImplemented);
         assert_eq!(reserved.status, no_model.status, "the wire answer is deliberately the same");
 
-        assert_eq!(reserved.log_level(), Some(crate::error::LogLevel::Info));
-        assert_eq!(no_model.log_level(), Some(crate::error::LogLevel::Error));
+        assert_eq!(reserved.log_level(), Some(LogLevel::Info));
+        assert_eq!(no_model.log_level(), Some(LogLevel::Error));
 
         // And the unbuilt-model case is raised at construction rather than
         // the code being lowered around it, so a third source added later
         // inherits the documented refusal's level and has to argue its way up.
         assert!(reserved.level_override.is_none());
-        assert_eq!(no_model.level_override, Some(crate::error::LogLevel::Error));
+        assert_eq!(no_model.level_override, Some(LogLevel::Error));
 
         // The other arm of the same match, which is the same condition
         // reported by a provider that names a model it cannot load.
@@ -1404,6 +1404,6 @@ mod tests {
             model: "a-model-this-build-does-not-have".into(),
             detail: "not present on this node".into(),
         });
-        assert_eq!(unknown_model.log_level(), Some(crate::error::LogLevel::Error));
+        assert_eq!(unknown_model.log_level(), Some(LogLevel::Error));
     }
 }
