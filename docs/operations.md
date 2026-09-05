@@ -812,6 +812,20 @@ and use dots — `kimmy.requests`, `kimmy.responses.4xx`,
 re-emerges from a collector's Prometheus exporter as
 `kimmy_requests_total_total`.
 
+**One series is measured per surface rather than shared: `kimmy.runtime.stall`.**
+It is a high-water mark that resets when it is read, and `/metrics` and the
+collector read on unrelated schedules, so a single mark would mean whichever
+read first took the value and the other reported a window it never measured.
+Each surface keeps its own mark, fed by the same observation, so each reports
+*the worst stall since that surface last reported one* — the same meaning on
+both, over different intervals. Do not expect the two to print the same number
+at the same moment; expect each to be correct about its own window. It is also
+in microseconds over OTLP (`us`) where `/metrics` renders seconds, because the
+interesting values are well under a second.
+
+Every other bridged series is a counter or a level that a plain read serves, so
+for those the two surfaces genuinely cannot disagree.
+
 ---
 
 ## The audit log

@@ -10,6 +10,29 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Fixed
+
+- **The runtime-stall gauge no longer latches on a deployment that reads its
+  telemetry through a collector.** `kimmy_runtime_stall_seconds` is a
+  high-water mark that clears when it is read, and 0.23.0 bridged it to OTLP
+  through the shared, non-clearing read every other instrument uses. So the
+  `/metrics` scrape cleared the mark and the collector's export did not: with
+  both surfaces in use the two reported windows neither had measured, and with
+  **only** a collector — the deployment the bridge exists for — nothing ever
+  cleared it, so `kimmy.runtime.stall` climbed to the worst stall since process
+  start and stayed there. A gauge that only ever rises cannot answer the
+  question it exists for, which is whether a worker thread is blocked *now*.
+  Each surface now keeps its own mark, fed by the same observation, so each
+  reports the worst stall since **that surface** last reported one: the same
+  meaning on both, over different intervals, and neither able to consume the
+  other's. The two will not print the same number at the same moment, and
+  [Operations](docs/operations.md) now says so — it is the one bridged series
+  that is measured per surface rather than shared, because it is the only one
+  whose read clears what it read. Nothing on `/metrics` changes: same name,
+  same value, same reset-on-scrape behaviour it has always had.
+
 ## 0.23.0 - 2026-09-05
 
 ### Added

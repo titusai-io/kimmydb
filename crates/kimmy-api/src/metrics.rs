@@ -128,7 +128,19 @@ pub struct Metrics {
     /// The worst scheduling delay the runtime probe saw since the last
     /// scrape, in microseconds. A worker that blocks on a storage commit
     /// shows up here before it shows up as a peer's handshake timeout.
+    ///
+    /// **One high-water mark per reader**, because reading one clears it.
+    /// `/metrics` and the OTLP bridge are two independent consumers on two
+    /// unrelated schedules: with a single mark, whichever read first would take
+    /// the value and leave the other reporting a window it did not measure, and
+    /// on a deployment that only ever reads through a collector nothing would
+    /// clear the `/metrics` mark at all. Every other series here is a counter or
+    /// a level, where a plain load serves every reader; this is the only
+    /// take-on-read series, so it is the only one that needs a mark each.
     runtime_stall_us: AtomicU64,
+    /// The OTLP bridge's own copy of [`Self::runtime_stall_us`]. Fed by the
+    /// same `fetch_max`, cleared by the bridge's own read.
+    runtime_stall_otlp_us: AtomicU64,
     requests: AtomicU64,
     responses_2xx: AtomicU64,
     responses_4xx: AtomicU64,
@@ -176,6 +188,7 @@ impl Default for Metrics {
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
             runtime_stall_us: AtomicU64::new(0),
+            runtime_stall_otlp_us: AtomicU64::new(0),
             requests: AtomicU64::new(0),
             responses_2xx: AtomicU64::new(0),
             responses_4xx: AtomicU64::new(0),
@@ -415,14 +428,34 @@ impl Metrics {
 
     /// Record how late the runtime probe woke up. Keeps the maximum until the
     /// next scrape reads it, so a one-off stall between scrapes is not lost.
+    ///
+    /// Fed to both marks: each reader gets the worst stall since *its own* last
+    /// read, and neither can consume the other's.
     pub fn record_runtime_stall(&self, late: std::time::Duration) {
         let us = u64::try_from(late.as_micros()).unwrap_or(u64::MAX);
         self.runtime_stall_us.fetch_max(us, Ordering::Relaxed);
+        self.runtime_stall_otlp_us.fetch_max(us, Ordering::Relaxed);
     }
 
     /// The worst runtime stall since the last call, in seconds.
     fn take_runtime_stall_secs(&self) -> f64 {
         self.runtime_stall_us.swap(0, Ordering::Relaxed) as f64 / 1_000_000.0
+    }
+
+    /// The worst runtime stall since the OTLP bridge last asked, in
+    /// microseconds.
+    ///
+    /// Separate from [`Self::take_runtime_stall_secs`] because both clear on
+    /// read and the two surfaces are read on unrelated schedules. In
+    /// microseconds rather than seconds because the instrument carries `us` as
+    /// its unit: the interesting values are well under a second, and rounding
+    /// them to seconds would report every one as 0.
+    ///
+    /// **Not part of [`Self::snapshot`]**, which is a plain read every other
+    /// bridged instrument shares and which must stay non-destructive — a
+    /// clearing read hidden inside it would silently break every other caller.
+    pub fn take_runtime_stall_otlp_us(&self) -> u64 {
+        self.runtime_stall_otlp_us.swap(0, Ordering::Relaxed)
     }
 
     fn get(&self, counter: &AtomicU64) -> u64 {
@@ -1129,6 +1162,49 @@ kimmy_request_duration_seconds_count 3
         let out = m.render();
         assert!(out.contains("kimmy_rate_limited_total 2"), "{out}");
         assert!(out.contains("kimmy_rate_limited_principal_total 1"), "{out}");
+    }
+
+    #[test]
+    fn each_runtime_stall_reader_clears_only_its_own_high_water_mark() {
+        // The stall gauge is the only series here whose read *clears* what it
+        // read, and it has two readers on unrelated schedules: the `/metrics`
+        // render and the OTLP bridge. With one mark between them, whichever
+        // read first would take the value and leave the other reporting a
+        // window it never measured — and on a deployment whose telemetry only
+        // leaves through a collector, nothing would ever clear the `/metrics`
+        // mark, so the bridged gauge would latch at the worst stall ever seen.
+        //
+        // Both directions are asserted, because a single mark passes a test
+        // that only ever reads one surface.
+        let m = Metrics::default();
+        m.record_runtime_stall(std::time::Duration::from_micros(1_500));
+
+        // The bridge reads first. It gets the stall, and clears only its own.
+        assert_eq!(m.take_runtime_stall_otlp_us(), 1_500);
+        assert_eq!(m.take_runtime_stall_otlp_us(), 0, "the bridge's own mark did not clear");
+        assert!(
+            m.render().contains("kimmy_runtime_stall_seconds 0.0015"),
+            "the bridge's read consumed the value /metrics had not yet reported"
+        );
+        assert!(
+            m.render().contains("kimmy_runtime_stall_seconds 0\n"),
+            "the /metrics mark did not clear on its own read"
+        );
+
+        // And the other way round: /metrics reads first.
+        m.record_runtime_stall(std::time::Duration::from_micros(2_500));
+        assert!(m.render().contains("kimmy_runtime_stall_seconds 0.0025"));
+        assert_eq!(
+            m.take_runtime_stall_otlp_us(),
+            2_500,
+            "a /metrics scrape consumed the stall the bridge had not yet reported"
+        );
+
+        // The mark is a maximum, not a last-value, on each surface
+        // independently.
+        m.record_runtime_stall(std::time::Duration::from_micros(9_000));
+        m.record_runtime_stall(std::time::Duration::from_micros(400));
+        assert_eq!(m.take_runtime_stall_otlp_us(), 9_000);
     }
 
     #[test]
