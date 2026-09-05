@@ -41,6 +41,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   message, which is the same on every level so one query still finds them all.
   ADR-136.
 
+- **Breaking, `kimmy-client` API: `ErrorCode` knows `timeout`, and `Unknown`
+  keeps the code it was handed.** The client's mirror of the server's code set
+  had no `Timeout` variant and no `"timeout"` arm, so a `503 timeout` — a code
+  the server has sent since ADR-099 — parsed as the unknown fallback, and a
+  caller branching on the code could not see a timeout at all. Separately,
+  `Unknown` was documented as keeping the string the server sent and did not:
+  every unrecognized code became the literal `unknown`, so the one situation
+  the variant exists for — a code newer than the client — was the one it made
+  undiagnosable. `ErrorCode::Unknown` now carries a `String` rather than a
+  `&'static str`, which means `ErrorCode` is no longer `Copy`; `Error::code()`
+  still returns an owned `Option<ErrorCode>` and every comparison against a
+  named variant is unchanged. The list of documented codes the client's
+  round-trip test checks had also fallen two behind the server and now names
+  all nineteen.
+
 ### Fixed
 
 - **Documentation only, no behaviour change:** ADR-123 now carries a forward
@@ -85,6 +100,15 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   two; the `$sort`, `$group` and `$count` rows now link to the definition.
   Nothing about the memory ceiling changes: a pipeline's input is materialised
   before the first stage and every stage works on that whole set.
+
+- **The error table in `docs/http-api.md` is now held to the server's code
+  set.** A contract test already pinned `docs/openapi.yaml`'s `ErrorCode`
+  schema to the enum, but nothing checked the prose table — the one a client
+  author actually reads — so a new code could go missing from it silently. The
+  new test asserts the table's codes are exactly the served set and that its
+  `retry` column matches what the server sends for each one. The table was in
+  fact complete and correct; what was missing was anything that would notice
+  when it stopped being.
 
 ## 0.22.0 - 2026-09-04
 
