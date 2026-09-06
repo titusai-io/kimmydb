@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
-use kimmy_cluster::transport::{DivergenceProbe, serve, sync_once};
+use kimmy_cluster::transport::{DivergenceProbe, push_entries, serve, serve_with, sync_once};
 use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
 use tokio::net::{TcpListener, TcpStream};
@@ -1990,4 +1990,146 @@ async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire
         b.engine.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
         "and the entries behind it arrive"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A schema change confirms itself on its peers (ADR-140)
+// ---------------------------------------------------------------------------
+
+/// Bind an ephemeral port and serve `engine` on it, with a push hook.
+async fn listen_with(
+    engine: &Arc<Engine>,
+    hook: kimmy_cluster::PushHook,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serving =
+        tokio::spawn(serve_with(Arc::clone(engine), listener, SECRET.to_string(), Some(hook)));
+    (addr, serving)
+}
+
+#[tokio::test]
+async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
+    // What the confirmation rides on: the member holds the definition when
+    // the push answers, not a sync interval later, and the entry is
+    // witnessed so anti-entropy does not fetch it again.
+    let a = node().await;
+    let b = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    let entries = a.engine.entries_for_peer(Hlc::ZERO, 10).unwrap().entries;
+    assert_eq!(entries.len(), 2, "the collection and the index");
+
+    let (node, outcome) =
+        push_entries(&a.engine, b.addr, SECRET, entries).await.expect("the push is answered");
+    assert_eq!(node, b.engine.node_id(), "the peer names itself in the handshake");
+    assert_eq!(outcome.ddl, 2, "{outcome:?}");
+    assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+    assert!(
+        b.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
+        "held now, not after the next sync interval"
+    );
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(second.total(), 0, "witnessed by the push, so nothing is re-requested: {second:?}");
+}
+
+#[tokio::test]
+async fn a_pushed_schema_change_the_receiver_cannot_apply_is_reported_as_refused() {
+    // The answer a confirmation acts on: the member could not apply the
+    // definition, skipped it, and counted it — and says so, rather than
+    // failing the exchange.
+    let (a, b) = sender_with_a_definition_the_receiver_cannot_arbitrate().await;
+    let entries: Vec<_> = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 10)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::CreateIndex)
+        .collect();
+    assert_eq!(entries.len(), 1);
+
+    let (_, outcome) = push_entries(&a.engine, b.addr, SECRET, entries).await.unwrap();
+    assert_eq!(outcome.ddl_refused, 1, "refused and reported: {outcome:?}");
+    assert!(
+        !b.engine.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
+        "B keeps the definition it cannot arbitrate away"
+    );
+}
+
+#[tokio::test]
+async fn the_push_hook_sees_what_the_receiver_refused() {
+    // The receiver's own counter must not depend on which way a refusal
+    // arrived: the hook is what carries a pushed refusal to it.
+    let a = node().await;
+    let refused = Arc::new(AtomicUsize::new(0));
+    let hook: kimmy_cluster::PushHook = Arc::new({
+        let refused = Arc::clone(&refused);
+        move |outcome: &kimmy_storage::SyncOutcome| {
+            refused.fetch_add(outcome.ddl_refused, Ordering::SeqCst);
+        }
+    });
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(Engine::open(&dir.path().join("kimmy.redb")).unwrap());
+    let (addr, _serving) = listen_with(&engine, hook).await;
+
+    // B holds an unstamped definition under the name A's rival carries.
+    let source = node().await;
+    source.engine.create_collection("shop", "orders").unwrap();
+    source
+        .engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    let mut page = source.engine.snapshot_page(None).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = None;
+        }
+    }
+    page.documents.clear();
+    page.versions = kimmy_core::VersionVector::default();
+    engine.apply_snapshot_page(&page).unwrap();
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
+        .unwrap();
+    let entries: Vec<_> = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, 10)
+        .unwrap()
+        .entries
+        .into_iter()
+        .filter(|e| e.kind == kimmy_core::OpKind::CreateIndex)
+        .collect();
+
+    let (_, outcome) = push_entries(&a.engine, addr, SECRET, entries).await.unwrap();
+    assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+    assert_eq!(refused.load(Ordering::SeqCst), 1, "the hook saw the refusal");
+}
+
+#[tokio::test]
+async fn a_push_larger_than_a_batch_is_refused() {
+    // The cap a pull is served under, applied to what a peer may hand this
+    // node to apply in one go.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let batch: Vec<_> =
+        (0..kimmy_cluster::protocol::MAX_BATCH as i64 + 1).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, batch).unwrap();
+    let entries = a
+        .engine
+        .entries_for_peer(Hlc::ZERO, kimmy_cluster::protocol::MAX_BATCH + 10)
+        .unwrap()
+        .entries;
+    assert!(entries.len() > kimmy_cluster::protocol::MAX_BATCH);
+
+    let err = push_entries(&a.engine, b.addr, SECRET, entries).await.unwrap_err();
+    assert!(
+        matches!(err, ProtocolError::Fault(ref reason) if reason.contains("batch limit")),
+        "{err:?}"
+    );
+    assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
 }

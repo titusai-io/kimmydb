@@ -12,6 +12,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Added
+
+- **`createIndex` and `dropIndex` confirm the change on every live member
+  before answering.** On a clustered node the entry is pushed to each member
+  SWIM considers alive, and the response carries `confirmation` — who applied
+  or already held it, who refused it (counted on their own
+  `kimmy_sync_ddl_refused_total`), and who did not answer within
+  `cluster.ddl_confirm_timeout_secs` (default 10 s; `0` turns it off). A
+  client that creates an index on one member and writes through a front a
+  moment later now finds the index enforced wherever the write lands, which
+  closes the ~3.5 s window the wedge below came through. A node without a
+  member set answers as before ([ADR-140](docs/decisions.md)).
+
 ### Changed
 
 - **A document an index cannot key is stored, not refused — and it no longer

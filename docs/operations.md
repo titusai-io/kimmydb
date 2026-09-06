@@ -44,6 +44,7 @@ fails fast on a bad volume mount.
 | `cluster.sync_interval_secs` | — | `5` | How often to run an anti-entropy round against each peer |
 | `cluster.discovery_interval_secs` | — | `30` | How often to re-resolve seeds. Must repeat, or a node never sees peers that joined later |
 | `cluster.fanout` | — | `3` | Peers contacted per round. A cap, not a quota — a smaller cluster contacts everyone |
+| `cluster.ddl_confirm_timeout_secs` | — | `10` | How long `createIndex` and `dropIndex` wait for every live member to apply or refuse the change before answering ([ADR-140](decisions.md)). A member that does not answer in time is named `pending` in the response and receives the change through anti-entropy. `0` turns the confirmation off. Needs `membership` |
 | `cluster.membership` | — | `true` | Gossip liveness over UDP. Off falls back to discovery-only peers |
 | `server.tls.cert_file` | `KIMMY_TLS_CERT` | — | PEM chain, leaf first. TLS is on when this and the key are both set. Re-read on SIGHUP, or within 60s of changing |
 | `server.tls.key_file` | `KIMMY_TLS_KEY` | — | PEM private key (PKCS#8, PKCS#1 or SEC1) |

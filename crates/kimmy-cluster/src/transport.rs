@@ -100,8 +100,23 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// from, which is exactly what [`crate::PeerHealth`] then does.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Called on the serving side with what a pushed batch became (ADR-140), so
+/// the receiver's own counters see a refusal that arrived by push exactly as
+/// one that arrived by pull.
+pub type PushHook = Arc<dyn Fn(&SyncOutcome) + Send + Sync>;
+
 /// Serve peer requests until the listener fails.
 pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
+    serve_with(engine, listener, secret, None).await
+}
+
+/// [`serve`], reporting each pushed batch's outcome to `on_pushed`.
+pub async fn serve_with(
+    engine: Arc<Engine>,
+    listener: TcpListener,
+    secret: String,
+    on_pushed: Option<PushHook>,
+) {
     let local = listener.local_addr().ok();
 
     // Generated once per process, not per connection: the certificate proves
@@ -131,6 +146,7 @@ pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
 
         let engine = Arc::clone(&engine);
         let secret = secret.clone();
+        let on_pushed = on_pushed.clone();
         let acceptor = tls.acceptor();
         // One task per peer: a slow or hostile peer must not stall the others,
         // and a panic in one connection must not take the listener down. The
@@ -154,7 +170,9 @@ pub async fn serve(engine: Arc<Engine>, listener: TcpListener, secret: String) {
                     }
                 }
             };
-            if let Err(e) = serve_peer(&engine, tls_stream, &secret, &binding).await {
+            if let Err(e) =
+                serve_peer(&engine, tls_stream, &secret, &binding, on_pushed.as_ref()).await
+            {
                 match e {
                     ProtocolError::Closed => debug!(%peer, "peer disconnected"),
                     other => warn!(%peer, error = %other, "peer connection failed"),
@@ -169,6 +187,7 @@ async fn serve_peer<S>(
     mut stream: S,
     secret: &str,
     binding: &[u8],
+    on_pushed: Option<&PushHook>,
 ) -> Result<(), ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -267,6 +286,39 @@ where
                 )
                 .await?;
             }
+            Message::Push { entries } => {
+                // The same cap a pull is served under: a peer must not be able
+                // to hand this node an unbounded batch to apply in one go.
+                if entries.len() > MAX_BATCH {
+                    let reason = format!(
+                        "a push of {} entries exceeds the {MAX_BATCH} entry batch limit",
+                        entries.len()
+                    );
+                    let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
+                    return Err(ProtocolError::Malformed(reason));
+                }
+                // Through `apply_batch`, exactly as a pulled window is: every
+                // entry is witnessed, so anti-entropy does not re-request it;
+                // a schema change this node applies is appended onward; one
+                // it cannot apply is refused, counted and reported (ADR-123),
+                // which is the answer the pusher is waiting for (ADR-140).
+                let outcome = engine
+                    .apply_batch(&entries)
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                if let Some(hook) = on_pushed {
+                    hook(&outcome);
+                }
+                write_frame(
+                    &mut stream,
+                    &Message::Pushed {
+                        applied: outcome.applied,
+                        ddl: outcome.ddl,
+                        ddl_refused: outcome.ddl_refused,
+                        unknown_collection: outcome.unknown_collection,
+                    },
+                )
+                .await?;
+            }
             Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
             // Anything else is a peer talking out of turn.
             other => {
@@ -339,6 +391,53 @@ pub async fn sync_once(
     secret: &str,
     probe: Option<DivergenceProbe>,
 ) -> Result<SyncOutcome, ProtocolError> {
+    let (mut stream, their_node) = dial(engine, peer, secret).await?;
+    sync_over(engine, &mut stream, peer, their_node, probe).await
+}
+
+/// Push entries this node holds to `peer` and wait for what became of them
+/// (ADR-140): the peer's node id, and its outcome — `ddl_refused` above zero
+/// is a schema change the peer could not apply and skipped, counted there.
+///
+/// One exchange on a fresh connection, bounded like a sync round. The entries
+/// are applied on the peer through the same path a pulled batch takes, so
+/// nothing about anti-entropy changes: the peer has simply seen them now
+/// rather than within a sync interval.
+pub async fn push_entries(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    entries: Vec<OplogEntry>,
+) -> Result<(kimmy_core::NodeId, SyncOutcome), ProtocolError> {
+    let (mut stream, their_node) = dial(engine, peer, secret).await?;
+    let exchange = async {
+        write_frame(&mut stream, &Message::Push { entries }).await?;
+        match read_frame(&mut stream).await? {
+            Message::Pushed { applied, ddl, ddl_refused, unknown_collection } => Ok(SyncOutcome {
+                applied,
+                ddl,
+                ddl_refused,
+                unknown_collection,
+                peer: Some(their_node),
+                ..SyncOutcome::default()
+            }),
+            Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
+            other => Err(ProtocolError::Malformed(format!("expected Pushed, got {other:?}"))),
+        }
+    };
+    let outcome = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+        .await
+        .map_err(|_| ProtocolError::Malformed("push timed out".into()))??;
+    Ok((their_node, outcome))
+}
+
+/// Dial `peer`, complete TLS and the handshake, and hand back the stream and
+/// the peer's proven node id. The prelude every client-side exchange shares.
+async fn dial(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+) -> Result<(tokio_rustls::client::TlsStream<TcpStream>, kimmy_core::NodeId), ProtocolError> {
     let tcp =
         tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(peer)).await.map_err(|_| {
             io::Error::new(
@@ -380,7 +479,20 @@ pub async fn sync_once(
     )
     .await
     .map_err(|_| ProtocolError::Malformed("handshake timed out".into()))??;
+    Ok((stream, their_node))
+}
 
+/// The body of [`sync_once`], over a connection [`dial`] opened.
+async fn sync_over<S>(
+    engine: &Engine,
+    mut stream: S,
+    peer: SocketAddr,
+    their_node: kimmy_core::NodeId,
+    probe: Option<DivergenceProbe>,
+) -> Result<SyncOutcome, ProtocolError>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let round = async {
         write_frame(&mut stream, &Message::AskVersions {}).await?;
         let Message::Versions(theirs) = read_frame(&mut stream).await? else {

@@ -1322,7 +1322,7 @@ async fn create_index(
         expire_after_seconds: body.expire_after_seconds,
         partial_filter_expression: body.partial_filter_expression,
     };
-    Ok(Json(exec::create_index(&state, &auth, &db, &coll, spec)?))
+    Ok(Json(exec::create_index_confirmed(&state, &auth, &db, &coll, spec).await?))
 }
 
 async fn list_indexes(
@@ -1354,7 +1354,7 @@ async fn drop_index(
     auth: Auth,
     Path((db, coll, name)): Path<(String, String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    Ok(Json(exec::drop_index(&state, &auth, &db, &coll, &name)?))
+    Ok(Json(exec::drop_index_confirmed(&state, &auth, &db, &coll, &name).await?))
 }
 
 // What this file's registrations are checked against lives in

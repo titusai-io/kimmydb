@@ -13,6 +13,35 @@ use tracing::warn;
 use crate::error::ApiError;
 use crate::ratelimit::RateLimits;
 
+/// What confirming a schema change on the cluster's live members found
+/// (ADR-140): who applied it or already held it, who could not apply it and
+/// skipped it, and who did not answer before the deadline.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DdlConfirmation {
+    /// Members that applied the change, or already held it.
+    pub confirmed: Vec<kimmy_core::NodeId>,
+    /// Members that could not apply the change and skipped it — counted in
+    /// their `kimmy_sync_ddl_refused_total` — or that do not hold the
+    /// collection it names.
+    pub refused: Vec<kimmy_core::NodeId>,
+    /// Members that did not answer before the deadline, and why. Each will
+    /// receive the change through anti-entropy; the response cannot say when.
+    pub pending: Vec<(kimmy_core::NodeId, String)>,
+}
+
+/// How this node confirms a schema change on its live members: handed an
+/// entry it just minted, pushes it to each member and reports what became
+/// of it. Installed by the daemon once clustering is up, since only it holds
+/// the member set and the cluster secret; a node with no confirmer says
+/// nothing about its peers rather than something false.
+pub type DdlConfirmer = Arc<
+    dyn Fn(
+            kimmy_core::OplogEntry,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = DdlConfirmation> + Send>>
+        + Send
+        + Sync,
+>;
+
 pub struct AppState {
     pub engine: Arc<Engine>,
     pub users: UserStore,
@@ -52,6 +81,10 @@ pub struct AppState {
     /// add `me` explicitly — the omission that silently undelivered every
     /// clustered webhook (ADR-051).
     pub(crate) members: std::sync::OnceLock<kimmy_cluster::Members>,
+    /// How a schema change minted here is confirmed on the live members
+    /// before its request answers (ADR-140). Set late, like `members`, and
+    /// for the same reason; `None` on a node that is not clustered.
+    pub(crate) ddl_confirm: std::sync::OnceLock<DdlConfirmer>,
     /// The external identity provider, when one is configured.
     ///
     /// Set late for the same reason `members` is: the router is built before
@@ -110,6 +143,16 @@ impl AppState {
     /// starts; a second call is ignored.
     pub fn set_members(&self, members: kimmy_cluster::Members) {
         let _ = self.members.set(members);
+    }
+
+    /// Install the schema-change confirmer, once, when clustering is up.
+    pub fn set_ddl_confirmer(&self, confirmer: DdlConfirmer) {
+        let _ = self.ddl_confirm.set(confirmer);
+    }
+
+    /// The schema-change confirmer, if this node has peers to confirm on.
+    pub fn ddl_confirmer(&self) -> Option<&DdlConfirmer> {
+        self.ddl_confirm.get()
     }
 
     /// The live member set, if this node is clustered.

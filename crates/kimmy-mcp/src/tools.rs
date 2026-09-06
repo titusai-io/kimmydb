@@ -754,7 +754,16 @@ impl KimmyMcp {
             // administrative decision rather than a query-tuning one.
             partial_filter_expression: None,
         };
-        render(exec::create_index(&self.state, &auth, &args.database, &args.collection, spec))
+        render(
+            exec::create_index_confirmed(
+                &self.state,
+                &auth,
+                &args.database,
+                &args.collection,
+                spec,
+            )
+            .await,
+        )
     }
 }
 
