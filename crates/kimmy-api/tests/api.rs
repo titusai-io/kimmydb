@@ -7796,6 +7796,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_sync_failures_total",
             "kimmy_sync_peers_backing_off",
             "kimmy_sync_ddl_refused_total",
+            "kimmy_sync_ddl_declined_total",
             "kimmy_sync_divergent_collections",
             "kimmy_sync_divergence_checks_total",
             "kimmy_sync_divergence_checks_total",
@@ -9416,13 +9417,59 @@ async fn create_index_and_drop_index_carry_the_cluster_confirmation() {
         assert_eq!(seen[2].kind, kimmy_core::OpKind::DropIndex);
     }
 
-    // Dropping what is not there mints nothing, so there is nothing to
-    // confirm and the response says so by leaving the field out.
+    // Dropping what is not here is still a drop: it is recorded, replicated
+    // and confirmed like any other, and `dropped: false` says only that this
+    // member held nothing to remove (ADR-141).
     let nothing = server.delete("/v1/db/shop/coll/orders/indexes/by_email", Some(&token)).await;
     assert_eq!(nothing.status, 200, "{:?}", nothing.body);
     assert_eq!(nothing.body["dropped"], false);
-    assert!(nothing.body.get("confirmation").is_none(), "{}", nothing.body);
-    assert_eq!(seen.lock().unwrap().len(), 3, "no push for a drop that found nothing");
+    assert_eq!(nothing.body["confirmation"]["confirmed"], json!([held.to_string()]));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 4, "a push for the drop of an index this member did not hold");
+        assert_eq!(seen[3].kind, kimmy_core::OpKind::DropIndex);
+    }
+}
+
+#[tokio::test]
+async fn a_drop_of_an_index_this_member_does_not_hold_is_recorded_and_replicates() {
+    // The finding: a drop through a front that landed on a non-holder
+    // answered 200 and did nothing cluster-wide. It now mints the drop entry
+    // and the tombstone, so the members that hold the index drop it
+    // (ADR-141). Observable here as the entry in this member's oplog.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+
+    let before = server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    let dropped = server.delete("/v1/db/shop/coll/orders/indexes/never_here", Some(&token)).await;
+    assert_eq!(dropped.status, 200, "{:?}", dropped.body);
+    assert_eq!(dropped.body["dropped"], false, "this member held nothing to remove");
+    let after = server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    assert_eq!(after.len(), before.len() + 1, "one entry minted for the drop");
+    let entry = after.last().unwrap();
+    assert_eq!(entry.kind, kimmy_core::OpKind::DropIndex);
+    let coll = server.state.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(
+        server
+            .state
+            .engine
+            .index_dropped_at(coll.id, kimmy_core::IndexMeta::derive_id("never_here"))
+            .unwrap(),
+        Some(entry.stamp),
+        "and the tombstone stands under the entry's stamp"
+    );
+
+    // A name a create would refuse is refused here too, and mints nothing.
+    let refused = server.delete("/v1/db/shop/coll/orders/indexes/__system", Some(&token)).await;
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    let unchanged =
+        server.state.engine.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+    assert_eq!(unchanged.len(), after.len(), "nothing minted for a name that cannot exist");
+
+    // And a collection that does not exist is still 404.
+    let missing = server.delete("/v1/db/shop/coll/nowhere/indexes/x", Some(&token)).await;
+    assert_eq!(missing.status, 404, "{:?}", missing.body);
 }
 
 #[tokio::test]

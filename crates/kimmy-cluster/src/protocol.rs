@@ -183,8 +183,17 @@ pub enum Message {
     /// as it would have been on the pull.
     Push { entries: Vec<OplogEntry> },
     /// What the pushed entries became on the receiver: the fields of its
-    /// `SyncOutcome` a pusher can act on.
-    Pushed { applied: usize, ddl: usize, ddl_refused: usize, unknown_collection: usize },
+    /// `SyncOutcome` a pusher can act on. `ddl_declined` is a drop the
+    /// receiver turned away as older than the index it holds (ADR-141);
+    /// optional on the wire for a receiver that predates the field.
+    Pushed {
+        applied: usize,
+        ddl: usize,
+        ddl_refused: usize,
+        unknown_collection: usize,
+        #[serde(default)]
+        ddl_declined: usize,
+    },
     /// Something went wrong; the sender is closing.
     Fault(String),
 }

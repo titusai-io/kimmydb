@@ -1071,6 +1071,7 @@ async fn spawn_cluster(
         let state = Arc::clone(&state);
         move |outcome: &kimmy_storage::SyncOutcome| {
             state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
+            state.metrics.record_ddl_declined(outcome.ddl_declined as u64);
         }
     });
     let serving = tokio::spawn(kimmy_cluster::serve_with(
@@ -1237,12 +1238,17 @@ fn ddl_confirmer(
             while let Some(joined) = pushes.join_next().await {
                 let Ok((addr, node, result)) = joined else { continue };
                 match result {
-                    Ok(outcome) if outcome.ddl_refused > 0 || outcome.unknown_collection > 0 => {
+                    Ok(outcome)
+                        if outcome.ddl_refused > 0
+                            || outcome.unknown_collection > 0
+                            || outcome.ddl_declined > 0 =>
+                    {
                         warn!(
                             peer = %addr,
                             node = %node,
                             refused = outcome.ddl_refused,
                             unknown_collection = outcome.unknown_collection,
+                            declined = outcome.ddl_declined,
                             "a member could not apply a schema change pushed to it"
                         );
                         found.refused.push(node);

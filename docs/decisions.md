@@ -6954,6 +6954,14 @@ where the span gave 300.
 
 ## ADR-123 — A dropped index leaves a tombstone, and a schema change a replica cannot apply is skipped, counted and exported
 
+> **Amended by [ADR-141](#adr-141--a-drop-mints-its-entry-wherever-it-lands-and-a-declined-drop-is-counted).**
+> The cost paragraph's last sentence — a local drop of an index that is not
+> there records nothing — is withdrawn: such a drop now mints its entry and
+> records its tombstone under a fresh stamp, so it reaches the members that
+> hold the index. The reason given, that a tombstone no peer hears of would
+> leave this node refusing a definition every other member accepts, does not
+> survive the entry being minted.
+>
 > **Amended by [ADR-139](#adr-139--a-document-an-index-cannot-key-is-stored-and-filed-unkeyed-not-refused).**
 > The refusal class below no longer holds a definition this node's
 > *documents* cannot be built under: such a definition is now built, with
@@ -10030,3 +10038,81 @@ and `Metrics::snapshot` survive as the reading-free forms, for callers with no
 engine in hand, which are tests. Nine more lines in the golden render, nine
 more instruments, and the guard now refuses any engine series added to the
 page without an instrument.
+
+## ADR-141 — A drop mints its entry wherever it lands, and a declined drop is counted
+
+**Decision.** `DELETE /v1/db/{db}/coll/{coll}/indexes/{name}` on a member that
+holds the collection but not the index **mints the `DropIndex` entry and
+records the tombstone all the same**, under a fresh local stamp, in one
+transaction, and answers `dropped: false` — this member removed nothing —
+while the drop replicates to every member that does hold the index, and, on a
+clustered node, is pushed to every live member before the response (ADR-140).
+A name a create would have refused is refused here too, before anything is
+minted. A collection that does not exist stays `404`. In `apply_ddl`, the
+branch that turns away a replicated drop older than the index standing under
+its name now logs at info with both stamps and counts in
+`kimmy_sync_ddl_declined_total` (bridged as `kimmy.sync.ddl_declined`), on the
+round report and on the push reply, where a confirmation reads a declined
+drop as a member that did not apply it. Amends ADR-123's cost paragraph.
+
+**Why.** Observed on a three-member cluster running 0.23.2. A test case's own
+cleanup dropped the index at the centre of the wedge ADR-139 records, through
+a front that spreads requests across members. The request landed on a member
+that did not hold the index, answered `200 {"dropped": false}`, minted no
+entry, and did nothing cluster-wide; the index survived on the member that
+held it for 42 minutes, until an operator dropped it there directly. A client
+checking the status saw success. A client reading the body could not tell
+"no such index anywhere" from "not here, but a peer holds it", which have
+opposite consequences. The product deliberately produces states in which an
+index stands on some members and not others — ADR-123's refusal class, and
+the seconds after any `createIndex` — and then offered a drop that silently
+did nothing against exactly those states.
+
+**Why ADR-123's reason no longer holds.** ADR-123 had a local drop of an
+absent index record nothing, because "a tombstone would be a decision this
+node's peers never hear of, and it would make this node refuse a definition
+every other member accepts." Both halves fall away once the entry is minted:
+the peers hear of it and drop theirs, and the definition this member will
+read as history is one no member keeps. ADR-132 supplies the arbitration the
+paragraph lacked. The drop's fresh stamp is ahead of every creation this
+member has witnessed, so on each holder the replicated drop removes the
+index, and a create arriving later at the dropper — the one in flight during
+the seconds after a `createIndex` — reads as older than the tombstone. The
+end state is the same everywhere: no index. A later re-creation, stamped
+after the drop, wins everywhere, as it already did.
+
+**Why a drop is an instruction, not a report.** A member a front happened to
+route the request to is no less entitled to issue it than the member that
+holds the index. `dropped` still answers the local question — did this
+member remove one — because that is a fact the member knows; what it no
+longer implies is that nothing happened. On a clustered node the response's
+`confirmation` says which members applied the drop, which is the cluster-wide
+answer the old body could not give.
+
+**Why the declined branch is counted, and at info.** The residual this
+change cannot reach is a holder whose creation stamp is *ahead* of the drop's
+— a member whose clock ran far ahead when it created the index, the case
+ADR-132 documents — which declines the replicated drop while the dropper's
+tombstone makes the create history there: a split nothing reported. A
+re-served window carries a drop past the recreation it preceded as a matter
+of course, and that is the rule doing its job, so the line is info rather
+than warn; the witnessed vector keeps re-serves rare, so a count that keeps
+rising while nothing is being recreated under the name is the clock case,
+and the escape hatch is the one `indexes.md` already gives: a local drop on
+that member, which mints a stamp ahead of the creation.
+
+**Alternatives.** *Answer differently on a non-holder* — a status or a field
+saying "a peer holds it" (the finding's first proposal). The receiving member
+can see the definition is replicated state, but cannot say which peers hold
+it now, and a client told so would still have to find the holder; once the
+drop reaches the holder there is nothing to distinguish. *Document it and
+send drops to the holder.* Correct, insufficient, and what ADR-140's first
+text said; withdrawn here. *Mint a tombstone but no entry.* That is the
+decision this record amends: a tombstone no peer hears of.
+
+**Cost.** A drop of an absent name costs one transaction and one entry where
+it cost nothing. `drop_index_inner` returns `Dropped { stamp, removed }`
+rather than a stamp. `SyncOutcome`, `RoundReport`, `Pushed` and the metrics
+snapshot gain `ddl_declined`; one new `/metrics` series, pinned by the golden
+tests and the bridge guard. A name that fails `validate_name` is a `400` on
+drop as on create, where before it was a silent `dropped: false`.

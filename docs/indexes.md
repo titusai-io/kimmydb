@@ -266,6 +266,15 @@ the resolution itself is counted nowhere; the stamp rules below say how. A
 snapshot page carrying a definition this member cannot apply is classified
 the same way, and the page's documents still restore.
 
+**A drop is an instruction to the cluster, not a report on the member that
+answers it.** `DELETE …/indexes/{name}` records the drop and replicates it
+whether or not the answering member holds the index, so a drop issued
+through a front that spreads requests across members removes the index
+wherever it stands; `dropped` in the response says only whether *that*
+member held it ([ADR-141](decisions.md)). On a clustered node the drop is
+pushed to every live member before the response, and `confirmation` names
+who applied it.
+
 **A dropped index leaves a tombstone**, and it is one reason the counter does
 *not* move for the sequence ADR-123 was written about. Like a dropped collection, an
 index drop is recorded in `indexes_dropped` under the drop's stamp and kept
@@ -294,7 +303,9 @@ ordinary case.
 > it is logged at debug and counted nowhere, because it happens routinely. But
 > a member whose clock ran far ahead when it created the index will decline
 > *every* drop for that name, indefinitely, with no default-level signal — the
-> drops keep arriving and keep being declined. The escape hatch is a local
+> drops keep arriving and keep being declined — each one counted in
+> `kimmy_sync_ddl_declined_total` and logged at info with both stamps, which
+> is the signal this case has ([ADR-141](decisions.md)). The escape hatch is a local
 > `DELETE /v1/db/{db}/coll/{coll}/indexes/{name}` on that member: a **local**
 > drop does not consult the creation stamp, removes the index, and mints a
 > drop entry under the member's own current stamp, which is ahead of the

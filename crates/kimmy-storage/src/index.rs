@@ -627,6 +627,20 @@ pub(crate) enum CreateOrigin {
     Replicated(Option<Stamp>),
 }
 
+/// What a drop did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dropped {
+    /// The stamp the drop was recorded under: minted here for a local drop,
+    /// the originating one for a replicated drop. `None` never, today — kept
+    /// as an `Option` because a caller confirming the drop on its peers
+    /// (ADR-140) asks "is there an entry to push", which is the question the
+    /// field answers.
+    pub stamp: Option<Stamp>,
+    /// Whether this member held the index and removed it. A local drop of an
+    /// index that is not here is still recorded and replicated (ADR-141).
+    pub removed: bool,
+}
+
 /// What a create decided.
 pub(crate) enum IndexCreated {
     /// Built, or already here under this definition.
@@ -1115,21 +1129,16 @@ impl crate::Engine {
         Ok((IndexCreated::Built(index), violations))
     }
 
-    /// Drop an index and every entry it holds.
+    /// Drop an index and every entry it holds. `true` when this member held
+    /// the index; the drop is recorded and replicated either way (ADR-141).
     pub fn drop_index(&self, db: &str, collection: &str, name: &str) -> Result<bool> {
-        Ok(self.drop_index_stamped(db, collection, name)?.is_some())
+        Ok(self.drop_index_stamped(db, collection, name)?.removed)
     }
 
-    /// [`Self::drop_index`], returning the stamp of the drop entry it minted —
-    /// `None` when there was nothing here to drop, and so no entry. The stamp
-    /// is what a caller confirming the drop on its peers looks the entry up
-    /// by (ADR-140).
-    pub fn drop_index_stamped(
-        &self,
-        db: &str,
-        collection: &str,
-        name: &str,
-    ) -> Result<Option<Stamp>> {
+    /// [`Self::drop_index`], with the stamp of the drop entry it minted — what
+    /// a caller confirming the drop on its peers looks the entry up by
+    /// (ADR-140) — beside whether this member held the index.
+    pub fn drop_index_stamped(&self, db: &str, collection: &str, name: &str) -> Result<Dropped> {
         self.drop_index_inner(db, collection, name, None)
     }
 
@@ -1141,34 +1150,77 @@ impl crate::Engine {
     /// ahead of a recreation that legitimately followed the drop.
     ///
     /// The tombstone (`INDEXES_DROPPED`, ADR-123) is what stops a replayed or
-    /// aged-out `CreateIndex` from rebuilding the index. It is recorded even
-    /// when the index is not here to drop, on the replicated path: a node
-    /// that never held the index still needs to know the definition is
-    /// history, or a later replay of the create builds it. A *local* drop of
-    /// an index that is not there records nothing — it mints no entry, so a
-    /// tombstone would be a decision this node's peers never hear of, and it
-    /// would make this node refuse a definition every other member accepts.
+    /// aged-out `CreateIndex` from rebuilding the index. It is recorded
+    /// whether or not the index is here to drop, on **both** paths. On the
+    /// replicated path a node that never held the index still needs to know
+    /// the definition is history, or a later replay of the create builds it.
+    /// On the local path a drop is an instruction to the cluster, not a
+    /// report on this member: it mints its entry and records its tombstone
+    /// under a fresh stamp even when the index is not here, so the drop
+    /// reaches the members that do hold it — the member a front happened to
+    /// route the request to is no less entitled to issue it (ADR-141). ADR-123
+    /// had it record nothing, on the reasoning that a tombstone no peer heard
+    /// of would leave this member refusing a definition every other member
+    /// accepts; with the entry minted the peers hear of it and drop theirs,
+    /// and the definition this member reads as history is one no member
+    /// keeps. A create arriving later is older than the tombstone, and a
+    /// re-creation after the drop is newer than it, so both settle the way
+    /// ADR-132 settles them everywhere else.
     pub(crate) fn drop_index_inner(
         &self,
         db: &str,
         collection: &str,
         name: &str,
         replicated: Option<Stamp>,
-    ) -> Result<Option<Stamp>> {
+    ) -> Result<Dropped> {
+        if replicated.is_none() {
+            // A name a create would have refused mints no tombstone: there is
+            // no index it could ever name, and the caller is there to be told.
+            CoreError::validate_name(name).map_err(StorageError::Core)?;
+        }
         let mut meta = self.get_collection(db, collection)?;
         // Derived from the name rather than read from the definition, so the
         // key agrees with what a `CreateIndex` replay will compute whether or
         // not the index is here.
         let index_id = IndexMeta::derive_id(name);
-        let Some(index) = meta.index(name).cloned() else {
-            if let Some(stamp) = replicated {
-                self.record_index_drop(meta.id, index_id, stamp)?;
-            }
-            return Ok(None);
-        };
-
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
         let log = replicated.is_none();
+        let drop_entry = || {
+            crate::engine::ddl_entry(
+                stamp,
+                kimmy_core::OpKind::DropIndex,
+                meta.id,
+                &kimmy_core::IndexDrop {
+                    db: db.to_string(),
+                    collection: collection.to_string(),
+                    index: name.to_string(),
+                },
+            )
+        };
+
+        let Some(index) = meta.index(name).cloned() else {
+            if !log {
+                self.record_index_drop(meta.id, index_id, stamp)?;
+                return Ok(Dropped { stamp: Some(stamp), removed: false });
+            }
+            // Not here, but the drop still happened: the tombstone and the
+            // entry go in one transaction, as they do below, so there is no
+            // instant in which the drop is recorded and not yet replicable.
+            let txn = self.begin_write()?;
+            crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
+            let entry = drop_entry()?;
+            crate::engine::append_oplog(&txn, &entry)?;
+            txn.commit()?;
+            self.publish(vec![entry]);
+            tracing::info!(
+                db,
+                collection,
+                index = name,
+                "recorded a drop for an index this member does not hold; the drop replicates"
+            );
+            return Ok(Dropped { stamp: Some(stamp), removed: false });
+        };
+
         let txn = self.begin_write()?;
         {
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
@@ -1184,16 +1236,7 @@ impl crate::Engine {
         crate::Engine::record_index_drop_in_txn(&txn, meta.id, index_id, stamp)?;
 
         let logged = if log {
-            let entry = crate::engine::ddl_entry(
-                stamp,
-                kimmy_core::OpKind::DropIndex,
-                meta.id,
-                &kimmy_core::IndexDrop {
-                    db: db.to_string(),
-                    collection: collection.to_string(),
-                    index: name.to_string(),
-                },
-            )?;
+            let entry = drop_entry()?;
             crate::engine::append_oplog(&txn, &entry)?;
             Some(entry)
         } else {
@@ -1205,7 +1248,7 @@ impl crate::Engine {
         }
 
         tracing::info!(db, collection, index = name, "dropped index");
-        Ok(Some(stamp))
+        Ok(Dropped { stamp: Some(stamp), removed: true })
     }
 
     pub fn list_indexes(&self, db: &str, collection: &str) -> Result<Vec<IndexMeta>> {

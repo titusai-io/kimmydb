@@ -2133,3 +2133,81 @@ async fn a_push_larger_than_a_batch_is_refused() {
     );
     assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
 }
+
+// ---------------------------------------------------------------------------
+// A drop mints its entry wherever it lands (ADR-141)
+// ---------------------------------------------------------------------------
+
+/// A holds an index; B holds the collection and has never heard of the
+/// index — the member a front happened to route a drop to.
+async fn holder_and_a_member_without_the_index() -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    b.engine.create_collection("shop", "orders").unwrap();
+    // Strictly later wall time than A's create, so B's drop sorts after the
+    // creation it removes (ADR-132).
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    (a, b)
+}
+
+#[tokio::test]
+async fn a_drop_issued_on_a_member_without_the_index_reaches_the_holder() {
+    // The finding, over the wire: the drop is recorded on the non-holder,
+    // replicates to the holder on the next round, and removes it there.
+    let (a, b) = holder_and_a_member_without_the_index().await;
+    let dropped = b.engine.drop_index_stamped("shop", "orders", "by_email").unwrap();
+    assert!(!dropped.removed, "B held nothing to remove");
+
+    let outcome = sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
+    assert_eq!(outcome.ddl_refused + outcome.ddl_declined, 0, "{outcome:?}");
+    assert!(
+        a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_none(),
+        "the holder dropped it on B's instruction"
+    );
+    let outcome = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(outcome.ddl_refused + outcome.ddl_declined, 0, "{outcome:?}");
+    assert!(
+        b.engine.get_collection("shop", "orders").unwrap().index("by_email").is_none(),
+        "A's create is older than B's tombstone and reads as history"
+    );
+}
+
+#[tokio::test]
+async fn a_drop_pushed_from_a_member_without_the_index_is_applied_by_the_holder() {
+    // With ADR-140's confirmation: the drop is pushed to the holder within
+    // the request that issued it, so a DELETE through a front removes the
+    // index before its response.
+    let (a, b) = holder_and_a_member_without_the_index().await;
+    let dropped = b.engine.drop_index_stamped("shop", "orders", "by_email").unwrap();
+    let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
+
+    let (_, outcome) = push_entries(&b.engine, a.addr, SECRET, vec![entry]).await.unwrap();
+    assert_eq!(outcome.ddl, 1, "applied on the holder: {outcome:?}");
+    assert_eq!(outcome.ddl_declined, 0, "{outcome:?}");
+    assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_none());
+}
+
+#[tokio::test]
+async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
+    // The residual, reported: the holder's index was created after the
+    // drop, so the holder keeps it and says why, which a confirmation reads
+    // as a member that did not apply the change.
+    let a = node().await;
+    let b = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    b.engine.create_collection("shop", "orders").unwrap();
+    let dropped = b.engine.drop_index_stamped("shop", "orders", "by_email").unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
+
+    let (_, outcome) = push_entries(&b.engine, a.addr, SECRET, vec![entry]).await.unwrap();
+    assert_eq!(outcome.ddl_declined, 1, "declined and reported: {outcome:?}");
+    assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some());
+}

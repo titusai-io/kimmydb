@@ -104,6 +104,9 @@ pub struct MetricsSnapshot {
     pub sync_failures: u64,
     pub sync_peers_backing_off: u64,
     pub sync_ddl_refused: u64,
+    /// Replicated index drops declined as older than the index standing
+    /// here (ADR-141).
+    pub sync_ddl_declined: u64,
     /// Collections the cross-member divergence check currently has confirmed
     /// (ADR-133): held by a peer and not here, or held by both with
     /// disagreeing document counts, seen on two ticks running. Moves for a
@@ -155,6 +158,7 @@ pub struct Metrics {
     sync_failures: AtomicU64,
     sync_peers_backing_off: AtomicU64,
     sync_ddl_refused: AtomicU64,
+    sync_ddl_declined: AtomicU64,
     sync_divergent_collections: AtomicU64,
     /// The gauge above says how many collections disagree; these two say
     /// whether anything looked (ADR-135). Counters, unlike the gauge beside
@@ -221,6 +225,7 @@ impl Default for Metrics {
             sync_failures: AtomicU64::new(0),
             sync_peers_backing_off: AtomicU64::new(0),
             sync_ddl_refused: AtomicU64::new(0),
+            sync_ddl_declined: AtomicU64::new(0),
             sync_divergent_collections: AtomicU64::new(0),
             sync_divergence_checks: AtomicU64::new(0),
             sync_divergence_skips: AtomicU64::new(0),
@@ -402,6 +407,7 @@ impl Metrics {
         self.sync_failures.fetch_add(round.failed as u64, Ordering::Relaxed);
         self.sync_peers_backing_off.store(round.backing_off as u64, Ordering::Relaxed);
         self.sync_ddl_refused.fetch_add(round.ddl_refused as u64, Ordering::Relaxed);
+        self.sync_ddl_declined.fetch_add(round.ddl_declined as u64, Ordering::Relaxed);
         self.sync_divergent_collections
             .store(round.divergent_collections as u64, Ordering::Relaxed);
         self.sync_divergence_checks.fetch_add(round.divergence_checks as u64, Ordering::Relaxed);
@@ -414,6 +420,13 @@ impl Metrics {
     /// arrived.
     pub fn record_ddl_refused(&self, n: u64) {
         self.sync_ddl_refused.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Count index drops a peer pushed to this node that it declined as older
+    /// than the index it holds (ADR-141), on the series a pulled decline
+    /// lands on, for the reason [`Self::record_ddl_refused`] gives.
+    pub fn record_ddl_declined(&self, n: u64) {
+        self.sync_ddl_declined.fetch_add(n, Ordering::Relaxed);
     }
 
     /// How many peers this node's SWIM instance currently considers alive.
@@ -562,6 +575,7 @@ impl Metrics {
             sync_failures: self.get(&self.sync_failures),
             sync_peers_backing_off: self.get(&self.sync_peers_backing_off),
             sync_ddl_refused: self.get(&self.sync_ddl_refused),
+            sync_ddl_declined: self.get(&self.sync_ddl_declined),
             sync_divergent_collections: self.get(&self.sync_divergent_collections),
             sync_divergence_checks: self.get(&self.sync_divergence_checks),
             sync_divergence_skips: self.get(&self.sync_divergence_skips),
@@ -728,6 +742,9 @@ impl Metrics {
              # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.\n\
              # TYPE kimmy_sync_ddl_refused_total counter\n\
              kimmy_sync_ddl_refused_total {sync_ddl_refused}\n\
+             # HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined because the index standing under the name here was created after the drop. A re-served window does this once and rarely; a count that keeps rising while nothing is being recreated under that name is a member whose clock ran ahead when it created the index, which is now the only member still holding it - drop it directly on that member.\n\
+             # TYPE kimmy_sync_ddl_declined_total counter\n\
+             kimmy_sync_ddl_declined_total {sync_ddl_declined}\n\
              # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.\n\
              # TYPE kimmy_sync_divergent_collections gauge\n\
              kimmy_sync_divergent_collections {sync_divergent}\n\
@@ -805,6 +822,7 @@ impl Metrics {
             sync_failures = self.get(&self.sync_failures),
             sync_backing_off = self.get(&self.sync_peers_backing_off),
             sync_ddl_refused = self.get(&self.sync_ddl_refused),
+            sync_ddl_declined = self.get(&self.sync_ddl_declined),
             sync_divergent = self.get(&self.sync_divergent_collections),
             sync_div_ran = self.get(&self.sync_divergence_checks),
             sync_div_skipped = self.get(&self.sync_divergence_skips),
@@ -902,6 +920,7 @@ mod tests {
             failed: 20,
             backing_off: 99,
             ddl_refused: 21,
+            ddl_declined: 28,
             divergent_collections: 12,
             divergence_checks: 30,
             divergence_skips: 33,
@@ -910,6 +929,7 @@ mod tests {
             failed: 3,
             backing_off: 24,
             ddl_refused: 4,
+            ddl_declined: 8,
             divergent_collections: 5,
             divergence_checks: 2,
             divergence_skips: 1,
@@ -1059,6 +1079,9 @@ kimmy_sync_peers_backing_off 24
 # HELP kimmy_sync_ddl_refused_total Replicated schema changes this node could not apply to its own data and skipped - an index its peers hold and it does not. Each one is logged at warning with the reason.
 # TYPE kimmy_sync_ddl_refused_total counter
 kimmy_sync_ddl_refused_total 25
+# HELP kimmy_sync_ddl_declined_total Replicated index drops this node declined because the index standing under the name here was created after the drop. A re-served window does this once and rarely; a count that keeps rising while nothing is being recreated under that name is a member whose clock ran ahead when it created the index, which is now the only member still holding it - drop it directly on that member.
+# TYPE kimmy_sync_ddl_declined_total counter
+kimmy_sync_ddl_declined_total 36
 # HELP kimmy_sync_divergent_collections Collections a periodic cross-member check currently finds disagreeing with a peer - held there and not here, or held by both with a different document count - confirmed on two checks running. 0 on a converged cluster. Moves for a divergence that leaves every other sync series reading healthy, because nothing about it fails a round.
 # TYPE kimmy_sync_divergent_collections gauge
 kimmy_sync_divergent_collections 5
@@ -1178,6 +1201,7 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_sync_failures_total {}\n", s.sync_failures));
         expect(&format!("kimmy_sync_peers_backing_off {}\n", s.sync_peers_backing_off));
         expect(&format!("kimmy_sync_ddl_refused_total {}\n", s.sync_ddl_refused));
+        expect(&format!("kimmy_sync_ddl_declined_total {}\n", s.sync_ddl_declined));
         expect(&format!("kimmy_sync_divergent_collections {}\n", s.sync_divergent_collections));
         expect(&format!(
             "kimmy_sync_divergence_checks_total{{outcome=\"ran\"}} {}\n",
@@ -1257,9 +1281,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 52 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // 53 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 67, "expected one sample per series: {out}");
+        assert_eq!(samples, 68, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -1391,6 +1415,7 @@ kimmy_request_duration_seconds_count 3
             failed: 1,
             backing_off: 1,
             ddl_refused: 0,
+            ddl_declined: 0,
             divergent_collections: 0,
             divergence_checks: 4,
             divergence_skips: 0,
@@ -1399,6 +1424,7 @@ kimmy_request_duration_seconds_count 3
             failed: 2,
             backing_off: 0,
             ddl_refused: 3,
+            ddl_declined: 0,
             divergent_collections: 6,
             divergence_checks: 0,
             divergence_skips: 5,

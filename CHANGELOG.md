@@ -12,6 +12,26 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **A drop is recorded and replicated wherever it lands.** `DELETE
+  …/indexes/{name}` on a member that holds the collection but not the index
+  used to answer `200 {"dropped": false}`, mint nothing, and do nothing
+  cluster-wide — so a drop issued through a front that spreads requests
+  across members was a silent no-op whenever it landed on a non-holder, and
+  the index at the centre of the wedge above survived its own cleanup for 42
+  minutes. It now mints the drop entry and records the tombstone under a
+  fresh stamp, so the drop removes the index on every member that holds it,
+  and on a clustered node is pushed to every live member before the
+  response. `dropped` keeps its meaning — whether *this* member held the
+  index — and `confirmation` says who applied it. A name a create would
+  refuse is now `400` on drop too. A replicated drop declined as older than
+  the index standing under its name is logged at info with both stamps and
+  counted in a new `kimmy_sync_ddl_declined_total` (bridged as
+  `kimmy.sync.ddl_declined`): a re-served window does that once and rarely,
+  and a count that keeps rising is a member whose clock ran ahead when it
+  created the index ([ADR-141](docs/decisions.md), amending ADR-123).
+
 ### Fixed
 
 - **Nine `/metrics` series were never on the OTLP bridge.** `kimmy_databases`,

@@ -355,6 +355,13 @@ impl TelemetryGuard {
         );
         observe!(
             u64_observable_counter,
+            "kimmy.sync.ddl_declined",
+            "{change}",
+            "Replicated index drops this node declined as older than the index standing under the name here.",
+            sync_ddl_declined
+        );
+        observe!(
+            u64_observable_counter,
             "kimmy.tls.reloads.ok",
             "{reload}",
             "Certificate reloads that succeeded.",
