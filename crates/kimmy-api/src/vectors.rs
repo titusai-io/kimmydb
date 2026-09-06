@@ -505,8 +505,16 @@ fn fusion_controls(body: &SearchRequest) -> Result<(FusionWeights, usize), ApiEr
     Ok((weights, min_overlap))
 }
 
-const DEFAULT_K: usize = 10;
-const MAX_K: usize = 1_000;
+/// Hits a search returns when the request names no `k`.
+///
+/// Public because `docs/openapi.yaml` and `docs/vectors.md` state it and the
+/// tests hold them to it.
+pub const DEFAULT_K: usize = 10;
+/// The most hits a search returns. A `k` above it is clamped rather than
+/// refused, and so is a `k` of `0` (to `1`): a search has no "window of
+/// nothing" the way `find`'s `limit: 0` does. Public for the same reason as
+/// [`DEFAULT_K`].
+pub const MAX_K: usize = 1_000;
 
 /// The largest admitted set for which a filtered search reads the admitted
 /// documents' chunks by key rather than searching everything and discarding.

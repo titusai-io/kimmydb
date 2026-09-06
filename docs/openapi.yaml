@@ -1318,7 +1318,7 @@ paths:
         - name: limit
           in: query
           required: false
-          schema: { type: integer, minimum: 0, default: 100, maximum: 10000 }
+          schema: { type: integer, minimum: 0, default: 100 }
           description: |
             Defaults to 100 and is clamped to 10,000 — the same as `find`. This
             route takes no cursor; paging goes through `POST .../find`.
@@ -1463,6 +1463,12 @@ paths:
       tags: [documents]
       operationId: count
       summary: Count matching documents.
+      description: |
+        The body is the `find` shape, and a count reads `filter` and
+        `explain` from it; the rest — `limit` included — is accepted and
+        ignored. A count is of every match and is never a page: there is no
+        cap, because a count that stopped early would be a wrong number
+        rather than a short list.
       x-kimmy-action: read
       requestBody:
         required: true
@@ -3201,7 +3207,6 @@ components:
           type: integer
           minimum: 0
           default: 100
-          maximum: 10000
           description: |
             Documents in one page. **Omitting it means 100, not "all"** — a
             client that treats an unlimited `find` as the whole collection
@@ -3638,9 +3643,12 @@ components:
           description: Restrict results to documents matching this filter.
         k:
           type: integer
-          minimum: 1
-          maximum: 1000
           default: 10
+          description: |
+            Hits to return. Defaults to 10 and is **clamped to `[1, 1000]`
+            rather than refused**: `0` is read as `1`, and a larger value
+            succeeds and answers with 1000 hits at most. There is no
+            "window of nothing" here, unlike `find`'s `limit: 0`.
         per_document:
           type: integer
           description: Chunks per document allowed into the results.

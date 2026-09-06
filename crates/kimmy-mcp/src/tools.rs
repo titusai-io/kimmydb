@@ -142,7 +142,9 @@ pub struct FindArgs {
         deserialize_with = "kimmy_api::json::non_null_field"
     )]
     pub projection: Option<Value>,
-    /// Maximum documents to return. Defaults to 100.
+    /// Maximum documents to return. Defaults to 100 and is clamped to 10,000
+    /// rather than refused: a larger value succeeds and answers with 10,000
+    /// documents at most.
     #[schemars(required)]
     #[serde(
         default,
@@ -227,7 +229,9 @@ pub struct SearchArgs {
         deserialize_with = "kimmy_api::json::non_null_field"
     )]
     pub filter: Option<Value>,
-    /// How many results to return. Defaults to 10.
+    /// How many results to return. Defaults to 10 and is clamped to `[1, 1000]`
+    /// rather than refused: `0` is read as `1`, and a larger value succeeds and
+    /// answers with 1000 hits at most.
     #[schemars(required)]
     #[serde(
         default,
@@ -288,7 +292,9 @@ pub struct HybridSearchArgs {
         deserialize_with = "kimmy_api::json::non_null_field"
     )]
     pub filter: Option<Value>,
-    /// How many results to return. Defaults to 10.
+    /// How many results to return. Defaults to 10 and is clamped to `[1, 1000]`
+    /// rather than refused: `0` is read as `1`, and a larger value succeeds and
+    /// answers with 1000 hits at most.
     #[schemars(required)]
     #[serde(
         default,

@@ -535,6 +535,155 @@ fn every_request_shape_is_closed() {
     );
 }
 
+/// A bound the server clamps is not a validation keyword.
+///
+/// `maximum` and `minimum` tell a generated client what to refuse before
+/// sending. A `find` with `limit: 50_000` is answered `200` with 10,000
+/// documents (ADR-019), and a search with `k: 2000` with 1,000 hits — so a
+/// spec that carried `maximum: 10000` beside prose saying "clamped rather
+/// than refused" had a client reject a request the server accepts, and the
+/// two halves of one field contradicted each other. The clamp belongs in the
+/// description; the keyword is for a bound the server answers `400`.
+///
+/// The rule reads the prose the way a client author would: on any property
+/// or parameter whose description says "clamp", `maximum` is forbidden
+/// outright, and `minimum` is forbidden when its value is a number the clamp
+/// sentence names — because a bound the prose says is clamped is the clamp
+/// restated as a refusal. A `minimum: 0` on an unsigned integer stays, as
+/// does the `minimum: 1` on `sample`, whose `0` really is refused: those are
+/// what the server does, and the prose beside them says so.
+#[test]
+fn no_clamped_bound_is_declared_as_a_validation_keyword() {
+    let mut offending = Vec::new();
+    find_clamped_bounds(spec(), "".to_string(), &mut offending);
+    assert!(
+        offending.is_empty(),
+        "these bounds are clamped by the server but declared as validation keywords, so a \
+         generated client refuses a request the server would answer: {offending:#?}"
+    );
+}
+
+/// The numbers a description names in the same sentence as "clamp".
+fn clamp_numbers(description: &str) -> BTreeSet<u64> {
+    let lower = description.to_lowercase();
+    let mut numbers = BTreeSet::new();
+    for (at, _) in lower.match_indices("clamp") {
+        let sentence = lower[at..].split('.').next().unwrap_or_default();
+        let mut digits = String::new();
+        for c in sentence.chars().chain(std::iter::once(' ')) {
+            match c {
+                '0'..='9' => digits.push(c),
+                // `10,000` and `10_000` are one number, not two.
+                ',' | '_' if !digits.is_empty() => {}
+                _ => {
+                    if let Ok(n) = digits.parse::<u64>() {
+                        numbers.insert(n);
+                    }
+                    digits.clear();
+                }
+            }
+        }
+    }
+    numbers
+}
+
+fn find_clamped_bounds(node: &Value, path: String, offending: &mut Vec<String>) {
+    match node {
+        Value::Object(map) => {
+            if let Some(description) = map.get("description").and_then(Value::as_str)
+                && description.to_lowercase().contains("clamp")
+            {
+                let named = clamp_numbers(description);
+                // A property carries its bounds itself; a parameter carries
+                // them on its `schema`, beside the description.
+                let holders = [(map, path.clone()), (map, format!("{path}/schema"))];
+                for (holder, at) in holders {
+                    let holder = if at.ends_with("/schema") {
+                        match holder.get("schema").and_then(Value::as_object) {
+                            Some(schema) => schema,
+                            None => continue,
+                        }
+                    } else {
+                        holder
+                    };
+                    if let Some(max) = holder.get("maximum") {
+                        offending.push(format!("{at}/maximum = {max}"));
+                    }
+                    if let Some(min) = holder.get("minimum").and_then(Value::as_u64)
+                        && named.contains(&min)
+                    {
+                        offending.push(format!("{at}/minimum = {min}"));
+                    }
+                }
+            }
+            for (key, value) in map {
+                find_clamped_bounds(value, format!("{path}/{key}"), offending);
+            }
+        }
+        Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                find_clamped_bounds(item, format!("{path}/{i}"), offending);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The clamps the specification states are the ones the server applies.
+///
+/// The bounds live in prose now, so this is what holds the prose to the
+/// constants: the default and cap of `find`'s `limit` on both routes, and of a
+/// search's `k`. A constant changed without the document is a failing test,
+/// not a client that learns the new number from a short page.
+#[test]
+fn the_documented_clamps_are_the_ones_the_server_applies() {
+    use kimmy_api::exec::{DEFAULT_LIMIT, MAX_LIMIT};
+    use kimmy_api::vectors::{DEFAULT_K, MAX_K};
+
+    let spec = spec();
+    let limit = &spec["components"]["schemas"]["FindRequest"]["properties"]["limit"];
+    assert_eq!(limit["default"], DEFAULT_LIMIT, "FindRequest.limit default");
+    let description = limit["description"].as_str().expect("FindRequest.limit is described");
+    assert!(
+        description.contains(&format!("clamped to {}", with_thousands(MAX_LIMIT))),
+        "FindRequest.limit must name the cap the server clamps to: {description}"
+    );
+
+    let listing = spec["paths"]["/v1/db/{db}/coll/{coll}/docs"]["get"]["parameters"]
+        .as_array()
+        .expect("listDocuments has parameters")
+        .iter()
+        .find(|p| p["name"] == "limit")
+        .expect("listDocuments has a limit parameter");
+    assert_eq!(listing["schema"]["default"], DEFAULT_LIMIT, "listDocuments limit default");
+    let description = listing["description"].as_str().expect("the limit parameter is described");
+    assert!(
+        description.contains(&format!("clamped to {}", with_thousands(MAX_LIMIT))),
+        "listDocuments?limit must name the cap the server clamps to: {description}"
+    );
+
+    let k = &spec["components"]["schemas"]["SearchRequest"]["properties"]["k"];
+    assert_eq!(k["default"], DEFAULT_K, "SearchRequest.k default");
+    let description = k["description"].as_str().expect("SearchRequest.k is described");
+    assert!(
+        description.contains(&format!("clamped to `[1, {MAX_K}]`")),
+        "SearchRequest.k must name the range the server clamps to: {description}"
+    );
+}
+
+/// `10000` as a document writes it: `10,000`.
+fn with_thousands(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Every `(method, path)` the specification gives a query parameter, at the
 /// operation or at the path level.
 fn operations_with_a_query_parameter() -> BTreeSet<(String, String)> {

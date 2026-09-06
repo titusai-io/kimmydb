@@ -5690,6 +5690,54 @@ async fn an_unlimited_find_returns_a_page_and_not_the_collection() {
     assert_eq!(over.body["count"], 150, "everything there was, and no complaint about the ask");
 }
 
+#[tokio::test]
+async fn a_search_clamps_k_at_both_ends_rather_than_refusing() {
+    // The search-side twin of the test above. `k` is clamped to `[1, MAX_K]`
+    // and the specification says so in prose rather than as a `maximum` a
+    // generated client would enforce before sending: `k: 2000` is answered
+    // `200` with at most `MAX_K` hits, and `k: 0` is answered `200` with one —
+    // a search has no "window of nothing" the way `find`'s `limit: 0` does.
+    use kimmy_api::vectors::MAX_K;
+
+    let server = Server::start().await;
+    let token = byo_collection(&server).await;
+    for (id, vector) in [("a", [1.0, 0.0, 0.0]), ("b", [0.0, 1.0, 0.0]), ("c", [0.0, 0.0, 1.0])] {
+        server
+            .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": id, "text": id }))
+            .await;
+        let stored = server
+            .put(
+                &format!("/v1/db/shop/coll/docs/docs/{id}/vectors"),
+                Some(&token),
+                json!([{ "chunk": 0, "vector": vector, "text": id }]),
+            )
+            .await;
+        assert_eq!(stored.status, 200, "{:?}", stored.body);
+    }
+
+    for path in ["vector_search", "hybrid_search"] {
+        let route = format!("/v1/db/shop/coll/docs/{path}");
+        let over = server
+            .post(
+                &route,
+                Some(&token),
+                json!({ "query": "a", "vector": [1.0, 0.0, 0.0], "k": 2000 }),
+            )
+            .await;
+        assert_eq!(over.status, 200, "{path}: over the cap is not an error: {:?}", over.body);
+        let hits = over.body["matches"].as_array().map_or(0, Vec::len);
+        assert!(hits <= MAX_K, "{path}: {hits} hits is more than the cap");
+        assert_eq!(hits, 3, "{path}: everything there was, and no complaint about the ask");
+
+        let none = server
+            .post(&route, Some(&token), json!({ "query": "a", "vector": [1.0, 0.0, 0.0], "k": 0 }))
+            .await;
+        assert_eq!(none.status, 200, "{path}: k: 0 is clamped, not refused: {:?}", none.body);
+        assert_eq!(none.body["count"], 1, "{path}: k: 0 is read as 1, not as nothing");
+        assert_eq!(none.body["matches"][0]["_id"], "a", "{path}: and it is the nearest");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Reads bounded by what they return (ADR-098)
 // ---------------------------------------------------------------------------
