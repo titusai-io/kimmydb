@@ -510,6 +510,12 @@ That example is the motivating case: **unique only where the field is present**.
 It was impossible before, because a missing field indexes as null and two
 documents lacking it collided on that null entry.
 
+A bound or an equality in the expression cannot be a `Decimal128`: the
+canonical order ranks one equal to every other number, so the filter would
+select every numeric value and the index would hold documents its definition
+never named. `createIndex` refuses it, naming the path
+([Key encoding](key-encoding.md#decimal128-is-refused)).
+
 **There is no separate `sparse` flag.** A sparse index is exactly
 `{field: {$exists: true}}`, which is where MongoDB has been steering people for
 years, so there is one mechanism rather than two overlapping ones.

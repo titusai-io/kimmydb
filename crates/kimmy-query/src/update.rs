@@ -120,12 +120,25 @@ pub enum ArraySort {
 }
 
 impl ArraySort {
-    fn sort(&self, items: &mut [Bson]) {
+    /// Refused, rather than sorted, when an element holds a `Decimal128`
+    /// where the order would read it: the canonical order ranks one equal to
+    /// every other number, so it has no position among them to be given.
+    fn sort(&self, items: &mut [Bson]) -> Result<()> {
         match self {
-            ArraySort::Whole { descending } => items.sort_by(|a, b| {
-                let ordering = canonical_cmp(a, b);
-                if *descending { ordering.reverse() } else { ordering }
-            }),
+            ArraySort::Whole { descending } => {
+                if items.iter().any(kimmy_core::holds_decimal128) {
+                    return Err(Error::InvalidUpdate(
+                        "$push $sort cannot order an element holding a Decimal128, which cannot \
+                         be compared: it has no exact key encoding in this engine and ranks equal \
+                         to every other number; store a double or a long instead"
+                            .into(),
+                    ));
+                }
+                items.sort_by(|a, b| {
+                    let ordering = canonical_cmp(a, b);
+                    if *descending { ordering.reverse() } else { ordering }
+                });
+            }
             ArraySort::ByFields(keys) => {
                 let empty = Document::new();
                 fn as_document<'a>(value: &'a Bson, empty: &'a Document) -> &'a Document {
@@ -134,11 +147,17 @@ impl ArraySort {
                         _ => empty,
                     }
                 }
+                for item in items.iter() {
+                    if let Some(why) = shape::unsortable(keys, as_document(item, &empty)) {
+                        return Err(Error::InvalidUpdate(format!("$push $sort {why}")));
+                    }
+                }
                 items.sort_by(|a, b| {
                     shape::compare(keys, as_document(a, &empty), as_document(b, &empty))
                 });
             }
         }
+        Ok(())
     }
 }
 
@@ -432,6 +451,20 @@ fn parse_op(op: &str, arg: &Bson) -> Result<OpKind> {
         "unset" => OpKind::Unset,
         "inc" => OpKind::Inc(numeric(arg)?),
         "mul" => OpKind::Mul(numeric(arg)?),
+        // These five compare their operand against what is stored — `$min`
+        // and `$max` against the value, `$addToSet`, `$pull` and `$pullAll`
+        // against every element — and the canonical order ranks a Decimal128
+        // equal to every other number. Let through, a `$pull` of one would
+        // empty an array of its numbers and an `$addToSet` of one would add
+        // nothing, silently. `$set` and `$push` take any value; these only
+        // what they can compare. Checked over the whole operand, so a
+        // Decimal128 inside `$each` or a condition document counts.
+        "min" | "max" | "addToSet" | "pull" | "pullAll" if kimmy_core::holds_decimal128(arg) => {
+            return Err(Error::InvalidUpdate(format!(
+                "${op} cannot compare a Decimal128 operand: it has no exact key encoding in this \
+                 engine and ranks equal to every other number; use $set, or a double or a long"
+            )));
+        }
         "min" => OpKind::Min(arg.clone()),
         "max" => OpKind::Max(arg.clone()),
         "push" => match modifier_document(arg) {
@@ -773,7 +806,7 @@ fn apply_one(op: &Operation, doc: &mut Document, now_ms: i64) -> Result<()> {
             };
             items.splice(at..at, each.values.iter().cloned());
             if let Some(sort) = &each.sort {
-                sort.sort(&mut items);
+                sort.sort(&mut items)?;
             }
             if let Some(n) = each.slice {
                 slice(&mut items, n);
@@ -1840,5 +1873,82 @@ mod tests {
     #[test]
     fn set_on_insert_may_not_touch_id() {
         assert!(parse(&doc! { "$setOnInsert": { "_id": 1 } }).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    fn dec(text: &str) -> Bson {
+        Bson::Decimal128(text.parse().unwrap())
+    }
+
+    #[test]
+    fn set_stores_a_decimal128_and_the_comparing_operators_refuse_one() {
+        // `$set` takes any value: a Decimal128 is stored intact, which is
+        // the promise the JSON edge now keeps. `$min` and `$max` compare,
+        // and the canonical order has nothing to compare a Decimal128 with.
+        let mut d = doc! { "_id": 1 };
+        let set = parse(&doc! { "$set": { "amount": dec("9.99") } }).unwrap();
+        apply(&set, &mut d, 0).unwrap();
+        assert_eq!(d.get("amount"), Some(&dec("9.99")));
+
+        for op in ["$min", "$max"] {
+            let msg = parse(&doc! { op: { "amount": dec("1") } }).unwrap_err().to_string();
+            assert!(msg.contains(op) && msg.contains("Decimal128"), "{op}: {msg}");
+            let msg = parse(&doc! { op: { "amount": { "n": dec("1") } } }).unwrap_err().to_string();
+            assert!(msg.contains("Decimal128"), "{op}, nested: {msg}");
+        }
+        assert!(parse(&doc! { "$max": { "amount": 1.5 } }).is_ok());
+    }
+
+    #[test]
+    fn the_set_and_pull_operators_refuse_an_operand_they_cannot_compare() {
+        // Each compares its operand against every element; let through, a
+        // `$pull` of a Decimal128 emptied `[1, 2.5, "s", 3]` down to `["s"]`
+        // and an `$addToSet` of one added nothing, both silently.
+        for update in [
+            doc! { "$addToSet": { "xs": dec("9.9") } },
+            doc! { "$addToSet": { "xs": { "$each": [1, dec("9.9")] } } },
+            doc! { "$addToSet": { "xs": { "n": dec("9.9") } } },
+            doc! { "$pull": { "xs": dec("1.5") } },
+            doc! { "$pull": { "xs": { "$gt": dec("1.5") } } },
+            doc! { "$pull": { "xs": { "n": dec("1.5") } } },
+            doc! { "$pullAll": { "xs": [1, dec("0")] } },
+        ] {
+            let msg = parse(&update).expect_err("refused").to_string();
+            let op = update.keys().next().unwrap();
+            assert!(msg.contains(op) && msg.contains("Decimal128"), "{update}: {msg}");
+        }
+        // The same operators over a double behave as ever.
+        let mut d = doc! { "_id": 1, "xs": [1, 2.5, "s", 3] };
+        let pull = parse(&doc! { "$pull": { "xs": 2.5 } }).unwrap();
+        apply(&pull, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("xs").unwrap().len(), 3);
+        let add = parse(&doc! { "$addToSet": { "xs": { "$each": [3, 9.9] } } }).unwrap();
+        apply(&add, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("xs").unwrap().len(), 4);
+    }
+
+    #[test]
+    fn push_sort_refuses_an_element_it_cannot_place() {
+        // Whole elements, and documents sorted by a field: either way the
+        // element has no position among the numbers, and the update says so
+        // rather than leaving it somewhere.
+        let mut d = doc! { "_id": 1, "xs": [3, dec("2")], "ds": [{ "n": 3 }, { "n": dec("2") }] };
+        let whole = parse(&doc! { "$push": { "xs": { "$each": [1], "$sort": 1 } } }).unwrap();
+        let msg = apply(&whole, &mut d.clone(), 0).unwrap_err().to_string();
+        assert!(msg.contains("$push $sort") && msg.contains("Decimal128"), "{msg}");
+        let by_field =
+            parse(&doc! { "$push": { "ds": { "$each": [{ "n": 1 }], "$sort": { "n": 1 } } } })
+                .unwrap();
+        let msg = apply(&by_field, &mut d.clone(), 0).unwrap_err().to_string();
+        assert!(msg.contains("$push $sort") && msg.contains("Decimal128"), "{msg}");
+        // The same pushes without a sort append as ever.
+        let plain = parse(&doc! { "$push": { "xs": { "$each": [1] } } }).unwrap();
+        apply(&plain, &mut d, 0).unwrap();
+        assert_eq!(d.get_array("xs").unwrap().len(), 3);
     }
 }

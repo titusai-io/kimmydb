@@ -359,3 +359,44 @@ fn vectors_states_the_k_clamp_the_server_applies() {
          {paragraph}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The JSON boundary lists every wrapper the edge reads
+// ---------------------------------------------------------------------------
+
+const HTTP_API: &str = include_str!("../../../docs/http-api.md");
+
+/// The rows of the Extended JSON table in `docs/http-api.md`, by BSON type.
+fn extended_json_rows(http_api: &str) -> Vec<(String, String)> {
+    let section = http_api.split("## The JSON boundary").nth(1).expect("the JSON boundary section");
+    section
+        .lines()
+        .skip_while(|l| !l.starts_with("| BSON type |"))
+        .skip(2)
+        .take_while(|l| l.starts_with('|'))
+        .map(|l| {
+            let cells: Vec<&str> = l.trim_matches('|').split('|').map(str::trim).collect();
+            (cells[0].to_string(), cells[1].to_string())
+        })
+        .collect()
+}
+
+#[test]
+fn the_json_boundary_lists_decimal128_as_read_and_written() {
+    // The table is what a client author reads to learn which wrappers the
+    // edge understands. `$numberDecimal` was emitted for years and not
+    // read, and the table did not say so either way; now that the edge
+    // reads it, the row is the promise (ADR-139).
+    let rows = extended_json_rows(HTTP_API);
+    let (_, form) = rows
+        .iter()
+        .find(|(ty, _)| ty == "Decimal128")
+        .expect("docs/http-api.md lists Decimal128 in the Extended JSON table");
+    assert!(form.contains("$numberDecimal"), "the row names the wrapper: {form}");
+    for wrapper in ["$oid", "$date", "$numberLong", "$numberDecimal", "$binary", "$minKey"] {
+        assert!(
+            rows.iter().any(|(_, form)| form.contains(wrapper)),
+            "docs/http-api.md's Extended JSON table has no row for {wrapper}"
+        );
+    }
+}

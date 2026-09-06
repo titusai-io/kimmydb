@@ -279,6 +279,20 @@ Strings sort after numbers in canonical order (used for *sorting*), but
 comparison operators are type-restricted. Equality, by contrast, *does* span
 numeric types — `5`, `5i64`, and `5.0` are all equal.
 
+**A `Decimal128` cannot be a filter operand.** The canonical order has no
+exact place for one — it ranks equal to every other number, and the key
+encoder refuses it ([Key encoding](key-encoding.md#decimal128-is-refused)) —
+so `{"v": {"$numberDecimal": "1.5"}}` would match every numeric `v` and
+could never use an index. It is refused instead, `400` with a message saying
+a Decimal128 *cannot be compared in a filter*: as a bare equality, under
+`$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`, `$in`, `$nin` and `$all`, inside
+a document or array literal, under `$not` and `$elemMatch`, as an `_id`, and
+as a literal anywhere in a `$expr` expression. `$type: "decimal"` and
+`$exists` compare nothing and find such documents as ever. The refusal is
+deliberate: through 0.24.0 the same filter was refused only by accident, as
+`unsupported operator "$numberDecimal"`, because the JSON edge did not read
+the wrapper.
+
 ---
 
 ## Update operators
@@ -291,11 +305,11 @@ both — mixing them is rejected rather than guessed at.
 | `$set` `$unset` | Set / remove, at any dot path |
 | `$setOnInsert` | Set only when an upsert inserts; ignored on a match |
 | `$inc` `$mul` | Arithmetic; a missing field starts at `0` |
-| `$min` `$max` | Set only if smaller / larger |
+| `$min` `$max` | Set only if smaller / larger, in the [canonical order](#3-comparisons-do-not-cross-type-groups); a `Decimal128` operand is refused, because that order cannot compare one |
 | `$push` | Append; `{"$each": [...]}` appends several, with `$position`, `$sort`, `$slice` |
-| `$addToSet` | Append only if not already present; takes `$each` |
-| `$pull` `$pop` | Remove matching elements / one end |
-| `$pullAll` | Remove every element equal to **any** value in a list |
+| `$addToSet` | Append only if not already present (canonical equality); takes `$each`. A `Decimal128` operand is refused: it would compare equal to every number and add nothing |
+| `$pull` `$pop` | Remove matching elements / one end. A `$pull` operand holding a `Decimal128` is refused: it would compare equal to every number and remove them all |
+| `$pullAll` | Remove every element equal to **any** value in a list; a `Decimal128` in the list is refused for the same reason |
 | `$rename` | Move a field |
 | `$currentDate` | Set to the server's current time |
 | `$[]` / `$[<identifier>]` in a path | Address array elements — see [Positional updates](#positional-updates) |
@@ -553,6 +567,23 @@ renders every JSON number as a float produces. `1.5`, `2`, `true` and the
 string `"1"` are all refused. A missing field sorts as `null`, putting absent
 values at one end rather than in arbitrary positions. Sorting by an array
 field uses its elements.
+
+**A matching document holding a `Decimal128` at a sort path refuses the
+query.** The canonical order ranks a Decimal128 equal to every other number,
+which is not an order a sort can use: the document would land somewhere among
+the numbers that depended on which of them it happened to be compared with.
+So `find`, `find_and_modify` and an aggregation `$sort` check every document
+they would order before ordering any, and answer `400` — `cannot sort by
+"v": document 3 holds a Decimal128 there` — naming the document rather than
+placing it. `$push`'s `$sort` refuses the same value once the elements are
+spliced in: its by-fields form gives that same message behind a `$push $sort`
+prefix, and its whole-element form gives `$push $sort cannot order an element
+holding a Decimal128`. Either
+way the update is refused and nothing is written. Only the documents the
+filter matched are checked:
+narrow the filter past them, sort by another field, or store the value as a
+double or a long. The same applies to `$min`, `$max`, `$addToSet`, `$pull`
+and `$pullAll`, which compare their operand and refuse a Decimal128 one.
 
 ```javascript
 { "projection": { "item": 1, "qty": 1 } }          // inclusion (+ _id)

@@ -6,7 +6,7 @@
 //! optimisation — it is the shared representation.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::canonical_cmp;
+use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
@@ -136,17 +136,21 @@ fn parse_logical(op: &str, value: &Bson) -> Result<Filter> {
 /// document. Mongo's rule is that the *first* key decides, and mixing is an
 /// error rather than a silent reinterpretation.
 fn parse_conditions(value: &Bson) -> Result<Vec<Condition>> {
+    let equality = |value: &Bson| -> Result<Vec<Condition>> {
+        comparable("equality", value)?;
+        Ok(vec![Condition::Eq(value.clone())])
+    };
     let Bson::Document(doc) = value else {
-        return Ok(vec![Condition::Eq(value.clone())]);
+        return equality(value);
     };
 
     let mut keys = doc.keys();
     let Some(first) = keys.next() else {
         // `{}` as a value is an equality match against an empty document.
-        return Ok(vec![Condition::Eq(value.clone())]);
+        return equality(value);
     };
     if !first.starts_with('$') {
-        return Ok(vec![Condition::Eq(value.clone())]);
+        return equality(value);
     }
 
     if let Some(plain) = doc.keys().find(|k| !k.starts_with('$')) {
@@ -200,6 +204,13 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
             _ => Err(Error::InvalidQuery(format!("${op} requires an array"))),
         }
     };
+
+    // Every operator that compares its operand against the field refuses a
+    // Decimal128 in it, for the reason on `comparable`; the ones below this
+    // block ask about shape or type and never compare.
+    if matches!(op, "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "in" | "nin" | "all") {
+        comparable(&format!("${op}"), arg)?;
+    }
 
     Ok(match op {
         "eq" => Condition::Eq(arg.clone()),
@@ -262,6 +273,26 @@ fn parse_condition(op: &str, arg: &Bson, sibling_options: &str) -> Result<Condit
         },
         other => return Err(Error::UnsupportedOperator(format!("${other}"))),
     })
+}
+
+/// Refuse a `Decimal128` anywhere in a comparison operand.
+///
+/// `canonical_cmp` ranks a Decimal128 equal to every other number — it has no
+/// exact representation there, and the key encoder refuses it outright
+/// (ADR-005) — so an operand holding one would match every numeric value of
+/// the field and could never be bounded by an index. The refusal lands at
+/// parse, where the caller can read it; matching everything would say
+/// nothing. The check is recursive because equality against a document or
+/// an array compares their contents by the same order.
+fn comparable(what: &str, operand: &Bson) -> Result<()> {
+    if holds_decimal128(operand) {
+        return Err(Error::InvalidQuery(format!(
+            "{what} operand holds a Decimal128, which cannot be compared in a filter: it has no \
+             exact key encoding in this engine and ranks equal to every other number, so the \
+             match would be neither exact nor indexable; compare a double or a long instead"
+        )));
+    }
+    Ok(())
 }
 
 fn truthy(value: &Bson) -> bool {
@@ -1150,5 +1181,61 @@ mod tests {
         assert!(parse(&doc! { "$expr": { "$gt": ["$$ROOT.a", 1] } }).is_ok());
         // `$expr` is not a field operator.
         assert!(parse(&doc! { "a": { "$expr": { "$gt": ["$a", 1] } } }).is_err());
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    fn dec() -> Bson {
+        Bson::Decimal128("1.5".parse().unwrap())
+    }
+
+    fn refused(filter: Document) {
+        let Err(err) = parse(&filter) else { panic!("{filter} should be refused") };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Decimal128") && msg.contains("cannot be compared in a filter"),
+            "{filter}: the refusal should say why: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_decimal128_operand_is_refused_wherever_a_filter_would_compare_it() {
+        // `canonical_cmp` ranks a Decimal128 equal to every number, so a
+        // parse that let one through would match every numeric value of the
+        // field. Refused on purpose, by every operator that compares — and
+        // inside a document or array literal, which compare by contents.
+        refused(doc! { "v": dec() });
+        refused(doc! { "v": { "$eq": dec() } });
+        refused(doc! { "v": { "$ne": dec() } });
+        refused(doc! { "v": { "$gt": dec() } });
+        refused(doc! { "v": { "$gte": dec() } });
+        refused(doc! { "v": { "$lt": dec() } });
+        refused(doc! { "v": { "$lte": dec() } });
+        refused(doc! { "v": { "$in": [1, dec()] } });
+        refused(doc! { "v": { "$nin": [dec()] } });
+        refused(doc! { "v": { "$all": [dec()] } });
+        refused(doc! { "v": { "$not": { "$lt": dec() } } });
+        refused(doc! { "v": { "$elemMatch": { "$gte": dec() } } });
+        refused(doc! { "v": { "$elemMatch": { "n": dec() } } });
+        refused(doc! { "$and": [{ "v": 1 }, { "v": dec() }] });
+        refused(doc! { "v": { "n": dec() } });
+        refused(doc! { "v": [1, [dec()]] });
+        refused(doc! { "_id": dec() });
+    }
+
+    #[test]
+    fn the_refusal_is_about_comparing_not_about_the_type() {
+        // A filter that asks what type a field holds, or whether it exists,
+        // compares nothing and still finds a stored Decimal128.
+        let stored = doc! { "v": dec() };
+        let by_type = parse(&doc! { "v": { "$type": "decimal" } }).unwrap();
+        assert!(matches(&by_type, &stored));
+        let exists = parse(&doc! { "v": { "$exists": true } }).unwrap();
+        assert!(matches(&exists, &stored));
+        assert!(parse(&doc! { "v": { "$eq": 1.5 } }).is_ok(), "a double compares as ever");
     }
 }

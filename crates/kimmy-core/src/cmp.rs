@@ -220,6 +220,31 @@ fn cmp_numbers(a: &Bson, b: &Bson) -> Ordering {
     cmp_numeric(na, nb)
 }
 
+/// Whether a value is, or contains, a `Decimal128`.
+///
+/// The one BSON type this order cannot place: `cmp_numbers` ranks it equal to
+/// every other number because it has no exact representation here, and
+/// [`crate::keyenc`] refuses it outright (ADR-005). Anything that compares
+/// values on a caller's behalf — a filter operand, a sort key, a partial
+/// index's bound — asks this first and refuses by name, rather than compare
+/// and match everything numeric without saying so.
+/// Every arm that [`canonical_cmp`] descends into is answered here, whether
+/// or not the JSON edge can currently produce it: a scoped JavaScript value
+/// is compared by its scope through `cmp_documents`, so it is searched too.
+/// The edge has no `$code` decoder today — it writes the wrapper and does
+/// not read it — but this whole unit exists because an edge that emitted a
+/// wrapper it did not read became silent data loss, and a `$code` decoder
+/// added later must not reopen that.
+pub fn holds_decimal128(value: &Bson) -> bool {
+    match value {
+        Bson::Decimal128(_) => true,
+        Bson::Array(items) => items.iter().any(holds_decimal128),
+        Bson::Document(doc) => doc.values().any(holds_decimal128),
+        Bson::JavaScriptCodeWithScope(code) => code.scope.values().any(holds_decimal128),
+        _ => false,
+    }
+}
+
 pub(crate) fn cmp_numeric(a: Numeric, b: Numeric) -> Ordering {
     let (ca, cb) = (a.class_rank(), b.class_rank());
     if ca != cb {
@@ -480,5 +505,36 @@ mod tests {
                 prop_assert_eq!(canonical_cmp(&a, &b), canonical_cmp(&b, &a).reverse());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::{Decimal128, doc};
+
+    #[test]
+    fn a_decimal128_is_found_wherever_it_is_nested() {
+        // What every comparing caller asks before it compares: the value
+        // itself, an element, a field, and a field of an element all count,
+        // because the order compares documents and arrays by their contents.
+        let d = Bson::Decimal128("1.5".parse::<Decimal128>().unwrap());
+        assert!(holds_decimal128(&d));
+        assert!(holds_decimal128(&Bson::Array(vec![Bson::Int32(1), d.clone()])));
+        assert!(holds_decimal128(&Bson::Document(doc! { "a": { "b": [d.clone()] } })));
+        assert!(!holds_decimal128(&Bson::Double(1.5)));
+        assert!(!holds_decimal128(&Bson::Document(doc! { "a": [1, "1.5", 1.5] })));
+
+        // A scoped JavaScript value is compared by its scope, so it is
+        // searched by its scope: the edge cannot produce one today, and a
+        // `$code` decoder added later must not make this a way through.
+        let scoped = |scope| {
+            Bson::JavaScriptCodeWithScope(bson::JavaScriptCodeWithScope {
+                code: "return 1".into(),
+                scope,
+            })
+        };
+        assert!(holds_decimal128(&scoped(doc! { "n": d })));
+        assert!(!holds_decimal128(&scoped(doc! { "n": 1.5 })));
     }
 }

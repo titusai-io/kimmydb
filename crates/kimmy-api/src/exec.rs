@@ -298,9 +298,23 @@ pub fn find(
             // whatever order the matches arrive in.
             let order = with_id_tiebreak(&sort);
             let mut top = TopK::new(window, &order);
+            // A match the order has no position for — a Decimal128 where the
+            // sort would read it — refuses the whole query by name, after
+            // the visit: the visitor cannot fail, and offering nothing more
+            // once one is found costs one pass it was making anyway.
+            let mut unsortable: Option<String> = None;
             let stats = visit_matching(state, &meta, &filter, Order::Any, None, |stamp, doc| {
-                top.offer(stamp, doc);
+                if unsortable.is_some() {
+                    return;
+                }
+                match shape::unsortable(&order, &doc) {
+                    None => top.offer(stamp, doc),
+                    Some(why) => unsortable = Some(why),
+                }
             })?;
+            if let Some(why) = unsortable {
+                return Err(ApiError::bad_request(why));
+            }
             let (stamps, docs) = top.into_sorted().into_iter().skip(skip).unzip();
             (stamps, docs, stats)
         } else {
@@ -1130,6 +1144,10 @@ impl kimmy_storage::ModifySpec for Modify<'_> {
 
     fn compare(&self, a: &Document, b: &Document) -> std::cmp::Ordering {
         shape::compare(self.sort, a, b)
+    }
+
+    fn unsortable(&self, doc: &Document) -> Option<String> {
+        shape::unsortable(self.sort, doc)
     }
 
     fn apply(&self, doc: &Document) -> std::result::Result<Option<Document>, String> {
@@ -2398,5 +2416,144 @@ mod tests {
 
         assert_eq!(visited, 0, "a stop_after of zero must visit nothing");
         assert_eq!(stats.matched, 0, "{:?}", stats.matched);
+    }
+}
+
+#[cfg(test)]
+mod decimal128_at_the_edge {
+    //! The member that accepts a write files a Decimal128 document exactly as
+    //! the backfill and the replicated apply do, because the JSON edge now
+    //! reads `$numberDecimal` (ADR-139). Storage-level, over the document the
+    //! edge produces rather than one built with a Decimal128 in hand.
+
+    use super::*;
+    use crate::json::json_to_document;
+    use kimmy_storage::IndexField;
+    use serde_json::json;
+
+    fn engine() -> (std::sync::Arc<kimmy_storage::Engine>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        engine.create_collection("app", "docs").unwrap();
+        (std::sync::Arc::new(engine), dir)
+    }
+
+    /// A compound index over `a` and `v`, so a `{a: 1}` range reads every
+    /// entry filed for the document under `a = 1` — whatever `v` was keyed
+    /// as, a Decimal128's nested-document form included.
+    fn index(engine: &kimmy_storage::Engine) -> kimmy_storage::CollectionMeta {
+        engine
+            .create_index(
+                "app",
+                "docs",
+                vec![IndexField::ascending("a"), IndexField::ascending("v")],
+                false,
+                Some("av".into()),
+            )
+            .unwrap();
+        engine.get_collection("app", "docs").unwrap()
+    }
+
+    fn decimal_document() -> Document {
+        json_to_document(&json!({ "_id": 1, "a": 1, "v": { "$numberDecimal": "1.5" } })).unwrap()
+    }
+
+    #[test]
+    fn the_two_orders_a_definition_and_a_document_can_meet_land_in_one_state() {
+        // Insert-then-createIndex files through the backfill, which re-decodes
+        // the stored bytes; createIndex-then-insert files the document the
+        // edge produced. The count used to differ — 1 and 0 — because the
+        // edge left `$numberDecimal` a nested document the index could key.
+        let (first, _d1) = engine();
+        let coll = first.get_collection("app", "docs").unwrap();
+        first.insert(&coll, decimal_document()).unwrap();
+        let coll = index(&first);
+        let backfilled = first.unkeyed_count(&coll, coll.index("av").unwrap().id).unwrap();
+
+        let (second, _d2) = engine();
+        let coll = index(&second);
+        second.insert(&coll, decimal_document()).unwrap();
+        let written = second.unkeyed_count(&coll, coll.index("av").unwrap().id).unwrap();
+
+        assert_eq!(backfilled, 1, "the backfill files the Decimal128 unkeyed");
+        assert_eq!(written, backfilled, "and so does the write path, on the same member");
+        assert_eq!(second.unkeyed_writes(), 1, "counted, as every unkeyed filing is");
+    }
+
+    #[test]
+    fn reshaping_the_document_leaves_no_entry_behind() {
+        // The old image is re-decoded from its bytes when it is replaced, and
+        // classified unkeyed; the acceptor used to have filed it keyed, so the
+        // unfiling missed and a document-typed key leaked. A full range over
+        // the document's `a` now reads exactly the one entry the new image
+        // made.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_for(&dir);
+        let coll = index(&state.engine);
+        state.engine.insert(&coll, decimal_document()).unwrap();
+        state
+            .engine
+            .replace(&coll, &kimmy_core::DocId::Int64(1), bson::doc! { "a": 1, "v": 1 }, false)
+            .unwrap();
+        let coll = state.engine.get_collection("app", "docs").unwrap();
+        assert_eq!(state.engine.unkeyed_count(&coll, coll.index("av").unwrap().id).unwrap(), 0);
+
+        let filter = filter::parse(&bson::doc! { "a": 1 }).unwrap();
+        let (matched, stats) = collect_matching(&state, &coll, &filter, None).unwrap();
+        assert_eq!(stats.index.as_deref(), Some("av"), "read through the index");
+        assert_eq!(matched.len(), 1);
+        assert_eq!(stats.index_entries, Some(1), "one document, one entry, nothing leaked");
+        assert_eq!(stats.unkeyed, Some(0));
+    }
+
+    #[test]
+    fn an_entry_filed_before_the_fix_outlives_every_later_write() {
+        // What the changelog has to say plainly. Through 0.24.0 the edge
+        // handed storage a nested document where a Decimal128 was meant, and
+        // the index keyed it. Unfiling recomputes the old image's keys from
+        // its bytes, which decode to a Decimal128 and classify unkeyed, so
+        // every later write removes an unkeyed entry that was never there and
+        // leaves the keyed one. Only dropping and recreating the index
+        // clears it. Pinned here so the statement stays true.
+        let dir = tempfile::tempdir().unwrap();
+        let state = live_state_for(&dir);
+        let coll = index(&state.engine);
+        // The document as the pre-fix edge produced it: the wrapper, unread.
+        state
+            .engine
+            .insert(&coll, bson::doc! { "_id": 1i64, "a": 1, "v": { "$numberDecimal": "1.5" } })
+            .unwrap();
+        state
+            .engine
+            .replace(&coll, &kimmy_core::DocId::Int64(1), bson::doc! { "a": 1, "v": 1 }, false)
+            .unwrap();
+
+        let filter = filter::parse(&bson::doc! { "a": 1 }).unwrap();
+        let coll = state.engine.get_collection("app", "docs").unwrap();
+        let (matched, stats) = collect_matching(&state, &coll, &filter, None).unwrap();
+        assert_eq!(matched.len(), 1, "the document itself is unaffected");
+        assert_eq!(stats.index_entries, Some(2), "the pre-fix entry survives the write");
+
+        state.engine.drop_index("app", "docs", "av").unwrap();
+        let coll = index(&state.engine);
+        let (_, stats) = collect_matching(&state, &coll, &filter, None).unwrap();
+        assert_eq!(stats.index_entries, Some(1), "recreating the index is what clears it");
+    }
+
+    fn live_state_for(dir: &tempfile::TempDir) -> SharedState {
+        let engine = std::sync::Arc::new(
+            kimmy_storage::Engine::open(&dir.path().join("kimmy.redb")).unwrap(),
+        );
+        engine.create_collection("app", "docs").unwrap();
+        let tokens =
+            kimmy_auth::TokenIssuer::new("an-adequately-long-test-secret-for-hs256", 3600).unwrap();
+        crate::state_with_egress(
+            engine,
+            tokens,
+            false,
+            crate::RateLimits::disabled(),
+            crate::egress::EgressPolicy::public_only(crate::egress::WEBHOOKS),
+        )
+        .unwrap()
     }
 }

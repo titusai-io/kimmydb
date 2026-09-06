@@ -23,7 +23,7 @@ pub mod vector_meta;
 pub mod vector_record;
 pub mod version;
 
-pub use cmp::canonical_cmp;
+pub use cmp::{canonical_cmp, holds_decimal128};
 pub use conflict::UniqueViolationDetail;
 pub use cursor::Cursor;
 pub use ddl::{CollectionRef, IndexCreate, IndexDrop, VectorSet};
