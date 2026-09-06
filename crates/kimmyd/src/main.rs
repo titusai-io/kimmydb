@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod lifecycle;
 mod logging;
 mod node;
 
@@ -143,6 +144,11 @@ fn main() -> Result<()> {
                      back."
                 );
             }
+
+            // A restored directory has a database and no run behind it. The
+            // marker says so, or the first start would warn about a run that
+            // did not shut down cleanly when there was no run at all.
+            lifecycle::record_exit(&config.storage.data_dir, lifecycle::Exit::Restore);
 
             eprintln!(
                 "note: this database carries the original node's identity. Do not start it \

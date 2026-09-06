@@ -455,6 +455,46 @@ disagree — a code given a level and left out here, or listed here as silent
 after it started logging, is a test failure rather than an operator finding out
 from a page.
 
+#### What a shutdown logs, and what a start says about the last one
+
+Every way out of the process is named. A signal — `SIGTERM` from `docker
+stop` or Kubernetes, `SIGINT` from a terminal — logs `shutdown signal
+received, draining` and then `shutdown complete`. A start that fails — a port
+already bound, a certificate that will not parse — logs `exiting on an error`
+with the error's text, beside the one-line error on stderr. Both leave a
+marker, `kimmy.last-exit`, in the data directory beside `kimmy.redb`: how the
+run ended (`shutdown`, `error`, or `restore` for a directory `kimmyd restore`
+wrote), its pid, its build and the time, as TOML. The next start reads and
+removes it, and logs `previous run ended cleanly` at `INFO` with those fields
+([ADR-147](decisions.md)).
+
+A start that finds the database and **no marker** logs at `WARN`:
+
+```text
+previous run did not shut down cleanly: the database is here and the exit marker is not, …  last_database_write_secs_ago=612
+```
+
+Nothing inside `kimmyd` exits without writing the marker — except a panic
+that unwinds out of `main`, which exits 101 with its message on stderr and
+leaves none, so that start too reads as unclean, which it was. Otherwise that
+line means the previous process was ended from outside by something that did
+not send it a signal it could log: the kernel's OOM killer, a runtime that
+lost the container, a host that went away. `last_database_write_secs_ago` is the
+database file's age at this start, the cheapest clue to when it stopped. Look
+at the runtime and the kernel log for that time, and at
+`kimmy_process_resident_peak_bytes` against the memory limit
+([Capacity](#capacity)). **Alert on it** as you alert on `ERROR`: a member
+restarting under an orchestrator has no other way of saying it did not choose
+to. A first start in an empty directory says nothing about a previous run;
+there was none.
+
+**The first start after upgrading warns once, on every node.** No release
+before this one wrote the marker, so a data directory written by 0.24.0 or
+earlier has a database and no marker beside it, and the code cannot tell
+that from a crash. Expect one `previous run did not shut down cleanly` per
+node on the first start of this release, and read it as the upgrade; the
+start after that is the first one the line means what it says.
+
 ### Health
 
 | Endpoint | Meaning | Probe |
@@ -488,6 +528,8 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_databases`, `kimmy_collections` | Counts, not names |
 | `kimmy_storage_bytes` | Size of the database file |
 | `kimmy_vector_index_cache_bytes` | Estimated bytes of HNSW graphs resident in memory — the figure `vector.index_cache.max_bytes` bounds, by the same estimate. Pinned at the bound while vector searches are slow is eviction churn: collections are rebuilding graphs on each other's behalf, and the bound wants raising |
+| `kimmy_process_resident_bytes` | Resident memory of the whole process as the kernel reports it (`VmRSS` from `/proc/self/status`) — the figure a container memory limit is enforced against, which neither `kimmy_storage_bytes` (a file size) nor `kimmy_vector_index_cache_bytes` (an estimate of one part of the heap) is. It holds `storage.cache_bytes`, the graphs, every request in flight and whatever heap the allocator keeps for reuse after a burst, so it does not follow the two byte gauges down; [Capacity](#capacity) says what to expect and what to do. **Alert on this** against the container's limit — at 80% of it, and on a reading still climbing while `kimmy_requests_total` is flat. 0 where there is no `/proc` ([ADR-147](decisions.md)) |
+| `kimmy_process_resident_peak_bytes` | The most the process has had resident at any moment since it started (`VmHWM`) — what a limit was reached *by*, readable after the current figure has come back down. Never falls within one process life; a restart resets it. 0 where there is no `/proc` |
 | `kimmy_requests_total` | HTTP requests handled |
 | `kimmy_responses_total{class}` | `2xx`, `4xx`, `5xx` |
 | `kimmy_authz_denied_total` | Refused by RBAC |
@@ -948,14 +990,17 @@ for those the two surfaces genuinely cannot disagree.
 
 **The engine's block is bridged too** — `kimmy.databases`, `kimmy.collections`,
 `kimmy.unique_violations`, `kimmy.commits`, `kimmy.fsyncs`,
-`kimmy.commits.grouped`, `kimmy.storage.bytes`, `kimmy.vector.index_cache.bytes`
-and `kimmy.up` — read fresh at each export exactly as `/metrics` reads them at
-each scrape ([ADR-142](decisions.md)). Before that record they were on
-`/metrics` and not on the bridge, so a collector-only deployment could not see
-unique violations, commit and fsync cost, storage size or the vector cache.
-The two count gauges cost a metadata scan per export, as they cost one per
-scrape. An export whose engine reading fails reports nothing for that
-interval rather than zeros.
+`kimmy.commits.grouped`, `kimmy.storage.bytes`, `kimmy.vector.index_cache.bytes`,
+`kimmy.process.resident.bytes`, `kimmy.process.resident.peak.bytes` and
+`kimmy.up` — read fresh at each export exactly as `/metrics` reads them at
+each scrape ([ADR-142](decisions.md); the two process gauges since
+[ADR-147](decisions.md), unit `By`). Before ADR-142 the engine's series were
+on `/metrics` and not on the bridge, so a collector-only deployment could not
+see unique violations, commit and fsync cost, storage size or the vector
+cache. The two count gauges cost a metadata scan per export, as they cost one
+per scrape; the two process gauges cost one read of `/proc/self/status`. An
+export whose engine reading fails reports nothing for that interval rather
+than zeros.
 
 ---
 
@@ -1122,12 +1167,38 @@ partially read.
 | Embedding throughput | **One node embeds a given collection** — its rendezvous owner ([ADR-077](decisions.md)), the same assignment as TTL and webhooks. Adding members does not raise the rate at which *one* collection is embedded; it raises how many collections embed at once, because ownership spreads them across members. Size the provider for the busiest collection's arrival rate, and see [Vectors](vectors.md#throughput-and-why-more-nodes-do-not-embed-one-collection-faster). Within one owner, `[vector.batch]` decides how many documents share a provider call |
 | Change-stream buffer | 1024 events per subscriber; lag recovers from disk |
 | `find` result cap | 100 default, 10,000 maximum |
-| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. It does not come down by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and freed heap is rarely returned to the OS. A restart is the reset |
+| Resident memory | Roughly `storage.cache_bytes`, plus up to `vector.index_cache.max_bytes` of HNSW graphs (see below), plus the allocator's retained peak — mimalloc's ([ADR-117](decisions.md)), which under a burst of concurrent writes measured about twice what glibc's malloc retained and four times musl's; [Benchmarks](benchmarks.md#the-allocator-musl-glibc-and-mimalloc) has the figures. **`kimmy_process_resident_bytes` is the whole of it**, as the kernel counts it; size a container limit from that gauge, not from the two byte gauges, which each bound one part. It does not come down promptly by itself: redb's cache evicts only for room, graphs go only when the budget needs the room, and the allocator hands freed heap back to the kernel in whole segments on its own schedule — a 0.24.0 member sat at its limit for eleven minutes after the load on it ended, came down to a third, and went back up with nothing running (see below). A restart is the certain reset; `kimmy_process_resident_peak_bytes` says what the last run climbed to |
 
 Oplog entries carry full post-images, so update-heavy workloads on large
 documents grow the log quickly: 10 KB documents updated once a second is roughly
 860 MB/day. Retention caps that at one window's worth, so provision for the data
 plus roughly `oplog_retention_secs` of log.
+
+**Resident memory and the container limit.** `kimmy_process_resident_bytes`
+is the number a cgroup limit is enforced against and the only series that
+measures it. Alert on it at 80% of the limit, and on it climbing while
+`kimmy_requests_total` is flat. A member that reaches the limit under a read
+burst and stays there after the burst is what 0.24.0 showed on a member with
+a 2 GiB limit: 110 MiB to exactly 2048 MiB during a concurrent read-heavy
+gate, about 2030 MiB for eleven minutes after every request to it had ended,
+down to 680 MiB, back to 2045 MiB with nothing running, and then ended
+without a log line ([ADR-147](decisions.md) has the record). What holds the
+memory there is not settled, and nothing is tuned for it yet — a knob set
+before the cause is known is a knob that is wrong for the next cause. In the
+order the source supports: the allocator's per-thread heaps (every find,
+aggregation, sync round and retention pass runs on a long-lived worker
+thread, and mimalloc returns a thread's freed segments on its own delayed
+schedule — the figure ADR-117 measured and did not chase); concurrent
+aggregations, each of which may hold up to 100,000 documents per stage while
+it runs, which explains a climb but not a hold; HNSW graphs above the
+estimate their budget is enforced by; and sync rounds allocating while the
+node is already at the limit. **The gauge is what tests them.** Watch it on
+an idle member after a burst across one `storage.gc_interval_secs`: a fall on
+that cadence is heap the retention pass's thread let the allocator return; a
+fall on no cadence is the allocator's own purge; no fall at all is memory
+something still holds, and `kimmy_process_resident_peak_bytes` beside
+`kimmy_vector_index_cache_bytes` says whether the graphs are it. Report the
+reading, the interval, and the `previous run` line from the next start.
 
 **Vector collections and the graph budget.** A collection that is searched
 keeps its HNSW graph resident, at about `dim × 4 + 5,000` bytes per chunk —
@@ -1322,6 +1393,7 @@ node. How to read and consume it, and what it does not prove, is in
 | `410 resume_token_expired` | Resume point passed out of the retained oplog; resubscribe |
 | Second `Engine::open` fails | redb allows one handle per file; share an `Arc<Engine>` |
 | Queries slow on a large collection | Check `find` with `"explain": true`; if `strategy` is `collectionScan`, add an index |
+| `previous run did not shut down cleanly` | The process before this one was ended without getting to log its exit — killed, or its container lost. Look at the runtime and kernel log around `last_database_write_secs_ago` before this start, and at `kimmy_process_resident_peak_bytes` ([Logs](#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one)) |
 
 ---
 

@@ -10,6 +10,50 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
+## Unreleased
+
+### Added
+
+- **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
+  is the process's resident set as the kernel reports it (`VmRSS` from
+  `/proc/self/status`) — the figure a container memory limit is enforced
+  against, which neither `kimmy_storage_bytes` (a file size) nor
+  `kimmy_vector_index_cache_bytes` (an estimate of one part of the heap) is —
+  and `kimmy_process_resident_peak_bytes` is its high-water mark (`VmHWM`),
+  readable after the current figure has come back down. Both sit after
+  `kimmy_vector_index_cache_bytes` in the engine's block, are read fresh on
+  every scrape and every export, and reach the OTLP bridge as
+  `kimmy.process.resident.bytes` and `kimmy.process.resident.peak.bytes`
+  with unit `By`. Alert on the first against the container's limit;
+  [Operations](docs/operations.md#capacity) says how, and what the gauge is
+  for testing about memory that does not come back down
+  ([ADR-147](docs/decisions.md)). 0 on a platform without `/proc`.
+
+  Why: a 0.24.0 member with a 2 GiB limit climbed to exactly that limit
+  under a read burst, held there for eleven minutes after the load on it
+  ended, and was then gone with exit status 0 and no line in its log. Only a
+  sampler shelling out to `docker stats` saw the climb; a deployment reading
+  `/metrics` or a collector could not have.
+
+- **Every exit is named in the log, and the one that cannot be is named by
+  the next start.** A run that ends on an error now logs `exiting on an
+  error` with the error's text, beside the two lines a signal has always
+  logged. Both paths leave `kimmy.last-exit` in the data directory, saying
+  how the run ended, its pid, build and time; the next start reads and
+  removes it and logs `previous run ended cleanly`. A start that finds the
+  database and no marker logs `previous run did not shut down cleanly` at
+  `WARN` with the database file's age as `last_database_write_secs_ago` —
+  the line an operator gets when a process was ended from outside by
+  something that did not let it log, which is what happened to the member
+  above. `kimmyd restore` writes a marker too, so a restored directory does
+  not start with that warning ([ADR-147](docs/decisions.md)).
+
+  **Expect that warning once per node on the first start after upgrading**:
+  no earlier release wrote the marker, so a data directory from 0.24.0 or
+  before has a database and no marker, and the node cannot tell an upgrade
+  from a crash. The start after that is the first one the line means what
+  it says.
+
 ## 0.24.0 - 2026-09-06
 
 ### Changed

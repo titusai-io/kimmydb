@@ -190,6 +190,23 @@ impl TelemetryGuard {
             "Estimated bytes of HNSW graphs held in memory across vector collections.",
             vector_index_cache_bytes
         );
+        // The process as the kernel sees it (ADR-147): the figure a container
+        // limit is enforced against, which neither byte gauge above is. Zero
+        // on a platform without /proc, as on `/metrics`.
+        observe!(
+            u64_observable_gauge,
+            "kimmy.process.resident.bytes",
+            "By",
+            "Resident memory of this process as the kernel reports it; 0 where /proc is not available.",
+            process_resident_bytes
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.process.resident.peak.bytes",
+            "By",
+            "The most resident memory this process has had at any moment since it started; 0 where /proc is not available.",
+            process_resident_peak_bytes
+        );
         observe!(
             u64_observable_gauge,
             "kimmy.up",

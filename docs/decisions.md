@@ -10737,3 +10737,159 @@ while `compared` rises on both members across eight checked contacts each
 discarded write defers its first three contacts — beside ADR-145's
 `a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
 which passes unchanged.
+
+---
+
+## ADR-147 — Resident memory is a `/metrics` series, and every exit is named in the log
+
+**Decision.** Two gauges join the engine's block on `/metrics`, after
+`kimmy_vector_index_cache_bytes`: `kimmy_process_resident_bytes`, the
+process's resident set as the kernel reports it (`VmRSS` from
+`/proc/self/status`), and `kimmy_process_resident_peak_bytes`, its high-water
+mark (`VmHWM`). Both are fields of `StorageReadings`, read fresh on every
+scrape and every OTLP export as the rest of that block is (ADR-142), and both
+reach the bridge as `kimmy.process.resident.bytes` and
+`kimmy.process.resident.peak.bytes` with unit `By`. They are parsed with the
+standard library alone and read 0 where there is no `/proc`; the HELP text
+says so. No crate is added.
+
+Every way out of `node::run` is named in the log, and the one that cannot be
+is named by the next start. The two shutdown lines stay; the error path now
+logs `exiting on an error` at `INFO` with the error's text on its way out,
+beside the one line `main` prints to stderr. On both paths the run writes
+`kimmy.last-exit` into the data directory — how it ended (`shutdown` or
+`error`), its pid, its build and the time, as TOML — and `kimmyd restore`
+writes one saying `restore`. The next start reads and removes the marker
+before opening the database and, after its banner, logs `previous run ended
+cleanly` with those fields at `INFO`; a start that finds the database and no
+marker logs `previous run did not shut down cleanly` at `WARN`, with the
+database file's age as `last_database_write_secs_ago`. An empty directory is
+a first start and says nothing. A marker that will not parse is removed and
+warned about, and read as neither.
+
+**Why.** The record this answers. A member of a three-node 0.24.0 cluster
+with a 2 GiB container memory limit: resident memory went from 110 MiB to
+2048 MiB, the limit exactly, during a concurrent read-heavy gate; held about
+2030 MiB for eleven minutes after every request to it had ended; fell to
+680 MiB; rose back to 2045 MiB with nothing running; and then the process
+was gone — exit status 0, not OOM-killed by the runtime's own account, and no
+line in its log between the routine `merged from peer` lines and the next
+startup banner. A deliberate roll of the same member later logged both
+shutdown lines, so the signal path works and was not taken. No health check
+had failed, no orchestrator had stopped it, and the host had 19 GB free.
+
+Two things about that record were the node's to fix. First, resident memory
+was not on `/metrics`. `kimmy_storage_bytes` is a file size and
+`kimmy_vector_index_cache_bytes` an estimate of one part of the heap; neither
+is the figure a cgroup enforces, and nothing on the page was. The deployment
+saw the climb only because its sampler shells out to `docker stats`; a
+deployment reading `/metrics` or a collector — the deployment the operations
+guide tells people to build — would have seen nothing until the process was
+gone. `/proc/self/status` is the source because it is what the project's own
+allocator measurements sample (docs/benchmarks.md) and what the kernel
+enforces against, and it costs one read of a file that is not on a disk. The
+peak is on the page beside the current figure because by the time anyone
+looks the current figure has usually come down, and a scrape interval that
+missed the moment the limit was reached still has to be able to say it was.
+
+Second, the log said nothing, and read against the source that is not a gap
+in what is logged but a statement about where the exit came from. `main`
+returns `node::run`'s outcome and nothing else; the signal path logs
+`shutdown signal received, draining` and then `shutdown complete`; `SIGHUP`
+only reloads the certificate; the stall probe only records; there is no
+`process::exit`, `abort`, panic hook, `setrlimit` or `panic = "abort"`
+anywhere in the workspace; and the subscriber writes to stdout synchronously,
+with no non-blocking writer that could have dropped a last line. There is no
+path through this binary that exits 0 while serving without both lines. The
+best-supported reading is a process ended from outside its cgroup — a runtime
+reporting a task it had lost — and it cannot be proven from source. What can
+be done is to make the next one say so. A marker written on every exit the
+process controls turns the one it does not control into the one line an
+operator reading only the log gets, and one an alert can be written against.
+It is written at the end rather than at the start, in the shape of a pidfile,
+so that its absence and not its presence is the abnormal case: a copied,
+restored or newly created directory has nothing in it and reads as a first
+start, which is the right reading. `restore` writes one because a restored
+directory has a database and no run behind it, and would otherwise start with
+a warning about a run that never happened. The error path writes one because
+a start that failed to bind has logged why, and the start after it must not
+call that unclean.
+
+**Why the retention is recorded and not fixed.** The rule for this change
+was: fix a cause that can be established from source, otherwise do not guess.
+None could be. `storage.cache_bytes` is a hard bound redb enforces
+(`Engine::open_with_cache`); the vector cache evicts to
+`vector.index_cache.max_bytes` by the same estimate it reports, and holds one
+graph over the budget only after evicting every other and warning; cursors
+are stateless; an aggregation materialises at most `DEFAULT_MAX_DOCUMENTS`
+(100,000) per stage and keeps nothing after it answers. Nothing in the
+process retains per-request state, so what held 2 GiB after the requests
+ended is one of these, in the order the source supports:
+
+1. **mimalloc's per-thread heaps.** Nothing here uses `spawn_blocking`:
+   every find, aggregation, sync round and retention pass runs on a
+   long-lived tokio worker thread and allocates on that thread's heap, and
+   mimalloc returns a thread's freed segments to the kernel on its own
+   delayed schedule. ADR-117 measured two to four times what glibc and musl
+   retained under a burst, ruled out the purge timer
+   (`MIMALLOC_PURGE_DELAY=0` made the peak larger), and did not chase where
+   it went. The eleven-minute hold and the fall fit: the retention pass runs
+   every `storage.gc_interval_secs` (600 s by default) on a worker thread,
+   and a pass that allocates and frees is what makes that thread's allocator
+   look at what it holds.
+2. **Concurrent materialisation**, which explains the climb and not the
+   hold: sixty-four aggregations each holding up to 100,000 documents is a
+   heap the size of the limit, freed when they answer — into (1).
+3. **HNSW graphs above the estimate** their budget is enforced by.
+   `kimmy_vector_index_cache_bytes` beside the new gauge is the test.
+4. **Sync rounds and count probes** allocating while the node is already at
+   the limit, which is what a second rise with no client running looks like.
+
+The gauge is what tests them. Watched across one `storage.gc_interval_secs`
+on an idle member after a burst, a fall on that cadence is (1) by way of the
+collector's thread, a fall on no cadence is the allocator's own purge, and no
+fall at all is (3) or something not on this list. No knob is added for a
+cause not yet established, and the allocator is not changed: ADR-117's
+measurement stands, and this record is where the next round starts from
+evidence rather than from the same guess.
+
+**Alternatives.** A marker present while running, absent when stopped —
+a pidfile. Rejected because it inverts the failure: a directory copied or
+restored while a node ran would carry the file and read as crashed, and a
+first start would have to know it was one. A committed-heap gauge from
+mimalloc's `mi_process_info`, the retained figure ADR-117 could not chase.
+Deferred: it needs `libmimalloc-sys`'s `extended` feature and one more crate
+in the lock, and whether the committed figure is maintained in the release
+build of the allocator is not known without measuring; the kernel's figure
+alone, watched on the collector's cadence, tests hypothesis (1). A `procfs`
+or `sysinfo` crate: two lines of a text file are not worth a dependency in a
+static binary where every crate is a build to audit.
+
+**Cost.** One read of `/proc/self/status` per scrape and per export. Two
+more lines in the golden render, two more instruments on the bridge, and the
+ordered-series test in `kimmy-api/tests/api.rs` names them. One file in the
+data directory, written once per run and removed once, and one more `INFO`
+line per start. A start after `kill -9` warns, correctly; so does a start
+after a container was ended with `SIGKILL` at the end of its stop grace
+period, which is a drain that outlived the grace and is worth the line. A
+marker that cannot be written — a read-only or full data directory — is a
+warning at shutdown and a spurious `did not shut down cleanly` at the next
+start, both naming the same directory. The first start after upgrading from
+0.24.0 or earlier warns once on every node: no earlier release wrote the
+marker, so the directory has a database and no marker beside it, and the
+code cannot tell an upgrade from a crash. The changelog and the operations
+guide both say to expect it. A panic that unwinds out of `main` exits 101
+with its message on stderr and writes no marker, so the start after it warns
+too — the one in-process exit that leaves none, and one that was not logged
+through the subscriber either. The retention is not fixed by this
+record. Defended by `kimmy-api`'s
+`resident_memory_is_read_from_the_two_status_lines_in_bytes`,
+`a_missing_or_malformed_line_reads_as_zero_and_leaves_the_other_field` and,
+on Linux,
+`the_live_reading_is_non_zero_on_linux_and_the_peak_is_at_least_the_current`;
+by the byte-for-byte render and the bridge guard, which now carry the two
+series; by `kimmyd`'s `lifecycle` unit tests; and by
+`crates/kimmyd/tests/lifecycle.rs`, which runs the shipped binary three ways
+— `SIGTERM`, which logs both lines and leaves a marker the next start reads;
+`SIGKILL`, after which the next start warns under its banner; and a bind that
+fails, which logs its exit and is read as clean by the start after it.
