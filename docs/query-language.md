@@ -342,7 +342,7 @@ bounded, ordered list. They apply in a fixed order — **`$position`, then
 |---|---|
 | `$position: n` | Insert the `$each` values at index `n`; negative counts from the end; past either end clamps to it |
 | `$sort: 1 \| -1` | Order whole elements, in the [canonical order](#3-comparisons-do-not-cross-type-groups) |
-| `$sort: {field: 1 \| -1, …}` | Order elements that are documents by these fields, dotted paths allowed; an element missing a field sorts as `null` |
+| `$sort: {field: 1 \| -1, …}` | Order elements that are documents by these fields, dotted paths allowed; an element missing a field sorts as `null`, and a path that reaches several values inside an element is reduced the way [a sort key is](#sort-and-projection) |
 | `$slice: n` | Keep the first `n` elements; negative keeps the last `n`; `0` empties the array |
 
 A modifier without `$each` is an error, as is a clause `$push` does not know —
@@ -565,8 +565,26 @@ projection value is (below), so a whole double equal to either passes: `1.0`
 and `-1.0` sort exactly as `1` and `-1` do, which is what an encoder that
 renders every JSON number as a float produces. `1.5`, `2`, `true` and the
 string `"1"` are all refused. A missing field sorts as `null`, putting absent
-values at one end rather than in arbitrary positions. Sorting by an array
-field uses its elements.
+values at one end rather than in arbitrary positions.
+
+**Sorting by an array uses its elements, and the element it uses is the
+smallest — in both directions.** A sort key names a field rather than
+computing one, so a path that reaches several values is reduced to a single
+key before anything is compared, and that key is the least of them in
+[canonical order](#3-comparisons-do-not-cross-type-groups). The two ways of
+reaching several values behave alike: `{"tags": 1}` over `tags: ["c", "a"]`
+sorts by `"a"`, and `{"items.qty": 1}` over `items: [{qty: 9}, {qty: 1}]`
+sorts by `1`. **`-1` reverses the comparison, not the choice of element** — a
+descending sort still reduces each document to its smallest element and puts
+the largest of those first, so `[2, 3]` comes before `[1, 100]` and the `100`
+never enters it. An empty array has no element to use and is compared as the
+array itself, at the rank arrays hold in the [type
+ordering](key-encoding.md#type-ordering) — not at either end of it. One
+comparison serves `find`, `find_and_modify` and the pipeline's
+[`$sort`](aggregation.md#stages), so the three order a collection identically.
+It is not the rule `$lookup` follows for a join key, which reads the *first*
+element of a path that crosses an array rather than the least
+([Aggregation](aggregation.md#lookup)).
 
 **A matching document holding a `Decimal128` at a sort path refuses the
 query.** The canonical order ranks a Decimal128 equal to every other number,

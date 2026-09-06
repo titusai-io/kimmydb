@@ -25,7 +25,7 @@ can answer it, which only a *leading* `$match` gets (see
 | `$project` | The same projection language as `find`, **plus computed fields** |
 | `$addFields`, `$set` | Add computed fields, keeping everything else. Two names for one stage |
 | `$replaceRoot` | `{$replaceRoot: {newRoot: <expression>}}` — the computed document becomes the document |
-| `$sort` | The same sort language. [Blocking](#the-memory-limit) |
+| `$sort` | The same [sort language](query-language.md#sort-and-projection), down to which element a key through an array reads. [Blocking](#the-memory-limit) |
 | `$skip`, `$limit` | Non-negative whole numbers |
 | `$unwind` | One output document per array element. Below |
 | `$group` | [Blocking](#the-memory-limit). **One row per distinct key**, so an empty input produces no rows at all. Accumulators below |
