@@ -59,8 +59,11 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   gone; each description states the clamp, `count` says which body fields it
   reads, and `docs/vectors.md` now documents that `k` defaults to 10 and is
   clamped to 1–1,000 (`0` is read as `1`, not as an empty page), which
-  nothing had written down. A spec lint keeps a clamp out of the validation
-  keywords from here on. Nothing the server does has changed.
+  nothing had written down. The MCP tool schemas say the same: `find`'s
+  `limit` and `vector_search`/`hybrid_search`'s `k` each describe their
+  clamp, since both route through the code that applies it. A spec lint
+  keeps a clamp out of the validation keywords from here on. Nothing the
+  server does has changed.
 
 ### Added
 
