@@ -10,8 +10,8 @@
 //!   serve()                          sync_once()
 //!     accept                            connect + handshake
 //!     handshake                         AskVersions  ─────▶
-//!            ◀───── AskVersions         ◀───── Versions
-//!     Versions ────▶                    behind(theirs)?
+//!            ◀───── AskVersions         ◀───── Vectors
+//!     Vectors ─────▶                    behind(theirs)?
 //!            ◀───── AskEntries          AskEntries  ─────▶
 //!     Entries ─────▶                    ◀───── Entries
 //!                                       apply_batch
@@ -21,7 +21,7 @@
 //! other is what converges them, and that falls out of every node running the
 //! same loop rather than needing a push half.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -204,10 +204,25 @@ where
 
     loop {
         match read_frame(&mut stream).await? {
-            Message::AskVersions {} => {
-                let versions =
+            Message::AskVersions { witnessed } => {
+                let servable =
                     engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-                write_frame(&mut stream, &Message::Versions(versions)).await?;
+                if !witnessed {
+                    // A requester that predates the flag, answered as it
+                    // always was (ADR-146).
+                    write_frame(&mut stream, &Message::Versions(servable)).await?;
+                    continue;
+                }
+                // Read after the servable vector, never before: the
+                // witnessed vector stays at or above the servable one by
+                // construction (ADR-054), and reading it second keeps that
+                // true of the pair on the wire, so the requester's gate can
+                // only ever read this node as further along, never as short
+                // of what it can serve.
+                let witnessed = engine
+                    .witnessed_vector()
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                write_frame(&mut stream, &Message::Vectors { servable, witnessed }).await?;
             }
             Message::AskWitnessed {} => {
                 let witnessed = engine
@@ -398,10 +413,11 @@ pub struct DivergenceProbe {
 /// branch is safe to check without flapping during ordinary catch-up.
 ///
 /// A round with no memory of the peer: the count half of the check is gated
-/// exactly as ADR-133 first had it — dropped while the peer is behind this
-/// node — because a peer can only be read as *frozen* rather than catching
-/// up across contacts, and this call has seen none. The loop, which has,
-/// calls [`sync_once_with`] and carries a [`PeerStalls`] between rounds.
+/// as ADR-133 first had it, on the vectors ADR-146 corrected it to — dropped
+/// while the peer has not processed everything this node has — because a
+/// peer can only be read as *frozen* rather than catching up across
+/// contacts, and this call has seen none. The loop, which has, calls
+/// [`sync_once_with`] and carries a [`PeerStalls`] between rounds.
 pub async fn sync_once(
     engine: &Engine,
     peer: SocketAddr,
@@ -417,10 +433,11 @@ pub async fn sync_once(
 /// `stalls` is read and updated in the round's own check branch, since that
 /// is where the peer's vector exists: the count half of the divergence
 /// check runs against a peer that is behind this node only once its
-/// position behind this node has come back unchanged on
+/// processed position behind this node has come back unchanged on
 /// [`FROZEN_CONTACTS`] consecutive checked contacts — see
 /// `divergence_probe_for` for why a moving position and a still one are
-/// different facts.
+/// different facts, and [`PeerStalls::gate_vector`] for which of the peer's
+/// two vectors "behind" is judged on.
 pub async fn sync_once_with(
     engine: &Engine,
     peer: SocketAddr,
@@ -635,15 +652,28 @@ where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let round = async {
-        write_frame(&mut stream, &Message::AskVersions {}).await?;
-        let Message::Versions(theirs) = read_frame(&mut stream).await? else {
-            return Err(ProtocolError::Malformed("expected Versions".into()));
+        // Both of the peer's vectors, on the one frame every round spends
+        // anyway (ADR-146): what it can serve drives the pull, and what it
+        // has processed drives the count half's gate below. A peer that
+        // predates the flag answers with the first alone.
+        write_frame(&mut stream, &Message::AskVersions { witnessed: true }).await?;
+        let (theirs, their_witnessed) = match read_frame(&mut stream).await? {
+            Message::Vectors { servable, witnessed } => (servable, Some(witnessed)),
+            Message::Versions(servable) => (servable, None),
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!("expected Vectors, got {other:?}")));
+            }
         };
+        let processed = stalls.gate_vector(peer, their_node, &theirs, their_witnessed.as_ref());
 
         // What we have *seen*, not what we could serve. Asking against the
         // servable vector re-requests everything a node processed without
-        // appending — replicated DDL, last-writer-wins losers — on every round,
-        // forever (ADR-054).
+        // appending — last-writer-wins losers, DDL it refused, declined or
+        // judged history, and stamps covered by a batch's window that it was
+        // never sent, such as a withheld `UniqueViolation` — on every round,
+        // forever (ADR-054). Replicated DDL that applies is *not* among them:
+        // `apply_ddl` appends the originating entry.
         let mine =
             engine.witnessed_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
         let Some(from) = mine.behind(&theirs) else {
@@ -659,7 +689,7 @@ where
             // branch is common on a converged cluster — though not, on its
             // own, on a busy one; see the `exhausted` branch below for the
             // other place this check runs.
-            let gate = divergence_probe_for(probe, stalls.observe(their_node, &theirs, &mine));
+            let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
             let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
@@ -794,7 +824,7 @@ where
         // nearly every round, unlike a single global "nothing to pull" gate,
         // which a continuous trickle of new writes can starve indefinitely.
         if window_exhausted {
-            let gate = divergence_probe_for(probe, stalls.observe(their_node, &theirs, &mine));
+            let gate = divergence_probe_for(probe, stalls.observe(their_node, processed, &mine));
             let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
             outcome.divergent = Some(findings.existence);
             outcome.count_probe = findings.count;
@@ -838,9 +868,10 @@ fn behind_beyond_horizon(
     Ok(kimmy_storage::lag_beyond_horizon_ms(theirs, mine, &collected))
 }
 
-/// Whether to trust the peer's document count this round, given `theirs` —
-/// the peer's version vector, fetched at the top of this round — and
-/// `mine`, this node's own vector as of just before asking (ADR-133).
+/// Whether to trust the peer's document count this round, given where the
+/// peer stands: its *witnessed* vector, fetched at the top of this round,
+/// against this node's own witnessed vector as of just before asking
+/// (ADR-133, on the vectors ADR-146 corrected it to).
 ///
 /// The gate that gets a caller into a divergence check at all —
 /// `mine.behind(&theirs).is_none()`, or the analogous `exhausted` check —
@@ -861,6 +892,25 @@ fn behind_beyond_horizon(
 /// cannot be trusted for a count this round, so the probe is dropped
 /// (`None`) — the existence half is unaffected, since it never depends on
 /// the peer being caught up on anything of *this* node's.
+///
+/// **Both sides of that question are witnessed vectors (ADR-146).** The
+/// gate first compared the peer's *servable* vector — what `AskVersions`
+/// answered, what the peer can hand onward — against this node's
+/// *witnessed* one, and the two are not the same measure. A peer that
+/// processed this node's latest entry from some origin without appending
+/// it — the loser of a concurrent write (ADR-054), a schema change it
+/// refused or declined, a `UniqueViolation` stamp it witnessed through a
+/// batch's coverage without ever being sent the entry (`entries_for_peer`
+/// withholds one from a pull and a push alike, ADR-029) — has a servable
+/// position on that origin below this node's witnessed
+/// position, for ever. Under the servable gate it read as behind
+/// indefinitely: before ADR-145 the count half was silently never compared
+/// against it, and after, it read as behind-and-still and was compared for
+/// the wrong reason after [`FROZEN_CONTACTS`] deferred contacts — on a
+/// converged idle cluster, a steady trickle of `deferred` from a peer that
+/// had nothing to catch up on. "Behind" means what ADR-133 says only when
+/// it is asked of what the peer has *processed*, which is the vector
+/// `AskVersions { witnessed: true }` now carries beside the servable one.
 ///
 /// **Behind and still is not behind and catching up (ADR-145).** The rule
 /// above reads every peer that is behind as a peer that is catching up, and
@@ -900,9 +950,9 @@ struct CountGate {
     deferred: bool,
 }
 
-/// How many consecutive checked contacts a peer's position behind this node
-/// must come back unchanged on before the peer is read as frozen rather
-/// than catching up (ADR-145).
+/// How many consecutive checked contacts a peer's processed position behind
+/// this node must come back unchanged on before the peer is read as frozen
+/// rather than catching up (ADR-145).
 ///
 /// A named constant rather than a setting: this is the number of sightings
 /// a stall needs before it stops being a coincidence, not a knob an
@@ -921,18 +971,20 @@ pub const FROZEN_CONTACTS: u32 = 3;
 /// document count in the first and third states and not the second.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerPosition {
-    /// The peer has witnessed everything this node has — `theirs` is not
-    /// behind `mine` at any origin. ADR-133's own trusted case.
+    /// The peer has processed everything this node has — its witnessed
+    /// vector is not behind this node's at any origin. ADR-133's own
+    /// trusted case, on the vector ADR-146 corrected it to.
     CaughtUp,
-    /// The peer is behind this node on some origin and its position there
-    /// moved since the last checked contact, or this node has too few
-    /// sightings of it to say. Ordinary catch-up: its count is stale and
-    /// must not be compared (ADR-133, defect 2).
+    /// The peer has not processed something this node has, on some origin,
+    /// and its processed position there moved since the last checked
+    /// contact, or this node has too few sightings of it to say. Ordinary
+    /// catch-up: its count is stale and must not be compared (ADR-133,
+    /// defect 2).
     Advancing,
-    /// The peer is behind this node and its position on every origin it
-    /// trails this node on has come back unchanged on [`FROZEN_CONTACTS`]
-    /// consecutive checked contacts. Not catching up: whatever its count
-    /// says is what it holds, and will keep holding.
+    /// The peer is behind this node and its processed position on every
+    /// origin it trails this node on has come back unchanged on
+    /// [`FROZEN_CONTACTS`] consecutive checked contacts. Not catching up:
+    /// whatever its count says is what it holds, and will keep holding.
     Frozen,
 }
 
@@ -952,24 +1004,35 @@ pub enum PeerPosition {
 /// id a restarted member keeps.
 ///
 /// Only the origins the peer *trails this node on* are remembered, at the
-/// peer's position for each. The peer's own origin is never among them —
-/// nothing holds more of a node's writes than the node — so a wedged member
-/// that is still taking local writes reads as still, which it is on every
-/// origin that matters here. An origin this node itself moved ahead on
-/// between two contacts joins the map without breaking the run, because
-/// that is this node advancing, not the peer; an origin the peer moved on
-/// breaks it, whether it caught up on that origin entirely or only got
-/// closer.
+/// peer's *processed* position for each — its witnessed vector against this
+/// node's (ADR-146), so a position only ever means "has not processed", and
+/// an entry the peer processed without appending does not read as a
+/// trailing position that never moves. The peer's own origin is never among
+/// them — nothing has processed more of a node's writes than the node — so
+/// a wedged member that is still taking local writes reads as still, which
+/// it is on every origin that matters here. An origin this node itself
+/// moved ahead on between two contacts joins the map without breaking the
+/// run, because that is this node advancing, not the peer; an origin the
+/// peer moved on breaks it, whether it caught up on that origin entirely or
+/// only got closer.
+///
+/// The invariant the memo and the gate hold together: the count probe is
+/// deferred only for a peer whose witnessed vector trails this node's
+/// witnessed vector on some origin *and* is still advancing there.
 #[derive(Debug, Default)]
 pub struct PeerStalls {
     by_peer: HashMap<NodeId, Stall>,
+    /// Peers whose last answer carried no witnessed vector — a version
+    /// before ADR-146 — so the gate is judged on their servable one, and
+    /// the log says so once rather than every round.
+    without_witnessed: HashSet<NodeId>,
 }
 
 /// One peer's remembered position and how long it has held it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Stall {
-    /// The peer's position, as of the last checked contact, on every origin
-    /// it then trailed this node on.
+    /// The peer's processed position, as of the last checked contact, on
+    /// every origin it then trailed this node on.
     trailing: BTreeMap<NodeId, Hlc>,
     /// Consecutive checked contacts on which every remembered position came
     /// back unchanged.
@@ -981,11 +1044,59 @@ impl PeerStalls {
         Self::default()
     }
 
+    /// Which of the peer's two vectors this contact's gate is judged on
+    /// (ADR-146): what it has processed, when it said; what it can serve,
+    /// from a peer that answered `AskVersions` without the witnessed vector
+    /// — a version before the flag — which is ADR-133's gate exactly as it
+    /// was, for that contact only, rather than a failed round. A peer that
+    /// processed an entry without appending it reads as behind under that
+    /// gate, and the count half defers or, after [`FROZEN_CONTACTS`]
+    /// contacts, compares it for the wrong reason, which is the state this
+    /// node was in before the peer is upgraded. Logged once per peer each
+    /// way, at info, because a rolling upgrade is bounded and ends, and a
+    /// `/metrics` series for it would read 0 for ever after: the line
+    /// names the member, and the operations guide names what a `deferred`
+    /// trickle on an idle cluster means.
+    pub fn gate_vector<'a>(
+        &mut self,
+        peer: SocketAddr,
+        node: NodeId,
+        servable: &'a VersionVector,
+        witnessed: Option<&'a VersionVector>,
+    ) -> &'a VersionVector {
+        match witnessed {
+            Some(witnessed) => {
+                if self.without_witnessed.remove(&node) {
+                    info!(
+                        %peer,
+                        node = %node,
+                        "peer now says what it has processed; the count half of the \
+                         divergence check is gated on it again"
+                    );
+                }
+                witnessed
+            }
+            None => {
+                if self.without_witnessed.insert(node) {
+                    info!(
+                        %peer,
+                        node = %node,
+                        "peer answered without saying what it has processed (a version before \
+                         the field); the count half of the divergence check is gated on what \
+                         it can serve until it does, which reads an entry it processed without \
+                         appending as a position it is behind on"
+                    );
+                }
+                servable
+            }
+        }
+    }
+
     /// Fold in the vector this checked contact with `peer` opened with, and
-    /// say where the peer stands. `theirs` is the peer's servable vector as
-    /// fetched at the top of the round; `mine` is this node's witnessed
-    /// vector as of just before the check — the same pair the gate always
-    /// judged.
+    /// say where the peer stands. `theirs` is the peer's witnessed vector as
+    /// fetched at the top of the round — or its servable one, from a peer
+    /// that did not say ([`Self::gate_vector`]); `mine` is this node's
+    /// witnessed vector as of just before the check.
     ///
     /// Called once per contact the check runs on, and not on a contact
     /// ADR-133's cap-truncation skip applies to: "consecutive" is
@@ -1191,21 +1302,24 @@ mod tests {
     }
 
     /// The truth table `divergence_probe_for` decides over `PeerStalls`
-    /// (ADR-133 defect 2, as amended by ADR-145). Three rows: a peer that
-    /// is behind and moving is deferred, every time; a peer that is behind
-    /// and has stood still for `FROZEN_CONTACTS` checked contacts is
-    /// compared; a peer that is not behind is compared at once. The gate's
-    /// `deferred` flag — what the `deferred` outcome is counted from — is
-    /// asserted alongside the probe on every row, so the counter cannot
-    /// say one thing while the wire does another.
+    /// (ADR-133 defect 2, as amended by ADR-145 and ADR-146), on the
+    /// vectors the gate is judged on: the peer's witnessed vector against
+    /// this node's. Three rows: a peer that is behind and moving is
+    /// deferred, every time; a peer that is behind and has stood still for
+    /// `FROZEN_CONTACTS` checked contacts is compared; a peer that is not
+    /// behind is compared at once. The gate's `deferred` flag — what the
+    /// `deferred` outcome is counted from — is asserted alongside the probe
+    /// on every row, so the counter cannot say one thing while the wire
+    /// does another.
     #[test]
     fn the_count_probe_is_deferred_for_a_moving_peer_and_compared_for_a_still_one() {
         let peer = node(1);
         let me = node(2);
         let mut stalls = PeerStalls::new();
 
-        // Behind and advancing: the peer's position on this node's origin
-        // moves on every contact, the shape of a backlog draining.
+        // Behind and advancing: the peer's processed position on this
+        // node's origin moves on every contact, the shape of a backlog
+        // draining.
         let mine = vector(&[(me, 100), (peer, 5)]);
         for their_wall in [10u64, 20, 30, 40, 50] {
             let theirs = vector(&[(me, their_wall), (peer, 5)]);
@@ -1215,10 +1329,10 @@ mod tests {
             assert_eq!(gate, CountGate { probe: None, deferred: true }, "at {their_wall}");
         }
 
-        // Behind and frozen: the same position comes back on contact after
-        // contact. The first sighting is the memo being written, the next
-        // `FROZEN_CONTACTS` are it standing still, and the probe goes out
-        // on the last of those.
+        // Behind and frozen: the same processed position comes back on
+        // contact after contact. The first sighting is the memo being
+        // written, the next `FROZEN_CONTACTS` are it standing still, and
+        // the probe goes out on the last of those.
         let mut stalls = PeerStalls::new();
         let theirs = vector(&[(me, 50), (peer, 5)]);
         for sighting in 1..=FROZEN_CONTACTS {
@@ -1258,11 +1372,13 @@ mod tests {
     }
 
     /// The two movements that must not break a stall's run, and the one that
-    /// must. This node moving ahead on its own origin, or gaining a new
-    /// origin from a third member, is this node advancing, not the peer; the
-    /// peer's own writes never enter the map at all. The peer getting closer
-    /// on an origin it trails — even without catching up on it — is the peer
-    /// advancing, and resets the run.
+    /// must — all on witnessed positions (ADR-146). This node moving ahead
+    /// on its own origin, or gaining a new origin from a third member, is
+    /// this node advancing, not the peer; the peer's own writes never enter
+    /// the map at all, because nothing has processed more of a node's
+    /// writes than the node. The peer processing more of an origin it
+    /// trails — even without catching up on it — is the peer advancing, and
+    /// resets the run.
     #[test]
     fn a_stall_survives_this_nodes_own_progress_and_breaks_on_the_peers() {
         let peer = node(1);
@@ -1270,6 +1386,7 @@ mod tests {
         let third = node(3);
         let mut stalls = PeerStalls::new();
 
+        // What the peer has processed, on each contact.
         let theirs = vector(&[(me, 50), (peer, 5)]);
         stalls.observe(peer, &theirs, &vector(&[(me, 100), (peer, 5)]));
         // This node writes more: its own origin moves, the peer's position
@@ -1288,7 +1405,8 @@ mod tests {
             "three unchanged sightings despite everything this node and the peer did locally"
         );
 
-        // The peer pulls some of this node's writes — closer, still behind.
+        // The peer processes some of this node's writes — closer, still
+        // behind.
         let theirs_moved = vector(&[(me, 120), (peer, 9)]);
         assert_eq!(
             stalls.observe(peer, &theirs_moved, &mine),
@@ -1296,5 +1414,152 @@ mod tests {
             "closer on an origin it trails is movement, and the run restarts"
         );
         assert_eq!(stalls.by_peer[&peer].unchanged, 0);
+    }
+
+    /// The defect ADR-146 corrects, at the gate. A peer that processed this
+    /// node's latest entry without appending it — the loser of a concurrent
+    /// write, say — has a servable position below this node's witnessed
+    /// one on that origin and a witnessed position level with it. Judged
+    /// on what it has processed, it is not behind and is compared at once;
+    /// judged on what it can serve, as the gate was, it is behind for ever
+    /// and reads as advancing, then frozen. A peer whose witnessed vector
+    /// does trail is behind, whatever it can serve.
+    #[test]
+    fn a_peer_that_processed_without_appending_is_not_behind() {
+        let peer = node(1);
+        let me = node(2);
+        let mine = vector(&[(me, 100), (peer, 5)]);
+        let their_servable = vector(&[(me, 80), (peer, 5)]);
+        let their_witnessed = vector(&[(me, 100), (peer, 5)]);
+
+        let mut stalls = PeerStalls::new();
+        for _ in 0..=FROZEN_CONTACTS {
+            let position = stalls.observe(peer, &their_witnessed, &mine);
+            assert_eq!(position, PeerPosition::CaughtUp, "processed everything this node has");
+            assert_eq!(
+                divergence_probe_for(probe(), position),
+                CountGate { probe: probe(), deferred: false }
+            );
+        }
+        assert!(stalls.by_peer.is_empty(), "nothing to remember about a peer that is level");
+
+        // The same peer on the servable vector: what the gate did before,
+        // and what it still does for a peer that did not say what it has
+        // processed.
+        let mut stalls = PeerStalls::new();
+        for _ in 0..FROZEN_CONTACTS {
+            let position = stalls.observe(peer, &their_servable, &mine);
+            assert_eq!(position, PeerPosition::Advancing, "behind on what it can serve");
+            assert!(divergence_probe_for(probe(), position).deferred);
+        }
+        assert_eq!(
+            stalls.observe(peer, &their_servable, &mine),
+            PeerPosition::Frozen,
+            "and then compared for the wrong reason: the position never moves"
+        );
+
+        // A peer that has genuinely not processed everything is behind,
+        // however much it can serve.
+        let mut stalls = PeerStalls::new();
+        let trailing = vector(&[(me, 90), (peer, 5)]);
+        let position = stalls.observe(peer, &trailing, &mine);
+        assert_eq!(position, PeerPosition::Advancing);
+        assert_eq!(
+            divergence_probe_for(probe(), position),
+            CountGate { probe: None, deferred: true }
+        );
+    }
+
+    /// Which vector the gate is judged on, and the one line each way. A
+    /// peer that said what it has processed is judged on that; one that
+    /// did not is judged on what it can serve, and the log line fires on
+    /// the first such answer and on the first answer that says again,
+    /// never in between.
+    #[test]
+    fn the_gate_is_judged_on_what_the_peer_processed_or_on_what_it_serves_if_it_did_not_say() {
+        let peer = node(1);
+        let addr: SocketAddr = "127.0.0.1:7900".parse().unwrap();
+        let servable = vector(&[(peer, 5)]);
+        let witnessed = vector(&[(peer, 5), (node(2), 100)]);
+        let mut stalls = PeerStalls::new();
+
+        assert_eq!(stalls.gate_vector(addr, peer, &servable, Some(&witnessed)), &witnessed);
+        assert!(stalls.without_witnessed.is_empty());
+
+        assert_eq!(stalls.gate_vector(addr, peer, &servable, None), &servable);
+        assert!(stalls.without_witnessed.contains(&peer), "remembered, so the line fires once");
+        assert_eq!(stalls.gate_vector(addr, peer, &servable, None), &servable);
+
+        assert_eq!(stalls.gate_vector(addr, peer, &servable, Some(&witnessed)), &witnessed);
+        assert!(stalls.without_witnessed.is_empty(), "upgraded: forgotten, so the line fires once");
+    }
+
+    /// A peer on one side of the upgrade or the other, over the wire this
+    /// round runs on. Both fake peers hold nothing this node lacks and
+    /// answer the same count; one answers `AskVersions` with both vectors
+    /// and a witnessed position level with this node's, the other — a
+    /// version before the flag — with its servable vector alone, which
+    /// trails. The first is compared; the second falls back to the old
+    /// gate and is deferred, and the round completes either way rather
+    /// than failing.
+    #[tokio::test]
+    async fn a_peer_that_answers_without_its_witnessed_vector_is_gated_on_its_servable_one() {
+        use tokio::io::DuplexStream;
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let orders = engine.create_collection("shop", "orders").unwrap();
+        engine.insert(&orders, bson::doc! { "_id": 1 }).unwrap();
+        let mine = engine.witnessed_vector().unwrap();
+        let me = engine.node_id();
+        assert!(mine.get(me) > Hlc::ZERO, "this node has something a peer can trail");
+        let probe = Some(DivergenceProbe { id: orders.id, mine_count: Some(1) });
+        let their_node = node(9);
+        let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+
+        // A peer that has processed everything this node has but can serve
+        // less of it: the entry it processed without appending.
+        let mut trailing = VersionVector::new();
+        trailing.insert(me, Hlc::new(1, 0));
+        let processed = mine.clone();
+
+        async fn fake_peer(mut stream: DuplexStream, answer: Message) {
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskVersions { witnessed: true } => {}
+                other => panic!("the round opens by asking for both vectors, got {other:?}"),
+            }
+            write_frame(&mut stream, &answer).await.unwrap();
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("nothing to pull, so the check comes next, got {other:?}"),
+            }
+            let divergence = Message::Divergence { collections: Vec::new(), probe_count: Some(1) };
+            write_frame(&mut stream, &divergence).await.unwrap();
+        }
+
+        // Upgraded: both vectors, gated on what it has processed.
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let answer = Message::Vectors { servable: trailing.clone(), witnessed: processed };
+        let peer = tokio::spawn(fake_peer(theirs, answer));
+        let mut stalls = PeerStalls::new();
+        let outcome = sync_over(&engine, ours, addr, their_node, probe, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        assert_eq!(
+            outcome.count_probe,
+            Some((orders.id, false)),
+            "compared, and equal: {outcome:?}"
+        );
+        assert!(!outcome.count_probe_deferred, "{outcome:?}");
+
+        // Not yet upgraded: the servable vector alone, and the old gate
+        // reads the same peer as behind. The round completes.
+        let (ours, theirs) = tokio::io::duplex(MAX_FRAME);
+        let peer = tokio::spawn(fake_peer(theirs, Message::Versions(trailing)));
+        let outcome = sync_over(&engine, ours, addr, their_node, probe, &mut stalls).await.unwrap();
+        peer.await.unwrap();
+        assert_eq!(outcome.count_probe, None, "deferred under the old gate: {outcome:?}");
+        assert!(outcome.count_probe_deferred, "{outcome:?}");
+        assert!(stalls.without_witnessed.contains(&their_node), "and noted as answering without");
+        assert_eq!(outcome.divergent, Some(std::collections::BTreeSet::new()), "the check ran");
     }
 }

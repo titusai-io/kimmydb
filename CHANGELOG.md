@@ -41,6 +41,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   counts a failed round twice and should drop the addition. The check still
   does not run on a failed round ([ADR-145](docs/decisions.md), amending
   ADR-133 and ADR-135).
+- **The divergence check's "behind" is judged on what a member has
+  processed, not on what it can serve.** The gate that decides whether a
+  peer's document count can be trusted compared the peer's servable version
+  vector against this node's witnessed one, and the two measure different
+  things: a member that processed this node's latest entry from some origin
+  without appending it — the loser of a concurrent write to one document, a
+  schema change it refused, a unique-violation stamp it witnessed through a
+  batch's coverage without ever being sent the entry — can
+  serve less of that origin than it has processed, for ever, and read as
+  behind for ever. Before ADR-145 its count was silently never compared;
+  after, it was compared only once it had "stood still" for three checked
+  contacts, so a converged idle cluster showed a trickle of
+  `kimmy_sync_divergence_count_probes_total{outcome="deferred"}` from a
+  member with nothing to catch up on. A sync round now asks a peer for both
+  vectors on the frame it already spends (`AskVersions` gains a `witnessed`
+  flag, answered by a new `Vectors` message) and gates on what the peer has
+  processed; on a converged idle cluster `deferred` no longer rises. Rolls
+  without failing a round: a member on the previous release ignores the
+  flag and answers as before, and the requester gates that contact on the
+  old rule and logs `peer answered without saying what it has processed`
+  once per such member, so a `deferred` trickle during a roll is expected
+  and ends with it ([ADR-146](docs/decisions.md), amending ADR-133 and
+  ADR-145).
 - **A drop is recorded and replicated wherever it lands.** `DELETE
   …/indexes/{name}` on a member that holds the collection but not the index
   used to answer `200 {"dropped": false}`, mint nothing, and do nothing

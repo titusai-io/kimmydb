@@ -8545,6 +8545,16 @@ which is unchanged.
 
 ## ADR-133 — A periodic cross-member check makes a divergence no counter can express visible, without repairing it
 
+> **Amended by [ADR-146](#adr-146--the-divergence-gate-compares-witnessed-with-witnessed-a-peer-is-behind-only-when-it-has-not-processed-everything-this-node-has).**
+> Defect 2's gate below judged whether the peer is behind by comparing the
+> peer's *servable* vector against this node's *witnessed* one. It now
+> compares witnessed with witnessed: the peer is behind only when it has
+> not *processed* everything this node has. A peer that processed this
+> node's latest entry from some origin without appending it can serve less
+> of that origin than it has processed, for ever, and under the servable
+> gate read as behind for ever. The argument below stands on the corrected
+> vectors.
+
 > **Amended by [ADR-145](#adr-145--the-count-half-compares-against-a-peer-that-is-behind-but-standing-still-and-the-divergence-gauge-says-how-old-its-reading-is).**
 > Defect 2's gate below — the count probe is dropped whenever the peer has
 > not yet witnessed something this node has — now drops it only while the
@@ -10293,6 +10303,15 @@ line with the defect, so the assertion above has a witness that can see it).
 
 ## ADR-145 — The count half compares against a peer that is behind but standing still, and the divergence gauge says how old its reading is
 
+> **Amended by [ADR-146](#adr-146--the-divergence-gate-compares-witnessed-with-witnessed-a-peer-is-behind-only-when-it-has-not-processed-everything-this-node-has).**
+> The gate and the memo below are fed the peer's *witnessed* vector, not
+> its servable one, so "behind" means the peer has not processed
+> everything this node has and "still" means its processed position
+> stopped moving. Under the servable vector a peer that processed an entry
+> without appending it read as behind-and-still and was compared for the
+> wrong reason, after three deferred contacts on a cluster with nothing to
+> catch up on. The frozen-run memo, the counter and the age gauge stand.
+
 **Decision.** Two amendments to the cross-member divergence check
 (ADR-133, ADR-135), one for each half of what a live cluster showed.
 
@@ -10527,3 +10546,194 @@ member's count half defers for `FROZEN_CONTACTS` contacts, compares, and
 confirms the count-only divergence with `failed` at 0 throughout; the
 frozen member's `ran` never moves again, every failed round is a skip, and
 its age rises while its gauge holds 0.
+
+---
+
+## ADR-146 — The divergence gate compares witnessed with witnessed: a peer is behind only when it has not processed everything this node has
+
+**Decision.** The guard on the count half of the cross-member divergence
+check — the document-count probe is dropped while the peer is behind this
+node and advancing (ADR-133 defect 2, as amended by ADR-145) — judges
+"behind" by comparing the peer's **witnessed** vector, what it has
+processed per origin whether it appended the entry or not, against this
+node's witnessed vector. It compared the peer's *servable* vector, the one
+`AskVersions` answers and the pull is driven by, against this node's
+witnessed one. So that the round has the peer's witnessed vector on every
+contact without spending a message on it, `AskVersions` gains an optional
+`witnessed` flag, and a flagged request is answered with a new message,
+`Vectors { servable, witnessed }`, in place of `Versions`; a sync round
+always sets the flag, and the served side reads the witnessed vector
+*after* the servable one so the pair on the wire keeps the order the two
+vectors hold on disk (ADR-054). A peer that predates the flag ignores it
+— plain serde, no `deny_unknown_fields`, the way `AskEntries::held`
+crossed versions (ADR-097) — and answers `Versions` as before; the
+requester then gates that contact on the servable vector exactly as
+ADR-133 and ADR-145 had it, logs once per peer at info that it did, and
+counts the contact as ADR-145 has it, `compared` or `deferred`, never
+failed. ADR-145's frozen-run memo (`PeerStalls`) stays as the safety net
+for a wedged peer and is fed the same vector, so "still" means the peer's
+*processed* position on the origins it trails stopped moving; the peer's
+own origin remains excluded from the trailing set — nothing has processed
+more of a node's writes than the node — and this node's own progress, on
+its own origin or on one pulled from a third member, still adds an origin
+to the map without breaking the run.
+
+**The invariant, stated.** The count probe is deferred only for a peer
+whose witnessed vector trails this node's witnessed vector on some origin
+and is still advancing there. A peer that has processed everything this
+node has is compared at once; a peer that trails and has stood still for
+`FROZEN_CONTACTS` checked contacts is compared; nothing about what either
+side can *serve* enters the decision.
+
+**Why.** Found in the review of ADR-145; pre-existing since ADR-133. The
+two vectors measure different things (ADR-054). What a node can serve
+onward is what it has appended; what it has processed includes every
+entry it took in without appending — the loser of a concurrent write to
+one document (ADR-054), a schema change it refused, declined or could not
+place (ADR-123, ADR-141), a replayed create or drop it judged history —
+older than the drop that removed what it names, or than the definition
+standing under the same name — and processed as applied without appending
+(`apply_ddl`'s history arms; `apply_remote_index` answering `false`), a
+`UniqueViolation` stamp it witnessed through a batch's coverage without
+ever being sent the entry — `entries_for_peer` withholds one from a pull
+and a push alike (ADR-029), and `coverage_after_batch` raises the
+witnessed vector to the sender's advertised one across the window it
+served, ADR-054's "an entry the sender holds but never ships". A peer
+that processed this node's latest entry from
+some origin that way has a servable position on that origin below this
+node's witnessed position, and nothing ever raises it: there is no later
+entry from that origin for it to append until that origin writes again,
+and on an idle cluster it does not. A gate that read the peer's servable
+vector took "cannot serve" for "has not seen", and such a peer read as
+behind for as long as the cluster stayed idle. Before ADR-145 that meant
+the count half was silently never compared against it. After ADR-145 the
+peer read as behind-and-still, was judged frozen after three checked
+contacts and then compared — the right comparison for the wrong reason,
+and on an idle cluster a trickle of `deferred` from every such peer while
+the memo caught up with it, which the operations guide had just told an
+operator was the signature of a member catching up. The new cluster test
+shows it in the smallest shape: two members, a collection and an index
+replicated, one concurrent write to one document, nothing else ever
+written, and the member holding the discarded write deferred its first
+three checked contacts against a peer that had nothing to catch up on.
+
+The mistake was easy to make because the gate on the other side of the
+same round is right. `mine.behind(&theirs)` asks whether *this* node has
+processed everything the peer can *serve*, a witnessed vector against a
+servable one, and that pairing is deliberate: it is the pull's question,
+and asking it of this node's servable vector re-requested everything a
+node processed without appending on every round, forever (ADR-054). The
+count half's question is the reverse — has the *peer* processed everything
+*this node* has — and the reverse of "my witnessed against their servable"
+is not "their servable against my witnessed". Each side's servable vector
+understates what that side has processed, so the only pair that answers
+the count half's question is the two witnessed vectors: this node's, which
+the round already reads, and the peer's, which the wire did not carry to a
+sync round until now. It has carried it to a push since ADR-143, which
+asks `AskWitnessed` to derive the window a member lacks from what that
+member has processed — the same distinction, made on the same wire, one
+message over.
+
+**Why a field on the frame the round already spends, and not the
+message a push asks.** `AskWitnessed` / `Witnessed` exist since ADR-143,
+and the round could send them once per checked contact, before the probe,
+at one extra round trip on a contact the check already pays a message
+for. Not taken, for two reasons that both come down to the roll. The
+round's first frame already asks the peer where it stands, and the second
+vector is a second read on the same side of the same connection; a flag
+on that frame costs one vector per contact and no round trip, on every
+contact rather than only checked ones, which is what lets the memo see it
+too. And a flag a peer does not know is ignored, where a *message* a peer
+does not know is a decode error that closes the connection: against a
+member on the previous release, `AskWitnessed` from a sync round would
+fail the round after its pull, back the member off, and slow replication
+between the two halves of a cluster for exactly the window a rolling
+upgrade wants it steady — the shape the operations guide documents for
+`AskDivergence` (ADR-133), which had no existing frame to ride on. This
+change does. `Versions` is a newtype variant, so the second vector could
+not be added to it as a field without changing its shape for a requester
+on the previous release; the answer to a flagged request is a new variant
+instead, sent only to a requester that asked, so a requester that did not
+reads exactly the frame it always did. Neither direction of a mixed pair
+loses a round.
+
+**Alternatives.** *Leave the gate and let the memo absorb it.* That is
+the state ADR-145 left, and it is wrong twice: three deferred contacts per
+such peer on a cluster with nothing to catch up on, and a `Frozen` verdict
+that ADR-145 defined as "its count is what it holds and will keep
+holding" handed to a peer that is level. The memo answers "has it
+stopped", not "is it behind", and the second question was being asked of
+the wrong vector. *Compare servable with servable.* Wrong the other way:
+this node's servable vector understates what this node has processed by
+the same mechanism, so a peer that had not processed an entry this node
+took in without appending would read as caught up, and its stale count
+compared. *Send `AskWitnessed` and treat a closed connection as "old
+peer".* A peer dying at that instant is indistinguishable from one on the
+previous release, the connection the probe needed is gone either way, and
+the round has to be reported as something; a flag the old peer answers
+through costs less and needs no such reading. *A `/metrics` series or
+label for the fallback.* A rolling upgrade is a bounded state that ends;
+a series for it would read 0 for the life of every cluster after, which is
+ADR-135's rule against a series that means nothing an operator can act
+on, and a third outcome on the count-probe counter would break its
+partition into `compared` and `deferred`, which the fallback contact still
+lands in. One line per peer each way, at info, names the member; the
+operations guide names what a `deferred` trickle on an idle cluster means.
+
+**Consequences.** On a converged idle cluster `deferred` does not rise,
+and the guide now says so as a reading: a steady trickle there is a member
+answering on the previous release's wire, named by the log line, or a
+real backlog, which `kimmy_replication_lag_seconds` shows. ADR-145's
+frozen-member reading is unchanged — a wedged member's processed position
+stands still exactly as its servable one did, since a member that
+processes nothing appends nothing — and its cluster test passes unchanged.
+During a rolling upgrade a member still on the previous release is gated
+on the old rule by every upgraded member until it is rolled, so the
+trickle ADR-145 produced persists for that member and ends with the roll;
+no round fails, nothing is backed off, and `kimmy_sync_failures_total`
+does not move for it.
+
+Residuals, stated. A peer on the previous release that processed an entry
+without appending it is still read as behind by an upgraded requester,
+and compared only after `FROZEN_CONTACTS` contacts, until it is rolled.
+The served side reads its witnessed vector a moment after its servable
+one, so the witnessed vector on the wire can only be the fresher of the
+two, which can only read the peer as further along and never as short of
+what it can serve; a peer that appended between the two reads is caught
+up on the entry it appended, which is the truth. Nothing about the
+existence half, the cap-truncation skip, the two-probe confirmation or
+the age gauge moves.
+
+Cost: one optional field on `AskVersions`, one message variant
+(`Vectors`), one `HashSet` on `PeerStalls` and `PeerStalls::gate_vector`
+beside `observe`; `sync_once` and `sync_once_with` keep their signatures,
+and the loop is untouched. Nothing on `/metrics` changes — no series, no
+label, no HELP text — so the byte-for-byte render test and the bridge
+guard are untouched. The stale phrase this ADR corrects in the operations
+guide, "if the peer has not yet witnessed something this node has", was
+right about what the gate should ask and wrong about what it did.
+
+Defended by `kimmy-cluster`'s protocol test
+`ask_versions_crosses_a_version_boundary_in_both_directions` (a request
+without the field reads as not asking, a field this build does not know
+does not fail the frame, and the frame this build writes is exactly that
+unknown field to an older receiver); by its transport tests
+`a_peer_that_processed_without_appending_is_not_behind` (the gate on
+witnessed positions, and the same peer on servable ones reading as
+advancing then frozen),
+`the_gate_is_judged_on_what_the_peer_processed_or_on_what_it_serves_if_it_did_not_say`
+(the fallback and its once-per-peer memo) and
+`a_peer_that_answers_without_its_witnessed_vector_is_gated_on_its_servable_one`
+(a real `sync_over` against a fake peer on each side of the upgrade over
+an in-process stream: compared under the new answer, deferred under the
+old one, and the round completing either way); by the two ADR-145
+transport tests, now on witnessed positions; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_converged_idle_cluster_defers_no_count_probe`, which runs two real
+loops over sockets on a converged cluster holding a replicated collection
+and index and one discarded concurrent write, and holds `deferred` at 0
+while `compared` rises on both members across eight checked contacts each
+— a test that fails on the servable gate, where the member holding the
+discarded write defers its first three contacts — beside ADR-145's
+`a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
+which passes unchanged.
