@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use kimmy_core::{CollectionId, DocId, Hlc, NodeId, OpKind, OplogEntry, Stamp, VersionVector};
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::docs::RemoteApplied;
 use crate::engine::{Engine, WriteTxn};
@@ -58,6 +58,14 @@ pub struct SyncOutcome {
     /// entry is witnessed so it is not re-served, and the divergence is
     /// visible here, in the log, and on `/metrics`.
     pub ddl_refused: usize,
+    /// Replicated index drops this node declined because the index standing
+    /// under the name here was created *after* the drop (ADR-132): a drop
+    /// re-served past the recreation it preceded, which is the rule doing
+    /// its job, or a drop from a member whose clock trailed the creator's,
+    /// which leaves this member holding an index its peers have dropped.
+    /// The witnessed vector keeps the first rare, so a count that keeps
+    /// rising is the second (ADR-141).
+    pub ddl_declined: usize,
     /// The peer the round was with, once it has introduced itself.
     pub peer: Option<NodeId>,
     /// How far the peer trails *this* node, in milliseconds of history —
@@ -229,7 +237,12 @@ pub fn lag_beyond_horizon_ms(
 
 impl SyncOutcome {
     pub fn total(&self) -> usize {
-        self.applied + self.superseded + self.ddl + self.unknown_collection + self.ddl_refused
+        self.applied
+            + self.superseded
+            + self.ddl
+            + self.unknown_collection
+            + self.ddl_refused
+            + self.ddl_declined
     }
 }
 
@@ -471,6 +484,7 @@ impl Engine {
             ddl = outcome.ddl,
             unknown_collection = outcome.unknown_collection,
             ddl_refused = outcome.ddl_refused,
+            ddl_declined = outcome.ddl_declined,
             "merged a batch from a peer"
         );
         Ok(outcome)
@@ -615,6 +629,10 @@ enum DdlOutcome {
     Applied,
     UnknownCollection,
     Refused,
+    /// A drop older than the index standing under its name: recorded as a
+    /// tombstone and not applied (ADR-132), counted so a member whose peers
+    /// have all dropped an index it keeps is visible (ADR-141).
+    Declined,
 }
 
 /// Sort a schema change's result into applied, gone, or refused, leaving
@@ -716,6 +734,7 @@ impl Engine {
                 DdlOutcome::Applied => outcome.ddl += 1,
                 DdlOutcome::UnknownCollection => outcome.unknown_collection += 1,
                 DdlOutcome::Refused => outcome.ddl_refused += 1,
+                DdlOutcome::Declined => outcome.ddl_declined += 1,
             }
             return Ok(());
         }
@@ -934,11 +953,23 @@ impl Engine {
                     && let Some(index) = current.index(&target.index)
                     && index.created.is_some_and(|created| entry.stamp < created)
                 {
-                    debug!(
+                    // Info, not warn: a re-served window carries a drop past
+                    // the recreation it preceded as a matter of course, and
+                    // that is the rule doing its job. Counted all the same,
+                    // because the other way to reach here is a drop from a
+                    // member whose clock trailed the creator's, which leaves
+                    // this member holding an index its peers have all
+                    // dropped, and nothing else reports that (ADR-141). The
+                    // escape hatch is a local drop on this member, which
+                    // mints a stamp ahead of the creation.
+                    info!(
                         db = %target.db,
                         collection = %target.collection,
                         index = %target.index,
-                        "ignored a drop older than the index it names"
+                        drop = ?entry.stamp,
+                        created = ?index.created,
+                        "declined a drop older than the index it names; counted in \
+                         kimmy_sync_ddl_declined_total"
                     );
                     // Still remembered, exactly as the `DropCollection` arm
                     // remembers a superseded drop: a tombstone never moves
@@ -954,7 +985,7 @@ impl Engine {
                         kimmy_core::IndexMeta::derive_id(&target.index),
                         entry.stamp,
                     )?;
-                    return Ok(DdlOutcome::Applied);
+                    return Ok(DdlOutcome::Declined);
                 }
 
                 let dropped = self.drop_index_inner(
@@ -2767,6 +2798,121 @@ mod tests {
     }
 
     #[test]
+    fn a_local_drop_of_an_index_this_member_does_not_hold_mints_the_drop_and_the_tombstone() {
+        // ADR-141: a drop is an instruction to the cluster, not a report on
+        // this member. Nothing here to remove, and still an entry to
+        // replicate and a tombstone to remember it by.
+        let (a, _da) = engine();
+        let ca = a.create_collection("shop", "orders").unwrap();
+        let dropped = a.drop_index_stamped("shop", "orders", "ghost").unwrap();
+        assert!(!dropped.removed, "this member held nothing");
+        let stamp = dropped.stamp.expect("the drop was recorded all the same");
+        let index_id = kimmy_core::IndexMeta::derive_id("ghost");
+        assert_eq!(a.index_dropped_at(ca.id, index_id).unwrap(), Some(stamp), "tombstone");
+        let history = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let drop = history.iter().find(|e| e.kind == OpKind::DropIndex).expect("the entry");
+        assert_eq!(drop.stamp, stamp, "under the stamp the tombstone records");
+        assert!(!a.drop_index("shop", "orders", "ghost").unwrap(), "and `drop_index` says so");
+        assert_eq!(
+            a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries.len(),
+            history.len() + 1,
+            "a second drop of the same absent name is a second instruction"
+        );
+    }
+
+    #[test]
+    fn a_drop_issued_on_a_member_without_the_index_removes_it_on_the_holder() {
+        // The finding, between two engines. A holds the index; B, which has
+        // never heard of it, is asked to drop it — the request a front routes
+        // to whichever member answers. B's drop replicates to A and removes
+        // the index there; A's create, arriving at B afterwards, is older
+        // than B's tombstone and reads as history. Both end without it, and
+        // nothing is refused.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let cb = b.create_collection("shop", "orders").unwrap();
+        // Strictly later wall time than A's create: the two engines share a
+        // clock but not a counter, and the drop must sort after the creation
+        // it removes (ADR-132).
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let dropped = b.drop_index_stamped("shop", "orders", "by_email").unwrap();
+        assert!(!dropped.removed);
+
+        let to_a = round(&a, &b, BATCH);
+        assert_eq!(to_a.ddl_refused + to_a.ddl_declined, 0, "{to_a:?}");
+        assert!(
+            a.get_collection("shop", "orders").unwrap().index("by_email").is_none(),
+            "the holder dropped it on B's instruction"
+        );
+        let to_b = round(&b, &a, BATCH);
+        assert_eq!(to_b.ddl_refused + to_b.ddl_declined, 0, "{to_b:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_email").is_none(),
+            "A's create is older than B's tombstone: history, not a rebuild"
+        );
+        assert_eq!(round(&a, &b, BATCH), SyncOutcome::default(), "converged, a's side");
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "converged, b's side");
+        let _ = cb;
+    }
+
+    #[test]
+    fn a_recreation_after_a_drop_from_a_non_holder_stands_everywhere() {
+        // The tombstone the non-holder recorded must not make the name
+        // unusable: a creation stamped after it is a new index, and wins on
+        // both members.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        b.drop_index("shop", "orders", "by_email").unwrap();
+        sync(&a, &b);
+        sync(&a, &b);
+        assert!(a.get_collection("shop", "orders").unwrap().index("by_email").is_none());
+        assert!(b.get_collection("shop", "orders").unwrap().index("by_email").is_none());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
+            .unwrap();
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.ddl_refused + outcome.ddl_declined, 0, "{outcome:?}");
+        assert!(
+            b.get_collection("shop", "orders").unwrap().index("by_email").is_some_and(|i| i.unique),
+            "the re-creation is newer than B's tombstone and stands on B too"
+        );
+    }
+
+    #[test]
+    fn a_replicated_drop_older_than_the_index_is_declined_and_counted() {
+        // The residual ADR-141 cannot reach, made visible: a drop whose stamp
+        // trails the creation of the index it names is declined, the index
+        // stays, and the decline is counted where an operator can see it.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        b.create_collection("shop", "orders").unwrap();
+        // B's drop first, then A's create: the create is the newer of the two.
+        let dropped = b.drop_index_stamped("shop", "orders", "by_email").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        a.create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+            .unwrap();
+        let drop = b.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
+
+        let outcome = a.apply_batch(&[drop]).unwrap();
+        assert_eq!(outcome.ddl_declined, 1, "declined and counted: {outcome:?}");
+        assert_eq!(outcome.ddl_refused, 0, "not a refusal: {outcome:?}");
+        assert!(
+            a.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
+            "the index it names is newer than the drop, and stands"
+        );
+    }
+
+    #[test]
     fn a_locally_recreated_index_with_the_same_name_beats_the_tombstone() {
         // A tombstone must not make a name permanently unusable: a creation
         // stamped after the drop is a new index, not a resurrection — on the
@@ -2831,6 +2977,7 @@ mod tests {
         // Now the older drop arrives, as an overlapping window re-serves it.
         let outcome = b.apply_batch(&[history[2].clone()]).unwrap();
         assert_eq!(outcome.ddl_refused, 0, "declining a stale drop is not a refusal: {outcome:?}");
+        assert_eq!(outcome.ddl_declined, 1, "but it is counted as declined (ADR-141): {outcome:?}");
         assert!(
             b.get_collection("shop", "orders").unwrap().index("email_1").is_some_and(|i| i.unique),
             "a drop older than the index it names must not remove it"

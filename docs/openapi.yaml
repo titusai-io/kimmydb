@@ -2136,17 +2136,21 @@ paths:
       operationId: dropIndex
       summary: Drop an index.
       description: |
-        Applied where it lands: the member that answers drops the index it
-        holds and the drop replicates. On a clustered node the drop is also
-        pushed to every live member before the response, as `createIndex`
-        is, and `confirmation` says who applied it (ADR-140). A drop that
-        finds nothing here answers `dropped: false`, mints nothing, and so
-        confirms nothing — it never reaches a member that does hold the
-        index. Send a drop to a member that holds the index.
+        A drop is an instruction to the cluster, not a report on the member
+        that answers: it is recorded and replicated whether or not that
+        member holds the index, so a drop issued through a front that spreads
+        requests across members removes the index wherever it stands
+        (ADR-141). `dropped` says whether *this* member held it and removed
+        it. On a clustered node the drop is also pushed to every live member
+        before the response, as `createIndex` is, and `confirmation` says
+        who applied it (ADR-140). A name a create would refuse is refused
+        here too, with `400`, before anything is recorded.
       x-kimmy-action: ddl
       responses:
         "200":
-          description: Dropped, or there was nothing to drop.
+          description: |
+            The drop is recorded and replicating. `dropped` says whether this
+            member held the index.
           content:
             application/json:
               schema:
@@ -2155,11 +2159,15 @@ paths:
                 properties:
                   dropped:
                     type: boolean
+                    description: |
+                      Whether this member held the index and removed it. `false`
+                      does not mean nothing happened: the drop is recorded and
+                      replicates to the members that do hold it.
                   confirmation:
                     $ref: "#/components/schemas/DdlConfirmation"
                     description: |
-                      Present on a clustered node when the drop minted an
-                      entry: what each live member answered.
+                      Present on a clustered node: what each live member
+                      answered when the drop was pushed to it.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }

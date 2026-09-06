@@ -57,6 +57,10 @@ pub struct RoundReport {
     /// its peers hold, and nothing will retry it; the `warn!` at the time
     /// names it.
     pub ddl_refused: usize,
+    /// Replicated index drops the rounds in this tick declined because the
+    /// index here was created after the drop — `SyncOutcome::ddl_declined`,
+    /// summed over the peers reached (ADR-141).
+    pub ddl_declined: usize,
     /// Collections the cross-member divergence check currently has confirmed
     /// against some peer (ADR-133): held there and not here, or held by
     /// both with disagreeing document counts. A level, like `backing_off` —
@@ -302,6 +306,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             health.succeeded(peer);
                             round_lag = Some(round_lag.unwrap_or(0).max(outcome.lag_ms));
                             report.ddl_refused += outcome.ddl_refused;
+                            report.ddl_declined += outcome.ddl_declined;
                             if let Some(node) = outcome.peer {
                                 // Folded in only when the check actually ran
                                 // against this peer this contact

@@ -1564,8 +1564,11 @@ fn drop_index_stamped(
 ) -> Result<(Value, Option<kimmy_core::Stamp>), ApiError> {
     let _span = op_span("drop_index", db, Some(coll)).entered();
     auth.require(Action::Ddl, db, Some(coll))?;
-    let stamp = state.engine.drop_index_stamped(db, coll, name)?;
-    Ok((json!({ "dropped": stamp.is_some() }), stamp))
+    // `dropped` says whether this member held the index; the drop is recorded
+    // and replicated either way, and its stamp is what the confirmation
+    // pushes (ADR-140, ADR-141).
+    let dropped = state.engine.drop_index_stamped(db, coll, name)?;
+    Ok((json!({ "dropped": dropped.removed }), dropped.stamp))
 }
 
 /// `unkeyed` is how many documents the index holds that it could not key —

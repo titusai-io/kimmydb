@@ -315,6 +315,7 @@ where
                         ddl: outcome.ddl,
                         ddl_refused: outcome.ddl_refused,
                         unknown_collection: outcome.unknown_collection,
+                        ddl_declined: outcome.ddl_declined,
                     },
                 )
                 .await?;
@@ -413,14 +414,17 @@ pub async fn push_entries(
     let exchange = async {
         write_frame(&mut stream, &Message::Push { entries }).await?;
         match read_frame(&mut stream).await? {
-            Message::Pushed { applied, ddl, ddl_refused, unknown_collection } => Ok(SyncOutcome {
-                applied,
-                ddl,
-                ddl_refused,
-                unknown_collection,
-                peer: Some(their_node),
-                ..SyncOutcome::default()
-            }),
+            Message::Pushed { applied, ddl, ddl_refused, unknown_collection, ddl_declined } => {
+                Ok(SyncOutcome {
+                    applied,
+                    ddl,
+                    ddl_refused,
+                    unknown_collection,
+                    ddl_declined,
+                    peer: Some(their_node),
+                    ..SyncOutcome::default()
+                })
+            }
             Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
             other => Err(ProtocolError::Malformed(format!("expected Pushed, got {other:?}"))),
         }
