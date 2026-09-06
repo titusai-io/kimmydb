@@ -1108,15 +1108,27 @@ mod tests {
 
     #[test]
     fn a_filter_restricts_the_results() {
+        // Half of the documents are allowed, not two of them. The graph's
+        // construction is randomised, and a point it leaves hard to reach is
+        // a recall roll — the one-in-ten `recall_against_exact_search_is_high`
+        // explicitly tolerates, and the roll `a_score_through_the_index…`
+        // once blocked a release on. Allowing two ids out of a hundred made
+        // this test a bet that neither was that point, and it lost on CI.
+        // With fifty allowed, an empty result would need every one of them
+        // unreachable, which is a broken graph rather than a roll. What the
+        // test asserts is unchanged: nothing outside the filter comes back,
+        // and the filter does not come back empty.
         let (engine, shadow, _dir) = setup(100, 8);
         let index = HnswIndex::build(&engine, &shadow, Metric::Cosine, 8).unwrap();
         let options = SearchOptions { k: 5, metric: Metric::Cosine, per_document: 1 };
 
-        let allowed: HashSet<String> = ["7".to_string(), "9".to_string()].into_iter().collect();
+        let allowed: HashSet<String> =
+            (0..100).filter(|i| i % 2 == 0).map(|i| i.to_string()).collect();
         let hits =
             index.search(&engine, &shadow, &pseudo_random(1, 8), &options, Some(&allowed)).unwrap();
 
         assert!(!hits.is_empty(), "the filter should not exclude everything");
+        assert!(hits.len() <= options.k, "no more than k: {}", hits.len());
         for hit in &hits {
             assert!(allowed.contains(&hit.id.to_string()), "{:?} was filtered out", hit.id);
         }
