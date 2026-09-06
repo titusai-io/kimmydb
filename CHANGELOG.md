@@ -12,6 +12,23 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **Nine `/metrics` series were never on the OTLP bridge.** `kimmy_databases`,
+  `kimmy_collections`, `kimmy_unique_violations`, `kimmy_commits`,
+  `kimmy_fsyncs`, `kimmy_commits_grouped_total`, `kimmy_storage_bytes`,
+  `kimmy_vector_index_cache_bytes` and `kimmy_up` were rendered by the
+  `/metrics` route ahead of the process counters, which is the block the
+  bridge reads and the block its guard test checks, so a collector-only
+  deployment could not see unique violations, commit and fsync cost, storage
+  size or the vector cache. They now render with everything else and reach
+  the bridge as `kimmy.databases`, `kimmy.collections`,
+  `kimmy.unique_violations`, `kimmy.commits`, `kimmy.fsyncs`,
+  `kimmy.commits.grouped`, `kimmy.storage.bytes`,
+  `kimmy.vector.index_cache.bytes` and `kimmy.up`; the guard now covers the
+  whole page ([ADR-142](docs/decisions.md)). `/metrics` itself is byte for
+  byte what it was.
+
 ### Added
 
 - **`createIndex` and `dropIndex` confirm the change on every live member

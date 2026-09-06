@@ -844,6 +844,17 @@ interesting values are well under a second.
 Every other bridged series is a counter or a level that a plain read serves, so
 for those the two surfaces genuinely cannot disagree.
 
+**The engine's block is bridged too** — `kimmy.databases`, `kimmy.collections`,
+`kimmy.unique_violations`, `kimmy.commits`, `kimmy.fsyncs`,
+`kimmy.commits.grouped`, `kimmy.storage.bytes`, `kimmy.vector.index_cache.bytes`
+and `kimmy.up` — read fresh at each export exactly as `/metrics` reads them at
+each scrape ([ADR-142](decisions.md)). Before that record they were on
+`/metrics` and not on the bridge, so a collector-only deployment could not see
+unique violations, commit and fsync cost, storage size or the vector cache.
+The two count gauges cost a metadata scan per export, as they cost one per
+scrape. An export whose engine reading fails reports nothing for that
+interval rather than zeros.
+
 ---
 
 ## The audit log

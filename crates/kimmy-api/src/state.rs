@@ -145,6 +145,40 @@ impl AppState {
         let _ = self.members.set(members);
     }
 
+    /// What the engine and the vector cache report right now: the block
+    /// `/metrics` renders ahead of the process counters, and the one the
+    /// OTLP bridge exports beside them (ADR-142). A fresh reading per
+    /// caller, so neither surface reports a window the other measured.
+    ///
+    /// Counts, never names: exposing collection names here would leak the
+    /// schema to anything that can reach the metrics port.
+    pub fn storage_readings(&self) -> Result<crate::metrics::StorageReadings, ApiError> {
+        let databases = self.engine.list_databases()?;
+        let mut collections = 0u64;
+        for db in &databases {
+            collections += self.engine.list_collections(&db.name)?.len() as u64;
+        }
+        Ok(crate::metrics::StorageReadings {
+            databases: databases.len() as u64,
+            collections,
+            // Surfaced here, not only on a change stream, so the condition is
+            // visible without anyone having been subscribed when it happened.
+            unique_violations: self.engine.unique_violations(),
+            // redb has a single writer and every commit is an fsync, so this
+            // over the request count is what a write actually costs.
+            commits: self.engine.commits(),
+            // Under `coalesced` the two diverge, and the gap is the win:
+            // commits that reached the disk without their own fsync (ADR-088).
+            fsyncs: self.engine.fsyncs(),
+            commits_grouped: self.engine.grouped_commits(),
+            storage_bytes: self.engine.storage_bytes(),
+            // An estimate from node count and width, not a heap measurement;
+            // what the budget evicts against, so the two agree by construction.
+            vector_index_cache_bytes: self.vectors.resident_bytes(),
+            index_unkeyed: self.engine.unkeyed_writes(),
+        })
+    }
+
     /// Install the schema-change confirmer, once, when clustering is up.
     pub fn set_ddl_confirmer(&self, confirmer: DdlConfirmer) {
         let _ = self.ddl_confirm.set(confirmer);
