@@ -231,10 +231,11 @@ definition carries no creation stamp there is nothing to compare, and the
 arrival is refused as below.
 
 **One that cannot be applied is skipped, not retried.** A replicated index
-definition this node's documents cannot be built under, or a name taken here
-by a different definition that cannot be settled against a stamp, is refused
-by this node's own data, and re-delivering the entry unchanged could never
-succeed. So the entry is witnessed, not appended, counted in
+definition this build cannot apply, or a name taken here by a different
+definition that cannot be settled against a stamp, is refused by this node's
+own state, and re-delivering the entry unchanged could never succeed. (A
+definition this node's *documents* do not fit is not in this class: it is
+built, and those documents are filed unkeyed under it — [ADR-139](decisions.md).) So the entry is witnessed, not appended, counted in
 `kimmy_sync_ddl_refused_total`, and logged at warning with the reason; the
 round goes on. Any *other* error still fails the round — a round that skips
 what it cannot understand is how corruption becomes convergence

@@ -3324,6 +3324,17 @@ components:
             as many entries as it returns, while a range that had to be put
             in `_id` order reads the whole range however few documents it
             returns. Absent for a collection scan and an `idLookup`.
+        unkeyedCandidates:
+          type: integer
+          description: |
+            Of `indexEntriesRead`, the entries read from the index's unkeyed
+            run: documents the index holds but could not key — arrays at two
+            of a compound index's paths, more than 1,000 keys, a Decimal128 —
+            which every scan of that index reads and rechecks whatever the
+            filter asked for. Present whenever `indexEntriesRead` is, and 0
+            for an index that keys every document it holds. A number above 0
+            is the cost of leaving such documents under the index; the index
+            listing's `unkeyed` reports the same set by size.
 
     ViolationGroup:
       type: object
@@ -3346,7 +3357,7 @@ components:
 
     Index:
       type: object
-      required: [name, fields, unique, enforcement, multikey]
+      required: [name, fields, unique, enforcement, multikey, unkeyed]
       properties:
         name: { type: string }
         fields:
@@ -3367,6 +3378,18 @@ components:
             Set once any indexed document held an array at an indexed path, and
             never cleared. Surfaced so an operator can see *why* a two-sided
             range on this index does not stop at its upper bound.
+        unkeyed:
+          type: integer
+          description: |
+            Documents the index holds that it could not key: arrays at two of
+            a compound index's paths, more than 1,000 keys for one document,
+            or a Decimal128 at an indexed path. They are stored and every
+            query still finds them, but each scan of this index rechecks all
+            of them, and a unique index does not check them at all. Zero is
+            the index doing its whole job. Anything else names work for the
+            collection's owner — reshape those documents, or split the index
+            — visible here without access to the server's logs, where each
+            one was also warned about by id.
         expireAfterSeconds:
           type: integer
           description: Present only on a TTL index.

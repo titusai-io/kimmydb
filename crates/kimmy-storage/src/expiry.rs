@@ -120,7 +120,10 @@ impl Engine {
 
         // The upper bound is inclusive, which is what makes a document whose
         // date lands exactly on the cutoff expire rather than waiting a pass.
-        self.index_candidates(coll, index.id, &lower, &upper)
+        // Keyed entries only: a document the index could not key holds no
+        // date it can be expired by, and reading it here would make every
+        // pass reconsider it and count it as skipped (ADR-139).
+        self.index_keyed_candidates(coll, index.id, &lower, &upper)
     }
 }
 

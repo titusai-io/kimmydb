@@ -590,6 +590,9 @@ async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
     for db in &databases {
         collections += state.engine.list_collections(&db.name)?.len();
     }
+    // The engine owns this count; the process counters mirror it so it
+    // renders in their block and reaches the OTLP bridge with them.
+    state.metrics.set_index_unkeyed(state.engine.unkeyed_writes());
 
     Ok(format!(
         "# HELP kimmy_databases Number of databases.\n\

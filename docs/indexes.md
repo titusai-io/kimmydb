@@ -186,57 +186,79 @@ little space and removes the hole.
 encode identically, so a lookup for `5` finds a document that stored `5.0`. See
 [Key Encoding](key-encoding.md).
 
-### Compound indexes over two arrays are rejected — per document, at write time
+### Documents an index cannot key
 
-A compound index spanning two array fields would write the cartesian product —
-`|a| × |b|` entries for a single document. Mongo rejects this ("cannot index
-parallel arrays"); so does KimmyDB, with a hard cap of 1,000 keys per document
-as a backstop.
+Three shapes give an index no finite, exact set of keys for a document:
 
-**When the rule bites.** The check runs on each document as its keys are
-computed, because that is the only moment the store knows what the document
-holds. So:
+- **arrays at two of a compound index's paths** — the keys would be the
+  cartesian product, `|a| × |b|` entries for one document;
+- **more than 1,000 keys for one document** — the backstop behind that rule,
+  and the ceiling for a single-field index over one very large array;
+- **a `Decimal128` at an indexed path** — which has no exact key encoding
+  ([Key Encoding](key-encoding.md#decimal128-is-refused)).
 
-- Creating a compound index over a collection in which **no** document holds
-  arrays at two of its paths succeeds, and is marked `multikey` if any document
-  holds one.
-- A later write of a document that holds arrays at two of the index's paths is
-  **refused with `400`**, naming the index.
-- Creating the index over a collection that **already** holds such a document
-  is **refused with `400`** too, naming the index — the same status and the
-  same message, `index "a_b" cannot be built for this document: a compound
-  index may span at most one array field`, because it is the same check
-  meeting the same pair from the other side.
+MongoDB refuses the first ("cannot index parallel arrays"). KimmyDB used to
+refuse all three, per document, at write time. **It no longer refuses any of
+them.** The document is stored, and the index files it under its **unkeyed
+run** — one entry under an empty key, which no real key can be and which
+sorts ahead of every real key. Every scan of the index reads that run beside
+its ranges and rechecks each document against the full filter, exactly as it
+rechecks any candidate. So every query still finds the document, and none
+finds it wrongly: the range was too wide, never too narrow, which is the rule
+everything above follows from.
 
-A schemaless store cannot refuse the definition at creation without refusing
-every compound index: nothing says the two fields will never both be arrays,
-and nothing says they ever will be. The rule is a property of the pair
-(definition, document), and it is checked where the pair meets.
+**An index is an access path, not a schema.** That is the whole of the
+reasoning, and [ADR-139](decisions.md) records what it cost to learn: a
+refusal that depends on an index is a constraint, and a leaderless store
+cannot hold a constraint across members without coordination. A member that
+had not yet received a definition legally accepted a document the
+definition's holder could then neither apply nor skip, and the holder's
+replication stopped for the life of the process. The rule bought a smaller
+index and an early error for a badly shaped document; it cost a cluster its
+convergence.
+
+**Where it shows.** Each unkeyed filing is logged at warning naming the
+database, collection, index and document id, and counted in
+`kimmy_index_unkeyed_total`. The index listing, `describe` and `createIndex`
+report `unkeyed` — how many documents the index holds that it could not
+key — and `explain` reports `unkeyedCandidates` beside `indexEntriesRead`,
+the entries a query read from the run. Zero is the index doing its whole
+job. Anything else is the cost of leaving such documents under the index:
+every scan of it rechecks all of them. The fix is the collection owner's, and
+needs no access to the server — reshape the documents, or split the compound
+index into single-field ones, which key every shape.
+
+**The unique exception.** A unique index must be able to key every document
+it covers, or it reports a constraint it does not hold. So a **local** write
+a unique index cannot key is still refused with `400`, naming the index, and
+creating a unique index over such a document is refused too — a client on
+this member is there to be told ([ADR-020](decisions.md)). A **replicated**
+write a unique index cannot key is a fact another member accepted: it is
+filed unkeyed, takes part in no uniqueness check, and is warned about and
+counted like any other, rather than refused.
 
 **On a replica.** A definition replicates as an operation, and the replica
-builds it over *its own* documents, which are not the origin's. If those
-cannot be indexed under it, the replica **skips the definition**, logs a
-warning naming the index and the reason, and counts it in
-`kimmy_sync_ddl_refused_total`. The round goes on, the entries behind it
-arrive, and the definition stands on the members that could build it. It does
-not fail the round: the refusal is a fact about the replica's data, and
-retrying the same entry could never succeed.
+builds it over *its own* documents, which are not the origin's. A document
+the definition cannot key is filed unkeyed, and the definition stands. The
+replica **skips** a definition only when it cannot apply it at all — a shape
+this build does not support, or a rival under a name it holds with no
+creation stamp to arbitrate — logging a warning naming the index and the
+reason and counting it in `kimmy_sync_ddl_refused_total`. The round goes on,
+the entries behind it arrive, and the definition stands on the members that
+could apply it. It does not fail the round: the refusal is a fact about the
+replica's state, and retrying the same entry could never succeed.
 
-What reaches it is a member that wrote a document the origin never had —
-while it was behind, or partitioned — and then receives a `CreateIndex` the
-origin still holds, whose backfill meets that document. Two more refusals are
-in the same class: an `enforcement` mode this build does not implement, and a
-rival definition arriving against a name this member holds **without a
-creation stamp**, which the conflict rule below has nothing to compare and so
-cannot resolve. Two *stamped* definitions under one name are resolved rather
-than refused, and the resolution itself is counted nowhere; the stamp rules
-below say how, and what is counted when the winning definition turns out to
-be one this member cannot build. A snapshot page carrying a definition this
-member cannot build is classified the same way as the first case, and the
-page's documents still restore.
+What reaches the refusal is a definition this build cannot apply, an
+`enforcement` mode it does not implement, or a rival definition arriving
+against a name this member holds **without a creation stamp**, which the
+conflict rule below has nothing to compare and so cannot resolve. Two
+*stamped* definitions under one name are resolved rather than refused, and
+the resolution itself is counted nowhere; the stamp rules below say how. A
+snapshot page carrying a definition this member cannot apply is classified
+the same way, and the page's documents still restore.
 
-**A dropped index leaves a tombstone**, and it is why the counter does *not*
-move for the sequence ADR-123 was written about. Like a dropped collection, an
+**A dropped index leaves a tombstone**, and it is one reason the counter does
+*not* move for the sequence ADR-123 was written about. Like a dropped collection, an
 index drop is recorded in `indexes_dropped` under the drop's stamp and kept
 for `tombstone_retention_secs`. So a creation re-served or replayed after the
 drop — which anti-entropy does routinely, and which is how the original wedge
@@ -292,10 +314,11 @@ rule working, not a divergence. **Creating a conflicting definition through
 the API is unaffected** — a client is refused `409 conflict`, naming what
 differs, because a client is there to be told.
 
-Where the winning definition cannot be built over the receiving member's own
-documents, the whole replacement is abandoned: that member keeps the index it
-already had, the refusal is counted in `kimmy_sync_ddl_refused_total` and
-logged, and the round goes on.
+Where the winning definition is one the receiving member cannot apply, the
+whole replacement is abandoned: that member keeps the index it already had,
+the refusal is counted in `kimmy_sync_ddl_refused_total` and logged, and the
+round goes on. A document the winner cannot key does not abandon it — the
+document is filed unkeyed under the winner, as under any index.
 
 **An index created before this version carries no creation stamp**, and reads
 as *older* than every drop and every rival: a replayed drop removes it, and a
@@ -670,7 +693,9 @@ defined but inert.
 A duplicate write is rejected with **409 `unique_violation`**. A document's own
 existing entry never counts against it, so updating in place works. Creating a
 unique index over data that *already* violates it is refused — building it
-anyway would advertise a constraint that does not hold.
+anyway would advertise a constraint that does not hold. For the same reason a
+unique index refuses a document it cannot key, where every other index files
+it unkeyed: see [Documents an index cannot key](#documents-an-index-cannot-key).
 
 ### The cross-node limit, stated plainly
 

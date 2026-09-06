@@ -782,14 +782,15 @@ async fn a_dropped_collection_does_not_come_back_through_replication() {
     );
 }
 
-/// A sender whose history holds an index definition the receiver's own
-/// documents cannot be built under.
+/// A sender holding an index definition over two paths, and a receiver
+/// holding a document with arrays at both — a document that definition
+/// cannot key.
 ///
-/// A created a compound index over two array fields while no document held
-/// arrays at both paths, dropped it, and then took such a document, which is
-/// legal once the index is gone. B holds one of its own. Replaying A's create
-/// on B means backfilling over B's document, which the definition forbids.
-async fn sender_with_an_index_the_receiver_cannot_build() -> (Node, Node) {
+/// A created the index while no document held arrays at both paths. B holds
+/// one of its own, written while it had not heard of the definition, which
+/// is the state a partition, a lagging member, or the seconds after a
+/// `createIndex` leave behind.
+async fn sender_with_an_index_over_a_document_the_receiver_cannot_key() -> (Node, Node) {
     let a = node().await;
     let b = node().await;
 
@@ -806,9 +807,8 @@ async fn sender_with_an_index_the_receiver_cannot_build() -> (Node, Node) {
             None,
         )
         .expect("accepted: no document holds arrays at both paths yet");
-    a.engine.drop_index("shop", "orders", "tags_1_cats_1").unwrap();
     let ca = a.engine.get_collection("shop", "orders").unwrap();
-    a.engine.insert(&ca, doc! { "_id": "both-a", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+    a.engine.insert(&ca, doc! { "_id": "fine", "tags": ["x", "y"], "cats": "p" }).unwrap();
 
     let cb = b.engine.create_collection("shop", "orders").unwrap();
     b.engine.insert(&cb, doc! { "_id": "both-b", "tags": ["x"], "cats": ["p"] }).unwrap();
@@ -816,41 +816,82 @@ async fn sender_with_an_index_the_receiver_cannot_build() -> (Node, Node) {
     (a, b)
 }
 
+/// Whether `engine` holds `name` on `shop.orders`, and how many of its
+/// documents that index could not key.
+fn index_state(engine: &kimmy_storage::Engine, name: &str) -> Option<u64> {
+    let coll = engine.get_collection("shop", "orders").unwrap();
+    let index = coll.index(name)?;
+    Some(engine.unkeyed_count(&coll, index.id).unwrap())
+}
+
 #[tokio::test]
-async fn a_replayed_index_that_cannot_be_built_does_not_wedge_replication() {
-    // The wedge ADR-123 fixes, over the wire. The create's backfill error is
-    // not `CollectionNotFound`, so it failed the round exactly as a dropped
-    // collection once did: the witnessed vector was discarded, the same
-    // window re-requested with backoff to 300 s for the life of the process,
-    // and the drop behind it in the window never reached. Observed on a
-    // three-member cluster running 0.20.0, with the lag gauge at 0 and every
-    // member live throughout.
-    let (a, b) = sender_with_an_index_the_receiver_cannot_build().await;
+async fn a_replayed_index_over_a_document_the_receiver_cannot_key_builds_and_does_not_wedge() {
+    // The order ADR-123 answered by refusing the definition, over the wire.
+    // Under ADR-139 the receiver builds it, files its own document unkeyed
+    // under it, counts nothing as refused, and reaches everything behind it.
+    let (a, b) = sender_with_an_index_over_a_document_the_receiver_cannot_key().await;
 
     // Unrelated work recorded after all of that, which the round has to get
-    // past the refused entry to reach.
+    // past the definition to reach.
     let live = a.engine.create_collection("shelf", "survivor").unwrap();
     a.engine.insert(&live, doc! { "_id": "must-replicate" }).unwrap();
 
     let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
-        .expect("the round must not fail on an index this node cannot build");
-    assert_eq!(outcome.ddl_refused, 1, "skipped and counted: {outcome:?}");
-    assert!(
-        b.engine.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
-        "the index must not exist on the receiver"
+        .expect("the round must not fail on an index over a document this node cannot key");
+    assert_eq!(outcome.ddl_refused, 0, "built, not refused: {outcome:?}");
+    assert_eq!(
+        index_state(&b.engine, "tags_1_cats_1"),
+        Some(1),
+        "the receiver holds the index, with its own document filed unkeyed"
     );
 
     let coll = b
         .engine
         .get_collection("shelf", "survivor")
-        .expect("work recorded after the refused create must replicate");
+        .expect("work recorded after the definition must replicate");
     assert!(
         b.engine.get(&coll, &DocId::String("must-replicate".into())).unwrap().is_some(),
-        "a refused schema change must not block the entries behind it"
+        "a schema change must not block the entries behind it"
     );
     let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
     assert_eq!(second.total(), 0, "witnessed, so the window is not re-served: {second:?}");
+}
+
+#[tokio::test]
+async fn a_document_an_index_here_cannot_key_does_not_wedge_replication() {
+    // The wedge, over the wire: the member holding the index pulls a
+    // document a member without it legally accepted. Before ADR-139 the
+    // batch failed as a malformed frame, the witnessed vector was discarded,
+    // and the same window was re-requested with backoff to 300 s for the
+    // life of the process — observed on a three-member cluster running
+    // 0.23.2, twice in one hour, with four collections diverging behind it.
+    // Now it is a round like any other.
+    let (a, b) = sender_with_an_index_over_a_document_the_receiver_cannot_key().await;
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&cb, doc! { "_id": "later" }).unwrap();
+
+    let outcome = sync_once(&a.engine, b.addr, SECRET, None)
+        .await
+        .expect("the round must not fail on a document this node's index cannot key");
+    assert_eq!(outcome.applied, 2, "both of B's documents apply: {outcome:?}");
+    assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+    let ca = a.engine.get_collection("shop", "orders").unwrap();
+    assert!(a.engine.get(&ca, &DocId::String("both-b".into())).unwrap().is_some(), "stored");
+    assert_eq!(
+        index_state(&a.engine, "tags_1_cats_1"),
+        Some(1),
+        "the holder keeps its index, with the document filed unkeyed under it"
+    );
+    let second = sync_once(&a.engine, b.addr, SECRET, None).await.unwrap();
+    assert_eq!(second.total(), 0, "witnessed, so the window is not re-served: {second:?}");
+
+    // And the two members converge on one state, whichever order the pair
+    // met in on each of them.
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(index_state(&b.engine, "tags_1_cats_1"), Some(1));
+    assert_eq!(a.engine.count(&ca).unwrap(), 3);
+    assert_eq!(b.engine.count(&cb).unwrap(), 3);
 }
 
 #[tokio::test]
@@ -904,16 +945,61 @@ async fn a_dropped_index_never_comes_back_through_replication() {
     );
 }
 
+/// A sender holding a definition the receiver refuses: the receiver holds
+/// the same name with **no creation stamp** — what a definition written
+/// before ADR-132 looks like on disk — and a rival it cannot arbitrate is
+/// refused and counted rather than resolved (ADR-123). Under ADR-139 no
+/// document can make a non-unique definition unbuildable, so this is the
+/// refusal a wire test reaches for.
+async fn sender_with_a_definition_the_receiver_cannot_arbitrate() -> (Node, Node) {
+    let a = node().await;
+    let b = node().await;
+    let source = node().await;
+
+    source.engine.create_collection("shop", "orders").unwrap();
+    source
+        .engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            false,
+            Some("by_email".into()),
+        )
+        .unwrap();
+    let mut page = source.engine.snapshot_page(None).unwrap();
+    for state in &mut page.collections {
+        for index in &mut state.indexes {
+            index.created = None;
+        }
+    }
+    page.documents.clear();
+    page.versions = kimmy_core::VersionVector::default();
+    b.engine.apply_snapshot_page(&page).unwrap();
+
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index(
+            "shop",
+            "orders",
+            vec![kimmy_core::IndexField::ascending("email")],
+            true,
+            Some("by_email".into()),
+        )
+        .unwrap();
+    (a, b)
+}
+
 #[tokio::test]
 async fn the_round_report_reaches_the_hook() {
     // What the replication loop tells the caller after each tick, beyond
     // lag: rounds that failed, peers it is backing off from, schema changes
     // it refused. Each one exists because the lag gauge said nothing while a
     // cluster was wedged (ADR-123). One peer that will refuse a connection,
-    // one whose history holds a definition this node cannot build.
+    // one whose history holds a definition this node cannot arbitrate.
     use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
 
-    let (a, b) = sender_with_an_index_the_receiver_cannot_build().await;
+    let (a, b) = sender_with_a_definition_the_receiver_cannot_arbitrate().await;
     // Bound and released: a port with nothing listening refuses at once.
     let dead = {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1822,14 +1908,15 @@ async fn an_unstamped_rival_definition_is_refused_and_counted_over_the_wire() {
     );
 }
 
-/// ADR-132's other remaining rise, over the wire: the arriving definition
-/// *wins* the creation-stamp comparison and still cannot be built over the
-/// documents this node holds. The replacement aborts whole — B keeps the
-/// index it had rather than ending with neither — the round goes on, and the
-/// skip is counted. This is the case that stops "refuse every rival" being a
-/// valid simplification of ADR-132's rule.
+/// ADR-132's other rise, over the wire, under ADR-139: the arriving definition
+/// *wins* the creation-stamp comparison over a document this node holds that
+/// the definition cannot key. Before ADR-139 the replacement aborted whole
+/// and was counted; now the winner builds, the document is filed unkeyed
+/// under it, and the members agree on the later definition. A definition
+/// this build cannot *apply* still aborts whole — that case is pinned at the
+/// storage level, where an entry no member can mint can be built by hand.
 #[tokio::test]
-async fn a_winning_definition_that_cannot_be_built_is_refused_and_counted_over_the_wire() {
+async fn a_winning_definition_builds_over_a_document_it_cannot_key_over_the_wire() {
     let a = node().await;
     let b = node().await;
     let source = node().await;
@@ -1865,8 +1952,8 @@ async fn a_winning_definition_that_cannot_be_built_is_refused_and_counted_over_t
          the comparison and this test proves something else"
     );
 
-    // The document A's compound definition cannot be built over: two
-    // indexed paths both holding arrays.
+    // The document A's compound definition cannot key: two indexed paths
+    // both holding arrays.
     let cb = b.engine.get_collection("shop", "orders").unwrap();
     b.engine.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
@@ -1889,16 +1976,18 @@ async fn a_winning_definition_that_cannot_be_built_is_refused_and_counted_over_t
 
     let outcome = sync_once(&b.engine, a.addr, SECRET, None)
         .await
-        .expect("a definition it cannot build must not wedge the round");
-    assert_eq!(outcome.ddl_refused, 1, "skipped and counted, not applied: {outcome:?}");
-    let index = b.engine.get_collection("shop", "orders").unwrap().index("probe").cloned().unwrap();
+        .expect("a definition over a document it cannot key must not wedge the round");
+    assert_eq!(outcome.ddl_refused, 0, "built, not refused: {outcome:?}");
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    let index = cb.index("probe").cloned().unwrap();
+    assert_eq!(index.fields.len(), 2, "the later definition stands on B, as on A");
     assert_eq!(
-        index.fields.len(),
+        b.engine.unkeyed_count(&cb, index.id).unwrap(),
         1,
-        "the replacement aborted whole: B keeps its own definition, not neither"
+        "B's own document, filed unkeyed under the winner"
     );
     assert!(
         b.engine.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
-        "and the refusal does not stop the entries behind it"
+        "and the entries behind it arrive"
     );
 }

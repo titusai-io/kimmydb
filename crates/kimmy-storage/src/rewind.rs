@@ -284,7 +284,7 @@ impl Engine {
                 // would answer from the future the rewind just undid.
                 if let Some(meta) = collections.get(&collection_id) {
                     let newly_multikey =
-                        index::maintain(&txn, meta, before.as_ref(), after.as_ref(), &key)?;
+                        index::maintain(self, &txn, meta, before.as_ref(), after.as_ref(), &key)?;
                     // A restored image can hold arrays the current one did not;
                     // the flag is one-way, so marking is the only safe answer.
                     index::mark_multikey(&txn, &meta.db, &meta.name, &newly_multikey)?;

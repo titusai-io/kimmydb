@@ -327,7 +327,7 @@ impl Engine {
         // Same transaction as the document write, so the index cannot describe
         // a state that never existed. A unique violation returns here and the
         // caller aborts, which discards the document write with it.
-        let newly_multikey = index::maintain(txn, coll, None, Some(&doc), &key)?;
+        let newly_multikey = index::maintain(self, txn, coll, None, Some(&doc), &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry {
@@ -414,7 +414,7 @@ impl Engine {
             (existed, previous)
         };
 
-        match index::maintain(&txn, coll, previous.as_ref(), Some(&doc), &key) {
+        match index::maintain(self, &txn, coll, previous.as_ref(), Some(&doc), &key) {
             Ok(newly_multikey) => {
                 index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
             }
@@ -564,7 +564,7 @@ impl Engine {
         // A tombstoned document must leave no index entries behind, or a scan
         // would surface a candidate whose document no longer exists. A delete
         // writes no new image, so it can never flip the multikey flag.
-        index::maintain(&txn, coll, previous.as_ref(), None, &key)?;
+        index::maintain(self, &txn, coll, previous.as_ref(), None, &key)?;
 
         let entry = OplogEntry {
             stamp,
@@ -707,7 +707,7 @@ impl Engine {
             // though `coll` was resolved from the last committed state.
             let next = winner.document()?;
             let (violations, newly_multikey) =
-                index::maintain_remote(txn, coll, previous.as_ref(), next.as_ref(), &key)?;
+                index::maintain_remote(self, txn, coll, previous.as_ref(), next.as_ref(), &key)?;
             // A replicated array write makes this node's index multikey exactly
             // as a local one would — the planner here answers queries over the
             // merged data, wherever it was written.
@@ -937,7 +937,13 @@ impl Engine {
         let mut keyed: Vec<(&DocId, Vec<Vec<u8>>)> = Vec::with_capacity(detail.ids.len());
         for id in &detail.ids {
             if let Some(doc) = self.get(coll, id)? {
-                keyed.push((id, index::index_keys(index, &doc)?));
+                // A document the index cannot key holds no key, so it can
+                // share none: it has left the group, whatever it shared before.
+                let keys = match index::document_keys(index, &doc)? {
+                    index::DocumentKeys::Keyed { keys, .. } => keys,
+                    index::DocumentKeys::Unkeyed { .. } => Vec::new(),
+                };
+                keyed.push((id, keys));
             }
         }
         let ids: Vec<DocId> = keyed

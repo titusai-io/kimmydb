@@ -45,6 +45,13 @@ pub struct Engine {
     /// metrics endpoint without anyone having to be watching a stream when it
     /// happens — see [ADR-020](../../../docs/decisions.md).
     unique_violations: std::sync::atomic::AtomicU64,
+    /// Documents filed under an index's unkeyed run, since start: stored,
+    /// but with no key the index could derive for them, so every scan of that
+    /// index rechecks them (ADR-139). Local writes, replicated writes and
+    /// backfills all count here, because all three file them; a client sees
+    /// the standing number per index as `unkeyed` on the listing, and this is
+    /// the rate, for the metrics endpoint.
+    unkeyed_writes: std::sync::atomic::AtomicU64,
     /// Durable write transactions committed, since start.
     ///
     /// redb has a single writer and every commit is an fsync, so the number of
@@ -289,6 +296,7 @@ impl Engine {
             vector_generations: Mutex::new(Default::default()),
             path: path.to_path_buf(),
             unique_violations: std::sync::atomic::AtomicU64::new(0),
+            unkeyed_writes: std::sync::atomic::AtomicU64::new(0),
             commits: std::sync::atomic::AtomicU64::new(0),
             multi_chunk_docs: std::sync::atomic::AtomicUsize::new(
                 crate::modify::DEFAULT_MULTI_CHUNK_DOCS,
@@ -330,6 +338,11 @@ impl Engine {
         self.unique_violations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// How many documents have been filed unkeyed under an index since start.
+    pub fn unkeyed_writes(&self) -> u64 {
+        self.unkeyed_writes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// How many durable write transactions have committed since start.
     ///
     /// One per unit of work is the expectation. Anything that turns one
@@ -355,6 +368,10 @@ impl Engine {
 
     pub(crate) fn count_unique_violation(&self) {
         self.unique_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub(crate) fn count_unkeyed(&self, n: u64) {
+        self.unkeyed_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn bump_vector_generation(&self, collection: CollectionId) {

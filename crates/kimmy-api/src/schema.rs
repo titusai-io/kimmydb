@@ -110,13 +110,18 @@ pub fn describe_collection(
         })
         .collect();
 
+    let mut indexes = Vec::with_capacity(meta.indexes.len());
+    for index in &meta.indexes {
+        indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
+    }
+
     Ok(json!({
         "database": db,
         "collection": meta.name,
         "documentCount": total,
         "sampled": sampled,
         "fields": described,
-        "indexes": meta.indexes.iter().map(index_to_json).collect::<Vec<_>>(),
+        "indexes": indexes,
         "vector": meta.vector,
         // A fact about the node that answered, not about the collection —
         // named so, because a client that read it as a per-collection setting

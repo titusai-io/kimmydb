@@ -6954,6 +6954,16 @@ where the span gave 300.
 
 ## ADR-123 — A dropped index leaves a tombstone, and a schema change a replica cannot apply is skipped, counted and exported
 
+> **Amended by [ADR-139](#adr-139--a-document-an-index-cannot-key-is-stored-and-filed-unkeyed-not-refused).**
+> The refusal class below no longer holds a definition this node's
+> *documents* cannot be built under: such a definition is now built, with
+> those documents filed unkeyed under it, on every path — the replicated
+> create, the snapshot page, and the write that arrives after the definition.
+> What the class keeps is a definition this build cannot apply and a rival it
+> cannot arbitrate. "Why a two-array compound index is not refused at
+> creation" below is still the reasoning, and its conclusion — the check runs
+> where the pair meets — now ends in a filing rather than a refusal.
+>
 > **Amended by [ADR-132](#adr-132--an-index-carries-the-stamp-of-its-creation-and-a-drop-and-a-rival-are-both-settled-by-it).**
 > Not superseded: two claims below are withdrawn, and each only where a
 > creation stamp is there to decide it. Where **both** definitions carry one,
@@ -9746,3 +9756,152 @@ what changes is that the cluster can now *see* it. The drop contract in
 issued once rather than per member.
 
 ---
+
+## ADR-139 — A document an index cannot key is stored and filed unkeyed, not refused
+
+**Decision.** An index never refuses a document. Where an index cannot derive
+a finite, exact set of keys for a document — arrays at two of a compound
+index's paths, more than 1,000 keys for one document, a `Decimal128` at an
+indexed path — the document is stored and filed under the index's **unkeyed
+run**: one entry per such document under the empty key, which no real key
+can be and which sorts ahead of every real key. Every scan of the index reads
+that run beside its ranges, in every delivery order, and rechecks each
+document against the full filter as it rechecks any candidate. `index_keys`
+keeps its strict form for the one place a refusal is right: a **local** write
+against a **unique** index, and a local `createIndex` of a unique index over
+such a document, both refused with `400`, because a unique index must be able
+to key every document it covers and a client on this member is there to be
+told (ADR-020). A replicated write a unique index cannot key is filed
+unkeyed, takes part in no uniqueness check, and is warned about. The write
+path, the replicated write path and the backfill all file the same way, so
+the two orders in which a definition and a document can meet on a member
+land in one state. TTL expiry reads keyed entries only, since a document with
+no key holds no date to be expired by. Each unkeyed filing is logged at
+warning with the database, collection, index and document id, counted in
+`kimmy_index_unkeyed_total` (bridged as `kimmy.index.unkeyed`), reported per
+index as `unkeyed` on the index listing, `describe` and `createIndex`, and
+per query as `unkeyedCandidates` on `explain`. Amends ADR-123: a definition a
+member's documents do not fit is no longer in the refusal class, because
+it now builds; the class is left for a definition this build cannot apply
+and a rival it cannot arbitrate.
+
+**Why.** Observed on a three-member cluster running 0.23.2, twice in one
+hour. A member created a compound index over two paths while no document held
+arrays at both — legal, and correct. Seconds later a client, through a front
+that spreads requests across members, wrote a document holding arrays at
+both paths to a member that had not yet received the definition. That member
+validated the write against the indexes *it* held, found nothing to refuse,
+and committed it — also correct. The document replicated to the member
+holding the index, whose `maintain_remote` raised the same `InvalidQuery` a
+local write draws a `400` for. Nothing on the document path classified it:
+the error propagated out of the run's transaction, the transport labelled it
+a malformed frame, the witnessed vector was discarded, and the identical
+window was re-requested with backoff to 300 s for the life of the process.
+The member's entire inbound stream stopped, four collections diverged behind
+it, `kimmy_replication_lag_seconds` held its last value, and the recovery was
+an operator dropping the index directly on the stalled member. The second
+occurrence wedged two members at once. ADR-123 had answered the mirror order
+— a definition arriving after the document — by skipping the definition; a
+document arriving after the definition had no answer at all.
+
+**Why the rule goes rather than the classification.** The narrower fix is
+ADR-123's, one level down: classify the document's failure as a refusal and
+skip the document. It was considered and rejected, and so was every other
+answer that keeps the rule:
+
+- *Skip the document, count it.* The member never holds a document its
+  peers hold. That is a data divergence, permanent until the document is
+  rewritten elsewhere, and it contradicts ADR-020's own rule that a
+  replicated write cannot be refused without abandoning convergence. The
+  refused-definition case ADR-123 accepts costs a member an index; this
+  would cost it a document. Order-dependent, too: the member that met the
+  pair the other way holds the document and lacks the index.
+- *Skip and quarantine for replay.* The same divergence with a repair path
+  bolted on — a table, a backup tag, a route, an operator step — for a state
+  the rule below never enters.
+- *Drop the index on the member instead.* Converges, order-independently, to
+  the state a fresh `createIndex` would report, and loses an index the
+  operator created, cluster-wide, on the strength of one document. Consistent
+  with ADR-020 and the least change that converges; rejected only because
+  the rule below converges without losing anything.
+- *Index the cartesian product.* Sound here, since every candidate is
+  rechecked, and bounded by the 1,000-key cap — which is the second trigger,
+  and cannot be indexed past. Two mechanisms for one class.
+
+Behind all four is the same fact. A rule that can refuse a document because
+of an index is a constraint, and ADR-020 already established that a
+leaderless store cannot hold a constraint across members without coordination:
+a member holding the definition and a member holding the document are each
+valid alone and invalid merged. For uniqueness the product chose to accept
+and record, because there is no merge function for it. For these three rules
+there is a merge function, and it is the one every leaderless store with
+secondary indexes already uses: the index is a projection of the local
+documents, never a schema over them. A document the projection cannot express
+is simply a document the index does not narrow, and the recheck — which this
+codebase already runs on every candidate because an index "answers which
+documents *might* match" — is what keeps the answer exact. The rules were
+inherited from MongoDB, which can afford a refusal because every write goes
+through one primary and an index build commits on a quorum; a store that
+accepts writes on every member cannot, and the refusal bought a smaller index
+and an early error for a badly shaped document at the price of the
+cluster's convergence.
+
+**Why an empty key in the same table, rather than a table of its own.** Every
+real key begins with a type tag byte, so no document produces an empty key,
+and an empty slice sorts first — the run sits at the front of an index's
+entries, disjoint from every range a planner can ask for. Living in
+`INDEX_ENTRIES` means a drop's range purge, a backup, and the id migration
+cover it with no code of their own, and a scan reads it as one more range:
+its entries are in document-key order and hold each document once, exactly
+the shape of an exact probe, so the merged-runs delivery takes it as one
+more head, the key-order pass takes its entries with the rest, and index
+order reads it first. One seek says whether the run is empty, which it is
+for almost every index, and then the scan is exactly what it was — the
+single-run delivery included.
+
+**Why unique keeps a refusal, locally.** A unique index that cannot key a
+document cannot check it, and an index that reports a constraint it does not
+hold is worse than no index. ADR-020's asymmetry answers both sides: a local
+write is refused, because the client is there to be told; a replicated write
+is a fact another member accepted, and is filed unkeyed and warned about
+rather than refused, exactly as a replicated duplicate is recorded rather
+than refused. The unkeyed document is outside the constraint, and the listing
+says so.
+
+**What still makes a member refuse a definition.** ADR-123's class shrinks to
+what is true of the *definition*: a shape this build cannot apply (a TTL over
+two fields, a partial filter it cannot parse, `coordinated` enforcement) and
+a rival under a held name with no creation stamp to arbitrate (ADR-132). No
+document can make a non-unique definition unbuildable, on any path, which
+is what makes both arrival orders converge. The tests that built "an index
+the receiver cannot build" out of a two-array document now build one out of
+a definition no member can mint, so the skip-and-count machinery stays
+covered.
+
+**Companion.** `createIndex` will confirm the definition on every live member
+before it answers, so that the ordinary case — a client creating an index on
+one member and writing through a front seconds later — no longer opens the
+window this finding came through. That is a protocol change with its own
+record; it narrows the window, and this record is what makes the window
+harmless.
+
+**Alternatives.** *Refuse two-array compound indexes at creation.* ADR-123's
+own argument against still holds, and it would not touch the other two
+triggers. *Defer a write on a member with no index until a definition might
+arrive.* The member cannot tell "no index" from "an index in flight", so it
+would hold every write for a sync interval and still miss a partitioned
+member. *Hold the document under the cartesian product up to the cap and
+refuse past it.* Two mechanisms, and the cap case is the one ordinary data
+reaches. *A separate table for the run.* Rejected above.
+
+**Cost.** One seek per index scan to learn the run is empty; for an index
+that holds unkeyed documents, every scan of it reads and rechecks them all,
+which `unkeyedCandidates` reports and `unkeyed` on the listing predicts. A
+document filed unkeyed under a unique index is not checked for uniqueness. A
+client that relied on the `400` to police document shape has lost it, and
+the changelog says so: the shape is now visible on the index rather than
+refused at the write. `maintain` and `maintain_remote` take the engine, for
+the counter and the warning. `IndexScanOutcome` gains `unkeyed`; the
+`Index` schema gains a required `unkeyed`; `explain` gains
+`unkeyedCandidates`. One new `/metrics` series, pinned by the golden tests
+and the bridge guard.

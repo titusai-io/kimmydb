@@ -5741,7 +5741,9 @@ async fn count_agrees_on_every_access_path_and_says_which_it_took() {
     // The index narrowed the work, and the count says how far into it went.
     assert_eq!(indexed.0["explain"]["documentsExamined"], 9);
     assert_eq!(indexed.0["explain"]["indexEntriesRead"], 9);
+    assert_eq!(indexed.0["explain"]["unkeyedCandidates"], 0, "every document was keyable");
     assert!(scanned.0["explain"].get("indexEntriesRead").is_none(), "a scan read no index");
+    assert!(scanned.0["explain"].get("unkeyedCandidates").is_none(), "no index, no run");
 
     let by_id =
         count(json!({ "filter": { "_id": { "$in": [1, 2, 3, 999] } }, "explain": true })).await;
@@ -7782,6 +7784,7 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_backups_total",
             "kimmy_ttl_expired_total",
             "kimmy_ttl_skipped_total",
+            "kimmy_index_unkeyed_total",
             "kimmy_webhook_deliveries_total",
             "kimmy_webhook_deliveries_total",
             "kimmy_webhook_events_total",
@@ -9163,4 +9166,164 @@ async fn a_wrong_value_inside_a_tagged_enum_names_the_enums_own_field_not_the_in
     assert_eq!(chunk.status, 422, "{:?}", chunk.body);
     let message = chunk.body["message"].as_str().unwrap_or_default();
     assert!(message.contains("chunk.max_tokens") || message.contains("max_tokens"), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// Documents an index cannot key (ADR-139)
+// ---------------------------------------------------------------------------
+
+/// The `/metrics` body, fetched raw: the endpoint answers plain text.
+async fn metrics_text(server: &Server) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let host = server.base.strip_prefix("http://").unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await.unwrap();
+    let req = format!("GET /metrics HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await.unwrap();
+    let raw = String::from_utf8_lossy(&buf).into_owned();
+    raw.split("\r\n\r\n").nth(1).expect("a response body").to_string()
+}
+
+#[tokio::test]
+async fn a_document_an_index_cannot_key_is_stored_found_and_reported() {
+    // The write that used to be refused with 400 — arrays at two of a
+    // compound index's paths — is stored, found by every query a scan finds
+    // it by, and reported everywhere a client or an operator would look:
+    // `explain`, the index listing, `describe`, and `/metrics` (ADR-139).
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "tagged" })).await;
+    let docs = "/v1/db/shop/coll/tagged/docs";
+    for i in 0..5 {
+        let res = server
+            .post(
+                docs,
+                Some(&token),
+                json!({ "_id": i, "tags": ["a", "b"], "cats": format!("c{i}") }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let created = server
+        .post(
+            "/v1/db/shop/coll/tagged/indexes",
+            Some(&token),
+            json!({ "name": "tc", "fields": [{ "path": "tags" }, { "path": "cats" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["multikey"], true);
+    assert_eq!(created.body["unkeyed"], 0, "every existing document was keyable");
+
+    let both = server
+        .post(docs, Some(&token), json!({ "_id": 9, "tags": ["a", "b"], "cats": ["c1", "c9"] }))
+        .await;
+    assert_eq!(both.status, 200, "stored, not refused: {:?}", both.body);
+    assert_eq!(server.get(&format!("{docs}/9"), Some(&token)).await.status, 200);
+
+    let (server_ref, token_ref) = (&server, &token);
+    let count = move |filter: Value| async move {
+        let res = server_ref
+            .post(
+                "/v1/db/shop/coll/tagged/count",
+                Some(token_ref),
+                json!({ "filter": filter, "explain": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body
+    };
+    // Found through the index, by the recheck, and only by the queries it
+    // matches.
+    let hit = count(json!({ "tags": "a", "cats": "c9" })).await;
+    assert_eq!(hit["explain"]["strategy"], "index", "{hit}");
+    assert_eq!(hit["count"], 1, "{hit}");
+    assert_eq!(hit["explain"]["unkeyedCandidates"], 1, "read from the unkeyed run: {hit}");
+    let miss = count(json!({ "tags": "a", "cats": "c7" })).await;
+    assert_eq!(miss["count"], 0, "rechecked and rejected: {miss}");
+    assert_eq!(miss["explain"]["unkeyedCandidates"], 1, "read all the same: {miss}");
+    let all = count(json!({ "tags": "a" })).await;
+    assert_eq!(all["count"], 6, "{all}");
+    let scan = count(json!({ "cats": "c9" })).await;
+    assert_eq!(scan["explain"]["strategy"], "collectionScan", "{scan}");
+    assert!(scan["explain"].get("unkeyedCandidates").is_none(), "no index, no run: {scan}");
+    assert_eq!(scan["count"], 1, "{scan}");
+
+    // Reported on the index, wherever it is listed.
+    let listed = server.get("/v1/db/shop/coll/tagged/indexes", Some(&token)).await;
+    let tc = listed.body["indexes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["name"] == "tc")
+        .expect("the index is listed");
+    assert_eq!(tc["unkeyed"], 1, "{listed:?}", listed = listed.body);
+    let described = server.get("/v1/db/shop/coll/tagged/describe", Some(&token)).await;
+    assert_eq!(described.status, 200, "{:?}", described.body);
+    assert_eq!(described.body["indexes"][0]["unkeyed"], 1, "{}", described.body);
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{metrics}");
+
+    // Reshaping the document files it under real keys and clears the run.
+    let fixed = server
+        .put(&format!("{docs}/9"), Some(&token), json!({ "tags": ["a", "b"], "cats": "c9" }))
+        .await;
+    assert_eq!(fixed.status, 200, "{:?}", fixed.body);
+    let listed = server.get("/v1/db/shop/coll/tagged/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{}", listed.body);
+    let hit = count(json!({ "tags": "a", "cats": "c9" })).await;
+    assert_eq!(hit["count"], 1, "{hit}");
+    assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{hit}");
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "a counter, not a level: {metrics}");
+}
+
+#[tokio::test]
+async fn a_unique_index_still_refuses_a_document_it_cannot_key() {
+    // The one refusal that stays: a unique index must be able to key every
+    // document it covers, and a client writing to this member is there to
+    // be told (ADR-020). The document is not stored.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "keys" })).await;
+    let docs = "/v1/db/shop/coll/keys/docs";
+    let seeded = server.post(docs, Some(&token), json!({ "_id": 1, "k": ["a"], "v": "x" })).await;
+    assert_eq!(seeded.status, 200, "{:?}", seeded.body);
+    let created = server
+        .post(
+            "/v1/db/shop/coll/keys/indexes",
+            Some(&token),
+            json!({ "name": "kv", "fields": [{ "path": "k" }, { "path": "v" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+
+    let refused =
+        server.post(docs, Some(&token), json!({ "_id": 2, "k": ["a"], "v": ["y"] })).await;
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "bad_request");
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("\"kv\""), "names the index: {message}");
+    assert!(message.contains("a unique index must be able to key"), "{message}");
+    assert_eq!(server.get(&format!("{docs}/2"), Some(&token)).await.status, 404, "not stored");
+
+    // And a unique index cannot be created over such a document: with the
+    // index gone the document is stored, and the index cannot come back.
+    assert_eq!(server.delete("/v1/db/shop/coll/keys/indexes/kv", Some(&token)).await.status, 200);
+    let over = server.post(docs, Some(&token), json!({ "_id": 3, "k": ["b"], "v": ["z"] })).await;
+    assert_eq!(over.status, 200, "no unique index covers `k` and `v` now: {:?}", over.body);
+    let refused = server
+        .post(
+            "/v1/db/shop/coll/keys/indexes",
+            Some(&token),
+            json!({ "name": "kv", "fields": [{ "path": "k" }, { "path": "v" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    assert!(
+        refused.body["message"].as_str().unwrap().contains("cannot be created"),
+        "{:?}",
+        refused.body
+    );
 }

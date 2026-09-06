@@ -530,6 +530,13 @@ pub struct QueryStats {
     /// `explain` runs the same read-only scan (ADR-131) — so it appears
     /// there too whenever an index answers.
     pub index_entries: Option<usize>,
+    /// Of `index_entries`, the ones read from the index's unkeyed run:
+    /// documents the index could not key, which every scan of it reads and
+    /// rechecks whatever the filter asked for (ADR-139). Reported whenever
+    /// `index_entries` is, so a client can see the cost of leaving such
+    /// documents under the index — zero for an index that keys everything
+    /// it holds.
+    pub unkeyed: Option<usize>,
     /// Whether the filter pinned `_id` and was answered by primary-key reads.
     ///
     /// Reported separately from `index` because the primary key is not one: no
@@ -562,6 +569,9 @@ impl QueryStats {
         }
         if let Some(entries) = self.index_entries {
             out["indexEntriesRead"] = json!(entries);
+        }
+        if let Some(unkeyed) = self.unkeyed {
+            out["unkeyedCandidates"] = json!(unkeyed);
         }
         out
     }
@@ -700,12 +710,14 @@ where
             matched: recheck.matched,
             probes: pk.keys.len(),
             index_entries: None,
+            unkeyed: None,
             id_lookup: true,
         });
     }
 
     let mut plan = plan::choose(filter, &meta.indexes);
     let mut entries = None;
+    let mut unkeyed = None;
     if let Some(p) = &plan {
         // Candidates stream out of the index and are rechecked as they come,
         // so stopping stops the read; nothing proportional to the range is
@@ -733,7 +745,10 @@ where
                 Ok(recheck.take(stamp, doc))
             })?;
         match outcome {
-            Some(outcome) => entries = Some(outcome.entries),
+            Some(outcome) => {
+                entries = Some(outcome.entries);
+                unkeyed = Some(outcome.unkeyed);
+            }
             None => plan = None,
         }
     }
@@ -750,6 +765,7 @@ where
         matched: recheck.matched,
         probes: plan.as_ref().map_or(0, |p| p.ranges.len()),
         index_entries: entries,
+        unkeyed,
         id_lookup: false,
     })
 }
@@ -1370,7 +1386,12 @@ pub fn create_index(
         spec.expire_after_seconds,
         partial_filter,
     )?;
-    Ok(index_to_json(&index))
+    // What the backfill could not key, read back from the index it just
+    // built: the one number a client creating an index over existing data
+    // most wants beside `multikey`, and the listing reports the same field.
+    let meta = state.engine.get_collection(db, coll)?;
+    let unkeyed = state.engine.unkeyed_count(&meta, index.id)?;
+    Ok(index_to_json(&index, unkeyed))
 }
 
 pub fn list_indexes(
@@ -1381,8 +1402,11 @@ pub fn list_indexes(
 ) -> Result<Value, ApiError> {
     let _span = op_span("list_indexes", db, Some(coll)).entered();
     authorize(state, auth, Action::Read, db, coll)?;
-    let indexes: Vec<Value> =
-        state.engine.list_indexes(db, coll)?.iter().map(index_to_json).collect();
+    let meta = state.engine.get_collection(db, coll)?;
+    let mut indexes = Vec::with_capacity(meta.indexes.len());
+    for index in &meta.indexes {
+        indexes.push(index_to_json(index, state.engine.unkeyed_count(&meta, index.id)?));
+    }
     Ok(json!({ "indexes": indexes }))
 }
 
@@ -1444,7 +1468,9 @@ pub fn drop_index(
     Ok(json!({ "dropped": state.engine.drop_index(db, coll, name)? }))
 }
 
-pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
+/// `unkeyed` is how many documents the index holds that it could not key —
+/// read from the index, since the definition does not carry it.
+pub fn index_to_json(index: &kimmy_storage::IndexMeta, unkeyed: u64) -> Value {
     let mut out = json!({
         "name": index.name,
         "fields": index.fields.iter().map(|f| json!({
@@ -1459,6 +1485,12 @@ pub fn index_to_json(index: &kimmy_storage::IndexMeta) -> Value {
         // Surfaced so an operator can see *why* a two-sided range on this
         // index does not stop at its upper bound.
         "multikey": index.multikey,
+        // Documents the index holds and could not key: arrays at two of a
+        // compound index's paths, more than 1,000 keys, a Decimal128. Every
+        // scan of the index rechecks them (ADR-139). Zero is the index doing
+        // its whole job; anything else names work for the collection's owner,
+        // who can see it here without access to the server's logs.
+        "unkeyed": unkeyed,
     });
     // Added only when set, so listing ordinary indexes does not suggest every
     // one of them carries an expiry policy that happens to be null.
@@ -1801,6 +1833,7 @@ mod tests {
             matched: 0,
             probes,
             index_entries: None,
+            unkeyed: None,
             id_lookup: false,
         }
     }
