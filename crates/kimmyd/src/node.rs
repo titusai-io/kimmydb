@@ -1196,9 +1196,11 @@ async fn spawn_cluster(
 
 /// How this node confirms a schema change on its live members (ADR-140).
 ///
-/// Pushes the entry to every member at once and waits for each, bounded by
-/// `deadline` per member, so the request waits about as long as the slowest
-/// member takes rather than the sum. A member that answers with a refusal is
+/// Hands every member, at once, the window it lacks from this node ending in
+/// the entry (ADR-143), and waits for each, bounded by `deadline` per member,
+/// so the request waits about as long as the slowest member takes rather
+/// than the sum. A member the window cannot reach — too far behind — is
+/// named pending with the reason. A member that answers with a refusal is
 /// named as such — it counted the refusal itself, on its own
 /// `kimmy_sync_ddl_refused_total` — and one that does not answer is named
 /// pending with the reason. Anti-entropy still carries the change to both,
@@ -1223,11 +1225,11 @@ fn ddl_confirmer(
                 pushes.spawn(async move {
                     let pushed = tokio::time::timeout(
                         deadline,
-                        kimmy_cluster::push_entries(&engine, addr, &secret, vec![entry]),
+                        kimmy_cluster::push_entry(&engine, addr, &secret, &entry),
                     )
                     .await;
                     let result = match pushed {
-                        Ok(Ok((_, outcome))) => Ok(outcome),
+                        Ok(Ok(pushed)) => Ok(pushed),
                         Ok(Err(e)) => Err(e.to_string()),
                         Err(_) => Err(format!("no answer within {deadline:?}")),
                     };
@@ -1238,7 +1240,16 @@ fn ddl_confirmer(
             while let Some(joined) = pushes.join_next().await {
                 let Ok((addr, node, result)) = joined else { continue };
                 match result {
-                    Ok(outcome)
+                    Ok(kimmy_cluster::PushOutcome { unreached: Some(reason), .. }) => {
+                        info!(
+                            peer = %addr,
+                            node = %node,
+                            %reason,
+                            "a member was not pushed a schema change; anti-entropy will carry it"
+                        );
+                        found.pending.push((node, reason));
+                    }
+                    Ok(kimmy_cluster::PushOutcome { outcome, .. })
                         if outcome.ddl_refused > 0
                             || outcome.unknown_collection > 0
                             || outcome.ddl_declined > 0 =>

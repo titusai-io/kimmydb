@@ -241,9 +241,12 @@ counted like any other, rather than refused.
 every live member has applied or refused the change**, or a deadline has
 passed ([ADR-140](decisions.md)). The response's `confirmation` names each
 member's answer, so a client that creates an index here and writes through a
-front a moment later finds it enforced wherever the write lands. A member
-that did not answer in time is listed as `pending` and receives the change
-through anti-entropy; a partitioned member always will, which is why the
+front a moment later finds it enforced wherever the write lands. What is
+pushed is the window the member lacks, ending in the change, so a member's
+history never gains a hole ([ADR-143](decisions.md)). A member that did not
+answer in time, or was too far behind for one push to reach, is listed as
+`pending` and receives the change through anti-entropy; a partitioned member
+always will, which is why the
 paragraph above, not this one, is what keeps the cluster safe.
 
 **On a replica.** A definition replicates as an operation, and the replica

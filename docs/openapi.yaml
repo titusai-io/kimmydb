@@ -3462,8 +3462,10 @@ components:
           type: array
           description: |
             Members that did not answer before `cluster.ddl_confirm_timeout_secs`,
-            each with why. Each receives the change through anti-entropy; the
-            response cannot say when.
+            or that were too far behind for one push to reach — more than a
+            batch behind this node, or below its retention horizon — each with
+            why. Each receives the change through anti-entropy; the response
+            cannot say when.
           items:
             type: object
             required: [node, reason]

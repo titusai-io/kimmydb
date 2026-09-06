@@ -24,8 +24,9 @@ pub struct DdlConfirmation {
     /// their `kimmy_sync_ddl_refused_total` — or that do not hold the
     /// collection it names.
     pub refused: Vec<kimmy_core::NodeId>,
-    /// Members that did not answer before the deadline, and why. Each will
-    /// receive the change through anti-entropy; the response cannot say when.
+    /// Members that did not answer before the deadline, or that were too far
+    /// behind for one push to reach (ADR-143), and why. Each will receive the
+    /// change through anti-entropy; the response cannot say when.
     pub pending: Vec<(kimmy_core::NodeId, String)>,
 }
 
