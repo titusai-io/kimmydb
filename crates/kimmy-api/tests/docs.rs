@@ -28,6 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const CHANGELOG: &str = include_str!("../../../CHANGELOG.md");
 const THREAT_MODEL: &str = include_str!("../../../docs/threat-model.md");
 const OPERATIONS: &str = include_str!("../../../docs/operations.md");
+const VECTORS: &str = include_str!("../../../docs/vectors.md");
 
 /// The marker ADR-110 puts on a control that is merged but not yet released.
 const MARKER: &str = "next release";
@@ -318,5 +319,43 @@ fn operations_names_every_code_that_is_never_logged() {
          disagree. Missing from the document: {:?}. Named there but logged: {:?}",
         served.difference(&documented).collect::<Vec<_>>(),
         documented.difference(&served).collect::<Vec<_>>(),
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Search bounds
+// ---------------------------------------------------------------------------
+
+/// `docs/vectors.md` states the clamp on `k` with the numbers the server uses.
+///
+/// The clamp is prose because it is not a refusal — `docs/openapi.yaml`
+/// carries no `maximum` for it, and `tests/openapi.rs` insists on that — so
+/// this is the only thing holding the numbers in the guide to the constants.
+#[test]
+fn vectors_states_the_k_clamp_the_server_applies() {
+    use kimmy_api::vectors::{DEFAULT_K, MAX_K};
+    let thousands = |n: usize| {
+        let digits = n.to_string();
+        let mut out = String::new();
+        for (i, c) in digits.chars().enumerate() {
+            if i > 0 && (digits.len() - i).is_multiple_of(3) {
+                out.push(',');
+            }
+            out.push(c);
+        }
+        out
+    };
+    let paragraph = VECTORS
+        .split("\n\n")
+        .find(|p| p.starts_with("`k` defaults to"))
+        .expect("docs/vectors.md has a paragraph on `k`");
+    let expected = format!(
+        "`k` defaults to {DEFAULT_K} and is clamped to the range 1 to {} rather than refused",
+        thousands(MAX_K)
+    );
+    assert!(
+        paragraph.starts_with(&expected),
+        "docs/vectors.md must state the clamp the server applies:\n  want: {expected}\n  have: \
+         {paragraph}"
     );
 }

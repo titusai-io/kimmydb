@@ -48,6 +48,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   `kimmy.vector.index_cache.bytes` and `kimmy.up`; the guard now covers the
   whole page ([ADR-142](docs/decisions.md)). `/metrics` itself is byte for
   byte what it was.
+- **`docs/openapi.yaml` no longer declares a `maximum` on a field the server
+  clamps.** `FindRequest.limit`, the `limit` query parameter of
+  `GET …/docs`, and `SearchRequest.k` carried `maximum: 10000`,
+  `maximum: 10000` and `minimum: 1, maximum: 1000` while the server clamps
+  each rather than refusing it, so a generated client that honoured the
+  keyword rejected `limit: 50000` or `k: 2000` before sending — requests the
+  server answers `200` with a shorter page — and `count`, which takes the
+  `find` body, inherited a cap on a route that has none. The keywords are
+  gone; each description states the clamp, `count` says which body fields it
+  reads, and `docs/vectors.md` now documents that `k` defaults to 10 and is
+  clamped to 1–1,000 (`0` is read as `1`, not as an empty page), which
+  nothing had written down. A spec lint keeps a clamp out of the validation
+  keywords from here on. Nothing the server does has changed.
 
 ### Added
 

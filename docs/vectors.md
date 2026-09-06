@@ -383,6 +383,10 @@ pre-computed one. A `byo` collection must send `vector` — the server has no
 provider to embed the query with, and says so rather than returning an empty
 result that looks like "no matches".
 
+`k` defaults to 10 and is clamped to the range 1 to 1,000 rather than refused:
+`0` is read as `1`, and a larger value succeeds and answers with 1,000 hits at
+most. A search has no "window of nothing" the way `find`'s `limit: 0` does.
+
 Two refusals look alike from a distance and answer different questions. A
 collection with **no vector configuration** — `POST …/vector` was never called
 on it — is refused **`400 bad_request`**, and the message names that route:
