@@ -251,7 +251,14 @@ Image is ~106 MB (Debian slim runtime). Notes:
 > batch claiming its tail was not reached, below) fails a round the same way
 > and adds to the same counter, so during a roll a real fault could plausibly
 > be blamed on the upgrade — the `warn!` line at the point of detection is
-> what tells the two apart; a version-mismatch failure has none.
+> what tells the two apart; a version-mismatch failure has none. A later
+> change to the same exchange rolls without failing anything: a member on a
+> release before [ADR-146](decisions.md) answers `AskVersions` without the
+> vector of what it has processed, and the requester gates the count half
+> of the check on what that member can serve for that contact, as it did
+> before, logging `peer answered without saying what it has processed` once
+> per such member; see "The divergence check" below for what that does to
+> `deferred` while the roll is in progress.
 
 **Clustering in containers needs an explicit `KIMMY_CLUSTER_BIND`.** It defaults
 to the wildcard `0.0.0.0:7900`, and a wildcard is a listening instruction rather
@@ -507,7 +514,7 @@ the series; every series the endpoint exposes has a row.
 | `kimmy_sync_ddl_declined_total` | Replicated index drops this node declined because the index standing under the name here was created *after* the drop ([ADR-132](decisions.md)). A re-served window does this once and rarely, and it is the rule doing its job. A count that keeps rising while nothing is being recreated under that name is a member whose clock ran ahead when it created the index, which is now the only member still holding it; drop it directly on that member ([ADR-141](decisions.md)). Logged at info with both stamps |
 | `kimmy_sync_divergent_collections` | Collections a periodic cross-member check currently finds disagreeing with a peer, confirmed on two checks running: held there and not here, or held by both with a different document count. 0 on a converged cluster. **Alert on this above 0**: it is the one series in this table that moves for a divergence the other three cannot — no round fails, the lag gauge reads 0, nothing is refused. **Its 0 is only as good as the series below**: a 0 while the check is not running means *not checked*, not *not divergent*, so alert on the pair, not on this alone. See [below](#the-divergence-check) for what it compares, how often, and what it cannot catch ([ADR-133](decisions.md)) |
 | `kimmy_sync_divergence_checks_total{outcome}` | Contacts with a peer in which the check above **`ran`**, and rounds that did not run it (**`skipped`**): the round completed but the pull was truncated by the batch cap and could not be trusted, or the round failed. This is what tells a quiet cluster from a blind one. **Alert on `ran` not increasing** while `kimmy_cluster_members` is above 0 — the gauge above is then holding a value nothing has re-examined — and treat any sustained `skipped` rate as the gauge being *unknown* rather than clean, **including while `ran` is also rising**, which is the partly-blind case the alert cannot catch because neither series is labelled by peer. A round that failed is in `kimmy_sync_failures_total` *and* in `skipped` ([ADR-145](decisions.md)), so `ran` + `skipped` is every round the node attempted. See [below](#the-divergence-check) for the four readings ([ADR-135](decisions.md)) |
-| `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because the peer is behind this node and still catching up. `deferred` rising on a busy cluster is ordinary; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
+| `kimmy_sync_divergence_count_probes_total{outcome}` | Checked contacts in which the count half of the check — the half that catches a run of missing documents in a collection every member holds by name — **`compared`** the probed collection's count against the peer's, and checked contacts in which it was **`deferred`** because the peer is behind this node — has not *processed* everything this node has ([ADR-146](decisions.md)) — and still catching up. `deferred` rising on a busy cluster is ordinary, and on a converged idle cluster it should not rise at all; **`compared` flat while `ran` rises** is a count half that has not looked at anything, and the gauge's 0 then says nothing about document counts. A peer that is behind but whose position has not moved for 3 consecutive checked contacts is compared regardless, so a member whose replication has stopped is not deferred for as long as it stays stopped ([ADR-145](decisions.md)) |
 | `kimmy_sync_divergence_check_age_seconds` | Seconds since the last contact, with any peer, in which the check ran, as of the last sync tick; 0 before the first, when `ran` is also 0. **Alert on this above *k* × `cluster.sync_interval_secs`** (three is a reasonable *k*): the gauge above is then holding a value nothing has re-examined, whatever it reads — look at `kimmy_sync_failures_total` and `kimmy_sync_peers_backing_off`. The one divergence series that keeps moving on a member whose every round fails, which leaves `ran` flat and the gauge serving its last value: measured on a three-member cluster, one member's gauge read 0 for half an hour after its last completed round ([ADR-145](decisions.md)) |
 | `kimmy_request_duration_seconds` | End-to-end latency histogram; buckets measured, not guessed ([ADR-046](decisions.md)). Health and metrics routes are excluded so scrapes do not crowd the buckets real traffic lands in |
 | `kimmy_tls_reloads_total{outcome}` | `ok` / `failed` certificate reloads. **Alert on `failed`**: the node keeps serving the certificate it already had, so a botched renewal is invisible until that one expires and every client drops at once ([ADR-049](decisions.md)) |
@@ -705,9 +712,20 @@ behind this node.** A peer that has simply not yet pulled this node's own
 recent writes answers a probe with a stale, lower count for any collection
 those writes touched — ordinary replication lag, not divergence — and a
 count comparison alone cannot tell the two apart. Before trusting a count,
-this node checks the peer's advertised version vector against its own: if
-the peer has not yet witnessed something this node has, the count is
-dropped for that contact and only the existence half runs. Without this a
+this node checks what the peer says it has **processed** — its witnessed
+vector, asked for on the same frame as the vector that says what it can
+serve ([ADR-146](decisions.md)) — against its own witnessed vector: if the
+peer has not processed everything this node has, the count is dropped for
+that contact and only the existence half runs. It is the processed vector
+on both sides, deliberately. What a member can *serve* is what it has
+appended, and a member that processed an entry without appending it — the
+loser of a concurrent write to one document, a schema change it refused, a
+unique-violation stamp it witnessed through a batch's coverage without ever
+being sent the entry — can serve less of that origin than it has
+processed, for ever; judged on that vector, as this gate was until
+[ADR-146](decisions.md), such a member read as behind indefinitely and its
+count was deferred, or compared only once it had "stood still" for three
+contacts, on a cluster with nothing to catch up on. Without this a
 cluster running with any steady per-peer lag — the round that produced
 finding 14 measured 130–260 s between some pairs — would see the gauge
 firing continuously on ordinary catch-up, which is worse than not having the
@@ -725,14 +743,17 @@ count half never once compared against the wedged member, while four
 collections held different document counts on it under the same fifty
 names everywhere — the existence half agreed, the count half never looked,
 and every member's gauge read 0 with `ran` climbing. So the count is now
-dropped only while the peer is behind **and advancing** — its position on
-some origin it trails this node on moved since the last checked contact.
-Once that position has come back unchanged on **3 consecutive checked
-contacts**, the peer is read as standing still and its count is compared:
-a backlog draining moves on every round it completes, and a member that
-has stopped does not. The peer's own local writes do not count as movement,
-and neither does this node's own progress; only the peer getting closer on
-an origin it trails does.
+dropped only while the peer is behind **and advancing** — its processed
+position on some origin it trails this node on moved since the last
+checked contact. Once that position has come back unchanged on **3
+consecutive checked contacts**, the peer is read as standing still and its
+count is compared: a backlog draining moves on every round it completes,
+and a member that has stopped does not. The peer's own local writes do not
+count as movement, and neither does this node's own progress; only the
+peer processing more of an origin it trails does. The rule, in one line:
+the count probe is deferred only for a peer whose processed position
+trails this node's on some origin and is still moving there
+([ADR-146](decisions.md)).
 `kimmy_sync_divergence_count_probes_total{outcome}` counts each checked
 contact as `compared` or `deferred`, so a count half that has never
 compared against anyone is a flat `compared` beside a rising `ran`, rather
@@ -744,6 +765,20 @@ hold the collection, which the existence half reports. Confirmation is unchanged
 two consecutive probes of the same collection against that peer, both
 compared, both mismatched.
 
+**The idle-cluster reading.** On a converged cluster with nothing being
+written, `deferred` should not rise: every member has processed everything
+every other member has, and each checked contact compares. A steady
+trickle of `deferred` on an idle cluster means one of two things. Either a
+member is answering with the wire of a release before
+[ADR-146](decisions.md), which says only what it can serve, so the
+requester is gating that member on the older rule and reads an entry it
+processed without appending as a position it is behind on — expected
+during a rolling upgrade and gone once the last member is rolled; the
+`peer answered without saying what it has processed` line, once per such
+member at info, names it. Or the cluster is not as idle as it looks and
+some member has a real backlog, which `kimmy_replication_lag_seconds`
+shows. `deferred` rising on a *busy* cluster is ordinary either way.
+
 **What it cannot catch.** A document present in equal numbers on every
 member but with different content — a lost update that still counts, rather
 than a lost document. **A count divergence until its collection has been
@@ -751,11 +786,12 @@ probed twice running against the same peer** — reaching its turn once
 detects it but does not confirm it and does not move the gauge; nothing
 about a different collection being probed against that peer in between
 resets or advances that count, only a clean probe of the *same* collection
-does. **A count divergence on a peer that is behind and still moving** —
-the count half is deferred against it until it either catches up or stands
-still for 3 consecutive checked contacts, and a member wedged on one
-origin's entries while still pulling another member's reads as moving
-until that other origin has drained ([ADR-145](decisions.md)). **A round
+does. **A count divergence on a peer that has not processed everything this
+node has and is still moving** — the count half is deferred against it
+until it either catches up or stands still for 3 consecutive checked
+contacts, and a member wedged on one origin's entries while still pulling
+another member's reads as moving until that other origin has drained
+([ADR-145](decisions.md), [ADR-146](decisions.md)). **A round
 whose pull did not reach the peer's tail — see "what a `0` reading means"
 above.** Anything on a peer this node is not
 currently paired with in a round (`cluster.fanout` bounds the peers contacted

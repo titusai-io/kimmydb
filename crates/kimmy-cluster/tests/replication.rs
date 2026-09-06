@@ -308,7 +308,7 @@ async fn a_peer_that_never_proves_itself_learns_nothing() {
 
     let mut stream = TcpStream::connect(a.addr).await.unwrap();
     // Skip the handshake entirely and ask straight out.
-    write_frame(&mut stream, &Message::AskVersions {}).await.unwrap();
+    write_frame(&mut stream, &Message::AskVersions { witnessed: false }).await.unwrap();
 
     let response = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stream)).await;
     match response {
@@ -1994,6 +1994,93 @@ async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_repo
     assert!(failed >= 1, "the freeze is a run of failed rounds");
     assert_eq!(skips, failed, "every failed round is counted as a skip, and only those");
     frozen_loop.abort();
+}
+
+/// The pre-existing defect ADR-146 corrects, end to end through two real
+/// loops on a cluster with nothing to do. The gate that decides whether a
+/// peer is "behind" compared the peer's *servable* vector against this
+/// node's *witnessed* vector. A peer that processed this node's latest entry
+/// from some origin without appending it — here, the loser of a concurrent
+/// write to one document (ADR-054) — has a servable position on that origin
+/// below this node's witnessed position, for ever: under the old gate it
+/// read as behind indefinitely, and under ADR-145 as behind-and-still, so
+/// the count half deferred against it for `FROZEN_CONTACTS` contacts before
+/// comparing — a steady `deferred` trickle on an idle cluster, and the right
+/// count for the wrong reason. Gated on what the peer has *processed*, a
+/// converged idle cluster defers nothing: `deferred` stays at 0 and
+/// `compared` rises on both members.
+///
+/// The collection and the index are created on one member and replicated
+/// to the other; a replicated schema change is appended under its
+/// originating stamp, so on its own it leaves no gap between the two
+/// vectors. The discarded write is what does.
+#[tokio::test]
+async fn a_converged_idle_cluster_defers_no_count_probe() {
+    use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let a = node().await;
+    let b = node().await;
+
+    let orders = a.engine.create_collection("shop", "orders").unwrap();
+    a.engine.create_index("shop", "orders", vec![field("email")], false, None).unwrap();
+    sync(&a, &b).await;
+
+    // A concurrent write to one document: the older one loses on the other
+    // member, which processes it without appending it (ADR-054).
+    a.engine.insert(&orders, doc! { "_id": 1, "email": "first" }).unwrap();
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let orders_b = b.engine.get_collection("shop", "orders").unwrap();
+    b.engine.insert(&orders_b, doc! { "_id": 1, "email": "second" }).unwrap();
+
+    sync(&a, &b).await;
+    sync(&a, &b).await; // converged, and nothing else is ever written
+    assert!(
+        a.engine.version_vector().unwrap() != b.engine.version_vector().unwrap()
+            || b.engine.witnessed_vector().unwrap() != b.engine.version_vector().unwrap(),
+        "the discarded write must leave one member's servable vector below its witnessed one"
+    );
+
+    let start = |from: &Node, to: &Node| {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+        let mut config = ReplicationConfig::new(
+            vec![SeedSource::Static(vec![to.addr])],
+            SECRET.into(),
+            from.addr,
+        );
+        config.sync_interval = Duration::from_millis(100);
+        config.discovery_interval = Duration::from_millis(100);
+        config.on_round = Some(Arc::new(move |report| {
+            let _ = tx.send(report);
+        }));
+        (tokio::spawn(replicate(Arc::clone(&from.engine), config)), rx)
+    };
+    let (a_loop, mut a_rx) = start(&a, &b);
+    let (b_loop, mut b_rx) = start(&b, &a);
+
+    // Several sync intervals on each member: every checked contact compares
+    // the one collection in rotation, and not one defers it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    for (name, rx) in [("a", &mut a_rx), ("b", &mut b_rx)] {
+        let (mut checks, mut compared) = (0usize, 0usize);
+        while checks < 8 {
+            let report = tokio::time::timeout_at(deadline, rx.recv())
+                .await
+                .unwrap_or_else(|_| panic!("member {name} never ran eight checks"))
+                .expect("the loop must keep reporting");
+            assert_eq!(report.failed, 0, "{name}: {report:?}");
+            assert_eq!(report.divergence_skips, 0, "{name}: {report:?}");
+            assert_eq!(
+                report.divergence_count_deferred, 0,
+                "{name}: a converged idle cluster has nothing to defer: {report:?}"
+            );
+            assert_eq!(report.divergent_collections, 0, "{name}: {report:?}");
+            checks += report.divergence_checks;
+            compared += report.divergence_count_compared;
+        }
+        assert_eq!(compared, checks, "{name}: every checked contact compared the one collection");
+    }
+    a_loop.abort();
+    b_loop.abort();
 }
 
 /// One of ADR-132's two remaining rises of `kimmy_sync_ddl_refused_total`,

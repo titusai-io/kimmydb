@@ -1964,11 +1964,16 @@ mod tests {
     }
 
     #[test]
-    fn replicated_ddl_is_witnessed_even_though_it_is_never_logged() {
-        // The universal case: applying a peer's schema change deliberately
-        // appends nothing, so before ADR-054 *every* cluster re-requested
-        // every DDL entry on every round, forever — an idle three-node cluster
-        // merged 40 times in 20 seconds.
+    fn replicated_ddl_is_witnessed_and_not_re_requested() {
+        // The universal case. Applying a peer's schema change appends the
+        // originating entry under its own stamp (`apply_ddl`), so the
+        // servable vector moves for it — but before ADR-054 `behind` was
+        // asked of the servable vector, which the bootstrap `root` insert's
+        // last-writer-wins loss pinned below every peer's advertised vector,
+        // so *every* cluster re-requested every DDL entry on every round,
+        // forever — an idle three-node cluster merged 40 times in 20 seconds.
+        // What this checks is the witnessed side: the entry is seen, and a
+        // second round asks for nothing.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("db", "c").unwrap();

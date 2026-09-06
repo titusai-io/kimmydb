@@ -68,14 +68,37 @@ pub enum Message {
     Welcome { node: NodeId, nonce: Vec<u8>, proof: Vec<u8> },
     /// Answers the responder's challenge. The handshake is complete after this.
     Confirm { proof: Vec<u8> },
-    /// "What do you hold?"
+    /// "What do you hold?" — and, when `witnessed` is set, "what have you
+    /// processed?"
     ///
-    /// A struct variant with no fields rather than a unit variant: BSON has no
+    /// A struct variant rather than a unit variant: BSON has no
     /// representation for a bare value at the top level, and a unit variant
     /// serializes to a string. Every message on this wire must be a document.
-    AskVersions {},
-    /// The answer.
+    ///
+    /// `witnessed` asks for the receiver's witnessed vector beside its
+    /// servable one, answered as [`Message::Vectors`] (ADR-146): the count
+    /// half of the divergence check gates on what the peer has *processed*,
+    /// which its servable vector understates for ever after an entry it
+    /// processed without appending. Optional on the wire, for the reason
+    /// `AskEntries::held` is: the handshake negotiates no version, so a
+    /// receiver that predates the field ignores it and answers
+    /// [`Message::Versions`] as before, which the requester reads as "no
+    /// witnessed vector" and gates on the servable one for that contact; a
+    /// requester that predates it sends none and is answered as it always
+    /// was. Neither direction of a mixed-version cluster fails a round.
+    AskVersions {
+        #[serde(default)]
+        witnessed: bool,
+    },
+    /// The answer: what the receiver can serve.
     Versions(VersionVector),
+    /// The answer to an `AskVersions` that set `witnessed`: what the receiver
+    /// can serve, and what it has processed (ADR-146). `servable` is exactly
+    /// what [`Message::Versions`] carries; `witnessed` is what
+    /// [`Message::Witnessed`] carries. One frame rather than two requests,
+    /// because every sync round asks the first question and a checked
+    /// contact needs the second.
+    Vectors { servable: VersionVector, witnessed: VersionVector },
     /// "Send me everything at or after this point."
     ///
     /// `held` is the requester's witnessed vector — the one `from` was derived
@@ -176,7 +199,9 @@ pub enum Message {
     /// appended or not — where `AskVersions` answers with what a node can
     /// *serve*. The one caller is a push (ADR-143): the pusher derives the
     /// window the member lacks from this exactly as the member would derive
-    /// it for itself, so a push never carries an entry out of order.
+    /// it for itself, so a push never carries an entry out of order. A sync
+    /// round asks the same question through `AskVersions { witnessed: true }`
+    /// (ADR-146), on the frame it already spends.
     AskWitnessed {},
     /// The answer.
     Witnessed(VersionVector),
@@ -475,10 +500,12 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip() {
         let messages = [
-            Message::AskVersions {},
+            Message::AskVersions { witnessed: false },
+            Message::AskVersions { witnessed: true },
             Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: None },
             Message::AskEntries { from: Hlc::new(7, 1), limit: 10, held: Some(populated_vector()) },
             Message::Versions(populated_vector()),
+            Message::Vectors { servable: populated_vector(), witnessed: populated_vector() },
             Message::Entries { entries: Vec::new(), scanned_to: Hlc::new(11, 2), exhausted: false },
             Message::Entries { entries: Vec::new(), scanned_to: Hlc::ZERO, exhausted: true },
             Message::Hello { node: NodeId::generate(), nonce: vec![1, 2, 3] },
@@ -521,13 +548,16 @@ mod tests {
         // The length prefix is what separates them; without it the second read
         // would consume the tail of the first message.
         let mut buffer = Vec::new();
-        write_frame(&mut buffer, &Message::AskVersions {}).await.unwrap();
+        write_frame(&mut buffer, &Message::AskVersions { witnessed: false }).await.unwrap();
         write_frame(&mut buffer, &Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None })
             .await
             .unwrap();
 
         let mut stream = buffer.as_slice();
-        assert_eq!(read_frame(&mut stream).await.unwrap(), Message::AskVersions {});
+        assert_eq!(
+            read_frame(&mut stream).await.unwrap(),
+            Message::AskVersions { witnessed: false }
+        );
         assert_eq!(
             read_frame(&mut stream).await.unwrap(),
             Message::AskEntries { from: Hlc::ZERO, limit: 5, held: None }
@@ -567,6 +597,44 @@ mod tests {
             Message::AskEntries { from, limit: 10, held: None },
             "a field this build does not know must not fail the frame"
         );
+    }
+
+    /// The same boundary for `AskVersions::witnessed` (ADR-146), which is
+    /// what keeps a sync round from failing against a peer on either side
+    /// of the upgrade: a requester before the field sends an empty
+    /// document, which reads as not asking; a receiver before the field
+    /// sees a field it does not know on an empty struct variant, which it
+    /// must ignore rather than refuse.
+    #[tokio::test]
+    async fn ask_versions_crosses_a_version_boundary_in_both_directions() {
+        let frame = |body: bson::Document| {
+            let mut buffer = Vec::new();
+            let bytes = bson::serialize_to_vec(&body).unwrap();
+            buffer.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+            buffer.extend_from_slice(&bytes);
+            buffer
+        };
+
+        let old_request = frame(bson::doc! { "AskVersions": {} });
+        assert_eq!(
+            read_frame(&mut old_request.as_slice()).await.unwrap(),
+            Message::AskVersions { witnessed: false },
+            "a request without the field must read as one that did not ask"
+        );
+
+        let future = frame(bson::doc! { "AskVersions": { "somethingNewer": true } });
+        assert_eq!(
+            read_frame(&mut future.as_slice()).await.unwrap(),
+            Message::AskVersions { witnessed: false },
+            "a field this build does not know must not fail the frame"
+        );
+
+        // And the frame this build writes when it asks is exactly the shape
+        // an old receiver is handed above: an unknown field on `AskVersions`.
+        let mut asked = Vec::new();
+        write_frame(&mut asked, &Message::AskVersions { witnessed: true }).await.unwrap();
+        let body = bson::deserialize_from_slice::<bson::Document>(&asked[4..]).unwrap();
+        assert_eq!(body, bson::doc! { "AskVersions": { "witnessed": true } });
     }
 
     #[tokio::test]
