@@ -224,6 +224,15 @@ fn extended_json(map: &Map<String, Value>) -> Result<Option<Bson>, ApiError> {
             let s = value.as_str().ok_or_else(|| bad("$numberDouble"))?;
             Bson::Double(s.parse().map_err(|_| bad("$numberDouble"))?)
         }
+        // Read because `bson_to_json` writes it. Left unread, the wrapper
+        // stayed a nested document in the request that stored it while every
+        // re-decode of the stored bytes yielded a Decimal128 — so the member
+        // that accepted a write keyed the value under an index its peers,
+        // applying the same bytes, filed unkeyed (ADR-139).
+        "$numberDecimal" => {
+            let s = value.as_str().ok_or_else(|| bad("$numberDecimal"))?;
+            Bson::Decimal128(s.parse().map_err(|_| bad("$numberDecimal"))?)
+        }
         "$binary" => {
             use base64::Engine as _;
             let inner = value.as_object().ok_or_else(|| bad("$binary"))?;
@@ -428,6 +437,48 @@ mod tests {
         assert!(json_to_bson(&json!({ "$oid": "not-hex" })).is_err());
         assert!(json_to_bson(&json!({ "$numberLong": "abc" })).is_err());
         assert!(json_to_bson(&json!({ "$date": true })).is_err());
+        assert!(json_to_bson(&json!({ "$numberDecimal": "abc" })).is_err());
+        assert!(json_to_bson(&json!({ "$numberDecimal": 1.5 })).is_err());
+    }
+
+    #[test]
+    fn decimal128_is_read_as_it_is_written() {
+        // `bson_to_json` has always emitted `$numberDecimal`; the decoder did
+        // not read it, so the same value was a nested document in the
+        // request that stored it and a Decimal128 after every re-decode of
+        // the stored bytes — and an index keyed the two differently on the
+        // member that accepted the write (ADR-139).
+        let v = json!({ "$numberDecimal": "1.5" });
+        assert!(matches!(json_to_bson(&v).unwrap(), Bson::Decimal128(_)));
+        assert_eq!(round_trip(v.clone()), v);
+
+        for text in [
+            "0",
+            "-0",
+            "1E+3",
+            "1.000",
+            "NaN",
+            "Infinity",
+            "-Infinity",
+            "9999999999999999999999999999999999",
+            "1.234567890123456789012345678901234E-6143",
+        ] {
+            let b = json_to_bson(&json!({ "$numberDecimal": text })).unwrap();
+            assert!(matches!(b, Bson::Decimal128(_)), "{text}");
+            // What the edge shows for a stored value reads back as that
+            // value, and the JSON form is a fixed point.
+            let j = bson_to_json(&b);
+            assert_eq!(json_to_bson(&j).unwrap(), b, "{text}");
+            assert_eq!(bson_to_json(&json_to_bson(&j).unwrap()), j, "{text}");
+        }
+
+        // The value in memory is the value a re-decode of its bytes yields,
+        // which is what lets every path file it the same way.
+        let doc = json_to_document(&json!({ "v": { "$numberDecimal": "1.5" } })).unwrap();
+        let bytes = bson::serialize_to_vec(&doc).unwrap();
+        let again: bson::Document = bson::deserialize_from_slice(&bytes).unwrap();
+        assert_eq!(doc, again);
+        assert!(matches!(again.get("v"), Some(Bson::Decimal128(_))));
     }
 
     #[test]

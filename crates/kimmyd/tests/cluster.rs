@@ -1093,3 +1093,129 @@ async fn a_replicated_drop_ends_a_stream_on_another_node() {
     assert_eq!(event["reason"], "CollectionDropped", "{event}");
     let _ = socket.send(tokio_tungstenite::tungstenite::Message::Close(None)).await;
 }
+
+// ---------------------------------------------------------------------------
+// A document an index cannot key is filed the same way on every member
+// ---------------------------------------------------------------------------
+
+/// The `unkeyed` count an index reports on one node, if the node answers.
+async fn unkeyed_on(
+    client: &reqwest::Client,
+    node: &Node,
+    token: &str,
+    index: &str,
+) -> Option<u64> {
+    let res = client
+        .get(node.url("/v1/db/shop/coll/ledger/indexes"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .ok()?;
+    let body = res.json::<serde_json::Value>().await.ok()?;
+    body["indexes"].as_array()?.iter().find(|i| i["name"] == index)?["unkeyed"].as_u64()
+}
+
+/// How many documents an indexed query counts on one node, if it answers.
+async fn indexed_count_on(client: &reqwest::Client, node: &Node, token: &str) -> Option<u64> {
+    let res = client
+        .post(node.url("/v1/db/shop/coll/ledger/count"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "filter": { "a": 1 }, "explain": true }))
+        .send()
+        .await
+        .ok()?;
+    let body = res.json::<serde_json::Value>().await.ok()?;
+    (body["explain"]["strategy"] == "index").then(|| body["count"].as_u64()).flatten()
+}
+
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn every_member_files_an_unkeyable_document_the_same_way() {
+    // The finding on a live cluster: a Decimal128 document written to one
+    // member was filed under a real key there and unkeyed on both peers,
+    // because the member's JSON edge left `$numberDecimal` a nested
+    // document while every re-decode of the stored bytes held a Decimal128.
+    // Each shape an index cannot key is written to A; every node must
+    // report the same `unkeyed` and count the document through the index —
+    // and again for the mirror order, an index created after the documents
+    // have replicated.
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "ledger" }))
+        .send()
+        .await
+        .unwrap();
+    let created = client
+        .post(a.url("/v1/db/shop/coll/ledger/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+
+    let shapes = [
+        serde_json::json!({ "_id": 1, "a": [1, 2], "b": [3, 4] }),
+        serde_json::json!({ "_id": 2, "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
+        serde_json::json!({ "_id": 3, "a": 1, "b": { "$numberDecimal": "1.5" } }),
+    ];
+    for shape in &shapes {
+        let res = client
+            .post(a.url("/v1/db/shop/coll/ledger/docs"))
+            .bearer_auth(&token)
+            .json(shape)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "stored, not refused: {}", res.text().await.unwrap());
+    }
+
+    let tokens = [a.login(&client).await, b.login(&client).await, c.login(&client).await];
+    let nodes = [&a, &b, &c];
+    eventually("every node to file all three documents unkeyed and count them", || {
+        let client = &client;
+        let tokens = &tokens;
+        async move {
+            for (node, token) in nodes.iter().zip(tokens) {
+                if unkeyed_on(client, node, token, "ab").await != Some(3) {
+                    return false;
+                }
+                if indexed_count_on(client, node, token).await != Some(3) {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+
+    // The mirror order: the documents are everywhere already, and a new
+    // index over them is backfilled on every node from the bytes it holds.
+    let created = client
+        .post(a.url("/v1/db/shop/coll/ledger/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "ba", "fields": [{ "path": "b" }, { "path": "a" }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(created.status(), 200);
+    eventually("every node to backfill the second index the same way", || {
+        let client = &client;
+        let tokens = &tokens;
+        async move {
+            for (node, token) in nodes.iter().zip(tokens) {
+                if unkeyed_on(client, node, token, "ba").await != Some(3) {
+                    return false;
+                }
+            }
+            true
+        }
+    })
+    .await;
+}

@@ -303,6 +303,26 @@ pub enum ConvertTo {
     Long,
 }
 
+/// Refuse a `Decimal128` literal, wherever an expression would hold one.
+///
+/// The reason `$convert` refuses `decimal` as a target, met from the other
+/// side: a Decimal128 has no exact key encoding here (ADR-005) and ranks
+/// equal to every other number in `canonical_cmp`, so a comparison against
+/// one would hold for every number and a value computed from one could be
+/// neither indexed nor grouped. Recursive, because a document or array
+/// literal is compared by its contents.
+fn refuse_decimal_literal(value: &Bson) -> Result<()> {
+    if kimmy_core::holds_decimal128(value) {
+        return Err(Error::InvalidQuery(
+            "a Decimal128 literal is not supported in an expression: it has no exact key \
+             encoding in this engine and ranks equal to every other number, so nothing compared \
+             with it or computed from it could be exact; write a double or a long instead"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
 impl ConvertTo {
     /// `to` as written: a type name or its numeric BSON code, both as `$type`
     /// spells them.
@@ -547,7 +567,10 @@ impl Expr {
                 _ => Expr::Literal(value.clone()),
             }),
             Bson::Document(doc) => Self::parse_document(doc, declared),
-            other => Ok(Expr::Literal(other.clone())),
+            other => {
+                refuse_decimal_literal(other)?;
+                Ok(Expr::Literal(other.clone()))
+            }
         }
     }
 
@@ -632,6 +655,7 @@ impl Expr {
                     )));
                 };
                 if op == Op::Literal {
+                    refuse_decimal_literal(raw)?;
                     return Ok(Expr::Op(op, vec![Expr::Literal(raw.clone())]));
                 }
                 let args = Self::parse_args(op, raw, declared)?;
@@ -3461,5 +3485,38 @@ mod tests {
         let expr = doc! {"$multiply": [{"$toInt": "$qty"}, 2]};
         assert_eq!(on(expr.clone().into(), doc! {"qty": "21"}), Bson::Int64(42));
         assert_eq!(on(expr.into(), doc! {"qty": 21}), Bson::Int64(42));
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_decimal128_literal_is_refused_wherever_an_expression_would_hold_one() {
+        // The mirror of `$convert` refusing `decimal` as a target: a literal
+        // Decimal128 would compare equal to every number and could be
+        // neither indexed nor grouped, so it is refused at parse — bare, as
+        // `$literal`, and inside a document or array literal.
+        let d = Bson::Decimal128("1.5".parse().unwrap());
+        for expr in [
+            Bson::Document(doc! { "$eq": ["$v", d.clone()] }),
+            Bson::Document(doc! { "$literal": d.clone() }),
+            Bson::Document(doc! { "$literal": { "n": d.clone() } }),
+            Bson::Document(doc! { "$in": [d.clone(), "$tags"] }),
+            Bson::Document(doc! { "$add": ["$v", d.clone()] }),
+            Bson::Document(doc! { "n": d.clone() }),
+            Bson::Array(vec![Bson::Int32(1), d.clone()]),
+            d.clone(),
+        ] {
+            let Err(err) = Expr::parse(&expr) else { panic!("{expr:?} should be refused") };
+            let msg = err.to_string();
+            assert!(
+                msg.contains("Decimal128 literal"),
+                "{expr:?}: the refusal should say why: {msg}"
+            );
+        }
+        assert!(Expr::parse(&Bson::Document(doc! { "$eq": ["$v", 1.5] })).is_ok());
     }
 }

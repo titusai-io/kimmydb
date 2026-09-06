@@ -2,7 +2,7 @@
 //! filtering has decided its membership.
 
 use bson::{Bson, Document};
-use kimmy_core::cmp::canonical_cmp;
+use kimmy_core::cmp::{canonical_cmp, holds_decimal128};
 use kimmy_core::{Error, Result};
 use std::cmp::Ordering;
 
@@ -80,11 +80,41 @@ fn sort_value(doc: &Document, path: &str) -> Bson {
 }
 
 /// Sort documents in place.
+///
+/// The caller has asked [`refuse_unsortable`] about every document first;
+/// this comparator has no way to refuse one.
 pub fn sort(keys: &[SortKey], docs: &mut [Document]) {
     if keys.is_empty() {
         return;
     }
     docs.sort_by(|a, b| compare(keys, a, b));
+}
+
+/// Why `keys` cannot order `doc`, if they cannot.
+///
+/// `canonical_cmp` ranks a `Decimal128` equal to every other number, which is
+/// not an order a sort can use: the document would land somewhere among the
+/// numbers that depended on which of them it happened to be compared with.
+/// Every place that sorts documents by keys asks this before it compares, so
+/// the refusal names the document and the path rather than placing it
+/// nowhere in particular. The path is resolved the way [`compare`] resolves
+/// it, so a Decimal128 inside an array or a document at the path counts.
+pub fn unsortable(keys: &[SortKey], doc: &Document) -> Option<String> {
+    let key = keys
+        .iter()
+        .find(|key| path::resolve(doc, &key.path).iter().any(|v| holds_decimal128(v)))?;
+    let id = doc.get(ID_FIELD).map_or_else(|| "?".to_string(), Bson::to_string);
+    Some(format!(
+        "cannot sort by {:?}: document {id} holds a Decimal128 there, which cannot be compared: \
+         it has no exact key encoding in this engine and ranks equal to every other number; \
+         store a double or a long instead",
+        key.path
+    ))
+}
+
+/// [`unsortable`], as the refusal a query returns.
+pub fn refuse_unsortable(keys: &[SortKey], doc: &Document) -> Result<()> {
+    unsortable(keys, doc).map_or(Ok(()), |why| Err(Error::InvalidQuery(why)))
 }
 
 // ---------------------------------------------------------------------------
@@ -399,5 +429,38 @@ mod tests {
     fn projecting_a_missing_field_simply_omits_it() {
         let out = projected(doc! { "zzz": 1, "_id": 0 }, doc! { "a": 1 });
         assert_eq!(out, doc! {});
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_document_holding_a_decimal128_at_a_sort_path_is_refused_by_name() {
+        // Wherever the sort would read it: at the path, inside an array at
+        // the path, or in a document the path descends into.
+        let keys = parse_sort(&doc! { "qty": 1, "meta.rank": -1 }).unwrap();
+        let d = Bson::Decimal128("2".parse().unwrap());
+        for held in [
+            doc! { "_id": 7, "qty": d.clone() },
+            doc! { "_id": 7, "qty": [1, d.clone()] },
+            doc! { "_id": 7, "meta": { "rank": d.clone() } },
+            doc! { "_id": 7, "meta": [{ "rank": d.clone() }] },
+        ] {
+            let why =
+                unsortable(&keys, &held).unwrap_or_else(|| panic!("{held} should be refused"));
+            assert!(why.contains("cannot sort by"), "{why}");
+            assert!(why.contains("document 7"), "names the document: {why}");
+            assert!(why.contains("Decimal128"), "{why}");
+            assert!(refuse_unsortable(&keys, &held).is_err());
+        }
+        // Elsewhere in the document it is nobody's business.
+        let elsewhere = doc! { "_id": 8, "qty": 1, "meta": { "rank": 2 }, "price": d.clone() };
+        assert_eq!(unsortable(&keys, &elsewhere), None);
+        assert!(refuse_unsortable(&keys, &elsewhere).is_ok());
+        let no_id = doc! { "qty": d };
+        assert!(unsortable(&keys, &no_id).unwrap().contains("document ?"));
     }
 }

@@ -44,7 +44,7 @@ use std::cmp::Ordering;
 
 use bson::{Bson, Document};
 
-use crate::cmp::canonical_cmp;
+use crate::cmp::{canonical_cmp, holds_decimal128};
 use crate::error::{Error, Result};
 use crate::path;
 
@@ -203,6 +203,18 @@ impl PartialFilter {
 }
 
 fn parse_op(path: &str, value: &Bson) -> Result<PartialOp> {
+    // A `Decimal128` cannot be a bound or an equality: `canonical_cmp` ranks
+    // it equal to every other number, so a filter holding one would select
+    // every numeric value and the index would hold documents its definition
+    // never named. Checked over the whole value, operator and all, because
+    // every shape below compares its operand.
+    if holds_decimal128(value) {
+        return Err(Error::InvalidQuery(format!(
+            "partialFilterExpression for {path:?} holds a Decimal128, which cannot be compared: \
+             it has no exact key encoding in this engine and ranks equal to every other number; \
+             use a double or a long"
+        )));
+    }
     let Bson::Document(spec) = value else {
         // A bare value is equality, as it is everywhere else in the filter
         // language.
@@ -498,5 +510,32 @@ mod tests {
             let reparsed = PartialFilter::parse(&parsed.to_document()).unwrap();
             assert_eq!(parsed, reparsed, "lost fidelity: {original:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_decimal128_cannot_be_a_bound_or_an_equality() {
+        // A partial filter compares on every write; a Decimal128 operand
+        // would select every numeric value. Refused at index creation, where
+        // an operator is there to read it, whatever shape carries it.
+        let d = Bson::Decimal128("1.5".parse().unwrap());
+        for filter in [
+            doc! { "v": d.clone() },
+            doc! { "v": { "$gt": d.clone() } },
+            doc! { "v": { "$eq": { "n": d.clone() } } },
+            doc! { "ok": { "$exists": true }, "v": { "$lte": d.clone() } },
+        ] {
+            let Err(err) = PartialFilter::parse(&filter) else {
+                panic!("{filter} should be refused")
+            };
+            let msg = err.to_string();
+            assert!(msg.contains("Decimal128") && msg.contains("\"v\""), "{filter}: {msg}");
+        }
+        assert!(PartialFilter::parse(&doc! { "v": { "$gt": 1.5 } }).is_ok());
     }
 }

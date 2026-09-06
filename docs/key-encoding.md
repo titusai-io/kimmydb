@@ -149,6 +149,17 @@ error, and Decimal128 cannot be an index key or `_id`. A document holding one
 at an indexed path is still stored: the index files it *unkeyed* and rechecks
 it on every scan ([Indexes](indexes.md#documents-an-index-cannot-key)).
 
+The comparator has the same gap: `canonical_cmp` ranks a `Decimal128` equal
+to every other number, because it has nothing exact to compare. That is why
+a Decimal128 is refused wherever a query would compare on a caller's behalf
+— as a filter operand, an expression literal, a partial index's bound, the
+operand of `$min`, `$max`, `$addToSet`, `$pull` or `$pullAll`, or a sort key
+a matching document holds — rather than
+matched against everything numeric or placed nowhere in particular among the
+numbers ([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
+Storing one, reading it back and finding it by `$type` all work; it is
+comparing that is refused.
+
 Refusing is the honest outcome. An approximate index key is a wrong answer
 waiting to happen.
 

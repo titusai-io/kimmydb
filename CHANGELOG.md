@@ -12,6 +12,62 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Fixed
+
+- **A Decimal128 document is filed unkeyed on the member that accepts it, not
+  only on its peers.** A document holding a `Decimal128` at an indexed path,
+  written over HTTP, was stored on the accepting member and filed under a
+  *real* index key there — `unkeyed` stayed 0, no warning, no
+  `kimmy_index_unkeyed_total` — while both peers, applying the same bytes
+  through replication, filed it unkeyed as [Indexes](docs/indexes.md) promise.
+  The other two unkeyable shapes were filed correctly everywhere. The cause
+  was the JSON edge: it emitted `$numberDecimal` but never read it, so the
+  wrapper arrived as a nested document, which an index keys happily, while
+  every re-decode of the stored bytes — the backfill, a replicated apply, the
+  old image on a replace, update or delete — yielded a Decimal128. Three
+  things followed on the acceptor: insert-then-`createIndex` and
+  `createIndex`-then-insert disagreed on `unkeyed`; a later replace, update
+  or delete unfiled the document from the unkeyed run it was never in and
+  left its keyed entry behind; and a unique index accepted a Decimal128 at
+  its path instead of the `400` it gives every other document it cannot key.
+  The edge now reads `$numberDecimal` — the Extended JSON table in
+  [HTTP API](docs/http-api.md) says so — and the value in memory is the value
+  its bytes decode to, so the write path, the replicated path and the
+  backfill file it one way. Storage is unchanged, and a Decimal128 already
+  stored reads back as it always did. **An index entry filed before this fix
+  is not repaired by later writes.** Unfiling recomputes the old image's keys
+  from its stored bytes, which decode to a Decimal128 and classify unkeyed,
+  so every later write to such a document removes an unkeyed entry that was
+  never there and leaves the keyed one behind; the document is still found
+  correctly, but the orphan is read by every scan of that range until the
+  index is **dropped and recreated**. An operator whose members took
+  Decimal128 writes through an indexed path on 0.24.0 or earlier should do
+  that once per affected index ([ADR-139](docs/decisions.md)).
+
+  Reading the wrapper opened a hazard the fix closes in the same change: the
+  canonical order ranks a Decimal128 equal to every other number, so
+  `{"v": {"$numberDecimal": "1.5"}}` in a filter — refused through 0.24.0
+  only by accident, as `unsupported operator "$numberDecimal"` — would have
+  matched every numeric `v`, and a `$pull` of one would have emptied an
+  array of its numbers. A Decimal128 is now refused **on purpose** wherever
+  a query or an update would compare one **on a caller's behalf** — that is,
+  wherever the caller supplies the value being compared. A Decimal128 already
+  *stored* is still ranked equal to every number by the canonical order, so
+  `{"$pull": {"xs": 1}}` removes a stored Decimal128 element and `$group`'s
+  `$min`/`$max` still rank one against the numbers beside it; that gap is
+  older than this change and untouched by it. What is refused: as a filter
+  operand under any
+  comparing operator or inside a literal (`… cannot be compared in a
+  filter`), as a literal anywhere in an expression, `$expr` included (`a
+  Decimal128 literal is not supported in an expression`), as a partial
+  index's bound, as the operand of `$min`, `$max`, `$addToSet`, `$pull` and
+  `$pullAll` (`$pull cannot compare a Decimal128 operand`), and as a sort key
+  a matching document holds (`cannot sort by "v": document 3 holds a
+  Decimal128 there`) — each a `400` that names what to do instead. `$set`
+  and `$push` store one intact, and `$type: "decimal"` finds such documents
+  without comparing them ([Query language](docs/query-language.md),
+  [Key encoding](docs/key-encoding.md)).
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
@@ -53,6 +109,7 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   before has a database and no marker, and the node cannot tell an upgrade
   from a crash. The start after that is the first one the line means what
   it says.
+
 
 ## 0.24.0 - 2026-09-06
 

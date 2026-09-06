@@ -9383,6 +9383,369 @@ async fn a_unique_index_still_refuses_a_document_it_cannot_key() {
 }
 
 // ---------------------------------------------------------------------------
+// The member that accepts a write files it exactly as its peers do (ADR-139)
+// ---------------------------------------------------------------------------
+
+/// The three shapes an index over `a` and `b` cannot key, as a client sends
+/// them: arrays at both paths, more than 1,000 keys from one array, and a
+/// `Decimal128` at the second path. Each keeps `a` scalar or holding `1`, so
+/// `{a: 1}` reaches every one of them through the index, and each carries
+/// something on `b` that only a collection scan can ask for.
+fn unkeyable_shapes() -> Vec<(&'static str, Value, Value)> {
+    vec![
+        ("arrays at two paths", json!({ "a": [1, 2], "b": [3, 4] }), json!({ "b": 3 })),
+        (
+            "more than 1,000 keys",
+            json!({ "a": (0..1_000).collect::<Vec<i32>>(), "b": 5 }),
+            json!({ "b": 5 }),
+        ),
+        (
+            "a Decimal128",
+            json!({ "a": 1, "b": { "$numberDecimal": "1.5" } }),
+            json!({ "b": { "$type": "decimal" } }),
+        ),
+    ]
+}
+
+/// How a document reaches the collection on the member that accepts it.
+#[derive(Clone, Copy, Debug)]
+enum Arrival {
+    Insert,
+    Replace,
+    Set,
+    BeforeTheIndex,
+}
+
+/// One shape, one arrival: the document lands under the index's unkeyed run,
+/// is reported everywhere the run is reported, is found through the index and
+/// by a scan alike, and leaves nothing behind once reshaped.
+async fn unkeyed_on_the_accepting_member(shape: &str, body: Value, scan_only: Value, via: Arrival) {
+    let why = format!("{shape} via {via:?}");
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "u" })).await;
+    let docs = "/v1/db/shop/coll/u/docs";
+    let indexes = "/v1/db/shop/coll/u/indexes";
+    let index = json!({ "name": "ab", "fields": [{ "path": "a" }, { "path": "b" }] });
+    let mut with_id = body.clone();
+    with_id["_id"] = json!(7);
+
+    if !matches!(via, Arrival::BeforeTheIndex) {
+        let created = server.post(indexes, Some(&token), index.clone()).await;
+        assert_eq!(created.status, 200, "{why}: {:?}", created.body);
+    }
+    match via {
+        Arrival::Insert | Arrival::BeforeTheIndex => {
+            let res = server.post(docs, Some(&token), with_id).await;
+            assert_eq!(res.status, 200, "{why}: stored, not refused: {:?}", res.body);
+        }
+        Arrival::Replace => {
+            let seeded = server.post(docs, Some(&token), json!({ "_id": 7, "a": 1, "b": 1 })).await;
+            assert_eq!(seeded.status, 200, "{why}: {:?}", seeded.body);
+            let res = server.put(&format!("{docs}/7"), Some(&token), body).await;
+            assert_eq!(res.status, 200, "{why}: {:?}", res.body);
+        }
+        Arrival::Set => {
+            let seeded = server.post(docs, Some(&token), json!({ "_id": 7, "a": 1, "b": 1 })).await;
+            assert_eq!(seeded.status, 200, "{why}: {:?}", seeded.body);
+            let res = server
+                .post(
+                    "/v1/db/shop/coll/u/update",
+                    Some(&token),
+                    json!({ "filter": { "_id": 7 }, "update": { "$set": body } }),
+                )
+                .await;
+            assert_eq!(res.status, 200, "{why}: {:?}", res.body);
+            assert_eq!(res.body["matched"], 1, "{why}: {:?}", res.body);
+        }
+    }
+    if matches!(via, Arrival::BeforeTheIndex) {
+        let created = server.post(indexes, Some(&token), index).await;
+        assert_eq!(created.status, 200, "{why}: {:?}", created.body);
+        assert_eq!(created.body["unkeyed"], 1, "{why}: the backfill filed it: {:?}", created.body);
+    }
+
+    let (server_ref, token_ref) = (&server, &token);
+    let count = move |filter: Value| async move {
+        let res = server_ref
+            .post(
+                "/v1/db/shop/coll/u/count",
+                Some(token_ref),
+                json!({ "filter": filter, "explain": true }),
+            )
+            .await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+        res.body
+    };
+
+    // Reported: on the listing, on describe, on explain and on /metrics.
+    let listed = server.get(indexes, Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{why}: listing: {}", listed.body);
+    let described = server.get("/v1/db/shop/coll/u/describe", Some(&token)).await;
+    assert_eq!(described.body["indexes"][0]["unkeyed"], 1, "{why}: describe: {}", described.body);
+    let hit = count(json!({ "a": 1 })).await;
+    assert_eq!(hit["explain"]["strategy"], "index", "{why}: {hit}");
+    assert_eq!(hit["count"], 1, "{why}: found through the index: {hit}");
+    assert_eq!(hit["explain"]["unkeyedCandidates"], 1, "{why}: read from the run: {hit}");
+    let scan = count(scan_only).await;
+    assert_eq!(scan["explain"]["strategy"], "collectionScan", "{why}: {scan}");
+    assert_eq!(scan["count"], 1, "{why}: found by a scan: {scan}");
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{why}: {metrics}");
+
+    // Reshaped to something the index can key, the run clears and the one
+    // entry the index now holds is the only one a full range reads: an
+    // orphan left under a key the old image never filed would read as two.
+    let fixed = server.put(&format!("{docs}/7"), Some(&token), json!({ "a": 1, "b": 1 })).await;
+    assert_eq!(fixed.status, 200, "{why}: {:?}", fixed.body);
+    let listed = server.get(indexes, Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 0, "{why}: cleared: {}", listed.body);
+    let hit = count(json!({ "a": 1 })).await;
+    assert_eq!(hit["count"], 1, "{why}: {hit}");
+    assert_eq!(hit["explain"]["unkeyedCandidates"], 0, "{why}: {hit}");
+    assert_eq!(hit["explain"]["indexEntriesRead"], 1, "{why}: nothing leaked: {hit}");
+    let metrics = metrics_text(&server).await;
+    assert!(metrics.contains("kimmy_index_unkeyed_total 1\n"), "{why}: a counter: {metrics}");
+}
+
+#[tokio::test]
+async fn every_unkeyable_shape_is_filed_unkeyed_on_the_member_that_accepts_it() {
+    // The member that accepts a write used to file a Decimal128 document
+    // under a real key while both peers, applying the same bytes through
+    // replication, filed it unkeyed: the JSON edge did not read
+    // `$numberDecimal`, so the accepting member keyed a nested document
+    // where every re-decode of the stored bytes held a Decimal128. Every
+    // shape, by every way a document can arrive, now lands in the one state
+    // ADR-139 promises.
+    for (shape, body, scan_only) in unkeyable_shapes() {
+        for via in [Arrival::Insert, Arrival::Replace, Arrival::Set, Arrival::BeforeTheIndex] {
+            unkeyed_on_the_accepting_member(shape, body.clone(), scan_only.clone(), via).await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_unique_index_refuses_a_decimal128_at_its_path_on_a_local_write() {
+    // The one refusal ADR-139 keeps, for the one shape the accepting member
+    // used to let through: a Decimal128 at a unique index's path is a
+    // document the index cannot key, and the client is there to be told.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "prices" })).await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/prices/indexes",
+            Some(&token),
+            json!({ "name": "by_amount", "fields": [{ "path": "amount" }], "unique": true }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+
+    let docs = "/v1/db/shop/coll/prices/docs";
+    let refused = server
+        .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
+        .await;
+    assert_eq!(refused.status, 400, "{:?}", refused.body);
+    assert_eq!(refused.body["error"], "bad_request");
+    let message = refused.body["message"].as_str().unwrap();
+    assert!(message.contains("\"by_amount\""), "names the index: {message}");
+    assert!(message.contains("Decimal128"), "names the cause: {message}");
+    assert!(message.contains("a unique index must be able to key"), "{message}");
+    assert_eq!(server.get(&format!("{docs}/1"), Some(&token)).await.status, 404, "not stored");
+
+    // Without the unique constraint the same document is stored, unkeyed.
+    let dropped = server.delete("/v1/db/shop/coll/prices/indexes/by_amount", Some(&token)).await;
+    assert_eq!(dropped.status, 200, "{:?}", dropped.body);
+    let plain = server
+        .post(
+            "/v1/db/shop/coll/prices/indexes",
+            Some(&token),
+            json!({ "name": "by_amount", "fields": [{ "path": "amount" }] }),
+        )
+        .await;
+    assert_eq!(plain.status, 200, "{:?}", plain.body);
+    let stored = server
+        .post(docs, Some(&token), json!({ "_id": 1, "amount": { "$numberDecimal": "9.99" } }))
+        .await;
+    assert_eq!(stored.status, 200, "{:?}", stored.body);
+    let listed = server.get("/v1/db/shop/coll/prices/indexes", Some(&token)).await;
+    assert_eq!(listed.body["indexes"][0]["unkeyed"], 1, "{}", listed.body);
+}
+
+#[tokio::test]
+async fn a_decimal128_is_stored_intact_and_returned_as_it_was_sent() {
+    // The value round-trips: `$numberDecimal` in, `$numberDecimal` out, the
+    // digits untouched, and `$type` can still find it.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "ledger" })).await;
+    let docs = "/v1/db/shop/coll/ledger/docs";
+    let stored = server
+        .post(
+            docs,
+            Some(&token),
+            json!({ "_id": 1, "amount": { "$numberDecimal": "12345678901234567890.123456789012" } }),
+        )
+        .await;
+    assert_eq!(stored.status, 200, "{:?}", stored.body);
+    let read = server.get(&format!("{docs}/1"), Some(&token)).await;
+    assert_eq!(read.status, 200, "{:?}", read.body);
+    assert_eq!(
+        read.body["amount"],
+        json!({ "$numberDecimal": "12345678901234567890.123456789012" }),
+        "{}",
+        read.body
+    );
+    let found = server
+        .post(
+            "/v1/db/shop/coll/ledger/find",
+            Some(&token),
+            json!({ "filter": { "amount": { "$type": "decimal" } } }),
+        )
+        .await;
+    assert_eq!(found.status, 200, "{:?}", found.body);
+    assert_eq!(found.body["count"], 1, "{}", found.body);
+
+    // A malformed wrapper is refused the way every other wrapper is.
+    let bad = server
+        .post(docs, Some(&token), json!({ "_id": 2, "amount": { "$numberDecimal": "x" } }))
+        .await;
+    assert_eq!(bad.status, 400, "{:?}", bad.body);
+    assert!(bad.body["message"].as_str().unwrap().contains("$numberDecimal"), "{:?}", bad.body);
+}
+
+#[tokio::test]
+async fn a_decimal128_cannot_be_a_filter_operand_a_sort_key_or_an_id() {
+    // Once the edge reads `$numberDecimal`, a Decimal128 operand would
+    // reach `canonical_cmp`, which ranks a Decimal128 equal to every number
+    // — so `{v: 1.5m}` would match every numeric `v`. It is refused on
+    // purpose instead, wherever a filter compares, and a sort or an `_id`
+    // has no place for it either.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "v" })).await;
+    let docs = "/v1/db/shop/coll/v/docs";
+    for (id, v) in [(1, json!(1)), (2, json!(1.5)), (3, json!({ "$numberDecimal": "1.5" }))] {
+        let res = server.post(docs, Some(&token), json!({ "_id": id, "v": v })).await;
+        assert_eq!(res.status, 200, "{:?}", res.body);
+    }
+    let dec = json!({ "$numberDecimal": "1.5" });
+
+    let refused = |filter: Value| {
+        let server = &server;
+        let token = &token;
+        async move {
+            let res = server
+                .post("/v1/db/shop/coll/v/find", Some(token), json!({ "filter": filter }))
+                .await;
+            assert_eq!(res.status, 400, "{filter}: {:?}", res.body);
+            assert_eq!(res.body["error"], "bad_request", "{filter}");
+            let message = res.body["message"].as_str().unwrap().to_string();
+            assert!(
+                message.contains("Decimal128")
+                    && message.contains("cannot be compared in a filter"),
+                "{filter}: {message}"
+            );
+            message
+        }
+    };
+    refused(json!({ "v": dec })).await;
+    refused(json!({ "v": { "$eq": dec } })).await;
+    refused(json!({ "v": { "$ne": dec } })).await;
+    refused(json!({ "v": { "$gt": dec } })).await;
+    refused(json!({ "v": { "$lte": dec } })).await;
+    refused(json!({ "v": { "$in": [1, dec] } })).await;
+    refused(json!({ "v": { "$nin": [dec] } })).await;
+    refused(json!({ "v": { "$all": [dec] } })).await;
+    refused(json!({ "v": { "$not": { "$gt": dec } } })).await;
+    refused(json!({ "v": { "$elemMatch": { "$eq": dec } } })).await;
+    refused(json!({ "$or": [{ "v": 1 }, { "v": dec }] })).await;
+    refused(json!({ "v": { "n": dec } })).await;
+    refused(json!({ "v": [dec] })).await;
+    refused(json!({ "_id": dec })).await;
+    let expr = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "$expr": { "$eq": ["$v", dec] } } }),
+        )
+        .await;
+    assert_eq!(expr.status, 400, "{:?}", expr.body);
+    assert!(expr.body["message"].as_str().unwrap().contains("Decimal128"), "{:?}", expr.body);
+
+    // The refusal is about comparing, not about the type: a filter that
+    // asks for the type, or for the document by another field, still works.
+    let by_type = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "v": { "$type": "decimal" } } }),
+        )
+        .await;
+    assert_eq!(by_type.status, 200, "{:?}", by_type.body);
+    assert_eq!(by_type.body["count"], 1, "{}", by_type.body);
+
+    // A sort over a field where a matching document holds a Decimal128 is
+    // refused naming the document, rather than placing it nowhere in
+    // particular among the numbers.
+    let sorted = server
+        .post("/v1/db/shop/coll/v/find", Some(&token), json!({ "filter": {}, "sort": { "v": 1 } }))
+        .await;
+    assert_eq!(sorted.status, 400, "{:?}", sorted.body);
+    let message = sorted.body["message"].as_str().unwrap();
+    assert!(message.contains("cannot sort by \"v\""), "{message}");
+    assert!(message.contains("Decimal128"), "{message}");
+    assert!(message.contains('3'), "names the document: {message}");
+    let others = server
+        .post(
+            "/v1/db/shop/coll/v/find",
+            Some(&token),
+            json!({ "filter": { "_id": { "$in": [1, 2] } }, "sort": { "v": -1 } }),
+        )
+        .await;
+    assert_eq!(
+        others.status, 200,
+        "the Decimal128 document is not among the matches: {:?}",
+        others.body
+    );
+    assert_eq!(others.body["documents"][0]["_id"], 2, "{}", others.body);
+
+    // And an `_id` cannot be one, which the write path already refused.
+    let as_id = server.post(docs, Some(&token), json!({ "_id": dec, "v": 0 })).await;
+    assert_eq!(as_id.status, 400, "{:?}", as_id.body);
+    assert_eq!(as_id.body["error"], "bad_request", "{:?}", as_id.body);
+
+    // The update operators that compare their operand against every
+    // element refuse one too. Before they did, `$pull` of a Decimal128
+    // emptied an array of its numbers and `$addToSet` added nothing, with
+    // a `200` either way.
+    let arrays = json!({ "_id": 4, "xs": [1, 2.5, "s", 3], "ys": [1, 2], "zs": [7, 8] });
+    let res = server.post(docs, Some(&token), arrays.clone()).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    for update in [
+        json!({ "$pull": { "xs": dec } }),
+        json!({ "$pullAll": { "zs": [dec] } }),
+        json!({ "$addToSet": { "ys": dec } }),
+        json!({ "$addToSet": { "ys": { "$each": [dec] } } }),
+        json!({ "$min": { "xs": dec } }),
+    ] {
+        let res = server
+            .post(
+                "/v1/db/shop/coll/v/update",
+                Some(&token),
+                json!({ "filter": { "_id": 4 }, "update": update }),
+            )
+            .await;
+        assert_eq!(res.status, 400, "{update}: {:?}", res.body);
+        assert_eq!(res.body["error"], "bad_request", "{update}");
+        let message = res.body["message"].as_str().unwrap();
+        assert!(message.contains("Decimal128"), "{update}: {message}");
+    }
+    let untouched = server.get(&format!("{docs}/4"), Some(&token)).await;
+    assert_eq!(untouched.body, arrays, "nothing was pulled or added");
+}
+
+// ---------------------------------------------------------------------------
 // A schema change confirms itself on every live member (ADR-140)
 // ---------------------------------------------------------------------------
 

@@ -737,11 +737,35 @@ edge uses **Extended JSON v2**:
 | ObjectId | `{"$oid": "6745f2a1b3c4d5e6f7081920"}` |
 | DateTime | `{"$date": 1700000000000}` or RFC 3339 |
 | Int64 | `{"$numberLong": "9007199254740993"}` |
+| Decimal128 | `{"$numberDecimal": "1.25"}` |
 | Binary | `{"$binary": {"base64": "…", "subType": "00"}}` |
 | MinKey / MaxKey | `{"$minKey": 1}` / `{"$maxKey": 1}` |
 
 Plain JSON keeps working for anything expressible in it — you only meet this
 when you need a type JSON lacks.
+
+**A Decimal128 is stored, returned, and never compared.** `$numberDecimal`
+is read on input and written on output, and the digits come back exactly as
+sent. It cannot be an index key or an `_id` — a document holding one at an
+indexed path is stored and filed under the index's unkeyed run
+([Indexes](indexes.md#documents-an-index-cannot-key)); one as `_id` is
+refused — and it cannot be a filter operand: `{"v": {"$numberDecimal":
+"1.5"}}`, or a Decimal128 under `$eq`, `$ne`, `$gt`, `$gte`, `$lt`, `$lte`,
+`$in`, `$nin`, `$all`, or inside a document or array literal, is `400
+bad_request` saying that a Decimal128 *cannot be compared in a filter*; as a
+literal in an expression, `$expr` included, the `400` says *a Decimal128
+literal is not supported in an expression*. The canonical order has no exact
+place for it — it ranks equal to every other number — so a filter that let
+one through would match every numeric value of the field. A sort over a
+field where a matching document holds one is refused naming the document
+(*cannot sort by "v": document 3 holds a Decimal128 there*), and the update
+operators that compare their operand — `$min`, `$max`, `$addToSet`, `$pull`,
+`$pullAll` — refuse one (*`$pull` cannot compare a Decimal128 operand*);
+`$type: "decimal"` finds such documents without comparing them
+([Query language](query-language.md#3-comparisons-do-not-cross-type-groups)).
+Through 0.24.0 the edge did not read `$numberDecimal` at all: the wrapper
+arrived as a nested document, which is why a Decimal128 written to a member
+was keyed there and filed unkeyed on its peers ([ADR-139](decisions.md)).
 
 **Whole numbers stay integers.** A JSON `42` becomes `Int32`, not `Double`.
 Widening would break `$type` queries and lose precision above 2^53; `2^53 + 1`

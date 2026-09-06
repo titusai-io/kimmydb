@@ -762,6 +762,9 @@ pub fn apply_with_vars(
             // the same rules `find`'s sort does — an array sorts by its
             // elements, and a path that crosses one is not fanned out.
             let mut docs = input;
+            for doc in &docs {
+                shape::refuse_unsortable(keys, doc)?;
+            }
             shape::sort(keys, &mut docs);
             docs
         }
@@ -2337,5 +2340,27 @@ mod tests {
         let d = doc! {};
         let read = Expr::parse_with_vars(&"$$outer".into(), &["outer".into()]).unwrap();
         assert_eq!(read.eval_in(&Scope::with_bindings(&d, &frame)).unwrap(), "rebound".into());
+    }
+}
+
+#[cfg(test)]
+mod decimal128 {
+    use super::*;
+    use bson::doc;
+
+    #[test]
+    fn a_sort_stage_refuses_a_document_it_cannot_place() {
+        // The same refusal `find`'s sort makes, from the stage that sorts a
+        // pipeline's documents in hand.
+        let d = Bson::Decimal128("1.5".parse().unwrap());
+        let input =
+            vec![doc! { "_id": 1, "v": 1 }, doc! { "_id": 2, "v": d }, doc! { "_id": 3, "v": 2 }];
+        let stages = parse(&[doc! { "$sort": { "v": 1 } }]).unwrap();
+        let msg = apply(&stages[0], input.clone(), &Limits::default()).unwrap_err().to_string();
+        assert!(msg.contains("cannot sort by \"v\"") && msg.contains("document 2"), "{msg}");
+        // Sorting by a path the Decimal128 is not on is unaffected.
+        let stages = parse(&[doc! { "$sort": { "_id": -1 } }]).unwrap();
+        let out = apply(&stages[0], input, &Limits::default()).unwrap();
+        assert_eq!(out[0].get_i32("_id").unwrap(), 3);
     }
 }
