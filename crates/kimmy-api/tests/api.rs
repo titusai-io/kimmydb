@@ -9327,3 +9327,120 @@ async fn a_unique_index_still_refuses_a_document_it_cannot_key() {
         refused.body
     );
 }
+
+// ---------------------------------------------------------------------------
+// A schema change confirms itself on every live member (ADR-140)
+// ---------------------------------------------------------------------------
+
+/// A confirmer that answers with a fixed finding and records what it was
+/// handed, standing in for the daemon's, which needs a cluster.
+fn canned_confirmer(
+    finding: kimmy_api::DdlConfirmation,
+    seen: Arc<std::sync::Mutex<Vec<kimmy_core::OplogEntry>>>,
+) -> kimmy_api::DdlConfirmer {
+    Arc::new(move |entry: kimmy_core::OplogEntry| {
+        let finding = finding.clone();
+        let seen = Arc::clone(&seen);
+        Box::pin(async move {
+            seen.lock().unwrap().push(entry);
+            finding
+        })
+    })
+}
+
+#[tokio::test]
+async fn create_index_and_drop_index_carry_the_cluster_confirmation() {
+    // What a client sees when the node has peers: `confirmation` on the
+    // response, naming who holds the definition now, who refused it and who
+    // has not answered — and the entry the confirmer was handed is the one
+    // the request minted.
+    let server = Server::start().await;
+    let token = server.root().await;
+    let held = kimmy_core::NodeId::generate();
+    let refused = kimmy_core::NodeId::generate();
+    let late = kimmy_core::NodeId::generate();
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    server.state.set_ddl_confirmer(canned_confirmer(
+        kimmy_api::DdlConfirmation {
+            confirmed: vec![held],
+            refused: vec![refused],
+            pending: vec![(late, "no answer within 10s".into())],
+        },
+        Arc::clone(&seen),
+    ));
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert_eq!(created.body["name"], "by_email", "the index, as before");
+    let confirmation = &created.body["confirmation"];
+    assert_eq!(confirmation["confirmed"], json!([held.to_string()]), "{}", created.body);
+    assert_eq!(confirmation["refused"], json!([refused.to_string()]), "{}", created.body);
+    assert_eq!(
+        confirmation["pending"],
+        json!([{ "node": late.to_string(), "reason": "no answer within 10s" }]),
+        "{}",
+        created.body
+    );
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "one push, for the create");
+        assert_eq!(seen[0].kind, kimmy_core::OpKind::CreateIndex);
+    }
+
+    // Creating it again is idempotent and confirms again: the definition's
+    // own entry is what travels, and it is still here.
+    let again = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "name": "by_email", "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(again.status, 200, "{:?}", again.body);
+    assert!(again.body.get("confirmation").is_some(), "{}", again.body);
+
+    let dropped = server.delete("/v1/db/shop/coll/orders/indexes/by_email", Some(&token)).await;
+    assert_eq!(dropped.status, 200, "{:?}", dropped.body);
+    assert_eq!(dropped.body["dropped"], true);
+    assert_eq!(dropped.body["confirmation"]["confirmed"], json!([held.to_string()]));
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 3, "the two creates and the drop");
+        assert_eq!(seen[2].kind, kimmy_core::OpKind::DropIndex);
+    }
+
+    // Dropping what is not there mints nothing, so there is nothing to
+    // confirm and the response says so by leaving the field out.
+    let nothing = server.delete("/v1/db/shop/coll/orders/indexes/by_email", Some(&token)).await;
+    assert_eq!(nothing.status, 200, "{:?}", nothing.body);
+    assert_eq!(nothing.body["dropped"], false);
+    assert!(nothing.body.get("confirmation").is_none(), "{}", nothing.body);
+    assert_eq!(seen.lock().unwrap().len(), 3, "no push for a drop that found nothing");
+}
+
+#[tokio::test]
+async fn a_node_without_peers_answers_an_index_request_as_before() {
+    // No confirmer — clustering off, or membership off — means no claim
+    // about peers, rather than an empty one.
+    let server = Server::start().await;
+    let token = server.root().await;
+    server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "orders" })).await;
+    let created = server
+        .post(
+            "/v1/db/shop/coll/orders/indexes",
+            Some(&token),
+            json!({ "fields": [{ "path": "email" }] }),
+        )
+        .await;
+    assert_eq!(created.status, 200, "{:?}", created.body);
+    assert!(created.body.get("confirmation").is_none(), "{}", created.body);
+    let dropped = server.delete("/v1/db/shop/coll/orders/indexes/email_1", Some(&token)).await;
+    assert_eq!(dropped.body, json!({ "dropped": true }));
+}

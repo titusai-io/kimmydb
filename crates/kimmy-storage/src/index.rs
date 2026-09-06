@@ -1117,6 +1117,19 @@ impl crate::Engine {
 
     /// Drop an index and every entry it holds.
     pub fn drop_index(&self, db: &str, collection: &str, name: &str) -> Result<bool> {
+        Ok(self.drop_index_stamped(db, collection, name)?.is_some())
+    }
+
+    /// [`Self::drop_index`], returning the stamp of the drop entry it minted —
+    /// `None` when there was nothing here to drop, and so no entry. The stamp
+    /// is what a caller confirming the drop on its peers looks the entry up
+    /// by (ADR-140).
+    pub fn drop_index_stamped(
+        &self,
+        db: &str,
+        collection: &str,
+        name: &str,
+    ) -> Result<Option<Stamp>> {
         self.drop_index_inner(db, collection, name, None)
     }
 
@@ -1141,7 +1154,7 @@ impl crate::Engine {
         collection: &str,
         name: &str,
         replicated: Option<Stamp>,
-    ) -> Result<bool> {
+    ) -> Result<Option<Stamp>> {
         let mut meta = self.get_collection(db, collection)?;
         // Derived from the name rather than read from the definition, so the
         // key agrees with what a `CreateIndex` replay will compute whether or
@@ -1151,7 +1164,7 @@ impl crate::Engine {
             if let Some(stamp) = replicated {
                 self.record_index_drop(meta.id, index_id, stamp)?;
             }
-            return Ok(false);
+            return Ok(None);
         };
 
         let stamp = replicated.unwrap_or_else(|| self.next_stamp());
@@ -1192,7 +1205,7 @@ impl crate::Engine {
         }
 
         tracing::info!(db, collection, index = name, "dropped index");
-        Ok(true)
+        Ok(Some(stamp))
     }
 
     pub fn list_indexes(&self, db: &str, collection: &str) -> Result<Vec<IndexMeta>> {

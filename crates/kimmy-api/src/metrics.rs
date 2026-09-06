@@ -386,6 +386,14 @@ impl Metrics {
         self.sync_divergence_skips.fetch_add(round.divergence_skips as u64, Ordering::Relaxed);
     }
 
+    /// Count schema changes a peer pushed to this node that it could not
+    /// apply and skipped (ADR-140), on the series a pulled refusal lands on:
+    /// the member's own counter must not depend on which way the change
+    /// arrived.
+    pub fn record_ddl_refused(&self, n: u64) {
+        self.sync_ddl_refused.fetch_add(n, Ordering::Relaxed);
+    }
+
     /// How many peers this node's SWIM instance currently considers alive.
     ///
     /// The observable the cluster harness asserts gossip *formed* with —

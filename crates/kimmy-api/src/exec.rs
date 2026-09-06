@@ -1352,6 +1352,38 @@ pub fn create_index(
     coll: &str,
     spec: IndexSpec,
 ) -> Result<Value, ApiError> {
+    create_index_stamped(state, auth, db, coll, spec).map(|(out, _)| out)
+}
+
+/// [`create_index`], then confirmed on every live member before answering
+/// (ADR-140): the response carries `confirmation` naming who holds the
+/// definition now, who refused it, and who has not answered. A node with no
+/// peers to confirm on answers exactly as before.
+pub async fn create_index_confirmed(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    spec: IndexSpec,
+) -> Result<Value, ApiError> {
+    let (mut out, stamp) = create_index_stamped(state, auth, db, coll, spec)?;
+    if let Some(stamp) = stamp
+        && let Some(confirmation) = confirm_ddl(state, stamp).await?
+    {
+        out["confirmation"] = confirmation;
+    }
+    Ok(out)
+}
+
+/// The body of [`create_index`], with the creation stamp of the index the
+/// response describes — the entry a confirmation pushes.
+fn create_index_stamped(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    spec: IndexSpec,
+) -> Result<(Value, Option<kimmy_core::Stamp>), ApiError> {
     let _span = op_span("create_index", db, Some(coll)).entered();
     auth.require(Action::Ddl, db, Some(coll))?;
 
@@ -1391,7 +1423,45 @@ pub fn create_index(
     // most wants beside `multikey`, and the listing reports the same field.
     let meta = state.engine.get_collection(db, coll)?;
     let unkeyed = state.engine.unkeyed_count(&meta, index.id)?;
-    Ok(index_to_json(&index, unkeyed))
+    Ok((index_to_json(&index, unkeyed), index.created))
+}
+
+/// Confirm a schema change this node just minted on every live member
+/// (ADR-140), rendered for a response.
+///
+/// `None` when this node has no confirmer — clustering or membership off —
+/// or when no entry stands under `stamp`, which is an index that was already
+/// here before this request and whose creation has since aged out of the
+/// oplog. The caller then says nothing about the peers rather than
+/// something false.
+pub async fn confirm_ddl(
+    state: &SharedState,
+    stamp: kimmy_core::Stamp,
+) -> Result<Option<Value>, ApiError> {
+    let Some(confirm) = state.ddl_confirmer() else {
+        return Ok(None);
+    };
+    let Some(entry) = state.engine.oplog_entry(&stamp)? else {
+        return Ok(None);
+    };
+    Ok(Some(confirmation_to_json(&confirm(entry).await)))
+}
+
+/// A confirmation as a response carries it: node ids as strings, the way
+/// `/v1/topology` names them, and each pending member with its reason.
+pub fn confirmation_to_json(found: &crate::state::DdlConfirmation) -> Value {
+    let ids = |nodes: &[kimmy_core::NodeId]| -> Vec<String> {
+        nodes.iter().map(ToString::to_string).collect()
+    };
+    json!({
+        "confirmed": ids(&found.confirmed),
+        "refused": ids(&found.refused),
+        "pending": found
+            .pending
+            .iter()
+            .map(|(node, reason)| json!({ "node": node.to_string(), "reason": reason }))
+            .collect::<Vec<_>>(),
+    })
 }
 
 pub fn list_indexes(
@@ -1463,9 +1533,39 @@ pub fn drop_index(
     coll: &str,
     name: &str,
 ) -> Result<Value, ApiError> {
+    drop_index_stamped(state, auth, db, coll, name).map(|(out, _)| out)
+}
+
+/// [`drop_index`], then confirmed on every live member before answering
+/// (ADR-140), as [`create_index_confirmed`] is. A drop that found nothing
+/// here mints no entry and confirms nothing: there is no drop to carry.
+pub async fn drop_index_confirmed(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    name: &str,
+) -> Result<Value, ApiError> {
+    let (mut out, stamp) = drop_index_stamped(state, auth, db, coll, name)?;
+    if let Some(stamp) = stamp
+        && let Some(confirmation) = confirm_ddl(state, stamp).await?
+    {
+        out["confirmation"] = confirmation;
+    }
+    Ok(out)
+}
+
+fn drop_index_stamped(
+    state: &SharedState,
+    auth: &Auth,
+    db: &str,
+    coll: &str,
+    name: &str,
+) -> Result<(Value, Option<kimmy_core::Stamp>), ApiError> {
     let _span = op_span("drop_index", db, Some(coll)).entered();
     auth.require(Action::Ddl, db, Some(coll))?;
-    Ok(json!({ "dropped": state.engine.drop_index(db, coll, name)? }))
+    let stamp = state.engine.drop_index_stamped(db, coll, name)?;
+    Ok((json!({ "dropped": stamp.is_some() }), stamp))
 }
 
 /// `unkeyed` is how many documents the index holds that it could not key —

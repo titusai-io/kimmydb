@@ -872,6 +872,17 @@ pub struct ClusterConfig {
     /// cluster size — anti-entropy is transitive, so a write still reaches
     /// everyone through intermediate peers.
     pub fanout: usize,
+    /// How long a schema change waits for every live member to confirm it
+    /// before its request answers (ADR-140).
+    ///
+    /// `createIndex` and `dropIndex` push the change to each member SWIM
+    /// considers alive and answer once each has applied or refused it, so a
+    /// client that creates an index on one member and writes through a
+    /// front a moment later finds the index enforced wherever the write
+    /// lands. A member that does not answer in time is named `pending` in
+    /// the response and receives the change through anti-entropy as before.
+    /// `0` turns the confirmation off. Needs `membership`.
+    pub ddl_confirm_timeout_secs: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1236,6 +1247,7 @@ impl Default for ClusterConfig {
             discovery_interval_secs: 30,
             membership: true,
             fanout: kimmy_cluster::DEFAULT_FANOUT,
+            ddl_confirm_timeout_secs: 10,
         }
     }
 }

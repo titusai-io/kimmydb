@@ -1063,7 +1063,22 @@ async fn spawn_cluster(
         .with_context(|| format!("binding the cluster listener on {}", config.cluster.bind))?;
     let local = listener.local_addr().unwrap_or(config.cluster.bind);
 
-    let serving = tokio::spawn(kimmy_cluster::serve(Arc::clone(&engine), listener, secret.clone()));
+    // A schema change a peer pushes here (ADR-140) goes through the same
+    // batch application a pulled one does, and lands on the same counter when
+    // this node cannot apply it: the member's own metric must not depend on
+    // which way the change arrived.
+    let on_pushed: kimmy_cluster::PushHook = Arc::new({
+        let state = Arc::clone(&state);
+        move |outcome: &kimmy_storage::SyncOutcome| {
+            state.metrics.record_ddl_refused(outcome.ddl_refused as u64);
+        }
+    });
+    let serving = tokio::spawn(kimmy_cluster::serve_with(
+        Arc::clone(&engine),
+        listener,
+        secret.clone(),
+        Some(on_pushed),
+    ));
 
     // SWIM shares the port with replication: UDP for probes and membership,
     // TCP for oplog transfer. Bound here for the same reason as the listener —
@@ -1094,6 +1109,29 @@ async fn spawn_cluster(
         announce = Some(tx);
     } else {
         warn!("SWIM membership is disabled; peers come from discovery alone");
+    }
+
+    // A schema change confirms itself on every live member before its request
+    // answers (ADR-140). The member set is SWIM's, so this needs membership;
+    // with it off the node answers as it always did, saying nothing about
+    // its peers.
+    match (&members, config.cluster.ddl_confirm_timeout_secs) {
+        (Some(live), secs) if secs > 0 => {
+            state.set_ddl_confirmer(ddl_confirmer(
+                Arc::clone(&engine),
+                secret.clone(),
+                live.clone(),
+                Duration::from_secs(secs),
+            ));
+        }
+        (Some(_), _) => {
+            info!("schema-change confirmation is off (cluster.ddl_confirm_timeout_secs = 0)")
+        }
+        (None, _) => {
+            warn!(
+                "schema-change confirmation needs membership; a createIndex will not wait for peers"
+            )
+        }
     }
 
     let replicating = tokio::spawn(kimmy_cluster::replicate(
@@ -1153,6 +1191,81 @@ async fn spawn_cluster(
         "clustering enabled"
     );
     Ok(Cluster { tasks: cluster_tasks, members })
+}
+
+/// How this node confirms a schema change on its live members (ADR-140).
+///
+/// Pushes the entry to every member at once and waits for each, bounded by
+/// `deadline` per member, so the request waits about as long as the slowest
+/// member takes rather than the sum. A member that answers with a refusal is
+/// named as such — it counted the refusal itself, on its own
+/// `kimmy_sync_ddl_refused_total` — and one that does not answer is named
+/// pending with the reason. Anti-entropy still carries the change to both,
+/// as it always did; what the push adds is the response meaning what a
+/// client reads it to mean.
+fn ddl_confirmer(
+    engine: Arc<Engine>,
+    secret: String,
+    members: kimmy_cluster::Members,
+    deadline: Duration,
+) -> kimmy_api::DdlConfirmer {
+    Arc::new(move |entry: kimmy_core::OplogEntry| {
+        let engine = Arc::clone(&engine);
+        let secret = secret.clone();
+        let members = members.clone();
+        Box::pin(async move {
+            let mut pushes = tokio::task::JoinSet::new();
+            for (addr, node) in members.entries() {
+                let engine = Arc::clone(&engine);
+                let secret = secret.clone();
+                let entry = entry.clone();
+                pushes.spawn(async move {
+                    let pushed = tokio::time::timeout(
+                        deadline,
+                        kimmy_cluster::push_entries(&engine, addr, &secret, vec![entry]),
+                    )
+                    .await;
+                    let result = match pushed {
+                        Ok(Ok((_, outcome))) => Ok(outcome),
+                        Ok(Err(e)) => Err(e.to_string()),
+                        Err(_) => Err(format!("no answer within {deadline:?}")),
+                    };
+                    (addr, node, result)
+                });
+            }
+            let mut found = kimmy_api::DdlConfirmation::default();
+            while let Some(joined) = pushes.join_next().await {
+                let Ok((addr, node, result)) = joined else { continue };
+                match result {
+                    Ok(outcome) if outcome.ddl_refused > 0 || outcome.unknown_collection > 0 => {
+                        warn!(
+                            peer = %addr,
+                            node = %node,
+                            refused = outcome.ddl_refused,
+                            unknown_collection = outcome.unknown_collection,
+                            "a member could not apply a schema change pushed to it"
+                        );
+                        found.refused.push(node);
+                    }
+                    Ok(_) => found.confirmed.push(node),
+                    Err(reason) => {
+                        warn!(
+                            peer = %addr,
+                            node = %node,
+                            %reason,
+                            "a member did not confirm a schema change; anti-entropy will carry it"
+                        );
+                        found.pending.push((node, reason));
+                    }
+                }
+            }
+            // Deterministic order, whatever order the members answered in.
+            found.confirmed.sort();
+            found.refused.sort();
+            found.pending.sort();
+            found
+        })
+    })
 }
 
 /// The address peers should use to reach this node.

@@ -59,7 +59,7 @@ pub use local_login::LocalLogin;
 pub use metrics::Metrics;
 pub use ratelimit::{Limiter, RateLimit, RateLimits};
 pub use sessions::Sessions;
-pub use state::{AppState, SharedState};
+pub use state::{AppState, DdlConfirmation, DdlConfirmer, SharedState};
 
 /// Assemble the shared server state.
 ///
@@ -136,6 +136,7 @@ pub fn state_with_policies(
         providers,
         sessions,
         members: std::sync::OnceLock::new(),
+        ddl_confirm: std::sync::OnceLock::new(),
         federation: std::sync::OnceLock::new(),
         stale_peers: Default::default(),
         local_login: std::sync::OnceLock::new(),

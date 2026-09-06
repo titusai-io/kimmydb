@@ -157,6 +157,13 @@ impl Members {
         self.0.read().values().copied().collect()
     }
 
+    /// Every peer with both its address and its id, for a caller that dials
+    /// by address and reports by id — a member that never answered the dial
+    /// still has to be named.
+    pub fn entries(&self) -> Vec<(SocketAddr, NodeId)> {
+        self.0.read().iter().map(|(addr, node)| (*addr, *node)).collect()
+    }
+
     pub fn is_empty(&self) -> bool {
         self.0.read().is_empty()
     }

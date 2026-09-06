@@ -1456,6 +1456,24 @@ pub(crate) fn raise_version(
     Ok(())
 }
 
+impl Engine {
+    /// The entry this node holds under `stamp`, if any.
+    ///
+    /// A point lookup, for a caller that minted an entry a moment ago and
+    /// wants to hand it to a peer directly — a schema change confirming
+    /// itself on every live member (ADR-140) — rather than wait for
+    /// anti-entropy to carry it.
+    pub fn oplog_entry(&self, stamp: &Stamp) -> Result<Option<OplogEntry>> {
+        let txn = self.db().begin_read()?;
+        let oplog = txn.open_table(tables::OPLOG)?;
+        let key = codec::oplog_key(stamp);
+        match oplog.get(key.as_slice())? {
+            Some(raw) => Ok(Some(codec::decode_oplog_entry(raw.value())?)),
+            None => Ok(None),
+        }
+    }
+}
+
 pub(crate) fn append_oplog(txn: &redb::WriteTransaction, entry: &OplogEntry) -> Result<()> {
     let key = codec::oplog_key(&entry.stamp);
     let mut oplog = txn.open_table(tables::OPLOG)?;

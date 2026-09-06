@@ -170,6 +170,21 @@ pub enum Message {
     /// piece of this exchange that reads documents, and it reads exactly one
     /// collection's worth.
     Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
+    /// "Apply these entries now, and tell me what became of them."
+    ///
+    /// The one message in this protocol that moves entries *toward* a peer
+    /// rather than pulling them, and it exists for exactly one caller: a
+    /// schema change confirming itself on every live member before its
+    /// request answers (ADR-140). Anti-entropy would carry the same entry
+    /// within a sync interval; the push makes the response mean what a
+    /// client reads it to mean. Applied through the same `apply_batch` a
+    /// pulled batch goes through, so the entry is witnessed, appended onward
+    /// and, if the member cannot apply it, refused and counted there exactly
+    /// as it would have been on the pull.
+    Push { entries: Vec<OplogEntry> },
+    /// What the pushed entries became on the receiver: the fields of its
+    /// `SyncOutcome` a pusher can act on.
+    Pushed { applied: usize, ddl: usize, ddl_refused: usize, unknown_collection: usize },
     /// Something went wrong; the sender is closing.
     Fault(String),
 }

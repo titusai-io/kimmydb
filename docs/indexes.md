@@ -237,6 +237,15 @@ write a unique index cannot key is a fact another member accepted: it is
 filed unkeyed, takes part in no uniqueness check, and is warned about and
 counted like any other, rather than refused.
 
+**On a clustered node, `createIndex` and `dropIndex` do not answer until
+every live member has applied or refused the change**, or a deadline has
+passed ([ADR-140](decisions.md)). The response's `confirmation` names each
+member's answer, so a client that creates an index here and writes through a
+front a moment later finds it enforced wherever the write lands. A member
+that did not answer in time is listed as `pending` and receives the change
+through anti-entropy; a partitioned member always will, which is why the
+paragraph above, not this one, is what keeps the cluster safe.
+
 **On a replica.** A definition replicates as an operation, and the replica
 builds it over *its own* documents, which are not the origin's. A document
 the definition cannot key is filed unkeyed, and the definition stands. The

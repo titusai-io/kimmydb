@@ -9905,3 +9905,75 @@ the counter and the warning. `IndexScanOutcome` gains `unkeyed`; the
 `Index` schema gains a required `unkeyed`; `explain` gains
 `unkeyedCandidates`. One new `/metrics` series, pinned by the golden tests
 and the bridge guard.
+
+## ADR-140 — A schema change confirms itself on every live member before its request answers
+
+**Decision.** `createIndex` and `dropIndex` on a clustered node push the entry
+they minted to every member SWIM considers alive, at once, and answer only
+when each has applied or refused it or a deadline has passed. A new pair of
+protocol messages carries it — `Push { entries }` and `Pushed { applied, ddl,
+ddl_refused, unknown_collection }` — and the receiver applies a push through
+the same `apply_batch` a pulled window goes through, so the entry is
+witnessed (anti-entropy does not fetch it again), appended onward (the member
+can serve it to a third), and, if the member cannot apply it, refused and
+counted there exactly as it would have been on the pull; the serving side
+takes a hook so a pushed refusal lands on the receiver's own
+`kimmy_sync_ddl_refused_total`. The response carries `confirmation`:
+`confirmed`, `refused` and `pending` members by node id, the last with a
+reason. The deadline is `cluster.ddl_confirm_timeout_secs` (default 10; `0`
+turns the confirmation off), applied per member with the pushes running
+concurrently, so the request waits about as long as the slowest member takes
+rather than the sum. A node with no member set — clustering off, or
+membership off — answers as before, with no `confirmation` at all. A drop that
+finds nothing here mints no entry and confirms nothing.
+
+**Why.** The window ADR-139's finding came through. A client created an index
+on one member and, seconds later, wrote through a front that spread requests
+across members; the write landed on a member that had not yet received the
+definition, which validated against the indexes *it* held, found nothing to
+refuse, and committed. Measured on a quiet cluster the gap is about 3.5 s —
+a definition is listed on a peer in 1.7–3.4 s and plannable in ~3.5 s — and
+it is exactly the moment a client, having been told `200`, reasonably
+believes the index exists. ADR-139 makes what slips through the window
+harmless; this makes the window not open in the ordinary case. The member
+that answers `createIndex` is the one that knows the definition exists and
+which peers have confirmed it, so the wait belongs there — not on the writing
+member, which cannot tell "no index" from "an index in flight" and could only
+hold every write for a sync interval, and still miss a partitioned member.
+
+**Why a push, and why through `apply_batch`.** Anti-entropy is pull-only and
+paced by the sync interval; a confirmation needs the member's answer now.
+Pushing the entry and applying it by the ordinary path costs nothing new in
+correctness: every rule a pulled entry meets, a pushed one meets — the
+witnessed vector, the tombstones, the creation-stamp arbitration, the refusal
+class — and the pull that follows finds it already witnessed. The alternative
+of *asking* the member whether it has seen the stamp yet would have polled
+the sync loop's schedule; the alternative of nudging the member to pull now
+would have needed a second round trip to learn the answer.
+
+**What the response means.** `200` with an empty `pending` list means every
+member the cluster considers alive holds or has refused the definition. A
+member under `refused` has counted the refusal on its own metrics and logged
+the reason; that is ADR-123's state, now told to the client that caused it. A
+member under `pending` did not answer in time — down, partitioned, or slow —
+and receives the change through anti-entropy as before; the response says so
+rather than pretending, and the request is not failed for it, because the
+index exists and will propagate. A partitioned member is the residual this
+cannot cover: it is why ADR-139, not this record, is what makes the cluster
+safe.
+
+**Alternatives.** *Return 202 or 503 when a member is pending.* The index
+exists and is in use here; a status that reads as failure would send a
+client to retry a create that succeeded. *Confirm every schema change.*
+Collection and vector DDL share the mechanism and could adopt it; index DDL
+is where the finding was, and the rest is left for a reason to appear.
+*Confirm on a quorum.* A leaderless store has no quorum to name (ADR-037);
+"every live member" is the set SWIM already maintains.
+
+**Cost.** Two protocol messages; a `Push` is capped at the batch limit and
+refused above it. `serve` gains a `serve_with` form taking the hook.
+`createIndex` and `dropIndex` on a clustered node wait for their peers, up to
+the deadline; a member that is slow to answer makes the request slow, which
+is the point. `drop_index_inner` returns the stamp it minted. `Members` gains
+an accessor for address-and-id pairs. One config key. The response schemas
+gain an optional `confirmation`.

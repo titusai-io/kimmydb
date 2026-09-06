@@ -2045,6 +2045,16 @@ paths:
         The backfill is blocking: the response means the index is built and
         usable, not scheduled.
 
+        On a clustered node the response also means every live member has
+        applied or refused the definition: the change is pushed to each
+        member and the request waits for their answers, so a client that
+        creates an index here and writes through a front a moment later
+        finds it enforced wherever the write lands. `confirmation` names
+        each member's answer; a member listed under `pending` did not answer
+        within `cluster.ddl_confirm_timeout_secs` and receives the change
+        through anti-entropy as before (ADR-140). A node without peers
+        answers with no `confirmation` at all.
+
         `expireAfterSeconds` makes it a TTL index — single-field and
         dates-only, and a document whose indexed field holds anything else is
         never expired. `partialFilterExpression` makes it partial, and the
@@ -2099,7 +2109,9 @@ paths:
                   description: Makes this a partial index.
       responses:
         "200":
-          description: The index, built and in use.
+          description: |
+            The index, built and in use — and, on a clustered node, confirmed
+            on every live member that answered.
           content:
             application/json:
               schema: { $ref: "#/components/schemas/Index" }
@@ -2123,6 +2135,14 @@ paths:
       tags: [indexes]
       operationId: dropIndex
       summary: Drop an index.
+      description: |
+        Applied where it lands: the member that answers drops the index it
+        holds and the drop replicates. On a clustered node the drop is also
+        pushed to every live member before the response, as `createIndex`
+        is, and `confirmation` says who applied it (ADR-140). A drop that
+        finds nothing here answers `dropped: false`, mints nothing, and so
+        confirms nothing — it never reaches a member that does hold the
+        index. Send a drop to a member that holds the index.
       x-kimmy-action: ddl
       responses:
         "200":
@@ -2135,6 +2155,11 @@ paths:
                 properties:
                   dropped:
                     type: boolean
+                  confirmation:
+                    $ref: "#/components/schemas/DdlConfirmation"
+                    description: |
+                      Present on a clustered node when the drop minted an
+                      entry: what each live member answered.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -3396,6 +3421,47 @@ components:
         partialFilterExpression:
           $ref: "#/components/schemas/Document"
           description: Present only on a partial index.
+        confirmation:
+          $ref: "#/components/schemas/DdlConfirmation"
+          description: |
+            Present on the `createIndex` response of a clustered node only:
+            what each live member answered when the definition was pushed to
+            it. Never on a listing or a description.
+
+    DdlConfirmation:
+      type: object
+      description: |
+        What confirming a schema change on the cluster's live members found
+        (ADR-140). Node ids are the ones `/v1/topology` reports. The member
+        that answered the request is not listed: it holds the change by
+        construction.
+      required: [confirmed, refused, pending]
+      properties:
+        confirmed:
+          type: array
+          items: { type: string }
+          description: Members that applied the change, or already held it.
+        refused:
+          type: array
+          items: { type: string }
+          description: |
+            Members that could not apply the change and skipped it — a
+            definition they cannot apply, or a rival under the same name they
+            cannot arbitrate — counted in their `kimmy_sync_ddl_refused_total`
+            and logged there with the reason; or that do not hold the
+            collection it names.
+        pending:
+          type: array
+          description: |
+            Members that did not answer before `cluster.ddl_confirm_timeout_secs`,
+            each with why. Each receives the change through anti-entropy; the
+            response cannot say when.
+          items:
+            type: object
+            required: [node, reason]
+            properties:
+              node: { type: string }
+              reason: { type: string }
 
     CollectionDescription:
       type: object
