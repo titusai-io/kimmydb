@@ -15,7 +15,9 @@ readers.
 
 ```
 /var/lib/kimmy/
-└── kimmy.redb        documents, oplog, users, node identity — everything
+├── kimmy.redb        documents, oplog, users, node identity — everything
+└── kimmy.last-exit   how the last run ended; written on the way out, read and
+                      removed by the next start ([Operations](operations.md#what-a-shutdown-logs-and-what-a-start-says-about-the-last-one))
 ```
 
 > Node identity lives **inside** the database file, not beside it. Copying or

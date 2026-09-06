@@ -159,6 +159,11 @@ impl AppState {
         for db in &databases {
             collections += self.engine.list_collections(&db.name)?.len() as u64;
         }
+        // The kernel's figure for the whole process, beside the two byte
+        // gauges that each bound one part of it (ADR-147). Read here, per
+        // scrape and per export, for the same reason the engine's numbers
+        // are: a gauge that lags is a gauge an alert fires late on.
+        let memory = crate::metrics::ProcessMemory::read();
         Ok(crate::metrics::StorageReadings {
             databases: databases.len() as u64,
             collections,
@@ -176,6 +181,8 @@ impl AppState {
             // An estimate from node count and width, not a heap measurement;
             // what the budget evicts against, so the two agree by construction.
             vector_index_cache_bytes: self.vectors.resident_bytes(),
+            process_resident_bytes: memory.resident_bytes,
+            process_resident_peak_bytes: memory.peak_resident_bytes,
             index_unkeyed: self.engine.unkeyed_writes(),
         })
     }

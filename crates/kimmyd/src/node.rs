@@ -10,6 +10,7 @@ use kimmy_storage::{Engine, RetentionPolicy};
 use tracing::{debug, info, warn};
 
 use crate::config::{AuthConfig, Config, OidcConfig};
+use crate::lifecycle;
 
 /// Filename of the redb database inside the data directory.
 const DATABASE_FILE: &str = "kimmy.redb";
@@ -86,7 +87,31 @@ fn remind_to_remove_previous_secret(ttl_secs: u64) {
 /// "now". See ADR-049.
 const CERT_POLL_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Start the node, serve until told to stop, and say how it ended.
+///
+/// Both ways out are logged and both leave the exit marker `lifecycle`
+/// reads on the next start (ADR-147): the marker's absence is what tells
+/// that start the process was ended by something else. The error path logs
+/// at `INFO` with the error's text — `main` prints it to stderr as well, so
+/// the level is for naming the exit in the log, not for paging; the exit
+/// status already says it failed.
 pub async fn run(config: Config) -> Result<()> {
+    let data_dir = config.storage.data_dir.clone();
+    let outcome = start_and_serve(config).await;
+    match &outcome {
+        Ok(()) => {
+            lifecycle::record_exit(&data_dir, lifecycle::Exit::Shutdown);
+            info!("shutdown complete");
+        }
+        Err(e) => {
+            lifecycle::record_exit(&data_dir, lifecycle::Exit::Error);
+            info!(error = format!("{e:#}"), "exiting on an error");
+        }
+    }
+    outcome
+}
+
+async fn start_and_serve(config: Config) -> Result<()> {
     std::fs::create_dir_all(&config.storage.data_dir).with_context(|| {
         format!("creating data directory {}", config.storage.data_dir.display())
     })?;
@@ -96,6 +121,10 @@ pub async fn run(config: Config) -> Result<()> {
     // matters because the id is the tiebreak half of every write's stamp — a
     // node that forgets it becomes a stranger to its own prior writes.
     let path = config.storage.data_dir.join(DATABASE_FILE);
+    // Read before the engine opens, because opening creates the database
+    // file, and a database with no marker beside it is what an unclean exit
+    // looks like (ADR-147). Announced after the banner below.
+    let previous = lifecycle::previous_run(&config.storage.data_dir, &path);
     let engine = Arc::new(
         Engine::open_with_cache(&path, Some(config.storage.cache_bytes as usize))
             .with_context(|| format!("opening database {}", path.display()))?,
@@ -117,6 +146,10 @@ pub async fn run(config: Config) -> Result<()> {
         "starting kimmyd"
     );
     info!("{}", config.summary());
+
+    // After the banner, so the line an operator is sent to look for sits
+    // under the identity of the run that is reporting it.
+    lifecycle::announce(&config.storage.data_dir, &previous);
 
     if config.auth.insecure_no_auth {
         warn!("authentication is DISABLED; every request runs with full privileges");
@@ -527,7 +560,8 @@ pub async fn run(config: Config) -> Result<()> {
     // an aborted delivery is redelivered rather than lost.
     webhook_handle.abort();
 
-    info!("shutdown complete");
+    // `run` writes the exit marker and says "shutdown complete", after this
+    // returns, so the last line of the log is the last thing done.
     Ok(())
 }
 

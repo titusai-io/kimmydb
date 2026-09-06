@@ -7818,6 +7818,8 @@ async fn the_metrics_body_exposes_exactly_these_series_in_exactly_this_order() {
             "kimmy_commits_grouped_total",
             "kimmy_storage_bytes",
             "kimmy_vector_index_cache_bytes",
+            "kimmy_process_resident_bytes",
+            "kimmy_process_resident_peak_bytes",
             "kimmy_up",
             "kimmy_uptime_seconds",
             "kimmy_runtime_stall_seconds",

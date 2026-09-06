@@ -37,9 +37,9 @@ const LATENCY_BUCKETS_US: [u64; 12] =
 /// A value struct rather than an accessor per counter: the OTLP bridge wants
 /// all of them, once, and twenty-five getters would be twenty-five things to
 /// forget when a counter is added. See [`Metrics::snapshot`].
-/// What the storage engine and the vector cache report at the moment a
-/// reader asks: the block `/metrics` renders ahead of the process counters,
-/// and the one the OTLP bridge reads beside them (ADR-142).
+/// What the storage engine, the vector cache and the kernel report at the
+/// moment a reader asks: the block `/metrics` renders ahead of the process
+/// counters, and the one the OTLP bridge reads beside them (ADR-142).
 ///
 /// Read by the caller, which has the engine, and handed in: this type holds
 /// no database handle, and the two readers — the `/metrics` handler and the
@@ -56,9 +56,75 @@ pub struct StorageReadings {
     pub commits_grouped: u64,
     pub storage_bytes: u64,
     pub vector_index_cache_bytes: u64,
+    /// This process's resident memory and its high-water mark, as the
+    /// kernel reports them ([`ProcessMemory`], ADR-147). The figure a
+    /// container memory limit is enforced against, which neither of the two
+    /// byte gauges above is.
+    pub process_resident_bytes: u64,
+    pub process_resident_peak_bytes: u64,
     /// Documents filed under an index's unkeyed run since start
     /// (`Engine::unkeyed_writes`, ADR-139).
     pub index_unkeyed: u64,
+}
+
+/// The process's resident memory, read from the kernel.
+///
+/// `VmRSS` and `VmHWM` from `/proc/self/status`, which is what the project's
+/// own allocator measurements sample (docs/benchmarks.md) and what a cgroup
+/// memory limit is enforced against. Parsed with the standard library alone:
+/// two lines of a text file are not worth a crate, and the release binary
+/// is a static musl build where every dependency is a build to audit.
+///
+/// Zero where there is no `/proc` — a macOS build, or a mount namespace
+/// without one. Zero rather than absent, so the series is always on the
+/// page and a dashboard built against it does not go blank on a platform;
+/// the HELP text says what a zero means.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ProcessMemory {
+    /// Bytes resident right now (`VmRSS`).
+    pub resident_bytes: u64,
+    /// The most bytes that were resident at any moment of this process's
+    /// life (`VmHWM`). What a container limit was hit *by*, after the fact,
+    /// when the current figure has already come back down.
+    pub peak_resident_bytes: u64,
+}
+
+impl ProcessMemory {
+    /// Read the kernel's figures for this process, fresh.
+    ///
+    /// One small file read; `/proc` is not a disk, so this costs what a
+    /// scrape can afford. A file that cannot be read reads as zeros, which
+    /// is what the HELP text promises for a platform without it.
+    pub fn read() -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/self/status")
+                .map(|s| Self::parse(&s))
+                .unwrap_or_default()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self::default()
+        }
+    }
+
+    /// Pull the two fields out of the text of `/proc/self/status`.
+    ///
+    /// The kernel prints both in kB whatever the value, as
+    /// `VmRSS:\t  123456 kB`. A line that is missing or does not parse leaves
+    /// its field at zero rather than failing the reading: the other field is
+    /// still worth having.
+    pub fn parse(status: &str) -> Self {
+        let field = |name: &str| -> u64 {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|kb| kb.parse::<u64>().ok())
+                .map_or(0, |kb| kb.saturating_mul(1024))
+        };
+        Self { resident_bytes: field("VmRSS:"), peak_resident_bytes: field("VmHWM:") }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -72,6 +138,10 @@ pub struct MetricsSnapshot {
     pub commits_grouped: u64,
     pub storage_bytes: u64,
     pub vector_index_cache_bytes: u64,
+    /// Resident memory and its high-water mark, from the same reading
+    /// (ADR-147).
+    pub process_resident_bytes: u64,
+    pub process_resident_peak_bytes: u64,
     pub uptime_secs: u64,
     pub requests: u64,
     pub responses_2xx: u64,
@@ -593,6 +663,8 @@ impl Metrics {
             commits_grouped: readings.commits_grouped,
             storage_bytes: readings.storage_bytes,
             vector_index_cache_bytes: readings.vector_index_cache_bytes,
+            process_resident_bytes: readings.process_resident_bytes,
+            process_resident_peak_bytes: readings.process_resident_peak_bytes,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -717,6 +789,12 @@ impl Metrics {
              # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
              # TYPE kimmy_vector_index_cache_bytes gauge\n\
              kimmy_vector_index_cache_bytes {index_cache}\n\
+             # HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.\n\
+             # TYPE kimmy_process_resident_bytes gauge\n\
+             kimmy_process_resident_bytes {resident}\n\
+             # HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started (VmHWM) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.\n\
+             # TYPE kimmy_process_resident_peak_bytes gauge\n\
+             kimmy_process_resident_peak_bytes {resident_peak}\n\
              # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
              # TYPE kimmy_up gauge\n\
              kimmy_up 1\n\
@@ -847,6 +925,8 @@ impl Metrics {
             grouped = readings.commits_grouped,
             storage = readings.storage_bytes,
             index_cache = readings.vector_index_cache_bytes,
+            resident = readings.process_resident_bytes,
+            resident_peak = readings.process_resident_peak_bytes,
             p_requests = kimmy_vector::provider_totals().0,
             p_tokens = kimmy_vector::provider_totals().1,
             uptime = self.uptime_secs(),
@@ -1026,6 +1106,8 @@ mod tests {
             commits_grouped: 46,
             storage_bytes: 47,
             vector_index_cache_bytes: 48,
+            process_resident_bytes: 49,
+            process_resident_peak_bytes: 50,
             index_unkeyed: 26,
         }
     }
@@ -1071,6 +1153,12 @@ kimmy_storage_bytes 47
 # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
 # TYPE kimmy_vector_index_cache_bytes gauge
 kimmy_vector_index_cache_bytes 48
+# HELP kimmy_process_resident_bytes Resident memory of this process as the kernel reports it (VmRSS in /proc/self/status) - the figure a container memory limit is enforced against. Holds storage.cache_bytes, the HNSW graphs, and whatever heap the allocator keeps for reuse after a burst, which is why it does not follow the two byte gauges above down. 0 where /proc is not available.
+# TYPE kimmy_process_resident_bytes gauge
+kimmy_process_resident_bytes 49
+# HELP kimmy_process_resident_peak_bytes The most resident memory this process has had at any moment since it started (VmHWM) - what a container limit was reached by, readable after the current figure has come back down. 0 where /proc is not available.
+# TYPE kimmy_process_resident_peak_bytes gauge
+kimmy_process_resident_peak_bytes 50
 # HELP kimmy_up Always 1; presence indicates the node is serving.
 # TYPE kimmy_up gauge
 kimmy_up 1
@@ -1237,6 +1325,8 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_commits_grouped_total {}\n", s.commits_grouped));
         expect(&format!("kimmy_storage_bytes {}\n", s.storage_bytes));
         expect(&format!("kimmy_vector_index_cache_bytes {}\n", s.vector_index_cache_bytes));
+        expect(&format!("kimmy_process_resident_bytes {}\n", s.process_resident_bytes));
+        expect(&format!("kimmy_process_resident_peak_bytes {}\n", s.process_resident_peak_bytes));
         expect(&format!("kimmy_uptime_seconds {}\n", s.uptime_secs));
         expect(&format!("kimmy_requests_total {}\n", s.requests));
         expect(&format!("kimmy_responses_total{{class=\"2xx\"}} {}\n", s.responses_2xx));
@@ -1364,7 +1454,7 @@ kimmy_request_duration_seconds_count 3
         }
         // 53 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 71, "expected one sample per series: {out}");
+        assert_eq!(samples, 73, "expected one sample per series: {out}");
     }
 
     #[test]
@@ -1592,5 +1682,45 @@ kimmy_request_duration_seconds_count 3
         let out = m.render();
         assert!(out.contains("kimmy_sync_divergence_check_age_seconds 0\n"), "{out}");
         assert!(out.contains("kimmy_sync_divergence_checks_total{outcome=\"ran\"} 0\n"), "{out}");
+    }
+    #[test]
+    fn resident_memory_is_read_from_the_two_status_lines_in_bytes() {
+        // The shape the kernel prints: a tab after the colon, right-aligned
+        // digits, the unit always kB. Order and surrounding lines are the
+        // kernel's business, so the fixture carries neighbours.
+        let status = "Name:\tkimmyd\nVmPeak:\t 2233104 kB\nVmSize:\t 2101972 kB\n\
+                      VmHWM:\t 2097152 kB\nVmRSS:\t  696320 kB\nRssAnon:\t  690000 kB\n\
+                      Threads:\t9\n";
+        let m = ProcessMemory::parse(status);
+        assert_eq!(m.resident_bytes, 696_320 * 1024);
+        assert_eq!(m.peak_resident_bytes, 2_097_152 * 1024);
+
+        // `VmSize` and `VmPeak` share a prefix character run with nothing
+        // here, but `RssAnon` and `VmRSS` must not be confused: the match is
+        // on the field name at the start of the line, not on a substring.
+        let m = ProcessMemory::parse("RssAnon:\t 1 kB\nVmRSSx:\t 2 kB\n");
+        assert_eq!(m, ProcessMemory::default());
+    }
+
+    #[test]
+    fn a_missing_or_malformed_line_reads_as_zero_and_leaves_the_other_field() {
+        // A kernel that stopped printing one of the two, or a line that is
+        // not a number, must not take the other reading with it. Zero is
+        // what the HELP text promises for "not available".
+        let m = ProcessMemory::parse("VmRSS:\t 12 kB\n");
+        assert_eq!(m, ProcessMemory { resident_bytes: 12 * 1024, peak_resident_bytes: 0 });
+        let m = ProcessMemory::parse("VmRSS:\t lots kB\nVmHWM:\t 3 kB\n");
+        assert_eq!(m, ProcessMemory { resident_bytes: 0, peak_resident_bytes: 3 * 1024 });
+        assert_eq!(ProcessMemory::parse(""), ProcessMemory::default());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_live_reading_is_non_zero_on_linux_and_the_peak_is_at_least_the_current() {
+        // The claim the two series make: on the target the release binary
+        // ships for, the numbers are the kernel's and not the placeholder.
+        let m = ProcessMemory::read();
+        assert!(m.resident_bytes > 0, "{m:?}");
+        assert!(m.peak_resident_bytes >= m.resident_bytes, "{m:?}");
     }
 }
