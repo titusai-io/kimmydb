@@ -1828,6 +1828,174 @@ async fn a_cap_truncated_round_counts_a_skip_and_never_a_check() {
     looping.abort();
 }
 
+/// A byte relay to `target` that hands exactly one connection through and
+/// closes every later one: a member whose inbound replication completes
+/// once and then never again. TLS runs end to end through it, so the
+/// channel binding holds and the one round is a real round — a relay that
+/// terminated TLS could not do this (see `man_in_the_middle`). The listener
+/// stays bound for the life of the test — dropping it would free the port
+/// for another test in the same process to bind — and every connection
+/// after the first is accepted and dropped at once, so each later dial
+/// fails on a socket the peer closed rather than on anything with a timer
+/// in it.
+async fn relay_one_connection(target: std::net::SocketAddr) -> std::net::SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let Ok((mut inbound, _)) = listener.accept().await else { return };
+        let relay = async {
+            let Ok(mut upstream) = TcpStream::connect(target).await else { return };
+            let _ = tokio::io::copy_bidirectional(&mut inbound, &mut upstream).await;
+        };
+        let close_the_rest = async {
+            while let Ok((later, _)) = listener.accept().await {
+                drop(later);
+            }
+        };
+        tokio::join!(relay, close_the_rest);
+    });
+    addr
+}
+
+/// The live finding ADR-145 answers, end to end through two real loops.
+/// One member's inbound replication freezes after a single good round;
+/// the other keeps writing into a collection both hold by name. Every
+/// member holds the same collections, so the existence half agrees
+/// everywhere; the frozen member is behind and never advances, so under
+/// ADR-133's gate alone the count half would be deferred against it on
+/// every contact for as long as the freeze lasts — which on the cluster
+/// that found this was some 250 checks reporting clean.
+///
+/// Two claims, one per side. On the healthy member: the count half defers
+/// while the peer's position is unproven, compares once it has stood still
+/// for `FROZEN_CONTACTS` checked contacts, and the gauge then names the
+/// count-only divergence. On the frozen member: its one check leaves a
+/// reading, every round after fails and is counted as a skip, `ran` never
+/// moves again, and the age of that reading rises — the number that says
+/// the gauge it is holding is old.
+#[tokio::test]
+async fn a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age() {
+    use kimmy_cluster::{FROZEN_CONTACTS, ReplicationConfig, RoundReport, SeedSource, replicate};
+
+    let healthy = node().await;
+    let frozen = node().await;
+
+    let orders = healthy.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..20 {
+        healthy.engine.insert(&orders, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+    sync(&healthy, &frozen).await;
+    sync(&healthy, &frozen).await; // converged: same collection, same count, both ways
+
+    // The member that will freeze pulls through a relay that lets exactly
+    // one round through. That round runs the check, so there is a reading
+    // to grow old; every round after it fails at once, on a connection the
+    // relay accepts and closes.
+    let relay = relay_one_connection(healthy.addr).await;
+    let (frozen_tx, mut frozen_rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config =
+        ReplicationConfig::new(vec![SeedSource::Static(vec![relay])], SECRET.into(), frozen.addr);
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = frozen_tx.send(report);
+    }));
+    let frozen_loop = tokio::spawn(replicate(Arc::clone(&frozen.engine), config));
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        let report = tokio::time::timeout_at(deadline, frozen_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the one relayed round never ran the check"))
+            .expect("the loop must keep reporting");
+        if report.divergence_checks > 0 {
+            assert_eq!(report.divergence_check_age_secs, Some(0), "just checked: {report:?}");
+            break;
+        }
+        assert_eq!(report.divergence_check_age_secs, None, "nothing has run yet: {report:?}");
+    }
+
+    // The healthy member keeps writing into the collection both hold. The
+    // frozen one will never see these: a count-only divergence on a
+    // collection whose name and existence agree on every member.
+    for i in 20..40 {
+        healthy.engine.insert(&orders, doc! { "_id": format!("d{i}") }).unwrap();
+    }
+
+    let (healthy_tx, mut healthy_rx) = tokio::sync::mpsc::unbounded_channel::<RoundReport>();
+    let mut config = ReplicationConfig::new(
+        vec![SeedSource::Static(vec![frozen.addr])],
+        SECRET.into(),
+        healthy.addr,
+    );
+    config.sync_interval = Duration::from_millis(100);
+    config.discovery_interval = Duration::from_millis(100);
+    config.on_round = Some(Arc::new(move |report| {
+        let _ = healthy_tx.send(report);
+    }));
+    let healthy_loop = tokio::spawn(replicate(Arc::clone(&healthy.engine), config));
+
+    // The healthy side: deferred while the peer's stillness is unproven,
+    // compared once it is, confirmed on the second compared probe.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (mut checks, mut compared, mut deferred, mut confirmed) = (0usize, 0usize, 0usize, 0usize);
+    while confirmed == 0 {
+        let report = tokio::time::timeout_at(deadline, healthy_rx.recv())
+            .await
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the count divergence never confirmed against the frozen peer: \
+                     checks={checks} compared={compared} deferred={deferred}"
+                )
+            })
+            .expect("the loop must keep reporting");
+        assert_eq!(report.failed, 0, "the frozen peer answers every pull: {report:?}");
+        assert_eq!(report.divergence_skips, 0, "nothing truncates a converged pull: {report:?}");
+        if compared == 0 && report.divergence_count_compared > 0 {
+            assert!(
+                deferred >= FROZEN_CONTACTS as usize,
+                "a peer that is behind is compared only after standing still for \
+                 {FROZEN_CONTACTS} checked contacts, never sooner: deferred={deferred}"
+            );
+        }
+        checks += report.divergence_checks;
+        compared += report.divergence_count_compared;
+        deferred += report.divergence_count_deferred;
+        confirmed = report.divergent_collections;
+    }
+    assert_eq!(confirmed, 1, "the count-only divergence, on a collection held everywhere by name");
+    assert!(compared >= 2, "confirmed on two consecutive probes, never one: compared={compared}");
+    assert_eq!(
+        checks,
+        compared + deferred,
+        "one collection in rotation: every checked contact either compared it or deferred it"
+    );
+    healthy_loop.abort();
+
+    // The frozen side: `ran` stays where its one good round left it, every
+    // failed round is a skip, and the age of the reading rises.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    let (mut later_checks, mut failed, mut skips) = (0usize, 0usize, 0usize);
+    let mut age = Some(0u64);
+    while age < Some(1) {
+        let report = tokio::time::timeout_at(deadline, frozen_rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the frozen member's check age never rose"))
+            .expect("the loop must keep reporting");
+        assert!(report.divergence_check_age_secs.is_some(), "a reading exists: {report:?}");
+        assert!(report.divergence_check_age_secs >= age, "the age does not fall: {report:?}");
+        assert_eq!(report.divergent_collections, 0, "the reading it is holding: {report:?}");
+        later_checks += report.divergence_checks;
+        failed += report.failed;
+        skips += report.divergence_skips;
+        age = report.divergence_check_age_secs;
+    }
+    assert_eq!(later_checks, 0, "no round completed after the freeze, so nothing re-examined");
+    assert!(failed >= 1, "the freeze is a run of failed rounds");
+    assert_eq!(skips, failed, "every failed round is counted as a skip, and only those");
+    frozen_loop.abort();
+}
+
 /// One of ADR-132's two remaining rises of `kimmy_sync_ddl_refused_total`,
 /// over the wire: a rival definition arrives under a name this node holds
 /// with **no creation stamp**, so there is nothing to arbitrate with, and the

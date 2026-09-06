@@ -135,6 +135,17 @@ pub struct SyncOutcome {
     /// judged untrustworthy this round (a lagging peer; see
     /// `divergence_probe_for` in `kimmy-cluster`).
     pub count_probe: Option<(kimmy_core::CollectionId, bool)>,
+    /// Whether the count half was *deferred* this round: a collection was
+    /// named for a count, the check ran, and the caller dropped the probe
+    /// because the peer is behind this node and still advancing
+    /// (`divergence_probe_for` in `kimmy-cluster`, ADR-133 defect 2 as
+    /// amended by ADR-145). `false` whenever `count_probe` is `Some`, and
+    /// also when there was simply nothing to probe. Carried so a caller can
+    /// count "compared" and "deferred" apart: without it a count half that
+    /// never runs against a peer permanently behind is indistinguishable
+    /// from one that runs and agrees. Set only by `kimmy-cluster`'s
+    /// `sync_once`, like the two fields above.
+    pub count_probe_deferred: bool,
 }
 
 /// How far behind in time `mine` is against `theirs`, in milliseconds, as of

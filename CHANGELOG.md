@@ -14,6 +14,33 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Changed
 
+- **The divergence check compares document counts against a member that
+  has stopped, and says how old its reading is.** On a three-member cluster
+  where one member's inbound replication failed every round for half an
+  hour, four collections diverged in document count under the same names
+  everywhere, and `kimmy_sync_divergent_collections` read 0 on every member
+  throughout: the healthy members deferred the count half against the
+  wedged one on every one of some 250 checks, because a member that is
+  behind was read as a member catching up, and the wedged member's own
+  gauge served a value nothing had re-examined with no series to say so.
+  The count half now defers only while the peer is behind *and moving*, and
+  compares once the peer's position has stood still for three consecutive
+  checked contacts; each checked contact is counted in a new
+  `kimmy_sync_divergence_count_probes_total{outcome="compared"|"deferred"}`
+  (bridged as `kimmy.sync.divergence_count_probes.compared` and
+  `.deferred`), so a count half that has never compared against anyone is a
+  flat `compared`, not a clean 0. A new gauge,
+  `kimmy_sync_divergence_check_age_seconds` (bridged as
+  `kimmy.sync.divergence_check_age`), is seconds since the last contact
+  whose round ran the check — **alert on it above a few multiples of
+  `cluster.sync_interval_secs`**, and treat the gauge as unknown while it
+  is. A failed round is now counted as `skipped` on
+  `kimmy_sync_divergence_checks_total` as well as in
+  `kimmy_sync_failures_total`, so `ran` + `skipped` is every round
+  attempted; a PromQL rule that added the failures counter to the pair now
+  counts a failed round twice and should drop the addition. The check still
+  does not run on a failed round ([ADR-145](docs/decisions.md), amending
+  ADR-133 and ADR-135).
 - **A drop is recorded and replicated wherever it lands.** `DELETE
   …/indexes/{name}` on a member that holds the collection but not the index
   used to answer `200 {"dropped": false}`, mint nothing, and do nothing
