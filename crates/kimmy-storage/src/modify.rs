@@ -483,6 +483,7 @@ impl Engine {
                             *index_id,
                             lower,
                             Some(upper),
+                            index::Unkeyed::Include,
                         )?);
                     }
                     lookup(keys, &mut matches)?;
@@ -541,7 +542,7 @@ impl Engine {
             docs.insert((coll.id.0, key.as_slice()), codec::encode_doc_record(&record).as_slice())?;
         }
 
-        let newly_multikey = index::maintain(txn, coll, Some(before), next.as_ref(), &key)?;
+        let newly_multikey = index::maintain(self, txn, coll, Some(before), next.as_ref(), &key)?;
         index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry { stamp, kind, collection: coll.id, doc_id: Some(id.clone()), body };

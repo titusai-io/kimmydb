@@ -48,8 +48,10 @@ pub struct SyncOutcome {
     /// that case is a gap in coverage rather than convergence.
     pub unknown_collection: usize,
     /// Replicated schema changes this node could not apply to its current
-    /// state and skipped: an index definition its documents cannot be built
-    /// under, or a name already taken by a different definition (ADR-123).
+    /// state and skipped: a definition this build cannot apply, or a name
+    /// already taken by a different definition it cannot arbitrate
+    /// (ADR-123). Not a definition its documents do not fit — that is built,
+    /// with those documents filed unkeyed under it (ADR-139).
     ///
     /// Counted rather than failed, because the refusal is a fact about this
     /// node's data and retrying the entry unchanged can never succeed; the
@@ -635,12 +637,13 @@ enum DdlOutcome {
 /// and warns about.
 ///
 /// **Refused.** The same wedge, from the other side (ADR-123). An index
-/// definition that cannot be built over this node's documents — a compound
-/// index where a document here holds arrays at two of its paths, or one that
-/// would fan out to more than 1,000 entries — raises `InvalidQuery` from the
-/// backfill; a name already taken here by a different definition, because two
-/// members created it concurrently, raises `IndexExists`; an enforcement mode
-/// this build does not implement raises `Unsupported`. None of these is
+/// definition this build cannot apply — a TTL over two fields, a partial
+/// filter it cannot parse — raises `InvalidQuery` from the definition checks;
+/// a name already taken here by a different definition, because two members
+/// created it concurrently, raises `IndexExists`; an enforcement mode this
+/// build does not implement raises `Unsupported`. A definition this node's
+/// *documents* do not fit used to be the first of these and is now none of
+/// them: the backfill files such a document unkeyed and builds (ADR-139). None of these is
 /// `CollectionNotFound`, so each failed the round exactly as a dropped
 /// collection once did — observed on a three-member cluster running 0.20.0,
 /// where a replayed `CreateIndex` re-requested the same window with backoff
@@ -650,7 +653,7 @@ enum DdlOutcome {
 ///
 /// This class is different from every other error, and that is why it is
 /// safe to skip: the refusal is a deterministic function of the definition
-/// and this node's data, so re-delivering the entry unchanged can never
+/// and this node's state, so re-delivering the entry unchanged can never
 /// succeed, and failing the round buys nothing but the wedge. The entry is
 /// still witnessed by `apply_batch_absorbing`, so it is not re-served; it is
 /// not appended, so this node does not propagate a definition it does not
@@ -2475,16 +2478,16 @@ mod tests {
     }
 
     #[test]
-    fn a_replayed_index_that_cannot_be_built_does_not_stop_the_entries_behind_it() {
-        // The finding ADR-123 fixes, at its smallest. A created a compound
-        // index over two array fields on a collection with no document holding
-        // both, dropped it, and then took a two-array document, which is legal
-        // once the index is gone. B, meanwhile, holds such a document of its
-        // own. Replaying A's history on B, the create's backfill meets B's
-        // document and cannot build the index — and before this that error
-        // failed the round, the witnessed vector was discarded, and the same
-        // window was re-requested for ever. The drop behind it in the same
-        // window was never reached, and so was nothing A wrote afterwards.
+    fn a_replayed_index_over_a_document_this_node_cannot_key_is_built_and_the_entries_behind_it_arrive()
+     {
+        // The finding ADR-123 fixed, replayed under ADR-139. A created a
+        // compound index over two array fields on a collection with no
+        // document holding both, dropped it, and then took a two-array
+        // document, which is legal once the index is gone. B, meanwhile,
+        // holds such a document of its own. Replaying A's history on B, the
+        // create's backfill meets B's document — and files it unkeyed rather
+        // than refusing the definition. Nothing is counted, the drop behind
+        // it lands, and so does everything A wrote afterwards.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -2498,15 +2501,16 @@ mod tests {
         b.insert(&cb, doc! { "_id": "both-b", "tags": ["x"], "cats": ["p"] }).unwrap();
 
         let outcome = round(&b, &a, BATCH);
-        assert_eq!(outcome.ddl_refused, 1, "the create is skipped and counted: {outcome:?}");
+        assert_eq!(outcome.ddl_refused, 0, "nothing to refuse: the index builds: {outcome:?}");
+        assert_eq!(outcome.ddl, 3, "the create, the drop, and the collection: {outcome:?}");
         assert!(
             b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
-            "the index must not exist on B — its documents cannot be indexed by it"
+            "built and then dropped, as on A"
         );
         for id in ["both-a", "after"] {
             assert!(
                 b.get(&cb, &DocId::String(id.into())).unwrap().is_some(),
-                "{id} must arrive: the refused create must not stop the entries behind it"
+                "{id} must arrive behind the schema changes"
             );
         }
         assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "and the window is not re-served");
@@ -2515,6 +2519,169 @@ mod tests {
         sync(&a, &b);
         assert_eq!(a.count(&ca).unwrap(), 3);
         assert_eq!(b.count(&cb).unwrap(), 3);
+    }
+
+    /// Whether `engine` holds `name` on `shop.orders`, and how many of its
+    /// documents that index could not key.
+    fn index_state(engine: &Engine, name: &str) -> Option<u64> {
+        let coll = engine.get_collection("shop", "orders").unwrap();
+        let index = coll.index(name)?;
+        Some(engine.unkeyed_count(&coll, index.id).unwrap())
+    }
+
+    #[test]
+    fn a_document_arriving_after_an_index_that_cannot_key_it_is_stored_unkeyed() {
+        // The wedge, at its smallest. A holds a compound index over two
+        // paths; B, which has not heard of it, legally accepts a document
+        // holding arrays at both; the document replicates to A. Before
+        // ADR-139 A could neither apply the entry nor skip it, and every
+        // round failed for the life of the process. Now A stores the
+        // document, files it unkeyed under the index it holds, and the
+        // round is a round like any other.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "fine", "tags": ["x"], "cats": "p" }).unwrap();
+
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+        b.insert(&cb, doc! { "_id": "later" }).unwrap();
+
+        // The documents alone, applied as a transport round would apply
+        // them: the collection's creation entry is a schema change, which
+        // ends a run by design, and what is measured here is the run
+        // (ADR-119). A holds the collection already.
+        let theirs = b.version_vector().unwrap();
+        let entries: Vec<_> = b
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        let end = entries.last().unwrap().stamp.hlc;
+        let commits = a.commits();
+        let outcome = a.apply_peer_batch(&theirs, &entries, end, true).unwrap();
+        assert_eq!(outcome.applied, 2, "both of B's documents apply: {outcome:?}");
+        assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+        assert_eq!(a.commits() - commits, 1, "one run, one commit, unkeyed document included");
+        assert!(a.get(&ca, &DocId::String("both".into())).unwrap().is_some(), "stored on A");
+        assert_eq!(index_state(&a, "tags_1_cats_1"), Some(1), "held, with one unkeyed document");
+        assert_eq!(a.unkeyed_writes(), 1);
+        assert_eq!(round(&a, &b, BATCH), SyncOutcome::default(), "witnessed, not re-served");
+
+        // And A's own planner finds the document through that index, as a
+        // scan would, so the two answer alike.
+        let coll = a.get_collection("shop", "orders").unwrap();
+        let filter = kimmy_query::filter::parse(&doc! { "tags": "x", "cats": "q" }).unwrap();
+        let plan = kimmy_query::plan::choose(&filter, &coll.indexes).expect("the index applies");
+        let mut found = Vec::new();
+        for (lower, upper) in &plan.ranges {
+            for key in a.index_candidates(&coll, plan.index_id, lower, upper).unwrap() {
+                if let Some(d) = a.get_by_encoded_key(&coll, &key).unwrap()
+                    && kimmy_query::filter::matches(&filter, &d)
+                {
+                    found.push(d.get_str("_id").unwrap().to_string());
+                }
+            }
+        }
+        assert_eq!(found, vec!["both"], "found through the index, by the recheck");
+    }
+
+    #[test]
+    fn both_arrival_orders_converge_to_the_same_state() {
+        // The pair can meet in two orders — definition first on the member
+        // that built it, document first on the member that took the write
+        // — and ADR-123 handled only one of them. Under ADR-139 both orders
+        // land in one state: the index on every member, the document on
+        // every member, filed unkeyed under it everywhere, nothing counted
+        // as refused, and nothing left to re-serve.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+        // A takes the document (definition first, document second) ...
+        let to_a = round(&a, &b, BATCH);
+        // ... and B takes the definition (document first, definition second).
+        let to_b = round(&b, &a, BATCH);
+        assert_eq!(to_a.ddl_refused + to_b.ddl_refused, 0, "{to_a:?} / {to_b:?}");
+
+        for (name, engine) in [("a", &a), ("b", &b)] {
+            let coll = engine.get_collection("shop", "orders").unwrap();
+            assert!(
+                engine.get(&coll, &DocId::String("both".into())).unwrap().is_some(),
+                "{name} holds the document"
+            );
+            assert_eq!(
+                index_state(engine, "tags_1_cats_1"),
+                Some(1),
+                "{name} holds the index, with the document filed unkeyed under it"
+            );
+        }
+        assert_eq!(round(&a, &b, BATCH), SyncOutcome::default(), "converged, a's side");
+        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "converged, b's side");
+    }
+
+    #[test]
+    fn an_index_arriving_after_a_document_it_cannot_key_is_built_over_it() {
+        // The order ADR-123 answered by refusing the definition. It is now
+        // built, over the document it cannot key, so the member ends with
+        // what its peers have rather than without an index they hold.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        let cb = b.create_collection("shop", "orders").unwrap();
+        b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
+
+        let outcome = round(&b, &a, BATCH);
+        assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+        assert_eq!(index_state(&b, "tags_1_cats_1"), Some(1));
+        assert_eq!(b.unkeyed_writes(), 1, "the backfill counted the document it filed");
+    }
+
+    #[test]
+    fn a_batch_holding_documents_an_index_cannot_key_applies_the_rest_of_the_run() {
+        // ADR-119's property, under ADR-139: a run is one transaction
+        // however many of its entries the index could not key, and every
+        // entry in it lands.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        two_array_index(&a);
+        let cb = b.create_collection("shop", "orders").unwrap();
+        for i in 0..20i64 {
+            let doc = if i % 3 == 0 {
+                doc! { "_id": i, "tags": ["x", "y"], "cats": ["p"] }
+            } else {
+                doc! { "_id": i, "tags": ["x"], "cats": "p" }
+            };
+            b.insert(&cb, doc).unwrap();
+        }
+
+        // The documents alone, as in `a_document_arriving_after_an_index…`
+        // above: the run is what is measured, and A holds the collection.
+        let theirs = b.version_vector().unwrap();
+        let entries: Vec<_> = b
+            .entries_for_peer(Hlc::ZERO, BATCH)
+            .unwrap()
+            .entries
+            .into_iter()
+            .filter(|e| e.kind.is_document())
+            .collect();
+        let end = entries.last().unwrap().stamp.hlc;
+        let commits = a.commits();
+        let outcome = a.apply_peer_batch(&theirs, &entries, end, true).unwrap();
+        assert_eq!(outcome.applied, 20, "{outcome:?}");
+        assert_eq!(a.commits() - commits, 1, "one run, one commit");
+        let ca = a.get_collection("shop", "orders").unwrap();
+        assert_eq!(a.count(&ca).unwrap(), 20);
+        assert_eq!(index_state(&a, "tags_1_cats_1"), Some(7), "0, 3, 6, …, 18");
     }
 
     #[test]
@@ -2745,7 +2912,15 @@ mod tests {
             b.get_collection("shop", "orders").unwrap().index("email_1").is_none(),
             "a drop newer than the index it names must still remove it"
         );
-        let entries = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        let entries = crate::index::scan_range(
+            b.db(),
+            cb.id,
+            index.id,
+            &[],
+            None,
+            crate::index::Unkeyed::Exclude,
+        )
+        .unwrap();
         assert!(entries.is_empty(), "and with it every entry it held");
     }
 
@@ -2945,7 +3120,15 @@ mod tests {
 
         // Built in full: both holders are in the index, so an index-backed
         // query finds both.
-        let entries = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        let entries = crate::index::scan_range(
+            b.db(),
+            cb.id,
+            index.id,
+            &[],
+            None,
+            crate::index::Unkeyed::Exclude,
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2, "every document is indexed, the colliding one included");
 
         // Recorded the way a merged write's collision is.
@@ -3166,21 +3349,24 @@ mod tests {
     }
 
     #[test]
-    fn a_definition_that_wins_the_stamp_but_cannot_be_built_leaves_the_one_it_would_replace() {
+    fn a_definition_that_wins_the_stamp_but_cannot_be_applied_leaves_the_one_it_would_replace() {
         // ADR-123's guard, kept honest against the rule that replaces its
         // `IndexExists` case. A refusal is still a refusal: the winning
-        // definition's backfill meets a document this node holds and cannot
-        // be built, so the whole replacement aborts — B keeps the index it
-        // had rather than ending with neither — and the round goes on,
-        // skipped, counted and not re-served, rather than wedging.
+        // definition is one this build cannot apply — a TTL over two fields,
+        // which no member can mint but a re-served or hand-built entry can
+        // carry — so the whole replacement aborts. B keeps the index it had
+        // rather than ending with neither, and the round goes on, skipped
+        // and counted, rather than wedging. Under ADR-139 no *document* can
+        // make a non-unique definition unbuildable any more, which is why
+        // the winner here is unbuildable by shape.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
         let cb = b.create_collection("shop", "orders").unwrap();
         b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
         b.create_index("shop", "orders", vec![field("tags")], false, Some("probe".into())).unwrap();
-        // B's definition is older than anything A can mint, so A's wins the
-        // comparison — and then fails to build over B's two-array document.
+        // B's definition is older than anything A can mint, so a winner's
+        // stamp beats it.
         restamp_index(
             &b,
             "shop",
@@ -3188,22 +3374,29 @@ mod tests {
             "probe",
             Some(Stamp::new(Hlc::new(1, 0), kimmy_core::NodeId::from_bytes([0; 16]))),
         );
-
-        a.create_index(
-            "shop",
-            "orders",
-            vec![field("tags"), field("cats")],
-            false,
-            Some("probe".into()),
-        )
-        .expect("accepted on A: no document there holds arrays at both paths");
-        let ca = a.get_collection("shop", "orders").unwrap();
-        a.insert(&ca, doc! { "_id": "after" }).unwrap();
         let held = b.get_collection("shop", "orders").unwrap().index("probe").unwrap().id;
-        let before = crate::index::scan_range(b.db(), cb.id, held, &[], None).unwrap();
+        let before = crate::index::scan_range(
+            b.db(),
+            cb.id,
+            held,
+            &[],
+            None,
+            crate::index::Unkeyed::Exclude,
+        )
+        .unwrap();
         assert!(!before.is_empty(), "the fixture gave the index entries to lose");
 
-        let outcome = round(&b, &a, BATCH);
+        let ca = a.get_collection("shop", "orders").unwrap();
+        let stamp = a.next_stamp();
+        let mut winner =
+            definition("probe", vec![field("tags"), field("cats")], false, Some(stamp));
+        winner.expire_after_secs = Some(60);
+        a.insert(&ca, doc! { "_id": "after" }).unwrap();
+        let mut batch = vec![create_index_entry(ca.id, "shop", "orders", winner, stamp)];
+        batch.extend(a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries);
+        batch.sort_by_key(|e| e.stamp);
+
+        let outcome = b.apply_batch(&batch).unwrap();
         assert_eq!(outcome.ddl_refused, 1, "skipped and counted, not applied: {outcome:?}");
         let index = b.get_collection("shop", "orders").unwrap().index("probe").cloned().unwrap();
         assert_eq!(
@@ -3211,7 +3404,15 @@ mod tests {
             1,
             "the replacement aborted whole: B keeps its own definition, not neither"
         );
-        let after = crate::index::scan_range(b.db(), cb.id, index.id, &[], None).unwrap();
+        let after = crate::index::scan_range(
+            b.db(),
+            cb.id,
+            index.id,
+            &[],
+            None,
+            crate::index::Unkeyed::Exclude,
+        )
+        .unwrap();
         for key in &before {
             assert!(
                 after.contains(key),
@@ -3223,7 +3424,10 @@ mod tests {
             b.get(&cb, &DocId::String("after".into())).unwrap().is_some(),
             "the entries behind the refusal still arrive"
         );
-        assert_eq!(round(&b, &a, BATCH), SyncOutcome::default(), "witnessed, not re-served");
+        assert!(
+            b.witnessed_vector().unwrap().get(stamp.node) >= stamp.hlc,
+            "witnessed, so it would not be re-requested"
+        );
     }
 
     #[test]

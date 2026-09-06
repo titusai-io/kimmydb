@@ -53,6 +53,12 @@ pub struct MetricsSnapshot {
     pub backups: u64,
     pub ttl_expired: u64,
     pub ttl_skipped: u64,
+    /// Documents filed under an index's unkeyed run — stored, but with no
+    /// key the index could derive, so every scan of that index rechecks
+    /// them (ADR-139). Mirrored from the engine, which is where the three
+    /// paths that file one (a local write, a replicated write, a backfill)
+    /// all count.
+    pub index_unkeyed: u64,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
     pub webhook_events: u64,
@@ -166,6 +172,14 @@ pub struct Metrics {
     jwks_refresh_failed: AtomicU64,
     ttl_expired: AtomicU64,
     ttl_skipped: AtomicU64,
+    /// The engine's count of documents filed unkeyed under an index, copied
+    /// here by whoever is about to read the series — the `/metrics` handler
+    /// and the OTLP bridge both have the engine in hand — so it renders and
+    /// bridges beside every other series and the golden tests pin it. A
+    /// mirror rather than a source: the engine owns the count because three
+    /// of its write paths produce it, and this type deliberately holds no
+    /// database handle. Monotonic, so a copy taken at read time is exact.
+    index_unkeyed: AtomicU64,
     /// Set once at startup when the embedding worker runs. `None` — the
     /// renderer then reports zeros — means this node has
     /// `[vector] worker_enabled = false`, which an operator must be able to
@@ -203,6 +217,7 @@ impl Default for Metrics {
             webhook_events: AtomicU64::new(0),
             ttl_expired: AtomicU64::new(0),
             ttl_skipped: AtomicU64::new(0),
+            index_unkeyed: AtomicU64::new(0),
             webhook_active: AtomicU64::new(0),
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
@@ -399,6 +414,14 @@ impl Metrics {
         self.ttl_skipped.fetch_add(skipped, Ordering::Relaxed);
     }
 
+    /// Mirror the engine's count of documents filed unkeyed under an index
+    /// (`Engine::unkeyed_writes`), for the reader about to render or bridge
+    /// this snapshot. A level set, not an increment: the engine's number is
+    /// the whole truth and is monotonic, so the latest copy is the right one.
+    pub fn set_index_unkeyed(&self, n: u64) {
+        self.index_unkeyed.store(n, Ordering::Relaxed);
+    }
+
     /// Count one certificate reload attempt.
     ///
     /// A failed reload is the quiet failure this metric exists for: the node
@@ -489,6 +512,7 @@ impl Metrics {
             backups: self.get(&self.backups),
             ttl_expired: self.get(&self.ttl_expired),
             ttl_skipped: self.get(&self.ttl_skipped),
+            index_unkeyed: self.get(&self.index_unkeyed),
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
@@ -596,6 +620,9 @@ impl Metrics {
              # HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.\n\
              # TYPE kimmy_ttl_skipped_total counter\n\
              kimmy_ttl_skipped_total {ttl_skipped}\n\
+             # HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.\n\
+             # TYPE kimmy_index_unkeyed_total counter\n\
+             kimmy_index_unkeyed_total {index_unkeyed}\n\
              # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.\n\
              # TYPE kimmy_webhook_deliveries_total counter\n\
              kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {wh_ok}\n\
@@ -685,6 +712,7 @@ impl Metrics {
             wh_events = self.get(&self.webhook_events),
             ttl_expired = self.get(&self.ttl_expired),
             ttl_skipped = self.get(&self.ttl_skipped),
+            index_unkeyed = self.get(&self.index_unkeyed),
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
@@ -774,6 +802,7 @@ mod tests {
 
         m.record_backup();
         m.record_expiry(11, 12);
+        m.set_index_unkeyed(26);
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
         m.record_webhook_delivery(false, 0);
@@ -871,6 +900,9 @@ kimmy_ttl_expired_total 11
 # HELP kimmy_ttl_skipped_total Expiry candidates refused because the document was refreshed before the delete.
 # TYPE kimmy_ttl_skipped_total counter
 kimmy_ttl_skipped_total 12
+# HELP kimmy_index_unkeyed_total Documents stored under an index that could not key them - arrays at two of a compound index's paths, more than 1000 keys, or a Decimal128 - and are rechecked on every scan of that index instead. Each one is logged at warning naming the index and the document; the index listing reports how many stand under each index.
+# TYPE kimmy_index_unkeyed_total counter
+kimmy_index_unkeyed_total 26
 # HELP kimmy_webhook_deliveries_total Webhook delivery attempts by outcome.
 # TYPE kimmy_webhook_deliveries_total counter
 kimmy_webhook_deliveries_total{outcome=\"delivered\"} 2
@@ -989,6 +1021,7 @@ kimmy_request_duration_seconds_count 3
         expect(&format!("kimmy_backups_total {}\n", s.backups));
         expect(&format!("kimmy_ttl_expired_total {}\n", s.ttl_expired));
         expect(&format!("kimmy_ttl_skipped_total {}\n", s.ttl_skipped));
+        expect(&format!("kimmy_index_unkeyed_total {}\n", s.index_unkeyed));
         expect(&format!(
             "kimmy_webhook_deliveries_total{{outcome=\"delivered\"}} {}\n",
             s.webhook_delivered
@@ -1088,9 +1121,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 42 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // 43 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 57, "expected one sample per series: {out}");
+        assert_eq!(samples, 58, "expected one sample per series: {out}");
     }
 
     #[test]

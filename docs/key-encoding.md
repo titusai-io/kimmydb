@@ -145,7 +145,9 @@ All three produce the same bytes, which is exactly what an index needs.
 
 `Decimal128` has no exact representation in this form. Rather than encode it
 approximately — which would silently mis-order values — `encode()` returns an
-error, and Decimal128 cannot be an index key or `_id`.
+error, and Decimal128 cannot be an index key or `_id`. A document holding one
+at an indexed path is still stored: the index files it *unkeyed* and rechecks
+it on every scan ([Indexes](indexes.md#documents-an-index-cannot-key)).
 
 Refusing is the honest outcome. An approximate index key is a wrong answer
 waiting to happen.

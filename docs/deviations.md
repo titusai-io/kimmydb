@@ -17,6 +17,37 @@ Status meanings:
 
 ---
 
+## 🟡 A compound index over two array fields indexes nothing for that document, where MongoDB refuses the write
+
+**Raised 2026-09-06, with ADR-139.** MongoDB refuses a write that would put
+arrays at two of a compound index's paths ("cannot index parallel arrays"),
+and refuses to build such an index over existing documents. KimmyDB used to
+do the same, per document, at write time. It no longer refuses either: the
+document is stored and filed under the index's *unkeyed* run, which every
+scan of that index reads beside its ranges and rechecks like any other
+candidate, so every query still finds it and none finds it wrongly. The same
+holds for a document that would produce more than 1,000 keys and for one
+holding a `Decimal128` at an indexed path. A unique index still refuses such
+a document on a local write, because a unique index must be able to key
+every document it covers.
+
+**Why.** A refusal that depends on an index is a constraint, and a leaderless
+store cannot hold a constraint across members without coordination
+(ADR-020). A member that had not yet received a definition legally accepted
+a document the definition's holder could then neither apply nor skip, and
+the holder's replication stopped for the life of the process (ADR-139). The
+refusal bought a smaller index and an early error for a badly shaped
+document; it cost a cluster its convergence. MongoDB can afford the refusal
+because every write goes through one primary and an index build commits on
+a quorum; a store that accepts writes on every member cannot.
+
+**What closes it.** Nothing needs to: a client that wants the refusal back
+polices document shape itself, or splits the compound index into single-field
+indexes, which key every shape. The `unkeyed` field on the index listing and
+`unkeyedCandidates` on `explain` say when it matters.
+
+---
+
 ## 🟡 A `$lookup` join key that crosses an array reads the first element, where MongoDB joins on every one
 
 **Raised 2026-09-04, by the 2026-09 test round, which asked which value

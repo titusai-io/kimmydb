@@ -17,34 +17,83 @@ use crate::error::{Result, StorageError};
 use crate::meta::{Enforcement, IndexField, IndexMeta};
 use crate::tables;
 
-/// Guard against a compound index over two array fields producing a
-/// combinatorial number of entries. Mongo rejects this outright, and so do we —
-/// the alternative is a single document writing millions of index rows.
+/// Guard against an index producing a combinatorial number of entries for one
+/// document. A compound index over two array fields would write the cartesian
+/// product, `|a| × |b|` entries; this is the backstop behind that rule, and the
+/// ceiling for a single-field index over one very large array.
 const MAX_KEYS_PER_DOCUMENT: usize = 1_000;
 
-/// Compute every index key a document contributes.
+/// The index key under which a document the index **cannot key** is filed.
 ///
-/// Returns more than one key when a field holds an array — a *multikey* index.
-/// Both the individual elements and the array as a whole are indexed, so that
-/// `{tags: "b"}` and `{tags: ["a","b"]}` are each answerable from the index.
-/// Indexing only the elements would leave whole-array equality with no entry,
-/// and the planner would return an incomplete result.
-pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
-    Ok(index_keys_observed(index, doc)?.0)
+/// Empty on purpose. Every real key begins with a type tag byte
+/// (`kimmy_core::keyenc`), so no document ever produces an empty key, and an
+/// empty slice sorts before every non-empty one — so the unkeyed run of an
+/// index sits at the front of its entries, disjoint from every range a query
+/// can ask for. That is what lets it live in `INDEX_ENTRIES` beside the real
+/// keys: a drop, a backup and a migration cover it with no code of their own.
+///
+/// A document is unkeyable when the index cannot derive a finite, exact set
+/// of keys for it: arrays at two of a compound index's paths, more than
+/// [`MAX_KEYS_PER_DOCUMENT`] keys, or a `Decimal128` at an indexed path. It is
+/// stored all the same — an index is an access path, not a schema — and every
+/// scan of the index reads this run beside its ranges and rechecks each
+/// document against the full filter like any other candidate. Too wide, never
+/// too narrow. Refusing the document instead was how one member's index made
+/// a document another member had legally accepted impossible to replicate
+/// ([ADR-139](../../../docs/decisions.md)).
+pub(crate) const UNKEYED: &[u8] = &[];
+
+/// What an index derives from one document.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DocumentKeys {
+    /// The document's keys, and whether it makes the index multikey.
+    Keyed { keys: Vec<Vec<u8>>, multikey: bool },
+    /// The index cannot key this document; it is filed under [`UNKEYED`].
+    ///
+    /// `multikey` is still reported: a document with arrays at two indexed
+    /// paths held arrays, and the flag is a one-way observation of that.
+    Unkeyed { reason: String, multikey: bool },
 }
 
-/// [`index_keys`], also reporting whether this document makes the index
-/// multikey.
+/// Compute every index key a document contributes, refusing a document the
+/// index cannot key.
+///
+/// The strict form, for the one place a refusal is the right answer: a
+/// **local** write against a unique index, where a client is present to be
+/// told and an index that reports a constraint it does not hold is worse
+/// than no index (ADR-020). Storage and replication go through
+/// [`document_keys`], which never refuses a document — it reports the
+/// document as unkeyed, and the index files it as such.
+pub fn index_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
+    match document_keys(index, doc)? {
+        DocumentKeys::Keyed { keys, .. } => Ok(keys),
+        DocumentKeys::Unkeyed { reason, .. } => {
+            Err(StorageError::Core(CoreError::InvalidQuery(reason)))
+        }
+    }
+}
+
+/// Every index key a document contributes, or the reason it contributes none.
+///
+/// Returns more than one key when a field holds an array — a *multikey*
+/// index. Both the individual elements and the array as a whole are indexed,
+/// so that `{tags: "b"}` and `{tags: ["a","b"]}` are each answerable from the
+/// index. Indexing only the elements would leave whole-array equality with no
+/// entry, and the planner would return an incomplete result.
 ///
 /// Multikey means some field contributed more than one value: it held an
 /// array, or its path fanned out through one (`a.b` over `{a: [{b: 1},
 /// {b: 2}]}`). That is the condition under which a two-sided key range stops
 /// being sound, so it is what the write path records — see
 /// [`IndexMeta::multikey`].
-pub(crate) fn index_keys_observed(
-    index: &IndexMeta,
-    doc: &Document,
-) -> Result<(Vec<Vec<u8>>, bool)> {
+///
+/// A document the index cannot key comes back as [`DocumentKeys::Unkeyed`]
+/// rather than as an error, because on a leaderless store there is nobody to
+/// refuse it to: a replicated write was accepted by the member that took it,
+/// and refusing it here would mean the two members never agree (ADR-020).
+/// The only error left is a partial filter that will not parse, which is a
+/// fact about the definition rather than the document.
+pub(crate) fn document_keys(index: &IndexMeta, doc: &Document) -> Result<DocumentKeys> {
     // A partial index holds only the documents its filter selects. Returning
     // no keys here is what makes membership fall out of the ordinary
     // maintenance path: entering the filter adds entries, leaving it removes
@@ -52,11 +101,12 @@ pub(crate) fn index_keys_observed(
     //
     // The early return also keeps a document outside the index from flipping
     // the multikey flag — an array it holds is not in the index, so it cannot
-    // make an index range unsound.
+    // make an index range unsound. Nor is such a document ever unkeyed: it is
+    // not in the index at all.
     if let Some(filter) = index.partial()
         && !filter?.matches(doc)
     {
-        return Ok((Vec::new(), false));
+        return Ok(DocumentKeys::Keyed { keys: Vec::new(), multikey: false });
     }
 
     // Per field, the set of values this document offers.
@@ -96,12 +146,15 @@ pub(crate) fn index_keys_observed(
         per_field.push(values);
     }
 
+    let unkeyed = |reason: String| {
+        Ok(DocumentKeys::Unkeyed {
+            reason: format!("index {:?} cannot key this document: {reason}", index.name),
+            multikey,
+        })
+    };
+
     if array_fields > 1 && index.fields.len() > 1 {
-        return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-            "index {:?} cannot be built for this document: a compound index may span \
-             at most one array field",
-            index.name
-        ))));
+        return unkeyed("a compound index may span at most one array field".into());
     }
 
     // Cartesian product across fields.
@@ -117,19 +170,35 @@ pub(crate) fn index_keys_observed(
         }
         keys = next;
         if keys.len() > MAX_KEYS_PER_DOCUMENT {
-            return Err(StorageError::Core(CoreError::InvalidQuery(format!(
-                "index {:?} would produce more than {MAX_KEYS_PER_DOCUMENT} entries \
-                 for a single document",
-                index.name
-            ))));
+            return unkeyed(format!("it would produce more than {MAX_KEYS_PER_DOCUMENT} entries"));
         }
     }
 
-    let mut encoded: Vec<Vec<u8>> =
-        keys.iter().map(|k| keyenc::encode_compound_ordered(k)).collect::<Result<_, _>>()?;
+    let mut encoded: Vec<Vec<u8>> = Vec::with_capacity(keys.len());
+    for key in &keys {
+        match keyenc::encode_compound_ordered(key) {
+            Ok(bytes) => encoded.push(bytes),
+            // Only `Decimal128`, which has no exact key encoding (ADR-005).
+            Err(e) => return unkeyed(e.to_string()),
+        }
+    }
     encoded.sort();
     encoded.dedup();
-    Ok((encoded, multikey))
+    Ok(DocumentKeys::Keyed { keys: encoded, multikey })
+}
+
+/// The keys a unique index derives from a document, refused when it cannot.
+///
+/// A unique index must be able to key every document it covers, or it
+/// reports a constraint it does not hold. The refusal is for a **local**
+/// write only; the replicated path files the document unkeyed and says so.
+fn unique_keys(index: &IndexMeta, doc: &Document) -> Result<Vec<Vec<u8>>> {
+    match document_keys(index, doc)? {
+        DocumentKeys::Keyed { keys, .. } => Ok(keys),
+        DocumentKeys::Unkeyed { reason, .. } => Err(StorageError::Core(CoreError::InvalidQuery(
+            format!("{reason}; a unique index must be able to key every document it covers"),
+        ))),
+    }
 }
 
 /// Bring every index on a collection in line with one document write.
@@ -140,7 +209,9 @@ pub(crate) fn index_keys_observed(
 /// existed.
 ///
 /// Unique constraints are checked *before* anything is mutated, so a rejected
-/// write leaves the index untouched.
+/// write leaves the index untouched. A document a unique index cannot key is
+/// rejected here too, for the reason on [`unique_keys`]; under every other
+/// index such a document is filed unkeyed by [`apply_entries`].
 ///
 /// Returns the ids of indexes this write has just made multikey, which the
 /// caller must persist with [`mark_multikey`] **in the same transaction** — a
@@ -148,6 +219,7 @@ pub(crate) fn index_keys_observed(
 /// planner intersects a two-sided range over an index that already holds an
 /// array's keys.
 pub(crate) fn maintain(
+    engine: &crate::Engine,
     txn: &redb::WriteTransaction,
     coll: &crate::CollectionMeta,
     old: Option<&Document>,
@@ -166,7 +238,7 @@ pub(crate) fn maintain(
     // would leave the index describing a write that was then rejected.
     if let Some(new) = new {
         for index in indexes.iter().filter(|i| i.unique) {
-            for key in index_keys(index, new)? {
+            for key in unique_keys(index, new)? {
                 for holder in holders_of(&table, coll.id, index.id, &key)? {
                     if holder != doc_key {
                         return Err(StorageError::Core(CoreError::UniqueViolation {
@@ -179,7 +251,7 @@ pub(crate) fn maintain(
         }
     }
 
-    apply_entries(&mut table, coll.id, &indexes, old, new, doc_key)
+    apply_entries(engine, &mut table, coll, &indexes, old, new, doc_key)
 }
 
 /// The index definitions as this transaction sees them.
@@ -232,7 +304,13 @@ pub struct UniqueViolation {
 /// entry rather than skipping it matters: a missing entry would leave an
 /// index-backed query silently unable to find a document that exists, which is
 /// a wrong answer rather than a reported problem.
+///
+/// The same asymmetry decides a document a unique index cannot key. Locally
+/// it is refused; here it is filed unkeyed, takes part in no uniqueness
+/// check — there is no key to collide on — and is warned about and counted
+/// by [`apply_entries`] like any other unkeyed document.
 pub(crate) fn maintain_remote(
+    engine: &crate::Engine,
     txn: &redb::WriteTransaction,
     coll: &crate::CollectionMeta,
     old: Option<&Document>,
@@ -248,7 +326,10 @@ pub(crate) fn maintain_remote(
     let mut violations = Vec::new();
     if let Some(new) = new {
         for index in indexes.iter().filter(|i| i.unique) {
-            for key in index_keys(index, new)? {
+            let DocumentKeys::Keyed { keys, .. } = document_keys(index, new)? else {
+                continue;
+            };
+            for key in keys {
                 let mut holders: Vec<Vec<u8>> = holders_of(&table, coll.id, index.id, &key)?
                     .into_iter()
                     .filter(|holder| holder != doc_key)
@@ -265,19 +346,25 @@ pub(crate) fn maintain_remote(
         }
     }
 
-    let newly_multikey = apply_entries(&mut table, coll.id, &indexes, old, new, doc_key)?;
+    let newly_multikey = apply_entries(engine, &mut table, coll, &indexes, old, new, doc_key)?;
     Ok((violations, newly_multikey))
 }
 
 /// Remove the old image's entries and add the new one's.
+///
+/// Both images are classified by [`document_keys`], so a document the index
+/// cannot key is unfiled from the unkeyed run exactly as it was filed there,
+/// and one that moves between the run and a real key — rewritten with one
+/// array fewer, say — leaves nothing behind on either side.
 ///
 /// Returns the ids of indexes the **new** image has just made multikey — those
 /// where it contributed more than one key and the definition does not say so
 /// yet. The old image is not consulted: the flag is one-way, so only the state
 /// being written can flip it.
 fn apply_entries(
+    engine: &crate::Engine,
     table: &mut redb::Table<'_, tables::IndexKey<'static>, ()>,
-    coll: CollectionId,
+    coll: &crate::CollectionMeta,
     indexes: &[IndexMeta],
     old: Option<&Document>,
     new: Option<&Document>,
@@ -286,21 +373,61 @@ fn apply_entries(
     let mut newly_multikey = Vec::new();
     for index in indexes {
         if let Some(old) = old {
-            for key in index_keys(index, old)? {
-                table.remove((coll.0, index.id, key.as_slice(), doc_key))?;
+            match document_keys(index, old)? {
+                DocumentKeys::Keyed { keys, .. } => {
+                    for key in keys {
+                        table.remove((coll.id.0, index.id, key.as_slice(), doc_key))?;
+                    }
+                }
+                DocumentKeys::Unkeyed { .. } => {
+                    table.remove((coll.id.0, index.id, UNKEYED, doc_key))?;
+                }
             }
         }
         if let Some(new) = new {
-            let (keys, multikey) = index_keys_observed(index, new)?;
+            let (multikey, unkeyed) = match document_keys(index, new)? {
+                DocumentKeys::Keyed { keys, multikey } => {
+                    for key in keys {
+                        table.insert((coll.id.0, index.id, key.as_slice(), doc_key), ())?;
+                    }
+                    (multikey, None)
+                }
+                DocumentKeys::Unkeyed { reason, multikey } => {
+                    table.insert((coll.id.0, index.id, UNKEYED, doc_key), ())?;
+                    (multikey, Some(reason))
+                }
+            };
             if multikey && !index.multikey {
                 newly_multikey.push(index.id);
             }
-            for key in keys {
-                table.insert((coll.0, index.id, key.as_slice(), doc_key), ())?;
+            if let Some(reason) = unkeyed {
+                // The operator's signal, and the developer's: the document is
+                // stored and every query still finds it, but each scan of
+                // this index rechecks it, and a unique index does not check
+                // it at all. Named per document, because the fix — reshape
+                // the document, or split the index — needs the id.
+                engine.count_unkeyed(1);
+                tracing::warn!(
+                    db = %coll.db,
+                    collection = %coll.name,
+                    index = %index.name,
+                    unique = index.unique,
+                    id = %id_of(new),
+                    reason = %reason,
+                    "stored a document this index cannot key; it is filed unkeyed and rechecked \
+                     on every scan of the index, counted in kimmy_index_unkeyed_total"
+                );
             }
         }
     }
     Ok(newly_multikey)
+}
+
+/// A document's `_id` as a log field, or a placeholder for one without.
+fn id_of(doc: &Document) -> String {
+    doc.get("_id")
+        .and_then(|v| kimmy_core::DocId::try_from_bson(v).ok())
+        .map_or_else(|| "?".to_string(), |id| id.to_string())
 }
 
 /// Persist that these indexes are now multikey, in the caller's transaction.
@@ -356,23 +483,34 @@ where
     Ok(out)
 }
 
+/// Whether a scan of an index range also reads the documents the index could
+/// not key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unkeyed {
+    /// A query: an unkeyed document might match, so it is a candidate.
+    Include,
+    /// A read of the keys themselves — TTL expiry — where a document with no
+    /// key holds no date to be expired by.
+    Exclude,
+}
+
 /// Scan an index for the document ids under a key range.
 ///
 /// Returns *candidates*: the caller must still apply the full filter. An index
-/// narrows the search; only the filter decides membership.
+/// narrows the search; only the filter decides membership. `unkeyed` says
+/// whether the documents the index could not key come back too — see
+/// [`Unkeyed`] for which reader wants which.
 pub(crate) fn scan_range(
     db: &redb::Database,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
+    unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    scan_range_in(&db.begin_read()?, coll, index_id, lower, upper)
+    scan_range_in(&db.begin_read()?, coll, index_id, lower, upper, unkeyed)
 }
 
-/// [`scan_range`] inside a caller-held transaction, for scans that must share
-/// a snapshot with something else — see
-/// [`crate::Engine::index_candidates_unless_multikey`].
 /// [`scan_range`] inside a **write** transaction.
 ///
 /// Separate from the read-transaction twin because redb's two transaction
@@ -384,39 +522,40 @@ pub(crate) fn scan_range_in_write(
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
+    unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    use std::ops::Bound;
     let table = txn.open_table(tables::INDEX_ENTRIES)?;
-
-    let start = Bound::Included((coll.0, index_id, lower, [].as_slice()));
-    let mut out = Vec::new();
-    for entry in table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))? {
-        let (found, _) = entry?;
-        let (c, i, k, doc_key) = found.value();
-        if c != coll.0 || i != index_id {
-            break;
-        }
-        if let Some(upper) = upper
-            && k > upper
-        {
-            break;
-        }
-        out.push(doc_key.to_vec());
-    }
-    out.sort();
-    out.dedup();
-    Ok(out)
+    scan_table(&table, coll, index_id, lower, upper, unkeyed)
 }
 
+/// [`scan_range`] inside a caller-held transaction, for scans that must share
+/// a snapshot with something else — see
+/// [`crate::Engine::index_candidates_unless_multikey`].
 fn scan_range_in(
     txn: &redb::ReadTransaction,
     coll: CollectionId,
     index_id: u32,
     lower: &[u8],
     upper: Option<&[u8]>,
+    unkeyed: Unkeyed,
 ) -> Result<Vec<Vec<u8>>> {
-    use std::ops::Bound;
     let table = txn.open_table(tables::INDEX_ENTRIES)?;
+    scan_table(&table, coll, index_id, lower, upper, unkeyed)
+}
+
+/// The body of [`scan_range`], over any readable view of the entries.
+fn scan_table<T>(
+    table: &T,
+    coll: CollectionId,
+    index_id: u32,
+    lower: &[u8],
+    upper: Option<&[u8]>,
+    unkeyed: Unkeyed,
+) -> Result<Vec<Vec<u8>>>
+where
+    T: ReadableTable<tables::IndexKey<'static>, ()>,
+{
+    use std::ops::Bound;
 
     let start = Bound::Included((coll.0, index_id, lower, [].as_slice()));
     let mut out = Vec::new();
@@ -433,9 +572,34 @@ fn scan_range_in(
         }
         out.push(doc_key.to_vec());
     }
+    if unkeyed == Unkeyed::Include {
+        out.extend(holders_of(table, coll, index_id, UNKEYED)?);
+    }
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// Whether an index holds any document it could not key.
+///
+/// One seek: the unkeyed run sits at the front of the index's entries, so
+/// the first entry at or after `(collection, index, UNKEYED)` either is one
+/// or proves there are none.
+fn has_unkeyed<T>(table: &T, coll: CollectionId, index_id: u32) -> Result<bool>
+where
+    T: ReadableTable<tables::IndexKey<'static>, ()>,
+{
+    use std::ops::Bound;
+    let start = Bound::Included((coll.0, index_id, UNKEYED, [].as_slice()));
+    let mut range = table.range::<tables::IndexKey<'_>>((start, Bound::Unbounded))?;
+    Ok(match range.next() {
+        Some(entry) => {
+            let (found, _) = entry?;
+            let (c, i, k, _) = found.value();
+            c == coll.0 && i == index_id && k.is_empty()
+        }
+        None => false,
+    })
 }
 
 /// Encode a document id the way index entries store it.
@@ -801,9 +965,10 @@ impl crate::Engine {
         // Scoped in a closure so every table borrow ends before the abort or
         // commit below, which need to move the transaction. Returns whether the
         // existing documents already make the index multikey — the backfill is
-        // the flag's only chance to see them — and, for a replicated unique
-        // index, the keys the existing documents already share.
-        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>)> {
+        // the flag's only chance to see them — for a replicated unique index,
+        // the keys the existing documents already share, and how many documents
+        // were filed unkeyed.
+        let build = |index: &IndexMeta| -> Result<(bool, Vec<UniqueViolation>, usize)> {
             let docs = txn.open_table(tables::DOCS)?;
             let mut entries = txn.open_table(tables::INDEX_ENTRIES)?;
             // What a unique index has filed so far. Locally only the keys
@@ -815,6 +980,7 @@ impl crate::Engine {
             let mut holders_by_key: std::collections::HashMap<Vec<u8>, Vec<Vec<u8>>> =
                 Default::default();
             let mut observed_multikey = false;
+            let mut unkeyed = 0usize;
 
             for entry in docs.range(crate::engine::doc_range(meta.id))? {
                 let (raw_key, raw_value) = entry?;
@@ -822,7 +988,27 @@ impl crate::Engine {
                 let Some(doc) = record.document()? else { continue };
                 let (_, doc_key) = raw_key.value();
 
-                let (keys, multikey) = index_keys_observed(index, &doc)?;
+                let (keys, multikey) = match document_keys(index, &doc)? {
+                    DocumentKeys::Keyed { keys, multikey } => (keys, multikey),
+                    DocumentKeys::Unkeyed { reason, multikey } => {
+                        // A unique index must be able to key every document
+                        // it covers, and a client creating one is there to be
+                        // told (ADR-020). Replicated, the definition exists on
+                        // a peer and cannot be refused without diverging: it
+                        // is built with the document filed unkeyed, as
+                        // `maintain_remote` files one that arrives later.
+                        if index.unique && matches!(origin, CreateOrigin::Local) {
+                            return Err(StorageError::Core(CoreError::InvalidQuery(format!(
+                                "{reason}; a unique index must be able to key every document \
+                                 it covers, so it cannot be created"
+                            ))));
+                        }
+                        entries.insert((meta.id.0, index.id, UNKEYED, doc_key), ())?;
+                        observed_multikey |= multikey;
+                        unkeyed += 1;
+                        continue;
+                    }
+                };
                 observed_multikey |= multikey;
                 for key in keys {
                     if index.unique && matches!(origin, CreateOrigin::Local) {
@@ -856,13 +1042,13 @@ impl crate::Engine {
                 .map(|(key, holders)| UniqueViolation { index: index.name.clone(), key, holders })
                 .collect();
             violations.sort_by(|a, b| a.key.cmp(&b.key));
-            Ok((observed_multikey, violations))
+            Ok((observed_multikey, violations, unkeyed))
         };
 
-        let violations = match build(&index) {
-            Ok((observed, violations)) => {
+        let (violations, unkeyed) = match build(&index) {
+            Ok((observed, violations, unkeyed)) => {
                 index.multikey = observed;
-                violations
+                (violations, unkeyed)
             }
             Err(e) => {
                 txn.abort()?;
@@ -908,6 +1094,21 @@ impl crate::Engine {
                 differs = %loser.differences(&index).join(", "),
                 "replaced an index with a peer's definition of the same name, created later; \
                  the members now agree on the later definition"
+            );
+        }
+        if unkeyed > 0 {
+            // Once per build rather than once per document: a backfill can
+            // meet thousands, and the number is the message. The counter
+            // moves by the same number, after the commit that made it true.
+            self.count_unkeyed(unkeyed as u64);
+            tracing::warn!(
+                db,
+                collection,
+                index = %index.name,
+                unique,
+                documents = unkeyed,
+                "built an index over documents it cannot key; they are filed unkeyed and \
+                 rechecked on every scan of it, counted in kimmy_index_unkeyed_total"
             );
         }
         tracing::info!(db, collection, index = %index.name, unique, "created index");
@@ -998,10 +1199,12 @@ impl crate::Engine {
         Ok(self.get_collection(db, collection)?.indexes)
     }
 
-    /// Document keys an index range points at.
+    /// Document keys an index range points at, and the documents the index
+    /// could not key.
     ///
     /// These are **candidates**, not results. An index says which documents
-    /// *might* match; the caller must re-apply the full filter.
+    /// *might* match; the caller must re-apply the full filter. A document
+    /// the index could not key might, so it is always among them.
     pub fn index_candidates(
         &self,
         coll: &crate::CollectionMeta,
@@ -1009,7 +1212,35 @@ impl crate::Engine {
         lower: &[u8],
         upper: &[u8],
     ) -> Result<Vec<Vec<u8>>> {
-        scan_range(self.db(), coll.id, index_id, lower, Some(upper))
+        scan_range(self.db(), coll.id, index_id, lower, Some(upper), Unkeyed::Include)
+    }
+
+    /// Document keys filed under keys in a range, and nothing else.
+    ///
+    /// For a reader asking about the *keys* rather than about the documents —
+    /// TTL expiry, which reads the dates the index holds — where a document
+    /// the index could not key has no key to be found by, and including it
+    /// would make every pass reconsider it for nothing.
+    pub fn index_keyed_candidates(
+        &self,
+        coll: &crate::CollectionMeta,
+        index_id: u32,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Result<Vec<Vec<u8>>> {
+        scan_range(self.db(), coll.id, index_id, lower, Some(upper), Unkeyed::Exclude)
+    }
+
+    /// How many documents an index holds that it could not key.
+    ///
+    /// The size of the run every scan of the index rechecks in full, which is
+    /// what a client reading `unkeyed` on the index listing wants to know:
+    /// zero is an index doing its whole job, anything else is a set of
+    /// documents to reshape or an index to split.
+    pub fn unkeyed_count(&self, coll: &crate::CollectionMeta, index_id: u32) -> Result<u64> {
+        let txn = self.db().begin_read()?;
+        let table = txn.open_table(tables::INDEX_ENTRIES)?;
+        Ok(holders_of(&table, coll.id, index_id, UNKEYED)?.len() as u64)
     }
 
     /// Candidates for a range that is only sound while the index is **not**
@@ -1046,7 +1277,7 @@ impl crate::Engine {
                 _ => return Ok(None),
             }
         }
-        scan_range_in(&txn, coll.id, index_id, lower, Some(upper)).map(Some)
+        scan_range_in(&txn, coll.id, index_id, lower, Some(upper), Unkeyed::Include).map(Some)
     }
 
     /// Fetch a document by its already-encoded key.
@@ -1135,6 +1366,11 @@ pub struct IndexScanOutcome {
     /// `_id` order whose first pass did not yield enough documents past the
     /// recheck, which goes back for more.
     pub passes: usize,
+    /// Of `entries`, the ones read from the index's unkeyed run: documents
+    /// the index could not key, which every scan of it reads and rechecks
+    /// whatever range it asked for. What `explain` reports as
+    /// `unkeyedCandidates`, and the cost of leaving such documents in place.
+    pub unkeyed: usize,
 }
 
 /// The tables one scan reads from, and the visitor it feeds.
@@ -1147,6 +1383,12 @@ struct Walk<'t, F> {
     index: &'t IndexMeta,
     entries: &'t redb::ReadOnlyTable<tables::IndexKey<'static>, ()>,
     docs: &'t redb::ReadOnlyTable<(u64, &'static [u8]), &'static [u8]>,
+    /// The ranges to read, in key order: the index's unkeyed run first, when
+    /// it holds one, then the planner's. The run is one more range whose
+    /// single key is [`UNKEYED`] — its entries are in document-key order and
+    /// hold each document once, exactly the shape of an exact probe — so
+    /// every delivery below merges it as it would one more probe, and reads
+    /// nothing extra when the run is empty.
     ranges: &'t [(Vec<u8>, Vec<u8>)],
     outcome: IndexScanOutcome,
     visit: F,
@@ -1179,6 +1421,14 @@ where
         }
     }
 
+    /// One entry read, and whether it came from the unkeyed run.
+    fn read(&mut self, key: &[u8]) {
+        self.outcome.entries += 1;
+        if key.is_empty() {
+            self.outcome.unkeyed += 1;
+        }
+    }
+
     /// Whether `key` is the first entry in these ranges that names `doc`.
     ///
     /// A multikey index holds a document under every key its arrays
@@ -1187,9 +1437,15 @@ where
     /// with the range — this recomputes the document's keys and accepts it
     /// only at the smallest one the scan covers. The scan visits the ranges
     /// in key order, so that is exactly the entry it met first.
+    ///
+    /// Never asked about an unkeyed entry: a document the index could not
+    /// key is filed once, under [`UNKEYED`], and under no real key.
     fn first_entry_for(&self, doc: &Document, key: &[u8]) -> Result<bool> {
-        // `index_keys` returns them sorted, so the first in range is the least.
-        let keys = index_keys(self.index, doc)?;
+        // `document_keys` returns them sorted, so the first in range is the
+        // least.
+        let DocumentKeys::Keyed { keys, .. } = document_keys(self.index, doc)? else {
+            return Ok(false);
+        };
         let first = keys.iter().find(|k| {
             self.ranges.iter().any(|(lower, upper)| {
                 k.as_slice() >= lower.as_slice() && k.as_slice() <= upper.as_slice()
@@ -1212,11 +1468,11 @@ where
                 if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
                     break;
                 }
-                self.outcome.entries += 1;
+                self.read(k);
                 let Some((stamp, doc)) = self.load(doc_key)? else {
                     continue;
                 };
-                if multikey && !self.first_entry_for(&doc, k)? {
+                if multikey && !k.is_empty() && !self.first_entry_for(&doc, k)? {
                     continue;
                 }
                 if !(self.visit)(doc_key, stamp, doc)? {
@@ -1245,7 +1501,7 @@ where
             if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
                 break;
             }
-            self.outcome.entries += 1;
+            self.read(k);
             if !self.offer(doc_key)? {
                 return Ok(());
             }
@@ -1279,7 +1535,7 @@ where
         // The next document key of run `i`, or `None` once it has left its
         // probe's range. Counted here, since this is where entries are read.
         let ranges = self.ranges;
-        let mut next = |i: usize, entries: &mut usize| -> Result<Option<Vec<u8>>> {
+        let mut next = |i: usize, outcome: &mut IndexScanOutcome| -> Result<Option<Vec<u8>>> {
             let upper = ranges[i].1.as_slice();
             match runs[i].next() {
                 Some(entry) => {
@@ -1288,7 +1544,10 @@ where
                     if c != coll || ix != index_id || k > upper {
                         return Ok(None);
                     }
-                    *entries += 1;
+                    outcome.entries += 1;
+                    if k.is_empty() {
+                        outcome.unkeyed += 1;
+                    }
                     Ok(Some(doc_key.to_vec()))
                 }
                 None => Ok(None),
@@ -1297,14 +1556,14 @@ where
 
         let mut heads = BinaryHeap::new();
         for i in 0..ranges.len() {
-            if let Some(key) = next(i, &mut self.outcome.entries)? {
+            if let Some(key) = next(i, &mut self.outcome)? {
                 heads.push(Reverse((key, i)));
             }
         }
 
         let mut last: Option<Vec<u8>> = None;
         while let Some(Reverse((key, i))) = heads.pop() {
-            if let Some(following) = next(i, &mut self.outcome.entries)? {
+            if let Some(following) = next(i, &mut self.outcome)? {
                 heads.push(Reverse((following, i)));
             }
             if last.as_deref() == Some(key.as_slice()) {
@@ -1350,7 +1609,7 @@ where
                     if c != self.coll.0 || i != self.index.id || k > upper.as_slice() {
                         break;
                     }
-                    self.outcome.entries += 1;
+                    self.read(k);
                     if after.as_deref().is_some_and(|bound| doc_key <= bound) {
                         continue;
                     }
@@ -1398,6 +1657,12 @@ impl crate::Engine {
     /// inexact range in `_id` order holds at most `want` keys per pass. See
     /// [`CandidateOrder`] for what each delivery promises.
     ///
+    /// The documents the index could not key are candidates of every scan,
+    /// whatever its ranges: they might match, and only the recheck can say.
+    /// Their run is read as one more range ahead of the planner's, found by
+    /// one seek and empty for almost every index, so a scan of an index that
+    /// keys every document it holds is exactly what it was.
+    ///
     /// `None` means the scan was refused and the caller must re-plan — the
     /// same rule as [`Engine::index_candidates_unless_multikey`]: a plan that
     /// intersected both bounds is only sound while the index is not multikey,
@@ -1429,24 +1694,33 @@ impl crate::Engine {
         };
         let entries = txn.open_table(tables::INDEX_ENTRIES)?;
         let docs = txn.open_table(tables::DOCS)?;
+        // A plan with no ranges — a `$in` over nothing — matches nothing,
+        // unkeyed documents included: they are candidates for a question,
+        // not for the absence of one.
+        if scan.ranges.is_empty() {
+            return Ok(Some(IndexScanOutcome::default()));
+        }
+        let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(scan.ranges.len() + 1);
+        if has_unkeyed(&entries, coll.id, scan.index_id)? {
+            ranges.push((UNKEYED.to_vec(), UNKEYED.to_vec()));
+        }
+        ranges.extend_from_slice(scan.ranges);
         let mut walk = Walk {
             coll: coll.id,
             index: &index,
             entries: &entries,
             docs: &docs,
-            ranges: scan.ranges,
+            ranges: &ranges,
             outcome: IndexScanOutcome::default(),
             visit,
         };
-        if !scan.ranges.is_empty() {
-            match order {
-                CandidateOrder::Any => walk.in_index_order()?,
-                CandidateOrder::ById { after, .. } if scan.exact && scan.ranges.len() == 1 => {
-                    walk.one_run(after)?;
-                }
-                CandidateOrder::ById { after, .. } if scan.exact => walk.merged_runs(after)?,
-                CandidateOrder::ById { after, want } => walk.in_key_order(after, want)?,
+        match order {
+            CandidateOrder::Any => walk.in_index_order()?,
+            CandidateOrder::ById { after, .. } if scan.exact && ranges.len() == 1 => {
+                walk.one_run(after)?;
             }
+            CandidateOrder::ById { after, .. } if scan.exact => walk.merged_runs(after)?,
+            CandidateOrder::ById { after, want } => walk.in_key_order(after, want)?,
         }
         Ok(Some(walk.outcome))
     }
@@ -1545,13 +1819,73 @@ mod tests {
     }
 
     #[test]
-    fn a_compound_index_over_two_array_fields_is_rejected() {
-        // The cartesian product is what makes this dangerous; Mongo rejects it
-        // too rather than writing |a| × |b| entries for one document.
+    fn a_compound_index_over_two_array_fields_cannot_key_the_document() {
+        // The cartesian product is what makes this dangerous: |a| × |b|
+        // entries for one document. The document is not refused for it — an
+        // index is an access path, not a schema — it is filed unkeyed, and
+        // the strict form says why (ADR-139).
         let idx = index(vec![IndexField::ascending("a"), IndexField::ascending("b")], false);
-        assert!(index_keys(&idx, &doc! { "a": [1, 2], "b": [3, 4] }).is_err());
+        match document_keys(&idx, &doc! { "a": [1, 2], "b": [3, 4] }).unwrap() {
+            DocumentKeys::Unkeyed { reason, multikey } => {
+                assert!(reason.contains("at most one array field"), "{reason}");
+                assert!(multikey, "it held arrays, and the flag is a one-way observation");
+            }
+            other => panic!("two arrays must be unkeyed, got {other:?}"),
+        }
+        let err = index_keys(&idx, &doc! { "a": [1, 2], "b": [3, 4] }).unwrap_err();
+        assert!(err.to_string().contains("cannot key this document"), "{err}");
         // One array field is fine.
-        assert!(index_keys(&idx, &doc! { "a": [1, 2], "b": 3 }).is_ok());
+        assert_eq!(index_keys(&idx, &doc! { "a": [1, 2], "b": 3 }).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn every_way_an_index_can_fail_to_key_a_document_is_the_same_outcome() {
+        // Three causes, one classification: the guard against a
+        // combinatorial number of entries, and the one value type with no
+        // exact key encoding (ADR-005). Each used to be a refusal on the
+        // write path and a permanent failure on the replication path.
+        let single = index(vec![IndexField::ascending("a")], false);
+        let big: Vec<Bson> = (0..1_000).map(Bson::Int32).collect();
+        match document_keys(&single, &doc! { "a": big }).unwrap() {
+            DocumentKeys::Unkeyed { reason, multikey } => {
+                assert!(reason.contains("more than 1000 entries"), "{reason}");
+                assert!(multikey);
+            }
+            other => panic!("a thousand elements must be unkeyed, got {other:?}"),
+        }
+        let just_under: Vec<Bson> = (0..998).map(Bson::Int32).collect();
+        assert!(
+            matches!(
+                document_keys(&single, &doc! { "a": just_under }).unwrap(),
+                DocumentKeys::Keyed { .. }
+            ),
+            "998 elements and the whole array are 999 keys, under the cap"
+        );
+        let decimal = doc! { "a": Bson::Decimal128("1.5".parse().unwrap()) };
+        match document_keys(&single, &decimal).unwrap() {
+            DocumentKeys::Unkeyed { reason, multikey } => {
+                assert!(reason.contains("Decimal128"), "{reason}");
+                assert!(!multikey, "a scalar, however unencodable, is not an array");
+            }
+            other => panic!("Decimal128 must be unkeyed, got {other:?}"),
+        }
+        assert!(index_keys(&single, &decimal).is_err(), "the strict form still refuses");
+    }
+
+    #[test]
+    fn a_document_outside_a_partial_filter_is_not_unkeyed_it_is_absent() {
+        // Whatever shape a document has, a partial index that does not
+        // select it holds nothing for it — not even an unkeyed entry, which
+        // would make it a candidate for a query it cannot match.
+        let mut idx = index(vec![IndexField::ascending("a"), IndexField::ascending("b")], false);
+        idx.partial_filter = Some(doc! { "kind": "keep" });
+        let outside = doc! { "kind": "drop", "a": [1, 2], "b": [3, 4] };
+        assert_eq!(
+            document_keys(&idx, &outside).unwrap(),
+            DocumentKeys::Keyed { keys: Vec::new(), multikey: false }
+        );
+        let inside = doc! { "kind": "keep", "a": [1, 2], "b": [3, 4] };
+        assert!(matches!(document_keys(&idx, &inside).unwrap(), DocumentKeys::Unkeyed { .. }));
     }
 
     #[test]
@@ -1585,7 +1919,7 @@ mod tests {
 
     /// Every document id currently filed under an index, via a full scan of it.
     fn entries_for(engine: &Engine, coll: &CollectionMeta, index_id: u32) -> Vec<Vec<u8>> {
-        scan_range(engine.db(), coll.id, index_id, &[], None).unwrap()
+        scan_range(engine.db(), coll.id, index_id, &[], None, Unkeyed::Exclude).unwrap()
     }
 
     #[test]
@@ -2858,5 +3192,382 @@ mod tests {
         };
         assert_eq!(id_of(&a, "email_1"), id_of(&b, "email_1"));
         assert_eq!(id_of(&a, "status_1"), id_of(&b, "status_1"));
+    }
+
+    /// Documents an index cannot key: stored, filed unkeyed, rechecked by
+    /// every scan, never refused (ADR-139).
+    mod unkeyed {
+        use super::*;
+
+        fn compound(engine: &Engine, name: &str) -> CollectionMeta {
+            engine
+                .create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a"), IndexField::ascending("b")],
+                    false,
+                    Some(name.into()),
+                )
+                .unwrap();
+            engine.get_collection("app", "docs").unwrap()
+        }
+
+        fn index_id(coll: &CollectionMeta, name: &str) -> u32 {
+            coll.index(name).expect("the index is here").id
+        }
+
+        fn agree(engine: &Engine, coll: &CollectionMeta, query: Document) {
+            let scan = by_scan(engine, coll, &query);
+            let indexed = by_index(engine, coll, &query).expect("the index should apply");
+            assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
+        }
+
+        #[test]
+        fn a_document_the_index_cannot_key_is_stored_and_every_query_still_finds_it() {
+            // The finding at its smallest, on one node: a compound index over
+            // two paths, then a document holding arrays at both. It used to
+            // be a 400; now it is stored, filed unkeyed, and found by exactly
+            // the queries a scan finds it by — and by no others.
+            let (engine, _, _dir) = engine();
+            let coll = compound(&engine, "ab");
+            engine.insert(&coll, doc! { "_id": 1i64, "a": [1, 2], "b": [3, 4] }).unwrap();
+            engine.insert(&coll, doc! { "_id": 2i64, "a": [1, 2], "b": 3 }).unwrap();
+            engine.insert(&coll, doc! { "_id": 3i64, "a": 1, "b": 3 }).unwrap();
+
+            assert_eq!(engine.unkeyed_count(&coll, index_id(&coll, "ab")).unwrap(), 1);
+            assert_eq!(engine.unkeyed_writes(), 1, "the counter moved once, for one document");
+            assert!(multikey_of(&engine, "ab"), "it held arrays, and the flag says so");
+
+            let coll = engine.get_collection("app", "docs").unwrap();
+            for query in [
+                doc! { "a": 1 },
+                doc! { "a": 2 },
+                doc! { "a": 1, "b": 3 },
+                doc! { "a": 1, "b": 4 },
+                doc! { "a": 5 },
+                doc! { "a": { "$in": [1, 5] } },
+                doc! { "a": { "$gte": 1 } },
+                doc! { "b": 4 },
+            ] {
+                let scan = by_scan(&engine, &coll, &query);
+                if let Some(indexed) = by_index(&engine, &coll, &query) {
+                    assert_eq!(indexed, scan, "disagreement for {query:?}");
+                }
+            }
+            assert_eq!(by_index(&engine, &coll, &doc! { "a": 1, "b": 4 }).unwrap(), vec![1]);
+            assert_eq!(by_index(&engine, &coll, &doc! { "a": 5 }).unwrap(), Vec::<i64>::new());
+        }
+
+        #[test]
+        fn an_unkeyed_document_is_unfiled_when_it_changes_shape_and_refiled_when_it_returns() {
+            // Both images go through the same classification, so a rewrite
+            // that gives the index a key to file the document under leaves
+            // nothing in the unkeyed run, and one that takes it away again
+            // leaves nothing under the real keys. A delete leaves nothing.
+            let (engine, _, _dir) = engine();
+            let coll = compound(&engine, "ab");
+            let id = index_id(&coll, "ab");
+            engine.insert(&coll, doc! { "_id": 1i64, "a": [1, 2], "b": [3, 4] }).unwrap();
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 1);
+            assert_eq!(entries_for(&engine, &coll, id).len(), 1, "one entry: the unkeyed one");
+
+            engine.replace(&coll, &DocId::Int64(1), doc! { "a": [1, 2], "b": 3 }, false).unwrap();
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0, "keyable now: unfiled");
+            assert_eq!(entries_for(&engine, &coll, id).len(), 1, "one document under real keys");
+            agree(&engine, &coll, doc! { "a": 1 });
+            agree(&engine, &coll, doc! { "a": 1, "b": 3 });
+
+            engine.replace(&coll, &DocId::Int64(1), doc! { "a": [1], "b": [3] }, false).unwrap();
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 1, "unkeyable again: refiled");
+            agree(&engine, &coll, doc! { "a": 1, "b": 3 });
+
+            engine.delete(&coll, &DocId::Int64(1)).unwrap();
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0);
+            assert!(entries_for(&engine, &coll, id).is_empty(), "a delete leaves no entry");
+            assert_eq!(by_index(&engine, &coll, &doc! { "a": 1 }).unwrap(), Vec::<i64>::new());
+        }
+
+        #[test]
+        fn every_delivery_order_reads_the_unkeyed_run_and_agrees_with_a_scan() {
+            // The four ways a scan delivers candidates — index order, one
+            // exact run, merged exact runs, an inexact range in `_id` order
+            // — each read the unkeyed run beside their ranges, count what
+            // they read from it, and deliver in the order they promise.
+            // The unkeyed ids are negative so they sort *first* in `_id`
+            // order, which is where a delivery that forgot the run would
+            // show it.
+            let (engine, _, _dir) = engine();
+            let coll = compound(&engine, "ab");
+            for i in 0..30i64 {
+                engine.insert(&coll, doc! { "_id": i, "a": i % 3, "b": [i] }).unwrap();
+            }
+            for i in 1..=4i64 {
+                engine.insert(&coll, doc! { "_id": -i, "a": [1, 9], "b": [7, i] }).unwrap();
+            }
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let all = |_: i64| true;
+
+            // A prefix equality: inexact, so `_id` order is the key-order pass.
+            let prefix = plan_for(&coll, &doc! { "a": 1 });
+            assert!(!prefix.exact);
+            let expect = by_scan(&engine, &coll, &doc! { "a": 1 });
+            let (mut any, outcome) =
+                walk(&engine, &coll, &prefix, CandidateOrder::Any, all, usize::MAX);
+            any.sort_unstable();
+            assert_eq!(any, expect, "index order");
+            assert_eq!(outcome.unkeyed, 4, "every unkeyed document was read: {outcome:?}");
+            let by_id = CandidateOrder::ById { after: None, want: None };
+            let (ordered, outcome) = walk(&engine, &coll, &prefix, by_id, all, usize::MAX);
+            assert_eq!(ordered, expect, "key-order pass, in `_id` order");
+            assert_eq!(outcome.unkeyed, 4, "{outcome:?}");
+            let first_two = CandidateOrder::ById { after: None, want: Some(2) };
+            let (two, _) = walk(&engine, &coll, &prefix, first_two, all, 2);
+            assert_eq!(two, vec![-4, -3], "the unkeyed documents sort first, and arrive first");
+
+            // A complete key: exact, one run — merged with the unkeyed run.
+            let exact = plan_for(&coll, &doc! { "a": 1, "b": 7 });
+            assert!(exact.exact && exact.ranges.len() == 1);
+            let expect = by_scan(&engine, &coll, &doc! { "a": 1, "b": 7 });
+            assert_eq!(expect, vec![-4, -3, -2, -1, 7], "the fixture: four unkeyed, one keyed");
+            let (ordered, outcome) = walk(&engine, &coll, &exact, by_id, all, usize::MAX);
+            assert_eq!(ordered, expect, "one exact run, merged with the unkeyed run");
+            assert_eq!(outcome.unkeyed, 4, "{outcome:?}");
+            assert_eq!(outcome.entries, 5, "four unkeyed entries and the one under the key");
+            let resume = CandidateOrder::ById {
+                after: Some(&keyenc::encode(&Bson::Int64(-2)).unwrap()),
+                want: None,
+            };
+            let (rest, _) = walk(&engine, &coll, &exact, resume, all, usize::MAX);
+            assert_eq!(rest, vec![-1, 7], "resuming after an unkeyed id resumes both runs");
+
+            // A `$in` on the last field: exact, several runs, plus the unkeyed one.
+            let union = plan_for(&coll, &doc! { "a": 1, "b": { "$in": [7, 4] } });
+            assert!(union.exact && union.ranges.len() == 2);
+            let expect = by_scan(&engine, &coll, &doc! { "a": 1, "b": { "$in": [7, 4] } });
+            let (ordered, outcome) = walk(&engine, &coll, &union, by_id, all, usize::MAX);
+            assert_eq!(ordered, expect, "merged runs");
+            assert_eq!(outcome.unkeyed, 4, "{outcome:?}");
+
+            // A `$in` over nothing matches nothing, unkeyed documents included.
+            let nothing = plan_for(&coll, &doc! { "a": { "$in": [] } });
+            assert!(nothing.ranges.is_empty());
+            let (none, outcome) = walk(&engine, &coll, &nothing, by_id, all, usize::MAX);
+            assert!(none.is_empty(), "no question, no candidates: {none:?}");
+            assert_eq!(outcome, IndexScanOutcome::default());
+        }
+
+        #[test]
+        fn an_index_that_keys_every_document_reads_nothing_extra() {
+            // The common case pays one seek and nothing else: no unkeyed
+            // entries are read, and the exact single-run delivery is the one
+            // that runs.
+            let (engine, _coll, _dir) = seeded();
+            engine
+                .create_index("app", "docs", vec![IndexField::ascending("a")], false, None)
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let plan = plan_for(&coll, &doc! { "a": 1 });
+            let (ids, outcome) = walk(
+                &engine,
+                &coll,
+                &plan,
+                CandidateOrder::ById { after: None, want: Some(1) },
+                |_| true,
+                1,
+            );
+            assert_eq!(ids.len(), 1);
+            assert_eq!(outcome.entries, 1, "a limit of one reads one entry: {outcome:?}");
+            assert_eq!(outcome.unkeyed, 0);
+        }
+
+        #[test]
+        fn a_backfill_files_the_documents_it_cannot_key() {
+            // The other order the pair can meet in: the documents first, the
+            // definition second. Creating the index used to be refused for
+            // it; now it builds, files what it cannot key, and says how many.
+            let (engine, coll, _dir) = engine();
+            engine.insert(&coll, doc! { "_id": 1i64, "a": [1, 2], "b": [3, 4] }).unwrap();
+            engine.insert(&coll, doc! { "_id": 2i64, "a": [1], "b": [3] }).unwrap();
+            engine.insert(&coll, doc! { "_id": 3i64, "a": 1, "b": 3 }).unwrap();
+            let coll = compound(&engine, "ab");
+            let index = coll.index("ab").unwrap();
+            assert!(index.multikey);
+            assert_eq!(engine.unkeyed_count(&coll, index.id).unwrap(), 2);
+            assert_eq!(engine.unkeyed_writes(), 2, "counted once per document, after the commit");
+            agree(&engine, &coll, doc! { "a": 1, "b": 3 });
+            agree(&engine, &coll, doc! { "a": 2 });
+            agree(&engine, &coll, doc! { "b": { "$in": [3, 4] }, "a": 1 });
+        }
+
+        #[test]
+        fn a_unique_index_still_refuses_a_document_it_cannot_key_locally() {
+            // The one refusal that stays. A unique index must be able to key
+            // every document it covers, or it reports a constraint it does
+            // not hold; a client writing locally is there to be told
+            // (ADR-020). Nothing is stored and nothing is filed.
+            let (engine, _, _dir) = engine();
+            engine
+                .create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a"), IndexField::ascending("b")],
+                    true,
+                    Some("ab".into()),
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let err = engine.insert(&coll, doc! { "_id": 1i64, "a": [1], "b": [2] }).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("a unique index must be able to key"), "{msg}");
+            assert!(engine.get(&coll, &DocId::Int64(1)).unwrap().is_none(), "not stored");
+            assert_eq!(engine.unkeyed_count(&coll, index_id(&coll, "ab")).unwrap(), 0);
+            assert_eq!(engine.unkeyed_writes(), 0);
+
+            // And creating a unique index over such a document is refused, as
+            // creating one over duplicates is.
+            engine.drop_index("app", "docs", "ab").unwrap();
+            engine.insert(&coll, doc! { "_id": 1i64, "a": [1], "b": [2] }).unwrap();
+            let err = engine
+                .create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a"), IndexField::ascending("b")],
+                    true,
+                    Some("ab".into()),
+                )
+                .unwrap_err();
+            assert!(err.to_string().contains("cannot be created"), "{err}");
+            assert!(engine.get_collection("app", "docs").unwrap().index("ab").is_none());
+        }
+
+        #[test]
+        fn a_replicated_write_a_unique_index_cannot_key_is_filed_unkeyed_not_refused() {
+            // The replicated half of the asymmetry: the peer that took the
+            // write had no such index, so the write is a fact. It is filed
+            // unkeyed here, takes part in no uniqueness check, and is
+            // counted — never refused, which would leave the two members
+            // disagreeing for ever.
+            let a_dir = tempfile::tempdir().unwrap();
+            let b_dir = tempfile::tempdir().unwrap();
+            let a = Engine::open(&a_dir.path().join("kimmy.redb")).unwrap();
+            let b = Engine::open(&b_dir.path().join("kimmy.redb")).unwrap();
+            a.create_collection("app", "docs").unwrap();
+            b.create_collection("app", "docs").unwrap();
+            b.create_index(
+                "app",
+                "docs",
+                vec![IndexField::ascending("a"), IndexField::ascending("b")],
+                true,
+                Some("ab".into()),
+            )
+            .unwrap();
+
+            let ca = a.get_collection("app", "docs").unwrap();
+            a.insert(&ca, doc! { "_id": 1i64, "a": [1], "b": [2] }).unwrap();
+            a.insert(&ca, doc! { "_id": 2i64, "a": 1, "b": 2 }).unwrap();
+            let entries = a.entries_for_peer(kimmy_core::Hlc::ZERO, 100).unwrap().entries;
+            let outcome = b.apply_batch(&entries).unwrap();
+            assert_eq!(outcome.applied, 2, "{outcome:?}");
+
+            let cb = b.get_collection("app", "docs").unwrap();
+            assert!(b.get(&cb, &DocId::Int64(1)).unwrap().is_some(), "stored");
+            assert_eq!(b.unkeyed_count(&cb, index_id(&cb, "ab")).unwrap(), 1);
+            assert_eq!(b.unkeyed_writes(), 1);
+            assert_eq!(b.unique_violations(), 0, "no key, no collision to report");
+            agree(&b, &cb, doc! { "a": 1, "b": 2 });
+        }
+
+        #[test]
+        fn dropping_an_index_purges_its_unkeyed_run_with_the_rest() {
+            let (engine, _, _dir) = engine();
+            let coll = compound(&engine, "ab");
+            let id = index_id(&coll, "ab");
+            engine.insert(&coll, doc! { "_id": 1i64, "a": [1], "b": [2] }).unwrap();
+            engine.insert(&coll, doc! { "_id": 2i64, "a": 1, "b": 2 }).unwrap();
+            assert_eq!(entries_for(&engine, &coll, id).len(), 2);
+            engine.drop_index("app", "docs", "ab").unwrap();
+            assert!(entries_for(&engine, &coll, id).is_empty(), "nothing left under the id");
+            assert_eq!(engine.unkeyed_count(&coll, id).unwrap(), 0);
+        }
+
+        #[test]
+        fn expiry_never_reads_the_unkeyed_run() {
+            // A TTL index expires documents by the date it holds for them;
+            // a document it could not key holds no date it can be expired
+            // by, and offering it to every pass would count a skip each
+            // time for a document that was never eligible.
+            let (engine, _coll, _dir) = engine();
+            engine
+                .create_index_with(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("at")],
+                    false,
+                    Enforcement::Local,
+                    Some("ttl".into()),
+                    Some(10),
+                    None,
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            let old = Bson::DateTime(bson::DateTime::from_millis(1_000));
+            engine.insert(&coll, doc! { "_id": 1i64, "at": old }).unwrap();
+            engine
+                .insert(&coll, doc! { "_id": 2i64, "at": Bson::Decimal128("1".parse().unwrap()) })
+                .unwrap();
+            let index = coll.index("ttl").unwrap().clone();
+            assert_eq!(engine.unkeyed_count(&coll, index.id).unwrap(), 1);
+
+            let out = engine.expire_documents(&coll, &index, 100_000).unwrap();
+            assert_eq!(out.deleted, 1, "{out:?}");
+            assert_eq!(out.skipped, 0, "the unkeyed document was never a candidate: {out:?}");
+            assert!(engine.get(&coll, &DocId::Int64(2)).unwrap().is_some());
+        }
+
+        #[test]
+        fn index_backed_results_are_identical_to_a_full_scan_over_unkeyable_documents() {
+            // The load-bearing property, over a dataset holding every way an
+            // index can fail to key a document, beside the ordinary shapes.
+            let (engine, coll, _dir) = seeded();
+            let thousand: Vec<Bson> = (0..1_000).map(Bson::Int32).collect();
+            for extra in [
+                doc! { "_id": 20i64, "a": [1, 2], "n": [10, 20] },
+                doc! { "_id": 21i64, "a": 1, "n": Bson::Decimal128("10".parse().unwrap()) },
+                doc! { "_id": 22i64, "a": thousand, "n": 10 },
+                doc! { "_id": 23i64, "a": [1], "n": [10] },
+            ] {
+                engine.insert(&coll, extra).unwrap();
+            }
+            engine
+                .create_index(
+                    "app",
+                    "docs",
+                    vec![IndexField::ascending("a"), IndexField::ascending("n")],
+                    false,
+                    None,
+                )
+                .unwrap();
+            let coll = engine.get_collection("app", "docs").unwrap();
+            assert_eq!(engine.unkeyed_count(&coll, coll.indexes[0].id).unwrap(), 4);
+
+            for query in [
+                doc! { "a": 1 },
+                doc! { "a": 1, "n": 10 },
+                doc! { "a": 1, "n": 20 },
+                doc! { "a": 2, "n": 20 },
+                doc! { "a": 999 },
+                doc! { "a": 999, "n": 10 },
+                doc! { "a": { "$in": [1, 2] } },
+                doc! { "a": { "$in": [1, 2] }, "n": 10 },
+                doc! { "a": { "$gte": 1, "$lte": 2 } },
+                doc! { "a": { "$gt": 500 } },
+                doc! { "a": Bson::Null },
+                doc! { "a": 1, "n": { "$in": [10, 20] } },
+            ] {
+                let scan = by_scan(&engine, &coll, &query);
+                let indexed = by_index(&engine, &coll, &query).expect("the index should apply");
+                assert_eq!(indexed, scan, "the index disagreed with a scan for {query:?}");
+            }
+        }
     }
 }

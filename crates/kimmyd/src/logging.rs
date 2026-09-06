@@ -86,7 +86,15 @@ impl TelemetryGuard {
         // not keep the engine alive past shutdown. A dead weak reference simply
         // observes nothing, which is the honest reading of "the node is gone".
         let weak = Arc::downgrade(state);
-        let snapshot = move || weak.upgrade().map(|state| state.metrics.snapshot());
+        let snapshot = move || {
+            weak.upgrade().map(|state| {
+                // The one series the engine counts and the process mirrors:
+                // refreshed here, as the `/metrics` handler refreshes it,
+                // so a collector reads the same number a scrape would.
+                state.metrics.set_index_unkeyed(state.engine.unkeyed_writes());
+                state.metrics.snapshot()
+            })
+        };
 
         macro_rules! observe {
             ($build:ident, $name:literal, $unit:literal, $description:literal, $field:ident) => {
@@ -180,6 +188,13 @@ impl TelemetryGuard {
             "{document}",
             "Documents deleted by a TTL index.",
             ttl_expired
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.index.unkeyed",
+            "{document}",
+            "Documents stored under an index that could not key them, rechecked on every scan of that index instead.",
+            index_unkeyed
         );
         observe!(
             u64_observable_counter,

@@ -240,12 +240,14 @@ impl Engine {
 
     /// Recreate a collection and its indexes from a snapshot.
     ///
-    /// Returns how many of its index definitions this node's documents
-    /// refused. A snapshot is served to exactly the peer most likely to hold
-    /// documents a definition cannot be built under — one that was away
-    /// long enough to write on its own past the origin's retention — and a
-    /// bare error here failed the whole snapshot round, the same wedge as a
-    /// replayed `CreateIndex` reached through the other route. So the
+    /// Returns how many of its index definitions this node refused. A
+    /// snapshot is served to exactly the peer most likely to hold documents
+    /// a definition does not fit — one that was away long enough to write on
+    /// its own past the origin's retention — and a bare error here failed the
+    /// whole snapshot round, the same wedge as a replayed `CreateIndex`
+    /// reached through the other route. Such documents are filed unkeyed
+    /// now (ADR-139); what is still refused is a definition this build cannot
+    /// apply. So the
     /// definitions go through the same classification as replicated DDL
     /// (`sync::settle`, ADR-123): a refused one is warned and counted, and
     /// the restore goes on to the documents; any other error still fails
@@ -438,12 +440,12 @@ mod tests {
     }
 
     #[test]
-    fn a_snapshot_index_this_node_cannot_build_is_skipped_and_the_documents_restore() {
-        // The same wedge as a replayed create, reached through the route
-        // that is served to exactly the peer most likely to hold divergent
+    fn a_snapshot_index_over_a_document_this_node_cannot_key_builds_and_files_it_unkeyed() {
+        // The route served to exactly the peer most likely to hold divergent
         // documents. B wrote a two-array document while away; A's snapshot
-        // carries a compound index over those two fields. The definition is
-        // refused by B's data, counted, and the documents still arrive.
+        // carries a compound index over those two fields. ADR-123 refused
+        // the definition here and counted it; under ADR-139 it builds, B's
+        // document is filed unkeyed under it, and every document restores.
         let (a, _da) = engine();
         let (b, _db) = engine();
         a.create_collection("shop", "orders").unwrap();
@@ -455,16 +457,44 @@ mod tests {
         b.insert(&cb, doc! { "_id": "both", "tags": ["x", "y"], "cats": ["p", "q"] }).unwrap();
 
         let page = a.snapshot_page(None).unwrap();
-        let outcome = b.apply_snapshot_page(&page).expect("a refused index must not fail the page");
-        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        let outcome = b.apply_snapshot_page(&page).expect("the page applies");
+        assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
         assert_eq!(outcome.applied, 2, "the documents restore: {outcome:?}");
-        assert!(
-            b.get_collection("shop", "orders").unwrap().index("tags_1_cats_1").is_none(),
-            "the definition this node's documents cannot be built under is skipped"
-        );
+        let cb = b.get_collection("shop", "orders").unwrap();
+        let index = cb.index("tags_1_cats_1").expect("the definition builds here too");
+        assert_eq!(b.unkeyed_count(&cb, index.id).unwrap(), 1, "B's own document, filed unkeyed");
         for id in ["a-1", "a-2", "both"] {
             assert!(b.get(&cb, &DocId::String(id.into())).unwrap().is_some(), "{id}");
         }
+    }
+
+    #[test]
+    fn a_snapshot_index_this_node_cannot_apply_is_skipped_and_the_documents_restore() {
+        // The refusal class ADR-123 keeps, reached through the snapshot
+        // route: a definition this build cannot apply — a TTL over two
+        // fields, which no member can mint but a page written by another
+        // build could carry — is warned, counted, and skipped, and the
+        // page's documents still restore.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.create_index("shop", "orders", vec![field("tags"), field("cats")], false, None).unwrap();
+        let ca = a.get_collection("shop", "orders").unwrap();
+        a.insert(&ca, doc! { "_id": "a-1", "tags": ["x"] }).unwrap();
+        b.create_collection("shop", "orders").unwrap();
+
+        let mut page = a.snapshot_page(None).unwrap();
+        for state in &mut page.collections {
+            for index in &mut state.indexes {
+                index.expire_after_secs = Some(60);
+            }
+        }
+        let outcome = b.apply_snapshot_page(&page).expect("a refused index must not fail the page");
+        assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+        assert_eq!(outcome.applied, 1, "the documents restore: {outcome:?}");
+        let cb = b.get_collection("shop", "orders").unwrap();
+        assert!(cb.index("tags_1_cats_1").is_none(), "a definition this build cannot apply");
+        assert!(b.get(&cb, &DocId::String("a-1".into())).unwrap().is_some());
     }
 
     /// Rewrite an index's creation stamp in place, so a test can put the
