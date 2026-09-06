@@ -10,9 +10,47 @@ Versioning follows the pre-1.0 policy in
 [docs/compatibility.md](docs/compatibility.md): a `0.MINOR` bump may carry
 breaking changes and says so here; a `0.x.PATCH` bump never does.
 
-## Unreleased
+## 0.24.0 - 2026-09-06
 
 ### Changed
+
+- **A document an index cannot key is stored, not refused — and it no longer
+  wedges replication.** Three shapes used to draw a `400` from an index: a
+  document holding arrays at two of a compound index's paths, one that would
+  produce more than 1,000 index entries, and one with a `Decimal128` at an
+  indexed path. Each is now stored and filed under the index's *unkeyed* run,
+  which every scan of that index reads beside its ranges and rechecks like any
+  other candidate — so every query still finds the document, and none finds
+  it wrongly. A unique index still refuses such a document on a local write,
+  because a unique index must be able to key every document it covers and the
+  client is there to be told; replicated, it is filed unkeyed and warned about
+  ([ADR-139](docs/decisions.md)).
+
+  Why: a three-member cluster wedged twice in one hour. A member built a
+  compound index while no document violated it; a peer that had not yet
+  received the definition legally accepted a two-array document; when that
+  document reached the holder, the holder could neither apply the entry nor
+  skip it, every sync round failed as a `malformed frame`, and the member's
+  whole inbound stream stopped for the life of the process with four
+  collections diverging behind it. ADR-123 had covered the mirror order — a
+  definition arriving after the document — by skipping the definition; this
+  order had no answer. Refusing a document a peer has already accepted is a
+  choice a leaderless store cannot make and converge, so the rule is gone
+  rather than patched: an index is an access path, not a schema.
+
+  What a client sees: the write returns `200`; `explain` reports
+  `unkeyedCandidates` beside `indexEntriesRead`; the index listing, `describe`
+  and `createIndex` report `unkeyed`, the number of documents the index could
+  not key; `/metrics` gains `kimmy_index_unkeyed_total`, on the OTLP bridge as
+  `kimmy.index.unkeyed`; and each such write is logged at warning naming the
+  database, collection, index and document id. A replicated `createIndex`
+  whose backfill meets such a document now **builds**, so
+  `kimmy_sync_ddl_refused_total` no longer rises for it — that counter is
+  left for a definition a member genuinely cannot apply.
+
+  Breaking, deliberately: a client relying on the `400` to police document
+  shape must check `unkeyed` on the index instead, or split the compound
+  index into single-field ones, which key every shape.
 
 - **The divergence check compares document counts against a member that
   has stopped, and says how old its reading is.** On a three-member cluster
@@ -140,49 +178,8 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   too far behind for one push to reach. A
   client that creates an index on one member and writes through a front a
   moment later now finds the index enforced wherever the write lands, which
-  closes the ~3.5 s window the wedge below came through. A node without a
+  closes the ~3.5 s window the wedge above came through. A node without a
   member set answers as before ([ADR-140](docs/decisions.md)).
-
-### Changed
-
-- **A document an index cannot key is stored, not refused — and it no longer
-  wedges replication.** Three shapes used to draw a `400` from an index: a
-  document holding arrays at two of a compound index's paths, one that would
-  produce more than 1,000 index entries, and one with a `Decimal128` at an
-  indexed path. Each is now stored and filed under the index's *unkeyed* run,
-  which every scan of that index reads beside its ranges and rechecks like any
-  other candidate — so every query still finds the document, and none finds
-  it wrongly. A unique index still refuses such a document on a local write,
-  because a unique index must be able to key every document it covers and the
-  client is there to be told; replicated, it is filed unkeyed and warned about
-  ([ADR-139](docs/decisions.md)).
-
-  Why: a three-member cluster wedged twice in one hour. A member built a
-  compound index while no document violated it; a peer that had not yet
-  received the definition legally accepted a two-array document; when that
-  document reached the holder, the holder could neither apply the entry nor
-  skip it, every sync round failed as a `malformed frame`, and the member's
-  whole inbound stream stopped for the life of the process with four
-  collections diverging behind it. ADR-123 had covered the mirror order — a
-  definition arriving after the document — by skipping the definition; this
-  order had no answer. Refusing a document a peer has already accepted is a
-  choice a leaderless store cannot make and converge, so the rule is gone
-  rather than patched: an index is an access path, not a schema.
-
-  What a client sees: the write returns `200`; `explain` reports
-  `unkeyedCandidates` beside `indexEntriesRead`; the index listing, `describe`
-  and `createIndex` report `unkeyed`, the number of documents the index could
-  not key; `/metrics` gains `kimmy_index_unkeyed_total`, on the OTLP bridge as
-  `kimmy.index.unkeyed`; and each such write is logged at warning naming the
-  database, collection, index and document id. A replicated `createIndex`
-  whose backfill meets such a document now **builds**, so
-  `kimmy_sync_ddl_refused_total` no longer rises for it — that counter is
-  left for a definition a member genuinely cannot apply.
-
-  Breaking, deliberately: a client relying on the `400` to police document
-  shape must check `unkeyed` on the index instead, or split the compound
-  index into single-field ones, which key every shape.
-
 ## 0.23.2 - 2026-09-05
 
 ### Fixed
