@@ -9977,3 +9977,56 @@ the deadline; a member that is slow to answer makes the request slow, which
 is the point. `drop_index_inner` returns the stamp it minted. `Members` gains
 an accessor for address-and-id pairs. One config key. The response schemas
 gain an optional `confirmation`.
+
+## ADR-142 — The engine's `/metrics` block renders with the process counters, so the bridge and its guard see the whole page
+
+**Decision.** The nine series the `/metrics` handler read from the engine and
+the state and rendered ahead of the process counters — `kimmy_databases`,
+`kimmy_collections`, `kimmy_unique_violations`, `kimmy_commits`,
+`kimmy_fsyncs`, `kimmy_commits_grouped_total`, `kimmy_storage_bytes`,
+`kimmy_vector_index_cache_bytes`, `kimmy_up` — are now inputs to the same
+render. `AppState::storage_readings` takes them as a `StorageReadings`
+value; `Metrics::render_with` renders the whole page from it, byte for byte
+what the route produced, and `Metrics::snapshot_with` carries the same nine
+fields, which the OTLP bridge exports as `kimmy.databases`,
+`kimmy.collections`, `kimmy.unique_violations`, `kimmy.commits`,
+`kimmy.fsyncs`, `kimmy.commits.grouped`, `kimmy.storage.bytes`,
+`kimmy.vector.index_cache.bytes` and `kimmy.up`. The bridge's export callback
+takes a fresh reading per export, as the handler takes one per scrape, and
+observes nothing that export if the reading fails. The guard test that
+compares the two surfaces renders the whole page. The mirror ADR-139 added
+for `kimmy_index_unkeyed_total` — an atomic each reader refreshed from the
+engine before reading — is gone: that count is one of the readings.
+
+**Why.** ADR-070 bridged "the same counters `/metrics` renders" and pinned
+the route's engine block "structurally", by the ordered list of series names
+a scrape sees. The bridge read `Metrics::snapshot`, which never held the
+engine's numbers, and the guard written later — because the bridge had
+drifted twelve series behind `/metrics` "without anyone deciding that it
+should" — rendered `Metrics::default()`, which never held them either. So a
+deployment that reads telemetry only through a collector, the deployment the
+bridge exists for, could not see unique violations, commit and fsync cost,
+storage size or the vector cache: the series `docs/benchmarks.md` and
+ADR-088's durability story are read through, and the one ADR-020 says makes
+a merged collision visible without a subscriber watching. Found placing
+ADR-139's counter, which had to go in the guarded block by way of a mirror
+to reach the bridge at all.
+
+**Why readings handed in, rather than a database handle on `Metrics`.**
+ADR-070's reason stands: this type prints numbers and should not own a
+database to print two of them. A value read by the caller keeps that, and
+gives both readers the same rule — take a reading, render or export it — so
+neither can report a window the other measured. Every field is a level or a
+monotonic count, so a reading taken at read time is exact, which is what let
+the mirror be correct and what makes it unnecessary.
+
+**Why the bridge observes nothing on a failed reading.** A counter exported
+as 0 and then as its true value is a reset the collector will believe. An
+export skipped is a gap the collector reports as one.
+
+**Cost.** Two metadata scans per export (`kimmy.databases`,
+`kimmy.collections`), as the scrape already paid per scrape. `Metrics::render`
+and `Metrics::snapshot` survive as the reading-free forms, for callers with no
+engine in hand, which are tests. Nine more lines in the golden render, nine
+more instruments, and the guard now refuses any engine series added to the
+page without an instrument.

@@ -37,8 +37,41 @@ const LATENCY_BUCKETS_US: [u64; 12] =
 /// A value struct rather than an accessor per counter: the OTLP bridge wants
 /// all of them, once, and twenty-five getters would be twenty-five things to
 /// forget when a counter is added. See [`Metrics::snapshot`].
+/// What the storage engine and the vector cache report at the moment a
+/// reader asks: the block `/metrics` renders ahead of the process counters,
+/// and the one the OTLP bridge reads beside them (ADR-142).
+///
+/// Read by the caller, which has the engine, and handed in: this type holds
+/// no database handle, and the two readers — the `/metrics` handler and the
+/// bridge's export callback — each take a fresh reading so neither reports a
+/// window the other measured. Every field is a level or a monotonic count,
+/// so a reading taken at read time is exact.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StorageReadings {
+    pub databases: u64,
+    pub collections: u64,
+    pub unique_violations: u64,
+    pub commits: u64,
+    pub fsyncs: u64,
+    pub commits_grouped: u64,
+    pub storage_bytes: u64,
+    pub vector_index_cache_bytes: u64,
+    /// Documents filed under an index's unkeyed run since start
+    /// (`Engine::unkeyed_writes`, ADR-139).
+    pub index_unkeyed: u64,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct MetricsSnapshot {
+    /// The engine's block, as read for this snapshot (ADR-142).
+    pub databases: u64,
+    pub collections: u64,
+    pub unique_violations: u64,
+    pub commits: u64,
+    pub fsyncs: u64,
+    pub commits_grouped: u64,
+    pub storage_bytes: u64,
+    pub vector_index_cache_bytes: u64,
     pub uptime_secs: u64,
     pub requests: u64,
     pub responses_2xx: u64,
@@ -55,9 +88,7 @@ pub struct MetricsSnapshot {
     pub ttl_skipped: u64,
     /// Documents filed under an index's unkeyed run — stored, but with no
     /// key the index could derive, so every scan of that index rechecks
-    /// them (ADR-139). Mirrored from the engine, which is where the three
-    /// paths that file one (a local write, a replicated write, a backfill)
-    /// all count.
+    /// them (ADR-139). One of the engine's readings.
     pub index_unkeyed: u64,
     pub webhook_delivered: u64,
     pub webhook_failed: u64,
@@ -172,14 +203,6 @@ pub struct Metrics {
     jwks_refresh_failed: AtomicU64,
     ttl_expired: AtomicU64,
     ttl_skipped: AtomicU64,
-    /// The engine's count of documents filed unkeyed under an index, copied
-    /// here by whoever is about to read the series — the `/metrics` handler
-    /// and the OTLP bridge both have the engine in hand — so it renders and
-    /// bridges beside every other series and the golden tests pin it. A
-    /// mirror rather than a source: the engine owns the count because three
-    /// of its write paths produce it, and this type deliberately holds no
-    /// database handle. Monotonic, so a copy taken at read time is exact.
-    index_unkeyed: AtomicU64,
     /// Set once at startup when the embedding worker runs. `None` — the
     /// renderer then reports zeros — means this node has
     /// `[vector] worker_enabled = false`, which an operator must be able to
@@ -217,7 +240,6 @@ impl Default for Metrics {
             webhook_events: AtomicU64::new(0),
             ttl_expired: AtomicU64::new(0),
             ttl_skipped: AtomicU64::new(0),
-            index_unkeyed: AtomicU64::new(0),
             webhook_active: AtomicU64::new(0),
             webhook_invalidated: AtomicU64::new(0),
             webhook_backlog_secs: AtomicU64::new(0),
@@ -422,14 +444,6 @@ impl Metrics {
         self.ttl_skipped.fetch_add(skipped, Ordering::Relaxed);
     }
 
-    /// Mirror the engine's count of documents filed unkeyed under an index
-    /// (`Engine::unkeyed_writes`), for the reader about to render or bridge
-    /// this snapshot. A level set, not an increment: the engine's number is
-    /// the whole truth and is monotonic, so the latest copy is the right one.
-    pub fn set_index_unkeyed(&self, n: u64) {
-        self.index_unkeyed.store(n, Ordering::Relaxed);
-    }
-
     /// Count one certificate reload attempt.
     ///
     /// A failed reload is the quiet failure this metric exists for: the node
@@ -507,7 +521,23 @@ impl Metrics {
     /// relaxed load, so a value may be one increment behind a sibling. That is
     /// already true of `render`, and of any counter read without a lock.
     pub fn snapshot(&self) -> MetricsSnapshot {
+        self.snapshot_with(&StorageReadings::default())
+    }
+
+    /// [`Self::snapshot`], with the engine's readings filled in — the form
+    /// the OTLP bridge uses, so every series `/metrics` renders has a field
+    /// here (ADR-142). The reading-free form above is for a caller with no
+    /// engine in hand, which is a test.
+    pub fn snapshot_with(&self, readings: &StorageReadings) -> MetricsSnapshot {
         MetricsSnapshot {
+            databases: readings.databases,
+            collections: readings.collections,
+            unique_violations: readings.unique_violations,
+            commits: readings.commits,
+            fsyncs: readings.fsyncs,
+            commits_grouped: readings.commits_grouped,
+            storage_bytes: readings.storage_bytes,
+            vector_index_cache_bytes: readings.vector_index_cache_bytes,
             uptime_secs: self.uptime_secs(),
             requests: self.get(&self.requests),
             responses_2xx: self.get(&self.responses_2xx),
@@ -520,7 +550,7 @@ impl Metrics {
             backups: self.get(&self.backups),
             ttl_expired: self.get(&self.ttl_expired),
             ttl_skipped: self.get(&self.ttl_skipped),
-            index_unkeyed: self.get(&self.index_unkeyed),
+            index_unkeyed: readings.index_unkeyed,
             webhook_delivered: self.get(&self.webhook_delivered),
             webhook_failed: self.get(&self.webhook_failed),
             webhook_events: self.get(&self.webhook_events),
@@ -570,12 +600,23 @@ impl Metrics {
         }
     }
 
-    /// Render the process counters in Prometheus text format.
-    ///
-    /// The storage gauges are rendered by the caller, which has the engine;
-    /// keeping them apart avoids giving this type a database handle purely to
-    /// print two numbers.
+    /// Render the page in Prometheus text format, with no engine readings —
+    /// every engine series at zero. For a caller with no engine in hand,
+    /// which is a test; the `/metrics` handler uses [`Self::render_with`].
     pub fn render(&self) -> String {
+        self.render_with(&StorageReadings::default())
+    }
+
+    /// Render the whole `/metrics` page: the engine's readings first, then
+    /// the process counters, in the order a scrape has always seen them.
+    ///
+    /// The engine block used to be a second format string in the route
+    /// handler, ahead of this one, which is how nine series came to be on
+    /// `/metrics` and not on the OTLP bridge with nothing to object: the
+    /// guard that compares the two surfaces reads this render, and those
+    /// series were not in it (ADR-142). The readings are handed in rather
+    /// than read here, so this type still holds no database handle.
+    pub fn render_with(&self, readings: &StorageReadings) -> String {
         // Read once: the worker's atomics move as it runs, and a render that
         // straddled an increment would show mismatched document/chunk pairs.
         let vc = self.vector_counters.get();
@@ -593,7 +634,34 @@ impl Metrics {
             };
         let [t_connect, t_timeout, t_reset, t_other] = transport;
         let mut out = format!(
-            "# HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
+            "# HELP kimmy_databases Number of databases.\n\
+             # TYPE kimmy_databases gauge\n\
+             kimmy_databases {databases}\n\
+             # HELP kimmy_collections Number of collections across all databases.\n\
+             # TYPE kimmy_collections gauge\n\
+             kimmy_collections {collections}\n\
+             # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
+             # TYPE kimmy_unique_violations counter\n\
+             kimmy_unique_violations {violations}\n\
+             # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
+             # TYPE kimmy_commits counter\n\
+             kimmy_commits {commits}\n\
+             # HELP kimmy_fsyncs Times the disk was asked to make something durable: one per commit under durable, one per shared flush under coalesced.\n\
+             # TYPE kimmy_fsyncs counter\n\
+             kimmy_fsyncs {fsyncs}\n\
+             # HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.\n\
+             # TYPE kimmy_commits_grouped_total counter\n\
+             kimmy_commits_grouped_total {grouped}\n\
+             # HELP kimmy_storage_bytes Size of the database file on disk.\n\
+             # TYPE kimmy_storage_bytes gauge\n\
+             kimmy_storage_bytes {storage}\n\
+             # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
+             # TYPE kimmy_vector_index_cache_bytes gauge\n\
+             kimmy_vector_index_cache_bytes {index_cache}\n\
+             # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
+             # TYPE kimmy_up gauge\n\
+             kimmy_up 1\n\
+             # HELP kimmy_uptime_seconds Seconds since this process started serving.\n\
              # TYPE kimmy_uptime_seconds gauge\n\
              kimmy_uptime_seconds {uptime}\n\
              # HELP kimmy_runtime_stall_seconds Worst delay a 250 ms timer on the async runtime saw since the last scrape. Above a few tens of milliseconds, something blocked a worker thread - the storage lock or an fsync - and peers may have marked this node down.\n\
@@ -702,6 +770,14 @@ impl Metrics {
              # HELP kimmy_embed_provider_tokens_total Input tokens the embedding provider reported billing for - the number a metered provider's invoice is made of. Zero for providers that report none.\n\
              # TYPE kimmy_embed_provider_tokens_total counter\n\
              kimmy_embed_provider_tokens_total {p_tokens}\n",
+            databases = readings.databases,
+            collections = readings.collections,
+            violations = readings.unique_violations,
+            commits = readings.commits,
+            fsyncs = readings.fsyncs,
+            grouped = readings.commits_grouped,
+            storage = readings.storage_bytes,
+            index_cache = readings.vector_index_cache_bytes,
             p_requests = kimmy_vector::provider_totals().0,
             p_tokens = kimmy_vector::provider_totals().1,
             uptime = self.uptime_secs(),
@@ -720,7 +796,7 @@ impl Metrics {
             wh_events = self.get(&self.webhook_events),
             ttl_expired = self.get(&self.ttl_expired),
             ttl_skipped = self.get(&self.ttl_skipped),
-            index_unkeyed = self.get(&self.index_unkeyed),
+            index_unkeyed = readings.index_unkeyed,
             wh_active = self.get(&self.webhook_active),
             wh_invalid = self.get(&self.webhook_invalidated),
             wh_backlog = self.get(&self.webhook_backlog_secs),
@@ -810,7 +886,6 @@ mod tests {
 
         m.record_backup();
         m.record_expiry(11, 12);
-        m.set_index_unkeyed(26);
         m.record_webhook_delivery(true, 13);
         m.record_webhook_delivery(true, 14);
         m.record_webhook_delivery(false, 0);
@@ -856,6 +931,23 @@ mod tests {
         m
     }
 
+    /// The engine's readings, every one distinct from every counter above
+    /// and from each other, so a reading rendered under another's name
+    /// cannot match the golden.
+    fn distinct_readings() -> StorageReadings {
+        StorageReadings {
+            databases: 41,
+            collections: 42,
+            unique_violations: 43,
+            commits: 44,
+            fsyncs: 45,
+            commits_grouped: 46,
+            storage_bytes: 47,
+            vector_index_cache_bytes: 48,
+            index_unkeyed: 26,
+        }
+    }
+
     /// **Production clusters scrape this endpoint. Any diff is a
     /// regression** — a renamed series is a dashboard that goes blank and an
     /// alert that stops firing, and neither announces itself.
@@ -873,6 +965,33 @@ mod tests {
     #[test]
     fn the_render_is_byte_for_byte_what_a_scrape_receives() {
         let expected = "\
+# HELP kimmy_databases Number of databases.
+# TYPE kimmy_databases gauge
+kimmy_databases 41
+# HELP kimmy_collections Number of collections across all databases.
+# TYPE kimmy_collections gauge
+kimmy_collections 42
+# HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.
+# TYPE kimmy_unique_violations counter
+kimmy_unique_violations 43
+# HELP kimmy_commits Durable write transactions committed by the storage engine.
+# TYPE kimmy_commits counter
+kimmy_commits 44
+# HELP kimmy_fsyncs Times the disk was asked to make something durable: one per commit under durable, one per shared flush under coalesced.
+# TYPE kimmy_fsyncs counter
+kimmy_fsyncs 45
+# HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.
+# TYPE kimmy_commits_grouped_total counter
+kimmy_commits_grouped_total 46
+# HELP kimmy_storage_bytes Size of the database file on disk.
+# TYPE kimmy_storage_bytes gauge
+kimmy_storage_bytes 47
+# HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.
+# TYPE kimmy_vector_index_cache_bytes gauge
+kimmy_vector_index_cache_bytes 48
+# HELP kimmy_up Always 1; presence indicates the node is serving.
+# TYPE kimmy_up gauge
+kimmy_up 1
 # HELP kimmy_uptime_seconds Seconds since this process started serving.
 # TYPE kimmy_uptime_seconds gauge
 kimmy_uptime_seconds 0
@@ -1001,7 +1120,7 @@ kimmy_request_duration_seconds_sum 0.03049
 kimmy_request_duration_seconds_count 3
 ";
 
-        assert_eq!(every_counter_distinct().render(), expected);
+        assert_eq!(every_counter_distinct().render_with(&distinct_readings()), expected);
     }
 
     #[test]
@@ -1011,12 +1130,21 @@ kimmy_request_duration_seconds_count 3
         // the duplication this was written to avoid, arrived at by accident —
         // so every field is checked against the text a scrape would see.
         let m = every_counter_distinct();
-        let s = m.snapshot();
-        let out = m.render();
+        let readings = distinct_readings();
+        let s = m.snapshot_with(&readings);
+        let out = m.render_with(&readings);
 
         let expect = |line: &str| {
             assert!(out.contains(line), "the render disagrees with the snapshot: {line}\n{out}")
         };
+        expect(&format!("kimmy_databases {}\n", s.databases));
+        expect(&format!("kimmy_collections {}\n", s.collections));
+        expect(&format!("kimmy_unique_violations {}\n", s.unique_violations));
+        expect(&format!("kimmy_commits {}\n", s.commits));
+        expect(&format!("kimmy_fsyncs {}\n", s.fsyncs));
+        expect(&format!("kimmy_commits_grouped_total {}\n", s.commits_grouped));
+        expect(&format!("kimmy_storage_bytes {}\n", s.storage_bytes));
+        expect(&format!("kimmy_vector_index_cache_bytes {}\n", s.vector_index_cache_bytes));
         expect(&format!("kimmy_uptime_seconds {}\n", s.uptime_secs));
         expect(&format!("kimmy_requests_total {}\n", s.requests));
         expect(&format!("kimmy_responses_total{{class=\"2xx\"}} {}\n", s.responses_2xx));
@@ -1129,9 +1257,9 @@ kimmy_request_duration_seconds_count 3
             assert!(value.parse::<f64>().is_ok(), "not a numeric sample: {line}");
             samples += 1;
         }
-        // 43 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
+        // 52 scalar sample lines plus the histogram: 12 buckets, +Inf, sum,
         // count.
-        assert_eq!(samples, 58, "expected one sample per series: {out}");
+        assert_eq!(samples, 67, "expected one sample per series: {out}");
     }
 
     #[test]

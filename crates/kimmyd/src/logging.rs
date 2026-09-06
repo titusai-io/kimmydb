@@ -87,13 +87,19 @@ impl TelemetryGuard {
         // observes nothing, which is the honest reading of "the node is gone".
         let weak = Arc::downgrade(state);
         let snapshot = move || {
-            weak.upgrade().map(|state| {
-                // The one series the engine counts and the process mirrors:
-                // refreshed here, as the `/metrics` handler refreshes it,
-                // so a collector reads the same number a scrape would.
-                state.metrics.set_index_unkeyed(state.engine.unkeyed_writes());
-                state.metrics.snapshot()
-            })
+            let state = weak.upgrade()?;
+            // The engine's readings, taken fresh for this export exactly as
+            // the `/metrics` handler takes them for a scrape (ADR-142). A
+            // reading that fails observes nothing this export rather than
+            // zeros: a counter reported as 0 and then its true value is a
+            // reset a collector will believe.
+            match state.storage_readings() {
+                Ok(readings) => Some(state.metrics.snapshot_with(&readings)),
+                Err(e) => {
+                    tracing::debug!(error = ?e, "metrics bridge: engine readings unavailable this export");
+                    None
+                }
+            }
         };
 
         macro_rules! observe {
@@ -124,6 +130,73 @@ impl TelemetryGuard {
         // adds to a counter: an OTLP counter called `kimmy_requests_total`
         // becomes `kimmy_requests_total_total` the moment a collector exports
         // it back to Prometheus.
+        //
+        // The engine's block first, as the scrape renders it (ADR-142). The
+        // two gauges below cost a metadata scan per export, as they cost one
+        // per scrape.
+        observe!(
+            u64_observable_gauge,
+            "kimmy.databases",
+            "{database}",
+            "Number of databases.",
+            databases
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.collections",
+            "{collection}",
+            "Number of collections across all databases.",
+            collections
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.unique_violations",
+            "{violation}",
+            "Unique constraints broken by merging replicated writes.",
+            unique_violations
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.commits",
+            "{commit}",
+            "Durable write transactions committed by the storage engine.",
+            commits
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.fsyncs",
+            "{fsync}",
+            "Times the disk was asked to make something durable: one per commit under durable, one per shared flush under coalesced.",
+            fsyncs
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.commits.grouped",
+            "{commit}",
+            "Commits made durable by a shared flush rather than their own fsync.",
+            commits_grouped
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.storage.bytes",
+            "By",
+            "Size of the database file on disk.",
+            storage_bytes
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.vector.index_cache.bytes",
+            "By",
+            "Estimated bytes of HNSW graphs held in memory across vector collections.",
+            vector_index_cache_bytes
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.up",
+            "1",
+            "Always 1; presence indicates the node is serving.",
+            |_s| 1
+        );
         observe!(u64_observable_gauge, "kimmy.uptime", "s", "Seconds serving.", uptime_secs);
         observe!(
             u64_observable_counter,
@@ -707,7 +780,11 @@ mod tests {
         // to please a test would be the wrong way round.
         let aliases = [("kimmy_webhook_deliveries", "kimmy_webhook_delivered")];
 
-        let rendered = kimmy_api::metrics::Metrics::default().render();
+        // The whole page, engine block included: the nine series that block
+        // holds were on `/metrics` and off the bridge for as long as the
+        // guard rendered the process counters alone (ADR-142).
+        let rendered = kimmy_api::metrics::Metrics::default()
+            .render_with(&kimmy_api::metrics::StorageReadings::default());
 
         // An exception has to carry a reason, or the list becomes the place a
         // series goes to stop being asked about — which is the failure this

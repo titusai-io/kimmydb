@@ -583,65 +583,12 @@ async fn healthz() -> Json<Value> {
 ///
 /// Unauthenticated like the health endpoints, and deliberately limited to
 /// counts: exposing collection *names* here would leak the schema to anything
-/// that can reach the port.
+/// that can reach the port. One render for the whole page — the engine's
+/// readings and the process counters — so the OTLP bridge and its guard see
+/// every series a scrape does (ADR-142).
 async fn metrics(State(state): State<SharedState>) -> Result<String, ApiError> {
-    let databases = state.engine.list_databases()?;
-    let mut collections = 0usize;
-    for db in &databases {
-        collections += state.engine.list_collections(&db.name)?.len();
-    }
-    // The engine owns this count; the process counters mirror it so it
-    // renders in their block and reaches the OTLP bridge with them.
-    state.metrics.set_index_unkeyed(state.engine.unkeyed_writes());
-
-    Ok(format!(
-        "# HELP kimmy_databases Number of databases.\n\
-         # TYPE kimmy_databases gauge\n\
-         kimmy_databases {databases_count}\n\
-         # HELP kimmy_collections Number of collections across all databases.\n\
-         # TYPE kimmy_collections gauge\n\
-         kimmy_collections {collections}\n\
-         # HELP kimmy_unique_violations Unique constraints broken by merging replicated writes.\n\
-         # TYPE kimmy_unique_violations counter\n\
-         kimmy_unique_violations {violations}\n\
-         # HELP kimmy_commits Durable write transactions committed by the storage engine.\n\
-         # TYPE kimmy_commits counter\n\
-         kimmy_commits {commits}\n\
-         # HELP kimmy_fsyncs Times the disk was asked to make something durable: one per commit under durable, one per shared flush under coalesced.\n\
-         # TYPE kimmy_fsyncs counter\n\
-         kimmy_fsyncs {fsyncs}\n\
-         # HELP kimmy_commits_grouped_total Commits made durable by a shared flush rather than their own fsync.\n\
-         # TYPE kimmy_commits_grouped_total counter\n\
-         kimmy_commits_grouped_total {grouped}\n\
-         # HELP kimmy_storage_bytes Size of the database file on disk.\n\
-         # TYPE kimmy_storage_bytes gauge\n\
-         kimmy_storage_bytes {storage}\n\
-         # HELP kimmy_vector_index_cache_bytes Estimated bytes of HNSW graphs held in memory across vector collections. Bounded by vector.index_cache.max_bytes; a graph larger than the whole budget is held anyway.\n\
-         # TYPE kimmy_vector_index_cache_bytes gauge\n\
-         kimmy_vector_index_cache_bytes {index_cache}\n\
-         # HELP kimmy_up Always 1; presence indicates the node is serving.\n\
-         # TYPE kimmy_up gauge\n\
-         kimmy_up 1\n\
-         {process}",
-        databases_count = databases.len(),
-        // An estimate from node count and width, not a heap measurement;
-        // what the budget evicts against, so the two agree by construction.
-        index_cache = state.vectors.resident_bytes(),
-        // Surfaced here, not only on a change stream, so the condition is
-        // visible without anyone having been subscribed when it happened.
-        violations = state.engine.unique_violations(),
-        // redb has a single writer and every commit is an fsync, so this over
-        // the request count is what a write actually costs. A client-visible
-        // write that costs two commits costs twice as much as one that costs
-        // one, and no latency figure says which of those is happening.
-        commits = state.engine.commits(),
-        // Under `coalesced` the two diverge, and the gap is the win: commits
-        // that reached the disk without paying for their own fsync (ADR-088).
-        fsyncs = state.engine.fsyncs(),
-        grouped = state.engine.grouped_commits(),
-        storage = state.engine.storage_bytes(),
-        process = state.metrics.render(),
-    ))
+    let readings = state.storage_readings()?;
+    Ok(state.metrics.render_with(&readings))
 }
 
 /// This node, described as an OAuth 2.0 protected resource (RFC 9728).
