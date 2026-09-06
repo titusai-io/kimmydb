@@ -9935,6 +9935,15 @@ rather than the sum. A node with no member set — clustering off, or
 membership off — answers as before, with no `confirmation` at all. A drop that
 finds nothing here mints no entry and confirms nothing.
 
+**Amended 2026-09-06 — the push carries a window, not an entry.** Pushing the
+entry alone through `apply_batch` raised the member's witnessed vector past
+every earlier entry from this origin it had not yet pulled, and nothing
+re-served them; ADR-143 makes a push a pull the sender starts, so `Push` now
+carries what `Versions` and `Entries` would have, and the receiver applies it
+through `apply_peer_batch`. The decision here — confirm on every live member
+before answering — stands unchanged. (ADR-141 has since made a drop mint its
+entry wherever it lands, so a drop always has an entry to confirm.)
+
 **Why.** The window ADR-139's finding came through. A client created an index
 on one member and, seconds later, wrote through a front that spread requests
 across members; the write landed on a member that had not yet received the
@@ -10116,3 +10125,62 @@ rather than a stamp. `SyncOutcome`, `RoundReport`, `Pushed` and the metrics
 snapshot gain `ddl_declined`; one new `/metrics` series, pinned by the golden
 tests and the bridge guard. A name that fails `validate_name` is a `400` on
 drop as on create, where before it was a silent `dropped: false`.
+
+## ADR-143 — A push is a pull the sender starts: a member's witnessed vector is raised only over a window that begins where its own history ends
+
+**Decision.** The push ADR-140 introduced carries the *window* a member
+lacks from the pushing node, ending in the change, not the change alone.
+`Push` now carries what `Versions` and `Entries` would have carried had the
+member pulled — the pusher's servable vector, the entries, `scanned_to` and
+`exhausted` — and the receiver applies it through `apply_peer_batch`, the
+same coverage rule a pulled window goes through. To derive the window the
+pusher asks the member what it has processed (`AskWitnessed` / `Witnessed`:
+the member's witnessed vector) and computes the threshold from it exactly as
+the member would for itself, then reads the window under the same batch and
+frame limits a served pull has, horizon check included. A member that has
+already processed the change is confirmed without anything being sent. A
+member the window cannot reach — more than a batch behind, or below the
+pusher's retention horizon — is sent nothing and named `pending` with that
+reason: the sync loop is already doing that work at its own pace, and a
+window that stops short of the change would only repeat it on a request's
+clock.
+
+**Why.** The first form of the push handed the member one entry through
+`apply_batch`, which observes every entry it takes into the witnessed vector
+(ADR-054). That is right for a pulled window, whose first entry sits at the
+member's own position, and wrong for an entry that arrives out of order: the
+member's witnessed position for the pushing origin jumped to the change's
+stamp, and every earlier entry from that origin it had not yet pulled — the
+collection created a few milliseconds before the index, the documents written
+into it — fell behind a position anti-entropy never asks about again. The
+member skipped the pushed index as an unknown collection, was never sent the
+collection, and stayed that way for the life of the cluster: a hole, of the
+kind ADR-054, ADR-082 and ADR-127 each closed one shape of. It showed as two
+cluster-harness TTL tests failing whenever the collection's expiry owner was
+not the node that created the index — about two runs in three — before the
+change was released.
+
+**The invariant, stated.** Nothing raises a node's witnessed vector for an
+origin except a window that starts at that node's own position for it, or a
+snapshot that hands over coverage wholesale (ADR-082). Every path that moves
+entries between members — pull, snapshot, and now push — goes through the
+coverage rule; no caller applies a foreign entry through `apply_batch`
+directly, which remains for a batch this node already accounts for.
+
+**Alternatives.** *Apply the pushed entry without witnessing it.* Appending
+an entry raises both vectors by construction (ADR-054: appending is the
+strongest form of having seen it), so the entry would have to be applied
+without being appended, leaving an index whose creation this member cannot
+serve onward and a snapshot that disagrees with the oplog. *Ask the member to
+pull now.* Needs the member to dial back, and a second round trip to learn
+the answer; deriving the window on the pusher's side is the same computation
+with the roles kept. *Push the window even when it stops short of the
+change.* A sync round's work on a request's clock, for a `pending` either
+way.
+
+**Cost.** Two protocol messages (`AskWitnessed`, `Witnessed`); `Push` gains
+three fields. `push_entries` becomes `push_entry`, which answers with the
+member, its outcome and, when the window could not reach the change, why. A
+confirmation can now name a member `pending` for being too far behind as
+well as for not answering. The receiver's cap on a pushed batch stays. One
+harness test and five transport tests.

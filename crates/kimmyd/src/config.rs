@@ -879,8 +879,10 @@ pub struct ClusterConfig {
     /// considers alive and answer once each has applied or refused it, so a
     /// client that creates an index on one member and writes through a
     /// front a moment later finds the index enforced wherever the write
-    /// lands. A member that does not answer in time is named `pending` in
-    /// the response and receives the change through anti-entropy as before.
+    /// lands. What is pushed is the window the member lacks, ending in the
+    /// change (ADR-143). A member that does not answer in time, or is too far
+    /// behind for one push to reach, is named `pending` in the response and
+    /// receives the change through anti-entropy as before.
     /// `0` turns the confirmation off. Needs `membership`.
     pub ddl_confirm_timeout_secs: u64,
 }

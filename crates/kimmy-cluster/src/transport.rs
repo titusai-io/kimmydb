@@ -207,6 +207,12 @@ where
                     engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 write_frame(&mut stream, &Message::Versions(versions)).await?;
             }
+            Message::AskWitnessed {} => {
+                let witnessed = engine
+                    .witnessed_vector()
+                    .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+                write_frame(&mut stream, &Message::Witnessed(witnessed)).await?;
+            }
             Message::AskEntries { from, limit, held } => {
                 // Tell a peer below the horizon rather than serving it what is
                 // left: it would apply that, advance its version vector, and
@@ -286,7 +292,7 @@ where
                 )
                 .await?;
             }
-            Message::Push { entries } => {
+            Message::Push { entries, scanned_to, exhausted, versions } => {
                 // The same cap a pull is served under: a peer must not be able
                 // to hand this node an unbounded batch to apply in one go.
                 if entries.len() > MAX_BATCH {
@@ -297,13 +303,15 @@ where
                     let _ = write_frame(&mut stream, &Message::Fault(reason.clone())).await;
                     return Err(ProtocolError::Malformed(reason));
                 }
-                // Through `apply_batch`, exactly as a pulled window is: every
-                // entry is witnessed, so anti-entropy does not re-request it;
-                // a schema change this node applies is appended onward; one
-                // it cannot apply is refused, counted and reported (ADR-123),
-                // which is the answer the pusher is waiting for (ADR-140).
+                // Through `apply_peer_batch`, exactly as a pulled window is
+                // (ADR-143): the coverage rule raises the witnessed vector only
+                // over what the window carried, so this node never witnesses
+                // past an entry it was not sent; a schema change it applies is
+                // appended onward; one it cannot apply is refused, counted and
+                // reported (ADR-123), which is the answer the pusher is waiting
+                // for (ADR-140).
                 let outcome = engine
-                    .apply_batch(&entries)
+                    .apply_peer_batch(&versions, &entries, scanned_to, exhausted)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
                 if let Some(hook) = on_pushed {
                     hook(&outcome);
@@ -396,43 +404,143 @@ pub async fn sync_once(
     sync_over(engine, &mut stream, peer, their_node, probe).await
 }
 
-/// Push entries this node holds to `peer` and wait for what became of them
-/// (ADR-140): the peer's node id, and its outcome — `ddl_refused` above zero
-/// is a schema change the peer could not apply and skipped, counted there.
+/// What a push to one member became (ADR-140, ADR-143).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PushOutcome {
+    /// The member, as it named itself in the handshake.
+    pub node: kimmy_core::NodeId,
+    /// What the window became there: `ddl_refused` above zero is a schema
+    /// change the member could not apply and skipped, counted there. Empty
+    /// when the member had already processed the entry and nothing was sent.
+    pub outcome: SyncOutcome,
+    /// Why the window could not carry the entry, when it could not: the
+    /// member is more than a batch behind this node, or below its retention
+    /// horizon. Nothing was sent, and anti-entropy carries the entry.
+    pub unreached: Option<String>,
+}
+
+/// Hand `peer` the window it lacks from this node, ending in `entry`, and
+/// wait for what became of it.
 ///
-/// One exchange on a fresh connection, bounded like a sync round. The entries
-/// are applied on the peer through the same path a pulled batch takes, so
-/// nothing about anti-entropy changes: the peer has simply seen them now
-/// rather than within a sync interval.
-pub async fn push_entries(
+/// **A push is a pull the sender starts** (ADR-143). The peer is asked what
+/// it has processed, the window is derived from that exactly as the peer
+/// would derive it for itself — same threshold, same horizon check, same
+/// batch and frame limits — and the peer accounts for it through the same
+/// coverage rule a pulled window goes through. So a push never carries an
+/// entry out of order, and a member's witnessed vector is raised only over
+/// entries it was sent. The first form of this call pushed the entry alone
+/// through `apply_batch`, which raised the vector past every earlier entry
+/// the member had not yet pulled; nothing re-served them.
+///
+/// A peer that has already processed `entry` is confirmed without anything
+/// being sent. A peer the window cannot reach — more than a batch behind, or
+/// below this node's retention horizon — is sent nothing and reported
+/// `unreached`: a window that stops short of the entry would only do a sync
+/// round's work on a request's clock, and the sync loop is already doing
+/// that work at its own pace.
+///
+/// One exchange on a fresh connection, bounded like a sync round.
+pub async fn push_entry(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
-    entries: Vec<OplogEntry>,
-) -> Result<(kimmy_core::NodeId, SyncOutcome), ProtocolError> {
+    entry: &OplogEntry,
+) -> Result<PushOutcome, ProtocolError> {
     let (mut stream, their_node) = dial(engine, peer, secret).await?;
+    let nothing_sent = |unreached: Option<String>| PushOutcome {
+        node: their_node,
+        outcome: SyncOutcome { peer: Some(their_node), ..SyncOutcome::default() },
+        unreached,
+    };
     let exchange = async {
-        write_frame(&mut stream, &Message::Push { entries }).await?;
+        write_frame(&mut stream, &Message::AskWitnessed {}).await?;
+        let held = match read_frame(&mut stream).await? {
+            Message::Witnessed(held) => held,
+            Message::Fault(reason) => return Err(ProtocolError::Fault(reason)),
+            other => {
+                return Err(ProtocolError::Malformed(format!("expected Witnessed, got {other:?}")));
+            }
+        };
+        if held.get(entry.stamp.node) >= entry.stamp.hlc {
+            // A sync round got there first; the member holds or has refused
+            // the entry already, and counted whichever it was.
+            return Ok(nothing_sent(None));
+        }
+
+        // What this node can serve, read *before* the window so the vector
+        // never claims more than the window could carry — the order a served
+        // pull has, where `AskVersions` precedes `AskEntries`.
+        let mine = engine.version_vector().map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        let Some(from) = held.behind(&mine) else {
+            return Ok(nothing_sent(None));
+        };
+        let servable = engine
+            .can_serve_peer_holding(&held)
+            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        if !servable {
+            return Ok(nothing_sent(Some(
+                "the member is below this node's retention horizon; anti-entropy will hand it \
+                 a snapshot"
+                    .into(),
+            )));
+        }
+        let mut window = engine
+            .entries_for_peer(from, MAX_BATCH)
+            .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        if let Fits::Only(fits) = how_many_fit(&window.entries) {
+            if fits == 0 {
+                return Err(ProtocolError::Malformed(format!(
+                    "a single oplog entry at or after {from:?} exceeds the {MAX_FRAME} byte \
+                     frame limit and cannot replicate"
+                )));
+            }
+            // Re-read at the smaller limit rather than trim: the end the
+            // window reports must match the entries it carries (ADR-127).
+            window = engine
+                .entries_for_peer(from, fits)
+                .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
+        }
+        if !window.entries.iter().any(|e| e.stamp == entry.stamp) {
+            return Ok(nothing_sent(Some(format!(
+                "the member is more than {} entries behind this node; anti-entropy will carry \
+                 the change",
+                window.entries.len()
+            ))));
+        }
+
+        write_frame(
+            &mut stream,
+            &Message::Push {
+                entries: window.entries,
+                scanned_to: window.scanned_to,
+                exhausted: window.exhausted,
+                versions: mine,
+            },
+        )
+        .await?;
         match read_frame(&mut stream).await? {
             Message::Pushed { applied, ddl, ddl_refused, unknown_collection, ddl_declined } => {
-                Ok(SyncOutcome {
-                    applied,
-                    ddl,
-                    ddl_refused,
-                    unknown_collection,
-                    ddl_declined,
-                    peer: Some(their_node),
-                    ..SyncOutcome::default()
+                Ok(PushOutcome {
+                    node: their_node,
+                    outcome: SyncOutcome {
+                        applied,
+                        ddl,
+                        ddl_refused,
+                        unknown_collection,
+                        ddl_declined,
+                        peer: Some(their_node),
+                        ..SyncOutcome::default()
+                    },
+                    unreached: None,
                 })
             }
             Message::Fault(reason) => Err(ProtocolError::Fault(reason)),
             other => Err(ProtocolError::Malformed(format!("expected Pushed, got {other:?}"))),
         }
     };
-    let outcome = tokio::time::timeout(REQUEST_TIMEOUT, exchange)
+    tokio::time::timeout(REQUEST_TIMEOUT, exchange)
         .await
-        .map_err(|_| ProtocolError::Malformed("push timed out".into()))??;
-    Ok((their_node, outcome))
+        .map_err(|_| ProtocolError::Malformed("push timed out".into()))?
 }
 
 /// Dial `peer`, complete TLS and the handshake, and hand back the stream and

@@ -13,7 +13,7 @@ use std::collections::BTreeSet;
 
 use bson::doc;
 use kimmy_cluster::protocol::{Message, ProtocolError, read_frame, write_frame};
-use kimmy_cluster::transport::{DivergenceProbe, push_entries, serve, serve_with, sync_once};
+use kimmy_cluster::transport::{DivergenceProbe, push_entry, serve, serve_with, sync_once};
 use kimmy_core::{DocId, Hlc};
 use kimmy_storage::Engine;
 use tokio::net::{TcpListener, TcpStream};
@@ -2011,7 +2011,7 @@ async fn listen_with(
 #[tokio::test]
 async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
     // What the confirmation rides on: the member holds the definition when
-    // the push answers, not a sync interval later, and the entry is
+    // the push answers, not a sync interval later, and the window is
     // witnessed so anti-entropy does not fetch it again.
     let a = node().await;
     let b = node().await;
@@ -2019,14 +2019,16 @@ async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
     a.engine
         .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
         .unwrap();
-    let entries = a.engine.entries_for_peer(Hlc::ZERO, 10).unwrap().entries;
-    assert_eq!(entries.len(), 2, "the collection and the index");
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let (node, outcome) =
-        push_entries(&a.engine, b.addr, SECRET, entries).await.expect("the push is answered");
-    assert_eq!(node, b.engine.node_id(), "the peer names itself in the handshake");
-    assert_eq!(outcome.ddl, 2, "{outcome:?}");
-    assert_eq!(outcome.ddl_refused, 0, "{outcome:?}");
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.expect("the push is answered");
+    assert_eq!(pushed.node, b.engine.node_id(), "the peer names itself in the handshake");
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(
+        pushed.outcome.ddl, 2,
+        "the collection the member lacked, then the index: {pushed:?}"
+    );
+    assert_eq!(pushed.outcome.ddl_refused, 0, "{pushed:?}");
     assert!(
         b.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some(),
         "held now, not after the next sync interval"
@@ -2035,24 +2037,147 @@ async fn a_pushed_schema_change_is_applied_at_once_and_reported() {
     assert_eq!(second.total(), 0, "witnessed by the push, so nothing is re-requested: {second:?}");
 }
 
+/// The newest entry of `kind` this node holds — the one a confirmation
+/// pushes a moment after minting it.
+fn newest(engine: &Engine, kind: kimmy_core::OpKind) -> kimmy_core::OplogEntry {
+    engine
+        .entries_for_peer(Hlc::ZERO, kimmy_cluster::protocol::MAX_BATCH * 2)
+        .unwrap()
+        .entries
+        .into_iter()
+        .rev()
+        .find(|e| e.kind == kind)
+        .expect("an entry of that kind")
+}
+
+#[tokio::test]
+async fn a_push_carries_everything_the_member_lacks_before_the_change() {
+    // The hole the first push opened, closed (ADR-143). A creates a
+    // collection, writes to it and adds an index within one sync interval;
+    // B has pulled nothing yet. Pushing the index alone raised B's witnessed
+    // vector past the collection and the document, so B skipped the index as
+    // an unknown collection and was never sent the collection again — a
+    // member with a hole in its history for the life of the cluster, which
+    // the cluster harness met as a TTL owner that never expired anything.
+    // The window a push carries now starts where B's history ends.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "sessions").unwrap();
+    a.engine.insert(&ca, doc! { "_id": "s1", "seen": 0 }).unwrap();
+    a.engine
+        .create_index("shop", "sessions", vec![field("seen")], false, Some("ttl_seen".into()))
+        .unwrap();
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(pushed.outcome.unknown_collection, 0, "the collection arrived first: {pushed:?}");
+    assert_eq!((pushed.outcome.ddl, pushed.outcome.applied), (2, 1), "{pushed:?}");
+    let cb = b.engine.get_collection("shop", "sessions").expect("the collection, not a hole");
+    assert!(cb.index("ttl_seen").is_some(), "and the index over it");
+    assert!(
+        b.engine.get(&cb, &DocId::String("s1".into())).unwrap().is_some(),
+        "and the document written before it"
+    );
+    let second = sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    assert_eq!(second.total(), 0, "nothing left to pull and nothing re-requested: {second:?}");
+}
+
+#[tokio::test]
+async fn a_member_that_already_holds_the_change_is_confirmed_without_a_window() {
+    // A sync round got there first: the member's witnessed position is past
+    // the entry, so the push sends nothing and reports it held.
+    let a = node().await;
+    let b = node().await;
+    a.engine.create_collection("shop", "orders").unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(pushed.outcome.total(), 0, "already held; nothing sent: {pushed:?}");
+}
+
+#[tokio::test]
+async fn a_member_more_than_a_batch_behind_is_reported_unreached_and_sent_nothing() {
+    // The window is derived exactly as a pull's and capped the same way, so
+    // a member this far behind cannot be reached in one exchange. It is told
+    // nothing — a window that stops short of the entry would only do a sync
+    // round's work on a request's clock — and named, and the sync loop
+    // brings it up at its own pace, in order, with no hole.
+    let a = node().await;
+    let b = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    let batch: Vec<_> =
+        (0..kimmy_cluster::protocol::MAX_BATCH as i64 + 1).map(|n| doc! { "_id": n }).collect();
+    a.engine.insert_many(&ca, batch).unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    let reason = pushed.unreached.clone().expect("named unreached");
+    assert!(reason.contains("entries behind"), "{reason}");
+    assert_eq!(pushed.outcome.total(), 0, "nothing was sent: {pushed:?}");
+    assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
+
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(b.engine.count(&cb).unwrap(), kimmy_cluster::protocol::MAX_BATCH as u64 + 1);
+    assert!(cb.index("by_email").is_some(), "anti-entropy carried it");
+}
+
+#[tokio::test]
+async fn a_member_below_the_retention_horizon_is_reported_unreached() {
+    // The same horizon check a served pull makes: a member whose gap has
+    // been collected is not handed what is left of it (ADR-097). It is named
+    // unreached, and the snapshot fallback brings it up on its next round.
+    let a = node().await;
+    let ca = a.engine.create_collection("shop", "orders").unwrap();
+    for i in 0..50i64 {
+        a.engine.insert(&ca, doc! { "_id": i }).unwrap();
+    }
+    a.engine
+        .collect_garbage_at(
+            kimmy_storage::physical_now_ms() + 1_000_000_000,
+            kimmy_storage::RetentionPolicy::new(0, u64::MAX),
+        )
+        .unwrap();
+    a.engine
+        .create_index("shop", "orders", vec![field("email")], false, Some("by_email".into()))
+        .unwrap();
+    let b = node().await;
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
+
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    assert!(
+        pushed.unreached.as_deref().is_some_and(|r| r.contains("retention horizon")),
+        "{pushed:?}"
+    );
+    assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
+
+    sync_once(&b.engine, a.addr, SECRET, None).await.unwrap();
+    let cb = b.engine.get_collection("shop", "orders").unwrap();
+    assert_eq!(b.engine.count(&cb).unwrap(), 50, "the snapshot brought it up");
+    assert!(cb.index("by_email").is_some(), "index included");
+}
+
 #[tokio::test]
 async fn a_pushed_schema_change_the_receiver_cannot_apply_is_reported_as_refused() {
     // The answer a confirmation acts on: the member could not apply the
     // definition, skipped it, and counted it — and says so, rather than
     // failing the exchange.
     let (a, b) = sender_with_a_definition_the_receiver_cannot_arbitrate().await;
-    let entries: Vec<_> = a
-        .engine
-        .entries_for_peer(Hlc::ZERO, 10)
-        .unwrap()
-        .entries
-        .into_iter()
-        .filter(|e| e.kind == kimmy_core::OpKind::CreateIndex)
-        .collect();
-    assert_eq!(entries.len(), 1);
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let (_, outcome) = push_entries(&a.engine, b.addr, SECRET, entries).await.unwrap();
-    assert_eq!(outcome.ddl_refused, 1, "refused and reported: {outcome:?}");
+    let pushed = push_entry(&a.engine, b.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert_eq!(pushed.outcome.ddl_refused, 1, "refused and reported: {pushed:?}");
     assert!(
         !b.engine.get_collection("shop", "orders").unwrap().index("by_email").unwrap().unique,
         "B keeps the definition it cannot arbitrate away"
@@ -2095,43 +2220,11 @@ async fn the_push_hook_sees_what_the_receiver_refused() {
     a.engine
         .create_index("shop", "orders", vec![field("email")], true, Some("by_email".into()))
         .unwrap();
-    let entries: Vec<_> = a
-        .engine
-        .entries_for_peer(Hlc::ZERO, 10)
-        .unwrap()
-        .entries
-        .into_iter()
-        .filter(|e| e.kind == kimmy_core::OpKind::CreateIndex)
-        .collect();
+    let entry = newest(&a.engine, kimmy_core::OpKind::CreateIndex);
 
-    let (_, outcome) = push_entries(&a.engine, addr, SECRET, entries).await.unwrap();
-    assert_eq!(outcome.ddl_refused, 1, "{outcome:?}");
+    let pushed = push_entry(&a.engine, addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.outcome.ddl_refused, 1, "{pushed:?}");
     assert_eq!(refused.load(Ordering::SeqCst), 1, "the hook saw the refusal");
-}
-
-#[tokio::test]
-async fn a_push_larger_than_a_batch_is_refused() {
-    // The cap a pull is served under, applied to what a peer may hand this
-    // node to apply in one go.
-    let a = node().await;
-    let b = node().await;
-    let ca = a.engine.create_collection("shop", "orders").unwrap();
-    let batch: Vec<_> =
-        (0..kimmy_cluster::protocol::MAX_BATCH as i64 + 1).map(|n| doc! { "_id": n }).collect();
-    a.engine.insert_many(&ca, batch).unwrap();
-    let entries = a
-        .engine
-        .entries_for_peer(Hlc::ZERO, kimmy_cluster::protocol::MAX_BATCH + 10)
-        .unwrap()
-        .entries;
-    assert!(entries.len() > kimmy_cluster::protocol::MAX_BATCH);
-
-    let err = push_entries(&a.engine, b.addr, SECRET, entries).await.unwrap_err();
-    assert!(
-        matches!(err, ProtocolError::Fault(ref reason) if reason.contains("batch limit")),
-        "{err:?}"
-    );
-    assert!(b.engine.get_collection("shop", "orders").is_err(), "nothing was applied");
 }
 
 // ---------------------------------------------------------------------------
@@ -2185,9 +2278,10 @@ async fn a_drop_pushed_from_a_member_without_the_index_is_applied_by_the_holder(
     let dropped = b.engine.drop_index_stamped("shop", "orders", "by_email").unwrap();
     let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
 
-    let (_, outcome) = push_entries(&b.engine, a.addr, SECRET, vec![entry]).await.unwrap();
-    assert_eq!(outcome.ddl, 1, "applied on the holder: {outcome:?}");
-    assert_eq!(outcome.ddl_declined, 0, "{outcome:?}");
+    let pushed = push_entry(&b.engine, a.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.unreached, None, "{pushed:?}");
+    assert!(pushed.outcome.ddl >= 1, "applied on the holder: {pushed:?}");
+    assert_eq!(pushed.outcome.ddl_declined, 0, "{pushed:?}");
     assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_none());
 }
 
@@ -2207,7 +2301,7 @@ async fn a_pushed_drop_older_than_the_holders_index_is_reported_as_declined() {
         .unwrap();
     let entry = b.engine.oplog_entry(&dropped.stamp.unwrap()).unwrap().expect("the drop entry");
 
-    let (_, outcome) = push_entries(&b.engine, a.addr, SECRET, vec![entry]).await.unwrap();
-    assert_eq!(outcome.ddl_declined, 1, "declined and reported: {outcome:?}");
+    let pushed = push_entry(&b.engine, a.addr, SECRET, &entry).await.unwrap();
+    assert_eq!(pushed.outcome.ddl_declined, 1, "declined and reported: {pushed:?}");
     assert!(a.engine.get_collection("shop", "orders").unwrap().index("by_email").is_some());
 }

@@ -170,28 +170,42 @@ pub enum Message {
     /// piece of this exchange that reads documents, and it reads exactly one
     /// collection's worth.
     Divergence { collections: Vec<CollectionId>, probe_count: Option<u64> },
-    /// "Apply these entries now, and tell me what became of them."
+    /// "What have you processed?"
+    ///
+    /// The receiver's *witnessed* vector — what it has processed per origin,
+    /// appended or not — where `AskVersions` answers with what a node can
+    /// *serve*. The one caller is a push (ADR-143): the pusher derives the
+    /// window the member lacks from this exactly as the member would derive
+    /// it for itself, so a push never carries an entry out of order.
+    AskWitnessed {},
+    /// The answer.
+    Witnessed(VersionVector),
+    /// "Here is the window you would have pulled from me; apply it now and
+    /// tell me what became of it."
     ///
     /// The one message in this protocol that moves entries *toward* a peer
     /// rather than pulling them, and it exists for exactly one caller: a
     /// schema change confirming itself on every live member before its
-    /// request answers (ADR-140). Anti-entropy would carry the same entry
-    /// within a sync interval; the push makes the response mean what a
-    /// client reads it to mean. Applied through the same `apply_batch` a
-    /// pulled batch goes through, so the entry is witnessed, appended onward
-    /// and, if the member cannot apply it, refused and counted there exactly
-    /// as it would have been on the pull.
-    Push { entries: Vec<OplogEntry> },
-    /// What the pushed entries became on the receiver: the fields of its
+    /// request answers (ADR-140). **A push is a pull the sender starts**
+    /// (ADR-143): `entries`, `scanned_to` and `exhausted` are what
+    /// `AskEntries` would have answered had the receiver asked from its own
+    /// witnessed position, and `versions` is what `AskVersions` would have
+    /// answered first — so the receiver accounts for the window through the
+    /// same coverage rule a pulled one goes through, and its witnessed
+    /// vector is raised only over entries it was sent. Pushing a lone entry
+    /// through `apply_batch`, as this message first did, raised the vector
+    /// past every earlier entry from the same origin the receiver had not
+    /// yet pulled, and nothing re-served them: a member could be handed an
+    /// index for a collection it was never sent.
+    Push { entries: Vec<OplogEntry>, scanned_to: Hlc, exhausted: bool, versions: VersionVector },
+    /// What the pushed window became on the receiver: the fields of its
     /// `SyncOutcome` a pusher can act on. `ddl_declined` is a drop the
-    /// receiver turned away as older than the index it holds (ADR-141);
-    /// optional on the wire for a receiver that predates the field.
+    /// receiver turned away as older than the index it holds (ADR-141).
     Pushed {
         applied: usize,
         ddl: usize,
         ddl_refused: usize,
         unknown_collection: usize,
-        #[serde(default)]
         ddl_declined: usize,
     },
     /// Something went wrong; the sender is closing.
@@ -476,6 +490,21 @@ mod tests {
                 probe_count: Some(7),
             },
             Message::Divergence { collections: Vec::new(), probe_count: None },
+            Message::AskWitnessed {},
+            Message::Witnessed(populated_vector()),
+            Message::Push {
+                entries: Vec::new(),
+                scanned_to: Hlc::new(11, 2),
+                exhausted: false,
+                versions: populated_vector(),
+            },
+            Message::Pushed {
+                applied: 1,
+                ddl: 2,
+                ddl_refused: 0,
+                unknown_collection: 0,
+                ddl_declined: 3,
+            },
             Message::Fault("nope".into()),
         ];
 

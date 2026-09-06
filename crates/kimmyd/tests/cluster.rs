@@ -396,6 +396,72 @@ async fn replication_converges_through_gossip_discovered_peers() {
     .await;
 }
 
+/// A schema change made right after its collection reaches every member.
+///
+/// The regression from the first form of ADR-140's push. The index, pushed
+/// alone, raised a member's witnessed vector past the collection created a
+/// few milliseconds earlier and not yet pulled, so the member skipped the
+/// index as unknown and was never sent the collection again. The two TTL
+/// tests below failed on exactly that whenever the collection's expiry owner
+/// was not the creating node. ADR-143 makes the push carry the window the
+/// member lacks, and this asserts what those tests assumed: a collection and
+/// an index created back to back are held by every node, and the response
+/// says so.
+#[tokio::test]
+#[ignore = "boots a real three-node cluster; run with --ignored"]
+async fn a_schema_change_made_right_after_its_collection_reaches_every_member() {
+    let client = reqwest::Client::new();
+    let (a, b, c) = three_nodes(&client).await;
+    eventually("gossip to form", || all_report(&client, vec![&a, &b, &c], 2)).await;
+
+    let token = a.login(&client).await;
+    client
+        .post(a.url("/v1/db/shop/collections"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "sessions" }))
+        .send()
+        .await
+        .unwrap();
+    let created: serde_json::Value = client
+        .post(a.url("/v1/db/shop/coll/sessions/indexes"))
+        .bearer_auth(&token)
+        .json(&serde_json::json!({ "name": "by_seen", "fields": [{ "path": "seen" }] }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Both peers were handed the collection and the index together, and
+    // confirmed them before the response.
+    assert_eq!(created["confirmation"]["confirmed"].as_array().map(Vec::len), Some(2), "{created}");
+    assert_eq!(created["confirmation"]["pending"].as_array().map(Vec::len), Some(0), "{created}");
+
+    for node in [&b, &c] {
+        let token = node.login(&client).await;
+        eventually("the collection and its index to be listed on every node", || {
+            let client = client.clone();
+            let url = node.url("/v1/db/shop/coll/sessions/indexes");
+            let token = token.clone();
+            async move {
+                let Ok(res) = client.get(url).bearer_auth(&token).send().await else {
+                    return false;
+                };
+                if res.status() != 200 {
+                    return false;
+                }
+                let Ok(body) = res.json::<serde_json::Value>().await else {
+                    return false;
+                };
+                body["indexes"]
+                    .as_array()
+                    .is_some_and(|indexes| indexes.iter().any(|i| i["name"] == "by_seen"))
+            }
+        })
+        .await;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Webhook ownership across the cluster
 // ---------------------------------------------------------------------------
