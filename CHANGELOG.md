@@ -32,6 +32,18 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   and a count that keeps rising is a member whose clock ran ahead when it
   created the index ([ADR-141](docs/decisions.md), amending ADR-123).
 
+- **A failed request's log line names its event in an `event` field, and
+  `message` is written once.** Every `request failed` line used to carry two
+  `message` keys — the event name, which a `tracing` format string is, and
+  the client-facing text — and the JSON format wrote both, so a parser kept
+  one of the two without saying which. The line now carries `event:
+  request failed`, `code` and `message`, each once, at all three levels; a
+  pipeline that matched on `message == "request failed"` should match on
+  `event` instead, and one that read `message` for the text now gets it every
+  time. The pretty format renders `event="request failed"` where the bare text
+  was. Nothing in the response moves ([ADR-144](docs/decisions.md), amending
+  ADR-136).
+
 ### Fixed
 
 - **Nine `/metrics` series were never on the OTLP bridge.** `kimmy_databases`,

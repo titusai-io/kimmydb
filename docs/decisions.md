@@ -9409,6 +9409,13 @@ remain the boundary this ADR declines to move.
 
 ## ADR-136 — What a failed request logs is a property of its error code, and the property is actionability rather than HTTP class
 
+> **Amended by [ADR-144](#adr-144--a-log-lines-event-name-and-its-message-are-two-fields-never-one-key-twice).**
+> "One event message on every level" below stands as an argument and moves as
+> a field: the `request failed` name is now written to an `event` field, not
+> as the macro's format string. Written that way it *was* a field named
+> `message`, beside the `message` field carrying the client-facing text, and
+> the JSON layer wrote both. Read "event message" below as "event name".
+>
 > **Amended by [ADR-137](#adr-137--the-log-level-a-failure-can-ask-for-is-a-three-variant-type-not-tracinglevel).**
 > Not superseded: every level below, and the reasoning for each, stands. What
 > changed is the type they are written in. `log_level()` returns
@@ -10184,3 +10191,73 @@ member, its outcome and, when the window could not reach the change, why. A
 confirmation can now name a member `pending` for being too far behind as
 well as for not answering. The receiver's cap on a pushed batch stays. One
 harness test and five transport tests.
+
+---
+
+## ADR-144 — A log line's event name and its message are two fields, never one key twice
+
+**Decision.** `impl IntoResponse for ApiError` logs a failure as
+`error!(event = EVENT, code, message)` — and the same shape at `warn!` and
+`info!` — with no format string. The line's fields are exactly `event`
+(`request failed`), `code` (the error code) and `message` (the client-facing
+text), plus whatever the subscriber adds: `timestamp`, `level`, `target`. No
+`tracing` macro call in the tree passes a field named `message` beside a
+format string, and `docs/operations.md`'s log-line contract now names the
+three fields as they are. A test drives a failure at each of the three levels
+through the same JSON layer `kimmyd` runs, and holds the raw bytes to the
+parsed object: every key written once, and the three fields carrying the
+values the document promises.
+
+**Why.** A `tracing` macro's format string is not separate from its fields;
+it is one of them, named `message`. So `error!(code, message, "{EVENT}")`
+— the shape ADR-136 chose — recorded two fields called `message`: the
+explicit one carrying the client-facing text, and the implicit one carrying
+`request failed`. The pretty formatter renders each field it is handed, and
+showed the two as two, which is why nothing looked wrong on a terminal and
+why the existing test, which reads the pretty formatter's output, could not
+see it. The JSON layer serialises the fields in the order they arrive and
+does not deduplicate, so every `request failed` line in the format an
+operator's pipeline reads carried `"message"` twice inside one object. That
+is legal to emit and every parser accepts it, keeping one of the two without
+saying which — first or last is a property of the parser, not of the line.
+`operations.md` promised that the client-facing text is in `message` and that
+every line says `request failed`; whichever value a parser kept, the line
+broke one of the two promises, and the operator learned which from their
+tooling rather than from the document.
+
+**Why `event` and not a different format string.** The name has to live
+somewhere, and the format string is the wrong place for it *because* it is a
+field with a fixed name: anything else called `message` collides with it.
+Renaming the explicit field to `detail` or `text` instead would have kept the
+format string and broken the promise the other way round — the document
+would say `message` and mean the event name, and the client-facing text would
+be under a name nothing else in the tree uses. Making the event name an
+ordinary field, named for what it is, keeps the contract ADR-136 wrote and
+gives the pipeline the key it was already told to match on. The name stays
+constant across the three levels for the reason ADR-136 gave: severity is the
+level's job alone.
+
+**Alternatives.** *Set `flatten_event` or another layer option.* Flattening
+moves the fields up a level; it does not make two keys one. *Deduplicate in
+the subscriber.* That is a fix to the wrong layer — the line is wrong before
+any subscriber sees it, and every subscriber would need the same fix again.
+*Leave it and document the double key.* A contract that says "one of these
+two, depending on your parser" is not a contract.
+
+**Cost.** Nothing on the wire moves: the status, the `error` code, the
+`retry` class and the response body are what they were. What changes is the
+log line, in both formats. A JSON pipeline that matched on
+`fields.message == "request failed"` was matching on a parser accident and
+now matches on `fields.event`; one that read `fields.message` for the text
+now gets it every time. The pretty format shows `event="request failed"`
+where the bare text was. `tests/docs.rs` pins the level table and the silent
+list, not the field names, so this ADR adds the pin the field names lacked:
+`a_failed_request_line_carries_event_code_and_message_once_each` and the
+key walk it rests on.
+
+**Held by** `crates/kimmy-api/src/error.rs`'s
+`a_failed_request_line_carries_event_code_and_message_once_each` (a 500, a
+503 and a 501 through `fmt().json()`, the parsed object checked for the three
+fields and the raw line walked for a key written twice), and
+`a_json_key_walk_sees_the_repeat_a_parser_would_swallow` (the walker shown a
+line with the defect, so the assertion above has a witness that can see it).

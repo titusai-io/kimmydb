@@ -564,19 +564,28 @@ impl IntoResponse for ApiError {
         // release one. Narrowing the type deleted the state rather than the
         // guard (ADR-137).
         //
-        // The event message is the *same* on all three, deliberately. Varying
+        // The event name is the *same* on all three, deliberately. Varying
         // it would put a second discriminator beside the level — one nothing
         // publishes and no test pins — and an operator grepping for one
         // wording would silently miss the lines written under the other. That
         // is the shape of trap this whole change removes, so severity is the
         // level's job alone, and `code` is what says which failure it was.
+        //
+        // The name rides in an `event` field and there is no format string.
+        // A `tracing` macro's format string *is* a field, named `message`, so
+        // `error!(code, message, "{EVENT}")` wrote two fields of that name —
+        // and the JSON layer `kimmyd` runs serialises fields in order without
+        // deduplicating, so every line carried `"message"` twice and a parser
+        // kept whichever one it kept. `operations.md` promises the
+        // client-facing text is in `message`; that is only true when nothing
+        // else is (ADR-144).
         const EVENT: &str = "request failed";
         if let Some(level) = self.log_level() {
             let (code, message) = (self.code.as_str(), self.message.as_str());
             match level {
-                LogLevel::Error => error!(code, message, "{EVENT}"),
-                LogLevel::Warn => warn!(code, message, "{EVENT}"),
-                LogLevel::Info => info!(code, message, "{EVENT}"),
+                LogLevel::Error => error!(event = EVENT, code, message),
+                LogLevel::Warn => warn!(event = EVENT, code, message),
+                LogLevel::Info => info!(event = EVENT, code, message),
             }
         }
         // `retry` rides in the envelope rather than living only in the
@@ -909,13 +918,183 @@ mod tests {
         assert!(reserved.contains("INFO"), "a documented refusal is not a fault: {reserved}");
         assert!(!reserved.contains("ERROR"), "{reserved}");
 
-        // And all three carry the same event message, so one query finds every
+        // And all three carry the same event name, so one query finds every
         // logged failure and the level is the only thing that separates them.
         // A wording that varied by level would be a second discriminator
         // nothing publishes: an operator grepping for one of them would miss
         // the lines written under the other, silently.
         for line in [&fault, &waited, &reserved] {
-            assert!(line.contains("request failed"), "the event message must not vary: {line}");
+            assert!(
+                line.contains(r#"event="request failed""#),
+                "the event name must not vary: {line}"
+            );
+        }
+    }
+
+    /// The same line, through the layer `kimmyd` actually runs.
+    ///
+    /// `logged` above uses the plain formatter, which renders every field it
+    /// is handed and so cannot show two of one name as anything but two
+    /// fields. The JSON layer serialises them in order without deduplicating,
+    /// which is where a second `message` became a line a parser silently
+    /// halves (ADR-144). This is `logging.rs`'s `LogFormat::Json` layer as
+    /// closely as a unit test can build it: `fmt().json()` with the target on,
+    /// so the field set and the nesting are the ones an operator's pipeline
+    /// sees.
+    fn logged_as_json(error: ApiError) -> String {
+        let sink = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .json()
+            .with_target(true)
+            .with_writer(sink.clone())
+            .with_max_level(Level::TRACE)
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let _ = error.into_response();
+        });
+        let out = sink.0.lock().clone();
+        String::from_utf8(out).expect("utf-8")
+    }
+
+    /// Every object key in `raw`, at every depth, in the order written — with
+    /// repeats kept, which is the one thing a parser will not do for us.
+    ///
+    /// A hand-rolled walk rather than `serde_json`, because the defect being
+    /// checked for is exactly the one a JSON parser hides: a duplicate key is
+    /// legal to emit and every parser keeps one of the two without saying so.
+    /// Only enough of the grammar to find keys — strings with escapes, and
+    /// the `{`/`}` nesting that says which object a key belongs to.
+    fn keys_as_written(raw: &str) -> Vec<(usize, String)> {
+        let mut keys = Vec::new();
+        let mut depth = 0usize;
+        let mut chars = raw.char_indices().peekable();
+        while let Some((_, c)) = chars.next() {
+            match c {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                '"' => {
+                    let mut text = String::new();
+                    let mut escaped = false;
+                    for (_, c) in chars.by_ref() {
+                        match (escaped, c) {
+                            (true, _) => {
+                                escaped = false;
+                                text.push(c);
+                            }
+                            (false, '\\') => escaped = true,
+                            (false, '"') => break,
+                            (false, _) => text.push(c),
+                        }
+                    }
+                    // A string followed by `:` is a key; anything else is a
+                    // value and not ours.
+                    while matches!(chars.peek(), Some((_, ' '))) {
+                        chars.next();
+                    }
+                    if matches!(chars.peek(), Some((_, ':'))) {
+                        keys.push((depth, text));
+                    }
+                }
+                _ => {}
+            }
+        }
+        keys
+    }
+
+    #[test]
+    fn a_json_key_walk_sees_the_repeat_a_parser_would_swallow() {
+        // The walker is the assertion below's only witness, so it is checked
+        // against a line whose duplicate is known — the shape the defect had.
+        let twice = r#"{"level":"ERROR","fields":{"message":"request failed","code":"internal","message":"the \"disk\": gone"},"target":"t"}"#;
+        assert_eq!(
+            keys_as_written(twice),
+            vec![
+                (1, "level".to_string()),
+                (1, "fields".to_string()),
+                (2, "message".to_string()),
+                (2, "code".to_string()),
+                (2, "message".to_string()),
+                (1, "target".to_string()),
+            ],
+            "escaped quotes and a colon inside a value do not make keys, and a repeat is kept"
+        );
+        // And the parser does what the walker exists to get around.
+        let parsed: serde_json::Value = serde_json::from_str(twice).unwrap();
+        assert_eq!(parsed["fields"].as_object().unwrap().len(), 2, "one of the two is gone");
+    }
+
+    #[test]
+    fn a_failed_request_line_carries_event_code_and_message_once_each() {
+        // The contract `operations.md` publishes: the event name in `event`,
+        // the code in `code`, the client-facing text in `message` — three
+        // fields, each written once. The macro used to take the event name as
+        // its format string, which is a field called `message`, beside the
+        // explicit `message` field; the JSON layer wrote both, and whichever
+        // one a parser kept, the line lied about the other (ADR-144).
+        //
+        // All three levels, because they are three macro invocations and a
+        // fix to one is not a fix to the others.
+        let cases: [(ApiError, &str, &str); 3] = [
+            (ApiError::internal("the disk"), "ERROR", "internal"),
+            (ApiError::timeout(std::time::Duration::from_secs(30)), "WARN", "timeout"),
+            (
+                CoreError::Unsupported("coordinated unique enforcement".into()).into(),
+                "INFO",
+                "not_implemented",
+            ),
+        ];
+        for (error, level, code) in cases {
+            // The text the response body carries; the line must carry the
+            // same one, whatever the constructor chose to say.
+            let message = error.message.clone();
+            let raw = logged_as_json(error);
+            let lines: Vec<&str> = raw.lines().collect();
+            assert_eq!(lines.len(), 1, "one failure, one line: {raw:?}");
+            let line = lines[0];
+
+            // (a) What the parsed object says.
+            let parsed: serde_json::Value =
+                serde_json::from_str(line).unwrap_or_else(|e| panic!("{e}: {line}"));
+            assert_eq!(parsed["level"], level, "{line}");
+            let fields = parsed["fields"].as_object().unwrap_or_else(|| panic!("{line}"));
+            assert_eq!(fields["event"], "request failed", "{line}");
+            assert_eq!(fields["code"], code, "{line}");
+            assert_eq!(
+                fields["message"], message,
+                "the client-facing text, not the event name: {line}"
+            );
+            assert_eq!(
+                fields.keys().collect::<Vec<_>>(),
+                ["event", "code", "message"],
+                "exactly the three fields the document names, in the order they are logged: {line}"
+            );
+
+            // (b) What the bytes say — the parsed object cannot show a key
+            // that was written twice, so the raw line is walked as well and
+            // its key count held to the parser's.
+            let written = keys_as_written(line);
+            let parsed_count = count_keys(&parsed);
+            assert_eq!(
+                written.len(),
+                parsed_count,
+                "a key was written more than once and the parser kept one of them: {line}"
+            );
+            let in_fields: Vec<&str> =
+                written.iter().filter(|(d, _)| *d == 2).map(|(_, k)| k.as_str()).collect();
+            assert_eq!(in_fields, ["event", "code", "message"], "{line}");
+        }
+    }
+
+    /// Object keys at every depth of a parsed value — what [`keys_as_written`]
+    /// counts, minus the repeats a parser has already dropped.
+    fn count_keys(value: &serde_json::Value) -> usize {
+        match value {
+            serde_json::Value::Object(map) => {
+                map.len() + map.values().map(count_keys).sum::<usize>()
+            }
+            serde_json::Value::Array(items) => items.iter().map(count_keys).sum(),
+            _ => 0,
         }
     }
 

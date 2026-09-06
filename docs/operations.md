@@ -430,12 +430,16 @@ kept. They are `bad_request`, `payload_too_large`, `unsupported_media_type`,
 authorization decisions among them in [the audit log](#the-audit-log), and see
 [HTTP API](http-api.md#errors) for what each one means to the client.
 
-**Every line here says `request failed`, at all three levels**, with the code in
-a `code` field and the client-facing text in a `message` field. The wording does
-not soften at `INFO`: a message that varied by level would be a second thing to
-filter on beside the level itself, and a query written for one wording would
-miss the lines written under the other. Filter on the level, and read `code` for
-which failure it was.
+**Every line here carries `event: request failed`, at all three levels**, with
+the code in a `code` field and the client-facing text — the same text the
+response body carries — in a `message` field. Three fields, each written once:
+in the JSON format they sit under `fields` beside the `timestamp`, `level` and
+`target` the subscriber adds, and in the pretty format they render as
+`event="request failed" code=… message=…` ([ADR-144](decisions.md)). The event
+name does not soften at `INFO`: one that varied by level would be a second
+thing to filter on beside the level itself, and a query written for one
+wording would miss the lines written under the other. Filter on the level,
+match on `event`, and read `code` for which failure it was.
 
 That list and the levels above are not maintained by hand beside the server: the
 levels live on the error-code enum, and
