@@ -33,4 +33,7 @@ pub use peers::{
     DEFAULT_DISCOVERY_INTERVAL, DEFAULT_SYNC_INTERVAL, ReplicationConfig, RoundHook, RoundReport,
     replicate,
 };
-pub use transport::{PushHook, PushOutcome, push_entry, serve, serve_with, sync_once};
+pub use transport::{
+    FROZEN_CONTACTS, PeerPosition, PeerStalls, PushHook, PushOutcome, push_entry, serve,
+    serve_with, sync_once, sync_once_with,
+};

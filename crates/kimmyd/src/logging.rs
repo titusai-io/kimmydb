@@ -414,8 +414,36 @@ impl TelemetryGuard {
             u64_observable_counter,
             "kimmy.sync.divergence_checks.skipped",
             "{contact}",
-            "Peer contacts whose round skipped the check because the pull was truncated by the batch cap.",
+            "Rounds that did not run the check: the pull was truncated by the batch cap, or the round failed.",
             sync_divergence_skips
+        );
+        // The count half's own pair, and the age of the gauge's reading
+        // (ADR-145). Same argument as the pair above, one level further
+        // down: `ran` rising says the check ran, and says nothing about
+        // whether the half that compares a document count ever did against
+        // a peer permanently behind; and a member whose rounds all fail
+        // moves neither counter while the gauge holds its last value, which
+        // the age is the one series to say.
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_count_probes.compared",
+            "{contact}",
+            "Checked peer contacts in which the count half of the divergence check compared the probed collection's document count against the peer's.",
+            sync_divergence_count_compared
+        );
+        observe!(
+            u64_observable_counter,
+            "kimmy.sync.divergence_count_probes.deferred",
+            "{contact}",
+            "Checked peer contacts in which the count half was deferred because the peer was behind this node and still catching up.",
+            sync_divergence_count_deferred
+        );
+        observe!(
+            u64_observable_gauge,
+            "kimmy.sync.divergence_check_age",
+            "s",
+            "Seconds since the last peer contact in which the cross-member divergence check ran, as of the last sync tick; 0 before the first.",
+            sync_divergence_check_age_secs
         );
 
         // The embedding worker. Every one of these reads 0 on a node where the

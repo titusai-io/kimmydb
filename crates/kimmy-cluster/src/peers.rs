@@ -12,7 +12,7 @@ use tracing::{Instrument, debug, info, warn};
 use crate::discovery::SeedSource;
 use crate::health::{DEFAULT_FANOUT, PeerHealth};
 use crate::membership::Members;
-use crate::transport::{DivergenceProbe, sync_once};
+use crate::transport::{DivergenceProbe, PeerStalls, sync_once_with};
 
 /// How often to run a round against every known peer.
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(5);
@@ -89,15 +89,41 @@ pub struct RoundReport {
     /// `DivergenceTracker`, not beside it, so this can never report a check
     /// the tracker was not told about.
     pub divergence_checks: usize,
-    /// Contacts in this tick whose round completed and did **not** run the
-    /// check, because the pull was truncated by the batch cap (ADR-133's
-    /// skip, ADR-135's counter). A counter, on the same terms.
+    /// Contacts in this tick whose round did **not** run the check: the
+    /// round completed but the pull was truncated by the batch cap
+    /// (ADR-133's skip, ADR-135's counter), or the round failed (ADR-145).
+    /// A counter, on the same terms.
     ///
-    /// Rounds that *failed* are in `failed` and in neither of these two, so
-    /// `divergence_checks + divergence_skips + failed` is the number of
-    /// peers this tick contacted — every successful round identifies its
-    /// peer, which is the gate both arms sit inside.
+    /// A failed round is in `failed` *and* here, since ADR-145: whatever
+    /// failed and however far it got, the gauge was not re-examined on
+    /// that round, which is the one thing this counter says. So
+    /// `divergence_checks + divergence_skips` is every round this tick
+    /// attempted, and `failed` is the part of the skips that failed. Before
+    /// ADR-145 a failed round was in neither, and a member whose every
+    /// round failed read as *both flat* — the same shape as a member with
+    /// no peers — while its gauge went on serving a number half an hour
+    /// old.
     pub divergence_skips: usize,
+    /// Checked contacts in this tick in which the count half of the check
+    /// compared the probed collection's count against the peer's
+    /// (ADR-145). A counter. `divergence_checks` says the check ran;
+    /// this says the half that catches a lost run of documents did.
+    pub divergence_count_compared: usize,
+    /// Checked contacts in this tick in which the count half was deferred:
+    /// the rotation named a collection and the probe was dropped because
+    /// the peer is behind this node and still advancing (ADR-133 defect 2,
+    /// as amended by ADR-145). A counter. Rising on a busy cluster is
+    /// ordinary; `divergence_count_compared` flat while this and
+    /// `divergence_checks` rise is a count half that has not looked at
+    /// anything.
+    pub divergence_count_deferred: usize,
+    /// Seconds since the last contact, with any peer, whose round ran the
+    /// check — as of the end of this tick; `None` before the first such
+    /// contact (ADR-145). A level, for a gauge. The one number that keeps
+    /// moving on a member whose rounds all fail: the two counters above
+    /// stop, `divergent_collections` holds its last value, and this says
+    /// how old that value is.
+    pub divergence_check_age_secs: Option<u64>,
 }
 
 /// What the loop reports after every sync tick. See [`RoundReport`].
@@ -192,6 +218,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
     // `health` and `stale_peers` below, it is a fact about this process's
     // ticks, not about the data.
     let mut divergence = kimmy_storage::DivergenceTracker::new();
+    // Where each peer last stood behind this node, and for how long
+    // (ADR-145): what lets the count half tell a peer that is catching up
+    // from one that has stopped. Owned here for the same reason as the
+    // tracker, and read and written inside the round, which is where the
+    // peer's vector exists.
+    let mut stalls = PeerStalls::new();
+    // When the check last ran against anyone, so the report can say how old
+    // the tracker's reading is (ADR-145). A tick in which every round fails
+    // moves nothing else about the check.
+    let mut last_check = LastCheck::default();
 
     // Peers currently flagged as stale rejoiners, so the warning fires on the
     // transition and not on every round they stay that way.
@@ -291,7 +327,7 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                     // Sequential rather than concurrent: a round is cheap when
                     // converged, and syncing with every peer at once would make
                     // a large cluster stampede one node that fell behind.
-                    match sync_once(&engine, peer, &config.secret, probe)
+                    match sync_once_with(&engine, peer, &config.secret, probe, &mut stalls)
                         .instrument(span.clone())
                         .await
                     {
@@ -332,14 +368,27 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                                 // gauge's 0 is supposed to mean; `None` is
                                 // ADR-133's cap-truncation skip, which the
                                 // gauge alone cannot distinguish from it. A
-                                // round that *failed* reaches neither arm and
-                                // is counted in `failed`.
+                                // round that *failed* reaches neither arm; it
+                                // is counted in `failed` and as a skip in the
+                                // `Err` arm below (ADR-145).
+                                //
+                                // The count half's own pair and the check's
+                                // clock sit in this same arm for the same
+                                // reason (ADR-145): a comparison the tracker
+                                // was not handed cannot be counted, and the
+                                // age cannot reset on a contact whose finding
+                                // was not folded in.
                                 if let Some(existence) = outcome.divergent.take() {
                                     report.divergence_checks += 1;
-                                    let findings = kimmy_storage::DivergenceFindings {
-                                        existence,
-                                        count: outcome.count_probe.take(),
-                                    };
+                                    last_check.ran(Instant::now());
+                                    let count = outcome.count_probe.take();
+                                    if count.is_some() {
+                                        report.divergence_count_compared += 1;
+                                    } else if outcome.count_probe_deferred {
+                                        report.divergence_count_deferred += 1;
+                                    }
+                                    let findings =
+                                        kimmy_storage::DivergenceFindings { existence, count };
                                     divergence.observe(node, findings);
                                 } else {
                                     report.divergence_skips += 1;
@@ -388,6 +437,16 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                             let due = health.failed(peer, now);
                             let failures = health.failures(peer);
                             report.failed += 1;
+                            // A failed round did not run the check, whatever
+                            // failed and however far it got — so it is a
+                            // skip too (ADR-145). Not a check: running the
+                            // check on the strength of a round that did not
+                            // complete would reopen ADR-133's hole. Before
+                            // this a member whose every round failed read
+                            // as "both counters flat", indistinguishable
+                            // from a member with no peers, while its gauge
+                            // served a value nothing had re-examined.
+                            report.divergence_skips += 1;
                             if due {
                                 warn!(%peer, error = %e, failures, "sync round failed; backing off");
                             } else {
@@ -405,6 +464,11 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 // on whether a caller wired up `on_round`, only `observe`
                 // above does, and that already ran per peer contacted.
                 report.divergent_collections = divergence.confirmed_count();
+                // And how old that reading is (ADR-145): the tracker keeps
+                // its last value through any number of ticks in which no
+                // check ran, and this is what says so.
+                report.divergence_check_age_secs =
+                    last_check.age(Instant::now()).map(|age| age.as_secs());
                 // Reported whether or not anything was reached: the tick in
                 // which every round failed is the one an operator most needs
                 // to hear about, and it is the one `on_lag` says nothing for.
@@ -414,6 +478,39 @@ pub async fn replicate(engine: Arc<Engine>, config: ReplicationConfig) {
                 }
             }
         }
+    }
+}
+
+/// When the cross-member divergence check last ran against any peer
+/// (ADR-145).
+///
+/// `DivergenceTracker::confirmed_count` is a level the loop re-reads every
+/// tick, and it keeps its last value through any number of ticks in which
+/// no check ran — a member whose every round fails re-reads the same number
+/// for as long as the wedge lasts, and nothing on the report said how old it
+/// was. This is the clock the report reads that from. It advances only in
+/// the arm that folds a finding into the tracker, so the age can never
+/// reset on a contact the tracker was not told about, and it advances for
+/// a contact with *any* peer: the gauge is a union over peers, so its
+/// reading is as fresh as the last check against anyone.
+///
+/// `None` before the first check, rather than a value: a node that has
+/// never checked has no reading to be old. The caller renders that as `0`
+/// beside a `ran` counter that also reads `0`, which is what ADR-135's
+/// objection to an age gauge — that the never-checked case has no honest
+/// number — comes down to once the counter is there to carry it.
+#[derive(Debug, Default)]
+struct LastCheck(Option<Instant>);
+
+impl LastCheck {
+    /// A check ran, at `now`.
+    fn ran(&mut self, now: Instant) {
+        self.0 = Some(now);
+    }
+
+    /// How long ago the last check ran, as of `now`; `None` if none has.
+    fn age(&self, now: Instant) -> Option<Duration> {
+        self.0.map(|at| now.saturating_duration_since(at))
     }
 }
 
@@ -578,5 +675,32 @@ mod tests {
             1,
             "a read failure must not be read as \"this node holds nothing\""
         );
+    }
+
+    /// The age the report carries (ADR-145): absent before any check has
+    /// run, rising through ticks in which every round failed — nothing
+    /// touches the clock on a failed round — and back to zero the moment a
+    /// check runs.
+    #[test]
+    fn the_check_age_is_absent_then_rises_through_failed_rounds_and_resets_on_a_check() {
+        let mut last = LastCheck::default();
+        let t0 = Instant::now();
+        assert_eq!(last.age(t0), None, "nothing has run, so nothing is old");
+
+        last.ran(t0);
+        assert_eq!(last.age(t0), Some(Duration::ZERO));
+
+        // Three ticks of failed rounds: the `Err` arm never calls `ran`, so
+        // the age is simply the clock.
+        let t1 = t0 + Duration::from_secs(5);
+        let t2 = t0 + Duration::from_secs(10);
+        let t3 = t0 + Duration::from_secs(15);
+        assert_eq!(last.age(t1), Some(Duration::from_secs(5)));
+        assert_eq!(last.age(t2), Some(Duration::from_secs(10)));
+        assert_eq!(last.age(t3), Some(Duration::from_secs(15)), "rises with the wedge");
+
+        last.ran(t3);
+        assert_eq!(last.age(t3), Some(Duration::ZERO), "a check resets it");
+        assert_eq!(last.age(t3 + Duration::from_secs(2)), Some(Duration::from_secs(2)));
     }
 }

@@ -8545,6 +8545,18 @@ which is unchanged.
 
 ## ADR-133 — A periodic cross-member check makes a divergence no counter can express visible, without repairing it
 
+> **Amended by [ADR-145](#adr-145--the-count-half-compares-against-a-peer-that-is-behind-but-standing-still-and-the-divergence-gauge-says-how-old-its-reading-is).**
+> Defect 2's gate below — the count probe is dropped whenever the peer has
+> not yet witnessed something this node has — now drops it only while the
+> peer is also *advancing*. A peer whose position behind this node has come
+> back unchanged on three consecutive checked contacts is compared. The
+> argument below is about ordinary lag, which moves on every round; a
+> member whose inbound replication has stopped does not, and under the
+> unamended gate its count was never compared for as long as it stayed
+> stopped. The dropped probe is now counted, so a count half that never
+> runs is visible. Everything else here stands, the cap-truncation skip
+> included.
+
 **Decision.** Every anti-entropy round whose pull reaches the peer's true
 tail — whether because there was nothing left to pull, or because this
 round's own batch was not truncated by the cap — also asks that peer what it
@@ -9111,6 +9123,21 @@ fields to give.
 ---
 
 ## ADR-135 — The divergence gauge reports whether it looked, and ADR-133's cap-truncation skip stays because a backlog fakes exactly what removing it would report
+
+> **Amended by [ADR-145](#adr-145--the-count-half-compares-against-a-peer-that-is-behind-but-standing-still-and-the-divergence-gauge-says-how-old-its-reading-is).**
+> Three points below are revised. A round that *failed* is now counted as
+> `skipped` as well as in `kimmy_sync_failures_total`, so `ran + skipped` is
+> every round attempted and "both flat" no longer describes a member whose
+> every round fails. The "seconds since the last check" gauge rejected under
+> alternatives is added, as `kimmy_sync_divergence_check_age_seconds`, on
+> terms that answer the objection: the never-checked case reads `0` beside
+> a `ran` counter that also reads `0`, and it is the counter, not the gauge,
+> that carries that case. And the count half's own suppression, rejected as
+> a third `outcome` on this ADR's series, is counted as a series of its own,
+> `kimmy_sync_divergence_count_probes_total{outcome="compared"|"deferred"}`,
+> for the case the rejection did not weigh — a peer permanently behind, on
+> which the count half never ran and nothing said so. The no-peer-label
+> rule, the cap-truncation skip and the fold-then-count rule all stand.
 
 **Decision.** Two things, one added and one deliberately left alone.
 
@@ -10261,3 +10288,242 @@ key walk it rests on.
 fields and the raw line walked for a key written twice), and
 `a_json_key_walk_sees_the_repeat_a_parser_would_swallow` (the walker shown a
 line with the defect, so the assertion above has a witness that can see it).
+
+---
+
+## ADR-145 — The count half compares against a peer that is behind but standing still, and the divergence gauge says how old its reading is
+
+**Decision.** Two amendments to the cross-member divergence check
+(ADR-133, ADR-135), one for each half of what a live cluster showed.
+
+*First*, the guard on the count half — the document-count probe is dropped
+whenever the peer has not yet witnessed something this node has (ADR-133,
+defect 2) — drops it only while the peer is behind **and advancing**. The
+round remembers, per peer, the peer's position on every origin it trails
+this node on as of the last checked contact, and how many consecutive
+checked contacts that position has come back unchanged on (`PeerStalls`,
+in `kimmy-cluster`'s transport beside the gate that reads it). A peer whose
+position moved is catching up and its count is stale: deferred, as before.
+A peer whose position has come back unchanged on `FROZEN_CONTACTS`
+consecutive checked contacts — three, a named constant with its reasoning
+on it, not a setting — is standing still: its count is what it holds and
+will keep holding, and it is compared. A peer that is not behind is compared
+at once, as before. Every checked contact is counted under a new series,
+`kimmy_sync_divergence_count_probes_total{outcome="compared"|"deferred"}`,
+so a count half that has never compared against anyone is visible rather
+than inferred; `compared + deferred ≤ ran` rather than `=`, because a
+checked contact increments neither when the rotation named no collection,
+when this node's own count of the named one failed, or when the peer's
+answer carried no count because it does not hold the collection, which the
+existence half reports.
+
+*Second*, a round that fails is counted as `skipped` on
+`kimmy_sync_divergence_checks_total` as well as in
+`kimmy_sync_failures_total`, and `/metrics` gains
+`kimmy_sync_divergence_check_age_seconds`: seconds since the last contact,
+with any peer, whose round ran the check, as of the last sync tick, `0`
+before the first. The check does **not** run on a failed round. Both new
+series reach the OTLP bridge in the same change, as
+`kimmy.sync.divergence_count_probes.compared`, `.deferred` and
+`kimmy.sync.divergence_check_age`.
+
+**Why.** Observed on a three-member cluster running 0.23.2. One member's
+inbound replication wedged: every sync round it ran failed and was retried,
+for half an hour. Four collections diverged in document count on it, under
+the same fifty collection names every member held.
+`kimmy_sync_divergent_collections` read 0 on all three members throughout.
+The two healthy members each ran the check some 250 times and reported
+clean every time; on the wedged member `{outcome="ran"}` stopped moving and
+the gauge went on serving the value its last completed round had left.
+Two defects, independent of each other.
+
+*The count half was blind to the wedged member, by the rule that protects
+it from ordinary lag.* Defect 2's argument is right and stands: a peer that
+has not yet pulled this node's recent writes answers a probe with a stale,
+lower count, the two-contact confirmation does not filter that out because
+a lagging peer reproduces the same mismatch on every contact, and an alert
+that cries wolf on lag is the one an operator disables. But the argument is
+about a peer that is *catching up*, and the gate it produced reads every
+peer that is behind as one. A member whose inbound replication has stopped
+is behind for good, so under that gate its count is never compared for as
+long as it stays stopped, while the existence half — which the gate does
+not touch — keeps `ran` climbing on every contact. That is the reading the
+healthy members produced: 250 checks, clean, and not one of them had looked
+at a document count on the member that mattered. Nothing counted a
+gate-dropped probe, so "compared and equal" and "never compared" were the
+same 0.
+
+What tells the two cases apart is not how far behind the peer is but
+whether it is *moving*. A backlog draining advances the peer's position on
+some origin it trails this node on, on every round it completes; a member
+that has stopped leaves every such position exactly where it was. So the
+memo keeps, per peer, the peer's position on each origin it trails this
+node on — the peer's own origin is never among them, since nothing holds
+more of a node's writes than the node, so a wedged member still taking
+local writes reads as still, which it is on every origin that matters; and
+this node's own progress, on its own origin or on one it pulled from a
+third member, adds an origin to the map without breaking the run, because
+that is this node advancing, not the peer. Only the peer getting closer on
+an origin it trails resets the count. Three unchanged sightings, because a
+peer with a backlog moves on every round it completes, so even one
+unchanged sighting is unusual, and three in a row is a peer that has
+stopped: fifteen seconds of standing still at the default interval, on a
+cluster whose healthy members converge in five. A larger value only delays
+the count half against a peer that is already wedged; a smaller one would
+trust a peer that merely missed one round's pull from this node, which the
+fanout rotation on a cluster larger than a few members makes routine.
+"Consecutive" is consecutive *checked* contacts: a contact ADR-133's
+cap-truncation skip applies to says nothing about whether the peer moved,
+and the memo is not consulted on it.
+
+The memo lives in the transport, beside the gate, and not in either of the
+two places it might seem to belong. `PeerHealth` is failure bookkeeping
+keyed by address, and it *forgets* a peer on every successful round — the
+exact rounds this memo is built from, since a frozen peer answers every one
+of this node's pulls perfectly. `DivergenceTracker` is `kimmy-storage`'s,
+transport-free by design, and keyed by what a check *found*; this is keyed
+by what the wire said before the check ran, which is transport's own
+business and the one place the peer's vector exists. The loop owns it, as
+it owns the tracker and the health record, because it is a fact about this
+process's contacts and not about the data; the round reads and writes it,
+because the round is where the vector is. `sync_once` keeps its signature
+and its meaning — a round with no memory of the peer, gated exactly as
+ADR-133 first had it — and the loop calls `sync_once_with`, which carries
+the memo.
+
+The deferral is counted as its own series rather than as a third outcome on
+`kimmy_sync_divergence_checks_total`, and ADR-135 rejected both shapes;
+this ADR reopens the second on a case that rejection did not weigh. A third
+outcome would double-count: a contact that ran the check *and* deferred the
+probe is one contact, already in `ran`, and ADR-135's closed set is a
+partition of completed rounds, which this is not. Counting the suppression
+at all was rejected because "on any busy healthy cluster that happens on
+most contacts, so the series would rise in proportion to write traffic and
+mean nothing an operator could act on." That is true of `deferred` alone,
+and it is why the series carries both outcomes: `deferred` rising is
+ordinary and says so, and `compared` flat beside a rising `ran` is the
+reading the wedged cluster needed — a count half that has never looked at
+anything — which no combination of the existing series can produce. The
+count half's coverage bound ADR-135 pointed to instead, order twice the
+collection count in checked contacts, was a bound on latency; a peer
+permanently behind is not late, it is never.
+
+*The gauge went stale with nothing to say so.* `divergent_collections` is
+`DivergenceTracker::confirmed_count()`, re-read every tick, and the tracker
+is told about a contact only on a round that succeeded: an `Err` round
+touches neither the tracker nor the two counters, and `PeerHealth::failed`
+backs the peer off, up to 300 s between attempts. So on a member whose every
+round fails, `ran` stops, the gauge holds its last value, and the guide's
+"both counters flat → look at failures and backing off" is the right advice
+for anyone who reads the counters — but the gauge itself goes on serving a
+number, and a dashboard that shows the number shows nothing beside it to
+say that the number is half an hour old.
+
+The obvious fix is wrong, and this ADR records why rather than leaving the
+temptation for the next reader: running the check on a failed round, or on
+the peer's answer to `AskVersions` before the round failed, is checking on
+the strength of a round that did not complete, which is the hole ADR-133's
+cap-truncation skip closes one level up. A failed round has not earned the
+belief the check depends on. It is counted instead, as `skipped`, because
+whatever failed and however far it got, the gauge was not re-examined on
+that round, and that is the one thing the counter says. Every failed round
+is counted, not only an apply failure: splitting failures by how far they
+got before failing would be a distinction the gauge does not care about,
+and the dial timeouts already make it elsewhere. ADR-135's accounting —
+"`ran + skipped + failures` is every contact" — becomes "`ran + skipped` is
+every round attempted, and `failed` is the part of the skips that failed",
+and the operations guide's PromQL drops the addition. The cost is one
+reading that used to be unambiguous: "`ran` flat, `skipped` rising" was a
+backlog and is now a backlog or a wedge, which `kimmy_sync_failures_total`
+tells apart, and the guide says so.
+
+*Count a failed round under a third outcome, `failed`, instead.* That would
+have kept `skipped`'s published meaning — a completed round whose pull was
+truncated — and given the counter an exact partition,
+`ran + skipped + failed = attempted`, though not the PromQL migration it
+looks to spare: the guide's `sum without (outcome)` takes a third outcome in
+with the other two, so the published addition of `kimmy_sync_failures_total`
+double-counts a failed round under either route, and what the alternative
+spares is only a rule that selects `outcome="skipped"` by name. Not taken,
+because the counter's question is whether the gauge was re-examined on
+that round, and on a failed round it was not, for the same reason and to
+the same effect as on a truncated one. A third outcome would split that
+one answer by a cause the counter does not care about and
+`kimmy_sync_failures_total` already names, and every rule that reads
+`skipped` as "the gauge is unknown" would have to learn a second label to
+stay right, where under the chosen route it stays right unchanged.
+
+The age gauge is the "seconds since the last check" series ADR-135 rejected,
+added on terms that answer the objection. The objection was that a node
+that has never checked has no honest number — `0` reads as just checked,
+uptime as a stale success, a large number as a fault on a node with no
+peers. That is true of the gauge alone, and ADR-135's own counter is what
+makes it false of the gauge beside the counter: `0` with `ran` at `0` is
+"never", and `ran` carries that case so the gauge does not have to. What
+the counter cannot do, and the gauge does, is keep moving on a member whose
+loop has stopped completing rounds: `ran` is flat, `skipped` moves once per
+backoff interval, and over an alerting window that pair is
+indistinguishable from a member with no peers. A level that rises with the
+clock is not. The age is a fact about the loop's contacts, so the loop
+owns it — a clock advanced in the same arm that folds a finding into the
+tracker, so it can never reset on a contact the tracker was not told
+about, and reported once per tick through `RoundReport`, the way every
+other divergence fact crosses into `/metrics` (ADR-135). It is therefore up
+to one interval stale at a scrape, which is why the guide's rule is "above
+*k* × the sync interval" and not "above the interval".
+
+**Consequences.** On a cluster with a wedged member, the healthy members'
+gauge now names the count-only divergence after the count half has
+compared twice against it — three deferred contacts to establish the
+stall, then two compared probes of the affected collection, so on the
+order of five checked contacts plus however many the rotation spends on
+other collections — where before it never did. The wedged member's own
+gauge still holds its last value, and now says how old that value is;
+`skipped` rises there once per backoff interval, so the counter pair reads
+the "unknown" shape the guide documents rather than the "no peers" one.
+The operator rule is one line: age above *k* × `cluster.sync_interval_secs`
+means the gauge is unknown; look at `kimmy_sync_failures_total` and
+`kimmy_sync_peers_backing_off`.
+
+Residuals, stated. A member wedged on one origin's entries while still
+pulling another member's reads as moving until that other origin has
+drained; the count half reaches it once it has. A peer that stands still
+for a reason other than a wedge — backed off from every peer with nothing
+to pull, say — is compared, and if it holds fewer documents than this node
+that is reported: honestly, since it has not taken this node's writes and
+is not about to, and still subject to the two-probe confirmation. The
+existence half is untouched. The cap-truncation skip is untouched. No name
+of any kind is added to `/metrics`: three series, all bare counts, per
+ADR-133's standing property and ADR-135's no-peer-label rule. What the
+check cannot catch is what it could not catch before, less the case this
+ADR is about.
+
+Cost: one `BTreeMap` of positions per peer in the loop; three `AtomicU64`s
+and three sample lines; one field on `SyncOutcome`
+(`count_probe_deferred`), three on `RoundReport`, and `sync_once_with`
+beside `sync_once`. The HELP text of `kimmy_sync_divergence_checks_total`
+is reworded for the failed-round accounting; its name, labels and position
+are unchanged, and the byte-for-byte render test carries the new text.
+Nothing on the cluster wire changes: the memo is built from `Versions`,
+which every round already exchanges.
+
+Defended by `kimmy-cluster`'s transport tests
+`the_count_probe_is_deferred_for_a_moving_peer_and_compared_for_a_still_one`
+(the truth table, gate and counter outcome together) and
+`a_stall_survives_this_nodes_own_progress_and_breaks_on_the_peers`; by
+`peers.rs`'s
+`the_check_age_is_absent_then_rises_through_failed_rounds_and_resets_on_a_check`;
+by `kimmy-api`'s `the_render_is_byte_for_byte_what_a_scrape_receives`,
+`the_snapshot_reads_the_same_atomics_the_render_does`,
+`the_pushed_gauges_render_what_was_pushed` and
+`an_age_the_loop_has_not_got_renders_as_zero`; by `kimmyd`'s
+`every_metrics_series_reaches_the_bridge`; and by
+`kimmy-cluster/tests/replication.rs`'s
+`a_count_divergence_on_a_frozen_peer_is_found_and_the_frozen_member_reports_its_age`,
+which runs two real loops over sockets — one member's inbound frozen after
+a single good round through a relay that hands exactly one connection
+through and refuses the rest — and asserts both halves: the healthy
+member's count half defers for `FROZEN_CONTACTS` contacts, compares, and
+confirms the count-only divergence with `failed` at 0 throughout; the
+frozen member's `ran` never moves again, every failed round is a skip, and
+its age rises while its gauge holds 0.

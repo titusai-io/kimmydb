@@ -21,11 +21,13 @@
 //! other is what converges them, and that falls out of every node running the
 //! same loop rather than needing a push half.
 
+use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use kimmy_core::{Hlc, NodeId, VersionVector};
 use kimmy_storage::{Engine, SyncOutcome};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream};
@@ -381,7 +383,7 @@ where
 /// node's own count of it — computed once by the caller so a tick contacting
 /// several peers pays for that collection's scan once, not once per peer
 /// (ADR-133).
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DivergenceProbe {
     pub id: kimmy_core::CollectionId,
     pub mine_count: Option<u64>,
@@ -394,14 +396,40 @@ pub struct DivergenceProbe {
 /// to pull, since that is the one state a truncated sync window can fake —
 /// see `kimmy_storage::divergence` for what is compared and why only that
 /// branch is safe to check without flapping during ordinary catch-up.
+///
+/// A round with no memory of the peer: the count half of the check is gated
+/// exactly as ADR-133 first had it — dropped while the peer is behind this
+/// node — because a peer can only be read as *frozen* rather than catching
+/// up across contacts, and this call has seen none. The loop, which has,
+/// calls [`sync_once_with`] and carries a [`PeerStalls`] between rounds.
 pub async fn sync_once(
     engine: &Engine,
     peer: SocketAddr,
     secret: &str,
     probe: Option<DivergenceProbe>,
 ) -> Result<SyncOutcome, ProtocolError> {
+    sync_once_with(engine, peer, secret, probe, &mut PeerStalls::new()).await
+}
+
+/// [`sync_once`], remembering where each peer stood behind this node on the
+/// contacts before this one (ADR-145).
+///
+/// `stalls` is read and updated in the round's own check branch, since that
+/// is where the peer's vector exists: the count half of the divergence
+/// check runs against a peer that is behind this node only once its
+/// position behind this node has come back unchanged on
+/// [`FROZEN_CONTACTS`] consecutive checked contacts — see
+/// `divergence_probe_for` for why a moving position and a still one are
+/// different facts.
+pub async fn sync_once_with(
+    engine: &Engine,
+    peer: SocketAddr,
+    secret: &str,
+    probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
+) -> Result<SyncOutcome, ProtocolError> {
     let (mut stream, their_node) = dial(engine, peer, secret).await?;
-    sync_over(engine, &mut stream, peer, their_node, probe).await
+    sync_over(engine, &mut stream, peer, their_node, probe, stalls).await
 }
 
 /// What a push to one member became (ADR-140, ADR-143).
@@ -601,6 +629,7 @@ async fn sync_over<S>(
     peer: SocketAddr,
     their_node: kimmy_core::NodeId,
     probe: Option<DivergenceProbe>,
+    stalls: &mut PeerStalls,
 ) -> Result<SyncOutcome, ProtocolError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -630,13 +659,14 @@ where
             // branch is common on a converged cluster — though not, on its
             // own, on a busy one; see the `exhausted` branch below for the
             // other place this check runs.
-            let probe = divergence_probe_for(probe, &theirs, &mine);
-            let findings = ask_divergence(engine, &mut stream, probe).await?;
+            let gate = divergence_probe_for(probe, stalls.observe(their_node, &theirs, &mine));
+            let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
             return Ok(SyncOutcome {
                 peer: Some(their_node),
                 behind_ms: behind_beyond_horizon(engine, &theirs, &mine)?,
                 divergent: Some(findings.existence),
                 count_probe: findings.count,
+                count_probe_deferred: gate.deferred,
                 exhausted: true,
                 ..SyncOutcome::default()
             });
@@ -764,10 +794,11 @@ where
         // nearly every round, unlike a single global "nothing to pull" gate,
         // which a continuous trickle of new writes can starve indefinitely.
         if window_exhausted {
-            let probe = divergence_probe_for(probe, &theirs, &mine);
-            let findings = ask_divergence(engine, &mut stream, probe).await?;
+            let gate = divergence_probe_for(probe, stalls.observe(their_node, &theirs, &mine));
+            let findings = ask_divergence(engine, &mut stream, gate.probe).await?;
             outcome.divergent = Some(findings.existence);
             outcome.count_probe = findings.count;
+            outcome.count_probe_deferred = gate.deferred;
         }
         // The other direction is a different question: how far the peer
         // trails this node, in history it can no longer be served. A peer
@@ -830,12 +861,163 @@ fn behind_beyond_horizon(
 /// cannot be trusted for a count this round, so the probe is dropped
 /// (`None`) — the existence half is unaffected, since it never depends on
 /// the peer being caught up on anything of *this* node's.
-fn divergence_probe_for(
+///
+/// **Behind and still is not behind and catching up (ADR-145).** The rule
+/// above reads every peer that is behind as a peer that is catching up, and
+/// a peer whose inbound replication has wedged is behind for good: on a
+/// three-member cluster where one member's every round failed for half an
+/// hour, the two healthy members ran the check some 250 times each and the
+/// count half never once compared against the wedged member, while four
+/// collections sat with different document counts on it and the same fifty
+/// names everywhere — the existence half agreed, the count half never
+/// looked, and the gauge said 0 with `ran` climbing. What tells the two
+/// apart is not how far behind the peer is but whether it is *moving*: a
+/// backlog draining advances the peer's position on some origin it trails
+/// this node on every round, and a wedge leaves every such position exactly
+/// where it was. So the probe is dropped only for a peer that is behind
+/// **and advancing** — [`PeerPosition::Advancing`] — and compared once its
+/// position behind this node has come back unchanged on
+/// [`FROZEN_CONTACTS`] consecutive checked contacts. The defect-2 argument
+/// still holds in full for the advancing case, which is every healthy
+/// lagging peer; the frozen case is the one it was never about.
+///
+/// The dropped probe is reported as `deferred` so a caller can count it.
+/// Without that a count half that never runs against a peer permanently
+/// behind is indistinguishable from one that runs and agrees, which is
+/// what the wedged cluster above read as.
+fn divergence_probe_for(probe: Option<DivergenceProbe>, position: PeerPosition) -> CountGate {
+    match position {
+        PeerPosition::Advancing => CountGate { probe: None, deferred: probe.is_some() },
+        PeerPosition::CaughtUp | PeerPosition::Frozen => CountGate { probe, deferred: false },
+    }
+}
+
+/// What [`divergence_probe_for`] decided: the probe to send, if any, and
+/// whether a probe the rotation named was held back this contact.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CountGate {
     probe: Option<DivergenceProbe>,
-    theirs: &kimmy_core::VersionVector,
-    mine: &kimmy_core::VersionVector,
-) -> Option<DivergenceProbe> {
-    if theirs.behind(mine).is_some() { None } else { probe }
+    deferred: bool,
+}
+
+/// How many consecutive checked contacts a peer's position behind this node
+/// must come back unchanged on before the peer is read as frozen rather
+/// than catching up (ADR-145).
+///
+/// A named constant rather than a setting: this is the number of sightings
+/// a stall needs before it stops being a coincidence, not a knob an
+/// operator tunes per deployment. Three, because a peer with a backlog
+/// moves on every round it completes, so even one unchanged sighting is
+/// unusual, and three in a row is a peer that has stopped — at the default
+/// interval, fifteen seconds of standing still on a cluster whose healthy
+/// members converge in five. A larger value would only delay the count half
+/// against a peer that is already wedged; a smaller one would trust a peer
+/// that merely missed one round's pull from this node, which the fanout
+/// rotation on a cluster larger than a few members makes routine.
+pub const FROZEN_CONTACTS: u32 = 3;
+
+/// Where a peer stands against this node, as of the contact just opened
+/// (ADR-145). The count half of the divergence check trusts a peer's
+/// document count in the first and third states and not the second.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerPosition {
+    /// The peer has witnessed everything this node has — `theirs` is not
+    /// behind `mine` at any origin. ADR-133's own trusted case.
+    CaughtUp,
+    /// The peer is behind this node on some origin and its position there
+    /// moved since the last checked contact, or this node has too few
+    /// sightings of it to say. Ordinary catch-up: its count is stale and
+    /// must not be compared (ADR-133, defect 2).
+    Advancing,
+    /// The peer is behind this node and its position on every origin it
+    /// trails this node on has come back unchanged on [`FROZEN_CONTACTS`]
+    /// consecutive checked contacts. Not catching up: whatever its count
+    /// says is what it holds, and will keep holding.
+    Frozen,
+}
+
+/// Where each peer last stood behind this node, and for how many contacts
+/// it has stood there (ADR-145).
+///
+/// Kept here, beside the gate that reads it, rather than in `PeerHealth` or
+/// `DivergenceTracker`. `PeerHealth` is failure bookkeeping keyed by
+/// address, and it *forgets* a peer on every successful round — the exact
+/// rounds this memo is built from, since a frozen peer answers every one of
+/// this node's pulls perfectly. `DivergenceTracker` is `kimmy-storage`'s,
+/// transport-free by design, and keyed by what a check *found*; this is
+/// keyed by what the wire said before the check ran, which is transport's
+/// own business and the one place the peer's vector exists. Keyed by node
+/// id, as the tracker is, because the handshake has already paired the
+/// address with one by the time the round reads the vector, and it is the
+/// id a restarted member keeps.
+///
+/// Only the origins the peer *trails this node on* are remembered, at the
+/// peer's position for each. The peer's own origin is never among them —
+/// nothing holds more of a node's writes than the node — so a wedged member
+/// that is still taking local writes reads as still, which it is on every
+/// origin that matters here. An origin this node itself moved ahead on
+/// between two contacts joins the map without breaking the run, because
+/// that is this node advancing, not the peer; an origin the peer moved on
+/// breaks it, whether it caught up on that origin entirely or only got
+/// closer.
+#[derive(Debug, Default)]
+pub struct PeerStalls {
+    by_peer: HashMap<NodeId, Stall>,
+}
+
+/// One peer's remembered position and how long it has held it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct Stall {
+    /// The peer's position, as of the last checked contact, on every origin
+    /// it then trailed this node on.
+    trailing: BTreeMap<NodeId, Hlc>,
+    /// Consecutive checked contacts on which every remembered position came
+    /// back unchanged.
+    unchanged: u32,
+}
+
+impl PeerStalls {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold in the vector this checked contact with `peer` opened with, and
+    /// say where the peer stands. `theirs` is the peer's servable vector as
+    /// fetched at the top of the round; `mine` is this node's witnessed
+    /// vector as of just before the check — the same pair the gate always
+    /// judged.
+    ///
+    /// Called once per contact the check runs on, and not on a contact
+    /// ADR-133's cap-truncation skip applies to: "consecutive" is
+    /// consecutive *checked* contacts, and a truncated pull in between says
+    /// nothing about whether the peer moved.
+    pub fn observe(
+        &mut self,
+        peer: NodeId,
+        theirs: &VersionVector,
+        mine: &VersionVector,
+    ) -> PeerPosition {
+        let trailing: BTreeMap<NodeId, Hlc> = mine
+            .iter()
+            .filter(|(origin, mine_at)| theirs.get(*origin) < *mine_at)
+            .map(|(origin, _)| (origin, theirs.get(origin)))
+            .collect();
+        if trailing.is_empty() {
+            self.by_peer.remove(&peer);
+            return PeerPosition::CaughtUp;
+        }
+
+        let stall = self.by_peer.entry(peer).or_default();
+        let still = !stall.trailing.is_empty()
+            && stall.trailing.iter().all(|(origin, at)| theirs.get(*origin) == *at);
+        stall.unchanged = if still { stall.unchanged.saturating_add(1) } else { 0 };
+        stall.trailing = trailing;
+        if stall.unchanged >= FROZEN_CONTACTS {
+            PeerPosition::Frozen
+        } else {
+            PeerPosition::Advancing
+        }
+    }
 }
 
 /// Whether a peer's `Entries` answer combines a claim no correct sender can
@@ -994,5 +1176,125 @@ mod tests {
             !is_unreachable_from_a_correct_sender(50, true),
             "a full batch that happened to reach the tail on its last entry"
         );
+    }
+
+    fn node(n: u128) -> NodeId {
+        NodeId::from_bytes(n.to_be_bytes())
+    }
+
+    fn vector(entries: &[(NodeId, u64)]) -> VersionVector {
+        entries.iter().map(|&(origin, wall)| (origin, Hlc::new(wall, 0))).collect()
+    }
+
+    fn probe() -> Option<DivergenceProbe> {
+        Some(DivergenceProbe { id: kimmy_core::CollectionId(7), mine_count: Some(10) })
+    }
+
+    /// The truth table `divergence_probe_for` decides over `PeerStalls`
+    /// (ADR-133 defect 2, as amended by ADR-145). Three rows: a peer that
+    /// is behind and moving is deferred, every time; a peer that is behind
+    /// and has stood still for `FROZEN_CONTACTS` checked contacts is
+    /// compared; a peer that is not behind is compared at once. The gate's
+    /// `deferred` flag — what the `deferred` outcome is counted from — is
+    /// asserted alongside the probe on every row, so the counter cannot
+    /// say one thing while the wire does another.
+    #[test]
+    fn the_count_probe_is_deferred_for_a_moving_peer_and_compared_for_a_still_one() {
+        let peer = node(1);
+        let me = node(2);
+        let mut stalls = PeerStalls::new();
+
+        // Behind and advancing: the peer's position on this node's origin
+        // moves on every contact, the shape of a backlog draining.
+        let mine = vector(&[(me, 100), (peer, 5)]);
+        for their_wall in [10u64, 20, 30, 40, 50] {
+            let theirs = vector(&[(me, their_wall), (peer, 5)]);
+            let position = stalls.observe(peer, &theirs, &mine);
+            assert_eq!(position, PeerPosition::Advancing, "moved since last contact");
+            let gate = divergence_probe_for(probe(), position);
+            assert_eq!(gate, CountGate { probe: None, deferred: true }, "at {their_wall}");
+        }
+
+        // Behind and frozen: the same position comes back on contact after
+        // contact. The first sighting is the memo being written, the next
+        // `FROZEN_CONTACTS` are it standing still, and the probe goes out
+        // on the last of those.
+        let mut stalls = PeerStalls::new();
+        let theirs = vector(&[(me, 50), (peer, 5)]);
+        for sighting in 1..=FROZEN_CONTACTS {
+            let position = stalls.observe(peer, &theirs, &mine);
+            assert_eq!(position, PeerPosition::Advancing, "sighting {sighting}: not yet frozen");
+            assert!(divergence_probe_for(probe(), position).deferred, "sighting {sighting}");
+        }
+        let position = stalls.observe(peer, &theirs, &mine);
+        assert_eq!(position, PeerPosition::Frozen, "unchanged for FROZEN_CONTACTS contacts");
+        assert_eq!(
+            divergence_probe_for(probe(), position),
+            CountGate { probe: probe(), deferred: false },
+            "a still peer's count is what it holds and will keep holding"
+        );
+        // And stays compared while it stays still.
+        assert_eq!(stalls.observe(peer, &theirs, &mine), PeerPosition::Frozen);
+
+        // Not behind: compared at once, no memory needed, and a memo that
+        // existed is dropped rather than left to count a peer that has
+        // since caught up.
+        let caught_up = vector(&[(me, 100), (peer, 5)]);
+        let position = stalls.observe(peer, &caught_up, &mine);
+        assert_eq!(position, PeerPosition::CaughtUp);
+        assert_eq!(
+            divergence_probe_for(probe(), position),
+            CountGate { probe: probe(), deferred: false }
+        );
+        assert!(stalls.by_peer.is_empty(), "nothing to remember about a peer that is level");
+
+        // No probe named this tick is neither compared nor deferred,
+        // whatever the peer's position.
+        assert_eq!(
+            divergence_probe_for(None, PeerPosition::Advancing),
+            CountGate { probe: None, deferred: false },
+            "nothing in rotation is not a deferral"
+        );
+    }
+
+    /// The two movements that must not break a stall's run, and the one that
+    /// must. This node moving ahead on its own origin, or gaining a new
+    /// origin from a third member, is this node advancing, not the peer; the
+    /// peer's own writes never enter the map at all. The peer getting closer
+    /// on an origin it trails — even without catching up on it — is the peer
+    /// advancing, and resets the run.
+    #[test]
+    fn a_stall_survives_this_nodes_own_progress_and_breaks_on_the_peers() {
+        let peer = node(1);
+        let me = node(2);
+        let third = node(3);
+        let mut stalls = PeerStalls::new();
+
+        let theirs = vector(&[(me, 50), (peer, 5)]);
+        stalls.observe(peer, &theirs, &vector(&[(me, 100), (peer, 5)]));
+        // This node writes more: its own origin moves, the peer's position
+        // there does not.
+        stalls.observe(peer, &theirs, &vector(&[(me, 200), (peer, 5)]));
+        // This node pulls a third member's writes the peer has none of: a
+        // new trailing origin appears at the peer's position of zero.
+        stalls.observe(peer, &theirs, &vector(&[(me, 300), (peer, 5), (third, 40)]));
+        // The peer takes a local write: its own origin moves, which is never
+        // in the map.
+        let theirs_wrote = vector(&[(me, 50), (peer, 9)]);
+        let mine = vector(&[(me, 300), (peer, 5), (third, 40)]);
+        assert_eq!(
+            stalls.observe(peer, &theirs_wrote, &mine),
+            PeerPosition::Frozen,
+            "three unchanged sightings despite everything this node and the peer did locally"
+        );
+
+        // The peer pulls some of this node's writes — closer, still behind.
+        let theirs_moved = vector(&[(me, 120), (peer, 9)]);
+        assert_eq!(
+            stalls.observe(peer, &theirs_moved, &mine),
+            PeerPosition::Advancing,
+            "closer on an origin it trails is movement, and the run restarts"
+        );
+        assert_eq!(stalls.by_peer[&peer].unchanged, 0);
     }
 }
