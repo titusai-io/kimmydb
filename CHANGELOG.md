@@ -239,13 +239,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   graph was evicted or the process restarted.
 
   Two things changed. The change-feed consumer that already forgets a dropped
-  collection's graph now forgets a reconfigured one's as well, on every member
-  the entry reaches. And the cache itself now records the metric and width a
-  graph was built for and declines an entry of another shape at the next
-  search, exactly as it declines one from a previous incarnation of the same
-  name — so a search is served by a graph of the configuration in force
-  whether or not the consumer has caught up, and a "too small" verdict
-  decided at one width is not reused at another.
+  collection's graph now acts on a reconfiguration as well, on every member
+  the entry reaches: it reads the configuration in force from the store,
+  compares the cached graph's metric and width with it, and forgets the graph
+  only on a difference. The comparison matters because the same entry reaches
+  the consumer more than once — an anti-entropy window starts at the last
+  witnessed stamp, inclusive, so a later round re-delivers it, and forgetting
+  on every delivery would have discarded a graph already rebuilt for the new
+  configuration each time; a re-delivered entry is now a no-op. And the cache
+  itself now records the metric and width a graph was built for and declines
+  an entry of another shape at the next search, exactly as it declines one
+  from a previous incarnation of the same name — so a search is served by a
+  graph of the configuration in force whether or not the consumer has caught
+  up, and a "too small" verdict decided at one width is not reused at another.
 
 - **A collection dropped and created again under the same name no longer
   keeps its predecessor's graph in memory or its snapshot on disk.** A

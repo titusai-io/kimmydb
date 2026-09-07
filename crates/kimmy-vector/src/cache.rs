@@ -906,6 +906,110 @@ impl IndexCache {
         forgot
     }
 
+    /// Forget a collection's index unless it was built for the shape the
+    /// collection is configured with now.
+    ///
+    /// The reconfiguration counterpart of [`Self::forget_unless_created`].
+    /// A `ConfigureVectors` entry keeps the shadow and writes no vector, so
+    /// a graph built for the previous configuration matches the cache on
+    /// every test but its shape; and, as with a drop, the entry is history
+    /// by the time the change-feed consumer reads it — the same entry
+    /// arrives again in every anti-entropy round that re-scans it, long
+    /// after the graph has been rebuilt for the configuration in force. So
+    /// the caller reads that configuration from the store and asks here
+    /// whether what is held matches it, rather than forgetting on the
+    /// entry's say-so.
+    ///
+    /// A resident entry of the given shape means **nothing happens at all**:
+    /// no epoch bump, no look at the disk, `false` back. That is the
+    /// re-delivered case, and doing anything with it would be the cost this
+    /// method exists to remove — one rebuild of a multi-second graph per
+    /// round, per member, for as long as replication lag spans the
+    /// reconfiguration. The disk is not looked at because the entry answers
+    /// for it: a graph of the shape in force was installed by the build that
+    /// renamed its snapshot over the directory, or by the load that checked
+    /// the directory's shape on the way in; a save that failed can leave an
+    /// old-shape file behind a new-shape entry, and that is `load`'s to
+    /// refuse, as it does for every other snapshot it cannot vouch for.
+    ///
+    /// A resident entry of another shape goes, with its `saved_at`, and the
+    /// snapshot directory is then checked on its own `meta.json`, as it is
+    /// when nothing was resident at all. That second case is not idle: a
+    /// graph evicted under the budget leaves its snapshot on disk with no
+    /// entry to be forgotten through, and a snapshot of the old shape would
+    /// otherwise sit there until a search on this member opened it — which a
+    /// collection searched only on other members never does. A `meta.json`
+    /// that cannot be read is left alone, as everywhere.
+    ///
+    /// The fence rule: a forget fences, a no-op does not. Removing the
+    /// resident entry moves the epoch under the same lock, so a build that
+    /// captured the epoch before it will decline to install — without that,
+    /// a build of the old shape already under way would install a graph
+    /// `serve` declines at every search, and the resident bytes would stay
+    /// until eviction. A match, or nothing resident, moves nothing: a build
+    /// in flight then is either of the shape in force, which is wanted, or
+    /// of the old shape as read by a request that raced the reconfiguration,
+    /// which installs an entry `serve` declines at the next search — and
+    /// that search's build replaces it. Bounded, and the same class as the
+    /// race the reconfiguring route already accepts.
+    ///
+    /// The directory is touched only under the collection's build lock,
+    /// taken with `try_lock` and skipped when held, for the reason
+    /// [`Self::forget_unless_created`] gives: a build in progress renames
+    /// its own result over it when it finishes.
+    ///
+    /// Returns whether anything was forgotten, resident or on disk.
+    pub fn forget_unless_shaped(
+        &self,
+        collection: CollectionId,
+        metric: Metric,
+        dim: usize,
+    ) -> bool {
+        let mut forgot = false;
+        {
+            let mut entries = self.entries.lock();
+            match entries.map.get(&collection) {
+                Some(entry) if entry.metric == metric && entry.dim == dim => return false,
+                Some(_) => {
+                    if let Some(entry) = entries.map.remove(&collection) {
+                        entries.resident -= entry.bytes();
+                    }
+                    entries.warned.remove(&collection);
+                    entries.fence(collection);
+                    forgot = true;
+                }
+                None => {}
+            }
+        }
+        if forgot {
+            // As in `forget_unless_created`: the entry gone, the count check
+            // in `try_snapshot` judges the next snapshot, and the build-lock
+            // slot stays because the id is live.
+            self.saved_at.lock().remove(&collection);
+        }
+
+        if let Some(path) = self.snapshot_path(collection)
+            && path.is_dir()
+        {
+            let build_lock = self.build_lock(collection);
+            let Some(_guard) = build_lock.try_lock() else {
+                debug!(
+                    collection = collection.0,
+                    "a build is writing this collection's snapshot; leaving the directory to it"
+                );
+                return forgot;
+            };
+            // Filesystem work from the change consumer, on a runtime worker:
+            // off the worker, as `invalidate` is.
+            let removed = kimmy_storage::blocking(|| remove_if_other_shape(&path, metric, dim));
+            if removed {
+                self.saved_at.lock().remove(&collection);
+                forgot = true;
+            }
+        }
+        forgot
+    }
+
     /// Delete every snapshot on disk that `live` does not vouch for.
     ///
     /// The complement to [`Self::invalidate`] and [`Self::forget_absent`],
@@ -1132,16 +1236,39 @@ enum Serve {
 /// `created` field reads as the default stamp, which no live collection
 /// carries, and goes — `load` would refuse it on its format anyway.
 fn remove_if_other_incarnation(path: &std::path::Path, created: Hlc) -> bool {
-    let Some(built_for) = crate::index::snapshot_created(path) else { return false };
-    if built_for == created {
+    let Some(built_for) = crate::index::snapshot_identity(path) else { return false };
+    if built_for.created == created {
         return false;
     }
+    remove_snapshot(
+        path,
+        "removed an HNSW snapshot a previous collection of the same name left behind",
+    )
+}
+
+/// Remove the snapshot at `path` if its `meta.json` says it was built at a
+/// shape other than `(metric, dim)`. Whether it did.
+///
+/// The shape counterpart of [`remove_if_other_incarnation`], on the same
+/// rule for a file it cannot read: unreadable is not "other", and is left
+/// for `try_snapshot`, which discards what it cannot load.
+fn remove_if_other_shape(path: &std::path::Path, metric: Metric, dim: usize) -> bool {
+    let Some(built_for) = crate::index::snapshot_identity(path) else { return false };
+    if built_for.metric == metric && built_for.dim == dim {
+        return false;
+    }
+    remove_snapshot(
+        path,
+        "removed an HNSW snapshot built for a configuration the collection no longer has",
+    )
+}
+
+/// The removal the two `remove_if_*` checks share, with `why` as the line
+/// that says so.
+fn remove_snapshot(path: &std::path::Path, why: &'static str) -> bool {
     match std::fs::remove_dir_all(path) {
         Ok(()) => {
-            debug!(
-                ?path,
-                "removed an HNSW snapshot a previous collection of the same name left behind"
-            );
+            debug!(?path, "{why}");
             true
         }
         Err(e) => {
@@ -2320,6 +2447,126 @@ mod tests {
             ));
         });
         assert_nothing_installed(&cache, first.id);
+    }
+
+    #[test]
+    fn a_forget_by_shape_leaves_a_graph_of_that_shape_entirely_alone() {
+        // The re-delivered case: a `ConfigureVectors` entry read again, with
+        // the graph already rebuilt for the configuration in force. Nothing
+        // may move — not the entry, not the snapshot, not the generation it
+        // was saved at, and not the epoch, or a build under way for the
+        // right shape would be discarded for nothing.
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        let Access::Approximate(before) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("60 vectors over a threshold of 10 should build a graph");
+        };
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(path.is_dir(), "the build should have been persisted");
+        assert_eq!(cache.entries.lock().epoch(shadow.id), 0);
+
+        assert!(
+            !cache.forget_unless_shaped(shadow.id, Metric::Cosine, 4),
+            "a graph of the configured shape is nothing to forget"
+        );
+        assert!(cache.contains(shadow.id), "the entry must stay");
+        assert!(path.is_dir(), "the snapshot must stay");
+        assert!(
+            cache.saved_at.lock().contains_key(&shadow.id),
+            "the generation the snapshot was saved at must stay"
+        );
+        assert_eq!(cache.entries.lock().epoch(shadow.id), 0, "a no-op must not fence");
+        let Access::Approximate(after) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("the graph should still be served");
+        };
+        assert!(Arc::ptr_eq(&before, &after), "the same graph, not a rebuild");
+    }
+
+    #[test]
+    fn a_forget_by_shape_removes_a_graph_of_another_metric_and_its_snapshot() {
+        // The reconfiguration proper: the collection now scores by another
+        // metric, and the graph resident here was built for the old one. It
+        // goes, with its snapshot and the generation it was saved at, and the
+        // epoch moves so a build of the old shape still in flight installs
+        // nothing.
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(path.is_dir());
+
+        assert!(
+            cache.forget_unless_shaped(shadow.id, Metric::Euclidean, 4),
+            "a graph of another metric must be forgotten"
+        );
+        assert!(!cache.contains(shadow.id), "the entry must go");
+        assert!(!path.exists(), "and the snapshot with it");
+        assert!(!cache.saved_at.lock().contains_key(&shadow.id));
+        assert_eq!(cache.resident_bytes(), 0, "the budget must be released");
+        assert_eq!(cache.entries.lock().epoch(shadow.id), 1, "a forget fences");
+
+        // A width change is the other half of a shape, and is judged the
+        // same way.
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        assert!(cache.forget_unless_shaped(shadow.id, Metric::Cosine, 8));
+        assert!(!cache.contains(shadow.id));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_forget_by_shape_with_nothing_resident_still_removes_a_snapshot_of_another_shape() {
+        // An evicted graph, or one a previous process wrote, has no entry to
+        // be forgotten through; its snapshot of the old shape would sit on
+        // disk until a search on this member opened it, which a collection
+        // searched only elsewhere never does. So the directory is checked on
+        // its own `meta.json` even when the map has nothing.
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        assert!(path.is_dir());
+        drop(cache);
+
+        // A fresh cache over the same directory: the snapshot, and no entry.
+        let cache = snapshot_cache(&dir);
+        assert!(cache.is_empty());
+        assert!(
+            cache.forget_unless_shaped(shadow.id, Metric::Euclidean, 4),
+            "a snapshot of another shape is something to forget"
+        );
+        assert!(!path.exists(), "the old shape's snapshot must go");
+    }
+
+    #[test]
+    fn a_forget_by_shape_with_nothing_resident_leaves_a_snapshot_of_that_shape() {
+        // The evicted counterpart of the re-delivered case: the snapshot is
+        // of the configured shape, so the next search may adopt it rather
+        // than rebuild, and the forget leaves it where it is.
+        let (engine, shadow, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        assert!(matches!(
+            cache.access(&engine, &shadow, Metric::Cosine, 4),
+            Access::Approximate(_)
+        ));
+        let path = cache.snapshot_path(shadow.id).unwrap();
+        drop(cache);
+
+        let cache = snapshot_cache(&dir);
+        assert!(cache.is_empty());
+        assert!(
+            !cache.forget_unless_shaped(shadow.id, Metric::Cosine, 4),
+            "a snapshot of the configured shape is nothing to forget"
+        );
+        assert!(path.is_dir(), "the snapshot must stay for the next search to adopt");
     }
 
     #[test]

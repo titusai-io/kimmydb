@@ -158,19 +158,34 @@ struct SnapshotMeta {
 /// of a name it was built for.
 const SNAPSHOT_FORMAT: u32 = 2;
 
-/// Which incarnation the snapshot at `dir` was built for, read from its
-/// `meta.json` and nothing else.
+/// What the snapshot at `dir` says it was built for, read from its
+/// `meta.json` and nothing else: which incarnation, and at which shape.
 ///
 /// For the cache's reconciliation passes, which need to know whether a
-/// directory belongs to the collection standing under its id *without*
-/// loading the graph — a load is the cost the snapshot exists to avoid, and
-/// a sweep at startup would pay it once per directory. `None` when the file
-/// is missing or does not parse; what the caller does with that is its own
-/// decision, and `load` refuses such a snapshot in any case.
-pub(crate) fn snapshot_created(dir: &std::path::Path) -> Option<Hlc> {
+/// directory belongs to the collection standing under its id — and, since a
+/// reconfiguration keeps the collection, whether it describes the shape that
+/// collection now has — *without* loading the graph: a load is the cost the
+/// snapshot exists to avoid, and a sweep at startup would pay it once per
+/// directory. `None` when the file is missing or does not parse; what the
+/// caller does with that is its own decision, and `load` refuses such a
+/// snapshot in any case.
+pub(crate) fn snapshot_identity(dir: &std::path::Path) -> Option<SnapshotIdentity> {
     let raw = std::fs::read(dir.join("meta.json")).ok()?;
     let meta: SnapshotMeta = serde_json::from_slice(&raw).ok()?;
-    Some(meta.created)
+    Some(SnapshotIdentity { created: meta.created, metric: meta.metric, dim: meta.dim })
+}
+
+/// The part of a snapshot's `meta.json` that says *what* it is a snapshot
+/// of, for [`snapshot_identity`]. The rest of the file (format, keys) is
+/// `load`'s concern.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SnapshotIdentity {
+    /// The incarnation of the shadow collection the graph was built from.
+    pub(crate) created: Hlc,
+    /// The metric the graph scores with.
+    pub(crate) metric: Metric,
+    /// The width of every vector in it.
+    pub(crate) dim: usize,
 }
 
 /// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
