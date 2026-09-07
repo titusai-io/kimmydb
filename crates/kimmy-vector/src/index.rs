@@ -158,6 +158,21 @@ struct SnapshotMeta {
 /// of a name it was built for.
 const SNAPSHOT_FORMAT: u32 = 2;
 
+/// Which incarnation the snapshot at `dir` was built for, read from its
+/// `meta.json` and nothing else.
+///
+/// For the cache's reconciliation passes, which need to know whether a
+/// directory belongs to the collection standing under its id *without*
+/// loading the graph — a load is the cost the snapshot exists to avoid, and
+/// a sweep at startup would pay it once per directory. `None` when the file
+/// is missing or does not parse; what the caller does with that is its own
+/// decision, and `load` refuses such a snapshot in any case.
+pub(crate) fn snapshot_created(dir: &std::path::Path) -> Option<Hlc> {
+    let raw = std::fs::read(dir.join("meta.json")).ok()?;
+    let meta: SnapshotMeta = serde_json::from_slice(&raw).ok()?;
+    Some(meta.created)
+}
+
 /// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
 ///
 /// The library `unwrap`s on a corrupt graph file — bad magic aborts the

@@ -438,12 +438,21 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // neither the routes nor the consumer: nothing opens a snapshot directory
     // until something asks for that collection, and nothing asks for one that
     // no longer exists. Swept once, here, before any graph can be building.
+    // That ordering is what makes removing the `<id>.build` staging
+    // directories safe: the listener has not bound and the consumer above only
+    // forgets, so no build is writing one, and anything staged was left by a
+    // build the previous process did not finish.
     match kimmy_storage::blocking(|| {
         kimmy_api::vectors::live_collections(&engine)
-            .map(|live| state.vectors.sweep_snapshots(&live))
+            .map(|live| state.vectors.sweep_snapshots(&live, kimmy_vector::Staging::Remove))
     }) {
         Ok(removed) if removed > 0 => {
-            info!(removed, "removed HNSW snapshots for collections this node no longer holds");
+            info!(
+                removed,
+                "removed HNSW snapshots this node holds no collection for, or that a previous \
+                 collection of the same name left behind, and staging directories of interrupted \
+                 builds"
+            );
         }
         Ok(_) => {}
         Err(e) => warn!(error = %e, "could not sweep stale HNSW snapshots"),

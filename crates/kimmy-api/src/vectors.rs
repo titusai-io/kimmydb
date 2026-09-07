@@ -1,6 +1,6 @@
 //! Vector configuration and search routes.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, State};
@@ -298,12 +298,12 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                     // ids are derived from names, so the shadow's is computable
                     // from the name this entry does carry. Checking an id that
                     // never held a graph costs a metadata read, so both go.
-                    forget_if_gone(&state, entry.collection);
+                    forget_unless_live(&state, entry.collection);
                     if let Some(body) = &entry.body
                         && let Ok(target) =
                             bson::deserialize_from_slice::<kimmy_core::CollectionRef>(body)
                     {
-                        forget_if_gone(
+                        forget_unless_live(
                             &state,
                             CollectionId::derive(
                                 &target.db,
@@ -357,10 +357,22 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                     // other storage step.
                     match kimmy_storage::blocking(|| live_collections(&state.engine)) {
                         Ok(live) => {
+                            // Resident entries first, then the disk. A snapshot
+                            // whose entry was evicted under the budget, or that
+                            // a previous process wrote, has no entry to be
+                            // forgotten through, so the map walk alone would
+                            // leave it — and a lost drop is exactly the case
+                            // where nothing else will ever name it. Staging
+                            // directories are kept: this is a running node, and
+                            // a build may be writing one this instant.
                             let forgotten = state.vectors.forget_absent(&live);
+                            let swept = kimmy_storage::blocking(|| {
+                                state.vectors.sweep_snapshots(&live, kimmy_vector::Staging::Keep)
+                            });
                             warn!(
                                 missed,
                                 forgotten,
+                                swept,
                                 "vector index consumer fell behind; reconciled the cache \
                                  against the collections this node holds"
                             );
@@ -380,7 +392,8 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
     }
 }
 
-/// Forget a collection's graph, but **only if the collection really is gone**.
+/// Forget a collection's graph, but **only what the live collection under the
+/// id does not account for**.
 ///
 /// A drop entry reaches this task as history, not as news: the feed is a
 /// bounded ring, and a burst of writes — five hundred chunks of one document
@@ -390,15 +403,23 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
 /// the same cache key and the same snapshot path. Acting on the entry alone
 /// would then delete a live index that nobody dropped.
 ///
-/// So the entry only says which id to *look at*; what decides is whether this
-/// node still holds a collection under it. That is a read of state the drop
-/// has already committed, and it makes this task's correctness independent of
-/// how far behind it is — and of whether any particular drop is announced at
-/// all, which is not this crate's decision to depend on.
-fn forget_if_gone(state: &SharedState, id: CollectionId) {
+/// So the entry only says which id to *look at*; what decides is what this
+/// node holds under it now. That is a read of state the drop has already
+/// committed, and it makes this task's correctness independent of how far
+/// behind it is — and of whether any particular drop is announced at all,
+/// which is not this crate's decision to depend on.
+///
+/// Finding a collection under the id is not the end of it, though. One
+/// anti-entropy round can deliver the drop and the recreate together, all
+/// committed before this task reads the drop, and then the id *is* live —
+/// held by a collection the graph was never built for. The cache compares
+/// the incarnation, entry and snapshot each on its own stamp, and forgets
+/// what belongs to the previous one.
+fn forget_unless_live(state: &SharedState, id: CollectionId) {
     match kimmy_storage::blocking(|| state.engine.collection_by_id(id)) {
-        Ok(None) => state.vectors.invalidate(id),
-        Ok(Some(_)) => {}
+        Ok(live) => {
+            state.vectors.forget_unless_created(id, live.map(|meta| meta.created));
+        }
         Err(e) => warn!(
             error = %e,
             collection = id.0,
@@ -408,22 +429,28 @@ fn forget_if_gone(state: &SharedState, id: CollectionId) {
     }
 }
 
-/// Every collection id this node holds, shadow collections included.
+/// Every collection this node holds, shadow collections included, as its id
+/// and the `created` stamp of the incarnation standing under it.
 ///
 /// Deliberately not `Engine::all_collection_ids`, which hides a shadow whose
 /// parent is present (ADR-138). The ids it hides are exactly the ones a vector
 /// index is keyed by, so reconciling against it would forget every live graph
 /// on the node.
+///
+/// The stamp rides along because the id alone cannot vouch for a graph or a
+/// snapshot: ids are derived from names, so a name dropped and created again
+/// is live at the same id, and whatever was built for its predecessor is
+/// keyed and stored under it too.
 pub fn live_collections(
     engine: &kimmy_storage::Engine,
-) -> Result<HashSet<CollectionId>, kimmy_storage::StorageError> {
-    let mut ids = HashSet::new();
+) -> Result<HashMap<CollectionId, kimmy_core::Hlc>, kimmy_storage::StorageError> {
+    let mut live = HashMap::new();
     for db in engine.list_databases()? {
         for coll in engine.list_collections(&db.name)? {
-            ids.insert(coll.id);
+            live.insert(coll.id, coll.created);
         }
     }
-    Ok(ids)
+    Ok(live)
 }
 
 // ---------------------------------------------------------------------------

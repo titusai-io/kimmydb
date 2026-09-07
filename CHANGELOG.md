@@ -234,6 +234,34 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   whether or not the consumer has caught up, and a "too small" verdict
   decided at one width is not reused at another.
 
+- **A collection dropped and created again under the same name no longer
+  keeps its predecessor's graph in memory or its snapshot on disk.** A
+  collection id is derived from its name, so the recreated collection has
+  the same id, the same cache key and the same snapshot path, and three
+  places that decide what to keep asked only whether the id was in use. The
+  change-feed consumer, reading a drop that arrived in the same round as the
+  recreate, found a collection under the id and forgot nothing, leaving the
+  old graph resident — declined on every search, but never released — and the
+  old snapshot in place. The sweep at startup kept every directory whose id
+  was live, so a recreated name's predecessor survived every restart, along
+  with the `<id>.build` staging directory an interrupted build leaves. And a
+  consumer that fell behind the feed reconciled only the graphs it held, so a
+  snapshot whose graph had been evicted, or that a previous process wrote,
+  was named by nothing. No wrong answers came of any of it — a graph and a
+  snapshot both record the incarnation they were built for and are refused
+  on a mismatch — but a recreated collection never searched on a member kept
+  hundreds of megabytes of orphaned disk there indefinitely.
+
+  All three now reconcile on the incarnation as well as the id, each half on
+  its own stamp: a resident graph goes when it was built for another
+  incarnation than the one standing under its id, and a snapshot goes when
+  its own `meta.json` says the same; a `meta.json` that cannot be read is left
+  for the first search to discard, as before. A directory is removed only
+  when no build is writing it. The startup sweep removes every staging
+  directory, since it runs before any build can begin; a lagging consumer
+  now sweeps the disk as well as the cache, and leaves staging directories to
+  the builds that may own them.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
