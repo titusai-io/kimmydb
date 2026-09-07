@@ -71,6 +71,86 @@ impl std::error::Error for BulkInsertError {
 /// The conventional primary-key field name.
 pub const ID_FIELD: &str = "_id";
 
+/// The writes of one [`Engine::write_batch`], and the entries they produced.
+///
+/// Constructible only by `write_batch`, which is what keeps the writer
+/// inside the crate: a caller can compose replaces and deletes into one
+/// commit but never hold, commit or abort the transaction itself. Each write
+/// mints its own stamp under the writer (ADR-148) and its entry is kept here,
+/// in the order written, for the engine to publish after the one commit.
+///
+/// A write that fails poisons the scope. The in-transaction forms write the
+/// document before its index entries and its oplog entry, so a failure part
+/// way through leaves the transaction holding a document nothing indexes
+/// and nothing logs; every caller inside this crate aborts on that, but a
+/// closure outside it may ignore the error and carry on. So the first
+/// failure is remembered here: every later write on the scope refuses
+/// without writing, and `write_batch` aborts the scope whatever the closure
+/// answers. A torn commit is not something a caller can opt into.
+pub struct WriteScope<'a> {
+    engine: &'a Engine,
+    txn: WriteTxn<'a>,
+    entries: Vec<OplogEntry>,
+    /// The first write that failed, as its error read; `Some` means the
+    /// transaction may hold a partial write and can never commit.
+    poisoned: Option<String>,
+}
+
+impl WriteScope<'_> {
+    /// [`Engine::replace`], into this scope's transaction.
+    pub fn replace(
+        &mut self,
+        coll: &CollectionMeta,
+        id: &DocId,
+        doc: Document,
+        upsert: bool,
+    ) -> Result<WriteOutcome> {
+        self.refuse_if_poisoned()?;
+        let (outcome, entry) = self
+            .engine
+            .replace_in_txn(&self.txn, coll, id, doc, upsert, None)
+            .map_err(|e| self.poison(e))?;
+        self.entries.extend(entry);
+        Ok(outcome)
+    }
+
+    /// [`Engine::delete`], into this scope's transaction.
+    pub fn delete(&mut self, coll: &CollectionMeta, id: &DocId) -> Result<bool> {
+        self.refuse_if_poisoned()?;
+        let entry = self
+            .engine
+            .delete_in_txn(&self.txn, coll, id, |_, _| Ok(true))
+            .map_err(|e| self.poison(e))?;
+        let removed = entry.is_some();
+        self.entries.extend(entry);
+        Ok(removed)
+    }
+
+    /// Remember the first failure and hand it back unchanged: the caller
+    /// sees the error it caused, and the scope sees that it can never
+    /// commit.
+    fn poison(&mut self, e: StorageError) -> StorageError {
+        self.poisoned.get_or_insert_with(|| e.to_string());
+        e
+    }
+
+    fn refuse_if_poisoned(&self) -> Result<()> {
+        match &self.poisoned {
+            Some(first) => Err(Self::poisoned_error(first)),
+            None => Ok(()),
+        }
+    }
+
+    /// The error a poisoned scope answers with, on every write after the
+    /// failure and from `write_batch` itself. A `Transaction` error, because
+    /// that is what it is: the transaction cannot be committed.
+    fn poisoned_error(first: &str) -> StorageError {
+        StorageError::Transaction(format!(
+            "a write inside this scope failed and the scope cannot commit: {first}"
+        ))
+    }
+}
+
 impl Engine {
     // -----------------------------------------------------------------------
     // Reads
@@ -371,19 +451,58 @@ impl Engine {
         upsert: bool,
         expected: Option<Stamp>,
     ) -> Result<WriteOutcome> {
+        let txn = self.begin_write()?;
+        match self.replace_in_txn(&txn, coll, id, doc, upsert, expected) {
+            Ok((outcome, Some(entry))) => {
+                txn.commit()?;
+                self.publish(vec![entry]);
+                Ok(outcome)
+            }
+            // Unmatched and not an upsert: nothing was written, so nothing
+            // is committed — a miss must not cost an fsync.
+            Ok((outcome, None)) => {
+                txn.abort()?;
+                Ok(outcome)
+            }
+            Err(e) => {
+                txn.abort()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The whole of a replace except the transaction's lifecycle, the way
+    /// [`Self::insert_in_txn`] is for an insert.
+    ///
+    /// The caller owns the transaction and holds the writer, so the stamp is
+    /// minted here, under it (ADR-148): a stamp minted while another
+    /// transaction holds the writer sorts below what that transaction
+    /// commits first, and a peer reading this node in that interval
+    /// witnesses past it unserved.
+    ///
+    /// Answers with the outcome and the entry to publish once the caller has
+    /// committed. An unmatched replace without `upsert` writes nothing and
+    /// yields no entry; a version that does not match `expected` is
+    /// [`StorageError::Stale`], and the caller aborts. Nothing is aborted
+    /// here: a scope holding many writes aborts once for the scope
+    /// (ADR-149), not once per write.
+    pub(crate) fn replace_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        id: &DocId,
+        doc: Document,
+        upsert: bool,
+        expected: Option<Stamp>,
+    ) -> Result<(WriteOutcome, Option<OplogEntry>)> {
         // The id is part of the document's identity, not its content: a replace
         // must not be able to move a document to a different key.
         let doc = with_id_first(doc, id.to_bson());
 
         let key = doc_key(id)?;
         let body = bson::serialize_to_vec(&doc)?;
-
-        let txn = self.begin_write()?;
-        // Under the writer, as an insert's is (ADR-148): a stamp minted
-        // while another transaction holds the writer sorts below what that
-        // transaction commits first, and a peer reading this node in that
-        // interval witnesses past it unserved.
         let stamp = self.next_stamp();
+
         let (existed, previous) = {
             let mut docs = txn.open_table(tables::DOCS)?;
             // The previous image is needed to remove the index entries it
@@ -398,19 +517,12 @@ impl Engine {
             let existed = previous.is_some();
 
             if expected.is_some() && current != expected {
-                drop(docs);
-                txn.abort()?;
                 return Err(StorageError::Stale { current });
             }
             if !existed && !upsert {
-                drop(docs);
-                txn.abort()?;
-                return Ok(WriteOutcome {
-                    matched: false,
-                    modified: false,
-                    upserted: false,
-                    stamp: None,
-                });
+                let unmatched =
+                    WriteOutcome { matched: false, modified: false, upserted: false, stamp: None };
+                return Ok((unmatched, None));
             }
 
             let record = DocRecord::live(stamp, body.clone());
@@ -418,15 +530,11 @@ impl Engine {
             (existed, previous)
         };
 
-        match index::maintain(self, &txn, coll, previous.as_ref(), Some(&doc), &key) {
-            Ok(newly_multikey) => {
-                index::mark_multikey(&txn, &coll.db, &coll.name, &newly_multikey)?;
-            }
-            Err(e) => {
-                txn.abort()?;
-                return Err(e);
-            }
-        }
+        // Same transaction as the document write, so the index cannot describe
+        // a state that never existed. A unique violation returns here and the
+        // caller aborts, which discards the document write with it.
+        let newly_multikey = index::maintain(self, txn, coll, previous.as_ref(), Some(&doc), &key)?;
+        index::mark_multikey(txn, &coll.db, &coll.name, &newly_multikey)?;
 
         let entry = OplogEntry {
             stamp,
@@ -437,16 +545,15 @@ impl Engine {
             doc_id: Some(id.clone()),
             body: Some(body),
         };
-        append_oplog(&txn, &entry)?;
-        txn.commit()?;
-        self.publish(vec![entry]);
+        append_oplog(txn, &entry)?;
 
-        Ok(WriteOutcome {
+        let outcome = WriteOutcome {
             matched: existed,
             modified: existed,
             upserted: !existed,
             stamp: Some(stamp),
-        })
+        };
+        Ok((outcome, Some(entry)))
     }
 
     /// Delete a document, leaving a tombstone.
@@ -527,11 +634,49 @@ impl Engine {
         id: &DocId,
         guard: impl Fn(Stamp, &Document) -> Result<bool>,
     ) -> Result<Option<Stamp>> {
-        let key = doc_key(id)?;
-
         let txn = self.begin_write()?;
-        // Under the writer, as an insert's is (ADR-148).
+        match self.delete_in_txn(&txn, coll, id, guard) {
+            Ok(Some(entry)) => {
+                txn.commit()?;
+                let stamp = entry.stamp;
+                self.publish(vec![entry]);
+                Ok(Some(stamp))
+            }
+            // Nothing to remove, or the guard declined: nothing was written,
+            // so nothing is committed — a refused expiry must not cost an
+            // fsync.
+            Ok(None) => {
+                txn.abort()?;
+                Ok(None)
+            }
+            Err(e) => {
+                txn.abort()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// The whole of a delete except the transaction's lifecycle, the way
+    /// [`Self::insert_in_txn`] is for an insert; `guard` is
+    /// [`Self::delete_where`]'s, and runs on the image about to be
+    /// tombstoned.
+    ///
+    /// The stamp is minted here, under the writer the caller holds
+    /// (ADR-148). Answers with the tombstone's entry, to publish once the
+    /// caller has committed, or `None` when there was nothing to remove or
+    /// the guard declined — nothing was written then, and no entry is
+    /// minted. Nothing is aborted here, for the reason
+    /// [`Self::replace_in_txn`] gives.
+    pub(crate) fn delete_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        coll: &CollectionMeta,
+        id: &DocId,
+        guard: impl Fn(Stamp, &Document) -> Result<bool>,
+    ) -> Result<Option<OplogEntry>> {
+        let key = doc_key(id)?;
         let stamp = self.next_stamp();
+
         let previous = {
             let mut docs = txn.open_table(tables::DOCS)?;
             let (current, previous) = match docs.get((coll.id.0, key.as_slice()))? {
@@ -542,22 +687,10 @@ impl Engine {
                 None => (stamp, None),
             };
             let Some(image) = previous.as_ref() else {
-                drop(docs);
-                txn.abort()?;
                 return Ok(None);
             };
-            match guard(current, image) {
-                Ok(true) => {}
-                Ok(false) => {
-                    drop(docs);
-                    txn.abort()?;
-                    return Ok(None);
-                }
-                Err(e) => {
-                    drop(docs);
-                    txn.abort()?;
-                    return Err(e);
-                }
+            if !guard(current, image)? {
+                return Ok(None);
             }
             docs.insert(
                 (coll.id.0, key.as_slice()),
@@ -569,7 +702,7 @@ impl Engine {
         // A tombstoned document must leave no index entries behind, or a scan
         // would surface a candidate whose document no longer exists. A delete
         // writes no new image, so it can never flip the multikey flag.
-        index::maintain(self, &txn, coll, previous.as_ref(), None, &key)?;
+        index::maintain(self, txn, coll, previous.as_ref(), None, &key)?;
 
         let entry = OplogEntry {
             stamp,
@@ -578,11 +711,76 @@ impl Engine {
             doc_id: Some(id.clone()),
             body: None,
         };
-        append_oplog(&txn, &entry)?;
-        txn.commit()?;
-        self.publish(vec![entry]);
+        append_oplog(txn, &entry)?;
 
-        Ok(Some(stamp))
+        Ok(Some(entry))
+    }
+
+    // -----------------------------------------------------------------------
+    // A scoped write
+    // -----------------------------------------------------------------------
+
+    /// Compose several writes into one commit, from outside this crate.
+    ///
+    /// A loop that wraps a public one-commit-per-call method is the shape
+    /// ADR-119 and ADR-125 each fixed once — the replica's apply and the
+    /// worker's position — and the vector write and the embedding worker's
+    /// store are the third and fourth. This is the general form (ADR-149):
+    /// the closure gets a [`WriteScope`] whose writes go into one
+    /// transaction the engine holds for the length of the closure, and the
+    /// writer never leaves the crate. On `Ok` the scope commits once — the
+    /// commit is counted and honours the durability class, as every commit
+    /// does — and every entry the writes produced is published after it, in
+    /// the order written, so nothing reaches a change stream before it is
+    /// durable. On `Err` the scope is aborted, nothing is published, and the
+    /// error is returned. A scope that wrote nothing is aborted too: no
+    /// fsync, no count, and nothing to publish, which is the rule
+    /// [`Self::insert_many`] states for an empty batch.
+    ///
+    /// Every stamp is minted inside the closure, under the writer, so
+    /// ADR-148's contiguity holds for a scope exactly as it does for a bulk
+    /// insert.
+    ///
+    /// A write that fails inside the scope poisons it: the transaction may
+    /// hold a document without its index entries or its oplog entry, so
+    /// every later write on the scope is refused, and the scope is aborted
+    /// with a `Transaction` error even when the closure swallows the
+    /// failure and returns `Ok`. A closure cannot commit a torn write by
+    /// ignoring an error.
+    ///
+    /// What a closure must not do while it holds the writer. It must not
+    /// call any other write on this engine — an insert, a replace outside
+    /// the scope, a schema change, anything that reaches `begin_write` —
+    /// because redb has one writer and this thread already holds it, so the
+    /// call would wait for itself forever. And nothing slow or network-bound
+    /// belongs inside: every other writer on the node waits behind the
+    /// scope for as long as the closure runs, so the closure should hold
+    /// its inputs ready and do nothing but write them. Reads are fine.
+    pub fn write_batch<T>(&self, f: impl FnOnce(&mut WriteScope<'_>) -> Result<T>) -> Result<T> {
+        let txn = self.begin_write()?;
+        let mut scope = WriteScope { engine: self, txn, entries: Vec::new(), poisoned: None };
+        let value = match f(&mut scope) {
+            Ok(value) => value,
+            Err(e) => {
+                scope.txn.abort()?;
+                return Err(e);
+            }
+        };
+        let WriteScope { txn, entries, poisoned, .. } = scope;
+        if let Some(first) = poisoned {
+            // The closure answered `Ok` over a failed write. What the
+            // transaction holds is not a state that ever existed, and it
+            // is not committed on anyone's say-so.
+            txn.abort()?;
+            return Err(WriteScope::poisoned_error(&first));
+        }
+        if entries.is_empty() {
+            txn.abort()?;
+            return Ok(value);
+        }
+        txn.commit()?;
+        self.publish(entries);
+        Ok(value)
     }
 
     // -----------------------------------------------------------------------
@@ -1145,6 +1343,198 @@ mod tests {
             1,
             "batching exists so that 100 documents cost one fsync, not 100"
         );
+    }
+
+    /// ADR-149's promise, in the shape of the ADR-119 test: a scope is one
+    /// commit and one fsync however many writes it holds, and what it wrote
+    /// reaches the change feed only after that commit, in the order written.
+    /// A loop of replaces and deletes over the public single-call methods is
+    /// one commit *each*, which is the defect this exists to end.
+    #[test]
+    fn a_scoped_write_is_one_commit_however_many_writes_it_holds() {
+        let (engine, coll, _dir) = engine();
+        // Two to replace over, two to delete; the other three are upserts.
+        for n in 0..4 {
+            engine.insert(&coll, doc! { "_id": n, "v": "before" }).unwrap();
+        }
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let fsyncs = engine.fsyncs();
+        let written: Vec<(DocId, OpKind)> = engine
+            .write_batch(|scope| {
+                let mut written = Vec::new();
+                for n in 0..2 {
+                    let id = DocId::Int64(n);
+                    let outcome = scope.replace(&coll, &id, doc! { "v": "after" }, false)?;
+                    assert!(outcome.matched && outcome.modified && !outcome.upserted);
+                    written.push((id, OpKind::Replace));
+                }
+                for n in 10..13 {
+                    let id = DocId::Int64(n);
+                    let outcome = scope.replace(&coll, &id, doc! { "v": "after" }, true)?;
+                    assert!(!outcome.matched && outcome.upserted);
+                    written.push((id, OpKind::Insert));
+                }
+                for n in 2..4 {
+                    let id = DocId::Int64(n);
+                    assert!(scope.delete(&coll, &id)?);
+                    written.push((id, OpKind::Delete));
+                }
+                // Nothing has reached the disk or the feed while the scope
+                // is open: a write inside it is not a commit of its own.
+                assert_eq!(
+                    engine.commits(),
+                    commits,
+                    "a write inside a scope committed on its own"
+                );
+                assert!(
+                    rx.try_recv().is_err(),
+                    "an entry was published before the scope committed"
+                );
+                Ok(written)
+            })
+            .unwrap();
+
+        assert_eq!(
+            engine.commits() - commits,
+            1,
+            "a scope exists so that seven writes cost one commit, not seven"
+        );
+        assert_eq!(engine.fsyncs() - fsyncs, 1, "and one fsync");
+
+        let mut published = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            published.push((entry.doc_id.clone().unwrap(), entry.kind));
+        }
+        assert_eq!(published, written, "every entry, once, in the order written");
+
+        for n in [0, 1, 10, 11, 12] {
+            let found = engine.get(&coll, &DocId::Int64(n)).unwrap().expect("written");
+            assert_eq!(found.get_str("v").unwrap(), "after");
+        }
+        for n in [2, 3] {
+            assert!(engine.get(&coll, &DocId::Int64(n)).unwrap().is_none(), "{n} was deleted");
+        }
+    }
+
+    /// The other half of one commit is none: a scope whose closure fails
+    /// leaves no document, no entry and no event behind, however far it got.
+    #[test]
+    fn a_scoped_write_that_fails_leaves_nothing_behind() {
+        let (engine, coll, _dir) = engine();
+        engine.insert(&coll, doc! { "_id": 1, "v": "before" }).unwrap();
+        engine.insert(&coll, doc! { "_id": 2, "v": "before" }).unwrap();
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let tail = engine.read_arrival_from(0, 100).unwrap().len();
+        let err = engine
+            .write_batch(|scope| {
+                scope.replace(&coll, &DocId::Int64(1), doc! { "v": "after" }, false)?;
+                scope.delete(&coll, &DocId::Int64(2))?;
+                scope.replace(&coll, &DocId::Int64(3), doc! { "v": "after" }, true)?;
+                Err::<(), _>(StorageError::Transaction("the caller changed its mind".into()))
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, StorageError::Transaction(_)),
+            "the caller's error comes back: {err}"
+        );
+
+        assert_eq!(engine.commits(), commits, "a failed scope must not reach the disk");
+        assert!(rx.try_recv().is_err(), "a failed scope must not publish");
+        assert_eq!(
+            engine.read_arrival_from(0, 100).unwrap().len(),
+            tail,
+            "the oplog must not move"
+        );
+        for n in [1, 2] {
+            let found = engine.get(&coll, &DocId::Int64(n)).unwrap().expect("still here");
+            assert_eq!(found.get_str("v").unwrap(), "before");
+        }
+        assert!(engine.get(&coll, &DocId::Int64(3)).unwrap().is_none(), "the upsert rolled back");
+    }
+
+    /// A scope that wrote nothing is not a commit — the rule `insert_many`
+    /// states for an empty batch — and a write that matched nothing is a
+    /// write that wrote nothing.
+    #[test]
+    fn an_empty_scope_does_not_commit() {
+        let (engine, coll, _dir) = engine();
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let outcome = engine
+            .write_batch(|scope| {
+                let outcome = scope.replace(&coll, &DocId::Int64(7), doc! { "v": 1 }, false)?;
+                assert!(!scope.delete(&coll, &DocId::Int64(8))?, "nothing to delete");
+                Ok(outcome)
+            })
+            .unwrap();
+        assert!(!outcome.matched && outcome.stamp.is_none(), "an unmatched replace wrote nothing");
+
+        assert_eq!(engine.commits(), commits, "an empty scope must not cost an fsync");
+        assert!(rx.try_recv().is_err(), "an empty scope has nothing to publish");
+        assert!(engine.get(&coll, &DocId::Int64(7)).unwrap().is_none());
+    }
+
+    /// The closure decides what its scope returns, and the closure is
+    /// outside this crate. A write that fails part way — the document
+    /// written, the unique probe refused before the index and the oplog
+    /// entry — must not reach the disk because the closure shrugged and
+    /// returned `Ok`: two live documents under one unique key, one of them
+    /// unlogged and so never replicated, is a state that never existed.
+    #[test]
+    fn a_swallowed_error_inside_a_scope_commits_nothing() {
+        let (engine, _dir) = indexed_engine();
+        engine.create_index("db", "c", vec![field("email")], true, None).unwrap();
+        let coll = engine.get_collection("db", "c").unwrap();
+        engine.insert(&coll, doc! { "_id": "a", "email": "same@x" }).unwrap();
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        // The closure shrugs at both answers and reports success; what each
+        // write answered is checked afterwards, so that the assertion that
+        // matters — nothing committed — is the one a missing poison fails.
+        let mut answers = Vec::new();
+        let err = engine
+            .write_batch(|scope| {
+                let b = scope.replace(
+                    &coll,
+                    &DocId::String("b".into()),
+                    doc! { "email": "same@x" },
+                    true,
+                );
+                let c = scope.replace(
+                    &coll,
+                    &DocId::String("c".into()),
+                    doc! { "email": "other@x" },
+                    true,
+                );
+                answers.push(b);
+                answers.push(c);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Transaction(_)), "the scope cannot commit: {err}");
+        assert!(err.to_string().contains("unique"), "and says why: {err}");
+        assert!(
+            matches!(answers[0], Err(StorageError::Core(CoreError::UniqueViolation { .. }))),
+            "the violation reached the closure: {:?}",
+            answers[0]
+        );
+        assert!(
+            matches!(answers[1], Err(StorageError::Transaction(_))),
+            "a poisoned scope refuses every later write: {:?}",
+            answers[1]
+        );
+
+        assert_eq!(engine.commits(), commits, "a poisoned scope must not reach the disk");
+        assert!(rx.try_recv().is_err(), "a poisoned scope must not publish");
+        assert!(engine.get(&coll, &DocId::String("b".into())).unwrap().is_none(), "b never landed");
+        assert!(engine.get(&coll, &DocId::String("c".into())).unwrap().is_none(), "nor c");
+        assert!(engine.get(&coll, &DocId::String("a".into())).unwrap().is_some(), "a is untouched");
     }
 
     #[test]
