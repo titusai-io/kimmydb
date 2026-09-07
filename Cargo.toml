@@ -196,7 +196,7 @@ serde_norway = "0.9"
 jsonschema = { version = "0.49", default-features = false }
 # Benchmarks. `html_reports` off: the numbers get recorded in docs/benchmarks.md
 # by hand, and an untracked report directory is noise in a repo.
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # Debug and test builds carry line tables rather than full DWARF. A panic,
 # an assertion failure and a backtrace still name the file and the line —
