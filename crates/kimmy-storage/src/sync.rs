@@ -3941,6 +3941,39 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_database_drop_takes_an_orphan_shadow_off_the_peer() {
+        // The orphan ADR-138 describes lives on a peer, not only where the
+        // drop is issued. A database drop that skipped it locally would mint
+        // nothing for it, and the peer would keep listing a database the
+        // issuer had just been told was gone.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        let orphan = b
+            .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name("docs"))
+            .unwrap();
+        a.create_collection("shop", "orders").unwrap();
+        sync(&a, &b);
+        assert_eq!(a.list_collections("shop").unwrap().len(), 2, "a holds orders and the orphan");
+        assert_eq!(b.list_collections("shop").unwrap().len(), 2, "so does b");
+
+        assert!(a.drop_database("shop").unwrap());
+        assert!(a.list_collections("shop").unwrap().is_empty());
+        assert!(
+            b.get_collection("shop", &orphan.name).is_ok(),
+            "nothing has reached b yet; the round below is what removes it"
+        );
+
+        sync(&a, &b);
+        assert!(
+            b.list_collections("shop").unwrap().is_empty(),
+            "the peer still lists {:?}",
+            b.list_collections("shop").unwrap().iter().map(|c| &c.name).collect::<Vec<_>>()
+        );
+        assert!(!b.database_exists("shop").unwrap());
+        assert!(b.collection_by_id(orphan.id).unwrap().is_none());
+    }
+
+    #[test]
     fn replicating_a_schema_change_does_not_amplify_it() {
         // Applying a replicated DDL entry must not mint a local one. If it did,
         // the peer would pull that back, apply it, mint another, and the two

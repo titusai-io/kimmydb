@@ -10005,6 +10005,57 @@ async fn dropping_a_database_forgets_every_vector_index_in_it() {
     assert!(!snapshot_of(&server, notes).exists());
 }
 
+#[tokio::test]
+async fn dropping_a_database_takes_an_orphan_shadow_and_its_vector_index_with_it() {
+    // A shadow with no parent (ADR-138: the parent's drop applied before the
+    // shadow's create arrived) has no parent's drop to go with. Left behind,
+    // it keeps the database listed after `dropped: true`, and its graph stays
+    // resident with a snapshot on disk for chunks nothing describes.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "notes").await;
+    let notes = build_graph(&server, "shop", "notes");
+
+    // The orphan, arranged on the engine directly: no route creates one.
+    let engine = &server.state.engine;
+    let orphan = engine
+        .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name("docs"))
+        .unwrap();
+    let source = kimmy_core::DocId::Int64(1);
+    let records: Vec<kimmy_core::VectorRecord> = (0..500u32)
+        .map(|chunk| kimmy_core::VectorRecord {
+            source: source.clone(),
+            chunk,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![chunk as f32, 0.0, 1.0],
+            text: "t".into(),
+        })
+        .collect();
+    engine.put_vectors(&orphan, &source, &records).unwrap();
+    let access = server.state.vectors.access(engine, &orphan, kimmy_core::Metric::Cosine, 3);
+    assert!(matches!(access, kimmy_vector::Access::Approximate(_)), "a graph over the orphan");
+    assert!(snapshot_of(&server, orphan.id).is_dir());
+    assert_eq!(server.state.vectors.len(), 2);
+
+    let res = server.delete("/v1/db/shop", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+
+    let res = server.get("/v1/db/shop/collections", Some(&token)).await;
+    assert_eq!(res.status, 404, "the database is still here: {:?}", res.body);
+    assert_eq!(server.state.vectors.len(), 0, "a graph survived the database it belonged to");
+    assert!(!snapshot_of(&server, orphan.id).exists(), "the orphan's snapshot survived");
+    assert!(!snapshot_of(&server, notes).exists());
+
+    // The 404 above is the database row, which the drop removes either way;
+    // the orphan's survival shows a moment later, when the next collection
+    // created in the database brings it back with the orphan beside it.
+    let res =
+        server.post("/v1/db/shop/collections", Some(&token), json!({ "name": "again" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    let res = server.get("/v1/db/shop/collections", Some(&token)).await;
+    assert_eq!(res.body["collections"], json!(["again"]), "the database came back with more in it");
+}
+
 /// Give a background consumer up to three seconds to reach some state.
 ///
 /// Returns whether it did. A consumer is a task, so what it has done is only

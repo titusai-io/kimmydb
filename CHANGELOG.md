@@ -194,6 +194,22 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   entry, which peers send by design and which writes nothing, does not bump;
   a replicated delete of a chunk does, as a local one always has.
 
+- **Dropping a database now takes a shadow collection that has no parent.**
+  `DELETE /v1/db/{db}` dropped each collection and let every vector shadow go
+  with its parent, in the parent's transaction. A shadow with no parent — the
+  residue [ADR-138](docs/decisions.md) describes, where a parent's drop was
+  applied before the shadow's create arrived — had no drop to go with, so it
+  was skipped: the request answered `dropped: true` and removed the database
+  row, but the shadow was still listed under the database, the next collection
+  created there brought the database back with the shadow's chunks already in
+  it, a vector-enabled collection recreated under the parent's name adopted
+  them, and `kimmy_sync_divergent_collections` kept counting a database the
+  operator had been told was gone. The drop now lists what the parent pass
+  left behind and drops each such shadow directly, each as its own replicated
+  entry, so every member holding the orphan removes it and its vector index
+  in the same way it would any other dropped collection
+  ([HTTP API](docs/http-api.md)).
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
