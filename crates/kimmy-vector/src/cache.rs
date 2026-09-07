@@ -48,7 +48,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use kimmy_core::{CollectionId, Metric};
+use kimmy_core::{CollectionId, Hlc, Metric};
 use kimmy_storage::{CollectionMeta, Engine};
 use parking_lot::Mutex;
 use tracing::debug;
@@ -127,14 +127,26 @@ struct Entry {
     /// The generation the decision was made at. A mismatch means writes have
     /// landed since.
     generation: u64,
+    /// The shadow collection incarnation this decision was made for.
+    ///
+    /// The same discriminator the snapshot carries on disk, and needed here
+    /// for the same reason one lock further in: an id is derived from a name,
+    /// the generation counter is keyed by that id and only ever counts up, so
+    /// a collection dropped and recreated arrives at an entry that is older
+    /// than it and yet matches on every other test. A recreated collection
+    /// with no vectors written yet has not bumped the generation at all, so
+    /// without this the previous incarnation's graph serves its searches with
+    /// no expiry — the staleness window never opens, because nothing looks
+    /// stale.
+    created: Hlc,
     decided: Instant,
     /// When a search last took this entry. Eviction order under the budget.
     last_used: Instant,
 }
 
 impl Entry {
-    fn new(decision: Decision, generation: u64, decided: Instant) -> Self {
-        Self { decision, generation, decided, last_used: Instant::now() }
+    fn new(decision: Decision, generation: u64, created: Hlc, decided: Instant) -> Self {
+        Self { decision, generation, created, decided, last_used: Instant::now() }
     }
 
     fn access(&self) -> Access {
@@ -292,7 +304,7 @@ impl IndexCache {
         }
 
         let generation = engine.vector_generation(shadow.id);
-        if let Some(access) = self.serve(shadow.id, Serve::Usable(generation)) {
+        if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
             return access;
         }
 
@@ -318,14 +330,14 @@ impl IndexCache {
                 // Someone is building this collection right now. A graph from
                 // before the write that made it stale is still a correct
                 // answer, so serve that rather than queue behind the build.
-                if let Some(access) = self.serve(shadow.id, Serve::Anything) {
+                if let Some(access) = self.serve(shadow, Serve::Anything) {
                     return access;
                 }
                 // Nothing to serve: wait for that build, then take its result.
                 // If it failed — there is no entry — this caller tries once
                 // itself, which is what it would have done unopposed.
                 let guard = build_lock.lock();
-                if let Some(access) = self.serve(shadow.id, Serve::Usable(generation)) {
+                if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
                     return access;
                 }
                 guard
@@ -335,7 +347,7 @@ impl IndexCache {
         // Holding the build lock. A build that finished between the lookup
         // and here has installed its result, and this one would be a
         // duplicate.
-        if let Some(access) = self.serve(shadow.id, Serve::Usable(generation)) {
+        if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
             return access;
         }
 
@@ -362,7 +374,8 @@ impl IndexCache {
         // Falling back on error keeps the query correct; the alternative is
         // failing a search because an optimisation could not be built.
         match self.decide(engine, shadow, metric, dim) {
-            Ok(decision) => self.install(shadow, Entry::new(decision, generation, Instant::now())),
+            Ok(decision) => self
+                .install(shadow, Entry::new(decision, generation, shadow.created, Instant::now())),
             Err(e) => {
                 debug!(error = %e, "falling back to an exact scan");
                 Access::Exact
@@ -377,9 +390,20 @@ impl IndexCache {
 
     /// Serve from the cache if an entry qualifies, touching it for eviction
     /// order. Holds the lock for a lookup and nothing longer.
-    fn serve(&self, collection: CollectionId, rule: Serve) -> Option<Access> {
+    ///
+    /// The incarnation is checked ahead of the rule and outside it, `Anything`
+    /// included: a stale graph is a graph of *this* collection from before a
+    /// write, which is a bounded loss and the whole point of the window. A
+    /// graph of a **previous collection of the same name** is not that. It
+    /// describes chunks that no longer exist, so it is no answer at all, and
+    /// nothing about it expires. Declining here is enough to be rid of it —
+    /// the caller falls through to a build, and installing replaces the entry.
+    fn serve(&self, shadow: &CollectionMeta, rule: Serve) -> Option<Access> {
         let mut entries = self.entries.lock();
-        let entry = entries.map.get_mut(&collection)?;
+        let entry = entries.map.get_mut(&shadow.id)?;
+        if entry.created != shadow.created {
+            return None;
+        }
         let usable = match rule {
             Serve::Anything => true,
             // Serving a stale graph is bounded recall loss on new documents,
@@ -465,7 +489,12 @@ impl IndexCache {
     /// bound as the 30-second staleness window, with a longer clock.
     ///
     /// Anything unreadable is deleted and `None` returned: a corrupt snapshot
-    /// is discarded, not trusted, and the ordinary build path takes over.
+    /// is discarded, not trusted, and the ordinary build path takes over. That
+    /// now includes a snapshot left by a *previous* collection of this name —
+    /// [`HnswIndex::load`] refuses one whose `created` is not this shadow's —
+    /// which is the case the count check above cannot see, because an orphan
+    /// whose count happens to match would otherwise be adopted as **fresh**
+    /// and serve until a vector write bumped the generation.
     fn try_snapshot(
         &self,
         engine: &Engine,
@@ -478,7 +507,7 @@ impl IndexCache {
         if !path.is_dir() {
             return None;
         }
-        let index = match HnswIndex::load(&path, metric, dim) {
+        let index = match HnswIndex::load(&path, metric, dim, shadow.created) {
             Ok(index) => index,
             Err(e) => {
                 tracing::warn!(error = %e, ?path, "discarding an unusable HNSW snapshot");
@@ -499,7 +528,7 @@ impl IndexCache {
             // clock: the next access falls through to a rebuild.
             (u64::MAX, Instant::now() - MAX_STALENESS)
         };
-        Some(Entry::new(Decision::Index(Arc::new(index)), generation, decided))
+        Some(Entry::new(Decision::Index(Arc::new(index)), generation, shadow.created, decided))
     }
 
     fn decide(
@@ -546,8 +575,104 @@ impl IndexCache {
         }
         self.builds.lock().remove(&collection);
         if let Some(path) = self.snapshot_path(collection) {
-            let _ = std::fs::remove_dir_all(&path);
+            // Removing a directory is filesystem work, and this is reached from
+            // a request handler and from a change consumer, both on runtime
+            // workers. `blocking` is what the build above already goes through,
+            // and for the same reason: an async worker held on I/O is what
+            // stalled `/metrics` and flapped membership on a live cluster.
+            kimmy_storage::blocking(|| {
+                let _ = std::fs::remove_dir_all(&path);
+            });
         }
+    }
+
+    /// Delete every snapshot on disk that `live` does not name.
+    ///
+    /// The complement to [`Self::invalidate`] and [`Self::forget_absent`],
+    /// which between them cover a collection this process saw go. A snapshot
+    /// orphaned by a drop this node was not running for, or by one whose entry
+    /// was lost to a lagging consumer, is reached by neither: nothing looks at
+    /// a directory until something asks for that collection, and nothing asks
+    /// for a collection that no longer exists. So it sits there, costing disk,
+    /// indefinitely.
+    ///
+    /// Run once at startup, before anything can be building. A name that is
+    /// not sixteen hex digits is logged and **left alone** — this deletes
+    /// directories, and the one thing it must never do is act on a name it
+    /// does not understand.
+    ///
+    /// Returns how many it removed, for the line that says so.
+    pub fn sweep_snapshots(&self, live: &HashSet<CollectionId>) -> usize {
+        let Some(dir) = &self.snapshot_dir else { return 0 };
+        let entries = match std::fs::read_dir(dir) {
+            Ok(entries) => entries,
+            // No directory yet is the ordinary state of a node that has never
+            // built a graph, and not something to complain about.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return 0,
+            Err(e) => {
+                tracing::warn!(error = %e, ?dir, "could not read the HNSW snapshot directory");
+                return 0;
+            }
+        };
+
+        let mut removed = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            // `save` stages a rebuild at `<id>.build` beside the snapshot and
+            // renames over it, so a build cut short by a crash leaves one
+            // here. It belongs to the same collection and lives or dies with
+            // it; left unrecognised it would be warned about at every start,
+            // for a collection that will never rebuild it away.
+            let stem = name.strip_suffix(".build").unwrap_or(&name);
+            let parsed = (stem.len() == 16 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
+                .then(|| u64::from_str_radix(stem, 16).ok())
+                .flatten();
+            let Some(id) = parsed else {
+                tracing::warn!(
+                    snapshot = %name,
+                    "left a file in the HNSW snapshot directory that is not a collection id"
+                );
+                continue;
+            };
+            if live.contains(&CollectionId(id)) {
+                continue;
+            }
+            match std::fs::remove_dir_all(entry.path()) {
+                Ok(()) => {
+                    removed += 1;
+                    debug!(
+                        snapshot = %name,
+                        "removed an HNSW snapshot for a collection this node no longer holds"
+                    );
+                }
+                Err(e) => tracing::warn!(error = %e, snapshot = %name, "could not remove it"),
+            }
+        }
+        removed
+    }
+
+    /// Forget every cached collection that `live` does not name.
+    ///
+    /// [`Self::invalidate`] is told which collection went away. This is for a
+    /// caller that has lost track — a change consumer told it missed entries —
+    /// and reconciles instead: a graph held for a collection this node no
+    /// longer has is precisely what a drop should already have removed, so it
+    /// goes, snapshot and all. Returns how many were forgotten, for the log
+    /// line that says so.
+    ///
+    /// It can also forget a collection created and first searched in the
+    /// instant between `live` being read and this being called. That costs a
+    /// rebuild, which is what an eviction under the budget costs anyway.
+    pub fn forget_absent(&self, live: &HashSet<CollectionId>) -> usize {
+        let gone: Vec<CollectionId> = {
+            let entries = self.entries.lock();
+            entries.map.keys().copied().filter(|id| !live.contains(id)).collect()
+        };
+        for id in &gone {
+            self.invalidate(*id);
+        }
+        gone.len()
     }
 
     pub fn len(&self) -> usize {
@@ -614,23 +739,7 @@ mod tests {
     /// One more vector collection in the same engine, holding `count`
     /// vectors of the same shape `setup` writes.
     fn add_collection(engine: &Engine, name: &str, count: usize) -> CollectionMeta {
-        engine.create_collection("app", name).unwrap();
-        engine
-            .configure_vectors(
-                "app",
-                name,
-                VectorConfig {
-                    fields: vec!["body".into()],
-                    provider: ProviderConfig::Byo {},
-                    dim: 4,
-                    metric: Metric::Cosine,
-                    document_prefix: None,
-                    query_prefix: None,
-                    chunk: ChunkConfig::default(),
-                },
-            )
-            .unwrap();
-        let shadow = engine.vector_collection("app", name).unwrap().unwrap();
+        let shadow = empty_collection(engine, name);
         for i in 0..count {
             let source = DocId::Int64(i as i64);
             engine
@@ -648,6 +757,28 @@ mod tests {
                 .unwrap();
         }
         shadow
+    }
+
+    /// A vector collection with nothing written to it yet, so its generation
+    /// counter has not moved.
+    fn empty_collection(engine: &Engine, name: &str) -> CollectionMeta {
+        engine.create_collection("app", name).unwrap();
+        engine
+            .configure_vectors(
+                "app",
+                name,
+                VectorConfig {
+                    fields: vec!["body".into()],
+                    provider: ProviderConfig::Byo {},
+                    dim: 4,
+                    metric: Metric::Cosine,
+                    document_prefix: None,
+                    query_prefix: None,
+                    chunk: ChunkConfig::default(),
+                },
+            )
+            .unwrap();
+        engine.vector_collection("app", name).unwrap().unwrap()
     }
 
     #[test]
@@ -922,7 +1053,7 @@ mod tests {
         let (engine, shadow) = reopen(&dir);
         let cache = snapshot_cache(&dir);
         let path = cache.snapshot_path(shadow.id).unwrap();
-        assert!(crate::index::HnswIndex::load(&path, Metric::Cosine, 8).is_err());
+        assert!(crate::index::HnswIndex::load(&path, Metric::Cosine, 8, shadow.created).is_err());
         // Through the cache, the mismatch falls back cleanly too.
         assert!(matches!(
             cache.access(&engine, &shadow, Metric::Cosine, 4),
@@ -940,6 +1071,151 @@ mod tests {
 
         cache.invalidate(shadow.id);
         assert!(!path.exists(), "dropped vectors must take their snapshot with them");
+    }
+
+    #[test]
+    fn a_snapshot_left_by_a_previous_collection_of_the_same_name_is_refused() {
+        // A collection id is derived from its name, so a name dropped and used
+        // again lands on the same snapshot path. Nothing about the old graph's
+        // shape says it is the wrong one: same metric, same width, and if the
+        // vector counts happen to agree it is adopted as *fresh* and serves
+        // until a write bumps the generation — on a collection that is only
+        // read, indefinitely, and again after every restart. So the graph
+        // records which incarnation it was built for.
+        let (engine, first, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &first, Metric::Cosine, 4);
+        let path = cache.snapshot_path(first.id).unwrap();
+        assert!(path.is_dir(), "the build should have been persisted");
+
+        engine.drop_collection("app", "docs").unwrap();
+        let second = add_collection(&engine, "docs", 70);
+        assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+        assert_ne!(second.created, first.created, "the incarnation does not");
+        assert!(path.is_dir(), "the orphan is sitting where the new graph's would go");
+
+        assert!(
+            crate::index::HnswIndex::load(&path, Metric::Cosine, 4, second.created).is_err(),
+            "a graph built for a previous collection of this name must not be trusted"
+        );
+
+        // And through the cache: 70 is the new collection's own count, 60 the
+        // orphan's, so the size says which graph answered.
+        let fresh = snapshot_cache(&dir);
+        let Access::Approximate(index) = fresh.access(&engine, &second, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        assert_eq!(index.len(), 70, "the orphan was adopted instead of a rebuild");
+    }
+
+    #[test]
+    fn a_resident_graph_does_not_outlive_the_collection_it_was_built_for() {
+        // The in-memory half of the same problem, and the sharper one, because
+        // nothing on this path expires. The graph is resident when the drop is
+        // applied; the name is used again before the consumer catches up, so
+        // the entry is still there under an id derived from that name. The
+        // generation counter is keyed by the id and only ever counts up, and
+        // the new collection has had nothing written to it — so the entry
+        // matches on generation and would serve the previous collection's
+        // graph for as long as that stays true, which is indefinitely.
+        let (engine, first, _dir) = setup(60);
+        let cache = IndexCache::with_min_vectors(10);
+        let Access::Approximate(built) = cache.access(&engine, &first, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        assert_eq!(built.len(), 60);
+        let generation = engine.vector_generation(first.id);
+
+        engine.drop_collection("app", "docs").unwrap();
+        let second = empty_collection(&engine, "docs");
+        assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+        assert_ne!(second.created, first.created, "the incarnation does not");
+        assert_eq!(
+            engine.vector_generation(second.id),
+            generation,
+            "nothing has been written, so nothing has bumped the generation"
+        );
+        assert!(cache.contains(second.id), "the consumer has not caught up yet");
+
+        // The honest answer for a collection holding no vectors is the exact
+        // scan. Anything else is the dead graph still answering.
+        assert!(
+            matches!(cache.access(&engine, &second, Metric::Cosine, 4), Access::Exact),
+            "a graph built for the previous collection of this name served a search on the new one"
+        );
+    }
+
+    #[test]
+    fn the_sweep_removes_snapshots_this_node_has_no_collection_for() {
+        // The complement to invalidation: a snapshot orphaned while this node
+        // was not running is reached by nothing, because nothing opens a
+        // snapshot directory until something asks for that collection, and
+        // nothing asks for one that no longer exists.
+        let (engine, kept, dir) = setup(60);
+        let gone = add_collection(&engine, "gone", 60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &kept, Metric::Cosine, 4);
+        cache.access(&engine, &gone, Metric::Cosine, 4);
+        let kept_path = cache.snapshot_path(kept.id).unwrap();
+        let gone_path = cache.snapshot_path(gone.id).unwrap();
+
+        // A name the sweep cannot read as a collection id. It removes
+        // directories, so the one thing it must never do is act on a name it
+        // does not understand.
+        let stranger = dir.path().join("hnsw").join("notes.txt");
+        std::fs::write(&stranger, b"not a collection id").unwrap();
+
+        // What a build interrupted by a crash leaves: `save` stages under
+        // `<id>.build` and renames over the snapshot. A collection that is
+        // never searched again never rebuilds, so nothing else would ever
+        // clear one — and warning about it at every start would say a file is
+        // unrecognised when it is this crate's own.
+        let kept_staging = kept_path.with_extension("build");
+        let gone_staging = gone_path.with_extension("build");
+        std::fs::create_dir_all(&kept_staging).unwrap();
+        std::fs::create_dir_all(&gone_staging).unwrap();
+
+        engine.drop_collection("app", "gone").unwrap();
+        let mut live: HashSet<CollectionId> = HashSet::new();
+        for db in engine.list_databases().unwrap() {
+            for coll in engine.list_collections(&db.name).unwrap() {
+                live.insert(coll.id);
+            }
+        }
+
+        // A fresh cache, as a restart has: nothing resident, only what is on
+        // disk.
+        let restarted = snapshot_cache(&dir);
+        assert_eq!(restarted.sweep_snapshots(&live), 2, "the snapshot and its staging directory");
+        assert!(!gone_path.exists(), "a dropped collection's snapshot must go");
+        assert!(!gone_staging.exists(), "and the staging directory beside it");
+        assert!(kept_path.is_dir(), "a live collection's must not");
+        assert!(kept_staging.is_dir(), "nor its staging directory");
+        assert!(stranger.exists(), "an unrecognised name must be left alone, not deleted");
+    }
+
+    #[test]
+    fn reconciling_forgets_the_graphs_of_collections_this_node_no_longer_holds() {
+        // What a consumer told it missed entries has left: it cannot say which
+        // collections went away, only which are still here. Anything held for
+        // a collection that is not must go, snapshot included, and everything
+        // else must survive — a reconciliation that cleared the cache would
+        // charge every live collection a rebuild to punish one dead one.
+        let (engine, gone, dir) = setup(60);
+        let kept = add_collection(&engine, "kept", 60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &gone, Metric::Cosine, 4);
+        cache.access(&engine, &kept, Metric::Cosine, 4);
+        let stranded = cache.snapshot_path(gone.id).unwrap();
+        assert!(stranded.is_dir(), "the build should have been persisted");
+
+        let live: HashSet<CollectionId> = [kept.id].into_iter().collect();
+        assert_eq!(cache.forget_absent(&live), 1);
+
+        assert!(!cache.contains(gone.id), "a collection this node lacks must not stay resident");
+        assert!(!stranded.exists(), "and must not leave its snapshot behind");
+        assert!(cache.contains(kept.id), "a live collection must keep its graph");
+        assert!(cache.snapshot_path(kept.id).unwrap().is_dir(), "and its snapshot");
     }
 
     #[test]

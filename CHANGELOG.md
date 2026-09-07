@@ -14,6 +14,83 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ### Fixed
 
+- **A dropped collection now takes its vector index with it, and a snapshot
+  can no longer outlive the collection it describes.** Dropping a collection
+  or a database removed the documents and the vectors, but nothing told the
+  index cache, so the HNSW graph built over those vectors stayed in memory and
+  its snapshot stayed on disk for the life of the process — for data that no
+  longer existed. The graph is keyed by the shadow collection that holds the
+  vectors, and that shadow is removed in the same transaction as its parent,
+  so after the drop there was no id left to forget it under. A member with no
+  user data at all was seen holding 353 MiB of resident graphs and 280 MiB of
+  snapshots twelve hours after the last collection had been dropped, stable
+  rather than draining, against peers reporting a cache of zero. Both drops now
+  resolve the shadows beforehand and forget them afterwards, a database drop
+  forgetting every vector-enabled collection it removes rather than one.
+
+  **The replicated half is closed too, and it is the half that showed on a
+  cluster.** A drop that arrives from a peer is applied by the sync path, which
+  runs no route, so only the member the request was typed at forgot anything
+  and every other member kept the graph — which is why the member that had
+  owned the vectors was the one carrying the memory. Each node now runs a
+  consumer over the change feed it already publishes, alongside the one that
+  keeps token state honest. It reads committed entries only and cannot affect
+  what a sync round applies, witnesses or reports. A drop reaches it as
+  history rather than as news, so it treats the entry as a question — is this
+  collection still here? — and forgets nothing that is.
+
+  **A recreated collection no longer inherits its predecessor's graph.** A
+  collection id is derived from its name, so a name dropped and used again gets
+  the same id, the same cache key and the same snapshot path. An orphaned
+  snapshot sitting there was adopted on the new collection's first search, and
+  nothing about its shape gave it away: same metric, same width, and if the
+  vector counts happened to agree it was adopted as *fresh* — serving until a
+  vector write bumped the generation, which on a collection that is only read
+  is indefinitely, and again after every restart. The resident graph had the
+  same hole and a wider one: the generation counter is keyed by the derived id
+  and only ever counts up, so a recreated collection with nothing written to it
+  yet matched the entry its predecessor left behind, and the staleness window
+  never opened because nothing looked stale. No wrong data could come of
+  either, because scores are recomputed from the stored vectors and candidates
+  are resolved against the live collection; but recall was not merely reduced,
+  and where the recreated collection used different document ids **every
+  candidate resolved to nothing and search returned empty over thousands of
+  live vectors**. A graph now records the incarnation it was built for, on disk
+  and in memory, and is refused when that does not match — exactly as a
+  snapshot from a different metric or width already was. This also covers the
+  case no consumer can: a node that resyncs past the oplog horizon never sees
+  the drop entry at all.
+
+  **Snapshot format 2.** Because the incarnation is a new field, every snapshot
+  written by an earlier build is refused and rebuilt on the first search that
+  wants it — the ordinary cost of a format change. And because a format
+  mismatch is only noticed when something opens the directory, which never
+  happens for a collection nobody recreates, each node now sweeps its `hnsw/`
+  directory once at startup and removes snapshots it holds no collection for —
+  including the staging directory a build interrupted by a crash leaves behind,
+  which nothing else would ever clear. A name it cannot read as a collection id
+  is logged and left alone.
+  **Upgrading therefore disposes of snapshots stranded by earlier drops**, at
+  the cost of one rebuild per collection on its next search.
+
+  **Storing vectors for a document no longer discards the collection's graph.**
+  `PUT .../docs/{id}/vectors` and its delete dropped the cached graph and, with
+  it, the snapshot — once per document written. The write already bumps the
+  collection's vector generation, which is what the search path reads to notice
+  it and is all the embedding worker does for the identical write, so the BYO
+  path now behaves as the worker path and as [Vectors](docs/vectors.md)
+  describes. It also removes a sharper edge: re-embedding one document usually
+  replaces its chunks with the same number of chunks, and the discarded
+  snapshot would then be loaded back as fresh at the current generation,
+  defeating the staleness window for the very write that had just happened.
+
+  What an operator should expect: `kimmy_vector_index_cache_bytes` falls to the
+  graphs of collections that still exist, within a replication round on every
+  member rather than on one; the `hnsw/` directory beside the database file
+  loses the dropped collections' snapshots at the next start; and the first
+  search on each surviving vector collection after the upgrade pays one
+  rebuild.
+
 - **A Decimal128 document is filed unkeyed on the member that accepts it, not
   only on its peers.** A document holding a `Decimal128` at an indexed path,
   written over HTTP, was stored on the accepting member and filed under a

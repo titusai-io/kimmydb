@@ -1,15 +1,19 @@
 //! Vector configuration and search routes.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use axum::extract::{Path, State};
 use axum::{Json, http::StatusCode};
 use kimmy_auth::Action;
-use kimmy_core::{ChunkConfig, DocId, Metric, ProviderConfig, VectorConfig};
+use kimmy_core::{
+    ChunkConfig, CollectionId, DocId, Metric, OpKind, ProviderConfig, VectorConfig, vector_meta,
+};
 use kimmy_vector::Access;
 use kimmy_vector::search::{self, Hit, SearchOptions};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tracing::warn;
 
 use crate::error::{ApiError, ErrorCode, LogLevel};
 use crate::exec::QueryStats;
@@ -253,6 +257,144 @@ pub async fn disable_vectors(
 }
 
 // ---------------------------------------------------------------------------
+// Forgetting a dropped collection's graph
+// ---------------------------------------------------------------------------
+
+/// Forget a dropped collection's vector index, however the drop reached this
+/// node.
+///
+/// [`crate::exec::drop_collection`], [`crate::exec::drop_database`] and
+/// [`disable_vectors`] forget synchronously, which is what makes a single node
+/// correct with no wiring at all. This is the other half, and the split is the
+/// one ADR-052 draws for token state. A drop that arrives by replication is
+/// applied by the sync path on the member that receives it, and that member
+/// never runs the route — so without this it holds the graph in memory and the
+/// snapshot on disk for a collection that no longer exists, for the life of
+/// the process. Seen on a three-member cluster twelve hours after every user
+/// collection had been dropped: 353 MiB of resident graphs and 280 MiB of
+/// snapshots on the member that had held the vectors, against nothing on its
+/// two peers, and stable rather than draining.
+///
+/// It reads the entry stream the apply path already publishes and touches
+/// nothing else. It cannot fail a sync round, change what an apply decides, or
+/// change what is witnessed: an entry reaches here only once it is committed
+/// and published, and what happens to it afterwards is this task's alone.
+///
+/// Subscribing happens **here**, not inside the returned future, so the
+/// caller's `tokio::spawn` cannot miss an entry published between the call and
+/// the task being polled for the first time.
+pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()> + use<> {
+    let mut events = state.engine.subscribe();
+    let state = Arc::clone(state);
+
+    async move {
+        loop {
+            match events.recv().await {
+                Ok(entry) if entry.kind == OpKind::DropCollection => {
+                    // The entry names what was dropped: the shadow itself when
+                    // the vectors were discarded on their own, the parent when
+                    // a whole collection went. A parent's drop takes its shadow
+                    // in the same transaction and mints no entry for it — but
+                    // ids are derived from names, so the shadow's is computable
+                    // from the name this entry does carry. Checking an id that
+                    // never held a graph costs a metadata read, so both go.
+                    forget_if_gone(&state, entry.collection);
+                    if let Some(body) = &entry.body
+                        && let Ok(target) =
+                            bson::deserialize_from_slice::<kimmy_core::CollectionRef>(body)
+                    {
+                        forget_if_gone(
+                            &state,
+                            CollectionId::derive(
+                                &target.db,
+                                &vector_meta::shadow_name(&target.name),
+                            ),
+                        );
+                    }
+                }
+                Ok(_) => {}
+                // Missed entries: which collections were dropped is unknown, so
+                // the cache is reconciled against what this node actually holds
+                // rather than trusted. Clearing it outright, as the token-state
+                // consumer does, is not the equivalent here — that would delete
+                // every snapshot on the node and charge a rebuild for
+                // collections that are perfectly alive.
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    // A read transaction per database, on a task that is
+                    // otherwise only ever waiting: off the worker, like every
+                    // other storage step.
+                    match kimmy_storage::blocking(|| live_collections(&state.engine)) {
+                        Ok(live) => {
+                            let forgotten = state.vectors.forget_absent(&live);
+                            warn!(
+                                missed,
+                                forgotten,
+                                "vector index consumer fell behind; reconciled the cache \
+                                 against the collections this node holds"
+                            );
+                        }
+                        Err(e) => warn!(
+                            missed,
+                            error = %e,
+                            "vector index consumer fell behind and could not list this \
+                             node's collections; a collection dropped in the meantime may \
+                             keep its index and its snapshot until this node restarts"
+                        ),
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    }
+}
+
+/// Forget a collection's graph, but **only if the collection really is gone**.
+///
+/// A drop entry reaches this task as history, not as news: the feed is a
+/// bounded ring, and a burst of writes — five hundred chunks of one document
+/// is five hundred entries — can put a drop arbitrarily far behind the writer.
+/// By the time it arrives the name may have been created again, and because a
+/// collection id is derived from its name the new collection has the same id,
+/// the same cache key and the same snapshot path. Acting on the entry alone
+/// would then delete a live index that nobody dropped.
+///
+/// So the entry only says which id to *look at*; what decides is whether this
+/// node still holds a collection under it. That is a read of state the drop
+/// has already committed, and it makes this task's correctness independent of
+/// how far behind it is — and of whether any particular drop is announced at
+/// all, which is not this crate's decision to depend on.
+fn forget_if_gone(state: &SharedState, id: CollectionId) {
+    match kimmy_storage::blocking(|| state.engine.collection_by_id(id)) {
+        Ok(None) => state.vectors.invalidate(id),
+        Ok(Some(_)) => {}
+        Err(e) => warn!(
+            error = %e,
+            collection = id.0,
+            "could not tell whether a dropped collection is gone; leaving its vector index \
+             in place, which costs memory rather than answers"
+        ),
+    }
+}
+
+/// Every collection id this node holds, shadow collections included.
+///
+/// Deliberately not `Engine::all_collection_ids`, which hides a shadow whose
+/// parent is present (ADR-138). The ids it hides are exactly the ones a vector
+/// index is keyed by, so reconciling against it would forget every live graph
+/// on the node.
+pub fn live_collections(
+    engine: &kimmy_storage::Engine,
+) -> Result<HashSet<CollectionId>, kimmy_storage::StorageError> {
+    let mut ids = HashSet::new();
+    for db in engine.list_databases()? {
+        for coll in engine.list_collections(&db.name)? {
+            ids.insert(coll.id);
+        }
+    }
+    Ok(ids)
+}
+
+// ---------------------------------------------------------------------------
 // Client-supplied vectors
 // ---------------------------------------------------------------------------
 
@@ -348,8 +490,15 @@ pub async fn put_document_vectors(
         .collect();
 
     let stored = records.len();
+    // No cache invalidation: `put_vectors` bumps the collection's vector
+    // generation, which is what the search path reads to notice a write, and
+    // it is all the embedding worker does for the identical write. Forgetting
+    // the entry outright would also delete the snapshot on every stored
+    // document — and, worse, a re-embed that replaces a document's chunks with
+    // the same number of chunks would then load that snapshot back as *fresh*
+    // at the current generation, defeating the staleness window for exactly
+    // the write that just happened.
     state.engine.put_vectors(&shadow, &doc_id, &records)?;
-    state.vectors.invalidate(shadow.id);
 
     Ok(Json(json!({ "stored": stored, "_id": id })))
 }
@@ -386,8 +535,10 @@ pub async fn delete_document_vectors(
     let Some(shadow) = state.engine.vector_collection(&db, &coll)? else {
         return Err(ApiError::not_found("vector collection is missing"));
     };
+    // No cache invalidation, for the reason `put_document_vectors` gives:
+    // `delete_vectors` bumps the generation, and that is the whole of what a
+    // write owes the index.
     let removed = state.engine.delete_vectors(&shadow, &doc_id)?;
-    state.vectors.invalidate(shadow.id);
     Ok(Json(json!({ "deleted": removed })))
 }
 
