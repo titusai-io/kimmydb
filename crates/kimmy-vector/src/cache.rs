@@ -917,6 +917,69 @@ mod tests {
     }
 
     #[test]
+    fn a_replicated_chunk_write_makes_the_graph_stale() {
+        // A member that does not own a collection's embedding receives every
+        // chunk by replication, and the apply path is a document write into
+        // the shadow collection rather than `put_vectors`. If that write left
+        // the generation alone, the entry built before it would match the
+        // counter forever and `serve` would call it fresh at every access —
+        // the staleness window never opening because, by the counter, nothing
+        // had happened.
+        use kimmy_core::{NodeId, OpKind, OplogEntry, Stamp};
+
+        let (engine, shadow, _dir) = setup(60);
+        let cache = IndexCache::with_min_vectors(10);
+        let Access::Approximate(first) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        let built_at = engine.vector_generation(shadow.id);
+        assert_eq!(cache.entries.lock().map[&shadow.id].generation, built_at);
+
+        // The chunk as a peer would send it: the vector record as
+        // `put_vectors` stores it, `_id` and all, stamped by a node this
+        // engine has never heard from, into the shadow collection by id.
+        let source = DocId::Int64(999);
+        let chunk_id = VectorRecord::id(&source, 0);
+        let record = VectorRecord {
+            source: source.clone(),
+            chunk: 0,
+            source_hlc: Hlc::new(2, 0),
+            vector: vec![1.0, 0.0, 0.0, 0.0],
+            text: "replicated".into(),
+        };
+        let mut body = bson::serialize_to_document(&record).unwrap();
+        body.insert("_id", chunk_id.to_bson());
+        let entry = OplogEntry {
+            stamp: Stamp::new(Hlc::new(9_000_000_000_000, 0), NodeId::from_bytes([9; 16])),
+            kind: OpKind::Replace,
+            collection: shadow.id,
+            doc_id: Some(chunk_id),
+            body: Some(bson::serialize_to_vec(&body).unwrap()),
+        };
+        assert!(engine.apply_remote(&shadow, &entry).unwrap(), "the chunk must have applied");
+        assert_eq!(count_vectors(&engine, &shadow).unwrap(), 61);
+
+        // The counter moved, so the entry is no longer fresh: it is served
+        // only inside the window now, as after a local write.
+        let replicated = engine.vector_generation(shadow.id);
+        assert!(replicated > built_at, "a replicated chunk write must bump the generation");
+
+        // Close the window. Ageing alone does not force a rebuild — an aged
+        // entry whose generation still matches the counter is fresh under
+        // `Serve::Usable`, and that is precisely how the old graph was served
+        // forever. Only the generation mismatch makes this access rebuild.
+        cache.age(shadow.id);
+        let Access::Approximate(second) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "the graph built before the replicated write was served as fresh after it"
+        );
+        assert_eq!(cache.entries.lock().map[&shadow.id].generation, replicated);
+    }
+
+    #[test]
     fn a_stale_index_is_served_until_the_interval_elapses() {
         // Rebuilding on every write would rebuild continuously under load, and
         // each rebuild is O(n log n).

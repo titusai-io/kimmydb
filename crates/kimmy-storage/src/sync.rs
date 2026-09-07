@@ -676,8 +676,9 @@ impl Engine {
     }
 
     /// Commit the open run, if there is one, then do what had to wait for
-    /// the commit: record each applied entry's unique violations and publish
-    /// the run to change streams, in entry order.
+    /// the commit: record each applied entry's unique violations, move the
+    /// vector generation of each shadow collection written, and publish the
+    /// run to change streams, in entry order.
     ///
     /// A commit that fails propagates and drops the pending work with it —
     /// nothing is published for a run that did not land, and the entries come
@@ -3860,6 +3861,65 @@ mod tests {
         assert!(
             b.get_collection("shop", "orders").unwrap().vector.is_none(),
             "turning it off must replicate as well"
+        );
+    }
+
+    #[test]
+    fn a_replicated_chunk_bumps_the_vector_generation_on_the_applier() {
+        // The index cache reads the generation to notice a write. On a member
+        // that does not own a collection's embedding every chunk arrives by
+        // replication, so if only a local `put_vectors` moved the counter a
+        // graph built there would be served as fresh for as long as the
+        // process lived — the 30 s staleness bound docs/vectors.md promises
+        // would not exist on exactly the members reads are routed to.
+        let (a, _da) = engine();
+        let (b, _db) = engine();
+        a.create_collection("shop", "orders").unwrap();
+        a.configure_vectors("shop", "orders", vector_config()).unwrap();
+        sync(&a, &b);
+        let shadow_b = b.vector_collection("shop", "orders").unwrap().unwrap();
+        assert_eq!(b.vector_generation(shadow_b.id), 0, "nothing written yet");
+
+        let shadow_a = a.vector_collection("shop", "orders").unwrap().unwrap();
+        let source = DocId::Int64(1);
+        a.put_vectors(
+            &shadow_a,
+            &source,
+            &[kimmy_core::VectorRecord {
+                source: source.clone(),
+                chunk: 0,
+                source_hlc: Hlc::new(1, 0),
+                vector: vec![1.0, 0.0, 0.0, 0.0],
+                text: "t".into(),
+            }],
+        )
+        .unwrap();
+        sync(&a, &b);
+        assert_eq!(b.count(&shadow_b).unwrap(), 1, "the chunk must have replicated");
+        let after_put = b.vector_generation(shadow_b.id);
+        assert!(after_put > 0, "a replicated chunk write must bump the applier's generation");
+
+        // Peers resend overlapping ranges by design. A re-delivery is
+        // superseded — nothing is written — so nothing has changed for the
+        // index to notice, and the counter must hold still.
+        let entries = a.entries_for_peer(Hlc::ZERO, BATCH).unwrap().entries;
+        let outcome = b.apply_batch(&entries).unwrap();
+        assert_eq!(outcome.applied, 0, "the whole window was already applied");
+        assert_eq!(
+            b.vector_generation(shadow_b.id),
+            after_put,
+            "a superseded re-delivery writes nothing and must not bump"
+        );
+
+        // A replicated delete is a tombstone into the shadow collection. It
+        // removes a chunk from what a search can find, so it has to count
+        // exactly as a local `delete_vectors` does.
+        assert_eq!(a.delete_vectors(&shadow_a, &source).unwrap(), 1);
+        sync(&a, &b);
+        assert_eq!(b.count(&shadow_b).unwrap(), 0, "the tombstone must have replicated");
+        assert!(
+            b.vector_generation(shadow_b.id) > after_put,
+            "a replicated chunk delete must bump the applier's generation"
         );
     }
 
