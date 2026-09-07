@@ -202,6 +202,43 @@ struct Entries {
     /// Collections already warned about outgrowing the whole budget alone, so
     /// a collection that is rebuilt every staleness window warns once.
     warned: HashSet<CollectionId>,
+    /// How many times each collection has been forgotten: the fence between
+    /// a forget and a build that started before it.
+    ///
+    /// A build runs for seconds under its own lock and installs when it is
+    /// done. Forgetting the collection meanwhile removes the entry, the
+    /// build-lock slot and the snapshot — and stops nothing, because the
+    /// builder holds its guard and reads a transaction from before the drop.
+    /// It would install a graph, charge it to the budget and write a
+    /// snapshot for a collection that no longer exists, until eviction or
+    /// the next startup sweep. So a build captures this counter before it
+    /// looks at the snapshot or the store, every forget increments it, and
+    /// [`IndexCache::install`] refuses to install under a counter that has
+    /// moved. Both sides act under the one lock this struct is behind, so
+    /// there is no instant between the compare and the insert for a forget
+    /// to fall into.
+    ///
+    /// Never removed: a forget must be visible to a build that captured the
+    /// counter before it, and clearing the slot would hand the next build a
+    /// zero that looks like the one it started at. Bounded by the number of
+    /// ids ever passed to a forget — the consumer asks about a dropped
+    /// collection's own id as well as its shadow's, so about two per drop —
+    /// at sixteen bytes each.
+    epochs: HashMap<CollectionId, u64>,
+}
+
+impl Entries {
+    /// Where a collection's fence stands now. A collection never forgotten
+    /// is at zero.
+    fn epoch(&self, collection: CollectionId) -> u64 {
+        self.epochs.get(&collection).copied().unwrap_or(0)
+    }
+
+    /// Move the fence: every build of `collection` that captured the epoch
+    /// before this call will decline to install.
+    fn fence(&mut self, collection: CollectionId) {
+        *self.epochs.entry(collection).or_default() += 1;
+    }
 }
 
 /// Per-collection index cache.
@@ -215,7 +252,9 @@ pub struct IndexCache {
     /// caller for the *same* collection finds the lock taken and either
     /// serves what is already cached or waits for this one build. Entries
     /// here are created on first use and removed on `invalidate`, so the map
-    /// is bounded by the number of vector collections.
+    /// is bounded by the number of vector collections. Removing a slot does
+    /// not stop the build holding it — the guard is the builder's own — which
+    /// is what [`Entries::epochs`] is for.
     builds: Mutex<HashMap<CollectionId, Arc<Mutex<()>>>>,
     /// Overridable so tests can exercise the threshold on small fixtures.
     min_vectors: usize,
@@ -412,6 +451,25 @@ impl IndexCache {
             return access;
         }
 
+        // Two things read under one lock before anything slow starts.
+        //
+        // The epoch is the fence `install` compares against: captured here,
+        // ahead of the snapshot load and the build alike, so a forget that
+        // lands during either — a drop committing while the graph is being
+        // built from a read transaction that still sees every vector — is
+        // seen by the install that follows. See [`Entries::epochs`].
+        //
+        // `seen` decides whether the snapshot is worth a look: a process's
+        // first look at this collection tries it before paying the build,
+        // but only on a true miss — an entry that has gone stale means this
+        // process has newer knowledge than any snapshot. Eviction removes
+        // the entry, so an evicted collection comes back this way too, which
+        // is the cheaper of its two ways back.
+        let (epoch, seen) = {
+            let entries = self.entries.lock();
+            (entries.epoch(shadow.id), entries.map.contains_key(&shadow.id))
+        };
+
         // Cloned out in its own statement, so the guard is gone before the
         // hook runs: a hook that parks must not park the lock too.
         #[cfg(test)]
@@ -422,14 +480,8 @@ impl IndexCache {
             }
         }
 
-        // A process's first look at this collection: try the snapshot before
-        // paying the build. Only on a true miss — a cache entry that has gone
-        // stale means this process has newer knowledge than any snapshot.
-        // Eviction removes the entry, so an evicted collection comes back
-        // this way too, which is the cheaper of its two ways back.
-        let seen = self.entries.lock().map.contains_key(&shadow.id);
         if !seen && let Some(entry) = self.try_snapshot(engine, shadow, metric, dim, generation) {
-            return self.install(shadow, entry);
+            return self.install(shadow, entry, epoch);
         }
 
         // Falling back on error keeps the query correct; the alternative is
@@ -438,6 +490,7 @@ impl IndexCache {
             Ok(decision) => self.install(
                 shadow,
                 Entry::new(decision, generation, shadow.created, metric, dim, Instant::now()),
+                epoch,
             ),
             Err(e) => {
                 debug!(error = %e, "falling back to an exact scan");
@@ -510,12 +563,44 @@ impl IndexCache {
     /// collection into an exact scan for want of memory the budget was only
     /// ever an estimate of, and the operator is warned so the budget can be
     /// raised or the collection reconsidered.
-    fn install(&self, shadow: &CollectionMeta, entry: Entry) -> Access {
+    ///
+    /// Nothing is installed when the collection has been forgotten since
+    /// `epoch` was captured — see [`Entries::epochs`]. The graph is dropped
+    /// here, and the snapshot the build may have just written goes with it,
+    /// along with the generation recorded for it: `decide` saves and records
+    /// after the forget removed both, so a fenced build is the one thing that
+    /// can leave either behind. The query is answered with the exact scan,
+    /// which is what a search on a collection that has been dropped or
+    /// replaced resolves to anyway — the graph and the verdict alike were
+    /// decided over vectors that are no longer the collection's. A build of
+    /// the collection now standing under the id, if one has started since,
+    /// has its own lock and its own epoch, and is fenced by nothing here; the
+    /// directory removal can cross its save, and costs a snapshot reload its
+    /// rebuild, as `invalidate`'s own removal already could.
+    fn install(&self, shadow: &CollectionMeta, entry: Entry, epoch: u64) -> Access {
         let access = entry.access();
         let bytes = entry.bytes();
         let budget = self.max_bytes() as usize;
 
         let mut entries = self.entries.lock();
+        if entries.epoch(shadow.id) != epoch {
+            drop(entries);
+            drop(entry);
+            debug!(
+                collection = %shadow.name,
+                "the collection was forgotten while its index was being built; discarding \
+                 the build"
+            );
+            self.saved_at.lock().remove(&shadow.id);
+            if let Some(path) = self.snapshot_path(shadow.id) {
+                // Filesystem work, and this is reached from a request handler
+                // on a runtime worker: off the worker, as `invalidate` is.
+                kimmy_storage::blocking(|| {
+                    let _ = std::fs::remove_dir_all(&path);
+                });
+            }
+            return Access::Exact;
+        }
         if let Some(old) = entries.map.remove(&shadow.id) {
             entries.resident -= old.bytes();
         }
@@ -695,6 +780,13 @@ impl IndexCache {
     /// The snapshot goes with it: the caller is telling us the vectors this
     /// graph described no longer exist, and a snapshot that outlived them
     /// would be adopted by the next restart.
+    ///
+    /// So does a build in progress, at the moment it would install: removing
+    /// the entry and the build-lock slot reaches nothing that is already
+    /// running, and a build that began before the drop would otherwise
+    /// install its graph and write its snapshot afterwards. The epoch is
+    /// moved under the same lock the entry is removed under, so a build
+    /// cannot install between the two — see [`Entries::epochs`].
     pub fn invalidate(&self, collection: CollectionId) {
         {
             let mut entries = self.entries.lock();
@@ -702,6 +794,7 @@ impl IndexCache {
                 entries.resident -= entry.bytes();
             }
             entries.warned.remove(&collection);
+            entries.fence(collection);
         }
         self.builds.lock().remove(&collection);
         self.saved_at.lock().remove(&collection);
@@ -742,6 +835,23 @@ impl IndexCache {
     /// already accepts, and it costs a rebuild, never a wrong answer: `serve`
     /// and `HnswIndex::load` refuse the other incarnation regardless.
     ///
+    /// A build in progress is fenced on this path as on the other, whether
+    /// or not anything was found to forget: the epoch moves on every call.
+    /// The build that matters here holds nothing resident yet — it is the
+    /// one a search on the *previous* collection of this name started, still
+    /// running on a read transaction from before the drop — so whether the
+    /// map held an entry says nothing about it, and comparing on what was
+    /// found would let exactly that build install a graph stamped with the
+    /// old incarnation under the live id, and write its snapshot. `serve`
+    /// would decline the graph at the next search and that search's build
+    /// would replace both; but a collection searched only on other members
+    /// has no next search here, and the resident bytes and the directory
+    /// would stay until eviction or the next startup sweep. One rule is
+    /// easier to hold than two: a forget fences every build that started
+    /// before it. The cost is a build of the *live* incarnation that happens
+    /// to be under way when a late drop entry arrives, which is discarded and
+    /// paid again at the next search — a rebuild, never a wrong answer.
+    ///
     /// Returns whether anything was forgotten, resident or on disk.
     pub fn forget_unless_created(&self, collection: CollectionId, live: Option<Hlc>) -> bool {
         let Some(created) = live else {
@@ -761,6 +871,7 @@ impl IndexCache {
                 entries.warned.remove(&collection);
                 forgot = true;
             }
+            entries.fence(collection);
         }
         if forgot {
             // The generation a snapshot was written at vouches for the
@@ -919,6 +1030,18 @@ impl IndexCache {
     /// It can also forget a collection created and first searched in the
     /// instant between `live` being read and this being called. That costs a
     /// rebuild, which is what an eviction under the budget costs anyway.
+    ///
+    /// A build in flight for a collection `live` does not name is fenced as
+    /// well, though it holds no entry to be found by the walk above: the
+    /// drop it straddles is one this node never read, so no other forget
+    /// will ever reach it, and it would install its graph under the dead id
+    /// once the reconciliation had passed. Every build-lock slot whose id is
+    /// absent has its epoch moved and its saved generation cleared — a slot
+    /// exists for every collection built here, so a build in flight has one
+    /// — and the install that follows discards the graph and the snapshot
+    /// it wrote. A snapshot already on disk for such an id is the sweep's,
+    /// which the caller runs next. Fenced builds are not counted in the
+    /// return value: nothing was held to forget.
     pub fn forget_absent(&self, live: &HashMap<CollectionId, Hlc>) -> usize {
         let gone: Vec<(CollectionId, Option<Hlc>)> = {
             let entries = self.entries.lock();
@@ -934,6 +1057,33 @@ impl IndexCache {
         };
         for (id, live) in &gone {
             self.forget_unless_created(*id, *live);
+        }
+
+        // Read after the loop, so a slot `invalidate` just removed is not
+        // fenced twice, and released before `entries` is taken: the two
+        // locks are never nested anywhere, and are not here either. The
+        // slots go as `invalidate` removes them — a build holding one keeps
+        // its own guard and is fenced regardless, and a dead id's slot would
+        // otherwise sit in the map until a restart.
+        let building: Vec<CollectionId> = {
+            let mut builds = self.builds.lock();
+            let absent: Vec<CollectionId> =
+                builds.keys().filter(|id| !live.contains_key(id)).copied().collect();
+            for id in &absent {
+                builds.remove(id);
+            }
+            absent
+        };
+        if !building.is_empty() {
+            let mut entries = self.entries.lock();
+            for id in &building {
+                entries.fence(*id);
+            }
+            drop(entries);
+            let mut saved_at = self.saved_at.lock();
+            for id in &building {
+                saved_at.remove(id);
+            }
         }
         gone.len()
     }
@@ -2034,6 +2184,181 @@ mod tests {
             assert_eq!(rebuilt.len(), 61, "the rebuild should see the write");
         });
         assert_eq!(gate.builds.load(Ordering::SeqCst), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // A forget fences every build that started before it
+    // -----------------------------------------------------------------------
+
+    /// Everything a fenced build must not leave behind: no entry, no
+    /// generation recorded for a snapshot, no snapshot, nothing resident.
+    fn assert_nothing_installed(cache: &IndexCache, collection: CollectionId) {
+        assert!(!cache.contains(collection), "a build fenced by a forget installed its entry");
+        assert!(
+            !cache.saved_at.lock().contains_key(&collection),
+            "a fenced build left the generation it saved its snapshot at"
+        );
+        if let Some(path) = cache.snapshot_path(collection) {
+            assert!(!path.exists(), "a fenced build left its snapshot on disk");
+        }
+        assert_eq!(cache.resident_bytes(), 0, "a fenced build was charged to the budget");
+    }
+
+    #[test]
+    fn a_build_that_outlives_a_drop_installs_nothing() {
+        // The drop route forgets the collection after the drop commits, and
+        // forgetting removes the entry, the build-lock slot and the snapshot.
+        // None of that reaches a build already running: it holds its own
+        // guard and reads a transaction from before the drop, so it would
+        // build the graph, save it, and install both under the dead id. The
+        // vectors are left in the store here for the same reason — the
+        // build's read view still sees every one of them.
+        let (engine, a, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, a.id);
+
+        std::thread::scope(|s| {
+            let result = timed_access(s, &cache, &engine, &a);
+            gate.wait_for_build_to_start();
+            cache.invalidate(a.id);
+            gate.release();
+
+            let served = result.recv_timeout(PATIENCE).expect("the fenced build never returned");
+            assert!(
+                matches!(served, Access::Exact),
+                "a build fenced by a drop must answer with the exact scan, not its graph"
+            );
+        });
+        assert_nothing_installed(&cache, a.id);
+        assert_eq!(gate.builds.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_verdict_that_outlives_a_drop_installs_nothing() {
+        // The same race starting just after the drop decides "too small" over
+        // whatever the read view holds. A verdict costs no bytes and so is
+        // never evicted: installed under a dead id it would sit there for
+        // the life of the process.
+        let (engine, a, _dir) = setup(5);
+        let cache = IndexCache::with_min_vectors(10);
+        let gate = Gate::install(&cache, a.id);
+
+        std::thread::scope(|s| {
+            let result = timed_access(s, &cache, &engine, &a);
+            gate.wait_for_build_to_start();
+            cache.invalidate(a.id);
+            gate.release();
+            assert!(matches!(
+                result.recv_timeout(PATIENCE).expect("the fenced verdict never returned"),
+                Access::Exact
+            ));
+        });
+        assert!(cache.is_empty(), "a verdict decided before the drop was installed after it");
+        assert_nothing_installed(&cache, a.id);
+    }
+
+    #[test]
+    fn a_snapshot_load_that_outlives_a_drop_installs_nothing() {
+        // The epoch must be captured before the snapshot is looked at, not
+        // only before the build: a process's first access loads the snapshot
+        // instead of building, and a drop landing during the load would
+        // install the loaded graph just the same. The forget removes the
+        // directory, so the snapshot is kept aside and put back before the
+        // access resumes — what runs after the park is the load, and it must
+        // be fenced by the epoch captured ahead of it.
+        let (engine, a, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &a, Metric::Cosine, 4);
+        let path = cache.snapshot_path(a.id).unwrap();
+        assert!(path.is_dir(), "the build should have been persisted");
+        drop(cache);
+
+        let aside = dir.path().join("aside");
+        std::fs::rename(&path, &aside).unwrap();
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, a.id);
+
+        std::thread::scope(|s| {
+            let result = timed_access(s, &cache, &engine, &a);
+            gate.wait_for_build_to_start();
+            cache.invalidate(a.id);
+            std::fs::rename(&aside, &path).unwrap();
+            gate.release();
+            assert!(matches!(
+                result.recv_timeout(PATIENCE).expect("the fenced load never returned"),
+                Access::Exact
+            ));
+        });
+        assert_nothing_installed(&cache, a.id);
+        assert!(!path.exists(), "the snapshot a fenced load adopted must go");
+    }
+
+    #[test]
+    fn a_build_of_a_previous_incarnation_that_outlives_the_recreate_installs_nothing() {
+        // The consumer's late-drop path: by the time the drop entry is read,
+        // the name has been created again, so the id is live and the forget
+        // compares incarnations. A build that a search on the *old*
+        // collection started holds nothing resident to compare, so the
+        // forget finds nothing — and must fence it regardless, or the graph
+        // it installs is stamped with the old incarnation under the live id,
+        // declined by every search and released by none.
+        let (engine, first, dir) = setup(60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, first.id);
+
+        std::thread::scope(|s| {
+            let result = timed_access(s, &cache, &engine, &first);
+            gate.wait_for_build_to_start();
+
+            engine.drop_collection("app", "docs").unwrap();
+            let second = add_collection(&engine, "docs", 60);
+            assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+            assert_ne!(second.created, first.created, "the incarnation does not");
+            assert!(
+                !cache.forget_unless_created(first.id, Some(second.created)),
+                "nothing was resident to forget; the fence is the whole effect"
+            );
+
+            gate.release();
+            assert!(matches!(
+                result.recv_timeout(PATIENCE).expect("the fenced build never returned"),
+                Access::Exact
+            ));
+        });
+        assert_nothing_installed(&cache, first.id);
+    }
+
+    #[test]
+    fn a_build_of_a_collection_lost_to_a_lagging_consumer_installs_nothing() {
+        // The consumer fell behind and never read the drop; all it can do is
+        // reconcile against what the node holds now. A build in flight for
+        // the dropped collection has no entry for that walk to find and no
+        // drop entry will ever name it, so the reconciliation is the only
+        // forget that can reach it — and it must, or the build installs its
+        // graph under the dead id the moment the reconciliation has passed.
+        let (engine, a, dir) = setup(60);
+        let kept = add_collection(&engine, "kept", 60);
+        let cache = snapshot_cache(&dir);
+        let gate = Gate::install(&cache, a.id);
+
+        std::thread::scope(|s| {
+            let result = timed_access(s, &cache, &engine, &a);
+            gate.wait_for_build_to_start();
+
+            let live: HashMap<CollectionId, Hlc> = [(kept.id, kept.created)].into_iter().collect();
+            assert_eq!(
+                cache.forget_absent(&live),
+                0,
+                "nothing was resident to forget; the fence is the whole effect"
+            );
+
+            gate.release();
+            assert!(matches!(
+                result.recv_timeout(PATIENCE).expect("the fenced build never returned"),
+                Access::Exact
+            ));
+        });
+        assert_nothing_installed(&cache, a.id);
     }
 
     // -----------------------------------------------------------------------
