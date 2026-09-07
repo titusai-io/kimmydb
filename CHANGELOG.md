@@ -305,6 +305,27 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   be under way when a late drop entry is read is discarded too and paid again
   at the next search — a rebuild, never a wrong answer.
 
+- **Storing a document's vectors is one commit, and a failure part way
+  through no longer leaves a torn chunk set.** Replacing a document's chunks
+  — from the embedding worker or a client's `PUT .../vectors` — wrote each
+  chunk as a commit of its own and then removed each stale tail chunk the
+  same way, so a document of N chunks cost N commits and, under the
+  `durable` class, N fsyncs, measured at about 4.6 ms apiece. A write that
+  failed between two of them left the document holding some chunks from the
+  new version in front of some from the old, a state nothing could tell
+  from a finished one, while [Vectors](docs/vectors.md) described the
+  replacement as all-or-nothing. Both writes now go through the scoped
+  write ADR-149 introduces: every chunk and every tail delete of one
+  document is a single transaction, committed once however many chunks the
+  document holds, and a failure inside it leaves the previous chunk set
+  exactly as it was. Deleting a document's vectors is one commit the same
+  way. The vector generation that tells the index cache a graph is stale now
+  moves only after that commit, never before it, and only when a chunk was
+  written or removed — an empty chunk set stored over a document that had
+  none used to move it for nothing. The change feed carries the same entries
+  as before, published together after the one commit rather than one at a
+  time.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
