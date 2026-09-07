@@ -110,6 +110,29 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   from a crash. The start after that is the first one the line means what
   it says.
 
+### Documentation
+
+- **The sort language now says which element a key through an array reads.** A
+  sort path that reaches several values — a field holding an array, or a path
+  crossing one — is reduced to the *smallest* of them, and `-1` reverses the
+  comparison rather than choosing the other end, so a descending sort orders
+  by each document's smallest element too: descending, `[2, 3]` comes before
+  `[1, 100]`, and the `100` never enters it. One comparison serves `find`,
+  `find_and_modify` and the pipeline's `$sort`, so the three order a
+  collection identically.
+  [Query language](docs/query-language.md#sort-and-projection) states it,
+  along with the empty-array case and the contrast against `$lookup`'s join
+  key, which reads the first element of a path that crosses an array rather
+  than the least; [Aggregation](docs/aggregation.md)'s `$sort` row now points
+  there instead of restating the rule. Nothing changes about what the server
+  does — this was true in every release and written down in none.
+
+- **Three settings an operator can be told about by name are now in the
+  settings table.** `server.advertise`, `storage.multi_chunk_docs` and
+  `auth.oidc.allow_federated_admin` are each named in a startup refusal or a
+  log line, and each was documented only in prose on another page.
+  [Operations](docs/operations.md#settings) now carries them with their
+  defaults beside every other key.
 
 ## 0.24.0 - 2026-09-06
 
