@@ -19,10 +19,11 @@
 //!
 //! **One provider call carries many documents.** The provider takes a batch,
 //! and the worker fills it from consecutive documents of the same collection
-//! rather than from one document's chunks (ADR-095). The storage write stays
-//! per document: `put_vectors` replaces one document's chunks, staleness is
-//! one document's HLC, and neither knows or cares how many documents shared
-//! the round trip.
+//! rather than from one document's chunks (ADR-095). Staleness stays per
+//! document — one document's HLC, checked again after the call — but the
+//! storage write is per batch: every document the call answered for is
+//! written in one commit, with the worker's oplog position in the same
+//! commit when the flush that sent the batch had one to record (ADR-149).
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -30,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use kimmy_core::{ChunkConfig, Hlc, OpKind, VectorConfig, VectorRecord, path};
-use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, WatchOptions, WatchScope};
+use kimmy_storage::{ChangeEvent, CollectionMeta, Engine, VectorWrite, WatchOptions, WatchScope};
 use tracing::{debug, error, info, warn};
 
 use crate::error::{Result, TransportKind, VectorError};
@@ -272,9 +273,10 @@ enum Prepared {
 ///
 /// Two things wait here, each with its own deadline. A partial batch waits
 /// `max_wait` for company; a held position waits [`POSITION_WAIT`] for more
-/// entries to cover. The position is recorded only by a flush, after every
-/// batch has landed, so the recorded position never runs ahead of an entry
-/// whose vectors are still in a batch. The crash-replay guarantee is
+/// entries to cover. The position is recorded only by a flush — in the
+/// commit of the last batch the flush stores, or in a commit of its own
+/// when there is no batch — so the recorded position never runs ahead of an
+/// entry whose vectors are still in a batch. The crash-replay guarantee is
 /// unchanged; it just covers a window of entries at once rather than one.
 #[derive(Default)]
 struct Pending {
@@ -340,6 +342,25 @@ impl Pending {
         batch.push(job);
         batch.full(limits)
     }
+}
+
+/// A position on its way into a batch's commit.
+///
+/// `flush` hands this down to the last batch it stores, so the position is
+/// written by the same commit as that batch's vectors rather than by a
+/// commit of its own: the ADR-125 rule that the position is recorded only
+/// after the work before it has landed is then kept by one transaction
+/// rather than by the order of two. `token` is the position still to
+/// write, `None` once a store has committed it. `failed` records that a
+/// store failed somewhere in the flush — a storage error, or a provider
+/// answer with the wrong number of vectors, which `store` refuses before it
+/// opens a scope; the flush then writes no position
+/// at all — a failed flush commits nothing — and the token goes back to
+/// [`Pending`] with its deadline untouched, for the next flush to write.
+#[derive(Default)]
+struct Checkpoint {
+    token: Option<kimmy_core::ResumeToken>,
+    failed: bool,
 }
 
 /// Keeps a collection's vectors in step with its documents.
@@ -761,25 +782,52 @@ impl EmbeddingWorker {
         }
     }
 
-    /// Send everything gathered, oldest collection first, then record the
-    /// position that covers it.
+    /// Send everything gathered, oldest collection first, and record the
+    /// position that covers it in the last batch's own commit.
     ///
     /// Any batch here may span several collections' worth of entries in the
     /// stream, and the token recorded is the newest one seen: by the time it
     /// is written every entry before it has either been handled on arrival or
-    /// embedded just now. There may be no batch at all — a position that has
-    /// waited [`POSITION_WAIT`] with nothing to embed flushes through here
-    /// too — in which case this is the one position write for however many
-    /// entries were held.
+    /// embedded just now. It is written by the store of the last batch — one
+    /// commit for the batch's vectors and the position together, where it
+    /// was one for the batch and a second for the position — and by a commit
+    /// of its own only when no store carried it: there may be no batch at
+    /// all — a position that has waited [`POSITION_WAIT`] with nothing to
+    /// embed flushes through here too, and that is the one position write
+    /// for however many entries were held, as before — or the last batch may
+    /// have stored nothing, its documents skipped or refused. The provider
+    /// calls are made before any of that: a scope holds the engine's one
+    /// writer, and nothing network-bound runs inside one.
+    ///
+    /// A store that fails is logged where it fails and leaves its documents
+    /// stale for a rescan to find, as before; what changes is the position.
+    /// A flush in which a store failed writes no position: the token goes
+    /// back to `pending` with its deadline untouched, so the next flush —
+    /// due when the position wait elapses, or sooner with the next batch —
+    /// writes it. The deadline rule is unchanged; the failed flush simply
+    /// commits nothing.
     async fn flush(&mut self, pending: &mut Pending) -> Result<()> {
-        for batch in std::mem::take(&mut pending.batches) {
-            self.embed_batch(batch).await;
-        }
+        let batches = std::mem::take(&mut pending.batches);
         pending.opened = None;
-        pending.held_since = None;
-        if let Some(token) = pending.token.take() {
+        let count = batches.len();
+        let mut checkpoint = Checkpoint::default();
+        for (i, batch) in batches.into_iter().enumerate() {
+            // Only the last batch carries the position, and only while no
+            // store has failed: the position must not land in a commit
+            // that follows a batch whose vectors did not.
+            if i + 1 == count && !checkpoint.failed {
+                checkpoint.token = pending.token.take();
+            }
+            self.embed_batch(batch, &mut checkpoint).await;
+        }
+        if checkpoint.failed {
+            pending.token = pending.token.or(checkpoint.token);
+            return Ok(());
+        }
+        if let Some(token) = pending.token.take().or(checkpoint.token) {
             self.engine.put_consumer_position(CONSUMER, token)?;
         }
+        pending.held_since = None;
         Ok(())
     }
 
@@ -957,11 +1005,15 @@ impl EmbeddingWorker {
                 let chunks = job.chunks.len();
                 let vectors =
                     self.call_provider(&collection, &config, std::slice::from_ref(&job)).await?;
-                Ok(if self.store(&collection, &shadow, &config, vec![job], vectors)? == 1 {
-                    Outcome::Embedded { chunks }
-                } else {
-                    Outcome::Skipped
-                })
+                let stored = self.store(
+                    &collection,
+                    &shadow,
+                    &config,
+                    vec![job],
+                    vectors,
+                    &mut Checkpoint::default(),
+                )?;
+                Ok(if stored == 1 { Outcome::Embedded { chunks } } else { Outcome::Skipped })
             }
         }
     }
@@ -1196,7 +1248,7 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_batch(ready).await;
+                embedded += self.embed_batch(ready, &mut Checkpoint::default()).await;
             }
             batch.push(job);
             if batch.full(&self.batching) {
@@ -1204,10 +1256,10 @@ impl EmbeddingWorker {
                     &mut batch,
                     Batch::new(collection.clone(), shadow.clone(), config.clone()),
                 );
-                embedded += self.embed_batch(ready).await;
+                embedded += self.embed_batch(ready, &mut Checkpoint::default()).await;
             }
         }
-        embedded += self.embed_batch(batch).await;
+        embedded += self.embed_batch(batch, &mut Checkpoint::default()).await;
 
         // The completed scan is what the fingerprint attests. Failing to
         // write it costs a redundant re-scan next time, never a gap.
@@ -1237,7 +1289,9 @@ impl EmbeddingWorker {
             return Ok(false);
         };
         let vectors = self.call_provider(collection, config, std::slice::from_ref(&job)).await?;
-        Ok(self.store(collection, shadow, config, vec![job], vectors)? == 1)
+        let stored =
+            self.store(collection, shadow, config, vec![job], vectors, &mut Checkpoint::default())?;
+        Ok(stored == 1)
     }
 
     /// Read one document afresh and prepare it, or nothing if its vectors are
@@ -1327,13 +1381,24 @@ impl EmbeddingWorker {
         provider.embed(inputs).await.inspect_err(|e| self.counters.failed(e))
     }
 
-    /// Write each job's vectors: one replace-all write per document, each
-    /// counted as one document and its chunks. Returns how many were written.
+    /// Write each job's vectors, and the position the flush handed down, in
+    /// one commit. Each document written is counted as one document and
+    /// its chunks. Returns how many were written.
     ///
-    /// This is the half of the work batching does not touch. `put_vectors`
-    /// replaces one document's chunks, staleness is one document's HLC, and
-    /// a crash between two documents' writes leaves the second one stale
-    /// for the replay to find — no different from a crash before it.
+    /// One scope for the batch (ADR-149): every document's replace-all
+    /// write goes into one transaction, with the checkpoint's position when
+    /// it holds one, and the scope commits once — about thirty documents
+    /// and their position were thirty-one commits and as many fsyncs. The
+    /// staleness check stays per document, inside the scope, because a
+    /// document can move while the provider call runs; it is a read, and
+    /// opens no write. The records are encoded before the scope opens, so
+    /// nothing runs under the writer but the writes. Any failure aborts the
+    /// whole batch's writes: a
+    /// document's chunk set is replaced whole or not at all, and a batch is
+    /// stored whole or not at all, so a retry is a retry of the batch. The
+    /// counters move after the commit, and count what was written, never
+    /// how many calls it took. The shadow's generation is bumped by the
+    /// scope, after the commit, never inside it.
     fn store(
         &self,
         collection: &CollectionMeta,
@@ -1341,6 +1406,7 @@ impl EmbeddingWorker {
         config: &VectorConfig,
         jobs: Vec<Job>,
         vectors: Vec<Vec<f32>>,
+        checkpoint: &mut Checkpoint,
     ) -> Result<usize> {
         let expected: usize = jobs.iter().map(|j| j.chunks.len()).sum();
         if vectors.len() != expected {
@@ -1351,28 +1417,12 @@ impl EmbeddingWorker {
                 detail: format!("expected {expected} vectors, got {}", vectors.len()),
             });
         }
+        // Encoded before the scope opens: the scope holds the engine's one
+        // writer, and every other writer on the node waits behind it.
         let mut vectors = vectors.into_iter();
-        let mut written = 0;
+        let mut writes = Vec::with_capacity(jobs.len());
         for job in jobs {
             let own: Vec<Vec<f32>> = vectors.by_ref().take(job.chunks.len()).collect();
-            // The provider call is the long part, and the document can move
-            // while it runs. Writing vectors for a version that has since
-            // been deleted would leave chunks with no source — and the
-            // `Delete` entry that would have removed them has already gone
-            // by. A newer version is the same case with a different ending:
-            // its own entry is behind this one and will do the work, so this
-            // write would only be overwritten. Either way, nothing to store.
-            match self.engine.document_stamp(collection, &job.source)? {
-                Some(current) if current.hlc == job.hlc => {}
-                Some(_) => {
-                    debug!("document moved while it was being embedded; its own entry follows");
-                    continue;
-                }
-                None => {
-                    debug!("document was deleted while it was being embedded");
-                    continue;
-                }
-            }
             let count = job.chunks.len();
             let records: Vec<VectorRecord> = job
                 .chunks
@@ -1387,16 +1437,54 @@ impl EmbeddingWorker {
                     text,
                 })
                 .collect();
-            self.engine.put_vectors(shadow, &job.source, &records)?;
-            // Every path that writes vectors ends here, so this is the one
-            // place the document and chunk counters move. They count what
-            // was written, never how many calls it took: a batch of thirty
-            // documents is thirty here.
-            self.counters.embedded(count);
-            debug!(chunks = count, "embedded a document");
-            written += 1;
+            let write = VectorWrite::encode(&job.source, &records)?;
+            writes.push((job.source, job.hlc, count, write));
         }
-        Ok(written)
+
+        let position = checkpoint.token;
+        let written: Vec<usize> = self.engine.write_batch(|scope| {
+            let mut written = Vec::new();
+            for (source, hlc, count, write) in writes {
+                // The provider call is the long part, and the document can
+                // move while it runs. Writing vectors for a version that has
+                // since been deleted would leave chunks with no source — and
+                // the `Delete` entry that would have removed them has
+                // already gone by. A newer version is the same case with a
+                // different ending: its own entry is behind this one and
+                // will do the work, so this write would only be overwritten.
+                // Either way, nothing to store.
+                match self.engine.document_stamp(collection, &source)? {
+                    Some(current) if current.hlc == hlc => {}
+                    Some(_) => {
+                        debug!("document moved while it was being embedded; its own entry follows");
+                        continue;
+                    }
+                    None => {
+                        debug!("document was deleted while it was being embedded");
+                        continue;
+                    }
+                }
+                scope.put_vectors(shadow, write)?;
+                written.push(count);
+            }
+            // Last, so that the position covers every write before it in
+            // the one commit that carries them all.
+            if let Some(token) = position {
+                scope.put_consumer_position(CONSUMER, token)?;
+            }
+            Ok(written)
+        })?;
+        checkpoint.token = None;
+        // Every path that writes vectors ends here, so this is the one place
+        // the document and chunk counters move. They count what was written,
+        // never how many calls it took: a batch of thirty documents is
+        // thirty here — after the commit, so a counter never claims a
+        // document a failed scope did not store.
+        for count in &written {
+            self.counters.embedded(*count);
+            debug!(chunks = count, "embedded a document");
+        }
+        Ok(written.len())
     }
 
     /// Embed one batch and return how many documents were written.
@@ -1410,16 +1498,24 @@ impl EmbeddingWorker {
     /// fault is skipped and named, the rest land. That costs one extra call
     /// per document, once, on a path that had already failed.
     ///
-    /// Storage errors are logged and end the batch: the documents written so
-    /// far are counted, the rest stay stale for a replay or rescan to find.
-    async fn embed_batch(&mut self, batch: Batch) -> usize {
+    /// A storage error is not a provider error: it is logged, marked on the
+    /// checkpoint, and ends the batch, whose documents stay stale for a
+    /// rescan to find — none of them landed, since the batch is one commit.
+    ///
+    /// `checkpoint` is the position the flush wants in this batch's commit.
+    /// It rides with the one store that answers for the whole batch, or
+    /// with the store of a lone document; a batch taken apart after a
+    /// permanent failure hands it to none of its documents, and the flush
+    /// writes it on its own afterwards — one extra commit on a path that
+    /// had already failed.
+    async fn embed_batch(&mut self, batch: Batch, checkpoint: &mut Checkpoint) -> usize {
         let Batch { collection, shadow, config, jobs, .. } = batch;
         if jobs.is_empty() {
             return 0;
         }
         if jobs.len() == 1 {
             let job = jobs.into_iter().next().expect("one job");
-            return self.embed_alone(&collection, &shadow, &config, job).await;
+            return self.embed_alone(&collection, &shadow, &config, job, checkpoint).await;
         }
         let vectors = loop {
             match self.call_provider(&collection, &config, &jobs).await {
@@ -1449,22 +1545,26 @@ impl EmbeddingWorker {
                         "a batch permanently failed; embedding its documents one at a time"
                     );
                     let mut written = 0;
+                    let mut alone = Checkpoint::default();
                     for job in jobs {
-                        written += self.embed_alone(&collection, &shadow, &config, job).await;
+                        written +=
+                            self.embed_alone(&collection, &shadow, &config, job, &mut alone).await;
                     }
+                    checkpoint.failed |= alone.failed;
                     return written;
                 }
             }
         };
-        match self.store(&collection, &shadow, &config, jobs, vectors) {
+        match self.store(&collection, &shadow, &config, jobs, vectors, checkpoint) {
             Ok(written) => written,
             Err(e) => {
                 warn!(
                     error = %e,
                     db = %collection.db,
                     collection = %collection.name,
-                    "storing a batch's vectors failed; the rest of the batch stays stale"
+                    "storing a batch's vectors failed; none of the batch landed and it stays stale"
                 );
+                checkpoint.failed = true;
                 0
             }
         }
@@ -1478,6 +1578,7 @@ impl EmbeddingWorker {
         shadow: &CollectionMeta,
         config: &VectorConfig,
         job: Job,
+        checkpoint: &mut Checkpoint,
     ) -> usize {
         let vectors = loop {
             match self.call_provider(collection, config, std::slice::from_ref(&job)).await {
@@ -1512,7 +1613,7 @@ impl EmbeddingWorker {
                 }
             }
         };
-        match self.store(collection, shadow, config, vec![job], vectors) {
+        match self.store(collection, shadow, config, vec![job], vectors, checkpoint) {
             Ok(written) => written,
             Err(e) => {
                 warn!(
@@ -1521,6 +1622,7 @@ impl EmbeddingWorker {
                     collection = %collection.name,
                     "storing a document's vectors failed; it stays stale"
                 );
+                checkpoint.failed = true;
                 0
             }
         }
@@ -2507,6 +2609,144 @@ mod tests {
         // Holding a newer token does not restart the clock.
         pending.hold(kimmy_core::ResumeToken::new(Hlc::new(2, 1), node), now + POSITION_WAIT);
         assert_eq!(pending.held_since, Some(now));
+    }
+
+    /// `count` documents written and prepared into one batch, with the
+    /// position that covers them held beside it — what `drive` hands to
+    /// `flush` when a batch fills or its wait elapses, built by hand so the
+    /// commit count is measured across exactly one flush.
+    fn a_batch_of(
+        engine: &Engine,
+        worker: &EmbeddingWorker,
+        coll: &CollectionMeta,
+        titles: &[&str],
+    ) -> (Pending, kimmy_core::ResumeToken) {
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let config = coll.vector.clone().unwrap();
+        let mut pending = Pending::default();
+        let now = Instant::now();
+        for (i, title) in titles.iter().enumerate() {
+            let id = engine.insert(coll, doc! { "_id": i as i64, "title": *title }).unwrap();
+            let job = worker
+                .prepare_one(coll, &shadow, &config, &id, false)
+                .unwrap()
+                .expect("a fresh document has a job");
+            let item = Item {
+                collection: coll.clone(),
+                shadow: shadow.clone(),
+                config: config.clone(),
+                job,
+            };
+            assert!(!pending.push(item, now, &worker.batching), "the batch is not full");
+        }
+        let latest = last_entry(engine);
+        let token = kimmy_core::ResumeToken::new(latest.stamp.hlc, latest.stamp.node);
+        pending.hold(token, now);
+        (pending, token)
+    }
+
+    /// The ADR-119 test rule applied to the worker's store (ADR-149): a
+    /// provider batch of K documents plus the position that covers them is
+    /// one commit, where it was K commits for the documents — each its own
+    /// `put_vectors` — and one more for the position. The counters still
+    /// read K documents: they count what was written, not the commits.
+    #[tokio::test]
+    async fn a_provider_batch_is_one_commit_with_its_position() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let titles = ["alpha", "beta", "gamma", "delta", "epsilon"];
+        let (mut pending, token) = a_batch_of(&engine, &worker, &coll, &titles);
+        let generation = engine.vector_generation(shadow.id);
+
+        let commits = engine.commits();
+        worker.flush(&mut pending).await.unwrap();
+        assert_eq!(
+            engine.commits() - commits,
+            1,
+            "{} documents and their position must be one commit, not {} plus one",
+            titles.len(),
+            titles.len()
+        );
+        assert_eq!(fake.calls(), 1, "one provider call for the batch");
+        assert_eq!(
+            engine.consumer_position(CONSUMER).unwrap(),
+            Some(token),
+            "the position landed in the batch's commit"
+        );
+        for i in 0..titles.len() {
+            let source = kimmy_core::DocId::Int64(i as i64);
+            assert_eq!(engine.get_vectors(&shadow, &source).unwrap().len(), 1, "{source} landed");
+        }
+        assert_eq!(worker.counters.documents_embedded.load(Ordering::Relaxed), titles.len() as u64);
+        assert_eq!(worker.counters.chunks_embedded.load(Ordering::Relaxed), titles.len() as u64);
+        assert_eq!(engine.vector_generation(shadow.id), generation + 1, "bumped once, after");
+        assert!(pending.token.is_none() && pending.held_since.is_none(), "nothing left held");
+    }
+
+    /// A batch is stored whole or not at all. A failure on the second
+    /// document — a unique index on the shadow that its chunk collides
+    /// with — leaves the first document's chunks unstored too, the position
+    /// where it was, and the commit counter where it was: the position
+    /// must not advance past work that did not land, and a failed flush
+    /// commits nothing. The token is still held, with its deadline, for the
+    /// next flush.
+    #[tokio::test]
+    async fn a_storage_failure_mid_batch_advances_neither_the_vectors_nor_the_position() {
+        let (engine, coll, mut worker, _dir) = setup().await;
+        let fake = FakeProvider::new(4);
+        worker.set_provider(coll.id.0, Arc::clone(&fake) as Arc<dyn EmbeddingProvider>);
+        let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
+        let text = kimmy_storage::IndexField { path: "text".into(), descending: false };
+        engine.create_index("app", &shadow.name, vec![text], true, None).unwrap();
+        // A committed chunk whose text the second document's chunk repeats.
+        engine.insert(&coll, doc! { "_id": "taken", "title": "same" }).unwrap();
+        assert!(matches!(
+            worker.process(&last_entry(&engine)).await.unwrap(),
+            Outcome::Embedded { .. }
+        ));
+        position_at_latest(&engine);
+        let before = engine.consumer_position(CONSUMER).unwrap();
+
+        let (mut pending, token) = a_batch_of(&engine, &worker, &coll, &["alpha", "same", "beta"]);
+        assert_ne!(Some(token), before);
+        let held_since = pending.held_since;
+        let documents = worker.counters.documents_embedded.load(Ordering::Relaxed);
+        let calls = fake.calls();
+
+        let commits = engine.commits();
+        worker.flush(&mut pending).await.unwrap();
+        assert_eq!(fake.calls() - calls, 1, "the provider answered; storage is what failed");
+        assert_eq!(engine.commits(), commits, "a failed flush commits nothing");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), before, "the position stayed");
+        for i in 0..3i64 {
+            let source = kimmy_core::DocId::Int64(i);
+            assert!(
+                engine.get_vectors(&shadow, &source).unwrap().is_empty(),
+                "no chunk of the batch may land when one document of it cannot: {source}"
+            );
+        }
+        assert_eq!(worker.counters.documents_embedded.load(Ordering::Relaxed), documents);
+        assert_eq!(pending.token, Some(token), "the position is held for the next flush");
+        assert_eq!(pending.held_since, held_since, "with its deadline untouched");
+        assert!(pending.batches.is_empty(), "the batch itself is spent");
+    }
+
+    /// ADR-125's other shape, unchanged: a held position with nothing to
+    /// embed is one commit of its own.
+    #[tokio::test]
+    async fn a_held_position_with_no_batch_is_still_one_commit() {
+        let (engine, _coll, mut worker, _dir) = setup().await;
+        let token = kimmy_core::ResumeToken::new(Hlc::new(42, 1), engine.node_id());
+        let mut pending = Pending::default();
+        pending.hold(token, Instant::now());
+
+        let commits = engine.commits();
+        worker.flush(&mut pending).await.unwrap();
+        assert_eq!(engine.commits() - commits, 1, "one position write, and nothing else");
+        assert_eq!(engine.consumer_position(CONSUMER).unwrap(), Some(token));
+        assert!(pending.token.is_none() && pending.held_since.is_none());
     }
 
     // -----------------------------------------------------------------------

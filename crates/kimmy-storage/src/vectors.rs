@@ -18,8 +18,42 @@ use tracing::info;
 
 use redb::{ReadableDatabase, ReadableTable};
 
+use crate::docs::WriteScope;
+use crate::engine::WriteTxn;
 use crate::error::{Result, StorageError};
 use crate::meta::CollectionMeta;
+
+/// One document's chunk set, encoded for its shadow collection ahead of any
+/// writer being taken.
+///
+/// A scope's contract (ADR-149) is to hold its inputs ready and do nothing
+/// but write them, since every other writer on the node waits behind it; so
+/// the BSON encoding of each chunk record happens here, before
+/// [`crate::Engine::write_batch`] is opened, and [`WriteScope::put_vectors`]
+/// takes the result. The chunk numbers are kept beside the documents so the
+/// scope can decide which stored chunks are a stale tail without decoding
+/// anything.
+pub struct VectorWrite {
+    source: DocId,
+    chunks: Vec<u32>,
+    docs: Vec<(DocId, bson::Document)>,
+}
+
+impl VectorWrite {
+    /// Encode `records` — the complete new chunk set of `source` — for the
+    /// shadow collection.
+    pub fn encode(source: &DocId, records: &[VectorRecord]) -> Result<Self> {
+        let docs = records
+            .iter()
+            .map(|record| {
+                let doc = bson::serialize_to_document(record)
+                    .map_err(|e| StorageError::Corrupt(format!("encoding vector record: {e}")))?;
+                Ok((VectorRecord::id(source, record.chunk), doc))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self { source: source.clone(), chunks: records.iter().map(|r| r.chunk).collect(), docs })
+    }
+}
 
 impl crate::Engine {
     /// Enable or replace auto-embedding for a collection.
@@ -237,11 +271,30 @@ impl crate::Engine {
     /// whole log on every restart.
     pub fn put_consumer_position(&self, consumer: &str, token: ResumeToken) -> Result<()> {
         let txn = self.begin_write()?;
-        {
-            let mut meta = txn.open_table(crate::tables::META)?;
-            meta.insert(consumer_key(consumer).as_str(), token.encode().as_bytes())?;
+        if let Err(e) = self.put_consumer_position_in_txn(&txn, consumer, token) {
+            txn.abort()?;
+            return Err(e);
         }
         txn.commit()?;
+        Ok(())
+    }
+
+    /// The whole of [`Self::put_consumer_position`] except the transaction's
+    /// lifecycle, so a scope can carry a position in the commit it makes
+    /// anyway ([`WriteScope::put_consumer_position`]).
+    ///
+    /// A position is one row of the metadata table: it mints no stamp and
+    /// appends no oplog entry, so ADR-148's rule about where a stamp is
+    /// minted has nothing here to apply to, and there is nothing to publish
+    /// after the caller commits.
+    pub(crate) fn put_consumer_position_in_txn(
+        &self,
+        txn: &WriteTxn<'_>,
+        consumer: &str,
+        token: ResumeToken,
+    ) -> Result<()> {
+        let mut meta = txn.open_table(crate::tables::META)?;
+        meta.insert(consumer_key(consumer).as_str(), token.encode().as_bytes())?;
         Ok(())
     }
 
@@ -307,58 +360,28 @@ impl crate::Engine {
     /// same transaction, so a document of N chunks costs one fsync rather
     /// than N, and a failure part way through leaves the previous chunk set
     /// exactly as it was — never a document with some new chunks and some
-    /// old. The existing chunk numbers are read inside the scope, under the
-    /// writer, so the tail that is removed is the tail that is there.
+    /// old. This is the single-document form of [`WriteScope::put_vectors`],
+    /// which the embedding worker composes for a whole provider batch; the
+    /// records are encoded here, before the writer is taken, and the scope
+    /// does nothing but write them.
     ///
     /// The generation moves only after the commit, never inside the scope: a
     /// bump before the commit would let an index build read the new
-    /// generation against the old chunks and be served as fresh for it. And
-    /// it moves only when something changed: an empty `records` over a
-    /// document with no chunks writes nothing, commits nothing and leaves the
-    /// generation where it was, the same rule [`Engine::delete_vectors`]
-    /// follows for a document that has nothing to delete.
+    /// generation against the old chunks and be served as fresh for it. The
+    /// scope records the shadow and `write_batch` bumps it once the commit
+    /// has landed. And it moves only when something changed: an empty
+    /// `records` over a document with no chunks writes nothing, commits
+    /// nothing and leaves the generation where it was, the same rule
+    /// [`Engine::delete_vectors`] follows for a document that has nothing to
+    /// delete.
     pub fn put_vectors(
         &self,
         shadow: &CollectionMeta,
         source: &DocId,
         records: &[VectorRecord],
     ) -> Result<()> {
-        // Encoded before the writer is taken: the scope's contract is to hold
-        // its inputs ready and do nothing but write them, since every other
-        // writer on the node waits behind it.
-        let encoded = records
-            .iter()
-            .map(|record| {
-                let doc = bson::serialize_to_document(record)
-                    .map_err(|e| StorageError::Corrupt(format!("encoding vector record: {e}")))?;
-                Ok((VectorRecord::id(source, record.chunk), doc))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        let changed = self.write_batch(|scope| {
-            // Read under the writer, not before it, so no other write can
-            // add or remove a chunk between the read and the replace.
-            let existing = self.vector_chunk_numbers(shadow, source)?;
-
-            for (id, doc) in encoded {
-                scope.replace(shadow, &id, doc, true)?;
-            }
-
-            // Drop the tail of a previously longer document.
-            let mut removed = 0;
-            for chunk in existing {
-                if !records.iter().any(|r| r.chunk == chunk)
-                    && scope.delete(shadow, &VectorRecord::id(source, chunk))?
-                {
-                    removed += 1;
-                }
-            }
-            Ok(!records.is_empty() || removed > 0)
-        })?;
-        if changed {
-            self.bump_vector_generation(shadow.id);
-        }
-        Ok(())
+        let write = VectorWrite::encode(source, records)?;
+        self.write_batch(|scope| scope.put_vectors(shadow, write))
     }
 
     /// Every vector belonging to one source document, in chunk order.
@@ -458,19 +481,7 @@ impl crate::Engine {
     /// the set whole. The generation moves after the commit, and only when a
     /// chunk was removed; a document with no chunks costs no commit.
     pub fn delete_vectors(&self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
-        let removed = self.write_batch(|scope| {
-            let mut removed = 0;
-            for chunk in self.vector_chunk_numbers(shadow, source)? {
-                if scope.delete(shadow, &VectorRecord::id(source, chunk))? {
-                    removed += 1;
-                }
-            }
-            Ok(removed)
-        })?;
-        if removed > 0 {
-            self.bump_vector_generation(shadow.id);
-        }
-        Ok(removed)
+        self.write_batch(|scope| scope.delete_vectors(shadow, source))
     }
 
     /// Visit every stored vector. Used by search and by index rebuilds.
@@ -528,6 +539,69 @@ impl crate::Engine {
             Ok(true)
         })?;
         Ok(out)
+    }
+}
+
+impl WriteScope<'_> {
+    /// [`crate::Engine::put_vectors`], into this scope's transaction: the
+    /// replace-all write of one source document's chunks, with no commit of
+    /// its own.
+    ///
+    /// The one implementation of the chunk loop. `Engine::put_vectors` is
+    /// this in a scope of its own; the embedding worker calls it once per
+    /// document of a provider batch inside one scope, with its position
+    /// beside them (ADR-125, as amended). The write was encoded before the
+    /// scope was opened ([`VectorWrite::encode`]), so nothing here but the
+    /// writes themselves runs under the writer. The existing chunk numbers
+    /// are read inside the scope, under the writer, so no other write can
+    /// add or remove a chunk between the read and the replace, and the tail
+    /// removed is the tail that is there; the read sees the state the scope
+    /// began from, which is the right state to decide a tail against.
+    ///
+    /// The generation bump belongs to the commit, not to the write: the
+    /// shadow is recorded here, when a chunk was written or removed, and
+    /// `write_batch` bumps it once after the commit has landed — never
+    /// inside the scope, and never for a scope that aborted. An empty chunk
+    /// set over a document that has none writes nothing and records
+    /// nothing.
+    pub fn put_vectors(&mut self, shadow: &CollectionMeta, write: VectorWrite) -> Result<()> {
+        let VectorWrite { source, chunks, docs } = write;
+        let existing = self.engine.vector_chunk_numbers(shadow, &source)?;
+
+        let written = !docs.is_empty();
+        for (id, doc) in docs {
+            self.replace(shadow, &id, doc, true)?;
+        }
+
+        // Drop the tail of a previously longer document.
+        let mut removed = 0;
+        for chunk in existing {
+            if !chunks.contains(&chunk) && self.delete(shadow, &VectorRecord::id(&source, chunk))? {
+                removed += 1;
+            }
+        }
+        if written || removed > 0 {
+            self.touch_vector_generation(shadow.id);
+        }
+        Ok(())
+    }
+
+    /// [`crate::Engine::delete_vectors`], into this scope's transaction.
+    ///
+    /// Every chunk of the document, read under the writer, deleted in this
+    /// scope; the shadow is recorded for the post-commit bump only when a
+    /// chunk was removed. Returns how many were.
+    pub fn delete_vectors(&mut self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
+        let mut removed = 0;
+        for chunk in self.engine.vector_chunk_numbers(shadow, source)? {
+            if self.delete(shadow, &VectorRecord::id(source, chunk))? {
+                removed += 1;
+            }
+        }
+        if removed > 0 {
+            self.touch_vector_generation(shadow.id);
+        }
+        Ok(removed)
     }
 }
 
@@ -719,6 +793,64 @@ mod tests {
         engine.configure_vectors("app", "docs", config(2)).unwrap();
         let shadow = engine.vector_collection("app", "docs").unwrap().unwrap();
         (engine, shadow, dir)
+    }
+
+    /// A scope holding only a position commits (ADR-149's "nothing written"
+    /// rule is measured by writes, not by entries): the embedding worker's
+    /// held position with no batch to ride in goes through the same scope
+    /// as one with a batch, and must still land.
+    #[test]
+    fn a_scope_holding_only_a_position_commits_once() {
+        let (engine, _dir) = engine();
+        let mut rx = engine.subscribe();
+        let token = ResumeToken::new(Hlc::new(7, 1), engine.node_id());
+
+        let commits = engine.commits();
+        engine.write_batch(|scope| scope.put_consumer_position("worker", token)).unwrap();
+        assert_eq!(engine.commits() - commits, 1, "a position is a write, and a write commits");
+        assert_eq!(engine.consumer_position("worker").unwrap(), Some(token), "and it is readable");
+        assert!(rx.try_recv().is_err(), "a position is not an entry: nothing to publish");
+    }
+
+    /// The scope's vector write bumps the generation after the commit, as
+    /// `put_vectors` does, and a scope that aborts bumps nothing: a build
+    /// must never read a generation the data has not caught up with.
+    #[test]
+    fn a_scoped_vector_write_bumps_the_generation_only_once_it_has_committed() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        let three: Vec<VectorRecord> = (0..3).map(|n| record(n, 10, "before")).collect();
+        engine.put_vectors(&shadow, &source, &three).unwrap();
+        let generation = engine.vector_generation(shadow.id);
+
+        let commits = engine.commits();
+        let one = VectorWrite::encode(&source, &[record(0, 20, "after")]).unwrap();
+        engine
+            .write_batch(|scope| {
+                scope.put_vectors(&shadow, one)?;
+                assert_eq!(
+                    engine.vector_generation(shadow.id),
+                    generation,
+                    "not bumped inside the scope: the commit has not happened yet"
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(engine.commits() - commits, 1);
+        assert_eq!(engine.vector_generation(shadow.id), generation + 1, "bumped once, after");
+        let chunks: Vec<u32> =
+            engine.get_vectors(&shadow, &source).unwrap().iter().map(|r| r.chunk).collect();
+        assert_eq!(chunks, vec![0], "the tail was dropped in the same commit");
+
+        let two = VectorWrite::encode(&source, &[record(0, 30, "x"), record(1, 30, "y")]).unwrap();
+        let err = engine
+            .write_batch(|scope| {
+                scope.put_vectors(&shadow, two)?;
+                Err::<(), _>(StorageError::Transaction("abandoned".into()))
+            })
+            .unwrap_err();
+        assert!(matches!(err, StorageError::Transaction(_)));
+        assert_eq!(engine.vector_generation(shadow.id), generation + 1, "an abort bumps nothing");
     }
 
     #[test]
