@@ -261,7 +261,7 @@ pub async fn disable_vectors(
 // ---------------------------------------------------------------------------
 
 /// Forget a dropped collection's vector index, however the drop reached this
-/// node.
+/// node — and a reconfigured collection's, for the same reason.
 ///
 /// [`crate::exec::drop_collection`], [`crate::exec::drop_database`] and
 /// [`disable_vectors`] forget synchronously, which is what makes a single node
@@ -310,6 +310,38 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                                 &vector_meta::shadow_name(&target.name),
                             ),
                         );
+                    }
+                }
+                Ok(entry) if entry.kind == OpKind::ConfigureVectors => {
+                    // A reconfiguration keeps its shadow and writes no vector,
+                    // so nothing else on this node notices it: the generation
+                    // does not move, no drop is minted, and a graph built for
+                    // the previous metric or width matches the cache on every
+                    // test it has except its shape. The entry names the parent
+                    // by database and collection; the shadow's id is derived
+                    // from those, as the drop arm derives it.
+                    //
+                    // Always invalidated, on purpose. On the member that took the request the route
+                    // forgets the entry itself, before or after this task does (the engine
+                    // publishes the entry before the route returns), so this is a second, harmless
+                    // invalidation, one that may cost one rebuild if a search rebuilt the graph in
+                    // between. On every other member the change arrived by replication, which runs
+                    // no route, so this is the only invalidation there is. Correctness does not
+                    // rest on it reaching here in time, or at all: the cache records the shape a
+                    // graph was built for and declines one that does not match at the next search
+                    // (`IndexCache`), so a reconfiguration that this task reads late, or loses to
+                    // `Lagged` below, costs the stale entry its memory until that search and
+                    // nothing else. `Lagged` reconciles against what this node holds, which a
+                    // reconfigured collection still is; the shape check covers it there, and
+                    // `HnswIndex::load` already refuses a snapshot of another shape.
+                    if let Some(body) = &entry.body
+                        && let Ok(target) =
+                            bson::deserialize_from_slice::<kimmy_core::VectorSet>(body)
+                    {
+                        state.vectors.invalidate(CollectionId::derive(
+                            &target.db,
+                            &vector_meta::shadow_name(&target.collection),
+                        ));
                     }
                 }
                 Ok(_) => {}
