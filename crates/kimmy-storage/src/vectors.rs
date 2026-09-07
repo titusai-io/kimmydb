@@ -301,26 +301,63 @@ impl crate::Engine {
     /// version. Without that cleanup, shortening a document would leave its
     /// tail chunks searchable forever — matches pointing at text the document
     /// no longer contains.
+    ///
+    /// The whole replacement is one commit, in one [`Engine::write_batch`]
+    /// scope (ADR-149): every chunk write and every tail delete goes into the
+    /// same transaction, so a document of N chunks costs one fsync rather
+    /// than N, and a failure part way through leaves the previous chunk set
+    /// exactly as it was — never a document with some new chunks and some
+    /// old. The existing chunk numbers are read inside the scope, under the
+    /// writer, so the tail that is removed is the tail that is there.
+    ///
+    /// The generation moves only after the commit, never inside the scope: a
+    /// bump before the commit would let an index build read the new
+    /// generation against the old chunks and be served as fresh for it. And
+    /// it moves only when something changed: an empty `records` over a
+    /// document with no chunks writes nothing, commits nothing and leaves the
+    /// generation where it was, the same rule [`Engine::delete_vectors`]
+    /// follows for a document that has nothing to delete.
     pub fn put_vectors(
         &self,
         shadow: &CollectionMeta,
         source: &DocId,
         records: &[VectorRecord],
     ) -> Result<()> {
-        for record in records {
-            let id = VectorRecord::id(source, record.chunk);
-            let doc = bson::serialize_to_document(record)
-                .map_err(|e| StorageError::Corrupt(format!("encoding vector record: {e}")))?;
-            self.replace(shadow, &id, doc, true)?;
-        }
+        // Encoded before the writer is taken: the scope's contract is to hold
+        // its inputs ready and do nothing but write them, since every other
+        // writer on the node waits behind it.
+        let encoded = records
+            .iter()
+            .map(|record| {
+                let doc = bson::serialize_to_document(record)
+                    .map_err(|e| StorageError::Corrupt(format!("encoding vector record: {e}")))?;
+                Ok((VectorRecord::id(source, record.chunk), doc))
+            })
+            .collect::<Result<Vec<_>>>()?;
 
-        // Drop the tail of a previously longer document.
-        for existing in self.vector_chunk_numbers(shadow, source)? {
-            if !records.iter().any(|r| r.chunk == existing) {
-                self.delete(shadow, &VectorRecord::id(source, existing))?;
+        let changed = self.write_batch(|scope| {
+            // Read under the writer, not before it, so no other write can
+            // add or remove a chunk between the read and the replace.
+            let existing = self.vector_chunk_numbers(shadow, source)?;
+
+            for (id, doc) in encoded {
+                scope.replace(shadow, &id, doc, true)?;
             }
+
+            // Drop the tail of a previously longer document.
+            let mut removed = 0;
+            for chunk in existing {
+                if !records.iter().any(|r| r.chunk == chunk)
+                    && scope.delete(shadow, &VectorRecord::id(source, chunk))?
+                {
+                    removed += 1;
+                }
+            }
+            Ok(!records.is_empty() || removed > 0)
+        })?;
+        if changed {
+            self.bump_vector_generation(shadow.id);
         }
-        self.bump_vector_generation(shadow.id);
         Ok(())
     }
 
@@ -414,15 +451,26 @@ impl crate::Engine {
     }
 
     /// Remove every vector belonging to one source document.
+    ///
+    /// One commit however many chunks the document holds, for the reason
+    /// [`Engine::put_vectors`] gives: the chunk numbers are read under the
+    /// writer and every delete goes into the same scope, so a failure leaves
+    /// the set whole. The generation moves after the commit, and only when a
+    /// chunk was removed; a document with no chunks costs no commit.
     pub fn delete_vectors(&self, shadow: &CollectionMeta, source: &DocId) -> Result<usize> {
-        let chunks = self.vector_chunk_numbers(shadow, source)?;
-        for chunk in &chunks {
-            self.delete(shadow, &VectorRecord::id(source, *chunk))?;
-        }
-        if !chunks.is_empty() {
+        let removed = self.write_batch(|scope| {
+            let mut removed = 0;
+            for chunk in self.vector_chunk_numbers(shadow, source)? {
+                if scope.delete(shadow, &VectorRecord::id(source, chunk))? {
+                    removed += 1;
+                }
+            }
+            Ok(removed)
+        })?;
+        if removed > 0 {
             self.bump_vector_generation(shadow.id);
         }
-        Ok(chunks.len())
+        Ok(removed)
     }
 
     /// Visit every stored vector. Used by search and by index rebuilds.
@@ -718,6 +766,180 @@ mod tests {
         let read = engine.get_vectors(&shadow, &source).unwrap();
         assert_eq!(read.len(), 1, "chunks 1 and 2 should be gone");
         assert_eq!(read[0].chunk, 0);
+    }
+
+    /// Every entry the change feed holds right now, as `(doc id, kind)`.
+    fn drain(
+        rx: &mut tokio::sync::broadcast::Receiver<std::sync::Arc<kimmy_core::OplogEntry>>,
+    ) -> Vec<(DocId, kimmy_core::OpKind)> {
+        let mut out = Vec::new();
+        while let Ok(entry) = rx.try_recv() {
+            out.push((entry.doc_id.clone().unwrap(), entry.kind));
+        }
+        out
+    }
+
+    /// ADR-149's promise for the vector write, in the shape of the ADR-119
+    /// test: a document's chunks are one commit however many it holds, and
+    /// they reach the change feed only after that commit. The loop this
+    /// replaces committed once per chunk and once per stale tail chunk, and
+    /// published each as it went.
+    #[test]
+    fn a_documents_chunks_are_one_commit_however_many_it_holds() {
+        use kimmy_core::OpKind;
+
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let five: Vec<VectorRecord> = (0..5).map(|n| record(n, 10, "long")).collect();
+        engine.put_vectors(&shadow, &source, &five).unwrap();
+        assert_eq!(
+            engine.commits() - commits,
+            1,
+            "five chunks over an empty shadow must be one commit, not five"
+        );
+        let published = drain(&mut rx);
+        assert_eq!(published.len(), 5, "five entries, after the commit: {published:?}");
+        assert!(
+            published.iter().all(|(_, kind)| *kind == OpKind::Insert),
+            "every chunk was new: {published:?}"
+        );
+
+        // Shorter now: three chunks replaced in place, two stale tails gone.
+        let commits = engine.commits();
+        let three: Vec<VectorRecord> = (0..3).map(|n| record(n, 20, "short")).collect();
+        engine.put_vectors(&shadow, &source, &three).unwrap();
+        assert_eq!(
+            engine.commits() - commits,
+            1,
+            "three replaces and two tail deletes must be one commit, not five"
+        );
+        let published = drain(&mut rx);
+        let replaces = published.iter().filter(|(_, k)| *k == OpKind::Replace).count();
+        let deletes = published.iter().filter(|(_, k)| *k == OpKind::Delete).count();
+        assert_eq!((replaces, deletes), (3, 2), "exactly 3 replaces and 2 deletes: {published:?}");
+        assert_eq!(published.len(), 5, "and nothing else: {published:?}");
+
+        let stored: Vec<u32> =
+            engine.get_vectors(&shadow, &source).unwrap().iter().map(|r| r.chunk).collect();
+        assert_eq!(stored, vec![0, 1, 2], "the stored chunk set is exactly 0..3");
+    }
+
+    /// The twin for the delete: one commit for the whole chunk set, the
+    /// generation moved once, and a second delete of a document with no
+    /// chunks costs nothing — no commit, no entry, no generation.
+    #[test]
+    fn deleting_a_documents_vectors_is_one_commit_however_many_it_holds() {
+        use kimmy_core::OpKind;
+
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        let five: Vec<VectorRecord> = (0..5).map(|n| record(n, 10, "text")).collect();
+        engine.put_vectors(&shadow, &source, &five).unwrap();
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let generation = engine.vector_generation(shadow.id);
+        assert_eq!(engine.delete_vectors(&shadow, &source).unwrap(), 5);
+        assert_eq!(engine.commits() - commits, 1, "five deletes must be one commit, not five");
+        let published = drain(&mut rx);
+        assert_eq!(published.len(), 5, "five delete entries: {published:?}");
+        assert!(published.iter().all(|(_, k)| *k == OpKind::Delete), "{published:?}");
+        assert_eq!(engine.vector_generation(shadow.id), generation + 1, "bumped once");
+        assert!(engine.get_vectors(&shadow, &source).unwrap().is_empty());
+
+        // Nothing left to delete: nothing happens.
+        let commits = engine.commits();
+        let generation = engine.vector_generation(shadow.id);
+        assert_eq!(engine.delete_vectors(&shadow, &source).unwrap(), 0);
+        assert_eq!(engine.commits(), commits, "a delete of nothing must not commit");
+        assert!(rx.try_recv().is_err(), "a delete of nothing must not publish");
+        assert_eq!(engine.vector_generation(shadow.id), generation, "or move the generation");
+    }
+
+    /// The correctness half of one commit: a write that fails at the third
+    /// of five chunks leaves the previous chunk set exactly as it was, not a
+    /// document with two new chunks in front of its old ones. The failure
+    /// is a unique violation on the shadow, which is an ordinary collection
+    /// and takes an index like any other.
+    #[test]
+    fn a_failed_chunk_write_leaves_the_previous_chunk_set_intact() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        engine
+            .create_index(
+                "app",
+                &shadow.name,
+                vec![crate::meta::IndexField { path: "text".into(), descending: false }],
+                true,
+                None,
+            )
+            .unwrap();
+
+        let before: Vec<VectorRecord> =
+            (0..3).map(|n| record(n, 10, &format!("old {n}"))).collect();
+        engine.put_vectors(&shadow, &source, &before).unwrap();
+        let raw_before: Vec<Option<bson::Document>> =
+            (0..3).map(|n| engine.get(&shadow, &VectorRecord::id(&source, n)).unwrap()).collect();
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let generation = engine.vector_generation(shadow.id);
+        let tail = engine.read_arrival_from(0, 100).unwrap().len();
+
+        // Chunk 2 repeats chunk 0's text, so the third write breaks the
+        // unique index against a chunk written earlier in the same scope.
+        let torn = vec![
+            record(0, 20, "new 0"),
+            record(1, 20, "new 1"),
+            record(2, 20, "new 0"),
+            record(3, 20, "new 3"),
+            record(4, 20, "new 4"),
+        ];
+        let err = engine.put_vectors(&shadow, &source, &torn).unwrap_err();
+        assert!(
+            matches!(err, StorageError::Core(CoreError::UniqueViolation { .. })),
+            "the write fails on the third chunk: {err}"
+        );
+
+        assert_eq!(engine.get_vectors(&shadow, &source).unwrap(), before, "the old set is intact");
+        for n in 0..3 {
+            let raw = engine.get(&shadow, &VectorRecord::id(&source, n)).unwrap();
+            assert_eq!(raw, raw_before[n as usize], "chunk {n} is byte-for-byte what it was");
+        }
+        for n in 3..5 {
+            assert!(
+                engine.get(&shadow, &VectorRecord::id(&source, n)).unwrap().is_none(),
+                "chunk {n} was never committed"
+            );
+        }
+        assert_eq!(engine.commits(), commits, "a failed write must not commit");
+        assert!(rx.try_recv().is_err(), "a failed write must not publish");
+        assert_eq!(
+            engine.read_arrival_from(0, 100).unwrap().len(),
+            tail,
+            "the oplog must not move"
+        );
+        assert_eq!(engine.vector_generation(shadow.id), generation, "the generation must not move");
+    }
+
+    /// An empty chunk set over a document that has none is not a write: no
+    /// commit, and no generation, since nothing an index could see changed.
+    #[test]
+    fn an_empty_vector_write_over_nothing_costs_nothing() {
+        let (engine, shadow, _dir) = with_vectors();
+        let source = DocId::Int64(1);
+        let mut rx = engine.subscribe();
+
+        let commits = engine.commits();
+        let generation = engine.vector_generation(shadow.id);
+        engine.put_vectors(&shadow, &source, &[]).unwrap();
+        assert_eq!(engine.commits(), commits, "an empty write over nothing must not commit");
+        assert!(rx.try_recv().is_err(), "or publish");
+        assert_eq!(engine.vector_generation(shadow.id), generation, "or move the generation");
+        assert!(engine.get_vectors(&shadow, &source).unwrap().is_empty());
     }
 
     #[test]

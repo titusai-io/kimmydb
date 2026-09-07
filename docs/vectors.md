@@ -272,6 +272,9 @@ curl -XPUT localhost:7878/v1/db/shop/coll/orders/docs/42/vectors -H "$A" -d '[
 previously stored under it and not named here is removed — the same replace-all
 semantics the embedding worker uses, and the only ones that stop a shortened
 document from leaving orphan chunks that still match text it no longer contains.
+The replacement is one transaction, however many chunks the body holds: a
+failure part way through leaves the previous chunk set untouched, never a
+document holding some chunks from each version.
 
 The server fills in the rest of each record: which document it belongs to, and
 the document's current HLC. That second part is why staleness detection keeps
