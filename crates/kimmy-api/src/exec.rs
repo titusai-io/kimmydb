@@ -178,6 +178,30 @@ pub fn create_collection(
     Ok(json!({ "created": meta.name, "id": meta.id.0 }))
 }
 
+/// The shadow collections a drop of `db.coll` will take with it.
+///
+/// Resolved *before* the drop, for the reason `vectors::disable_vectors`
+/// resolves its own there: the vector index is keyed by the **shadow**
+/// collection's id, the shadow is removed in the same transaction as its
+/// parent, and once that has happened there is no id left to forget the graph
+/// under. Looked up by name rather than through `vector_collection`, which
+/// answers `None` for a collection whose configuration was removed without its
+/// vectors — the drop still takes that shadow, so it still strands a graph.
+/// A shadow named directly is its own answer.
+fn shadows_of(state: &SharedState, db: &str, coll: &str) -> Vec<kimmy_core::CollectionId> {
+    let mut ids = Vec::new();
+    if kimmy_core::vector_meta::is_shadow(coll) {
+        if let Ok(meta) = state.engine.get_collection(db, coll) {
+            ids.push(meta.id);
+        }
+    } else if let Ok(shadow) =
+        state.engine.get_collection(db, &kimmy_core::vector_meta::shadow_name(coll))
+    {
+        ids.push(shadow.id);
+    }
+    ids
+}
+
 /// Drop every collection in a database. Each drop is a replicated entry and
 /// the last one takes the database with it on every member, so this needs
 /// no replication of its own. System databases are refused: the node keeps
@@ -190,7 +214,23 @@ pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value
         )));
     }
     auth.require(Action::Ddl, db, None)?;
-    Ok(json!({ "dropped": state.engine.drop_database(db)? }))
+    // Every vector-enabled collection in the database, not one: this drops
+    // them all, and a graph left behind for any of them is resident memory
+    // and disk for data that no longer exists. Listed before the drop for the
+    // reason `shadows_of` gives, and the shadows are listed here beside their
+    // parents, so this is the whole set.
+    let shadows: Vec<kimmy_core::CollectionId> = state
+        .engine
+        .list_collections(db)?
+        .into_iter()
+        .filter(|c| kimmy_core::vector_meta::is_shadow(&c.name))
+        .map(|c| c.id)
+        .collect();
+    let dropped = state.engine.drop_database(db)?;
+    for shadow in shadows {
+        state.vectors.invalidate(shadow);
+    }
+    Ok(json!({ "dropped": dropped }))
 }
 
 pub fn drop_collection(
@@ -201,7 +241,12 @@ pub fn drop_collection(
 ) -> Result<Value, ApiError> {
     let _span = op_span("drop_collection", db, Some(coll)).entered();
     auth.require(Action::Ddl, db, Some(coll))?;
-    Ok(json!({ "dropped": state.engine.drop_collection(db, coll)? }))
+    let shadows = shadows_of(state, db, coll);
+    let dropped = state.engine.drop_collection(db, coll)?;
+    for shadow in shadows {
+        state.vectors.invalidate(shadow);
+    }
+    Ok(json!({ "dropped": dropped }))
 }
 
 // ---------------------------------------------------------------------------

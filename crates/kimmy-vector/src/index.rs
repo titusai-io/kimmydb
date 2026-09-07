@@ -12,7 +12,7 @@
 use std::collections::HashSet;
 
 use hnsw_rs::prelude::{DistCosine, DistL2, Hnsw};
-use kimmy_core::{DocId, Metric, VectorRecord, similarity};
+use kimmy_core::{DocId, Hlc, Metric, VectorRecord, similarity};
 use kimmy_storage::{CollectionMeta, Engine};
 use tracing::debug;
 
@@ -129,12 +129,34 @@ struct SnapshotMeta {
     format: u32,
     metric: Metric,
     dim: usize,
+    /// The `created` stamp of the shadow collection this graph was built from
+    /// — *which* collection it describes, not merely which name.
+    ///
+    /// A collection id is derived from its name, so a name that is dropped and
+    /// created again gets the same id, the same snapshot path, and would adopt
+    /// its predecessor's graph. `CollectionMeta` already carries `created` for
+    /// exactly this reason and `sync.rs` already discriminates a stale drop by
+    /// it; this is the same discriminator at the snapshot's trust boundary.
+    /// `created` rather than `incarnation_floor`, which is `None` on a first
+    /// creation and so cannot tell two incarnations apart when it matters
+    /// most.
+    ///
+    /// Defaulted on read so that a format-1 file, which has no such field,
+    /// parses far enough for the format check below to name what is wrong,
+    /// rather than failing on a missing field first. Either way it is refused.
+    #[serde(default)]
+    created: Hlc,
     keys: Vec<String>,
 }
 
 /// Bumped when the snapshot layout changes; a mismatch is a rebuild, not a
 /// migration.
-const SNAPSHOT_FORMAT: u32 = 1;
+///
+/// 2 added `created`. Every snapshot written by an earlier build is refused
+/// and rebuilt on its first access, which is the ordinary cost of a format
+/// change and cheaper than trusting a graph that cannot say which incarnation
+/// of a name it was built for.
+const SNAPSHOT_FORMAT: u32 = 2;
 
 /// Reload one graph from a leaked io handle, containing `hnsw_rs`'s panics.
 ///
@@ -210,6 +232,9 @@ pub struct HnswIndex {
     keys: Vec<String>,
     metric: Metric,
     dim: usize,
+    /// The shadow collection incarnation this was built from. Persisted, and
+    /// checked on load — see [`SnapshotMeta::created`].
+    created: Hlc,
     /// [`estimate_bytes`] at construction, so the cache can budget without
     /// recomputing it on every install.
     bytes: usize,
@@ -408,7 +433,7 @@ impl HnswIndex {
 
         debug!(vectors = keys.len(), "built HNSW index");
         let bytes = estimate_bytes(&keys, dim);
-        let index = Self { graph, keys, metric, dim, bytes };
+        let index = Self { graph, keys, metric, dim, created: shadow.created, bytes };
 
         // Ask the sampled vectors to find themselves. A few dozen searches
         // against an O(n log n) build, and no extra reads.
@@ -505,6 +530,7 @@ impl HnswIndex {
             format: SNAPSHOT_FORMAT,
             metric: self.metric,
             dim: self.dim,
+            created: self.created,
             keys: self.keys.clone(),
         };
         std::fs::write(
@@ -522,13 +548,16 @@ impl HnswIndex {
     /// Load a snapshot from `dir`, refusing one that describes a different
     /// index than the caller wants.
     ///
-    /// The metric and dimension checks are the trust boundary: a snapshot
-    /// written under an old vector configuration would compute every distance
-    /// wrongly, which is worse than the rebuild it saves. Any other failure —
-    /// missing files, torn writes, a format this build does not speak — is a
-    /// plain `Err`, and the caller discards the snapshot and rebuilds.
-    /// Correctness never depends on a load succeeding.
-    pub fn load(dir: &std::path::Path, metric: Metric, dim: usize) -> Result<Self> {
+    /// The metric, dimension and incarnation checks are the trust boundary. A
+    /// snapshot written under an old vector configuration would compute every
+    /// distance wrongly, which is worse than the rebuild it saves; a snapshot
+    /// left behind by a *previous collection of the same name* describes
+    /// chunks that no longer exist, and because ids are derived from names it
+    /// is sitting at exactly the path the new collection's graph would use.
+    /// Any other failure — missing files, torn writes, a format this build
+    /// does not speak — is a plain `Err`, and the caller discards the snapshot
+    /// and rebuilds. Correctness never depends on a load succeeding.
+    pub fn load(dir: &std::path::Path, metric: Metric, dim: usize, created: Hlc) -> Result<Self> {
         let corrupt = |detail: String| VectorError::Snapshot(detail);
 
         let raw = std::fs::read(dir.join("meta.json")).map_err(|e| corrupt(e.to_string()))?;
@@ -547,6 +576,13 @@ impl HnswIndex {
                 meta.metric, meta.dim, metric, dim
             )));
         }
+        if meta.created != created {
+            return Err(corrupt(format!(
+                "snapshot was built for the collection created at {:?}, not the one created \
+                 at {created:?} — a previous collection of this name left it behind",
+                meta.created
+            )));
+        }
 
         let graph = match metric {
             Metric::Cosine => load_graph::<DistCosine>(dir).map(Graph::Cosine),
@@ -557,7 +593,7 @@ impl HnswIndex {
 
         debug!(vectors = meta.keys.len(), ?dir, "loaded HNSW snapshot");
         let bytes = estimate_bytes(&meta.keys, dim);
-        Ok(Self { graph, keys: meta.keys, metric, dim, bytes })
+        Ok(Self { graph, keys: meta.keys, metric, dim, created: meta.created, bytes })
     }
 
     /// Approximate k-nearest neighbours, as chunk keys.

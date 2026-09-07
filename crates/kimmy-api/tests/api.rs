@@ -9910,3 +9910,279 @@ async fn a_node_without_peers_answers_an_index_request_as_before() {
     let dropped = server.delete("/v1/db/shop/coll/orders/indexes/email_1", Some(&token)).await;
     assert_eq!(dropped.body, json!({ "dropped": true }));
 }
+
+// ---------------------------------------------------------------------------
+// Dropping data forgets the vector index built over it
+// ---------------------------------------------------------------------------
+
+/// Where a shadow collection's HNSW snapshot lives under a test server.
+///
+/// The cache puts snapshots beside the database file, named by the derived
+/// collection id, so a test can name one without the cache exposing the path.
+fn snapshot_of(server: &Server, shadow: kimmy_core::CollectionId) -> std::path::PathBuf {
+    server._dir.path().join("hnsw").join(format!("{:016x}", shadow.0))
+}
+
+/// A fresh collection with `byo` embeddings configured.
+async fn configure_vectors(server: &Server, token: &str, db: &str, coll: &str) {
+    server.post(&format!("/v1/db/{db}/collections"), Some(token), json!({ "name": coll })).await;
+    let res = server
+        .post(
+            &format!("/v1/db/{db}/coll/{coll}/vector"),
+            Some(token),
+            json!({ "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "configuring vectors failed: {:?}", res.body);
+}
+
+/// Fill a configured collection's shadow with enough vectors to be worth a
+/// graph, build the graph, and return the shadow's id.
+///
+/// The vectors go straight into the shadow rather than over HTTP: what these
+/// tests are about is what a *drop* does to the graph, not how the vectors
+/// reached the collection, and one write of many chunks is one commit instead
+/// of five hundred.
+fn build_graph(server: &Server, db: &str, coll: &str) -> kimmy_core::CollectionId {
+    let engine = &server.state.engine;
+    let shadow = engine.vector_collection(db, coll).unwrap().unwrap();
+    let source = kimmy_core::DocId::Int64(1);
+    let records: Vec<kimmy_core::VectorRecord> = (0..500u32)
+        .map(|chunk| kimmy_core::VectorRecord {
+            source: source.clone(),
+            chunk,
+            source_hlc: kimmy_core::Hlc::new(1, 0),
+            vector: vec![chunk as f32, 1.0, 0.0],
+            text: "t".into(),
+        })
+        .collect();
+    engine.put_vectors(&shadow, &source, &records).unwrap();
+
+    let access = server.state.vectors.access(engine, &shadow, kimmy_core::Metric::Cosine, 3);
+    assert!(
+        matches!(access, kimmy_vector::Access::Approximate(_)),
+        "500 vectors is the threshold; this should have built a graph"
+    );
+    assert!(snapshot_of(server, shadow.id).is_dir(), "the build should have been persisted");
+    shadow.id
+}
+
+#[tokio::test]
+async fn dropping_a_collection_forgets_its_vector_index() {
+    // The graph is keyed by the shadow collection, which the drop removes in
+    // the same transaction — so unless the id is resolved beforehand there is
+    // nothing left to forget it under, and it stays resident with its snapshot
+    // on disk for data that no longer exists.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    let shadow = build_graph(&server, "shop", "docs");
+
+    let res = server.delete("/v1/db/shop/coll/docs", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+
+    assert_eq!(server.state.vectors.len(), 0, "the graph outlived the collection it described");
+    assert!(!snapshot_of(&server, shadow).exists(), "and so did its snapshot");
+}
+
+#[tokio::test]
+async fn dropping_a_database_forgets_every_vector_index_in_it() {
+    // Every one, not one: a database drop takes all its collections, so a fix
+    // that resolved a single shadow would leave every other graph behind.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    configure_vectors(&server, &token, "shop", "notes").await;
+    let docs = build_graph(&server, "shop", "docs");
+    let notes = build_graph(&server, "shop", "notes");
+    assert_eq!(server.state.vectors.len(), 2);
+
+    let res = server.delete("/v1/db/shop", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+
+    assert_eq!(server.state.vectors.len(), 0, "a graph survived the database it belonged to");
+    assert!(!snapshot_of(&server, docs).exists());
+    assert!(!snapshot_of(&server, notes).exists());
+}
+
+/// Give a background consumer up to three seconds to reach some state.
+///
+/// Returns whether it did. A consumer is a task, so what it has done is only
+/// ever observable a poll later — and a caller using this as a *fence* (proof
+/// that the consumer has passed some entry) must assert the result, or a
+/// consumer that never got there passes the fence silently.
+#[must_use]
+async fn wait_until(mut reached: impl FnMut() -> bool) -> bool {
+    for _ in 0..300 {
+        if reached() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+/// One direction of an anti-entropy round, as two members would run it.
+fn replicate(from: &Server, to: &Server) {
+    let mine = to.state.engine.version_vector().unwrap();
+    let theirs = from.state.engine.version_vector().unwrap();
+    if let Some(start) = mine.behind(&theirs) {
+        let window = from.state.engine.entries_for_peer(start, 1024).unwrap();
+        to.state.engine.apply_batch(&window.entries).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
+    // The half a single node cannot show. A drop that arrives by replication
+    // is applied by the sync path, and the member applying it never runs the
+    // route that forgets the graph — so the member holding the vectors kept
+    // them, resident and on disk, while the member the drop was issued on had
+    // nothing. That is the reading a live cluster gave twelve hours after
+    // every user collection had been dropped.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    // Spawned as the daemon spawns it, before anything is published.
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    replicate(&issuer, &applier);
+    let shadow = build_graph(&applier, "shop", "docs");
+    assert_eq!(applier.state.vectors.len(), 1);
+
+    let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+
+    // The consumer is a task, so the drop takes effect a poll later rather
+    // than within the apply — which is the whole point of it not being in the
+    // apply.
+    assert!(
+        wait_until(|| applier.state.vectors.is_empty()).await,
+        "the applying member kept a graph for a collection it no longer holds"
+    );
+    assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
+    consumer.abort();
+}
+
+#[tokio::test]
+async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alone() {
+    // A collection recreated under the same name derives the same id, so it
+    // reuses the same cache key and the same snapshot path. A drop from the
+    // previous life therefore names, as far as an id goes, the collection
+    // standing here now.
+    //
+    // Writing this test is what found the hazard: the consumer originally
+    // acted on the entry, and a drop can reach it long after the fact, because
+    // the feed is a bounded ring and five hundred chunks of one document is
+    // five hundred entries through it. By the time it read the drop the name
+    // had been created again and its graph rebuilt, and it deleted that live
+    // graph and snapshot. The consumer now checks whether the collection is
+    // actually gone before forgetting anything, which is what this pins.
+    //
+    // The lateness is arranged rather than raced: the consumer's receiver is
+    // opened before the drop — so the drop is queued for it, exactly as it
+    // would be behind a burst — but the consumer is not run until after the
+    // recreation and the rebuild. A consumer that trusted the entry would
+    // remove the live graph the moment it started; the guard collection's
+    // drop, published after, is the fence that proves it got that far.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    // Incarnation one, replicated, with its graph built on the applier.
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    replicate(&issuer, &applier);
+    let first = build_graph(&applier, "shop", "docs");
+
+    // Subscribed now, run later: `invalidator` subscribes when it is called,
+    // not when it is first polled, so everything published from here on
+    // queues for it.
+    let late_consumer = kimmy_api::vectors::invalidator(&applier.state);
+
+    // Dropped on the issuer and applied on the applier, which publishes the
+    // drop into the parked receiver. Nothing is running to act on it, so the
+    // applier still holds incarnation one's graph — the state a lagging
+    // member is in.
+    let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert_eq!(applier.state.vectors.len(), 1, "nothing has consumed the drop yet");
+
+    // Incarnation two under the same name — same derived id, same snapshot
+    // path — with its graph rebuilt on the applier, plus a guard collection
+    // whose own drop is the fence at the end.
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    configure_vectors(&issuer, &token, "shop", "guard").await;
+    replicate(&issuer, &applier);
+    let live = build_graph(&applier, "shop", "docs");
+    assert_eq!(live, first, "the recreated name must derive the same id for this to test anything");
+    let guard = build_graph(&applier, "shop", "guard");
+    assert_eq!(applier.state.vectors.len(), 2);
+    assert!(snapshot_of(&applier, live).is_dir());
+
+    // Now the consumer runs, and the first thing it reads is a drop for the
+    // id that the live collection holds.
+    let consumer = tokio::spawn(late_consumer);
+
+    // The guard's drop is published after the stale one, and the feed is
+    // ordered, so the guard's snapshot going means the consumer has read and
+    // passed the stale drop. Asserted, so a consumer that never got there
+    // cannot pass the fence silently.
+    let res = issuer.delete("/v1/db/shop/coll/guard", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert!(
+        wait_until(|| !snapshot_of(&applier, guard).exists()).await,
+        "the consumer never reached the guard's drop, so nothing below is evidence"
+    );
+
+    assert!(
+        snapshot_of(&applier, live).is_dir(),
+        "a drop from a previous incarnation took the live collection's snapshot"
+    );
+    assert_eq!(
+        applier.state.vectors.len(),
+        1,
+        "the live collection's graph should be the one entry left"
+    );
+    consumer.abort();
+}
+
+#[tokio::test]
+async fn storing_vectors_for_a_document_leaves_the_collection_s_snapshot_alone() {
+    // Writing vectors is not losing them. The write bumps the collection's
+    // vector generation, which is the whole of what the search path needs to
+    // notice it, and is exactly what the embedding worker does for the same
+    // write. Discarding the cached graph on top of that also deleted the
+    // snapshot — once per stored document — so the next search paid a full
+    // rebuild instead of the bounded staleness the index is designed around.
+    // What keeps the surviving snapshot honest past this write is the cache
+    // itself (`a_snapshot_this_process_wrote_is_not_fresh_past_a_later_write`
+    // in kimmy-vector), not the route.
+    let server = Server::start().await;
+    let token = server.root().await;
+    configure_vectors(&server, &token, "shop", "docs").await;
+    let shadow = build_graph(&server, "shop", "docs");
+    let snapshot = snapshot_of(&server, shadow);
+
+    // The document has to exist: the route takes its stamp from it.
+    let res = server
+        .post("/v1/db/shop/coll/docs/docs", Some(&token), json!({ "_id": 1, "text": "a widget" }))
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    let res = server
+        .put(
+            "/v1/db/shop/coll/docs/docs/1/vectors",
+            Some(&token),
+            json!([{ "chunk": 0, "vector": [1.0, 0.0, 0.0], "text": "a widget" }]),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+
+    assert!(snapshot.is_dir(), "a vector write must not throw away the persisted graph");
+    assert_eq!(server.state.vectors.len(), 1, "nor the resident one");
+}

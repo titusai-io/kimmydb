@@ -427,6 +427,28 @@ async fn start_and_serve(config: Config) -> Result<()> {
     let sessions_handle =
         tokio::spawn(kimmy_api::sessions::invalidator(&engine, state.sessions.clone()));
 
+    // The same shape, one cache over. Dropping a collection forgets its vector
+    // index on the member that took the request; a drop that arrives by
+    // replication is applied by the sync path, which runs no route, so without
+    // this consumer that member keeps the graph resident and its snapshot on
+    // disk for a collection that no longer exists.
+    let vector_index_handle = tokio::spawn(kimmy_api::vectors::invalidator(&state));
+
+    // Snapshots left by a drop this node was not running for are reached by
+    // neither the routes nor the consumer: nothing opens a snapshot directory
+    // until something asks for that collection, and nothing asks for one that
+    // no longer exists. Swept once, here, before any graph can be building.
+    match kimmy_storage::blocking(|| {
+        kimmy_api::vectors::live_collections(&engine)
+            .map(|live| state.vectors.sweep_snapshots(&live))
+    }) {
+        Ok(removed) if removed > 0 => {
+            info!(removed, "removed HNSW snapshots for collections this node no longer holds");
+        }
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "could not sweep stale HNSW snapshots"),
+    }
+
     // The embedding worker is an ordinary change-stream subscriber, so it runs
     // alongside the server rather than inside the write path. A write returns
     // as soon as its oplog entry is durable; embedding catches up behind it.
@@ -532,6 +554,8 @@ async fn start_and_serve(config: Config) -> Result<()> {
     }
     // Holds only a cache, which the next start rebuilds by reading.
     sessions_handle.abort();
+    // Likewise, and it is holding nothing when it is between entries.
+    vector_index_handle.abort();
     stall_probe.abort();
     // The worker holds no locks and its position is durable, so aborting is
     // safe: whatever it had not finished is re-delivered on the next start.

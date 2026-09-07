@@ -682,7 +682,8 @@ not yet compose inside a pipeline.
 
 Tracked in [Deviations](deviations.md). Two former entries here are built:
 graphs **persist across restarts** (M8 — loaded before any rebuild is paid,
-validated by vector count), and **reindexing is just `POST /vector` again** —
+validated by the incarnation they were built for and then by vector count),
+and **reindexing is just `POST /vector` again** —
 every configuration change triggers a backfill that scans the collection and
 re-embeds what the new configuration demands. Changing the dimension in place
 is legal for server-embedded collections (old-width vectors are invisible to
@@ -701,6 +702,8 @@ The exact path is the oracle for everything approximate:
 | Dispatch does not change results | `the_approximate_path_agrees_with_the_exact_one` asserts both paths return the same nearest neighbour with a **byte-identical score** |
 | A rebuild stalls no other collection | A build of one collection is parked and a search on another is asserted served meanwhile; two searches on an unbuilt collection produce exactly one build; a search arriving mid-rebuild is served the previous graph |
 | The budget evicts least recently searched first, and never refuses | Three graphs under a budget for two: the untouched one goes, and comes back rebuilt on its next search; a graph larger than the whole budget still loads; a rebuild is charged once; `0` evicts nothing |
+| Dropping the data drops the graph | A collection drop, a database drop and a drop arriving by replication each leave the cache without the graph and the snapshot directory gone; a drop re-delivered after the name was created again leaves the live graph alone |
+| A snapshot cannot outlive the collection it describes | A collection dropped and recreated under the same name derives the same id and the same snapshot path; the graph records the incarnation it was built for and is refused when that does not match, and the startup sweep removes snapshots for collections the node no longer holds |
 | Re-embedding is idempotent | Replaying an oplog entry after vectors exist at that HLC is a no-op |
 | A crash does not lose embeddings | The recorded position always trails completed work |
 | Retry does not stall the queue | Retryable and terminal provider failures are distinguished and tested apart |
