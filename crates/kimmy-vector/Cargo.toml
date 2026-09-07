@@ -24,7 +24,7 @@ serde_json.workspace = true
 # (OpenSSL) on top of ONNX Runtime, so a build needs libssl-dev as well; the
 # rustls variants avoid that. `image-models` is dropped because this is a text
 # embedding pipeline.
-fastembed = { version = "5", default-features = false, features = [
+fastembed = { version = "6", default-features = false, features = [
     "ort-download-binaries-rustls-tls",
     "hf-hub-rustls-tls",
 ], optional = true }
