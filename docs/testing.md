@@ -769,8 +769,8 @@ Security properties are asserted as behaviour, not assumed:
 ### The protocol contract
 
 `crates/kimmy-api/tests/openapi.rs` holds `docs/openapi.yaml` to the server it
-describes ([ADR-056](decisions.md)). It is the only test here whose subject is
-a *document*.
+describes ([ADR-056](decisions.md)). It and the file below are the only tests
+here whose subject is a *document*.
 
 | Property | Test |
 |---|---|
@@ -818,6 +818,31 @@ drops on another — the only arrangement that could have shown that replicated
 schema changes were appended without being published. Cursor portability had been argued
 from the encoding and inherited from resume tokens; the protocol now tells
 clients to fail over between nodes, so it needed to be a measurement.
+
+### The prose contract
+
+`crates/kimmy-api/tests/docs.rs` holds the pages an operator acts on to the
+code they describe: the `next release` markers in `docs/threat-model.md`, swept
+once the changelog's newest section is a dated release; the log level of every
+error code; the `k` clamp in `docs/vectors.md`; the Extended JSON table in
+`docs/http-api.md`; and the metrics table.
+
+| Property | Test |
+|---|---|
+| The metrics table and the `/metrics` render name the same series, each way round, and every label key a series carries is named in its row | `operations_lists_every_series_the_metrics_endpoint_exposes` |
+| No series is on the page only because of the engine readings, so an empty render is the whole endpoint | `nothing_the_endpoint_exposes_depends_on_the_engine_readings` |
+
+The metrics row is the one that had to be written. That section promises "every
+series the endpoint exposes has a row", and the table has been wrong about it
+once: the 0.20.0 test round found fourteen exposed series with no row, and it
+took a harness outside this repository to notice, a release after the last of
+them shipped. Every series since has landed with its row in the same commit
+that added it to `metrics.rs` — ADR-145, ADR-147 and ADR-148 each did — and
+this test is what makes that a rule rather than a habit: equality in both
+directions, so a series cannot be added without its row and a row cannot
+outlive its series. It holds names and label *keys* only. A row that enumerates
+a label's values in its description — `ran`/`skipped`, `2xx`/`4xx`/`5xx` — can
+still fall behind the values the exposition emits, which nothing here reads.
 
 ---
 
