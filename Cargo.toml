@@ -131,7 +131,7 @@ argon2 = { version = "0.5", features = ["std"] }
 # not add a *second* native crypto stack: `ring` is already paid for, and
 # aws_lc_rs would add CMake for the same primitives.
 jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
-rand = "0.9"
+rand = "0.10"
 
 # The global allocator for `kimmyd`, and the second native library in the
 # default build beside `ring` (ADR-117). Every channel ships the static musl
