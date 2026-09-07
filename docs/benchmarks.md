@@ -198,8 +198,12 @@ trusted to serve. It passes.
 | `insert`, two secondary indexes | 3.53 ms | 283/s |
 | `replace` | 3.38 ms | 296/s |
 | `delete` + `insert` | 6.81 ms | 147/s |
-| `put_vectors`, 1 chunk | 5.67 ms | 176/s |
-| `put_vectors`, 4 chunks | 18.51 ms | 54/s |
+
+`put_vectors` used to have two rows here, 5.67 ms for one chunk and 18.51 ms
+for four, from the same 2026-08-08 run. They were taken when each chunk was a
+commit of its own; the re-measurement after that changed is
+["Storing a document's vectors"](#storing-a-documents-vectors-is-one-commit-however-many-chunks-it-holds)
+below, on a different machine, so it is not a row in this table.
 
 ### Secondary indexes are free on the write path
 
@@ -222,9 +226,55 @@ transaction**, not tuning anything inside a write. When this was first
 written nothing in the API offered that; `POST .../bulk` (`insert_many`) now
 does, and "Batching into one commit" below is what it was worth. The other
 lever, sharing one fsync between concurrent commits, is the `coalesced`
-durability class measured further down. Per-document commits still set the
-ceiling the embedding worker runs against, since it stores vectors one
-document at a time.
+durability class measured further down — and it is for concurrent writers
+only; a lone writer is slower under it, which is spelled out there. The
+embedding worker used to run against a ceiling of one commit per chunk of
+every document it stored, plus one each time it checkpointed its position; a
+document's chunks are now one commit however many there are
+([ADR-149](decisions.md), the section below), and the worker commits once per
+provider batch of about 32 documents with its position checkpoint folded into
+the same transaction (the amendment to [ADR-125](decisions.md)), so the
+ceiling it runs against is one commit per batch.
+
+### Storing a document's vectors is one commit, however many chunks it holds
+
+Re-measured 2026-09-07 on a different machine from the table above (an
+Apple-silicon laptop, `cargo bench -p kimmy-storage --bench write_path --
+put_vectors`; Criterion medians over 30 samples, two runs of each tree on a
+quiet machine, the mean of the two; 384-dimensional vectors), so read the
+two columns against each other rather than against the rows above. "Before"
+is the tree in which `put_vectors` wrote each chunk, and removed each stale
+tail chunk, as a commit of its own; "after" is the tree as shipped, where the
+whole replacement is one scoped write ([ADR-149](decisions.md)). The 32-chunk
+case was added to the bench for this measurement, because one chunk cannot
+show a per-chunk cost and four barely can.
+
+| Chunks | Before: one commit per chunk | After: one commit per document | Ratio |
+|---:|---:|---:|---:|
+| 1 | 6.08 ms, 164 docs/s | 6.30 ms, 159 docs/s | 1.0× |
+| 4 | 25.20 ms, 40 docs/s | 7.76 ms, 129 docs/s | 3.2× |
+| 32 | 183.8 ms, 5.4 docs/s | 13.07 ms, 77 docs/s | **14×** |
+
+**The old rows hid a multiplier of one commit per chunk.** Before, the
+marginal chunk cost 5.7 ms — a durable commit on this machine — so a
+document's cost was its chunk count times the commit, and the 3.3× step from
+the one-chunk row to the four-chunk row was that multiplier without a name.
+After, the marginal chunk is ~0.22 ms: the record and its oplog entry, with
+the commit paid once; 32 chunks land at 2,400 chunks a second against 170
+before.
+
+**The one-chunk row does not move, and is not supposed to.** With one chunk
+there is nothing to amortise, the same way `bulk` at batch size 1 lands on the
+single-insert number. On a corpus of about one chunk per document — the last
+real one embedded was 12,789 documents in 12,829 chunks — this change saves
+nothing per document; what it saves there is at the worker, whose batch of
+~32 documents plus its position is now one commit rather than 33.
+
+`scripts/bench-baseline.json` still holds the one- and four-chunk medians
+from before the change, recorded on its own machine, and has no 32-chunk
+entry; a `check` there will report the four-chunk case as `FASTER`, beyond
+the tolerance band, and the 32-chunk case as new, until the next `record` on
+that machine replaces them.
 
 ---
 

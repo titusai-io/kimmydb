@@ -482,6 +482,25 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   repair reaches the peer's tail. Both series are on the OTLP bridge
   ([ADR-148](docs/decisions.md)).
 
+- **The write-path benchmark rows for storing vectors were re-measured after
+  the one-commit change, and the operations guide now says `coalesced` slows
+  a lone writer, the embedding worker included.** The two `put_vectors` rows
+  in [Benchmarks](docs/benchmarks.md#the-write-path) were taken when each of
+  a document's chunks was a commit of its own, so the four-chunk row cost
+  3.3× the one-chunk row and the multiplier sat in the table without a name.
+  Measured again on one machine, before and after, one chunk costs what it
+  did, four chunks cost 3.2× less and thirty-two 14× less: the marginal chunk
+  fell from a commit to about a fifth of a millisecond, and the page now says
+  what ceiling the embedding worker runs against instead — one commit per
+  provider batch, its position folded in. Beside `storage.durability`,
+  [Operations](docs/operations.md#settings) now says that `coalesced` shares
+  an fsync among *concurrent* committers only: a lone writer waits out a
+  window for company that never comes, and the embedding worker is one, so
+  on a member that embeds the class makes that member's own embedding slower
+  per batch, not faster. [Vectors](docs/vectors.md#batching) says a batch's
+  documents and the worker's position are one commit, where it used to say
+  the storage write was still per document.
+
 ## 0.24.0 - 2026-09-06
 
 ### Changed
