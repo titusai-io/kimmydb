@@ -58,10 +58,12 @@ pub fn compare(keys: &[SortKey], a: &Document, b: &Document) -> Ordering {
 /// The value a document sorts by for one key.
 ///
 /// When a path resolves to several values — because it passes through an array
-/// — Mongo sorts ascending by the smallest and descending by the largest. Since
-/// the direction is applied by the caller, taking the minimum here and
-/// reversing gives the wrong end, so both extremes are handled by the caller
-/// through `descending`.
+/// — the smallest of them is the one the document sorts by, whichever
+/// direction was asked for. Direction is not visible here: [`compare`] applies
+/// `descending` by reversing the comparison of two minima that were already
+/// chosen, so a descending sort orders documents by their smallest element
+/// rather than their largest. Mongo takes the largest for a descending sort,
+/// so the two orderings differ where a sort key passes through an array.
 fn sort_value(doc: &Document, path: &str) -> Bson {
     let values = path::resolve(doc, path);
     if values.is_empty() {

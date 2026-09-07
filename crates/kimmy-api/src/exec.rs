@@ -1730,7 +1730,7 @@ pub fn aggregate_with_limits(
     if docs.len() > limits.max_documents {
         return Err(ApiError::bad_request(format!(
             "{what} admits more than {} documents, the pipeline limit. Narrow it with a more \
-             selective $match, or raise server.aggregate.max_documents",
+             selective $match",
             limits.max_documents
         )));
     }

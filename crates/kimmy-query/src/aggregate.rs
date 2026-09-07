@@ -816,7 +816,7 @@ pub fn check_limit(stage: &str, produced: usize, limits: &Limits) -> Result<()> 
     if produced > limits.max_documents {
         return Err(Error::InvalidQuery(format!(
             "{stage} produced {produced} documents, over the pipeline limit of {}. Narrow the \
-             pipeline with an earlier $match, or raise server.aggregate.max_documents",
+             pipeline with an earlier $match",
             limits.max_documents
         )));
     }

@@ -3060,4 +3060,361 @@ api_key_env = "KIMMY_PROVIDER_HOSTED"
             }
         );
     }
+
+    /// No message may name a setting the configuration parser would reject.
+    ///
+    /// Advice that names a key is only advice if the key exists. Every section
+    /// here is `deny_unknown_fields`, so an operator who is told to "raise
+    /// `x.y.z`" and writes `[x.y]` into their file gets a node that refuses to
+    /// start — the message took the deployment down rather than helping it.
+    /// The aggregation ceiling's refusal did exactly that: it offered a
+    /// `server.aggregate` setting that has never existed. So the invariant is
+    /// checked against the source rather than trusted.
+    ///
+    /// What is scanned: the prose string literals of every crate's `src`,
+    /// `#[cfg(test)]` modules excepted — those are stepped over and the scan
+    /// carries on below them, because a test module part way down a file must
+    /// not make the rest of it invisible. Prose means the literal contains a
+    /// space, which is what separates something said to an operator from a
+    /// field name, a route, a span name or a filename; those collide with
+    /// section names often enough (`storage.commit` is a span,
+    /// `svc.cluster.local` a hostname) to drown the signal. A name is also
+    /// ignored where it follows `.`, `-` or `/`, the tail of a hostname or a
+    /// URL path.
+    ///
+    /// What is not scanned, and would not be caught here: integration tests,
+    /// benches, the documentation, the client libraries, and any key a message
+    /// puts together rather than spelling out — of which the sharper edge is a
+    /// key held in a literal of its own, `format!("... raise {}", KEY)`, since
+    /// a literal with no space in it is exactly what this test skips.
+    ///
+    /// The scanner is checked against a fixture before it is believed, because
+    /// its failure mode is silence: a scanner that has stopped seeing
+    /// literals reports no offenders at all.
+    #[test]
+    fn no_message_names_a_setting_the_parser_would_reject() {
+        /// Does `text` continue with `word` at `i`?
+        fn at(text: &[char], i: usize, word: &str) -> bool {
+            word.chars().enumerate().all(|(n, ch)| text.get(i + n) == Some(&ch))
+        }
+
+        /// Every string literal in a Rust source, with comments, char
+        /// literals and `#[cfg(test)]` modules left out.
+        ///
+        /// Line continuations are joined, so a message split across source
+        /// lines is read as the one sentence it prints as. A test module is
+        /// skipped by matching its braces rather than by stopping the scan:
+        /// everything below it is still read.
+        fn literals(src: &str) -> Vec<String> {
+            let c: Vec<char> = src.chars().collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            // Brace depth, and the depth a test module's body closes back to.
+            // Its literals are still parsed — a quote or a brace in there has
+            // to be stepped over correctly either way — and simply not kept.
+            let mut depth = 0usize;
+            let mut skipping: Option<usize> = None;
+            let mut awaiting_test_mod = false;
+            while i < c.len() {
+                // Comments first: `#[cfg(test)]` written inside one is prose
+                // about a test module, not one.
+                if at(&c, i, "//") {
+                    while i < c.len() && c[i] != '\n' {
+                        i += 1;
+                    }
+                } else if at(&c, i, "/*") {
+                    let mut nesting = 1;
+                    i += 2;
+                    while i < c.len() && nesting > 0 {
+                        if at(&c, i, "/*") {
+                            nesting += 1;
+                            i += 2;
+                        } else if at(&c, i, "*/") {
+                            nesting -= 1;
+                            i += 2;
+                        } else {
+                            i += 1;
+                        }
+                    }
+                } else if at(&c, i, "#[cfg(test)]") {
+                    let mut j = i + "#[cfg(test)]".chars().count();
+                    while j < c.len() && c[j].is_whitespace() {
+                        j += 1;
+                    }
+                    // Only a whole test *module* is skipped. The same
+                    // attribute on a field or a type leaves the source around
+                    // it in the scan, which is where it belongs.
+                    awaiting_test_mod = at(&c, j, "mod ");
+                    i = j;
+                } else if c[i] == '{' {
+                    if awaiting_test_mod && skipping.is_none() {
+                        skipping = Some(depth);
+                    }
+                    awaiting_test_mod = false;
+                    depth += 1;
+                    i += 1;
+                } else if c[i] == '}' {
+                    depth = depth.saturating_sub(1);
+                    if skipping == Some(depth) {
+                        skipping = None;
+                    }
+                    i += 1;
+                } else if c[i] == ';' {
+                    // `mod tests;` — a module in another file, with no body
+                    // here to skip.
+                    awaiting_test_mod = false;
+                    i += 1;
+                } else if c[i] == 'r'
+                    && (i == 0 || !(c[i - 1].is_alphanumeric() || c[i - 1] == '_'))
+                    && i + 1 < c.len()
+                    && (c[i + 1] == '"' || c[i + 1] == '#')
+                {
+                    let mut hashes = 0;
+                    let mut j = i + 1;
+                    while j < c.len() && c[j] == '#' {
+                        hashes += 1;
+                        j += 1;
+                    }
+                    if j < c.len() && c[j] == '"' {
+                        j += 1;
+                        let start = j;
+                        let close: String =
+                            std::iter::once('"').chain(std::iter::repeat_n('#', hashes)).collect();
+                        while j < c.len() && !at(&c, j, &close) {
+                            j += 1;
+                        }
+                        if skipping.is_none() {
+                            out.push(c[start..j.min(c.len())].iter().collect());
+                        }
+                        i = j + close.chars().count();
+                    } else {
+                        i += 1;
+                    }
+                } else if c[i] == '"' {
+                    i += 1;
+                    let mut text = String::new();
+                    while i < c.len() && c[i] != '"' {
+                        if c[i] == '\\' && i + 1 < c.len() {
+                            if c[i + 1] == '\n' {
+                                i += 2;
+                                while i < c.len() && (c[i] == ' ' || c[i] == '\t') {
+                                    i += 1;
+                                }
+                                continue;
+                            }
+                            text.push(c[i + 1]);
+                            i += 2;
+                            continue;
+                        }
+                        text.push(c[i]);
+                        i += 1;
+                    }
+                    if skipping.is_none() {
+                        out.push(text);
+                    }
+                    i += 1;
+                } else if c[i] == '\'' {
+                    // A char literal, or a lifetime — only the first can hold
+                    // a quote or a brace that would otherwise be counted.
+                    if i + 2 < c.len() && c[i + 1] != '\\' && c[i + 2] == '\'' {
+                        i += 3;
+                    } else if i + 1 < c.len() && c[i + 1] == '\\' {
+                        i += 2;
+                        while i < c.len() && c[i] != '\'' {
+                            i += 1;
+                        }
+                        i += 1;
+                    } else {
+                        i += 1;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            out
+        }
+
+        /// The dotted names in `text` that begin with one of `sections`.
+        fn keys_named(text: &str, sections: &[String]) -> Vec<String> {
+            let c: Vec<char> = text.chars().collect();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < c.len() {
+                let after_a_name = i > 0
+                    && (c[i - 1].is_alphanumeric() || matches!(c[i - 1], '_' | '.' | '-' | '/'));
+                let section =
+                    if after_a_name { None } else { sections.iter().find(|s| at(&c, i, s)) };
+                let Some(section) = section else {
+                    i += 1;
+                    continue;
+                };
+                let mut j = i + section.chars().count();
+                let mut key = section.clone();
+                while j < c.len() && c[j] == '.' {
+                    let mut k = j + 1;
+                    if k >= c.len() || !(c[k].is_ascii_lowercase() || c[k] == '_') {
+                        break;
+                    }
+                    while k < c.len()
+                        && (c[k].is_ascii_lowercase() || c[k].is_ascii_digit() || c[k] == '_')
+                    {
+                        k += 1;
+                    }
+                    key.push('.');
+                    key.extend(&c[j + 1..k]);
+                    j = k;
+                }
+                if key != *section && !(j < c.len() && (c[j].is_alphanumeric() || c[j] == '_')) {
+                    out.push(key);
+                }
+                i = j.max(i + 1);
+            }
+            out
+        }
+
+        /// Every setting named in the prose of one source.
+        fn settings_named(source: &str, sections: &[String]) -> Vec<String> {
+            literals(source)
+                .into_iter()
+                .filter(|literal| literal.contains(' '))
+                .flat_map(|literal| keys_named(&literal, sections))
+                .collect()
+        }
+
+        /// Would the parser accept a file that set this key?
+        ///
+        /// The value is a number the key probably does not want, so an
+        /// accepted key still usually fails — but on its *type*. Only a key
+        /// that is not in the schema at all is an unknown field.
+        fn parser_accepts(key: &str) -> bool {
+            match toml::from_str::<Config>(&format!("{key} = 0")) {
+                Ok(_) => true,
+                Err(e) => !e.to_string().contains("unknown field"),
+            }
+        }
+
+        // The sections come from the config itself, so a new one is covered
+        // the day it is added.
+        let default = toml::to_string(&Config::default()).unwrap();
+        let sections: Vec<String> =
+            default.parse::<toml::Table>().unwrap().keys().cloned().collect();
+        assert!(sections.iter().any(|s| s == "server"), "no sections found: {sections:?}");
+
+        // The check has to be able to fail. Assembled rather than written out,
+        // so nothing below puts the false key into this file's own source.
+        let invented = ["server", "aggregate", "max_documents"].join(".");
+        assert!(!parser_accepts(&invented), "{invented} parses, so this test proves nothing");
+        let (head, tail) = invented.rsplit_once('.').expect("the invented key is dotted");
+
+        // The scanner, on a source holding every shape it has to see through:
+        // a message split by a line continuation *inside the key*, a char
+        // literal holding a quote, a raw string, a comment, and a test module
+        // part way down rather than at the end.
+        let fixture = format!(
+            r##"
+fn refuse() -> String {{
+    // A comment naming server.in_a_comment is not a message.
+    let quote = '"';
+    let raw = r#"and server.in_a_raw_string is one"#;
+    format!(
+        "over the pipeline limit. Narrow the \
+         pipeline with an earlier $match, or raise {head}.\
+         {tail}"
+    )
+}}
+
+#[cfg(test)]
+mod test_support {{
+    const BRACE: char = '{{';
+    const OLD: &str = "raise server.in_a_test_module to keep this";
+}}
+
+fn advise() -> &'static str {{
+    "raise storage.oplog_retention_secs to keep more history"
+}}
+"##
+        );
+        let seen = settings_named(&fixture, &sections);
+        for wanted in [invented.as_str(), "server.in_a_raw_string", "storage.oplog_retention_secs"]
+        {
+            assert!(seen.iter().any(|k| k == wanted), "the scanner missed {wanted}: {seen:?}");
+        }
+        for unwanted in ["server.in_a_comment", "server.in_a_test_module"] {
+            assert!(!seen.iter().any(|k| k == unwanted), "the scanner read {unwanted}: {seen:?}");
+        }
+
+        let crates = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates");
+        let mut sources = Vec::new();
+        let mut pending: Vec<std::path::PathBuf> = std::fs::read_dir(&crates)
+            .unwrap()
+            .map(|e| e.unwrap().path().join("src"))
+            .filter(|p| p.is_dir())
+            .collect();
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    sources.push(path);
+                }
+            }
+        }
+        assert!(sources.len() > 50, "the source walk found almost nothing: {}", sources.len());
+
+        // `vector` is one word over two namespaces: this file's `[vector]`
+        // section, and the vector block of a *collection's* metadata — the
+        // document `create_collection` is given, whose `dim`, `fields` and
+        // `chunk` are nothing to do with the node's configuration. Only that
+        // file, and only its `vector.` names.
+        let collection_vector_block =
+            std::path::Path::new("kimmy-core").join("src").join("vector_meta.rs");
+
+        let mut offenders = Vec::new();
+        let mut crates_scanned: std::collections::BTreeMap<String, usize> = Default::default();
+        for path in sources {
+            let a_collection_block = path.ends_with(&collection_vector_block);
+            let crate_name = path
+                .strip_prefix(&crates)
+                .unwrap()
+                .components()
+                .next()
+                .unwrap()
+                .as_os_str()
+                .to_string_lossy()
+                .to_string();
+            let display = path.strip_prefix(&crates).unwrap().display().to_string();
+            for key in settings_named(&std::fs::read_to_string(&path).unwrap(), &sections) {
+                if a_collection_block && key.starts_with("vector.") {
+                    continue;
+                }
+                *crates_scanned.entry(crate_name.clone()).or_default() += 1;
+                if !parser_accepts(&key) {
+                    offenders.push(format!("{display}: {key}"));
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+
+        // A scan that has gone blind over one crate reports no offenders in
+        // it, which looks exactly like a clean crate. Every crate that names
+        // a setting in a message today has to still be naming one.
+        for crate_name in
+            ["kimmy-api", "kimmy-auth", "kimmy-cli", "kimmy-storage", "kimmy-vector", "kimmyd"]
+        {
+            assert!(
+                crates_scanned.contains_key(crate_name),
+                "no setting was found in {crate_name}, which names one in a message today — \
+                 the scan has stopped reading it: {crates_scanned:?}"
+            );
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these messages name settings this file's parser rejects, so an operator who \
+             follows them writes a configuration the node will not start on:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 }

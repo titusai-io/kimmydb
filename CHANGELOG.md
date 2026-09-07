@@ -68,6 +68,24 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   without comparing them ([Query language](docs/query-language.md),
   [Key encoding](docs/key-encoding.md)).
 
+
+- **The aggregation ceiling's refusal no longer tells you to raise a setting
+  that does not exist.** A pipeline over the 100,000-document limit was
+  refused with "Narrow the pipeline with an earlier `$match`, or raise
+  `server.aggregate.max_documents`". There has never been a
+  `[server.aggregate]` section, and every section of the configuration file
+  rejects fields it does not know — so an operator who followed that advice
+  and wrote one into their file got a node that would not start. The message
+  turned one refused query into a member that will not come back up. The
+  ceiling is fixed by design, as [Aggregation](docs/aggregation.md)
+  documents it, and both refusals — the one naming a stage and the one
+  naming the source the pipeline reads — now say only the thing that works,
+  which is to select less with an earlier `$match`. The example refusal on
+  that page was quoted with an ellipsis that fell exactly where the false
+  advice began; it now quotes the whole message. A test over the sources
+  fails the build if any message names a setting the configuration parser
+  would reject.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
