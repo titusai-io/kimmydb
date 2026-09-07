@@ -217,8 +217,9 @@ pub fn drop_database(state: &SharedState, auth: &Auth, db: &str) -> Result<Value
     // Every vector-enabled collection in the database, not one: this drops
     // them all, and a graph left behind for any of them is resident memory
     // and disk for data that no longer exists. Listed before the drop for the
-    // reason `shadows_of` gives, and the shadows are listed here beside their
-    // parents, so this is the whole set.
+    // reason `shadows_of` gives, and every shadow in the database is listed
+    // here by name — beside its parent or, for an orphan (ADR-138), without
+    // one — so this is the whole set the drop takes.
     let shadows: Vec<kimmy_core::CollectionId> = state
         .engine
         .list_collections(db)?

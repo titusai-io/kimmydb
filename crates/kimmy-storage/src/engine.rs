@@ -1080,21 +1080,35 @@ impl Engine {
     }
 
     /// Drop a database and every collection in it.
-    /// Drop every collection in a database. Each drop is its own replicated
-    /// entry, and the last one removes the database row on every member.
+    ///
+    /// Each drop is its own replicated entry, and the last one removes the
+    /// database row on every member. A vector shadow goes with its parent in
+    /// the parent's transaction; a shadow with no parent (ADR-138) is dropped
+    /// on its own afterwards, so nothing in the database survives the answer.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
         // Answer "did it exist" up front: dropping the last collection removes
         // the row, so the removal below finds nothing on the common path.
         let existed = self.database_exists(name)?;
         let collections = self.list_collections(name)?;
         for collection in &collections {
-            // Shadows go with their parents; a shadow reached after its
-            // parent is already gone, which `drop_collection` reports as
-            // `false` rather than an error.
+            // Shadows go with their parents, in the parent's transaction.
             if vector_meta::is_shadow(&collection.name) {
                 continue;
             }
             self.drop_collection(name, &collection.name)?;
+        }
+
+        // What the parent loop leaves behind is a shadow with no parent to
+        // take it: the residue ADR-138 describes, where a parent's drop was
+        // applied before the shadow's create arrived. Skipped, it outlives
+        // the database row and the `true` this answers, and the next create
+        // in the database brings it back with its chunks. Listed again rather
+        // than remembered from the first pass, so only what is still here is
+        // named; `drop_collection_inner` takes a shadow name directly and
+        // mints its own `DropCollection` entry for it, which is how a peer
+        // holding the same orphan learns to drop its copy.
+        for orphan in self.list_collections(name)? {
+            self.drop_collection(name, &orphan.name)?;
         }
 
         // A database with no collections (the row exists, nothing else) still
@@ -1618,6 +1632,44 @@ mod tests {
         assert!(engine.drop_database("shop").unwrap());
         assert!(engine.list_collections("shop").unwrap().is_empty());
         assert!(!engine.database_exists("shop").unwrap());
+        assert!(!engine.drop_database("shop").unwrap(), "already gone");
+    }
+
+    #[test]
+    fn drop_database_drops_an_orphan_shadow_that_has_no_parent_to_take_it() {
+        // A shadow beside its parent goes in the parent's transaction. An
+        // orphan (ADR-138: the parent's drop applied before the shadow's
+        // create arrived) has no parent to go with, so unless the drop names
+        // it directly it survives the database it was in — still listed,
+        // resurrected by the next create in the database, and adopted by a
+        // vector-enabled collection recreated under its parent's name.
+        let (engine, _dir) = engine();
+        let orphan =
+            engine.create_system_collection("shop", &vector_meta::shadow_name("docs")).unwrap();
+        let config = kimmy_core::vector_meta::VectorConfig {
+            fields: vec!["body".into()],
+            provider: kimmy_core::ProviderConfig::Byo {},
+            dim: 3,
+            metric: Default::default(),
+            document_prefix: None,
+            query_prefix: None,
+            chunk: Default::default(),
+        };
+        engine.create_collection("shop", "notes").unwrap();
+        engine.configure_vectors("shop", "notes", config).unwrap();
+        assert_eq!(engine.list_collections("shop").unwrap().len(), 3, "orphan, notes, its shadow");
+
+        assert!(engine.drop_database("shop").unwrap());
+
+        assert!(engine.list_collections("shop").unwrap().is_empty(), "the orphan survived");
+        assert!(!engine.database_exists("shop").unwrap());
+        // Its own replicated entry, naming the shadow: a peer holding the same
+        // orphan drops it through the ordinary sync arm.
+        let entries = engine.entries_for_peer(Hlc::ZERO, 100).unwrap().entries;
+        assert!(
+            entries.iter().any(|e| e.kind == OpKind::DropCollection && e.collection == orphan.id),
+            "no DropCollection entry names the orphan shadow"
+        );
         assert!(!engine.drop_database("shop").unwrap(), "already gone");
     }
 
