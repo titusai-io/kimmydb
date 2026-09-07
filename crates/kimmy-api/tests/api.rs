@@ -9944,8 +9944,17 @@ async fn configure_vectors(server: &Server, token: &str, db: &str, coll: &str) {
 /// reached the collection, and one write of many chunks is one commit instead
 /// of five hundred.
 fn build_graph(server: &Server, db: &str, coll: &str) -> kimmy_core::CollectionId {
+    let shadow = server.state.engine.vector_collection(db, coll).unwrap().unwrap();
+    fill_and_build(server, &shadow)
+}
+
+/// [`build_graph`] for a shadow the caller has already resolved — or created
+/// itself, beneath the vector route.
+fn fill_and_build(
+    server: &Server,
+    shadow: &kimmy_storage::CollectionMeta,
+) -> kimmy_core::CollectionId {
     let engine = &server.state.engine;
-    let shadow = engine.vector_collection(db, coll).unwrap().unwrap();
     let source = kimmy_core::DocId::Int64(1);
     let records: Vec<kimmy_core::VectorRecord> = (0..500u32)
         .map(|chunk| kimmy_core::VectorRecord {
@@ -9956,9 +9965,9 @@ fn build_graph(server: &Server, db: &str, coll: &str) -> kimmy_core::CollectionI
             text: "t".into(),
         })
         .collect();
-    engine.put_vectors(&shadow, &source, &records).unwrap();
+    engine.put_vectors(shadow, &source, &records).unwrap();
 
-    let access = server.state.vectors.access(engine, &shadow, kimmy_core::Metric::Cosine, 3);
+    let access = server.state.vectors.access(engine, shadow, kimmy_core::Metric::Cosine, 3);
     assert!(
         matches!(access, kimmy_vector::Access::Approximate(_)),
         "500 vectors is the threshold; this should have built a graph"
@@ -10119,6 +10128,73 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
 }
 
 #[tokio::test]
+async fn a_replicated_reconfiguration_forgets_the_index_on_the_member_that_applies_it() {
+    // The route that reconfigures a collection forgets its graph, on the
+    // member that ran it. On every other member the change arrives as a
+    // replicated entry applied by the sync path, which runs no route, and a
+    // metric change at the same width — the only in-place change `byo`
+    // permits — keeps the shadow and writes nothing. So the applying member
+    // kept the cosine graph, and served it: a graph scores with its own
+    // metric, so every search there was ordered by a metric the collection
+    // no longer had.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    // Spawned as the daemon spawns it, before anything is published.
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    replicate(&issuer, &applier);
+    let shadow = build_graph(&applier, "shop", "docs");
+    assert_eq!(applier.state.vectors.len(), 1);
+    assert!(snapshot_of(&applier, shadow).is_dir());
+
+    // Same width, other metric.
+    let res = issuer
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({
+                "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                "metric": "euclidean",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "reconfiguring the metric failed: {:?}", res.body);
+    replicate(&issuer, &applier);
+
+    // The consumer is a task, so the change takes effect a poll later.
+    assert!(
+        wait_until(|| applier.state.vectors.is_empty()).await,
+        "the applying member kept a graph built for the metric the collection no longer has"
+    );
+    assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
+
+    // A search on the applier is served, and by a graph of the new metric.
+    let applier_token = applier.root().await;
+    let res = applier
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&applier_token),
+            json!({ "vector": [1.0, 1.0, 0.0], "k": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(applier.state.vectors.len(), 1, "the search should have built a graph");
+    let engine = &applier.state.engine;
+    let shadow_meta = engine.vector_collection("shop", "docs").unwrap().unwrap();
+    let access =
+        applier.state.vectors.access(engine, &shadow_meta, kimmy_core::Metric::Euclidean, 3);
+    let kimmy_vector::Access::Approximate(index) = access else {
+        panic!("500 vectors is the threshold; the search should have left a graph");
+    };
+    assert_eq!(index.metric(), kimmy_core::Metric::Euclidean, "the graph must be the new metric's");
+    assert_eq!(applier.state.vectors.len(), 1, "served from the cache, not rebuilt");
+    consumer.abort();
+}
+
+#[tokio::test]
 async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alone() {
     // A collection recreated under the same name derives the same id, so it
     // reuses the same cache key and the same snapshot path. A drop from the
@@ -10139,14 +10215,27 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
     // recreation and the rebuild. A consumer that trusted the entry would
     // remove the live graph the moment it started; the guard collection's
     // drop, published after, is the fence that proves it got that far.
+    //
+    // The recreation is done beneath the vector route, on purpose. A
+    // `ConfigureVectors` entry forgets the graph by design — the consumer
+    // treats one as a reconfiguration, whatever it held before — and one
+    // published after the drop would sit in the same queue and take the live
+    // graph a moment after the drop had left it alone, which is a rebuild
+    // this test is not about. So incarnation two is created as a plain
+    // collection, and its shadow and vectors are written directly, which
+    // publishes only entries the consumer does not act on. The guard is set
+    // up before the receiver opens for the same reason.
     let issuer = Server::start().await;
     let applier = Server::start().await;
     let token = issuer.root().await;
 
-    // Incarnation one, replicated, with its graph built on the applier.
+    // Incarnation one, replicated, with its graph built on the applier, and
+    // the guard beside it.
     configure_vectors(&issuer, &token, "shop", "docs").await;
+    configure_vectors(&issuer, &token, "shop", "guard").await;
     replicate(&issuer, &applier);
     let first = build_graph(&applier, "shop", "docs");
+    let guard = build_graph(&applier, "shop", "guard");
 
     // Subscribed now, run later: `invalidator` subscribes when it is called,
     // not when it is first polled, so everything published from here on
@@ -10160,17 +10249,20 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
     replicate(&issuer, &applier);
-    assert_eq!(applier.state.vectors.len(), 1, "nothing has consumed the drop yet");
+    assert_eq!(applier.state.vectors.len(), 2, "nothing has consumed the drop yet");
 
     // Incarnation two under the same name — same derived id, same snapshot
-    // path — with its graph rebuilt on the applier, plus a guard collection
-    // whose own drop is the fence at the end.
-    configure_vectors(&issuer, &token, "shop", "docs").await;
-    configure_vectors(&issuer, &token, "shop", "guard").await;
+    // path — with its graph rebuilt on the applier.
+    let res = issuer.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
     replicate(&issuer, &applier);
-    let live = build_graph(&applier, "shop", "docs");
+    let shadow = applier
+        .state
+        .engine
+        .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name("docs"))
+        .unwrap();
+    let live = fill_and_build(&applier, &shadow);
     assert_eq!(live, first, "the recreated name must derive the same id for this to test anything");
-    let guard = build_graph(&applier, "shop", "guard");
     assert_eq!(applier.state.vectors.len(), 2);
     assert!(snapshot_of(&applier, live).is_dir());
 

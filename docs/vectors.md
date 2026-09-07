@@ -688,7 +688,10 @@ every configuration change triggers a backfill that scans the collection and
 re-embeds what the new configuration demands. Changing the dimension in place
 is legal for server-embedded collections (old-width vectors are invisible to
 search while the backfill replaces them) and refused for `byo`, whose vectors
-the server cannot regenerate — drop those first.
+the server cannot regenerate — drop those first. Either change takes effect on
+every member, not only the one that took the request: each member's index
+cache records the metric and width a graph was built for and rebuilds on the
+first search that asks for another.
 
 ---
 

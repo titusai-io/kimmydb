@@ -482,6 +482,20 @@ impl HnswIndex {
         current_vectors.abs_diff(built) > (built / 4).max(1)
     }
 
+    /// The metric the graph was built for. Its walk chooses candidates by
+    /// this, and [`Self::search`] scores them by this too — from the stored
+    /// vectors, but with the graph's own metric — so a graph of one metric
+    /// answering a query configured for another orders the results wrongly.
+    pub fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// The width every vector in the graph has. A query of another width is
+    /// refused by [`Self::search_keys`].
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
     pub fn len(&self) -> usize {
         self.keys.len()
     }

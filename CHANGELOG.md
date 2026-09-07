@@ -210,6 +210,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   in the same way it would any other dropped collection
   ([HTTP API](docs/http-api.md)).
 
+- **A reconfigured vector collection no longer keeps serving its old graph
+  on every member but the one that took the request.** `POST .../vector` on
+  a collection that already had a configuration forgot the cached HNSW graph
+  on the member that ran the route and on no other: on every other member the
+  change arrived by replication, which runs no route, and the graph built for
+  the previous configuration stayed resident with nothing to tell it apart —
+  the shadow collection is kept, so the incarnation matched, and no vector is
+  written, so the generation matched too. A metric change at the same width
+  (the only in-place change a `byo` collection permits) left those members
+  ordering every search by the old metric, because a graph scores with the
+  metric it was built for, and the difference showed only in which hits came
+  first. A width change on a server-embedded collection left them holding a
+  graph that refused the query, so every search there was a `400` until the
+  graph was evicted or the process restarted.
+
+  Two things changed. The change-feed consumer that already forgets a dropped
+  collection's graph now forgets a reconfigured one's as well, on every member
+  the entry reaches. And the cache itself now records the metric and width a
+  graph was built for and declines an entry of another shape at the next
+  search, exactly as it declines one from a previous incarnation of the same
+  name — so a search is served by a graph of the configuration in force
+  whether or not the consumer has caught up, and a "too small" verdict
+  decided at one width is not reused at another.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`

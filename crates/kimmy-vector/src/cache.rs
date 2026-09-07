@@ -139,14 +139,41 @@ struct Entry {
     /// no expiry — the staleness window never opens, because nothing looks
     /// stale.
     created: Hlc,
+    /// The metric and width this decision was made for.
+    ///
+    /// A discriminator of the same kind as `created`, and for the same
+    /// reason: neither is a matter of staleness. A stale graph is a graph of
+    /// this collection at this shape from before a write — a bounded loss the
+    /// window exists to permit. A graph built at another metric scores its
+    /// walk with that metric and hands back the wrong ordering; a graph
+    /// built at another width cannot take the query at all. Nothing about
+    /// either expires, and neither the generation nor the incarnation can
+    /// see it: a reconfiguration that keeps the shadow writes no vector and
+    /// mints no drop, so the entry matches on every other test. The
+    /// reconfiguring route forgets the entry on the member that ran it, and a
+    /// change-feed consumer does so on the members it reaches by replication,
+    /// but a consumer is a task and can lag or miss entries; recording the
+    /// shape here is what makes a search correct however late that is. A
+    /// "too small" verdict carries the shape too — a width change alters
+    /// which stored vectors count, so a verdict for one shape says nothing
+    /// about another.
+    metric: Metric,
+    dim: usize,
     decided: Instant,
     /// When a search last took this entry. Eviction order under the budget.
     last_used: Instant,
 }
 
 impl Entry {
-    fn new(decision: Decision, generation: u64, created: Hlc, decided: Instant) -> Self {
-        Self { decision, generation, created, decided, last_used: Instant::now() }
+    fn new(
+        decision: Decision,
+        generation: u64,
+        created: Hlc,
+        metric: Metric,
+        dim: usize,
+        decided: Instant,
+    ) -> Self {
+        Self { decision, generation, created, metric, dim, decided, last_used: Instant::now() }
     }
 
     fn access(&self) -> Access {
@@ -319,7 +346,7 @@ impl IndexCache {
         }
 
         let generation = engine.vector_generation(shadow.id);
-        if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
+        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
             return access;
         }
 
@@ -345,14 +372,14 @@ impl IndexCache {
                 // Someone is building this collection right now. A graph from
                 // before the write that made it stale is still a correct
                 // answer, so serve that rather than queue behind the build.
-                if let Some(access) = self.serve(shadow, Serve::Anything) {
+                if let Some(access) = self.serve(shadow, metric, dim, Serve::Anything) {
                     return access;
                 }
                 // Nothing to serve: wait for that build, then take its result.
                 // If it failed — there is no entry — this caller tries once
                 // itself, which is what it would have done unopposed.
                 let guard = build_lock.lock();
-                if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
+                if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
                     return access;
                 }
                 guard
@@ -362,7 +389,7 @@ impl IndexCache {
         // Holding the build lock. A build that finished between the lookup
         // and here has installed its result, and this one would be a
         // duplicate.
-        if let Some(access) = self.serve(shadow, Serve::Usable(generation)) {
+        if let Some(access) = self.serve(shadow, metric, dim, Serve::Usable(generation)) {
             return access;
         }
 
@@ -389,8 +416,10 @@ impl IndexCache {
         // Falling back on error keeps the query correct; the alternative is
         // failing a search because an optimisation could not be built.
         match self.decide(engine, shadow, metric, dim, generation) {
-            Ok(decision) => self
-                .install(shadow, Entry::new(decision, generation, shadow.created, Instant::now())),
+            Ok(decision) => self.install(
+                shadow,
+                Entry::new(decision, generation, shadow.created, metric, dim, Instant::now()),
+            ),
             Err(e) => {
                 debug!(error = %e, "falling back to an exact scan");
                 Access::Exact
@@ -413,10 +442,26 @@ impl IndexCache {
     /// describes chunks that no longer exist, so it is no answer at all, and
     /// nothing about it expires. Declining here is enough to be rid of it —
     /// the caller falls through to a build, and installing replaces the entry.
-    fn serve(&self, shadow: &CollectionMeta, rule: Serve) -> Option<Access> {
+    ///
+    /// The shape — `metric` and `dim`, what the caller's configuration says
+    /// now — is checked in the same place and for the same reason. A
+    /// reconfigured collection keeps its shadow, so `created` still matches,
+    /// and writes nothing, so the generation does too; the entry's own record
+    /// of what it was built for is the only thing that can tell. See
+    /// [`Entry::metric`].
+    fn serve(
+        &self,
+        shadow: &CollectionMeta,
+        metric: Metric,
+        dim: usize,
+        rule: Serve,
+    ) -> Option<Access> {
         let mut entries = self.entries.lock();
         let entry = entries.map.get_mut(&shadow.id)?;
         if entry.created != shadow.created {
+            return None;
+        }
+        if entry.metric != metric || entry.dim != dim {
             return None;
         }
         let usable = match rule {
@@ -574,7 +619,14 @@ impl IndexCache {
             // clock: the next access falls through to a rebuild.
             (u64::MAX, Instant::now() - MAX_STALENESS)
         };
-        Some(Entry::new(Decision::Index(Arc::new(index)), generation, shadow.created, decided))
+        Some(Entry::new(
+            Decision::Index(Arc::new(index)),
+            generation,
+            shadow.created,
+            metric,
+            dim,
+            decided,
+        ))
     }
 
     /// Build the graph or the "too small" verdict, persisting a graph and
@@ -886,6 +938,98 @@ mod tests {
         };
         // Reused rather than rebuilt on every query.
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn a_graph_built_for_one_metric_is_not_served_for_another() {
+        // A reconfiguration that changes the metric at the same width keeps
+        // the shadow and writes no vector, so the entry matches on
+        // incarnation and generation alike. Only the entry's own record of
+        // what it was built for can decline it — and it must, because the
+        // graph scores with its own metric and would hand back the old
+        // ordering under the new configuration.
+        let (engine, shadow, _dir) = setup(60);
+        let cache = IndexCache::with_min_vectors(10);
+
+        let Access::Approximate(cosine) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        assert_eq!(cosine.metric(), Metric::Cosine);
+
+        let Access::Approximate(euclidean) = cache.access(&engine, &shadow, Metric::Euclidean, 4)
+        else {
+            panic!("a supported metric over enough vectors should build an index");
+        };
+        assert!(
+            !Arc::ptr_eq(&cosine, &euclidean),
+            "the graph built for cosine was served for a euclidean configuration"
+        );
+        assert_eq!(
+            euclidean.metric(),
+            Metric::Euclidean,
+            "the graph must be built for the metric asked for"
+        );
+        assert_eq!(
+            cache.len(),
+            1,
+            "the new graph replaces the old one rather than sitting beside it"
+        );
+    }
+
+    #[test]
+    fn a_graph_built_for_one_width_is_not_served_for_another() {
+        // A width change is the loud case: the old graph refuses a query of
+        // the new width, so every search would be an error until something
+        // evicted it. The vectors of the old width are skipped by a build at
+        // the new one, so what replaces it may be a graph over nothing; what
+        // matters is that the old graph is not what comes back.
+        let (engine, shadow, _dir) = setup(60);
+        let cache = IndexCache::with_min_vectors(10);
+
+        let Access::Approximate(old) = cache.access(&engine, &shadow, Metric::Cosine, 4) else {
+            panic!("expected an index");
+        };
+        assert_eq!(old.dim(), 4);
+
+        if let Access::Approximate(served) = cache.access(&engine, &shadow, Metric::Cosine, 8) {
+            assert!(
+                !Arc::ptr_eq(&old, &served),
+                "the graph built at width 4 was served for a configuration of width 8"
+            );
+            assert_eq!(served.dim(), 8);
+        }
+        assert_eq!(cache.len(), 1, "one entry per collection, whatever shape it holds");
+        assert_eq!(cache.entries.lock().map[&shadow.id].dim, 8, "the entry records the new width");
+    }
+
+    #[test]
+    fn a_too_small_verdict_for_one_shape_is_not_reused_for_another() {
+        // A width change alters which stored vectors count, so a verdict for
+        // one shape says nothing about another. The hook fires once per
+        // decision, so it counts how many times the cache looked rather than
+        // reused.
+        let (engine, shadow, _dir) = setup(5);
+        let cache = IndexCache::with_min_vectors(10);
+        let decisions = Arc::new(AtomicUsize::new(0));
+        *cache.build_hook.lock() = Some(Arc::new({
+            let decisions = Arc::clone(&decisions);
+            move |_| {
+                decisions.fetch_add(1, Ordering::SeqCst);
+            }
+        }));
+
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Exact));
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 4), Access::Exact));
+        assert_eq!(decisions.load(Ordering::SeqCst), 1, "the same shape reuses the verdict");
+
+        assert!(matches!(cache.access(&engine, &shadow, Metric::Cosine, 8), Access::Exact));
+        assert_eq!(
+            decisions.load(Ordering::SeqCst),
+            2,
+            "a verdict decided for width 4 was reused for a configuration of width 8"
+        );
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.entries.lock().map[&shadow.id].dim, 8);
     }
 
     #[test]
