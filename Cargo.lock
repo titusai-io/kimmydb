@@ -2404,7 +2404,7 @@ dependencies = [
  "kimmy-core",
  "kimmy-storage",
  "proptest",
- "rand 0.9.5",
+ "rand 0.10.2",
  "serde",
  "serde_json",
  "tempfile",
