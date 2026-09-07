@@ -10294,6 +10294,193 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
     consumer.abort();
 }
 
+/// Incarnation one of `shop.docs`, replicated to the applier with its graph
+/// built there, and a guard collection beside it. Returns the shadow's id,
+/// its `created`, and the guard's shadow id.
+///
+/// Everything here is published *before* a test opens the consumer's
+/// receiver: a `ConfigureVectors` entry forgets the shadow's graph by design,
+/// whatever it held, so one left queued for a late consumer would take
+/// incarnation one's graph on its own and the test could not fail without
+/// the mechanism it means to pin.
+async fn stage_incarnation_one(
+    issuer: &Server,
+    applier: &Server,
+    token: &str,
+) -> (kimmy_core::CollectionId, kimmy_core::Hlc, kimmy_core::CollectionId) {
+    configure_vectors(issuer, token, "shop", "docs").await;
+    configure_vectors(issuer, token, "shop", "guard").await;
+    replicate(issuer, applier);
+    let first = build_graph(applier, "shop", "docs");
+    let guard = build_graph(applier, "shop", "guard");
+    let first_created = applier.state.engine.collection_by_id(first).unwrap().unwrap().created;
+    (first, first_created, guard)
+}
+
+/// On the issuer: the drop of `docs` and a plain recreate — the collection,
+/// and its shadow directly on the engine — for the caller to deliver in one
+/// round.
+///
+/// Deliberately not `configure_vectors`, for the reason
+/// [`stage_incarnation_one`] gives: a configure entry queued behind the drop
+/// would forget the shadow's graph whether or not the consumer compares
+/// incarnations. A shadow created directly mints an ordinary create entry,
+/// which the consumer ignores.
+async fn drop_and_plainly_recreate_docs(issuer: &Server, token: &str) {
+    let res = issuer.delete("/v1/db/shop/coll/docs", Some(token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    let res = issuer.post("/v1/db/shop/collections", Some(token), json!({ "name": "docs" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    issuer
+        .state
+        .engine
+        .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name("docs"))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_drop_and_a_recreate_applied_in_one_batch_forget_the_previous_incarnation() {
+    // One anti-entropy round can carry the drop and the recreate together,
+    // every entry committed before the consumer reads the first. By the time
+    // it looks, a collection stands under the id — the new one — and a
+    // consumer that took "something is here" for "nothing to forget" left
+    // incarnation one's graph resident and its snapshot on disk. `serve`
+    // declined the graph on every search without releasing it, and the
+    // snapshot was refused only by a search of the new collection on this
+    // member with nothing resident to answer it, which a collection never
+    // searched here never triggers. So the consumer compares the incarnation
+    // it found with the one the graph and the snapshot were built for.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    let (first, first_created, guard) = stage_incarnation_one(&issuer, &applier, &token).await;
+
+    // Subscribed before the drop, run after the batch: what a consumer that
+    // polls once per round sees.
+    let late_consumer = kimmy_api::vectors::invalidator(&applier.state);
+
+    drop_and_plainly_recreate_docs(&issuer, &token).await;
+    replicate(&issuer, &applier);
+
+    let second = applier.state.engine.collection_by_id(first).unwrap().unwrap();
+    assert_ne!(second.created, first_created, "the recreated shadow is another incarnation");
+    assert_eq!(applier.state.vectors.len(), 2, "nothing has consumed the drop yet");
+    assert!(snapshot_of(&applier, first).is_dir(), "incarnation one's snapshot is in place");
+
+    let consumer = tokio::spawn(late_consumer);
+
+    // The guard's drop is the fence: published after the batch, so its
+    // snapshot going means the consumer read and passed the drop of `docs`.
+    let res = issuer.delete("/v1/db/shop/coll/guard", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert!(
+        wait_until(|| !snapshot_of(&applier, guard).exists()).await,
+        "the consumer never reached the guard's drop, so nothing below is evidence"
+    );
+
+    assert_eq!(
+        applier.state.vectors.len(),
+        0,
+        "a graph built for the previous incarnation stayed resident under the live id"
+    );
+    assert!(
+        !snapshot_of(&applier, first).exists(),
+        "the previous incarnation's snapshot stayed on disk under the live id"
+    );
+
+    // The new incarnation, searched, writes a snapshot of its own — one that
+    // names *its* stamp, which is what `load` checks.
+    let live = fill_and_build(&applier, &second);
+    assert_eq!(live, first, "the recreated name must derive the same id for this to test anything");
+    assert!(
+        kimmy_vector::HnswIndex::load(
+            &snapshot_of(&applier, live),
+            kimmy_core::Metric::Cosine,
+            3,
+            second.created
+        )
+        .is_ok(),
+        "the new snapshot must carry the new incarnation's stamp"
+    );
+    consumer.abort();
+}
+
+#[tokio::test]
+async fn a_drop_lost_to_a_lagging_consumer_is_reconciled_by_incarnation() {
+    // The feed is a bounded ring. A consumer that falls more than a ring
+    // behind is told so and loses what it missed, so it cannot act on the
+    // drop and reconciles against what the node holds instead. Keyed on the
+    // id alone, that reconciliation found the recreated name live and left
+    // incarnation one's graph and snapshot exactly as the batch case did —
+    // with less to catch it, because no later entry names that id.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    // A collection nothing here touches, whose graph must survive.
+    configure_vectors(&issuer, &token, "shop", "kept").await;
+    let (first, first_created, guard) = stage_incarnation_one(&issuer, &applier, &token).await;
+
+    // Incarnation one's graph is evicted under the budget before anything
+    // else happens, so its snapshot sits on disk with no resident entry — the
+    // case the map walk alone cannot see, and the one a lost drop leaves
+    // nothing else to name. `kept` is built last so it is what survives the
+    // eviction; its own graph is larger than a budget of one byte, which is
+    // installed anyway with a warning, and the guard goes with `docs`.
+    applier.state.vectors.set_max_bytes(1);
+    let kept = build_graph(&applier, "shop", "kept");
+    assert_eq!(applier.state.vectors.len(), 1, "only the last-built graph fits the budget");
+    assert!(snapshot_of(&applier, first).is_dir(), "eviction keeps the snapshot on disk");
+
+    let late_consumer = kimmy_api::vectors::invalidator(&applier.state);
+
+    drop_and_plainly_recreate_docs(&issuer, &token).await;
+    replicate(&issuer, &applier);
+    let second = applier.state.engine.collection_by_id(first).unwrap().unwrap();
+    assert_ne!(second.created, first_created, "the recreated shadow is another incarnation");
+    assert_eq!(applier.state.vectors.len(), 1, "nothing has consumed the drop yet");
+
+    // More entries than the ring holds, published on the applier itself, so
+    // the parked receiver's first read is `Lagged` and the drop is gone from
+    // it. The ring is `EVENT_BUFFER` in kimmy-storage, 1024; a wide margin
+    // keeps this a fact rather than a race with whatever else published.
+    let engine = &applier.state.engine;
+    let noise = engine.create_collection("shop", "noise").unwrap();
+    let flood: Vec<bson::Document> = (0..1024 + 256).map(|i| bson::doc! { "n": i }).collect();
+    engine.insert_many(&noise, flood).unwrap();
+
+    let consumer = tokio::spawn(late_consumer);
+
+    // The guard's drop is published after the flood, so it is read normally
+    // once the consumer has reconciled: its snapshot going is the fence.
+    let res = issuer.delete("/v1/db/shop/coll/guard", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    replicate(&issuer, &applier);
+    assert!(
+        wait_until(|| !snapshot_of(&applier, guard).exists()).await,
+        "the consumer never reached the guard's drop, so nothing below is evidence"
+    );
+
+    assert!(
+        !snapshot_of(&applier, first).exists(),
+        "the previous incarnation's snapshot survived the reconciliation with no entry to name it"
+    );
+    assert_eq!(applier.state.vectors.len(), 1, "only the live matching graph is resident");
+    assert!(snapshot_of(&applier, kept).is_dir(), "a live matching snapshot must survive");
+    let kept_meta = engine.collection_by_id(kept).unwrap().unwrap();
+    assert!(
+        matches!(
+            applier.state.vectors.access(engine, &kept_meta, kimmy_core::Metric::Cosine, 3),
+            kimmy_vector::Access::Approximate(_)
+        ),
+        "the live collection's graph must still be served"
+    );
+    assert_eq!(applier.state.vectors.len(), 1, "served from the cache, not rebuilt");
+    consumer.abort();
+}
+
 #[tokio::test]
 async fn storing_vectors_for_a_document_leaves_the_collection_s_snapshot_alone() {
     // Writing vectors is not losing them. The write bumps the collection's

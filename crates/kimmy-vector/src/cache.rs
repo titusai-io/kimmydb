@@ -276,6 +276,25 @@ pub enum Access {
     Exact,
 }
 
+/// What [`IndexCache::sweep_snapshots`] does with a `<id>.build` directory.
+///
+/// `save` stages a rebuild there and renames it over the snapshot once every
+/// file is on disk, so one exists for exactly as long as a build is writing —
+/// or forever, if the process died in between. Which of those it is depends
+/// on who is asking, and the sweep cannot tell from the directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Staging {
+    /// Remove every staging directory. For a caller that knows no build can
+    /// be under way — the startup sweep, which runs before the listener binds
+    /// — so that anything staged was left by an interrupted build, and only a
+    /// future save of that same collection would ever clear it otherwise.
+    Remove,
+    /// Leave staging directories alone. For a caller on a running node, where
+    /// a directory being written this instant is indistinguishable from one
+    /// abandoned a month ago; the next startup sweep takes the latter.
+    Keep,
+}
+
 impl IndexCache {
     pub fn new() -> Self {
         Self::default()
@@ -698,7 +717,85 @@ impl IndexCache {
         }
     }
 
-    /// Delete every snapshot on disk that `live` does not name.
+    /// Forget a collection's index unless the collection standing under its
+    /// id is the one the index was built for.
+    ///
+    /// `live` is what the caller found under the id: `None`, and this is
+    /// [`Self::invalidate`]. `Some(created)`, and the id is in use — but an
+    /// id is derived from a name, so that says only that *a* collection of
+    /// this name exists, not that the entry or the snapshot describes it. Each
+    /// half is compared on its own stamp: the resident entry goes when its
+    /// `created` is not the live one's, and the snapshot directory goes when
+    /// its `meta.json` says another incarnation wrote it. A `meta.json` that
+    /// cannot be read or parsed is left where it is, for [`Self::try_snapshot`]
+    /// to discard on the first search that opens it — this method deletes on
+    /// evidence, and an unreadable file is not evidence of anything.
+    ///
+    /// The directory is touched only under the collection's build lock, taken
+    /// with `try_lock` and skipped when held: a build in progress renames its
+    /// own result over the directory when it finishes, so whatever is there
+    /// now is about to be replaced, and removing it from under the rename
+    /// would win nothing. What remains is the window the caller opens by
+    /// reading `created` from the store first — a drop and a recreate landing
+    /// between that read and this call would have this compare against a
+    /// stamp that is already history. That is the class [`Self::forget_absent`]
+    /// already accepts, and it costs a rebuild, never a wrong answer: `serve`
+    /// and `HnswIndex::load` refuse the other incarnation regardless.
+    ///
+    /// Returns whether anything was forgotten, resident or on disk.
+    pub fn forget_unless_created(&self, collection: CollectionId, live: Option<Hlc>) -> bool {
+        let Some(created) = live else {
+            let held = self.entries.lock().map.contains_key(&collection)
+                || self.snapshot_path(collection).is_some_and(|p| p.exists());
+            self.invalidate(collection);
+            return held;
+        };
+
+        let mut forgot = false;
+        {
+            let mut entries = self.entries.lock();
+            if entries.map.get(&collection).is_some_and(|entry| entry.created != created)
+                && let Some(entry) = entries.map.remove(&collection)
+            {
+                entries.resident -= entry.bytes();
+                entries.warned.remove(&collection);
+                forgot = true;
+            }
+        }
+        if forgot {
+            // The generation a snapshot was written at vouches for the
+            // snapshot of *this* incarnation only; with the entry gone the
+            // count check in `try_snapshot` is the right judge again. The
+            // build-lock slot stays, unlike in `invalidate`: the id is live,
+            // and a build of the new incarnation may be holding that lock
+            // now — removing the slot would hand the next caller a fresh
+            // lock and let two builds of one collection run at once.
+            self.saved_at.lock().remove(&collection);
+        }
+
+        if let Some(path) = self.snapshot_path(collection)
+            && path.is_dir()
+        {
+            let build_lock = self.build_lock(collection);
+            let Some(_guard) = build_lock.try_lock() else {
+                debug!(
+                    collection = collection.0,
+                    "a build is writing this collection's snapshot; leaving the directory to it"
+                );
+                return forgot;
+            };
+            // Filesystem work from a request handler or the change consumer,
+            // both on runtime workers: off the worker, as `invalidate` is.
+            let removed = kimmy_storage::blocking(|| remove_if_other_incarnation(&path, created));
+            if removed {
+                self.saved_at.lock().remove(&collection);
+                forgot = true;
+            }
+        }
+        forgot
+    }
+
+    /// Delete every snapshot on disk that `live` does not vouch for.
     ///
     /// The complement to [`Self::invalidate`] and [`Self::forget_absent`],
     /// which between them cover a collection this process saw go. A snapshot
@@ -708,13 +805,28 @@ impl IndexCache {
     /// for a collection that no longer exists. So it sits there, costing disk,
     /// indefinitely.
     ///
-    /// Run once at startup, before anything can be building. A name that is
-    /// not sixteen hex digits is logged and **left alone** — this deletes
-    /// directories, and the one thing it must never do is act on a name it
-    /// does not understand.
+    /// `live` maps each collection id this node holds to that collection's
+    /// `created`. A directory whose id is absent goes, as before. A directory
+    /// whose id is present is not thereby vouched for — ids are derived from
+    /// names, so a name dropped and created again is "live" at the same path
+    /// its predecessor's snapshot occupies — and its `meta.json` is read for
+    /// the stamp the graph was built under: another incarnation's, and it
+    /// goes; the live one's, and it stays. A `meta.json` that cannot be read
+    /// or parsed is left alone, on the same rule that leaves alone a name
+    /// that is not a collection id: this deletes directories, and it acts on
+    /// nothing it does not understand. `try_snapshot` discards such a
+    /// snapshot on the first search that opens it.
+    ///
+    /// A live id's own directory is removed only under its build lock, taken
+    /// with `try_lock` and skipped when held, for the reason
+    /// [`Self::forget_unless_created`] gives: a build in progress is about to
+    /// rename over it. Taken on every call, the startup sweep included, where
+    /// no build can be running and the lock is uncontended — one rule is
+    /// easier to reason about than one per caller. Staging directories are
+    /// the caller's call, through `staging`: see [`Staging`].
     ///
     /// Returns how many it removed, for the line that says so.
-    pub fn sweep_snapshots(&self, live: &HashSet<CollectionId>) -> usize {
+    pub fn sweep_snapshots(&self, live: &HashMap<CollectionId, Hlc>, staging: Staging) -> usize {
         let Some(dir) = &self.snapshot_dir else { return 0 };
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
@@ -733,10 +845,12 @@ impl IndexCache {
             let name = name.to_string_lossy();
             // `save` stages a rebuild at `<id>.build` beside the snapshot and
             // renames over it, so a build cut short by a crash leaves one
-            // here. It belongs to the same collection and lives or dies with
-            // it; left unrecognised it would be warned about at every start,
-            // for a collection that will never rebuild it away.
-            let stem = name.strip_suffix(".build").unwrap_or(&name);
+            // here. Recognised, so it is not warned about at every start as
+            // a file this crate does not know, and handled as `staging` says.
+            let (stem, is_staging) = match name.strip_suffix(".build") {
+                Some(stem) => (stem, true),
+                None => (&*name, false),
+            };
             let parsed = (stem.len() == 16 && stem.bytes().all(|b| b.is_ascii_hexdigit()))
                 .then(|| u64::from_str_radix(stem, 16).ok())
                 .flatten();
@@ -747,42 +861,79 @@ impl IndexCache {
                 );
                 continue;
             };
-            if live.contains(&CollectionId(id)) {
+            let id = CollectionId(id);
+
+            if is_staging {
+                if staging == Staging::Keep {
+                    continue;
+                }
+                match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => {
+                        removed += 1;
+                        debug!(snapshot = %name, "removed the staging directory of an interrupted HNSW build");
+                    }
+                    Err(e) => tracing::warn!(error = %e, snapshot = %name, "could not remove it"),
+                }
                 continue;
             }
-            match std::fs::remove_dir_all(entry.path()) {
-                Ok(()) => {
-                    removed += 1;
-                    debug!(
-                        snapshot = %name,
-                        "removed an HNSW snapshot for a collection this node no longer holds"
-                    );
+
+            match live.get(&id) {
+                None => match std::fs::remove_dir_all(entry.path()) {
+                    Ok(()) => {
+                        removed += 1;
+                        debug!(
+                            snapshot = %name,
+                            "removed an HNSW snapshot for a collection this node no longer holds"
+                        );
+                    }
+                    Err(e) => tracing::warn!(error = %e, snapshot = %name, "could not remove it"),
+                },
+                Some(created) => {
+                    let build_lock = self.build_lock(id);
+                    let Some(_guard) = build_lock.try_lock() else {
+                        debug!(snapshot = %name, "a build is writing it; left to the build");
+                        continue;
+                    };
+                    if remove_if_other_incarnation(&entry.path(), *created) {
+                        self.saved_at.lock().remove(&id);
+                        removed += 1;
+                    }
                 }
-                Err(e) => tracing::warn!(error = %e, snapshot = %name, "could not remove it"),
             }
         }
         removed
     }
 
-    /// Forget every cached collection that `live` does not name.
+    /// Forget every cached collection that `live` does not vouch for.
     ///
     /// [`Self::invalidate`] is told which collection went away. This is for a
     /// caller that has lost track — a change consumer told it missed entries —
     /// and reconciles instead: a graph held for a collection this node no
     /// longer has is precisely what a drop should already have removed, so it
-    /// goes, snapshot and all. Returns how many were forgotten, for the log
-    /// line that says so.
+    /// goes, snapshot and all. So does a graph held under an id this node
+    /// *does* have, when the collection there was created at another stamp
+    /// than the graph was built for: the drop that was missed was followed by
+    /// a create of the same name, and the entry describes the one that went.
+    /// Returns how many were forgotten, for the log line that says so.
     ///
     /// It can also forget a collection created and first searched in the
     /// instant between `live` being read and this being called. That costs a
     /// rebuild, which is what an eviction under the budget costs anyway.
-    pub fn forget_absent(&self, live: &HashSet<CollectionId>) -> usize {
-        let gone: Vec<CollectionId> = {
+    pub fn forget_absent(&self, live: &HashMap<CollectionId, Hlc>) -> usize {
+        let gone: Vec<(CollectionId, Option<Hlc>)> = {
             let entries = self.entries.lock();
-            entries.map.keys().copied().filter(|id| !live.contains(id)).collect()
+            entries
+                .map
+                .iter()
+                .filter_map(|(id, entry)| match live.get(id) {
+                    None => Some((*id, None)),
+                    Some(created) if *created != entry.created => Some((*id, Some(*created))),
+                    Some(_) => None,
+                })
+                .collect()
         };
-        for id in &gone {
-            self.invalidate(*id);
+        for (id, live) in &gone {
+            self.forget_unless_created(*id, *live);
         }
         gone.len()
     }
@@ -821,6 +972,33 @@ enum Serve {
     /// already under way — whatever exists is no staler than what it would
     /// have been served a moment before the build began.
     Anything,
+}
+
+/// Remove the snapshot at `path` if its `meta.json` names an incarnation
+/// other than `created`. Whether it did.
+///
+/// Unreadable or unparseable is *not* "other": it is left for `try_snapshot`,
+/// which discards what it cannot load. A file that parses but predates the
+/// `created` field reads as the default stamp, which no live collection
+/// carries, and goes — `load` would refuse it on its format anyway.
+fn remove_if_other_incarnation(path: &std::path::Path, created: Hlc) -> bool {
+    let Some(built_for) = crate::index::snapshot_created(path) else { return false };
+    if built_for == created {
+        return false;
+    }
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => {
+            debug!(
+                ?path,
+                "removed an HNSW snapshot a previous collection of the same name left behind"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, ?path, "could not remove it");
+            false
+        }
+    }
 }
 
 /// Count a collection's vectors.
@@ -1504,29 +1682,127 @@ mod tests {
         // `<id>.build` and renames over the snapshot. A collection that is
         // never searched again never rebuilds, so nothing else would ever
         // clear one — and warning about it at every start would say a file is
-        // unrecognised when it is this crate's own.
+        // unrecognised when it is this crate's own. At startup no build can be
+        // writing one, so every one there is abandoned, live collection or
+        // not.
         let kept_staging = kept_path.with_extension("build");
         let gone_staging = gone_path.with_extension("build");
         std::fs::create_dir_all(&kept_staging).unwrap();
         std::fs::create_dir_all(&gone_staging).unwrap();
 
         engine.drop_collection("app", "gone").unwrap();
-        let mut live: HashSet<CollectionId> = HashSet::new();
-        for db in engine.list_databases().unwrap() {
-            for coll in engine.list_collections(&db.name).unwrap() {
-                live.insert(coll.id);
-            }
-        }
+        let live = live_collections(&engine);
 
         // A fresh cache, as a restart has: nothing resident, only what is on
         // disk.
         let restarted = snapshot_cache(&dir);
-        assert_eq!(restarted.sweep_snapshots(&live), 2, "the snapshot and its staging directory");
+        assert_eq!(
+            restarted.sweep_snapshots(&live, Staging::Remove),
+            3,
+            "the snapshot and both staging directories"
+        );
         assert!(!gone_path.exists(), "a dropped collection's snapshot must go");
         assert!(!gone_staging.exists(), "and the staging directory beside it");
         assert!(kept_path.is_dir(), "a live collection's must not");
-        assert!(kept_staging.is_dir(), "nor its staging directory");
+        assert!(!kept_staging.exists(), "but its abandoned staging directory must");
         assert!(stranger.exists(), "an unrecognised name must be left alone, not deleted");
+    }
+
+    /// What the daemon hands the sweep: every collection this engine holds,
+    /// shadows included, by id and incarnation.
+    fn live_collections(engine: &Engine) -> HashMap<CollectionId, Hlc> {
+        let mut live = HashMap::new();
+        for db in engine.list_databases().unwrap() {
+            for coll in engine.list_collections(&db.name).unwrap() {
+                live.insert(coll.id, coll.created);
+            }
+        }
+        live
+    }
+
+    #[test]
+    fn the_sweep_removes_a_snapshot_a_previous_collection_of_the_same_name_left() {
+        // A recreated name derives the id it had before, so its predecessor's
+        // snapshot sits under an id the sweep finds live. Keeping every
+        // directory whose id is live keeps that one on every restart, and
+        // only a search of the new collection on this node — with nothing
+        // resident to answer it — would ever refuse and delete it. A
+        // collection never searched here keeps its predecessor's graph on
+        // disk indefinitely. So a live id is not enough: the directory's own
+        // `meta.json` says which incarnation built it, and that is compared.
+        let (engine, first, dir) = setup(60);
+        let other = add_collection(&engine, "other", 60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &first, Metric::Cosine, 4);
+        cache.access(&engine, &other, Metric::Cosine, 4);
+        let path = cache.snapshot_path(first.id).unwrap();
+        let other_path = cache.snapshot_path(other.id).unwrap();
+        assert!(path.is_dir() && other_path.is_dir(), "both builds should have been persisted");
+        // An interrupted build's residue beside the live one.
+        let staging = other_path.with_extension("build");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        engine.drop_collection("app", "docs").unwrap();
+        let second = add_collection(&engine, "docs", 60);
+        assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+        assert_ne!(second.created, first.created, "the incarnation does not");
+
+        // The previous process's view: the sweep sees a live id and a
+        // directory, and the map still names the incarnation that built it.
+        // Nothing is wrong, so nothing goes.
+        let mut stale = live_collections(&engine);
+        stale.insert(first.id, first.created);
+        let restarted = snapshot_cache(&dir);
+        assert_eq!(restarted.sweep_snapshots(&stale, Staging::Keep), 0);
+        assert!(path.is_dir(), "a snapshot the live map vouches for must stay");
+        assert!(staging.is_dir(), "and a staging directory is kept when told to");
+
+        // What the daemon reads at startup: the recreated collection's stamp.
+        let live = live_collections(&engine);
+        assert_eq!(
+            restarted.sweep_snapshots(&live, Staging::Remove),
+            2,
+            "the predecessor's snapshot and the staging directory"
+        );
+        assert!(!path.exists(), "a previous incarnation's snapshot survived the sweep");
+        assert!(other_path.is_dir(), "a live collection's matching snapshot must stay");
+        assert!(!staging.exists(), "an abandoned staging directory must go at startup");
+    }
+
+    #[test]
+    fn reconciling_forgets_a_graph_built_for_a_previous_collection_of_the_same_name() {
+        // The map-only half of the same problem. The consumer missed the
+        // drop; the name is back, so the id is live; the entry and snapshot
+        // were built for the collection that went. A reconciliation keyed on
+        // the id alone finds nothing absent and leaves both, and `serve`
+        // then declines the entry on every search without ever releasing it.
+        let (engine, first, dir) = setup(60);
+        let kept = add_collection(&engine, "kept", 60);
+        let cache = snapshot_cache(&dir);
+        cache.access(&engine, &first, Metric::Cosine, 4);
+        cache.access(&engine, &kept, Metric::Cosine, 4);
+        let path = cache.snapshot_path(first.id).unwrap();
+        assert!(path.is_dir(), "the build should have been persisted");
+
+        engine.drop_collection("app", "docs").unwrap();
+        let second = empty_collection(&engine, "docs");
+        assert_eq!(second.id, first.id, "the id is derived from the name, so it repeats");
+        assert_ne!(second.created, first.created, "the incarnation does not");
+        assert!(cache.contains(second.id), "the consumer has not caught up yet");
+
+        // A matching map first: nothing to forget.
+        let matching: HashMap<CollectionId, Hlc> =
+            [(first.id, first.created), (kept.id, kept.created)].into_iter().collect();
+        assert_eq!(cache.forget_absent(&matching), 0);
+        assert!(cache.contains(first.id) && path.is_dir(), "a matching entry must stay");
+
+        let live = live_collections(&engine);
+        assert_eq!(live[&second.id], second.created);
+        assert_eq!(cache.forget_absent(&live), 1);
+        assert!(!cache.contains(second.id), "a graph of the previous incarnation stayed resident");
+        assert!(!path.exists(), "and its snapshot stayed on disk");
+        assert!(cache.contains(kept.id), "a live collection must keep its graph");
+        assert!(cache.snapshot_path(kept.id).unwrap().is_dir(), "and its snapshot");
     }
 
     #[test]
@@ -1544,7 +1820,7 @@ mod tests {
         let stranded = cache.snapshot_path(gone.id).unwrap();
         assert!(stranded.is_dir(), "the build should have been persisted");
 
-        let live: HashSet<CollectionId> = [kept.id].into_iter().collect();
+        let live: HashMap<CollectionId, Hlc> = [(kept.id, kept.created)].into_iter().collect();
         assert_eq!(cache.forget_absent(&live), 1);
 
         assert!(!cache.contains(gone.id), "a collection this node lacks must not stay resident");

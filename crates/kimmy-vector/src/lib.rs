@@ -19,7 +19,7 @@ pub mod provider;
 pub mod search;
 pub mod worker;
 
-pub use cache::{Access, DEFAULT_MAX_BYTES as DEFAULT_INDEX_CACHE_BYTES, IndexCache};
+pub use cache::{Access, DEFAULT_MAX_BYTES as DEFAULT_INDEX_CACHE_BYTES, IndexCache, Staging};
 pub use error::{Result, TransportKind, VectorError};
 
 /// Whether this build can embed in-process.
