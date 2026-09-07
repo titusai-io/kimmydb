@@ -3,13 +3,22 @@ name: CI
 on:
   push:
     branches: [main]
+    # Kept here, deliberately, where it is removed from the pull request
+    # trigger below: nothing waits on a status for a push, so no docs commit
+    # is ever held up by its absence, and a push to main is the event that
+    # additionally starts the expensive jobs — the cluster harness, the
+    # reachability test and the two release-shaped builds. The pull request
+    # that carried the commit reported its verdict before the merge.
     paths-ignore:
       - "**.md"
       - "docs/**"
+  # No `paths-ignore` here, and this is load-bearing. Branch protection on main
+  # requires the `fmt, clippy` and `test` contexts by name, and a workflow that
+  # never starts reports no context at all — so filtering documentation-only
+  # pull requests out at the trigger left them waiting forever on a status that
+  # no run existed to deliver, mergeable only by an admin override. The
+  # filtering happens inside the jobs now; see the `changes` job below.
   pull_request:
-    paths-ignore:
-      - "**.md"
-      - "docs/**"
   # A run on request, for re-checking main without pushing to it: after a run
   # was cancelled or its runner lost, or to rewrite the caches after a quiet
   # week has let them age out.
@@ -38,6 +47,77 @@ env:
 # unreadable, or unusable, on a tag (ADR-118).
 
 jobs:
+  # What changed, decided once and read by the two required jobs below.
+  #
+  # This is the half of the fix that a trigger cannot do. Skipping a workflow
+  # and skipping a job look alike from the outside but are not: a workflow that
+  # never starts reports nothing, while a job that starts and runs no steps
+  # still reports its own context, green. So the required jobs always start,
+  # and ask this one whether there is anything worth compiling. Whoever is
+  # tempted to move this back up into `paths-ignore` on the pull request
+  # trigger: that is the exact shape that deadlocked a documentation-only pull
+  # request against branch protection.
+  #
+  # The diff is taken against the merge base of the pull request rather than
+  # against its previous head, so the answer describes the whole proposed
+  # change and is the same whether the branch carries one commit or thirty,
+  # and whether it was force-pushed since the last run. Anything the job
+  # cannot resolve into a range — a manual dispatch, a rewritten history whose
+  # old tip is gone — is reported as not documentation-only, because being
+  # wrong in that direction costs a few minutes of runner time and being wrong
+  # in the other puts unreviewed code on main.
+  changes:
+    name: changed paths
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+    steps:
+      # The whole history, because the classification is a diff against the
+      # merge base and the default single-commit fetch cannot reach it. The
+      # repository is small enough that this costs seconds.
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Classify the changed paths
+        id: classify
+        env:
+          BASE: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${BASE:-}" ] || [ -z "${HEAD:-}" ] \
+             || ! git cat-file -e "${BASE}^{commit}" 2>/dev/null \
+             || ! git cat-file -e "${HEAD}^{commit}" 2>/dev/null; then
+            echo "No usable range (${BASE:-none}...${HEAD:-none}); running the full gate."
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Three dots: the diff from the merge base of the two commits, not
+          # between their tips, so a base branch that moved under the pull
+          # request does not turn other people's commits into this one's.
+          changed="$(git diff --name-only "${BASE}...${HEAD}")"
+          echo "Changed files:"
+          echo "${changed:-(none)}"
+
+          if [ -z "$changed" ]; then
+            echo "An empty range tells us nothing; running the full gate."
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # The same two patterns the trigger used to carry: any Markdown file
+          # anywhere, and everything under docs/.
+          if printf '%s\n' "$changed" | grep -qvE '\.md$|^docs/'; then
+            echo "Something outside the documentation changed; running the full gate."
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Documentation only; the required jobs will report without compiling."
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          fi
+
   # The pull-request gate is two jobs so that the cheap verdicts arrive first:
   # formatting and clippy are done in about a minute against a warm cache, the
   # test suite takes most of ten. As one job, a formatting slip was reported
@@ -49,15 +129,27 @@ jobs:
   lint:
     name: fmt, clippy
     runs-on: ubuntu-latest
+    needs: changes
+    # The gate has to report even when the job it consults did not: without
+    # this, a broken `changes` job would skip both required jobs, and a skipped
+    # required check is counted as a passing one by branch protection. Skipped,
+    # its outputs are empty, which reads as not documentation-only below and
+    # runs everything.
+    if: ${{ !cancelled() }}
     env:
       # Debug info roughly doubles CI build time and nothing here reads a
       # backtrace symbol table.
       CARGO_PROFILE_TEST_DEBUG: 0
       RUSTFLAGS: -D warnings
     steps:
+      # Every step below is gated on there being code to check. On a
+      # documentation-only change the job still runs, runs nothing, and
+      # reports `fmt, clippy` green in a few seconds.
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.docs_only != 'true'
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -71,13 +163,16 @@ jobs:
       # 87% of it duplicate Rust caches, so GitHub was evicting main's entries
       # to make room for copies of them.
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Check formatting
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo fmt --all --check
 
       - name: Clippy
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       # ADR-001 and ADR-016 both cite keeping the build free of a C toolchain.
@@ -89,24 +184,32 @@ jobs:
       # rides with the fast job because `cargo tree` reads the lockfile and
       # compiles nothing.
       - name: Native build dependencies
+        if: needs.changes.outputs.docs_only != 'true'
         run: ./scripts/check-native-deps.sh
 
   test:
     name: test
     runs-on: ubuntu-latest
+    needs: changes
+    # Reports even when `changes` did not — see the note on the `lint` job.
+    if: ${{ !cancelled() }}
     env:
       # Debug info roughly doubles CI build time and nothing here reads a
       # backtrace symbol table.
       CARGO_PROFILE_TEST_DEBUG: 0
       RUSTFLAGS: -D warnings
     steps:
+      # Gated step by step on there being code to test, as on the `lint` job.
       - uses: actions/checkout@v7
+        if: needs.changes.outputs.docs_only != 'true'
 
       - name: Install Rust
+        if: needs.changes.outputs.docs_only != 'true'
         uses: dtolnay/rust-toolchain@stable
 
       # Save only from main — see the note on the `lint` job above.
       - uses: Swatinem/rust-cache@v2
+        if: needs.changes.outputs.docs_only != 'true'
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
@@ -120,14 +223,17 @@ jobs:
       # runs them with `cargo test --doc`, against the same build artifacts.
       # Pinned to a release of the installer rather than its floating tag.
       - name: Install nextest
+        if: needs.changes.outputs.docs_only != 'true'
         uses: taiki-e/install-action@v2.87.2
         with:
           tool: nextest
 
       - name: Test
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo nextest run --workspace
 
       - name: Doctests
+        if: needs.changes.outputs.docs_only != 'true'
         run: cargo test --workspace --doc
 
   cluster:
