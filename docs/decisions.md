@@ -11057,20 +11057,23 @@ definition this build cannot apply and false of a document whose
 collection has not arrived yet: that one succeeds the moment the
 collection does. So it is not skipped, it is left.
 
-**Cost.** A round that leaves entries reports `exhausted: false` and so
-does not run the divergence check that round — correct, because it did
-not reach the peer's tail, and the entries it left arrive next round.
-Worth stating plainly, because it is the fix's own deferral suppressing
-the fix's own trigger: the check is the detector the repair depends on,
-and it is skipped on exactly the rounds this change is aimed at, under
-exactly the load that produces them. It is not a regression — before
-this, those rounds *did* check, on the strength of a window that had
-absorbed entries it was never served, which is the belief ADR-133 says a
-truncated window can fake — and the deferral is rare and clears on the
-next round, where the check runs. But a member under sustained relay
-churn checks less often than one at rest, and
-`kimmy_sync_divergence_checks_total{outcome="skipped"}` is where that
-shows.
+**Cost.** A round that leaves entries above the peer's advertised vector
+still runs the divergence check. This was first written the other way —
+a deferral reported `exhausted: false` and the check waited for a round
+that deferred nothing — on the argument that such a round had not reached
+the peer's tail. That argument was wrong, and the test that guards
+finding 14 caught it: under sustained writes an entry lands between the
+peer's two reads on nearly every round, so nearly every round deferred
+something, and the check never ran at all — the detector the repair
+depends on went dark under exactly the load that produces the holes it
+exists to find. The tail the check needs is the one the peer *announced*:
+a round that applied everything up to that vector has reached it, and a
+deferred entry lies past it by definition, in the next round's window.
+So the check runs whenever the window was taken whole, deferrals or not;
+only a batch stopped at a collection this node lacks withholds it, since
+that batch did not reach the announced tail. The count half's known
+limit is unchanged by this — a collection being written to can read as
+divergent for the length of one contact, as ADR-145 records.
 `SyncOutcome` gains `deferred`, `unknown`, and `repairing`; `Message::Push`'s
 answer gains `deferred`, defaulted so a receiver on the previous release
 reads unchanged. `RoundReport` gains three counters, and `/metrics` two

@@ -833,12 +833,17 @@ where
                 let outcome = engine
                     .apply_peer_batch(&theirs, &entries, scanned_to, exhausted)
                     .map_err(|e| ProtocolError::Malformed(e.to_string()))?;
-                // The peer's tail was reached only if the batch took the
-                // whole window: an entry left for the next window — above
-                // the vector the peer advertised, or for a collection this
-                // node lacks — means this round did not (ADR-148).
-                window_exhausted =
-                    exhausted && outcome.deferred == 0 && outcome.unknown_collection == 0;
+                // The peer's tail was reached if the batch took the whole
+                // window up to the vector the peer advertised. An entry
+                // deferred above that vector does not change that: it lies
+                // past the tail the peer announced, and the divergence check
+                // compares against that announced vector, so the check may
+                // run. Gating it on nothing deferred would silence the check
+                // for as long as writes keep landing between the peer's two
+                // reads — exactly the busy cluster the check exists for. A
+                // batch stopped at a collection this node lacks did not reach
+                // the tail (ADR-148).
+                window_exhausted = exhausted && outcome.unknown_collection == 0;
                 match (repair, &outcome.unknown) {
                     // A replay under way: done when it reached the tail,
                     // escalated to a snapshot if it stopped at a collection
@@ -1821,7 +1826,8 @@ mod tests {
     /// ADR-148 at the wire: a peer whose window carries entries above the
     /// vector it advertised for their origin. The receiver applies nothing
     /// above that vector, witnesses exactly what the vector promised, and
-    /// reports the round as not having reached the tail. What it never
+    /// still runs the divergence check, because the tail it needs is the one
+    /// the peer announced and a deferred entry lies past it. What it never
     /// does is what it did: observe the entries and claim everything of
     /// that origin below them.
     #[tokio::test]
@@ -1862,6 +1868,15 @@ mod tests {
             let scanned_to = window.last().unwrap().stamp.hlc;
             let entries = Message::Entries { entries: window, scanned_to, exhausted: true };
             write_frame(&mut stream, &entries).await.unwrap();
+            // The window was taken whole up to the advertised vector, so the
+            // round reached the tail the peer announced and runs the check —
+            // the entries it left lie past that tail, not short of it.
+            match read_frame(&mut stream).await.unwrap() {
+                Message::AskDivergence { .. } => {}
+                other => panic!("expected AskDivergence, got {other:?}"),
+            }
+            let answer = Message::Divergence { collections: Vec::new(), probe_count: None };
+            write_frame(&mut stream, &answer).await.unwrap();
         }
 
         let (ours, peer_end) = tokio::io::duplex(MAX_FRAME);
@@ -1873,8 +1888,12 @@ mod tests {
 
         assert_eq!(outcome.applied, 1, "the entry the vector covered: {outcome:?}");
         assert_eq!(outcome.deferred, 2, "the two above it were left: {outcome:?}");
-        assert!(!outcome.exhausted, "a round that left entries did not reach the tail");
-        assert_eq!(outcome.divergent, None, "so the check did not run on it");
+        assert!(outcome.exhausted, "the window was taken whole up to the advertised vector");
+        assert_eq!(
+            outcome.divergent,
+            Some(std::collections::BTreeSet::new()),
+            "so the check ran on a round that deferred: {outcome:?}"
+        );
         assert_eq!(engine.count(&orders).unwrap(), 1);
         let mine = engine.witnessed_vector().unwrap();
         assert_eq!(mine.get(origin), advertised, "witnessed exactly what was advertised");

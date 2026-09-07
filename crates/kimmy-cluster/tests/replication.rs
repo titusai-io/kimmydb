@@ -6,7 +6,7 @@
 //! actually gates access, and that a listener survives a peer misbehaving.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use std::collections::BTreeSet;
@@ -1517,12 +1517,67 @@ async fn the_replication_loop_reports_a_stranded_collection_while_every_other_si
 async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() {
     use kimmy_cluster::{ReplicationConfig, RoundReport, SeedSource, replicate};
 
+    // How busy the cluster is, and how it is busy. Three documents rewritten
+    // between rounds is a handful of entries per round, well under the batch
+    // cap, so a round pulling them still reaches the peer's tail.
+    //
+    // They are *rewritten*, never added to. That is what lets the assertion
+    // below name a collection the report only ever counts: `busy` holds
+    // exactly `BUSY_DOCS` live documents on A from before the hole is
+    // induced until the end of the run, so the count half can never report
+    // it, and the one collection this check can ever confirm is `stranded`.
+    // Growing the collection instead — as this test used to — makes B
+    // legitimately behind on `busy`'s count at every probe: the loop reads
+    // B's own count once per tick, before the round pulls anything
+    // (`peers.rs`), while A answers the probe with a live count a round trip
+    // later, and nothing defers that probe, because the count half's gate
+    // drops one only for a peer that trails *this* node and is still
+    // advancing (ADR-145, ADR-146) — which A, the node B pulls from, never
+    // does. `busy` then confirms beside `stranded`, correctly, and the gauge
+    // reads 2 or 1 depending on nothing but how the writer's bursts fall
+    // against the rounds.
+    const BUSY_DOCS: usize = 3;
+
     let a = node().await;
     let b = node().await;
 
+    // B converges on `busy` the ordinary way, before the hole exists. That
+    // is not tidiness: it is what keeps the *divergence check* the only
+    // thing that can find the stranded collection. A round whose batch stops
+    // at an entry for a collection this node does not hold plans a snapshot
+    // from that peer on the strength of the stop alone (ADR-148), and that
+    // snapshot brings every collection — including `stranded`. Leaving B
+    // without `busy` at the start makes the writer's very first rewrite such
+    // an entry, so the hole is closed by the repair path before the check
+    // has reported anything, and this test passes with the check switched
+    // off entirely. With `busy` already here, every entry B ever pulls is
+    // for a collection B holds, and nothing but the check can name
+    // `stranded`.
+    let busy = a.engine.create_collection("shop", "busy").unwrap();
+    for i in 0..BUSY_DOCS {
+        a.engine.insert(&busy, doc! { "_id": format!("h{i}"), "seq": 0i64 }).unwrap();
+    }
+    sync(&a, &b).await;
+    let busy_here = b.engine.get_collection("shop", "busy").expect("B holds the busy collection");
+    assert_eq!(b.engine.count(&busy_here).unwrap(), BUSY_DOCS as u64, "and all of its documents");
+
+    // Only now the collection that gets stranded, and the induced hole: B's
+    // witness claims to cover the creation it never applied.
     let stranded = a.engine.create_collection("shop", "stranded").unwrap();
     a.engine.insert(&stranded, doc! { "_id": "1" }).unwrap();
-    let busy = a.engine.create_collection("shop", "busy").unwrap();
+
+    // One more `busy` entry on top, and the reason is the same one as
+    // above. `VersionVector::behind` is an inclusive threshold and
+    // `entries_for_peer` serves the window *at or after* it, so the newest
+    // entry the hole covers is re-served on B's very first pull. If that
+    // entry is one of `stranded`'s, B stops at a collection it does not
+    // hold and takes the ADR-148 snapshot instead of waiting for the check.
+    // Whatever sits at the top of the covered window must therefore belong
+    // to a collection B already holds — the assertion in the loop below
+    // guards this, and will fail loudly if these lines are ever reordered.
+    a.engine
+        .replace(&busy, &DocId::String("h0".into()), doc! { "_id": "h0", "seq": 0i64 }, true)
+        .unwrap();
 
     let theirs0 = a.engine.version_vector().unwrap();
     b.engine.apply_peer_batch(&theirs0, &[], Hlc::ZERO, true).unwrap();
@@ -1538,28 +1593,97 @@ async fn the_check_still_runs_while_a_round_keeps_finding_new_entries_to_pull() 
     }));
     let looping = tokio::spawn(replicate(Arc::clone(&b.engine), config));
 
-    // A modest busy cluster: a handful of writes between rounds, well under
-    // the batch cap, so a round pulling them still reaches the tail.
+    // The writer runs until it is told to stop rather than a fixed number of
+    // times, so that on a slow or contended machine this cannot quietly
+    // become a test of an idle cluster — the one shape it exists to rule
+    // out. It yields between writes because `#[tokio::test]` is a
+    // *current-thread* runtime: both nodes' listeners, B's replication loop
+    // and this writer share one thread, and an unbroken burst of writes is a
+    // blocking section on it. Each write costs milliseconds, so a burst that
+    // does not yield starves the very loop this test is waiting on, and on a
+    // two-core runner it starves it for longer than the burst interval.
+    let writing = Arc::new(AtomicBool::new(true));
     let a_engine = Arc::clone(&a.engine);
+    let keep_writing = Arc::clone(&writing);
     let writer = tokio::spawn(async move {
-        for i in 0..20 {
-            for j in 0..5 {
-                a_engine.insert(&busy, doc! { "_id": format!("d{i}-{j}") }).unwrap();
+        let mut seq = 0i64;
+        while keep_writing.load(Ordering::Relaxed) {
+            seq += 1;
+            for i in 0..BUSY_DOCS {
+                let id = DocId::String(format!("h{i}"));
+                let doc = doc! { "_id": format!("h{i}"), "seq": seq };
+                a_engine.replace(&busy, &id, doc, true).unwrap();
+                tokio::task::yield_now().await;
             }
             tokio::time::sleep(Duration::from_millis(60)).await;
         }
     });
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    // How far B has followed the rewrites. Every rise is a round that found
+    // new entries and pulled them.
+    let seq_on_b = || {
+        b.engine
+            .get(&busy_here, &DocId::String("h0".into()))
+            .unwrap()
+            .and_then(|d| d.get_i64("seq").ok())
+            .unwrap_or(-1)
+    };
+
+    // Two conditions, one wait: the check confirms the stranded collection,
+    // and rounds go on finding new entries to pull after it has. The second
+    // is what keeps this a test of a busy cluster rather than of an idle
+    // one; the doc comment above says why an idle cluster would exercise
+    // none of it.
+    //
+    // The budget is not sized from what this needs when nothing goes wrong —
+    // three checked contacts to confirm and one more for the rewrites to
+    // reach B, four ticks, some 400 ms. It is sized so that a round which
+    // hangs and burns `REQUEST_TIMEOUT` (30 s, `transport.rs`), plus the
+    // peer backoff behind it, still leaves room for those contacts. On a
+    // two-core runner with the rest of the suite in parallel that is the
+    // shape this deadline must not mistake for a check that never ran.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
     let mut confirmed = 0usize;
-    while confirmed == 0 {
+    let mut at_confirmation = -1i64;
+    let (mut checked, mut skipped, mut failed) = (0usize, 0usize, 0usize);
+    while confirmed == 0 || seq_on_b() <= at_confirmation {
         let report = tokio::time::timeout_at(deadline, rx.recv())
             .await
-            .unwrap_or_else(|_| panic!("the check never confirmed under sustained write load"))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the check did not confirm and keep running under sustained write load: \
+                     confirmed={confirmed} checks={checked} skips={skipped} failed={failed} \
+                     seq on B={} (at confirmation {at_confirmation})",
+                    seq_on_b()
+                )
+            })
             .expect("the loop must keep reporting");
-        confirmed = report.divergent_collections;
+        // The check must be the only thing that can find `stranded`. A
+        // batch that stops at a collection this node lacks plans a snapshot
+        // from the peer on the strength of the stop alone (ADR-148), and
+        // that snapshot closes the hole — leaving this test green with the
+        // check switched off entirely. See the setup above for what keeps
+        // it from happening.
+        assert_eq!(
+            report.entries_skipped_unknown_collection, 0,
+            "no batch may stop at the collection B lacks, or the repair path closes the hole \
+             before the check reports it: {report:?}"
+        );
+        checked += report.divergence_checks;
+        skipped += report.divergence_skips;
+        failed += report.failed;
+        // Latched at the first non-zero reading: the confirmed finding is a
+        // level, and the repair a confirmation plans against the peer
+        // (ADR-148) may close it again while this loop is still running.
+        if confirmed == 0 && report.divergent_collections > 0 {
+            confirmed = report.divergent_collections;
+            at_confirmation = seq_on_b();
+        }
     }
-    assert_eq!(confirmed, 1, "the stranded collection, found despite the concurrent writes");
+    assert_eq!(confirmed, 1, "the stranded collection, and only it, despite the concurrent writes");
+    assert!(checked > 0, "confirmed from rounds that ran the check: checks={checked}");
+
+    writing.store(false, Ordering::Relaxed);
     looping.abort();
     writer.abort();
 }
