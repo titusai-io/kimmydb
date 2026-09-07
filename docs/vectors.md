@@ -227,18 +227,21 @@ writes arriving slightly faster than the floor allows grows its backlog
 without bound — Little's law, and what a live ingest showed. Batching removes
 the floor.
 
-What batching does not change: the storage write is still per document.
-`put_vectors` replaces one document's chunks, staleness is one document's
-HLC, and the oplog position is recorded once the batch has landed — or, with
-no batch to land, after at most a second (ADR-125) — so a crash replays
-rather than skips exactly as before. A document's chunks always share
-one call, so a document larger than the token bound goes alone rather than
-being split. Only one collection's documents share a call, because the
-collection names the provider, the model and the prefix. A batch that fails
-*permanently* — a `400` for one input the model cannot take, which the
-provider does not name — is taken apart and each document sent alone, so the
-one at fault is skipped and named and the rest land; a *retryable* failure
-retries the whole batch, as one document retried before.
+What batching changes on the storage side: a batch's documents land in one
+commit (ADR-149), with the worker's position folded into it (ADR-125), where
+each document used to be a commit of its own and the position another. What it
+does not change: `put_vectors` still replaces one document's chunks,
+staleness is one document's HLC, and the oplog position is recorded once the
+batch has landed — or, with no batch to land, after at most a second
+(ADR-125) — so a crash replays rather than skips exactly as before. A
+document's chunks always share one call, so a document larger than the token
+bound goes alone rather than being split. Only one collection's documents
+share a call, because the collection names the provider, the model and the
+prefix. A batch that fails *permanently* — a `400` for one input the model
+cannot take, which the provider does not name — is taken apart and each
+document sent alone, so the one at fault is skipped and named and the rest
+land; a *retryable* failure retries the whole batch, as one document retried
+before.
 
 `kimmy_embed_documents_total` and `kimmy_embed_chunks_total` still count
 documents and chunks. `kimmy_embed_provider_requests_total` counts calls, so

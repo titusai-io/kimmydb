@@ -252,13 +252,18 @@ fn other_mutations(c: &mut Criterion) {
 /// document, so it removes any existing chunks before writing — more work than
 /// an insert, and the comparison against `insert/secondary_indexes/0` is the
 /// point of measuring it here rather than alone.
+///
+/// The chunk counts climb because the whole replacement is one commit
+/// ([ADR-149](../../../docs/decisions.md)) and the way to see that is a
+/// document whose chunks would each have been a commit before: one chunk
+/// cannot show a per-chunk cost, four barely can, 32 cannot hide one.
 fn vector_writes(c: &mut Criterion) {
     let mut group = c.benchmark_group("put_vectors");
     group.sample_size(30);
 
     let vector: Vec<f32> = (0..384).map(|i| i as f32 / 384.0).collect();
 
-    for chunks in [1usize, 4] {
+    for chunks in [1usize, 4, 32] {
         group.bench_with_input(BenchmarkId::new("chunks", chunks), &chunks, |b, &chunks| {
             let (engine, _dir) = open();
             engine.create_collection("bench", "docs").unwrap();
