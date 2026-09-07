@@ -325,7 +325,8 @@ impl Engine {
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
-    /// How many times this collection's vectors have changed.
+    /// How many times this collection's vectors have changed, whether the
+    /// change was written here or arrived by replication.
     ///
     /// Resets to zero on restart, which is correct: an in-memory index does
     /// not survive one either.
@@ -374,6 +375,13 @@ impl Engine {
         self.unkeyed_writes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Record that a collection's vectors have changed.
+    ///
+    /// Called after the change is committed, never before, by every path that
+    /// writes a shadow collection: `put_vectors` and `delete_vectors` for a
+    /// local write, and `report_remote_write` for one that arrived by
+    /// replication. Bumping before the commit would let a build read the new
+    /// generation against the old data and be served as fresh for it.
     pub(crate) fn bump_vector_generation(&self, collection: CollectionId) {
         *self.vector_generations.lock().entry(collection).or_insert(0) += 1;
     }

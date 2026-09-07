@@ -730,14 +730,31 @@ impl Engine {
     }
 
     /// The part of a replicated write that must follow its commit: count and
-    /// record its unique violations, and return what to publish, in order —
-    /// the entry, then one `UniqueViolation` entry per constraint it broke.
+    /// record its unique violations, return what to publish, in order —
+    /// the entry, then one `UniqueViolation` entry per constraint it broke —
+    /// and, for a write into a shadow collection, move the vector generation.
     ///
     /// After the commit and not before, because recording a violation mints a
     /// local entry in its own transaction (see [`Self::log_unique_violation`]
     /// for why it is separate), and redb has one writer. The caller publishes
     /// the result, which keeps the rule that nothing reaches a subscriber
     /// before it is durable.
+    ///
+    /// The generation bump lives here for the same reason. A chunk that
+    /// arrives by replication is a vector write exactly as `put_vectors` is,
+    /// and the index cache reads the generation to notice one; on a member
+    /// that does not own the collection's embedding every chunk arrives this
+    /// way, so without the bump a graph built there was served as fresh
+    /// indefinitely. It follows the commit as `put_vectors` bumps after its
+    /// own writes commit: a bump inside the transaction opens a window in
+    /// which a build reads the new generation from the counter but the data
+    /// from a read transaction that predates the commit, and that graph
+    /// would then be served as fresh at a generation it does not describe.
+    /// Only an applied entry reaches here, so a superseded re-delivery does
+    /// not bump; a replicated tombstone (body `None`) does, since removing a
+    /// chunk changes the answer as much as adding one — the same rule as
+    /// `delete_vectors`. The bump is a counter, not a write: it mints no stamp
+    /// and nothing under ADR-148 applies to it.
     pub(crate) fn report_remote_write(
         &self,
         coll: &CollectionMeta,
@@ -745,6 +762,11 @@ impl Engine {
         id: &DocId,
         violations: &[index::UniqueViolation],
     ) -> Result<Vec<OplogEntry>> {
+        // Ahead of the violation work, which can fail: a report that errors
+        // out is still a write that landed, and the index must hear of it.
+        if kimmy_core::vector_meta::is_shadow(&coll.name) {
+            self.bump_vector_generation(coll.id);
+        }
         let mut published = Vec::with_capacity(1 + violations.len());
         published.push(entry.clone());
         for violation in violations {

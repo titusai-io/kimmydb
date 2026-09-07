@@ -168,6 +168,32 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   fails the build if any message names a setting the configuration parser
   would reject.
 
+- **A vector index on a member that does not own the collection's embedding
+  now notices the chunks that reach it by replication.** The search path
+  decides whether a cached HNSW graph is still fresh by comparing the
+  generation it was built at with the collection's vector generation, a
+  counter that moves once per vector write; a graph whose generation matches
+  is served as fresh, and one whose generation does not is served for at most
+  30 seconds before it is rebuilt. Only a local vector write moved the
+  counter. A chunk that arrives from a peer is applied by the sync path as a
+  document write into the shadow collection, which never did, so on a member
+  that does not embed for a collection — where every chunk arrives that way —
+  the counter never moved at all. A graph built there matched it forever and
+  was served as fresh until the process restarted, the graph was evicted, or
+  the collection was dropped. Documents embedded after the build were absent
+  from that member's results indefinitely, on exactly the members a
+  deployment routes searches to, while the embedding member found them within
+  30 seconds. Recall, never wrong data: a candidate is re-scored from the
+  stored vector and a missing one is skipped. But the bound the design
+  promises did not exist there.
+
+  A replicated write into a shadow collection now moves the generation once
+  it has committed — after, as a local write does, because a bump ahead of the
+  commit would let a build read the new generation against the old data and
+  serve that graph as fresh for a write it does not contain. A re-delivered
+  entry, which peers send by design and which writes nothing, does not bump;
+  a replicated delete of a chunk does, as a local one always has.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
