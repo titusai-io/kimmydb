@@ -262,6 +262,30 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   now sweeps the disk as well as the cache, and leaves staging directories to
   the builds that may own them.
 
+- **A collection dropped while its vector index was being built no longer
+  gets that index installed afterwards.** Building a graph takes seconds at
+  realistic sizes and runs on a read view of the store that is fixed when it
+  starts, so a drop committing during the build changed nothing the build
+  could see: it finished, saved its snapshot and installed the graph under an
+  id no collection held any more. Forgetting the collection — from the drop
+  route, the change-feed consumer or a reconciliation — removed the entry and
+  the snapshot that existed at that moment and did not reach the build in
+  progress, so a drop landing inside that window left a resident graph
+  charged to `vector.index_cache.max_bytes` and a snapshot on disk until the
+  graph was evicted or the node restarted; a drop landing just before the
+  build's count installed a "too small" verdict instead, which costs no bytes
+  and is never evicted at all. The window the entries above close was, for
+  the length of one build, still open. Every forget now moves a
+  per-collection marker that a build reads before it looks at the snapshot or
+  the store, and a build that finds the marker moved when it comes to install
+  discards its graph, removes the snapshot it wrote, and answers its own
+  search with the exact scan — the answer a search on a dropped or replaced
+  collection resolves to anyway. A forget that finds the name created again
+  fences the same way, so a build started for the previous collection cannot
+  install under the new one; a build of the live collection that happens to
+  be under way when a late drop entry is read is discarded too and paid again
+  at the next search — a rebuild, never a wrong answer.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
