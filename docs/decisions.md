@@ -7428,6 +7428,24 @@ and the `cluster.sync` span's `applied`. The measured benchmark numbers in
 [Benchmarks](benchmarks.md) are left as they were taken, with a note that the
 second commit is gone.
 
+**Amended by the composition of the worker's store over ADR-149.** The
+position is now written inside the commit of the batch it covers whenever
+the flush has one: `Worker::store` writes every document of a provider batch
+through one `Engine::write_batch` scope and folds the position into that
+same scope through `WriteScope::put_consumer_position`, so a batch of about
+thirty documents and its checkpoint is one commit where it was thirty-one.
+A held position with no batch is still written by a flush of its own — one
+commit, exactly as above — and `POSITION_WAIT`, `Pending::deadline`, the
+per-entry deadline check and the five tests named above are unchanged. One
+case is new: a flush in which a store failed writes no position at all. The
+batch's writes were aborted whole, and a position committed on its own
+behind them would be a checkpoint past work that did not land; the token
+stays held with its original `held_since`, so the next flush writes it
+inside the same bound. Defended by
+`a_provider_batch_is_one_commit_with_its_position`,
+`a_storage_failure_mid_batch_advances_neither_the_vectors_nor_the_position`
+and `a_held_position_with_no_batch_is_still_one_commit`.
+
 ---
 
 ## ADR-126 — A batch's entry cap is spent after the filter, not before it
@@ -11184,13 +11202,16 @@ several document writes into one commit. It takes the writer once through
 `Engine::begin_write`, hands the closure a `WriteScope` — a type only this
 crate can construct, which owns the transaction and offers `replace` and
 `delete` — runs the closure, and then does one of three things. On `Ok`
-with at least one entry written, it commits once through `WriteTxn::commit`,
+with something written, it commits once through `WriteTxn::commit`,
 so the commit is counted and the durability class is honoured as every
 commit is (ADR-088), and publishes every entry the scope collected after
 that commit, in the order written. On `Err` it aborts and publishes nothing,
 returning the closure's error. On `Ok` with nothing written — every replace
 unmatched, every delete of a document that was not there — it aborts rather
-than commits: no fsync, no count, and nothing to publish. `insert_many`
+than commits: no fsync, no count, and nothing to publish. "Written" is
+wider than "produced an entry": a consumer position written through the
+scope (the amendment to ADR-125) is a write with no entry, and a scope
+holding only one commits. `insert_many`
 reaches the same end for an empty batch by opening no transaction at all;
 a scope cannot know it is empty until the closure has run, so it opens one
 and aborts it, to the same effect. And a write that fails inside the scope

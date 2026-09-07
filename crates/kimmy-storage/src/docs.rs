@@ -10,7 +10,10 @@
 //! subscriber can never observe a change that was rolled back.
 
 use bson::{Bson, Document};
-use kimmy_core::{DocId, DocRecord, Error as CoreError, OpKind, OplogEntry, Stamp, keyenc};
+use kimmy_core::{
+    CollectionId, DocId, DocRecord, Error as CoreError, OpKind, OplogEntry, ResumeToken, Stamp,
+    keyenc,
+};
 use redb::{ReadableDatabase, ReadableTable};
 use tracing::warn;
 
@@ -87,10 +90,25 @@ pub const ID_FIELD: &str = "_id";
 /// failure is remembered here: every later write on the scope refuses
 /// without writing, and `write_batch` aborts the scope whatever the closure
 /// answers. A torn commit is not something a caller can opt into.
+///
+/// A scope also carries what must happen only *after* its commit. A vector
+/// write through [`Self::put_vectors`] or [`Self::delete_vectors`] names
+/// the shadow collection it changed, and `write_batch` bumps that
+/// collection's vector generation once the commit has landed — never inside
+/// the scope, where a bump would let an index build read the new generation
+/// against data the commit had not yet made visible, and be served as fresh
+/// for it.
 pub struct WriteScope<'a> {
-    engine: &'a Engine,
+    pub(crate) engine: &'a Engine,
     txn: WriteTxn<'a>,
     entries: Vec<OplogEntry>,
+    /// Whether anything has landed in the transaction: a write that produced
+    /// an entry, or a consumer position, which produces none. A scope that
+    /// wrote nothing is aborted, not committed.
+    wrote: bool,
+    /// Shadow collections whose vectors this scope changed, each once, for
+    /// the generation bump that follows the commit.
+    vector_generations: Vec<CollectionId>,
     /// The first write that failed, as its error read; `Some` means the
     /// transaction may hold a partial write and can never commit.
     poisoned: Option<String>,
@@ -110,6 +128,7 @@ impl WriteScope<'_> {
             .engine
             .replace_in_txn(&self.txn, coll, id, doc, upsert, None)
             .map_err(|e| self.poison(e))?;
+        self.wrote |= entry.is_some();
         self.entries.extend(entry);
         Ok(outcome)
     }
@@ -122,8 +141,37 @@ impl WriteScope<'_> {
             .delete_in_txn(&self.txn, coll, id, |_, _| Ok(true))
             .map_err(|e| self.poison(e))?;
         let removed = entry.is_some();
+        self.wrote |= removed;
         self.entries.extend(entry);
         Ok(removed)
+    }
+
+    /// [`Engine::put_consumer_position`], into this scope's transaction.
+    ///
+    /// The third kind of write a scope takes, and the one with nothing to
+    /// publish: a consumer's position is a row in the metadata table, not a
+    /// document, so it mints no stamp and yields no entry — ADR-148 is not
+    /// engaged — but it is a write all the same, and a scope holding only a
+    /// position commits. What it buys is the embedding worker's checkpoint
+    /// riding in the same commit as the batch it covers (ADR-125), rather
+    /// than in one of its own. Under the same poison rule as `replace` and
+    /// `delete`: a failed write here is refused every write after it, and
+    /// the scope aborts.
+    pub fn put_consumer_position(&mut self, consumer: &str, token: ResumeToken) -> Result<()> {
+        self.refuse_if_poisoned()?;
+        self.engine
+            .put_consumer_position_in_txn(&self.txn, consumer, token)
+            .map_err(|e| self.poison(e))?;
+        self.wrote = true;
+        Ok(())
+    }
+
+    /// Note that this scope changed a shadow collection's vectors, so
+    /// `write_batch` bumps its generation once the commit has landed.
+    pub(crate) fn touch_vector_generation(&mut self, shadow: CollectionId) {
+        if !self.vector_generations.contains(&shadow) {
+            self.vector_generations.push(shadow);
+        }
     }
 
     /// Remember the first failure and hand it back unchanged: the caller
@@ -735,7 +783,16 @@ impl Engine {
     /// durable. On `Err` the scope is aborted, nothing is published, and the
     /// error is returned. A scope that wrote nothing is aborted too: no
     /// fsync, no count, and nothing to publish, which is the rule
-    /// [`Self::insert_many`] states for an empty batch.
+    /// [`Self::insert_many`] states for an empty batch. "Nothing" is
+    /// measured by writes, not by entries: a consumer position
+    /// ([`WriteScope::put_consumer_position`]) produces no entry, and a
+    /// scope holding only one still commits.
+    ///
+    /// After the commit, and only then, the vector generation of every
+    /// shadow collection the scope changed through
+    /// [`WriteScope::put_vectors`] or [`WriteScope::delete_vectors`] is
+    /// bumped once — the rule `bump_vector_generation` states, kept here so
+    /// that no caller, inside the crate or out, has to.
     ///
     /// Every stamp is minted inside the closure, under the writer, so
     /// ADR-148's contiguity holds for a scope exactly as it does for a bulk
@@ -758,7 +815,14 @@ impl Engine {
     /// its inputs ready and do nothing but write them. Reads are fine.
     pub fn write_batch<T>(&self, f: impl FnOnce(&mut WriteScope<'_>) -> Result<T>) -> Result<T> {
         let txn = self.begin_write()?;
-        let mut scope = WriteScope { engine: self, txn, entries: Vec::new(), poisoned: None };
+        let mut scope = WriteScope {
+            engine: self,
+            txn,
+            entries: Vec::new(),
+            wrote: false,
+            vector_generations: Vec::new(),
+            poisoned: None,
+        };
         let value = match f(&mut scope) {
             Ok(value) => value,
             Err(e) => {
@@ -766,7 +830,7 @@ impl Engine {
                 return Err(e);
             }
         };
-        let WriteScope { txn, entries, poisoned, .. } = scope;
+        let WriteScope { txn, entries, wrote, vector_generations, poisoned, .. } = scope;
         if let Some(first) = poisoned {
             // The closure answered `Ok` over a failed write. What the
             // transaction holds is not a state that ever existed, and it
@@ -774,11 +838,16 @@ impl Engine {
             txn.abort()?;
             return Err(WriteScope::poisoned_error(&first));
         }
-        if entries.is_empty() {
+        if !wrote {
             txn.abort()?;
             return Ok(value);
         }
         txn.commit()?;
+        // Committed, so a build that reads the new generation now reads the
+        // new chunks with it; before the commit it would not have.
+        for shadow in vector_generations {
+            self.bump_vector_generation(shadow);
+        }
         self.publish(entries);
         Ok(value)
     }

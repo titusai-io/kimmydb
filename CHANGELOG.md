@@ -326,6 +326,21 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
   as before, published together after the one commit rather than one at a
   time.
 
+- **The embedding worker commits once per provider batch, not once per
+  document and once more for its position.** The worker stored the documents
+  one provider call answers for — about thirty — one write each, every one a
+  commit of its own and, under `durable`, an fsync of its own, and then
+  recorded its oplog position in one more. A batch is now written through
+  one scoped transaction with the position folded into the same commit: one
+  commit and one fsync where there were about thirty-three, so `kimmy_commits`
+  on a member that embeds falls to roughly one per provider call. A held
+  position with nothing to embed is still one commit of its own, on the same
+  one-second deadline as before, and `kimmy_embed_documents_total` and
+  `kimmy_embed_chunks_total` count what they counted. A batch is also stored
+  whole or not at all: a storage failure part way through now leaves every
+  document of the batch unstored and the position where it was, rather than
+  some documents written, the rest stale, and the position past them.
+
 ### Added
 
 - **Resident memory is a `/metrics` series.** `kimmy_process_resident_bytes`
