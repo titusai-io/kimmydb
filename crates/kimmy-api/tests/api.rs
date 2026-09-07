@@ -10108,11 +10108,12 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
     // A plain collection after the configuration, so the `ConfigureVectors`
     // entry is not the last one the applier witnesses from the issuer. An
     // anti-entropy window starts *at* the last witnessed stamp, so the next
-    // round re-delivers that entry, and a re-delivered `ConfigureVectors` is
-    // re-applied and re-published — and forgets the shadow's graph on the
-    // consumer's configure arm before the drop behind it is read. Then this
-    // test passes whatever the drop arm does. A re-delivered
-    // `CreateCollection` the consumer does not act on.
+    // round would re-deliver that entry, re-applied and re-published, ahead
+    // of the drop. The consumer's configure arm compares shapes and leaves a
+    // matching graph alone, so that would be harmless now — but this test is
+    // about the drop arm, and it should not lean on the other arm's restraint
+    // to mean anything. A re-delivered `CreateCollection` the consumer does
+    // not act on.
     let res =
         issuer.post("/v1/db/shop/collections", Some(&token), json!({ "name": "after" })).await;
     assert_eq!(res.status, 200, "{:?}", res.body);
@@ -10123,8 +10124,8 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
     // Subscribed only now, so the drop is the one entry queued for it, for
     // the same reason: the `ConfigureVectors` replicated above would be read
     // at the first `.await` after the graph is built — *here* — by a consumer
-    // spawned before it, as the daemon spawns one, and take the graph before
-    // the drop was ever read.
+    // spawned before it, as the daemon spawns one, and the drop arm would
+    // then not be the only thing that had looked at the graph.
     let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
 
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
@@ -10150,9 +10151,9 @@ async fn a_replicated_drop_that_names_the_shadow_itself_forgets_its_index() {
     // be taken as it is — suffixed a second time it derives an id nothing
     // holds, and the graph stays. Dropped on the engine rather than through
     // `DELETE .../vector?drop_vectors=true` on purpose: that route also mints
-    // a `ConfigureVectors` entry, and the consumer forgets a reconfigured
-    // collection's graph unconditionally, which would mask the drop arm
-    // under test.
+    // a `ConfigureVectors` entry, for a parent whose configuration is now
+    // gone, and the consumer's configure arm forgets the shadow's graph on
+    // that as well — which would mask the drop arm under test.
     let issuer = Server::start().await;
     let applier = Server::start().await;
     let token = issuer.root().await;
@@ -10255,6 +10256,130 @@ async fn a_replicated_reconfiguration_forgets_the_index_on_the_member_that_appli
 }
 
 #[tokio::test]
+async fn a_re_delivered_reconfiguration_leaves_the_rebuilt_graph_alone() {
+    // The same `ConfigureVectors` entry reaches the consumer more than once.
+    // An anti-entropy window starts *at* the requester's last witnessed
+    // stamp, inclusive, so the next round with news from the issuer carries
+    // the reconfiguration again, and the sync path re-applies and re-publishes
+    // it. A consumer that forgot the graph on every delivery discarded, each
+    // time, a graph already rebuilt for the configuration in force — one
+    // multi-second rebuild per round for as long as any member's lag spanned
+    // the reconfiguration. So the consumer asks what shape the store
+    // configures now and forgets only a graph of another one; a re-delivered
+    // entry finds the rebuilt graph matching and does nothing.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    // The guard first, so `docs`'s configuration is the last entry the
+    // applier witnesses before the reconfiguration: the round that carries
+    // the reconfiguration then re-delivers only entries about `docs`, whose
+    // graph goes either way, and the guard's graph is untouched until the
+    // final round no matter what the arm does with a re-delivery.
+    configure_vectors(&issuer, &token, "shop", "guard").await;
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    replicate(&issuer, &applier);
+    let shadow = build_graph(&applier, "shop", "docs");
+    let guard = build_graph(&applier, "shop", "guard");
+    assert_eq!(applier.state.vectors.len(), 2);
+
+    // Subscribed only now, as the replicated-drop tests do and for their
+    // reason: a consumer spawned before the graphs were built would read the
+    // initial `ConfigureVectors` entries at the first `.await` after the
+    // build — the reconfiguring request below — and what this test pins is
+    // what the arm does with an entry *re-delivered* after a rebuild, not
+    // with one read late. The daemon's consumer reads those initial entries
+    // long before any graph exists.
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    // Same width, other metric: the reconfiguration proper, which must
+    // forget the cosine graph on the applier.
+    let res = issuer
+        .post(
+            "/v1/db/shop/coll/docs/vector",
+            Some(&token),
+            json!({
+                "fields": ["text"], "provider": { "kind": "byo" }, "dim": 3,
+                "metric": "euclidean",
+            }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "reconfiguring the metric failed: {:?}", res.body);
+    replicate(&issuer, &applier);
+    assert!(
+        wait_until(|| !snapshot_of(&applier, shadow).exists()).await,
+        "the applying member kept a graph built for the metric the collection no longer has"
+    );
+    assert_eq!(applier.state.vectors.len(), 1, "only the guard's graph should be left");
+
+    // A search on the applier rebuilds at the new shape. The graph it left
+    // is the one the re-delivery must not touch.
+    let applier_token = applier.root().await;
+    let res = applier
+        .post(
+            "/v1/db/shop/coll/docs/vector_search",
+            Some(&applier_token),
+            json!({ "vector": [1.0, 1.0, 0.0], "k": 3 }),
+        )
+        .await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    assert_eq!(applier.state.vectors.len(), 2, "the search should have rebuilt the graph");
+    let engine = &applier.state.engine;
+    let shadow_meta = engine.vector_collection("shop", "docs").unwrap().unwrap();
+    let kimmy_vector::Access::Approximate(before) =
+        applier.state.vectors.access(engine, &shadow_meta, kimmy_core::Metric::Euclidean, 3)
+    else {
+        panic!("500 vectors is the threshold; the search should have left a graph");
+    };
+
+    // The next round with news from the issuer — here the guard's drop, which
+    // is also the fence — starts at the applier's last witnessed stamp, the
+    // reconfiguration's, and so carries that entry a second time. Checked,
+    // not assumed: a window without it would make everything below pass for
+    // nothing.
+    let res = issuer.delete("/v1/db/shop/coll/guard", Some(&token)).await;
+    assert_eq!(res.body, json!({ "dropped": true }));
+    let mine = applier.state.engine.version_vector().unwrap();
+    let theirs = issuer.state.engine.version_vector().unwrap();
+    let start = mine.behind(&theirs).expect("the guard's drop is news");
+    let window = issuer.state.engine.entries_for_peer(start, 1024).unwrap();
+    let redelivered = window.entries.iter().filter(|e| {
+        e.kind == kimmy_core::OpKind::ConfigureVectors
+            && e.body.as_deref().is_some_and(|b| {
+                bson::deserialize_from_slice::<kimmy_core::VectorSet>(b)
+                    .is_ok_and(|set| set.collection == "docs")
+            })
+    });
+    assert_eq!(redelivered.count(), 1, "the window should re-deliver the reconfiguration");
+    applier.state.engine.apply_batch(&window.entries).unwrap();
+
+    // The feed is ordered, so the guard's snapshot going means the consumer
+    // has read and passed the re-delivered entry. Asserted, so a consumer
+    // that never got there cannot pass the fence silently.
+    assert!(
+        wait_until(|| !snapshot_of(&applier, guard).exists()).await,
+        "the consumer never reached the guard's drop, so nothing below is evidence"
+    );
+
+    assert_eq!(
+        applier.state.vectors.len(),
+        1,
+        "a re-delivered reconfiguration took the graph rebuilt for it"
+    );
+    assert!(snapshot_of(&applier, shadow).is_dir(), "and its snapshot");
+    let kimmy_vector::Access::Approximate(after) =
+        applier.state.vectors.access(engine, &shadow_meta, kimmy_core::Metric::Euclidean, 3)
+    else {
+        panic!("the rebuilt graph should still be served");
+    };
+    assert!(
+        std::sync::Arc::ptr_eq(&before, &after),
+        "the graph served after the re-delivery must be the one built before it, not a rebuild"
+    );
+    consumer.abort();
+}
+
+#[tokio::test]
 async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alone() {
     // A collection recreated under the same name derives the same id, so it
     // reuses the same cache key and the same snapshot path. A drop from the
@@ -10276,26 +10401,20 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
     // remove the live graph the moment it started; the guard collection's
     // drop, published after, is the fence that proves it got that far.
     //
-    // The recreation is done beneath the vector route, on purpose. A
-    // `ConfigureVectors` entry forgets the graph by design — the consumer
-    // treats one as a reconfiguration, whatever it held before — and one
-    // published after the drop would sit in the same queue and take the live
-    // graph a moment after the drop had left it alone, which is a rebuild
-    // this test is not about. So incarnation two is created as a plain
-    // collection, and its shadow and vectors are written directly, which
-    // publishes only entries the consumer does not act on. The guard is set
-    // up before the receiver opens for the same reason.
+    // The recreation goes through the vector route, as a real one would, so
+    // the queue also holds a `ConfigureVectors` for the live collection and
+    // one for the guard. The consumer treats those the way it treats the
+    // drop — as a question about what this node holds now, not as news —
+    // and a graph already built for the configured shape is nothing to
+    // forget, so neither entry touches the live graph either.
     let issuer = Server::start().await;
     let applier = Server::start().await;
     let token = issuer.root().await;
 
-    // Incarnation one, replicated, with its graph built on the applier, and
-    // the guard beside it.
+    // Incarnation one, replicated, with its graph built on the applier.
     configure_vectors(&issuer, &token, "shop", "docs").await;
-    configure_vectors(&issuer, &token, "shop", "guard").await;
     replicate(&issuer, &applier);
     let first = build_graph(&applier, "shop", "docs");
-    let guard = build_graph(&applier, "shop", "guard");
 
     // Subscribed now, run later: `invalidator` subscribes when it is called,
     // not when it is first polled, so everything published from here on
@@ -10309,20 +10428,17 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
     replicate(&issuer, &applier);
-    assert_eq!(applier.state.vectors.len(), 2, "nothing has consumed the drop yet");
+    assert_eq!(applier.state.vectors.len(), 1, "nothing has consumed the drop yet");
 
     // Incarnation two under the same name — same derived id, same snapshot
-    // path — with its graph rebuilt on the applier.
-    let res = issuer.post("/v1/db/shop/collections", Some(&token), json!({ "name": "docs" })).await;
-    assert_eq!(res.status, 200, "{:?}", res.body);
+    // path — with its graph rebuilt on the applier, plus a guard collection
+    // whose own drop is the fence at the end.
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    configure_vectors(&issuer, &token, "shop", "guard").await;
     replicate(&issuer, &applier);
-    let shadow = applier
-        .state
-        .engine
-        .create_system_collection("shop", &kimmy_core::vector_meta::shadow_name("docs"))
-        .unwrap();
-    let live = fill_and_build(&applier, &shadow);
+    let live = build_graph(&applier, "shop", "docs");
     assert_eq!(live, first, "the recreated name must derive the same id for this to test anything");
+    let guard = build_graph(&applier, "shop", "guard");
     assert_eq!(applier.state.vectors.len(), 2);
     assert!(snapshot_of(&applier, live).is_dir());
 
@@ -10359,10 +10475,10 @@ async fn a_drop_consumed_after_the_name_was_recreated_leaves_the_live_index_alon
 /// its `created`, and the guard's shadow id.
 ///
 /// Everything here is published *before* a test opens the consumer's
-/// receiver: a `ConfigureVectors` entry forgets the shadow's graph by design,
-/// whatever it held, so one left queued for a late consumer would take
-/// incarnation one's graph on its own and the test could not fail without
-/// the mechanism it means to pin.
+/// receiver, so what the tests below queue for a late consumer is the drop
+/// and the recreate and nothing else: they pin the drop arm's comparison of
+/// incarnations, and a `ConfigureVectors` in the queue would put a second
+/// arm's reading of the same graph between the drop and the assertion.
 async fn stage_incarnation_one(
     issuer: &Server,
     applier: &Server,
@@ -10383,9 +10499,9 @@ async fn stage_incarnation_one(
 ///
 /// Deliberately not `configure_vectors`, for the reason
 /// [`stage_incarnation_one`] gives: a configure entry queued behind the drop
-/// would forget the shadow's graph whether or not the consumer compares
-/// incarnations. A shadow created directly mints an ordinary create entry,
-/// which the consumer ignores.
+/// is a second arm looking at the same graph, and these tests are about the
+/// first. A shadow created directly mints an ordinary create entry, which
+/// the consumer ignores.
 async fn drop_and_plainly_recreate_docs(issuer: &Server, token: &str) {
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));

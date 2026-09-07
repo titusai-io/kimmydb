@@ -327,27 +327,40 @@ pub fn invalidator(state: &SharedState) -> impl std::future::Future<Output = ()>
                     // by database and collection; the shadow's id is derived
                     // from those, as the drop arm derives it.
                     //
-                    // Always invalidated, on purpose. On the member that took the request the route
-                    // forgets the entry itself, before or after this task does (the engine
-                    // publishes the entry before the route returns), so this is a second, harmless
-                    // invalidation, one that may cost one rebuild if a search rebuilt the graph in
-                    // between. On every other member the change arrived by replication, which runs
-                    // no route, so this is the only invalidation there is. Correctness does not
-                    // rest on it reaching here in time, or at all: the cache records the shape a
-                    // graph was built for and declines one that does not match at the next search
-                    // (`IndexCache`), so a reconfiguration that this task reads late, or loses to
-                    // `Lagged` below, costs the stale entry its memory until that search and
-                    // nothing else. `Lagged` reconciles against what this node holds, which a
-                    // reconfigured collection still is; the shape check covers it there, and
-                    // `HnswIndex::load` already refuses a snapshot of another shape.
+                    // A question, not a command — the rule the drop arm
+                    // follows, for the same reason: the entry is history. A
+                    // pull window starts *at* the requester's last witnessed
+                    // stamp, inclusive, on whichever origin it trails most,
+                    // and re-scans every origin's entries above it; the sync
+                    // path re-applies an already-applied entry idempotently
+                    // and publishes it again. So the same `ConfigureVectors`
+                    // reaches here once more in the next round with news from
+                    // its origin, and on every round while any other origin's
+                    // position on the issuer sits below its stamp — under lag,
+                    // tens of times. Forgetting on each would discard a graph
+                    // already rebuilt for the configuration in force, and the
+                    // next search would pay a multi-second build for nothing.
+                    // The configuration the entry carries is not consulted
+                    // either: it is what was configured *then*, and a later
+                    // entry may have moved it since. What the graph must match
+                    // is what the store says now, so that is read, by one
+                    // point read of the parent, and the cache forgets only a
+                    // graph that does not match it. On the member that took
+                    // the request the route has already forgotten the old
+                    // graph itself, and this finds nothing or the new one.
+                    //
+                    // Correctness does not rest on this arm at all: the cache
+                    // records the shape a graph was built for and declines
+                    // one that does not match at the next search
+                    // (`IndexCache`), and `HnswIndex::load` refuses a snapshot
+                    // of another shape, so an entry read late or lost to
+                    // `Lagged` below costs the stale graph its memory until
+                    // that search and nothing else.
                     if let Some(body) = &entry.body
                         && let Ok(target) =
                             bson::deserialize_from_slice::<kimmy_core::VectorSet>(body)
                     {
-                        state.vectors.invalidate(CollectionId::derive(
-                            &target.db,
-                            &vector_meta::shadow_name(&target.collection),
-                        ));
+                        forget_reconfigured(&state, &target.db, &target.collection);
                     }
                 }
                 Ok(_) => {}
@@ -425,6 +438,44 @@ fn forget_dropped(state: &SharedState, db: &str, name: &str) {
         Err(e) => Err(e),
     });
     forget_unless_live(state, id, live);
+}
+
+/// Forget the graph a reconfiguration of `db.name` strands, by one point
+/// read of the parent.
+///
+/// The shadow holds the graph, and its id is derived from the parent's name
+/// (ADR-031); the parent holds the configuration, so it is the row read.
+/// What the read finds decides, on the rule [`forget_unless_live`] states
+/// for a drop: a configuration in force, and the cache is asked whether the
+/// graph it holds matches that shape (`IndexCache::forget_unless_shaped`),
+/// which is a no-op for an entry re-delivered after the rebuild. No
+/// configuration — a replicated disable, which is what `disable_vectors`
+/// does on the member that ran it — or no collection at all, and the graph
+/// goes as it would on a drop; either finds nothing resident on a re-delivery
+/// and costs nothing. A read that failed outright is logged and the graph
+/// left in place, on the trade `forget_unless_live` makes: memory rather
+/// than answers, and the shape check in `serve` refuses the graph regardless.
+fn forget_reconfigured(state: &SharedState, db: &str, name: &str) {
+    let id = CollectionId::derive(db, &vector_meta::shadow_name(name));
+    let configured = kimmy_storage::blocking(|| match state.engine.get_collection(db, name) {
+        Ok(meta) => Ok(meta.vector.map(|cfg| (cfg.metric, cfg.dim))),
+        Err(kimmy_storage::StorageError::Core(kimmy_core::Error::CollectionNotFound {
+            ..
+        })) => Ok(None),
+        Err(e) => Err(e),
+    });
+    match configured {
+        Ok(Some((metric, dim))) => {
+            state.vectors.forget_unless_shaped(id, metric, dim);
+        }
+        Ok(None) => state.vectors.invalidate(id),
+        Err(e) => warn!(
+            error = %e,
+            collection = id.0,
+            "could not read a reconfigured collection's configuration; leaving its vector \
+             index in place, which costs memory rather than answers"
+        ),
+    }
 }
 
 /// Forget a collection's graph, but **only what the live collection under the
