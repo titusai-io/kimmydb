@@ -12,6 +12,19 @@ breaking changes and says so here; a `0.x.PATCH` bump never does.
 
 ## Unreleased
 
+### Changed
+
+- **The vector-index consumer reconciles a replicated drop with one keyed
+  read rather than two walks of the catalogue.** A drop entry carries the
+  dropped collection's database and name, and the graph a drop strands is
+  keyed by the shadow collection whose id derives from that name, so the
+  consumer now reads that one row instead of scanning every database twice
+  per entry. On a node holding thousands of collections, that scanning was
+  what let a `drop_database` push the consumer behind the change feed and
+  into a full reconciliation. The reconciliation itself, and the startup
+  snapshot sweep, now list the catalogue in one read transaction rather than
+  one per database.
+
 ### Fixed
 
 - **A dropped collection now takes its vector index with it, and a snapshot

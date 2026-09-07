@@ -52,16 +52,19 @@ use std::collections::{BTreeSet, HashMap};
 
 use kimmy_core::{CollectionId, NodeId};
 
-use crate::engine::Engine;
+use crate::engine::{Engine, PairedShadows};
 use crate::error::Result;
 
 impl Engine {
-    /// Every collection id this node holds, across every database.
+    /// Every collection id this node holds, across every database — **less
+    /// the vector shadows whose parent is present** (ADR-138). Not the set to
+    /// reconcile the index cache against: [`Self::live_collections`] is, and
+    /// the ids hidden here are exactly the ones it must not miss.
     ///
-    /// Metadata only: [`Self::list_databases`] and [`Self::list_collections`]
-    /// each scan their own small table, never a document, so this costs the
-    /// same on a cluster with empty collections as one with full ones and can
-    /// run every round without the cost this module exists to bound (see the
+    /// Metadata only: one read transaction over the `collections` table
+    /// ([`Self::all_collections`]), never a document, so this costs the same
+    /// on a cluster with empty collections as one with full ones and can run
+    /// every round without the cost this module exists to bound (see the
     /// module docs).
     ///
     /// A vector shadow collection is excluded **while the collection it serves
@@ -82,24 +85,12 @@ impl Engine {
     /// exactly the reading ADR-135 added to mean "checked and agreed"
     /// (ADR-138).
     ///
-    /// The base is looked up by name within the same database, which is where
-    /// the shadow's own name is derived from, so this stays one pass over
-    /// metadata already loaded.
+    /// The rule itself is written once, in `Engine::collections`, and this is
+    /// that walk with `PairedShadows::Hidden`; [`Self::live_collections`] is
+    /// the same walk with `PairedShadows::Included`, and that one argument is
+    /// the whole difference between them.
     pub fn all_collection_ids(&self) -> Result<BTreeSet<CollectionId>> {
-        let mut ids = BTreeSet::new();
-        for db in self.list_databases()? {
-            let colls = self.list_collections(&db.name)?;
-            let present: std::collections::HashSet<&str> =
-                colls.iter().map(|c| c.name.as_str()).collect();
-            for coll in &colls {
-                let hidden = kimmy_core::vector_meta::base_name(&coll.name)
-                    .is_some_and(|base| present.contains(base));
-                if !hidden {
-                    ids.insert(coll.id);
-                }
-            }
-        }
-        Ok(ids)
+        Ok(self.collections(PairedShadows::Hidden)?.into_iter().map(|c| c.id).collect())
     }
 
     /// The live document count of collection `id`, or `None` if this node
@@ -466,6 +457,59 @@ mod tests {
         let (stranded, _d1) = engine_with(false, true);
         let ids = stranded.all_collection_ids().unwrap();
         assert_eq!(ids.len(), 1, "an orphaned shadow must be visible to the check");
+    }
+
+    #[test]
+    fn live_collections_reports_the_paired_shadow_that_all_collection_ids_hides() {
+        // The two views are one walk apart on one rule: `all_collection_ids`
+        // hides a shadow standing beside its parent (ADR-138), and
+        // `live_collections` hides nothing, because the hidden ids are the
+        // ones a vector index is keyed by. Everything else — an ordinary
+        // collection, an orphaned shadow — they agree on. The hidden set is
+        // pinned against the loop `all_collection_ids` used to be, kept here
+        // as the oracle, so moving it onto the single walk changed nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(&dir.path().join("kimmy.redb")).unwrap();
+        let shadow_of = kimmy_core::vector_meta::shadow_name;
+        let docs = engine.create_collection("app", "docs").unwrap();
+        let docs_shadow = engine.create_system_collection("app", &shadow_of("docs")).unwrap();
+        let notes = engine.create_collection("app", "notes").unwrap();
+        // A parent named `docs` in *another* database must not vouch for this
+        // orphan: the rule is per database, where the shadow's name derives.
+        let orphan = engine.create_system_collection("other", &shadow_of("docs")).unwrap();
+
+        let oracle: BTreeSet<CollectionId> = {
+            let mut ids = BTreeSet::new();
+            for db in engine.list_databases().unwrap() {
+                let colls = engine.list_collections(&db.name).unwrap();
+                let present: std::collections::HashSet<&str> =
+                    colls.iter().map(|c| c.name.as_str()).collect();
+                for coll in &colls {
+                    let hidden = kimmy_core::vector_meta::base_name(&coll.name)
+                        .is_some_and(|base| present.contains(base));
+                    if !hidden {
+                        ids.insert(coll.id);
+                    }
+                }
+            }
+            ids
+        };
+        let hidden = engine.all_collection_ids().unwrap();
+        assert_eq!(hidden, oracle, "the single walk must hide exactly what the old loop hid");
+        assert_eq!(hidden, [docs.id, notes.id, orphan.id].into_iter().collect::<BTreeSet<_>>());
+        assert!(!hidden.contains(&docs_shadow.id), "a paired shadow is hidden from the check");
+
+        let live = engine.live_collections().unwrap();
+        assert_eq!(
+            live.keys().copied().collect::<BTreeSet<_>>(),
+            [docs.id, docs_shadow.id, notes.id, orphan.id].into_iter().collect::<BTreeSet<_>>(),
+            "live_collections hides nothing"
+        );
+        assert_eq!(live[&docs_shadow.id], docs_shadow.created, "and carries the incarnation");
+        assert_eq!(live[&orphan.id], orphan.created);
+        for id in &hidden {
+            assert!(live.contains_key(id), "everything the check sees, the cache sees too");
+        }
     }
 
     #[test]

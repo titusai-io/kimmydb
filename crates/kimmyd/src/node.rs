@@ -441,9 +441,17 @@ async fn start_and_serve(config: Config) -> Result<()> {
     // That ordering is what makes removing the `<id>.build` staging
     // directories safe: the listener has not bound and the consumer above only
     // forgets, so no build is writing one, and anything staged was left by a
-    // build the previous process did not finish.
+    // build the previous process did not finish. The listener is the only
+    // thing this orders against: the embedding worker below never reads or
+    // writes a snapshot, and the sweep is disk hygiene, not a correctness
+    // step — the load boundary's `created` check is what refuses a previous
+    // incarnation's graph, swept or not. Kept on the critical path on purpose:
+    // a readdir and a `meta.json` parse per live vector collection, against a
+    // restart that already takes seconds, buys the one arrangement with no
+    // race.
     match kimmy_storage::blocking(|| {
-        kimmy_api::vectors::live_collections(&engine)
+        engine
+            .live_collections()
             .map(|live| state.vectors.sweep_snapshots(&live, kimmy_vector::Staging::Remove))
     }) {
         Ok(removed) if removed > 0 => {

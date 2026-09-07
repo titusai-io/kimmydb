@@ -10104,13 +10104,28 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
     let applier = Server::start().await;
     let token = issuer.root().await;
 
-    // Spawned as the daemon spawns it, before anything is published.
-    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
-
     configure_vectors(&issuer, &token, "shop", "docs").await;
+    // A plain collection after the configuration, so the `ConfigureVectors`
+    // entry is not the last one the applier witnesses from the issuer. An
+    // anti-entropy window starts *at* the last witnessed stamp, so the next
+    // round re-delivers that entry, and a re-delivered `ConfigureVectors` is
+    // re-applied and re-published — and forgets the shadow's graph on the
+    // consumer's configure arm before the drop behind it is read. Then this
+    // test passes whatever the drop arm does. A re-delivered
+    // `CreateCollection` the consumer does not act on.
+    let res =
+        issuer.post("/v1/db/shop/collections", Some(&token), json!({ "name": "after" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
     replicate(&issuer, &applier);
     let shadow = build_graph(&applier, "shop", "docs");
     assert_eq!(applier.state.vectors.len(), 1);
+
+    // Subscribed only now, so the drop is the one entry queued for it, for
+    // the same reason: the `ConfigureVectors` replicated above would be read
+    // at the first `.await` after the graph is built — *here* — by a consumer
+    // spawned before it, as the daemon spawns one, and take the graph before
+    // the drop was ever read.
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
 
     let res = issuer.delete("/v1/db/shop/coll/docs", Some(&token)).await;
     assert_eq!(res.body, json!({ "dropped": true }));
@@ -10122,6 +10137,51 @@ async fn a_replicated_drop_forgets_the_index_on_the_member_that_applies_it() {
     assert!(
         wait_until(|| applier.state.vectors.is_empty()).await,
         "the applying member kept a graph for a collection it no longer holds"
+    );
+    assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
+    consumer.abort();
+}
+
+#[tokio::test]
+async fn a_replicated_drop_that_names_the_shadow_itself_forgets_its_index() {
+    // The other shape a drop entry takes: the shadow's own, minted when the
+    // vectors are discarded without their parent. The consumer derives the id
+    // to reconcile from the name the entry carries, and a shadow's name must
+    // be taken as it is — suffixed a second time it derives an id nothing
+    // holds, and the graph stays. Dropped on the engine rather than through
+    // `DELETE .../vector?drop_vectors=true` on purpose: that route also mints
+    // a `ConfigureVectors` entry, and the consumer forgets a reconfigured
+    // collection's graph unconditionally, which would mask the drop arm
+    // under test.
+    let issuer = Server::start().await;
+    let applier = Server::start().await;
+    let token = issuer.root().await;
+
+    configure_vectors(&issuer, &token, "shop", "docs").await;
+    // Arranged as the parent-drop test above is, for the reasons it gives: a
+    // plain collection after the configuration, so the `ConfigureVectors`
+    // entry is not re-delivered with the drop, and the consumer subscribed
+    // only once the graph is built, so that entry is not in its queue either.
+    let res =
+        issuer.post("/v1/db/shop/collections", Some(&token), json!({ "name": "after" })).await;
+    assert_eq!(res.status, 200, "{:?}", res.body);
+    replicate(&issuer, &applier);
+    let shadow = build_graph(&applier, "shop", "docs");
+    assert_eq!(applier.state.vectors.len(), 1);
+    let consumer = tokio::spawn(kimmy_api::vectors::invalidator(&applier.state));
+
+    let shadow_name = kimmy_core::vector_meta::shadow_name("docs");
+    assert!(issuer.state.engine.drop_collection("shop", &shadow_name).unwrap());
+    replicate(&issuer, &applier);
+    assert!(
+        applier.state.engine.get_collection("shop", &shadow_name).is_err(),
+        "the drop should have replicated"
+    );
+    assert!(applier.state.engine.get_collection("shop", "docs").is_ok(), "the parent stays");
+
+    assert!(
+        wait_until(|| applier.state.vectors.is_empty()).await,
+        "the applying member kept a graph for a shadow it no longer holds"
     );
     assert!(!snapshot_of(&applier, shadow).exists(), "and kept its snapshot on disk");
     consumer.abort();

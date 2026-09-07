@@ -22,6 +22,23 @@ use crate::tables;
 /// allowed to stall writers.
 const EVENT_BUFFER: usize = 1024;
 
+/// Whether [`Engine::collections`] reports a vector shadow collection that
+/// stands beside its parent in the same database.
+///
+/// `Hidden` is the ADR-138 rule: a shadow whose parent is present is the
+/// owning member's lifecycle lag, not a divergence, so the cross-member
+/// existence check leaves it out; an orphaned shadow — parent gone — is
+/// residue and stays in under either value. `Included` hides nothing. The
+/// ids `Hidden` removes are exactly the ones a vector index is keyed by, so
+/// anything reconciling the index cache must ask for `Included`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PairedShadows {
+    /// Leave out a shadow whose parent is present (ADR-138).
+    Hidden,
+    /// Report every collection there is.
+    Included,
+}
+
 pub struct Engine {
     db: Database,
     node_id: NodeId,
@@ -1287,6 +1304,54 @@ impl Engine {
             out.push(serde_json::from_slice(value.value())?);
         }
         Ok(out)
+    }
+
+    /// Every collection this node holds, across every database, shadow
+    /// collections included — one read transaction over the whole
+    /// `collections` table, in key order (database, then name).
+    ///
+    /// The one catalogue walk. [`Self::all_collection_ids`],
+    /// [`Self::live_collections`] and [`Self::collection_by_id`] are each a
+    /// view over this rather than their own `list_databases` ×
+    /// `list_collections` loop, which was a read transaction per database and
+    /// had been written four times over. Metadata only: a JSON parse per
+    /// collection and never a document, so it costs the same whether the
+    /// collections are empty or full.
+    pub fn all_collections(&self) -> Result<Vec<CollectionMeta>> {
+        let txn = self.db.begin_read()?;
+        let collections = txn.open_table(tables::COLLECTIONS)?;
+        let mut out = Vec::new();
+        for entry in collections.iter()? {
+            let (_, value) = entry?;
+            out.push(serde_json::from_slice(value.value())?);
+        }
+        Ok(out)
+    }
+
+    /// [`Self::all_collections`] with the ADR-138 rule applied, or not, as
+    /// `paired_shadows` says. The **only** place the rule is written: the two
+    /// public views that differ on it, [`Self::all_collection_ids`] and
+    /// [`Self::live_collections`], differ by this one argument and nothing
+    /// else.
+    pub(crate) fn collections(&self, paired_shadows: PairedShadows) -> Result<Vec<CollectionMeta>> {
+        let mut all = self.all_collections()?;
+        if paired_shadows == PairedShadows::Hidden {
+            // The parent is looked for by name within the same database, which
+            // is where the shadow's own name is derived from.
+            let hidden: std::collections::HashSet<CollectionId> = {
+                let present: std::collections::HashSet<(&str, &str)> =
+                    all.iter().map(|c| (c.db.as_str(), c.name.as_str())).collect();
+                all.iter()
+                    .filter(|c| {
+                        kimmy_core::vector_meta::base_name(&c.name)
+                            .is_some_and(|base| present.contains(&(c.db.as_str(), base)))
+                    })
+                    .map(|c| c.id)
+                    .collect()
+            };
+            all.retain(|c| !hidden.contains(&c.id));
+        }
+        Ok(all)
     }
 
     /// Drop a collection along with all its documents and index entries.
