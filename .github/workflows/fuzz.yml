@@ -42,7 +42,7 @@ jobs:
     name: build targets
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@nightly
@@ -79,7 +79,7 @@ jobs:
           done
           ls -l fuzz-bin
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: fuzz-targets
           path: fuzz-bin
@@ -106,9 +106,9 @@ jobs:
           - jwt_local_verify
           - jwt_oidc_verify
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: fuzz-targets
           path: fuzz-bin
@@ -136,7 +136,7 @@ jobs:
       # it locally; `cargo fuzz tmin` shrinks it.
       - name: Keep the crashing input
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: crash-${{ matrix.target }}
           path: fuzz/artifacts/${{ matrix.target }}
